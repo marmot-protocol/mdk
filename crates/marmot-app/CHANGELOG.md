@@ -7,10 +7,19 @@
   ids)` returns the still-eligible subset in the caller's order, never adding chats. Pending base rows return
   `ChatPresentationNotReady` instead of a partial list. No schema or wire change.
 
+- Keep uncertain sends pending for ordinary recovery when later SDK retries or an authentication fallback are
+  refused; acknowledgements still succeed.
+
 - Add qualified prior-linked-slot context and explicit user-controlled local device-group reset before fresh pairing. Preserve ordinary local chat data/identity; busy native work may refuse indefinitely and ordinary admission/removal rules still apply. No schema or wire migration.
 
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
-  class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
+  class. Mixed, ambiguous and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
+
+- Retain a best-effort coarse size diagnosis on canonical creates or confirmed Adds whose Welcome remains owed, in pending queries and
+  the existing once-per-process notice. Legacy size reasons, including `EventTooLarge`, explain the observed attempt;
+  earlier exposure can be unknown after a crash or expired bookkeeping. Later coarse retries may replace the cause
+  with Unknown without changing membership or debt. Rust records/events gain an
+  optional field and the account index gains nullable migration 0177; retry/rollback policy and wire formats stay unchanged.
 
 - Skip history-upload endpoints the existing Blossom transport cannot contact, including public HTTP URLs.
   With no eligible endpoint, history follows the existing no-server outcome instead of staying owed until expiry;

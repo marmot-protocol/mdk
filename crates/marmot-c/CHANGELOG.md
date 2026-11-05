@@ -15,6 +15,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Append `MARMOT_STATUS_EVENT_TOO_LARGE` (119) for conclusive shared size refusals. Use the matching header/library;
   the error text is coarse and no structured C payload or record layout changes.
 
+- Add `marmot_pending_welcome_deliveries` and its owned list/free functions. The existing Welcome pending event
+  appends `has_size_class` and `size_class`, changing its ABI layout: rebuild with the matching header/library.
+  Unknown includes old annotations and later coarse legacy retries; this diagnostic never clears delivery debt.
+  Welcome status119 and size reasons describe the observed refusal, not proof of non-delivery or a terminal outcome.
+
 - Erase library-owned recovery-word buffers before freeing them. Host copies still need separate clearing;
   earlier managed/FFI copies are outside this free's scope. No C layout or function signature changes.
 

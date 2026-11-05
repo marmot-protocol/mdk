@@ -532,6 +532,7 @@ fn measure_create_tail(
         };
         let pending = (0..invitees)
             .map(|recipient| crate::PendingWelcomeDeliveryRecord {
+                size_class: None,
                 message_id_hex: format!("{sample:056x}{recipient:08x}"),
                 group_id_hex: group_id_hex.clone(),
                 recipient_hex: format!("{recipient:064x}"),

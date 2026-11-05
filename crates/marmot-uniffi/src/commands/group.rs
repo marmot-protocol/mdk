@@ -1018,6 +1018,24 @@ impl Marmot {
             }))
     }
 
+    /// Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. The coarse
+    /// size class is a best-effort diagnosis, never a terminal verdict. The
+    /// pending notice is once per process/Welcome; re-read this query for later
+    /// causes. Coarse legacy retries may replace a specific cause with None
+    /// (Unknown) while the same repair handle and debt remain.
+    pub async fn pending_welcome_deliveries(
+        &self,
+        account_ref: String,
+    ) -> Result<Vec<crate::conversions::PendingWelcomeDeliveryFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .pending_welcome_deliveries(&account_ref)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Re-read on GroupStateUpdated; display uncertainty separately from whether
     /// the user accepted the original invitation. `history_notice_ids` are this
     /// group's "history may be incomplete" occurrences.

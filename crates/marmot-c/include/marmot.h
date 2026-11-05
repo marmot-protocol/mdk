@@ -282,7 +282,9 @@ enum MarmotStatus
    */
   MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118,
   /**
-   * Every current publish target conclusively refused the event for size.
+   * Every current publish target refused the event for size on the observed
+   * attempt. For legacy Welcomes, earlier exposure can be unknown: this is
+   * not proof of non-delivery or a terminal outcome. Keep native retry work.
    * Detail contains only the artifact kind and coarse locally measured size.
    */
   MARMOT_STATUS_EVENT_TOO_LARGE = 119,
@@ -573,6 +575,21 @@ typedef enum MarmotSendMaintenanceDisposition {
   MARMOT_SEND_MAINTENANCE_DISPOSITION_READY,
   MARMOT_SEND_MAINTENANCE_DISPOSITION_POST_JOIN_ROTATION_PENDING_RETRYABLE,
 } MarmotSendMaintenanceDisposition;
+
+/**
+ * Coarse serialized event size, not an inferred relay limit. Only read
+ * when the corresponding has_size_class flag is true.
+ */
+typedef enum MarmotEventSizeClass {
+  MARMOT_EVENT_SIZE_CLASS_UNDER64_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM64_TO128_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM128_TO256_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM256_TO512_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM512_KIB_TO1_MIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM1_TO2_MIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM2_TO4_MIB,
+  MARMOT_EVENT_SIZE_CLASS_OVER4_MIB,
+} MarmotEventSizeClass;
 
 /**
  * Why recovery parked. Current policy parks only the first five;
@@ -2837,6 +2854,32 @@ typedef struct MarmotGroupCommitDelivery {
   uint32_t relay_count;
   uint64_t since;
 } MarmotGroupCommitDelivery;
+
+/**
+ * A retained Welcome repair handle after a canonical create or confirmed Add.
+ * Unknown includes legacy rows and later coarse retry outcomes; it does
+ * not clear the debt. A class explains the observed refusal, not delivery:
+ * earlier legacy exposure can be unknown. Requires the matching library and header.
+ */
+typedef struct MarmotPendingWelcomeDelivery {
+  char *group_id_hex;
+  char *message_id_hex;
+  char *recipient_hex;
+  uint64_t recorded_at;
+  bool has_size_class;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotEventSizeClass size_class;
+} MarmotPendingWelcomeDelivery;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotPendingWelcomeDeliveryList {
+  struct MarmotPendingWelcomeDelivery *items;
+  uintptr_t len;
+} MarmotPendingWelcomeDeliveryList;
 
 /**
  * Embedded replacement offer; show the authenticated inviter before confirmation.
@@ -6093,9 +6136,8 @@ typedef enum MarmotEvent_Tag {
   MARMOT_EVENT_ACCOUNT_ERROR,
   MARMOT_EVENT_AGENT_STREAM_ACTIVITY,
   /**
-   * A confirmed create/invite could not deliver a welcome to
-   * `recipient_hex`; that member is unjoinable until the welcome is
-   * re-delivered.
+   * A canonical create or confirmed Add still owes a Welcome to
+   * `recipient_hex`; pending does not prove whether the recipient received it.
    */
   MARMOT_EVENT_WELCOME_DELIVERY_PENDING,
   /**
@@ -6226,6 +6268,16 @@ typedef struct MarmotEvent_WelcomeDeliveryPending_Body {
   char *group_id_hex;
   char *message_id_hex;
   char *recipient_hex;
+  /**
+   * Observed refusal, not delivery evidence; earlier legacy exposure can
+   * be unknown. False means Unknown. Query for later causes;
+   * this notice remains once per process/Welcome.
+   */
+  bool has_size_class;
+  /**
+   * Only meaningful when has_size_class is true.
+   */
+  enum MarmotEventSizeClass size_class;
 } MarmotEvent_WelcomeDeliveryPending_Body;
 
 typedef struct MarmotEvent_EpochStallEscalated_Body {
@@ -8278,6 +8330,23 @@ MarmotStatus marmot_group_commit_delivery(const struct MarmotClient *client,
                                           const char *account_ref,
                                           const char *group_id_hex,
                                           struct MarmotGroupCommitDelivery **out);
+
+/**
+ * Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
+ * evidence is diagnostic only. A false has_size_class means Unknown,
+ * including old rows or a later coarse legacy retry. The pending notice
+ * remains once per process/Welcome; query for later causes. Free the list
+ * with marmot_pending_welcome_delivery_list_free. Use matching artifacts.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_pending_welcome_deliveries(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               struct MarmotPendingWelcomeDeliveryList **out);
 
 /**
  * Query advisory membership health and pending rejoin offers.
@@ -14052,6 +14121,15 @@ void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList
  * `event` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_event_free(struct MarmotEvent *event);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_pending_welcome_delivery_list_free(struct MarmotPendingWelcomeDeliveryList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

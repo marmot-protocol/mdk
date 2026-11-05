@@ -18,6 +18,32 @@ use super::common::SelfMembershipFfi;
 use super::media::EncryptedMediaVersionFfi;
 use crate::errors::MarmotKitError;
 
+/// A retained repair handle for a canonical create or confirmed Add. A missing size
+/// class means Unknown, including old rows or a later coarse legacy retry.
+/// A present class explains the observed refusal, not non-delivery: legacy
+/// bookkeeping may miss earlier exposure after a crash or record expiry.
+/// No annotation changes membership or ends the delivery obligation.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PendingWelcomeDeliveryFfi {
+    pub group_id_hex: String,
+    pub message_id_hex: String,
+    pub recipient_hex: String,
+    pub recorded_at: u64,
+    pub size_class: Option<crate::EventSizeClassFfi>,
+}
+
+impl From<marmot_app::PendingWelcomeDelivery> for PendingWelcomeDeliveryFfi {
+    fn from(value: marmot_app::PendingWelcomeDelivery) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            message_id_hex: value.message_id_hex,
+            recipient_hex: value.recipient_hex,
+            recorded_at: value.recorded_at,
+            size_class: value.size_class.map(Into::into),
+        }
+    }
+}
+
 /// Opaque application-owned state. Empty data is present state.
 #[derive(Clone, uniffi::Record)]
 pub struct GroupAppComponentFfi {

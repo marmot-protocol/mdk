@@ -11,6 +11,12 @@
 - Add typed `EventTooLarge` with coarse artifact and size-class enums. Regenerate Swift/Kotlin bindings with the
   matching library; existing error cases and publication lifecycle remain unchanged. No database or wire migration.
 
+- Expose pending Welcome repair handles and optional coarse size diagnosis in the existing pending event.
+  Regenerate bindings with the matching library. Diagnostics are best effort, old/future unknown annotations remain
+  Unknown, and later coarse legacy retries may replace a specific cause; existing debt and retry behavior remain.
+  Legacy Welcome reasons, including `EventTooLarge`, explain the observed attempt, not earlier non-delivery or a
+  terminal outcome; a crash or expired bookkeeping can hide previous exposure.
+
 - Add a default-off `dev-device-groups` host capability and explicit experimental constructor. Ordinary constructors
   remain disabled; opt-in native/generated build outputs are isolated. Existing options layouts remain unchanged.
 

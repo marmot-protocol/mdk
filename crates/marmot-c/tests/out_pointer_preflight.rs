@@ -8,8 +8,9 @@ use std::ffi::CString;
 use std::time::Instant;
 
 use marmot_c::commands::{
-    marmot_group_app_component, marmot_send_prepared_media_with_client_token,
-    marmot_set_group_archived, marmot_update_app_component,
+    marmot_group_app_component, marmot_pending_welcome_deliveries,
+    marmot_send_prepared_media_with_client_token, marmot_set_group_archived,
+    marmot_update_app_component,
 };
 use marmot_c::subscriptions::{
     MarmotEventsSubscription, marmot_events_subscription_free, marmot_events_subscription_next,
@@ -70,8 +71,25 @@ fn null_out_is_rejected_before_the_command_runs() {
 }
 
 #[test]
-fn app_component_out_preflight() {
+fn group_output_preflight() {
     unsafe {
+        assert_eq!(
+            marmot_pending_welcome_deliveries(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        let mut pending = std::ptr::dangling_mut();
+        assert_eq!(
+            marmot_pending_welcome_deliveries(std::ptr::null(), std::ptr::null(), &raw mut pending),
+            MarmotStatus::NullPointer
+        );
+        assert!(
+            pending.is_null(),
+            "output must be cleared before reading the client or account"
+        );
         assert_eq!(
             marmot_group_app_component(
                 std::ptr::null(),

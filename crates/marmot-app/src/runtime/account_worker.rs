@@ -8930,8 +8930,8 @@ pub(crate) fn publish_app_runtime_group_state_updated(
 }
 
 /// Broadcast a `WelcomeDeliveryPending` event for each Welcome a publish
-/// queued for re-delivery (mdk#352), so subscribers learn a member is
-/// unjoinable without polling the durable queue.
+/// queued for re-delivery (mdk#352), so subscribers learn delivery remains
+/// pending without polling the durable queue. This is not non-delivery evidence.
 fn publish_pending_welcome_delivery_events(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -8948,6 +8948,7 @@ fn publish_pending_welcome_delivery_events(
             group_id: GroupId::new(group_id_bytes),
             message_id_hex: pending.message_id_hex,
             recipient_hex: pending.recipient_hex,
+            size_class: pending.size_class,
         });
     }
 }
@@ -9123,6 +9124,7 @@ mod tests {
         client
             .pending_welcome_delivery_events
             .push(crate::PendingWelcomeDelivery {
+                size_class: Some(crate::EventSizeClass::From512KibTo1Mib),
                 group_id_hex: hex::encode(group_id.as_slice()),
                 message_id_hex: "ab".repeat(32),
                 recipient_hex: "cd".repeat(32),
@@ -9135,13 +9137,21 @@ mod tests {
             if let MarmotAppEvent::WelcomeDeliveryPending {
                 group_id,
                 message_id_hex,
+                size_class,
                 ..
             } = event
             {
-                announced.push((group_id, message_id_hex));
+                announced.push((group_id, message_id_hex, size_class));
             }
         }
-        assert_eq!(announced, [(group_id, "ab".repeat(32))]);
+        assert_eq!(
+            announced,
+            [(
+                group_id,
+                "ab".repeat(32),
+                Some(crate::EventSizeClass::From512KibTo1Mib)
+            )]
+        );
         assert!(client.take_pending_welcome_delivery_events().is_empty());
     }
 
