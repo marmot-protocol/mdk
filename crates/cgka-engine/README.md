@@ -99,6 +99,11 @@ Exact existing-carrier outcomes still settle while its origin is held. Older dev
 are retired rather than guessed and have no automatic upgrade recovery. If the chat already holds that sibling,
 another Add is refused and cannot recreate the missing Welcome.
 
+If the origin check observes the source chat as `Unrecoverable`, it permanently retires that sibling Welcome.
+Repairing the chat later does not make the retired Welcome owed again. While the sibling's Add leaf remains installed,
+another automatic Add is refused, so ordinary Welcome repair cannot reconstruct the missing delivery. Already
+handed-off transport traffic and completed joins retain their existing behavior.
+
 **Delivered Welcome repair.** The app uses the target's authenticated heartbeat activity for its current
 roster incarnation once that activity is at least ten minutes after the latest carrier's actual first accepted
 publication. The engine still checks the retained origin, selected target-device participation, expiry and current
