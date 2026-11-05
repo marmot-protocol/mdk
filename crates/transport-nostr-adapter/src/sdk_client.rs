@@ -4272,6 +4272,7 @@ impl NostrSdkRelayClient {
             kind: TransportEndpointFailureKind::PossiblyExposed,
             rejection_category: None,
         };
+        let mut possibly_exposed = false;
         for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
             match timeout(
                 SDK_RELAY_PUBLISH_WAIT,
@@ -4289,7 +4290,17 @@ impl NostrSdkRelayClient {
                         ack_kind,
                     });
                 }
-                Ok(Err(failure)) => {
+                Ok(Err(mut failure)) => {
+                    let terminal_rejection =
+                        failure.kind == TransportEndpointFailureKind::TerminalRejected;
+                    possibly_exposed |=
+                        failure.kind == TransportEndpointFailureKind::PossiblyExposed;
+                    // A later refusal describes only that attempt. The owner
+                    // must still retain an event an earlier attempt may have
+                    // exposed, even though this refusal stops internal retries.
+                    if possibly_exposed {
+                        failure.kind = TransportEndpointFailureKind::PossiblyExposed;
+                    }
                     // An anonymous connection cannot satisfy NIP-42 by waiting
                     // and resending. Return its explicit rejection so the
                     // account owner can perform its authenticated fallback.
@@ -4310,12 +4321,13 @@ impl NostrSdkRelayClient {
                     // `blocked:`, `invalid:`, `pow:`, `restricted:` and the
                     // like are the relay's final answer for this event;
                     // resending only repeats the rejection (mdk#2270).
-                    if failure.kind == TransportEndpointFailureKind::TerminalRejected {
+                    if terminal_rejection {
                         return Err(failure);
                     }
                     last_failure = failure;
                 }
                 Err(_) => {
+                    possibly_exposed = true;
                     last_failure.reason = "send event timed out".to_owned();
                     last_failure.kind = TransportEndpointFailureKind::PossiblyExposed;
                     last_failure.rejection_category = None;
@@ -11928,42 +11940,56 @@ mod tests {
         }
     }
 
-    /// One publication reports every attempt's exposure, including an earlier
-    /// unknown reply hidden by a later definite refusal from the same relay.
+    /// Internal retries cannot erase uncertainty, but a later acknowledgement
+    /// still confirms publication. A definite refusal still stops sending.
     #[tokio::test]
-    async fn an_ambiguous_attempt_survives_a_later_terminal_rejection() {
-        let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
-            Arc::new(AtomicBool::new(true)),
-            vec!["error: publication unavailable", "invalid: bad event"],
-        )
-        .await;
-        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
-        let error = sdk
-            .publish_event(
-                std::slice::from_ref(&endpoint),
-                &signed_group_event_dto(),
-                1,
+    async fn publication_retries_preserve_uncertainty_without_hiding_success() {
+        for (last_reply, category, expected_attempts) in [
+            (
+                "invalid: bad event",
+                Some(TransportEndpointRejectionCategory::Invalid),
+                2,
+            ),
+            (
+                "rate-limited: try later",
+                Some(TransportEndpointRejectionCategory::RateLimited),
+                SDK_RELAY_PUBLISH_ATTEMPTS,
+            ),
+            ("", None, 2),
+        ] {
+            let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
+                Arc::new(AtomicBool::new(true)),
+                vec!["error: publication unavailable", last_reply],
             )
-            .await
-            .expect_err("the relay never acknowledged the publication");
-        let failures = error.publish_endpoint_failures();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].endpoint, endpoint);
-        assert_eq!(
-            attempts.lock().await.len(),
-            2,
-            "the unknown reply is retried, then the definite refusal stops sending"
-        );
-        assert_eq!(
-            failures[0].rejection_category,
-            Some(TransportEndpointRejectionCategory::Invalid)
-        );
-        assert_eq!(
-            failures[0].kind,
-            TransportEndpointFailureKind::PossiblyExposed,
-            "a later refusal cannot rule out exposure during an earlier attempt"
-        );
-        sdk.client().shutdown().await;
+            .await;
+            let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+            let result = sdk
+                .publish_event(
+                    std::slice::from_ref(&endpoint),
+                    &signed_group_event_dto(),
+                    1,
+                )
+                .await;
+            assert_eq!(attempts.lock().await.len(), expected_attempts);
+            if let Some(category) = category {
+                let error = result.expect_err("the relay never acknowledged the publication");
+                let failures = error.publish_endpoint_failures();
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].endpoint, endpoint);
+                assert_eq!(failures[0].rejection_category, Some(category));
+                assert_eq!(
+                    failures[0].kind,
+                    TransportEndpointFailureKind::PossiblyExposed,
+                    "a later refusal cannot rule out exposure during an earlier attempt"
+                );
+            } else {
+                let outcome = result.expect("a later acknowledgement confirms publication");
+                assert_eq!(outcome.accepted.len(), 1);
+                assert_eq!(outcome.accepted[0].endpoint, endpoint);
+                assert!(outcome.failed.is_empty());
+            }
+            sdk.client().shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -13396,12 +13422,9 @@ mod tests {
                             attempts.push(tokio::time::Instant::now());
                             index
                         };
-                        let rejected = limited.load(Ordering::Relaxed);
-                        let reason = if rejected {
-                            reasons[index.min(reasons.len() - 1)]
-                        } else {
-                            ""
-                        };
+                        let reason = reasons[index.min(reasons.len() - 1)];
+                        let rejected = limited.load(Ordering::Relaxed) && !reason.is_empty();
+                        let reason = if rejected { reason } else { "" };
                         let response = serde_json::json!(["OK", value[1]["id"], !rejected, reason]);
                         if socket.send(response.to_string().into()).await.is_err() {
                             return;
