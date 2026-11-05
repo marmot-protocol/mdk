@@ -53,10 +53,12 @@ fn private_candidate(client: &AppClient, issuer: &DeviceSlotId) -> ReceivedPriva
 }
 
 fn take_private_key_package(client: &AppClient, issuer: &DeviceSlotId) -> KeyPackage {
-    let record = devices_storage(client)
-        .take_received_private_key_package(&hex::encode(issuer), crate::unix_now_seconds())
-        .unwrap()
-        .unwrap();
+    let record = private_candidate(client, issuer);
+    assert!(
+        devices_storage(client)
+            .take_received_private_key_package_exact(&record, crate::unix_now_seconds())
+            .unwrap()
+    );
     AppClient::received_private_key_package(&record)
 }
 

@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- Remove the experimental `SqliteAppStorage::next_received_private_key_package` and
+  `take_received_private_key_package` conveniences. Rust source/nightly consumers should read
+  `received_private_key_packages_from`, validate their selected record, then call
+  `take_received_private_key_package_exact`; broad listing remains supported. No stable release contained these
+  methods, and no database, wire or host-binding format changes.
+
 - Experimental sibling-Welcome repair uses current-incarnation D35 heartbeats (D100). Remove
   `SqliteAppStorage::due_sibling_welcome_resends`, `qualify_sibling_welcome_activity` and
   `ignore_sibling_welcome_activity`; use `sibling_welcome_resend_is_due(welcome_id, linked_at)` for heartbeat
