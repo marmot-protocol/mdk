@@ -1162,8 +1162,9 @@ choice. To apply it again, edit the device once it is listed in the selected ros
 
 In an experimental device-group build, offer `reset_device_group_for_repair(account_ref)` only after the user chooses
 to discard this device's local hidden device-group copy. It keeps account credentials, the stable device slot and
-ordinary chats, history, drafts and settings. It abandons old unfinished device synchronization, sends no removal and
-repairs no ordinary-chat membership. It is separate from sign-out, account removal and a Move. An already unlinked
+ordinary chats, history, drafts and settings. It abandons old link-bound preparations; retained shared values and
+security decisions can synchronize again under ordinary rules. It sends no removal and repairs no ordinary-chat
+membership. It is separate from sign-out, account removal and a Move. An already unlinked
 device cannot use it to bypass removal.
 
 The returned link snapshot has no trusted old copy to restore. Reset does not publish a new KeyPackage. Use the normal

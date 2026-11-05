@@ -698,8 +698,9 @@ wn --account "$ACCOUNT" key-package rotate
 wn --account "$ACCOUNT" devices link start
 ```
 
-This keeps ordinary chats/history/drafts/settings, account credentials and the current slot; it abandons unfinished
-device sync and publishes no removal. It refuses active pairing/Move or unsettled native work (`device_group_busy`),
+This keeps ordinary chats/history/drafts/settings, account credentials and the current slot; it abandons old link-bound
+preparations, not shared-state/security synchronization, and publishes no removal. It refuses active pairing/Move or
+unsettled native work (`device_group_busy`),
 possibly indefinitely. No trusted copy returns `no_device_group`. Reset does not guarantee fresh admission: an approver
 that still lists the slot/old leaf, rejects it or is full can refuse. Reset itself publishes no KeyPackage; use the
 existing rotation command before fresh code pairing, as above. A failed publication does not restore old trust;

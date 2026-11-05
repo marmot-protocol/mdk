@@ -22,8 +22,8 @@ impl Marmot {
     }
 
     /// User-controlled local device-group reset before fresh code pairing.
-    /// Keeps credentials, slot and ordinary chat data, but abandons unfinished
-    /// device sync. It repairs no chat membership and sends no removal. Busy
+    /// Keeps credentials, slot and ordinary data; abandons old link-bound
+    /// preparation, not shared state/security sync. No membership repair/removal. Busy
     /// native work/pairing/Move can refuse indefinitely; cancellation after
     /// reset does not restore old trust. Requires explicit experimental gates.
     pub async fn reset_device_group_for_repair(

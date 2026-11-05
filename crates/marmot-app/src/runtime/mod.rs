@@ -4452,8 +4452,8 @@ impl MarmotAppRuntime {
 
     /// Explicitly discard this device's quiet trusted device-group copy
     /// before fresh code pairing. Preserves this account's credentials, slot
-    /// and ordinary chat data. Unfinished device sync is abandoned; this
-    /// publishes no removal and repairs no ordinary-chat membership.
+    /// and ordinary chat data. Old link-bound preparation is abandoned;
+    /// shared state/security can resync. No removal or membership repair.
     /// Refuses active pairing/Move or unsettled native work with
     /// `device_group_busy`; settlement may take indefinitely. Cancellation
     /// after reset does not restore the discarded copy. Requires device groups.
