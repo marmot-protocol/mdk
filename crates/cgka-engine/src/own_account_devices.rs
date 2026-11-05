@@ -794,6 +794,27 @@ impl<S: StorageProvider> Engine<S> {
     /// settling. Unlike new-send eligibility, settlement remains possible
     /// while the originating chat or Add is temporarily held.
     pub fn carried_sibling_welcomes(&self) -> Result<Vec<(MessageId, Vec<u8>)>, EngineError> {
+        self.carried_sibling_welcomes_matching(None)
+    }
+
+    /// Carried sibling Welcomes matching these exact opaque carrier ids.
+    /// Unmatched origins are neither checked nor retired. Group and Sent-row
+    /// scans still span storage and their errors propagate; selected origins
+    /// retain the same checks and fallible retirement as the full query.
+    pub fn carried_sibling_welcomes_for_carriers(
+        &self,
+        carriers: &[&[u8]],
+    ) -> Result<Vec<(MessageId, Vec<u8>)>, EngineError> {
+        if carriers.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.carried_sibling_welcomes_matching(Some(carriers))
+    }
+
+    fn carried_sibling_welcomes_matching(
+        &self,
+        carriers: Option<&[&[u8]]>,
+    ) -> Result<Vec<(MessageId, Vec<u8>)>, EngineError> {
         let mut carried = Vec::new();
         for group_id in self.storage.list_groups()? {
             for record in self.storage.list_messages_in_states(
@@ -809,6 +830,9 @@ impl<S: StorageProvider> Engine<S> {
                 else {
                     continue;
                 };
+                if carriers.is_some_and(|ids| !ids.contains(&carrier.as_slice())) {
+                    continue;
+                }
                 if self.check_sibling_welcome_origin(&record, &origin)?
                     != SiblingWelcomeOriginState::Withdrawn
                 {

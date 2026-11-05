@@ -1479,6 +1479,16 @@ impl AccountDeviceSession {
         Ok(self.engine.carried_sibling_welcomes()?)
     }
 
+    /// See [`cgka_engine::Engine::carried_sibling_welcomes_for_carriers`].
+    pub fn carried_sibling_welcomes_for_carriers(
+        &self,
+        carriers: &[&[u8]],
+    ) -> SessionResult<Vec<(MessageId, Vec<u8>)>> {
+        Ok(self
+            .engine
+            .carried_sibling_welcomes_for_carriers(carriers)?)
+    }
+
     /// Reserve a generated carrier's actual timestamp and attach its engine
     /// association on the session connection, before external publication.
     pub fn reserve_sibling_welcome_carrier(

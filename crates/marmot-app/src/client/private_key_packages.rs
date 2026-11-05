@@ -1193,8 +1193,9 @@ impl AppClient {
         for carrier in published.iter().chain(&failed) {
             self.sibling_welcome_carriers.remove(carrier);
         }
+        let carriers: Vec<&[u8]> = published.iter().chain(&failed).map(Vec::as_slice).collect();
         self.runtime
-            .carried_sibling_welcomes()
+            .carried_sibling_welcomes_for_carriers(&carriers)
             .map_err(AppError::from)
             .and_then(|carried| {
                 for (id, carrier) in carried {
