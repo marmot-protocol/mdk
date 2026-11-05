@@ -753,6 +753,13 @@
   unusable artwork. Authenticated carried keys and retained canonical source
   exporters replace stale same-epoch cache entries (mdk#2840).
 
+- Imported-history device names recover after a failed roster read or local
+  label write without opening Devices or waiting for another roster change
+  (mdk#2832). Existing worker seams and pre-import reads retry only until
+  labels are stored; success refreshes timeline rows through the existing linked-device notice,
+  and a changed latest-import answer uses the existing history-import notice.
+  No API, wire or database migration is required.
+
 - A device cleans up after every device its device group's roster stops
   listing, not only one whose `removed` record it still reads (mdk#2761):
   it removes that device's tagged leaves from chats that take a
