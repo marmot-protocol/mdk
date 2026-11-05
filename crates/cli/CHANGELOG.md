@@ -287,7 +287,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - The TUI keeps `/login` secret input hidden while a quoted argument is still being edited, including leading
   whitespace inside quotes or an unfinished extra argument (mdk#2955). Submitting an unfinished quote still reports
-  a parse error.
+  a parse error. Whitespace-padded secrets use stdin for TUI login, and the CLI rejects them as identity arguments.
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
   `delete_group` inside a transaction and only logged the failure; the group id stayed taken.

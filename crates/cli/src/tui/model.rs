@@ -4936,7 +4936,7 @@ pub(crate) fn composer_display_text(input: &str) -> String {
         && words
             .iter()
             .skip(1)
-            .any(|word| crate::is_nostr_secret(word.trim_start()))
+            .any(|word| crate::is_nostr_secret(word))
     {
         return "/login <hidden nsec>".to_owned();
     }

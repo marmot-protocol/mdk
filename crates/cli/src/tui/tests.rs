@@ -348,10 +348,18 @@ fn slash_command_parser_handles_account_onboarding_commands() {
             ))
         );
     }
-    // Display masking may ignore leading whitespace; submission retains it.
+    // Padding inside quotes must not route secret material through public argv.
     assert_eq!(
         parse_slash_command("/login \" nsec1synthetic\""),
-        Ok(SlashCommand::AccountAddPublic(" nsec1synthetic".to_owned()))
+        Ok(SlashCommand::AccountImportSecret(
+            " nsec1synthetic".to_owned()
+        ))
+    );
+    assert_eq!(
+        parse_slash_command("/login \" npub1synthetic \""),
+        Ok(SlashCommand::AccountAddPublic(
+            " npub1synthetic ".to_owned()
+        ))
     );
     for input in [
         "/login \" nsec1synthetic",
@@ -2063,7 +2071,6 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
         "/login 'npub1public'",
         "/login \"",
         "/login '",
-        "/\"login nsec1synthetic",
     ] {
         assert_eq!(composer_display_text(input), input);
     }
@@ -2079,6 +2086,15 @@ fn composer_redacts_uppercase_nsec_import() {
 
 #[test]
 fn account_setup_invocation_pipes_nsec_imports_to_stdin() {
+    for identity in [" nsec1synthetic", "\tNsEc1synthetic \n"] {
+        assert_eq!(
+            account_setup_invocation(Some(identity.to_owned()), None),
+            WnInvocation {
+                args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
+                stdin: Some(format!("{identity}\n")),
+            }
+        );
+    }
     assert_eq!(
         account_setup_invocation(Some("nsec1secret".to_owned()), None),
         WnInvocation {
