@@ -2,7 +2,8 @@
 
 use std::sync::OnceLock;
 
-use crate::{Inline, LinkDestinationKind, classify_link_destination};
+use crate::{Inline, classify_link_destination};
+use unicode_script::{Script, UnicodeScript};
 
 const ROOTS: &str = include_str!("iana-tlds.txt");
 static ROOT_LABELS: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -15,14 +16,29 @@ const FILE_ENDINGS: &[&str] = &[
 
 /// Necessary raw-source condition shared with explicit-label precedence handling.
 pub(crate) fn has_host_separator(text: &str) -> bool {
-    text.contains(['.', '。', '．', '｡'])
+    text.as_bytes().contains(&b'.')
 }
 
+/// Check raw token boundaries without treating a script transition as a new host.
 pub(crate) fn eligible_start(raw: &str, i: usize) -> bool {
-    let Some(c) = raw[i..].chars().next() else {
-        return false;
-    };
-    if !c.is_alphanumeric() {
+    let bytes = raw.as_bytes();
+    let first = bytes[i];
+    if first.is_ascii() {
+        if !first.is_ascii_alphanumeric() {
+            return false;
+        }
+        if i == 0 {
+            return true;
+        }
+        let prev = bytes[i - 1];
+        if prev.is_ascii() {
+            return prev.is_ascii_whitespace()
+                || matches!(
+                    prev,
+                    b'(' | b'[' | b'"' | b'\'' | b',' | b';' | b'!' | b'*' | b'_' | b'~'
+                );
+        }
+    } else if !raw[i..].chars().next().is_some_and(char::is_alphanumeric) {
         return false;
     }
     i == 0
@@ -32,7 +48,43 @@ pub(crate) fn eligible_start(raw: &str, i: usize) -> bool {
                     prev,
                     '(' | '[' | '"' | '\'' | ',' | ';' | '!' | '*' | '_' | '~'
                 )
+                || unicode_boundary(prev)
         })
+}
+
+/// Common prose punctuation is a boundary, never an IDNA-mapped host separator.
+pub(crate) fn unicode_boundary(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '．'
+            | '｡'
+            | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '«'
+            | '»'
+            | '‹'
+            | '›'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+            | '【'
+            | '】'
+            | '〈'
+            | '〉'
+            | '《'
+            | '》'
+            | '（'
+            | '）'
+    )
 }
 
 /// Return both the inferred link and the attempted token's end. The caller
@@ -40,36 +92,42 @@ pub(crate) fn eligible_start(raw: &str, i: usize) -> bool {
 pub(crate) fn scan(raw: &str, start: usize) -> (Option<(Inline, usize)>, usize) {
     let mut end = start;
     let mut suffix = false;
+    let mut host_dot = false;
     for (offset, c) in raw[start..].char_indices() {
         if c.is_whitespace()
-            || matches!(c, '<' | '>' | '`' | '"' | '\'' | '[' | ']')
+            || matches!(c, '<' | '>' | '`' | '"' | '[' | ']')
+            || (!suffix && unicode_boundary(c))
+            || (!suffix && c == '\'')
             || (!suffix && matches!(c, '(' | ',' | ';' | '*' | '~'))
         {
             break;
         }
+        host_dot |= !suffix && c == '.';
         suffix |= matches!(c, '/' | '?' | '#');
         end = start + offset + c.len_utf8();
     }
     let attempted_end = end;
-    end = crate::inline::trim_trailing_punct(raw.as_bytes(), start, end);
+    if !host_dot {
+        return (None, attempted_end);
+    }
+    end = crate::inline::trim_trailing_punct(raw.as_bytes(), start, end, true);
     let text = &raw[start..end];
-    let inferred = infer(text).and_then(|dest| {
+    let inferred = infer(text).map(|dest| {
         let classification = classify_link_destination(&dest);
-        (classification == LinkDestinationKind::Web).then(|| {
-            (
-                Inline::Link {
-                    dest,
-                    title: None,
-                    children: vec![Inline::Text(text.to_owned())],
-                    classification,
-                },
-                end,
-            )
-        })
+        (
+            Inline::Link {
+                dest,
+                title: None,
+                children: vec![Inline::Text(text.to_owned())],
+                classification,
+            },
+            end,
+        )
     });
     (inferred, attempted_end)
 }
 
+/// Validate one whole candidate and supply an ASCII-host HTTPS destination.
 fn infer(text: &str) -> Option<String> {
     // Never silently drop or interpret controls/formatting as part of a host or
     // target. In particular UTS46 maps some default-ignorables away.
@@ -78,10 +136,7 @@ fn infer(text: &str) -> Option<String> {
     }
     let authority_end = text.find(['/', '?', '#']).unwrap_or(text.len());
     let authority = &text[..authority_end];
-    if authority.len() > 1024
-        || !has_host_separator(authority)
-        || authority.contains(['@', '\\', '%'])
-    {
+    if authority.len() > 1024 || !has_host_separator(authority) || authority.contains(['@', '%']) {
         return None;
     }
     let (host, port) = match authority.split_once(':') {
@@ -106,6 +161,15 @@ fn infer(text: &str) -> Option<String> {
     if reserved_nostr_host(&ascii) {
         return None;
     }
+    if !host.is_ascii() {
+        // Inspect the validated canonical Unicode label as well: compatibility
+        // digits and mathematical letters can map into ASCII during IDNA.
+        let (normalized, status) = idna::domain_to_unicode(&ascii);
+        status.ok()?;
+        if ambiguous_first_label(&normalized) {
+            return None;
+        }
+    }
     let (_, root) = ascii.rsplit_once('.')?;
     if root.is_empty() || FILE_ENDINGS.contains(&root) {
         return None;
@@ -126,12 +190,34 @@ fn infer(text: &str) -> Option<String> {
     Some(dest)
 }
 
+/// Refuse ambiguous glued prose without guessing a different host suffix.
+fn ambiguous_first_label(host: &str) -> bool {
+    let first = host.split('.').next().unwrap_or(host);
+    if first.is_ascii() {
+        return false;
+    }
+    let mut latin_or_digit = false;
+    let mut unspaced = false;
+    for c in first.chars() {
+        latin_or_digit |= c.is_ascii_digit() || c.script() == Script::Latin;
+        if !c.is_ascii() {
+            unspaced |= matches!(
+                c.script(),
+                Script::Han | Script::Hiragana | Script::Katakana | Script::Thai
+            );
+        }
+    }
+    latin_or_digit && unspaced
+}
+
+/// Reserved Nostr-looking prefixes must remain inert even after IDNA mapping.
 fn reserved_nostr_host(host: &str) -> bool {
     ["nsec1", "ncryptsec1", "npub1"]
         .iter()
         .any(|prefix| host.starts_with(prefix))
 }
 
+/// Controls and Default_Ignorable characters must not disappear during IDNA.
 fn unsafe_character(c: char) -> bool {
     c.is_control()
         || matches!(c as u32,
@@ -146,6 +232,7 @@ fn unsafe_character(c: char) -> bool {
 mod tests {
     use super::ROOTS;
 
+    /// Binary lookup requires the bundled data to remain sorted, unique and valid.
     #[test]
     fn embedded_root_snapshot_satisfies_lookup_invariants() {
         let mut lines = ROOTS.lines();

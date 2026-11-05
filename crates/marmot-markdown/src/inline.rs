@@ -22,13 +22,13 @@ use crate::scanner;
 /// Keep in sync with the explicit match arms — used as the exit condition
 /// for the plain-byte fast-scan in the `_` wildcard arm.
 ///
-/// `h`, `m`, `t`, `w` are tripwires for bare-URL prefixes (`http(s)://`,
+/// `h`, `m`, `t`, `w` and `W` are tripwires for bare-URL prefixes (`http(s)://`,
 /// `mailto:`, `marmot://`, `tel:`, `whitenoise:`, `www.`); the bulk-scan rescue
 /// below keeps the fast path for the overwhelmingly common case of ordinary
 /// prose containing those letters.
 const INLINE_SPECIAL: [bool; 128] = {
     let mut t = [false; 128];
-    let chars = b"\\`$&[!*_~]<@nhmtw\n";
+    let chars = b"\\`$&[!*_~]<@nhmtwW\n";
     let mut k = 0;
     while k < chars.len() {
         t[chars[k] as usize] = true;
@@ -242,12 +242,15 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     tokenize_inner(raw, refs, true, None)
 }
 
+/// Parse a raw inline span. Domain inference is disabled when rebuilding an
+/// explicit label; `edges` preserves its real surrounding bracket punctuation.
 fn tokenize_inner(
     raw: &str,
     refs: &HashMap<String, LinkRef>,
     infer_domains: bool,
     edges: Option<(u8, u8)>,
 ) -> Vec<Inline> {
+    let infer_domains = infer_domains && crate::domain::has_host_separator(raw);
     let bytes = raw.as_bytes();
     let code_span_index = CodeSpanIndex::new(bytes);
     let mut out: Vec<Inline> = Vec::new();
@@ -479,7 +482,7 @@ fn tokenize_inner(
                     i += 1;
                 }
             }
-            b'h' | b'm' | b't' | b'w' => {
+            b'h' | b'm' | b't' | b'w' | b'W' => {
                 if let Some((url, kind, end)) = try_bare_url(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
                     let classification = classify_autolink_destination(&url, kind);
@@ -555,8 +558,8 @@ fn tokenize_inner(
                             // Same rescue for `h`/`m`/`t`/`w` — they're
                             // tripwires for bare-URL prefixes and most occur
                             // mid-word in prose.
-                            if matches!(cc, b'h' | b'm' | b't' | b'w')
-                                && !looks_like_bare_url_start(bytes, i)
+                            if matches!(cc, b'h' | b'm' | b't' | b'w' | b'W')
+                                && bare_url_prefix(bytes, i).is_none()
                             {
                                 i += 1;
                                 continue;
@@ -841,6 +844,26 @@ fn deactivate_bracket_delim(
     refresh_active_bracket_state(delims, last_bracket_delim, open_bracket_delims);
 }
 
+/// A generated domain target requires an existing Link node somewhere in the
+/// label. Authored links are harmless false positives; no-Link labels can keep
+/// their already parsed children without rescanning the entire source.
+fn contains_link(items: &[Inline]) -> bool {
+    let mut stack = vec![items];
+    while let Some(items) = stack.pop() {
+        for item in items {
+            match item {
+                Inline::Link { .. } => return true,
+                Inline::Emph(children)
+                | Inline::Strong(children)
+                | Inline::Strikethrough(children) => stack.push(children),
+                Inline::Image { alt, .. } => stack.push(alt),
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Handle a `]` byte at position `i`. Returns the byte index past the close
 /// on success, or `None` if the `]` should be emitted as literal text.
 #[allow(clippy::too_many_arguments)] // Shares the existing delimiter state; no second parser state owner.
@@ -861,12 +884,13 @@ fn try_close_bracket(
     let opener_idx = previous_active_bracket_delim(delims, *last_bracket_delim)?;
     *last_bracket_delim = Some(opener_idx);
     let opener = delims[opener_idx];
+    let label_has_link = infer_domains && contains_link(&out[opener.out_pos + 1..]);
     // Resolve explicit labels from their original source with fuzzy inference
     // disabled. This preserves escapes/entities without nesting generated links.
     // The replacement pass never reparses labels again. Work is bounded by the
     // existing bracket/depth cap, including nested image labels.
     let explicit_label = || {
-        if !infer_domains {
+        if !label_has_link {
             return None;
         }
         let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
@@ -1223,13 +1247,18 @@ const BARE_URL_PREFIXES: &[(&[u8], AutolinkKind)] = &[
     (b"www.", AutolinkKind::Www),
 ];
 
-/// True if the bytes starting at `i` begin with one of the recognized bare-URL
-/// prefixes. Used by the bulk-scan tripwire to keep ordinary text
-/// (every `d`/`h`/`m`/`t`/`w` byte in prose) on the fast path.
-fn looks_like_bare_url_start(bytes: &[u8], i: usize) -> bool {
-    BARE_URL_PREFIXES
-        .iter()
-        .any(|(prefix, _)| bytes.get(i..i + prefix.len()) == Some(*prefix))
+/// Find a bare URL prefix. Only `www.` is case-insensitive; explicit schemes
+/// retain their existing matching policy. Shared with the bulk-scan tripwire.
+fn bare_url_prefix(bytes: &[u8], i: usize) -> Option<(&'static [u8], AutolinkKind)> {
+    BARE_URL_PREFIXES.iter().copied().find(|(prefix, kind)| {
+        bytes.get(i..i + prefix.len()).is_some_and(|candidate| {
+            if *kind == AutolinkKind::Www {
+                candidate.eq_ignore_ascii_case(prefix)
+            } else {
+                candidate == *prefix
+            }
+        })
+    })
 }
 
 /// Try to consume a bare URL (no surrounding `<>`) starting at `i`. Matches
@@ -1249,10 +1278,7 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
     if prev == Some(b'<') {
         return None;
     }
-    let (prefix, kind) = BARE_URL_PREFIXES
-        .iter()
-        .copied()
-        .find(|(prefix, _)| bytes.get(i..i + prefix.len()) == Some(*prefix))?;
+    let (prefix, kind) = bare_url_prefix(bytes, i)?;
     let body_start = i + prefix.len();
     let mut j = body_start;
     while j < bytes.len() {
@@ -1273,7 +1299,7 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
     if j == body_start {
         return None;
     }
-    j = trim_trailing_punct(bytes, body_start, j);
+    j = trim_trailing_punct(bytes, body_start, j, false);
     if j == body_start {
         return None;
     }
@@ -1285,7 +1311,14 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
 /// - Always strip `.`, `,`, `;`, `:`, `!`, `?`, `*`, `_`, `~`.
 /// - Strip `)` only when the body has more `)` than `(` (so balanced parens
 ///   inside the URL — e.g. Wikipedia disambiguation links — are kept).
-pub(crate) fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
+/// - Inferred domains additionally strip terminal quote/Unicode prose punctuation;
+///   internal suffix punctuation remains URL data. Parentheses are counted once.
+pub(crate) fn trim_trailing_punct(
+    bytes: &[u8],
+    start: usize,
+    mut end: usize,
+    inferred_punctuation: bool,
+) -> usize {
     let mut opens = 0usize;
     let mut closes = 0usize;
     for &b in &bytes[start..end] {
@@ -1302,6 +1335,27 @@ pub(crate) fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) ->
             b')' if closes > opens => {
                 end -= 1;
                 closes -= 1;
+            }
+            b'\'' if inferred_punctuation => end -= 1,
+            b if inferred_punctuation && b >= 0x80 => {
+                // Decode only this final UTF-8 scalar, not the whole remaining
+                // token on every iteration. At most four bytes are visited.
+                let mut scalar_start = end - 1;
+                while scalar_start > start && bytes[scalar_start] & 0xc0 == 0x80 {
+                    scalar_start -= 1;
+                }
+                let Ok(scalar) = std::str::from_utf8(&bytes[scalar_start..end]) else {
+                    return end;
+                };
+                if scalar
+                    .chars()
+                    .next()
+                    .is_some_and(crate::domain::unicode_boundary)
+                {
+                    end = scalar_start;
+                } else {
+                    return end;
+                }
             }
             b')' => return end,
             _ => return end,
@@ -1496,6 +1550,7 @@ fn try_nostr_uri(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)> {
 // Emphasis / strong / strikethrough — the spec's process_emphasis algorithm.
 // ---------------------------------------------------------------------------
 
+/// Apply delimiter flanking with the original neighbors of a sliced label.
 fn classify_delim_run(
     bytes: &[u8],
     i: usize,

@@ -5,7 +5,8 @@
 //!
 //! Destination classifications are renderer-policy input, not authorization.
 //! Hosts must inspect them before navigating to a link or fetching an image;
-//! the original untrusted destination is intentionally preserved.
+//! explicit destinations retain their spelling. Inferred bare domains carry
+//! their original label and a validated ASCII-host HTTPS destination.
 
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{

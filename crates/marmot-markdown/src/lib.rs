@@ -6,7 +6,8 @@
 //! 1. **Simplicity.** Straight-line parsing, no clever abstractions, no
 //!    speculative generality.
 //! 2. **Near-zero dependencies.** `serde` handles AST (de)serialization and
-//!    `idna` validates internationalized bare-domain hosts.
+//!    `idna` validates internationalized bare-domain hosts; `unicode-script`
+//!    identifies ambiguous CJK/Thai prose mixtures.
 //! 3. **First-class nostr.** Two extra inline node types —
 //!    [`Inline::NostrMention`] for bare `@npub1…` handles, and
 //!    [`Inline::NostrUri`] for explicit `nostr:<hrp>1…` references —
@@ -38,7 +39,8 @@
 //!
 //! ## Untrusted destinations
 //!
-//! Link, image, and autolink destinations are preserved and classified with
+//! Explicit destinations retain their spelling; inferred domains carry their
+//! original label and an ASCII-host HTTPS destination. All are classified with
 //! [`LinkDestinationKind`]. Classification is descriptive, not permission to
 //! navigate or fetch. Renderers must inspect it before binding a destination
 //! to a WebView, OS opener, deep-link handler, or image loader. Dangerous and
@@ -95,12 +97,16 @@ pub use destination::classify_link_destination;
 ///   Device-local formatting and live relative updates belong to renderers.
 /// - Bare URLs (GFM-style extended autolinks) for the schemes `http://`,
 ///   `https://`, `mailto:`, `tel:`, `marmot://`, `whitenoise://`, and
-///   `whitenoise-staging://`, plus bare `www.` host/path forms. `www.`
+///   `whitenoise-staging://`, plus case-insensitive `www.` host/path forms. `www.`
 ///   autolinks preserve their source text; renderers synthesize an `https://`
 ///   launch destination. Recognized at word boundaries; trailing punctuation
 ///   (`.,;:!?*_~` and unbalanced `)`) is excluded from the matched URL. Opaque
 ///   app-scheme forms like `marmot:foo` and `whitenoise:foo` (no `//`) stay
 ///   literal.
+/// - Scheme-less domains with known IANA roots and ASCII periods, emitted as
+///   [`Inline::Link`] with original labels and ASCII-host HTTPS destinations.
+///   Filename exceptions and conservative prose boundaries are documented in
+///   the crate README; explicit URLs retain their existing behavior.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).
 /// - Bounded `<details>` / `<summary>` disclosure blocks. The opener and

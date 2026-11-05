@@ -188,6 +188,7 @@ fn deeply_nested_images_do_not_overflow_parse() {
         .expect("nested-image parse panicked or aborted");
 }
 
+/// Dotted labels exercise source replacement without bypassing depth or stack bounds.
 #[test]
 fn deeply_nested_dotted_image_labels_remain_bounded() {
     let handle = std::thread::Builder::new()

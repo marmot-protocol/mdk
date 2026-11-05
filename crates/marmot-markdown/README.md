@@ -13,7 +13,7 @@ engine behavior.
 - Parses local-time timestamps into `Inline::Timestamp` with Unix seconds and a typed display style.
 - Does not parse general HTML. Tag-like sequences stay literal text; only autolinks, timestamps and the `<details>` extension get
   structured treatment.
-- Keeps dependencies scoped to `serde` and strict host validation through `idna`.
+- Uses `serde`, strict host validation through `idna`, and Unicode script properties for conservative prose boundaries.
 
 ```rust
 use marmot_markdown::{Block, parse};
@@ -33,7 +33,7 @@ Renderers **must inspect `classification` before making a destination actionable
 
 - `Dangerous` (`javascript:`, `data:`, `vbscript:`, `file:`) and `Sensitive` (`nsec` / `ncryptsec`, including Nostr
   wrappers) should remain non-actionable by default.
-- `Unknown` and `Relative` require an explicit client policy before delegating to a WebView or OS opener.
+- `Unknown` and `Relative` require an explicit client decision rather than inheriting a WebView or OS opener default.
 - `Web`, `Contact`, `App`, and `Nostr` identify recognized destination families, but clients still apply their own
   navigation, deep-link, privacy, and network policies.
 - Image renderers must apply the classification and their network policy before fetching `dest`; classification alone
@@ -60,7 +60,7 @@ This is a block-oriented extension, not a general HTML parser:
   (formatting, entities, links, and Nostr mentions). Missing or empty summaries
   yield `summary: []`; clients may supply a localized fallback label. A later
   summary is ordinary body text. A malformed initial summary falls back to
-  ordinary Markdown, preserving its text.
+  ordinary Markdown instead of dropping text.
 - The `open` attribute means expanded even when written `open="false"`. Other
   attributes are ignored and never tokenized as destinations. Styles, scripts,
   event handlers, and URLs are not rendering instructions.
@@ -75,7 +75,7 @@ This is a block-oriented extension, not a general HTML parser:
   and unmatched backtick runs are never rescanned. An open summary code span
   keeps interior `</summary>` and `</details>` lines as content until a
   matching run closes it. Failed candidates restore ordinary block structure
-  and the original source gaps.
+  and source gaps instead of collapsing to one paragraph.
 - Body blank-line counts align with `body` and saturate at
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.
@@ -137,11 +137,12 @@ preserves the source spelling and `dest` contains an HTTPS URL with an IDNA-vali
 ASCII host. Root recognition is an offline display heuristic, not evidence that a
 site exists or is safe. Explicit Markdown links, code and escapes take precedence.
 As with scheme-qualified autolinks, entities and math syntax inside an inferred
-URL suffix remain literal URL data. A token containing a backslash is not inferred.
+URL suffix remain literal URL data. Internal suffix punctuation is retained; terminal
+quote and sentence punctuation is excluded. A token containing a backslash is not inferred.
 
 Bare `.pdf`, `.md`, `.zip`, `.mov`, `.py`, `.rs`, `.sh`, `.pl`, `.java` and `.so`
 names remain text, case-insensitively, even when the ending is a delegated root. This applies to bare inference only: an explicit
-`https://` URL, `www.` address or Markdown link still expresses navigation intent.
+`https://` URL, case-insensitive `www.` address or Markdown link still expresses navigation intent.
 Other ordinary file extensions absent from the root list also remain text.
 
 Controls, bidirectional formatting controls and default-ignorable formatting
@@ -151,13 +152,22 @@ confirmation policy, show the actual ASCII authority when confirming an IDN, and
 never replace confusable characters with a guessed Latin destination. Existing
 explicit URLs retain their original parsing/classification contract.
 
+Bare inference uses ASCII periods between host labels. Ideographic/fullwidth stops
+and common Unicode quotes, brackets and sentence punctuation delimit prose. A first
+label mixing Latin letters or ASCII digits with Han, Hiragana, Katakana or Thai stays text:
+the parser cannot safely distinguish glued prose from a mixed-script domain. It does
+not guess a different ASCII suffix. Explicit URLs remain available for those hosts.
+Accented Latin and pure Unicode IDNs with ASCII periods remain supported.
+
+The filename exceptions prioritize common document, archive, source, video and
+shared-library names. They are a finite display policy, not file-type detection:
+`main.cc` and `Xcode.app` still look like domains, while bare `docs.rs` and `notion.so`
+remain text. Use an explicit URL when navigation is intended. Missing spaces and code
+outside code spans can also resemble domains: `Done.Now`, `Ok.No` and `Date.now()`
+are intentionally inferred according to the same root rule.
+
 The bundled [root snapshot](src/iana-tlds.txt) comes from
 [IANA's delegated-TLD list](https://data.iana.org/TLD/tlds-alpha-by-domain.txt).
-Its header records the data version/date. Update it through reviewed source
-maintenance; builds and message parsing never fetch registry data. Download a
-candidate to a local file and run `python3 scripts/update_tlds.py CANDIDATE` from
-this crate. The updater installs the candidate in place after validating it; review the resulting
-diff before committing. It checks the header, label syntax and ordering, then prints root counts,
-a digest and added/removed roots for review. Compare the candidate with IANA before
-committing; syntax checks alone cannot establish a complete registry snapshot. Explicit links remain usable for newly
-delegated roots before the next snapshot update.
+Its header records the version/date. Builds and message parsing use it offline;
+newly delegated roots require a reviewed snapshot update. Explicit links remain
+usable before that update. Maintainer steps are in [AGENTS.md](AGENTS.md).
