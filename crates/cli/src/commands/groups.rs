@@ -1879,6 +1879,85 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, 
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn invite_acceptance_waits_for_the_invite_on_the_same_runtime() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let alice_home = tempfile::tempdir().unwrap();
+        let bob_home = tempfile::tempdir().unwrap();
+        AccountHome::open(alice_home.path())
+            .create_account("alice")
+            .unwrap();
+        let bob_id = AccountHome::open(bob_home.path())
+            .create_account("bob")
+            .unwrap()
+            .account_id_hex;
+        let config =
+            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+        let alice_app =
+            MarmotApp::with_relay_and_config(alice_home.path(), url.clone(), config.clone());
+        let bob_app = MarmotApp::with_relay_and_config(bob_home.path(), url, config);
+        bob_app
+            .client("bob")
+            .await
+            .unwrap()
+            .publish_key_package()
+            .await
+            .unwrap();
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let group = alice
+            .create_group("invite still in flight", &[])
+            .await
+            .unwrap();
+        let bob = bob_app.runtime();
+        bob.start().await.unwrap();
+        // This real worker read drains startup before the acceptance request.
+        bob.key_package_maintenance_status("bob").await.unwrap();
+        assert!(
+            bob_app
+                .group("bob", &hex::encode(group.as_slice()))
+                .unwrap()
+                .is_none()
+        );
+
+        // With an already-ready worker, no other caller, and the current-thread
+        // executor, the worker lookup and empty-channel send cannot wait for
+        // another task. Remove cooperative budget yields too: this first poll
+        // enqueues acceptance before the FIFO read below.
+        let mut acceptance = Box::pin(tokio::task::unconstrained(
+            accept_group_invite_retrying_busy(&bob, "bob", &group),
+        ));
+        poll_fn(|cx| {
+            assert!(acceptance.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        bob.key_package_maintenance_status("bob").await.unwrap();
+        poll_fn(|cx| {
+            assert!(
+                acceptance.as_mut().poll(cx).is_pending(),
+                "a processed unknown invitation must stay retryable"
+            );
+            Poll::Ready(())
+        })
+        .await;
+
+        let sent = alice.invite_members(&group, &[&bob_id]).await.unwrap();
+        assert!(sent.published > 0);
+        let accepted = tokio::time::timeout(Duration::from_secs(15), acceptance).await;
+        bob.shutdown().await;
+        drop(alice);
+        relay.shutdown();
+        let accepted = accepted.expect("the published invite is accepted").unwrap();
+        assert_eq!(accepted.group_id_hex, hex::encode(group.as_slice()));
+        assert_eq!(accepted.profile.name, "invite still in flight");
+        assert!(!accepted.pending_confirmation);
+        assert!(!accepted.archived);
+    }
+
     #[test]
     fn only_welcome_launching_group_commands_require_a_drain() {
         assert!(group_command_requires_welcome_drain(
