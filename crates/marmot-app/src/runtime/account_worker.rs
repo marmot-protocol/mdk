@@ -2433,133 +2433,133 @@ async fn run_app_runtime_account_worker(
             yield_to_convergence,
         );
         tokio::select! {
-                    biased;
-                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                        client.finish_audit_recording();
-                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
-                        break 'worker;
-                    }
-                    stop = &mut shutdown => {
-                        if stop.is_ok() {
-                            client.finish_audit_recording();
-                        }
-                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
-                        break 'worker;
-                    }
-                    completed = async {
-                        comparison_recovery
-                            .as_mut()
-                            .and_then(|job| job.network.as_mut())
-                            .expect("comparison network task exists")
-                            .wait()
+            biased;
+            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                client.finish_audit_recording();
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                break 'worker;
+            }
+            stop = &mut shutdown => {
+                if stop.is_ok() {
+                    client.finish_audit_recording();
+                }
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                break 'worker;
+            }
+            completed = async {
+                comparison_recovery
+                    .as_mut()
+                    .and_then(|job| job.network.as_mut())
+                    .expect("comparison network task exists")
+                    .wait()
+                    .await
+            }, if comparison_recovery.as_ref().is_some_and(|job| job.network.is_some()) => {
+                let job = comparison_recovery.as_mut().expect("completed comparison task exists");
+                job.network = None;
+                match completed {
+                    Ok((credit, network)) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .extend(network.outcome_kinds_for_test());
+                        // The task owned this permit until its future really
+                        // ended; keep it through owner admission/checkpoint.
+                        job.credit = Some(credit);
+                        match client
+                            .accept_comparison_network(&job.grant, &mut job.execution, network)
                             .await
-                    }, if comparison_recovery.as_ref().is_some_and(|job| job.network.is_some()) => {
-                        let job = comparison_recovery.as_mut().expect("completed comparison task exists");
-                        job.network = None;
-                        match completed {
-                            Ok((credit, network)) => {
-                                #[cfg(test)]
-                                shared
-                                    .comparison_test_trace
-                                    .lock()
-                                    .unwrap()
-                                    .extend(network.outcome_kinds_for_test());
-                                // The task owned this permit until its future really
-                                // ended; keep it through owner admission/checkpoint.
-                                job.credit = Some(credit);
-                                match client
-                                    .accept_comparison_network(&job.grant, &mut job.execution, network)
-                                    .await
-                                {
-                                    Ok(admission) => job.admission = admission,
-                                    Err(error) => job.failure = Some(error),
-                                }
-                            }
-                            Err(error) => {
-                                #[cfg(test)]
-                                shared
-                                    .comparison_test_trace
-                                    .lock()
-                                    .unwrap()
-                                    .push("task_join_error");
-                                tracing::warn!(
-                                    target: "marmot_app::account_worker",
-                                    method = "comparison_recovery",
-                                    error_kind = if error.is_panic() { "panic" } else { "cancelled" },
-                                    "comparison task ended before worker admission"
-                                );
-                                job.abandoned = true;
-                            }
+                        {
+                            Ok(admission) => job.admission = admission,
+                            Err(error) => job.failure = Some(error),
                         }
                     }
-                    recovered = async {
-                        let recovery = welcome_recovery
-                            .as_mut()
-                            .expect("Welcome recovery branch requires a live task");
-                        (&mut recovery.handle).await
-                    }, if welcome_recovery.is_some() => {
-                        let mut recovery = welcome_recovery
-                            .take()
-                            .expect("completed Welcome recovery task must still be owned");
-                        match recovered {
-                            Ok(completed) => {
-                                client
-                                    .finish_pending_welcome_delivery_recovery_best_effort(completed)
-                                    .await;
-                            }
-                            Err(error) => {
-                                client.abandon_pending_welcome_delivery_recovery(
-                                    &recovery.message_ids,
-                                );
-                                tracing::warn!(
-                                    target: "marmot_app::runtime",
-                                    method = "startup_welcome_recovery",
-                                    error_kind = if error.is_panic() { "panic" } else { "cancelled" },
-                                    "startup Welcome relay task ended before reconciliation"
-                                );
-                            }
-                        }
-                        for respond in recovery.drain_waiters.drain(..) {
-                            let _ = respond.send(());
-                        }
+                    Err(error) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .push("task_join_error");
+                        tracing::warn!(
+                            target: "marmot_app::account_worker",
+                            method = "comparison_recovery",
+                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                            "comparison task ended before worker admission"
+                        );
+                        job.abandoned = true;
                     }
-                    // Consume completed blobs before admitting more commands.
-                    done = media_http_rx.recv() => {
-                        match done {
-                            Some(done) => {
-                                complete_media_http(&mut client, done, &shared, &media_http).await;
-                                // Ordinary transfers return the same credits used by
-                                // restore; resume only after completion released one.
-                                dispatch_backup_restore(&mut client, &media_http);
-                                dispatch_backup_pass(&mut client, &media_http);
-                                // A fetched history imports messages; show them, and
-                                // the chat's history state, now, not at the next
-                                // maintenance pass.
-                                publish_client_pending_projection_updates(
-                                    &mut client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                );
-                                publish_device_group_changes(
-                                    &mut client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                );
-                                avatar_due = true;
-                                attachment_due = true;
-                                schedule_pending_convergence_groups(
-                                    &mut scheduled_convergence,
-                                    &mut client,
-                                );
-                            }
-                            None => {
-                                stop_recovery_runner(&mut recovery_runner, &mut client).await;
-                                break 'worker;
-                            }
-                        }
+                }
+            }
+            recovered = async {
+                let recovery = welcome_recovery
+                    .as_mut()
+                    .expect("Welcome recovery branch requires a live task");
+                (&mut recovery.handle).await
+            }, if welcome_recovery.is_some() => {
+                let mut recovery = welcome_recovery
+                    .take()
+                    .expect("completed Welcome recovery task must still be owned");
+                match recovered {
+                    Ok(completed) => {
+                        client
+                            .finish_pending_welcome_delivery_recovery_best_effort(completed)
+                            .await;
                     }
+                    Err(error) => {
+                        client.abandon_pending_welcome_delivery_recovery(
+                            &recovery.message_ids,
+                        );
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "startup_welcome_recovery",
+                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                            "startup Welcome relay task ended before reconciliation"
+                        );
+                    }
+                }
+                for respond in recovery.drain_waiters.drain(..) {
+                    let _ = respond.send(());
+                }
+            }
+            // Consume completed blobs before admitting more commands.
+            done = media_http_rx.recv() => {
+                match done {
+                    Some(done) => {
+                        complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // Ordinary transfers return the same credits used by
+                        // restore; resume only after completion released one.
+                        dispatch_backup_restore(&mut client, &media_http);
+                        dispatch_backup_pass(&mut client, &media_http);
+                        // A fetched history imports messages; show them, and
+                        // the chat's history state, now, not at the next
+                        // maintenance pass.
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        publish_device_group_changes(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        avatar_due = true;
+                        attachment_due = true;
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                    }
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
+                }
+            }
             // Settle ready media before a platform wake admits more work.
             _ = async {
                 backup_condition_updates
@@ -2570,1019 +2570,1019 @@ async fn run_app_runtime_account_worker(
             }, if backup_condition_updates.is_some() => {
                 dispatch_backup_pass(&mut client, &media_http);
             }
-                    // Alternate a command and a ready recovery quantum. A permanently
-                    // nonempty command channel must not starve group convergence.
-                    command = async {
-                        match ready_command.and_then(|index| pending.remove(index)) {
-                            Some(command) => Some((command, true)),
-                            None => commands.recv().await.map(|command| (command, false)),
-                        }
-                    }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
-                        yield_to_convergence = true;
-                        match command {
-                            Some((command, approved_pending)) => {
-                                #[cfg(test)]
-                                tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
-                                // ready_command_index has already approved pending work
-                                // before the CatchUp barrier. Apply this extra gate only
-                                // to fresh channel arrivals, or the earlier work would
-                                // be requeued behind CatchUp after capacity returns.
-                                if comparison_recovery.is_some() && !approved_pending
-                                    && (command.waits_for_recovery_job()
-                                        || (pending.iter().any(AccountWorkerCommand::waits_for_recovery_job)
-                                            && !command.readable_during_comparison_catch_up()))
-                                {
-                                    pending.push_back(command);
-                                    continue;
-                                }
-                                let command = match command {
-                                    AccountWorkerCommand::Drain { respond } => {
-                                        if let Some(recovery) = &mut welcome_recovery {
-                                            recovery.drain_waiters.push(respond);
-                                        } else {
-                                            let _ = respond.send(());
-                                        }
-                                        continue;
-                                    }
-                                    #[cfg(test)]
-                                    AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
-                                        match &recovery_runner {
-                                            Some(runner) => {
-                                                let handle = runner.handle().clone();
-                                                tokio::spawn(async move {
-                                                    let _ = respond.send(handle.run_pass(budget).await);
-                                                });
-                                            }
-                                            None => {
-                                                let _ = respond.send(None);
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    command => command,
-                                };
-                                let may_change_push_registration_work =
-                                    command.may_change_push_registration_work();
-                                match command {
-                                    AccountWorkerCommand::CatchUp { respond } => {
-                                        handle_account_worker_catch_up(
-                                            &mut client,
-                                            respond,
-                                            &mut commands,
-                                            &mut pending,
-                                            AccountWorkerCatchUpContext {
-                                                app: &app,
-                                                events: &events,
-                                                account_id_hex: &account_id_hex,
-                                                account_label: &account_label,
-                                                shared: &shared,
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                    AccountWorkerCommand::PublishSetupKeyPackage { respond }
-                                        if setup_key_package_result.is_some() =>
-                                    {
-                                        let _ = respond.send(
-                                            setup_key_package_result.take().expect("cached setup result"),
-                                        );
-                                    }
-                                    command => {
-                                        handle_account_worker_command(
-                                            &mut client,
-                                            command,
-                                            AccountWorkerCommandContext {
-                                                commands: &mut commands,
-                                                pending: &mut pending,
-                                                app: &app,
-                                                events: &events,
-                                                account_id_hex: &account_id_hex,
-                                                account_label: &account_label,
-                                                shared: &shared,
-                                                media_http: &media_http,
-                                                scheduled_convergence: &mut scheduled_convergence,
-                                                recovery_runner: recovery_runner.as_mut(),
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                }
-                                schedule_pending_convergence_groups(
-                                    &mut scheduled_convergence,
-                                    &mut client,
-                                );
-                                scheduled_runtime_group_subscription_refresh.observe_pending(
-                                    client.has_pending_runtime_group_subscription_refresh(),
-                                    &command_tx,
-                                );
-                                if may_change_push_registration_work {
-                                    scheduled_push_retry.observe_pending(
-                                        client.has_pending_push_registration_work(),
-                                        &command_tx,
-                                    );
-                                }
-                            }
-                            None => {
-                                stop_recovery_runner(&mut recovery_runner, &mut client).await;
-                                break 'worker;
-                            }
-                        }
-                    }
-                    // A completed optional retry owes durable admission one turn once
-                    // its finite command predecessors have drained. Keep the existing
-                    // command/convergence alternation, including blocked predecessors.
-                    _ = tokio::time::sleep_until(local_submission_retry_at),
-                        if local_submission_service_owed && local_submission_due
-                            && pending.is_empty() && commands.is_empty()
-                            && !lifecycle.is_stopping() => {
-                        // Recheck after polling the deadline: a buffered command may
-                        // have arrived while the normal command arm was fairness-gated.
-                        if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
-                        let retry = publish_next_local_submission(
-                            &mut client, &app, &shared, &events,
-                            &account_id_hex, &account_label,
-                        ).await;
-                        local_submission_service_owed = false;
-                        local_submission_due = retry.is_some();
-                        if let Some(delay) = retry {
-                            local_submission_retry_at = TokioInstant::now() + delay;
-                            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-                        }
-                    }
-                    _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
-                        yield_to_convergence = false;
-                        let Some(group_id) = scheduled_convergence.take_ready() else { continue };
-                        let secondary_retry_yield = wait_for_local_submission_or_shutdown(
-                            app.clone(),
-                            account_label.clone(),
-                            shared.local_submission_gate(&account_id_hex),
-                            shared.local_submission_wakeups.subscribe(),
-                            lifecycle.subscribe_shutdown(),
-                        ).boxed().shared();
-                        let yield_observation = secondary_retry_yield.clone();
-                        let mut phase = Some(shared.observer.performance().observe(RuntimeOp::WorkerConvergence));
-                        // Recovery owns the live client, but member/roster reads can
-                        // use the last committed snapshot while its relay I/O waits.
-                        // Mutations retain worker FIFO order; reads use the snapshot.
-                        let read_snapshot = capture_group_read_snapshot(
-                            &client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            "runtime scheduled convergence snapshot failed",
-                        );
-                        Box::pin(serve_snapshot_reads_until(
-                            read_snapshot,
-                            async {
-                                #[cfg(any(test, feature = "test-policy-overrides"))]
-                                if let Some(barrier) = shared.take_next_scheduled_convergence_barrier() {
-                                    barrier.wait().await;
-                                    barrier.wait().await;
-                                }
-                                match client.retry_pending_runtime_group_subscription_refresh().await {
-                                    Ok(_) => {
-                                        // Shutdown is safe here: no engine snapshot guard is live.
-                                        if lifecycle.is_stopping() { return; }
-                                        let progress = Arc::new(ProjectionPublicationProgress::new(
-                                            events.clone(), &account_id_hex, &account_label,
-                                        ));
-                                        let progress_sink = progress.clone();
-                                        let on_publication = Arc::new(move |update| {
-                                            progress_sink.publish(update);
-                                        });
-                                        let result = client.advance_convergence_with_projection_progress_and_yield(
-                                            &group_id, Some(on_publication), secondary_retry_yield,
-                                        ).await;
-                                        record_runtime_publication(
-                                            &client,
-                                            marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
-                                            None,
-                                            progress.take_publication(),
-                                        );
-                                        match result {
-                                            Ok(summary) => {
-                                                publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
-                                                // A pass that superseded one of this
-                                                // device's own commits reports it
-                                                // through the client's pending
-                                                // buffer; this arm is the only seam
-                                                // that can observe such a pass
-                                                // without a later command to drain
-                                                // it (mdk#1734).
-                                                publish_client_pending_projection_updates(
-                                                    &mut client,
-                                                    &events,
-                                                    &account_id_hex,
-                                                    &account_label,
-                                                );
-                                                match client.convergence_schedule_state(&group_id) {
-                                                    Ok(state) => scheduled_convergence
-                                                        .schedule_after_pass(&group_id, state),
-                                                    Err(err) => {
-                                                        scheduled_convergence
-                                                            .schedule_retry_groups([group_id.clone()]);
-                                                        publish_app_runtime_account_error(
-                                                            &events,
-                                                            &account_id_hex,
-                                                            &account_label,
-                                                            account_error_message(
-                                                                "convergence schedule state failed",
-                                                                &err,
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                                schedule_pending_convergence_groups(
-                                                    &mut scheduled_convergence,
-                                                    &mut client,
-                                                );
-                                                let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
-                                                // An existing comparison owns the one
-                                                // account lease. Keep this local pass
-                                                // complete and let that job settle the
-                                                // still-durable recovery debt.
-                                                let backfill_armed = client.has_pending_epoch_backfill();
-                                                let observation = backfill_armed.then(|| shared.observer.product().begin(
-                                                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
-                                                )).flatten();
-                                                let backfill_result = if comparison_recovery.is_some() {
-                                                    Ok(EpochBackfillRunOutcome::Deferred)
-                                                } else {
-                                                    match start_pending_recovery_job(
-                                                        &mut client,
-                                                        &shared,
-                                                        EpochBackfillExecutionSeam::Maintenance,
-                                                    ).await {
-                                                        PendingRecoveryJob::Started {
-                                                            grant, execution, network,
-                                                        } => {
-                                                            comparison_recovery = Some(ComparisonRecoveryJob::new(
-                                                                *grant,
-                                                                execution,
-                                                                network,
-                                                                observation,
-                                                                backfill_armed,
-                                                                Some(phase.take().expect("scheduled phase exists")),
-                                                                ComparisonRecoveryOrigin::PostConvergence {
-                                                                    audit_tracker_update,
-                                                                },
-                                                            ));
-                                                            return;
-                                                        }
-                                                        PendingRecoveryJob::Settled(result) => result,
-                                                    }
-                                                };
-                                                let _ = report_pending_epoch_backfill_result(
-                                                    &mut client,
-                                                    backfill_result,
-                                                    backfill_armed,
-                                                    observation,
-                                                    EpochBackfillReportContext {
-                                                        events: &events,
-                                                        account_id_hex: &account_id_hex,
-                                                        account_label: &account_label,
-                                                        shared: &shared,
-                                                    },
-                                                ).await;
-                                                if audit_tracker_update {
-                                                    shared.schedule_audit_log_tracker_update("scheduled_convergence");
-                                                }
-                                            }
-                                            Err(err) => {
-                                                let mut retry_groups = client.take_pending_convergence_groups();
-                                                retry_groups.push(group_id.clone());
-                                                scheduled_convergence.schedule_retry_groups(retry_groups);
-                                                publish_app_runtime_account_error(
-                                                    &events,
-                                                    &account_id_hex,
-                                                    &account_label,
-                                                    account_error_message("scheduled convergence failed", &err),
-                                                );
-                                                // A failure that spent the pass's budget
-                                                // parks it (mdk#2684); the next turn
-                                                // tells hosts to re-read the group.
-                                                if let Ok(parked) = client.convergence_pass_parked(&group_id) {
-                                                    client.note_convergence_park(&group_id, parked);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        scheduled_convergence.schedule_retry_groups([group_id]);
-                                        publish_app_runtime_account_error(
-                                            &events,
-                                            &account_id_hex,
-                                            &account_label,
-                                            account_error_message("scheduled convergence sync failed", &err),
-                                        );
-                                    }
-                                }
-                            },
-                            &mut commands,
-                            &mut pending,
-                            &app,
-                            &account_label,
-                        ))
-                        .await;
-                        if yield_observation.peek().is_some() {
-                            local_submission_service_owed = true;
-                            // Never erase the ordinary drain's contention/completion
-                            // backoff merely because another optional pass yielded.
-                            if !local_submission_due {
-                                local_submission_due = true;
-                                local_submission_retry_at = TokioInstant::now();
-                            }
-                        }
+            // Alternate a command and a ready recovery quantum. A permanently
+            // nonempty command channel must not starve group convergence.
+            command = async {
+                match ready_command.and_then(|index| pending.remove(index)) {
+                    Some(command) => Some((command, true)),
+                    None => commands.recv().await.map(|command| (command, false)),
+                }
+            }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
+                yield_to_convergence = true;
+                match command {
+                    Some((command, approved_pending)) => {
                         #[cfg(test)]
-                        tests::secondary_retry_scheduler_tests::pass_tail(&account_id_hex).await;
-
-                        if let Some(phase) = phase {
-                            phase.finish(TelemetryOutcome::Success);
-                        }
-                    }
-                    changed = wait_for_replay_change(&mut replay_changes) => {
-                        if !changed {
-                            replay_changes = None;
-                            continue 'worker;
-                        }
-                        if let Err(error) = client.synchronize_native_replay().await {
-                            publish_app_runtime_account_error(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message("native replay synchronization failed", &error),
-                            );
-                        }
-                        publish_account_level_changes(
-                            &mut client, &events, &account_id_hex, &account_label,
-                        );
-                    }
-                    received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
-                        #[cfg(test)]
-                        if let Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) = &received
-                            && let (Ok(event_id), Some(subscription_id)) = (
-                                <[u8; 32]>::try_from(delivery.message.id.as_slice()),
-                                delivery.source.subscription_id.as_ref(),
-                            )
+                        tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
+                        // ready_command_index has already approved pending work
+                        // before the CatchUp barrier. Apply this extra gate only
+                        // to fresh channel arrivals, or the earlier work would
+                        // be requeued behind CatchUp after capacity returns.
+                        if comparison_recovery.is_some() && !approved_pending
+                            && (command.waits_for_recovery_job()
+                                || (pending.iter().any(AccountWorkerCommand::waits_for_recovery_job)
+                                    && !command.readable_during_comparison_catch_up()))
                         {
-                            let drop_this = shared
-                                .ordinary_drop_once
-                                .lock()
-                                .unwrap()
-                                .take_if(|target| {
-                                    target.account_label == account_label && target.event_id == event_id
-                                })
-                                .is_some();
-                            if drop_this {
-                                *shared.ordinary_drop_witness.lock().unwrap() =
-                                    Some(subscription_id.clone());
-                                shared.ordinary_delivery_dropped.notify_one();
-                                continue 'worker;
-                            }
+                            pending.push_back(command);
+                            continue;
                         }
-                        // Only the transport wait participates in `select!`. Once a
-                        // delivery has been claimed, finish ingest + incidental
-                        // publish + projection as one uncancelled worker operation;
-                        // commands remain queued until that durable sequence lands.
-                        let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
-                            .then(Instant::now);
-                        let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
-                        let result = match received {
-                            Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
-                                let ingested = client.ingest_received_delivery(*delivery).await;
-                                // Pairing messages arrive among the account's gift
-                                // wraps; answer them while the other device waits.
-                                client.drive_device_pairing().await;
-                                ingested
+                        let command = match command {
+                            AccountWorkerCommand::Drain { respond } => {
+                                if let Some(recovery) = &mut welcome_recovery {
+                                    recovery.drain_waiters.push(respond);
+                                } else {
+                                    let _ = respond.send(());
+                                }
+                                continue;
                             }
-                            // receive_next_delivery persisted the loss. The owned
-                            // comparison job dispatched below recovers it off the
-                            // worker, never by replaying live subscriptions.
-                            Ok(transport_nostr::AccountDeliveryReceive::Overflow(_)) => {
-                                Ok(SyncSummary::default())
+                            #[cfg(test)]
+                            AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
+                                match &recovery_runner {
+                                    Some(runner) => {
+                                        let handle = runner.handle().clone();
+                                        tokio::spawn(async move {
+                                            let _ = respond.send(handle.run_pass(budget).await);
+                                        });
+                                    }
+                                    None => {
+                                        let _ = respond.send(None);
+                                    }
+                                }
+                                continue;
                             }
-                            Err(err) => Err(err),
+                            command => command,
                         };
-                        if result.is_err() && let Some(started) = delivery_started {
-                            shared.observer.performance().record(
-                                AppPerformanceOperation::InboundDeliveryProjection,
-                                started.elapsed(),
-                                false,
-                            );
-                        }
-                        receive_observation.finish_app(&result);
-                        match result {
-                            Ok(summary) => {
-                                reconnect_backoff.reset();
-                                publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
-                                // An inline convergence pass on a delivered rival can
-                                // supersede one of this device's own commits; the
-                                // report waits in the client's pending buffer and this
-                                // arm has no later command to drain it (mdk#1734).
-                                publish_client_pending_projection_updates(
+                        let may_change_push_registration_work =
+                            command.may_change_push_registration_work();
+                        match command {
+                            AccountWorkerCommand::CatchUp { respond } => {
+                                handle_account_worker_catch_up(
                                     &mut client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                );
-                                if let Some(started) = delivery_started {
-                                    shared.observer.performance().record(
-                                        AppPerformanceOperation::InboundDeliveryProjection,
-                                        started.elapsed(),
-                                        true,
-                                    );
-                                }
-                                if client.device_unlinked() {
-                                    // Nothing more goes out; the next turn stops the worker.
-                                    continue 'worker;
-                                }
-                                start_post_join_history_after_visibility(
-                                    &mut client,
-                                    &summary,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
+                                    respond,
+                                    &mut commands,
+                                    &mut pending,
+                                    AccountWorkerCatchUpContext {
+                                        app: &app,
+                                        events: &events,
+                                        account_id_hex: &account_id_hex,
+                                        account_label: &account_label,
+                                        shared: &shared,
+                                    },
                                 )
                                 .await;
-                                scheduled_runtime_group_subscription_refresh.observe_pending(
-                                    client.has_pending_runtime_group_subscription_refresh(),
-                                    &command_tx,
+                            }
+                            AccountWorkerCommand::PublishSetupKeyPackage { respond }
+                                if setup_key_package_result.is_some() =>
+                            {
+                                let _ = respond.send(
+                                    setup_key_package_result.take().expect("cached setup result"),
                                 );
-                                schedule_pending_convergence_groups(
-                                    &mut scheduled_convergence,
+                            }
+                            command => {
+                                handle_account_worker_command(
                                     &mut client,
-                                );
-                                if start_receive_recovery(
-                                    &mut client,
-                                    &mut comparison_recovery,
-                                    &summary,
-                                    EpochBackfillReportContext {
+                                    command,
+                                    AccountWorkerCommandContext {
+                                        commands: &mut commands,
+                                        pending: &mut pending,
+                                        app: &app,
                                         events: &events,
                                         account_id_hex: &account_id_hex,
                                         account_label: &account_label,
                                         shared: &shared,
+                                        media_http: &media_http,
+                                        scheduled_convergence: &mut scheduled_convergence,
+                                        recovery_runner: recovery_runner.as_mut(),
                                     },
-                                ).await {
-                                    continue 'worker;
-                                }
-                                let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
-                                let retry_push_registration = !summary.joined_groups.is_empty();
-                                finish_receive_after_recovery(
-                                    &mut client,
-                                    ReceiveTailContext {
-                                        events: &events,
-                                        account_id_hex: &account_id_hex,
-                                        account_label: &account_label,
-                                        shared: &shared,
-                                        scheduled_push_retry: &mut scheduled_push_retry,
-                                        command_tx: &command_tx,
-                                    },
-                                    audit_tracker_update, retry_push_registration,
-                                ).await;
-                            }
-                            Err(err) => {
-                                publish_app_runtime_account_error(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    account_error_message("runtime receive failed", &err),
-                                );
-                                if client.arm_failed_receive_projection_retry() {
-                                    // Reopening cannot reconstruct consumed activity events
-                                    // or the output of a batch awaiting its state checkpoint.
-                                    // Keep the owning client for the bounded projection retry.
-                                    scheduled_runtime_group_subscription_refresh.observe_pending(
-                                        true, &command_tx,
-                                    );
-                                    continue 'worker;
-                                }
-                                // The account-session ownership guard is held by
-                                // `AppClient`. Destroy the failed engine before the
-                                // backoff as well as before hydrating its replacement;
-                                // this leaves room for a one-shot client during a
-                                // prolonged transport outage.
-                                let transport_account = client.adapter.account_id().clone();
-                                // Its turns need this client; the reopened one gets
-                                // a runner of its own.
-                                stop_recovery_runner(&mut recovery_runner, &mut client).await;
-                                drop(client);
-                                client = loop {
-                                    let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
-                                    let retry_started_at = Instant::now();
-                                    let mut retry_delay =
-                                        std::pin::pin!(sleep(reconnect_backoff.next_delay()));
-                                    loop {
-                                        tokio::select! {
-                                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
-                                            _ = &mut shutdown => break 'worker,
-                                            _ = &mut retry_delay => break,
-                                            command = commands.recv() => {
-                                                match command {
-                                                    Some(
-                                                        command @ (AccountWorkerCommand::CatchUp { .. }
-                                                        | AccountWorkerCommand::ConnectivityRestored { .. }),
-                                                    ) => {
-                                                        // Host recovery commands are meaningful without
-                                                        // an engine session: retain their responses and use
-                                                        // them to end only this stale sleep. Coalesce an
-                                                        // already queued burst into the same reopen attempt;
-                                                        // new signals can still interrupt later sleeps, so
-                                                        // extra attempts remain bounded by host signal rate
-                                                        // while the network stays unavailable.
-                                                        pending.push_back(command);
-                                                        while let Ok(command) = commands.try_recv() {
-                                                            match command {
-                                                                command @ (AccountWorkerCommand::CatchUp { .. }
-                                                                | AccountWorkerCommand::ConnectivityRestored { .. }) => {
-                                                                    pending.push_back(command);
-                                                                }
-                                                                AccountWorkerCommand::CaptureSelection { respond, .. } => {
-         shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-         let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
-        }
-        AccountWorkerCommand::ApplySelection { respond, .. } => {
-         shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-         let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
-        }
-        AccountWorkerCommand::DepartSelection { respond, .. } => {
-         shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-         let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
-        }
-        AccountWorkerCommand::CaptureConversation { respond, queued, .. } => {
-                                                                    if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
-                                                                    let _ = respond.send(Err(ConversationWindowError::NotReady));
-                                                                }
-                                                                command => {
-                                                                    shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-                                                                    drop(command);
-                                                                },
-                                                            }
-                                                        }
-                                                        tracing::debug!(
-                                                            target: "marmot_app::runtime",
-                                                            method = "account_worker_reconnect",
-                                                            phase = "backoff_wait",
-                                                            outcome = "interrupted",
-                                                            elapsed_ms = u64::try_from(
-                                                                retry_started_at.elapsed().as_millis()
-                                                            )
-                                                            .unwrap_or(u64::MAX),
-                                                            "host recovery interrupted account worker reconnect backoff",
-                                                        );
-                                                        break;
-                                                    }
-                                                    Some(AccountWorkerCommand::CaptureSelection { respond, .. }) => {
-         shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-         let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
-        }
-        Some(AccountWorkerCommand::ApplySelection { respond, .. }) => {
-         shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-         let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
-        }
-        Some(AccountWorkerCommand::DepartSelection { respond, .. }) => {
-         shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-         let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
-        }
-        Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
-                                                        if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
-                                                        let _ = respond.send(Err(ConversationWindowError::NotReady));
-                                                    }
-                                                    // There is deliberately no engine
-                                                    // session during this backoff.
-                                                    // Poll the bounded channel and
-                                                    // reject callers promptly by
-                                                    // dropping their response sender
-                                                    // instead of letting the queue fill
-                                                    // until host-side timeouts fire.
-                                                    Some(command) => {
-                                                        shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
-                                                        drop(command);
-                                                    },
-                                                    None => break 'worker,
-                                                }
-                                            }
-                                        }
-                                    }
-                                    reconnect_wait.finish(TelemetryOutcome::Success);
-                                    let reopen = shared.observer.performance().observe(RuntimeOp::WorkerReopen);
-                                    let reopened_result = tokio::select! {
-                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
-                                        _ = &mut shutdown => break 'worker,
-                                        result = async {
-                                            // The reopened session registers a new signer,
-                                            // so retire the previous session's SDK context.
-                                            relay_plane.retire_account_session_transport(&transport_account).await;
-                                            app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(), None).await
-                                        } => result,
-                                    };
-                                    reopen.finish_app(&reopened_result);
-                                    match reopened_result {
-                                        Ok(mut reopened) => {
-                                            install_storage_telemetry(&reopened, shared.observer.performance());
-                                            reopened.runtime_telemetry = Some(shared.observer.performance().clone());
-                                            reopened.recovery_credits = shared.recovery_credit_pool();
-                                            #[cfg(test)]
-                                            {
-                                                reopened.test_recovery_selection_witness = shared
-                                                    .recovery_selection_witness
-                                                    .lock()
-                                                    .unwrap()
-                                                    .as_ref()
-                                                    .and_then(|target| {
-                                                        (target.account_label == account_label)
-                                                            .then(|| target.sink.clone())
-                                                    });
-                                            }
-                                            // A reconnect open is deferred like the
-                                            // startup open; drain the hydration
-                                            // eagerly here — the steady-state loop
-                                            // below answers reads live and must not
-                                            // hand out not-hydrated errors after a
-                                            // mid-session reconnect (mdk#1161).
-                                            if let Err(err) = drain_deferred_hydration(&mut reopened).await
-                                            {
-                                                publish_app_runtime_account_error(
-                                                    &events,
-                                                    &account_id_hex,
-                                                    &account_label,
-                                                    account_error_message(
-                                                        "runtime restart hydration failed",
-                                                        &err,
-                                                    ),
-                                                );
-                                                drop(reopened);
-                                                continue;
-                                            }
-                                            // Reconnect restores transport activation
-                                            // and subscriptions, then resumes the live
-                                            // receive tail. Do not block the command
-                                            // loop on a full catch-up; the maintenance
-                                            // path performs bounded repair syncs when
-                                            // required.
-                                            let telemetry = shared.observer.performance().clone();
-                                            let prepare_transport = tokio::select! {
-                                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                                                    reopened.finish_audit_recording();
-                                                    break 'worker;
-                                                }
-                                                stop = &mut shutdown => {
-                                                    if stop.is_ok() {
-                                                        reopened.finish_audit_recording();
-                                                    }
-                                                    break 'worker;
-                                                }
-                                                result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
-                                            };
-                                            if let Err(transport_err) = prepare_transport {
-                                                publish_app_runtime_account_error(
-                                                    &events,
-                                                    &account_id_hex,
-                                                    &account_label,
-                                                    account_error_message(
-                                                        "runtime restart transport failed",
-                                                        &transport_err,
-                                                    ),
-                                                );
-                                                drop(reopened);
-                                                continue;
-                                            }
-                                            app.finish_client_open_network_maintenance(&mut reopened)
-                                                .await;
-                                            match reopened.drain_pending_session_events().await {
-                                                Ok(summary) => {
-                                                    publish_app_runtime_summary_with_v5(&reopened,
-                                                        &events,
-                                                        &account_id_hex,
-                                                        &account_label,
-                                                        &summary,
-                                                    );
-                                                    start_post_join_history_after_visibility(
-                                                        &mut reopened,
-                                                        &summary,
-                                                        &events,
-                                                        &account_id_hex,
-                                                        &account_label,
-                                                    )
-                                                    .await;
-                                                }
-                                                Err(error) => {
-                                                    publish_app_runtime_account_error(
-                                                        &events,
-                                                        &account_id_hex,
-                                                        &account_label,
-                                                        account_error_message(
-                                                            "runtime restart queued-work wake failed",
-                                                            &error,
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                            // A reopen while the host's network
-                                            // stayed up gets no connectivity edge to
-                                            // release sends backed off by the outage
-                                            // that closed the old transport (mdk#2762).
-                                            wake_retained_sends_after_transport_start(
-                                                &mut reopened,
-                                                "reopen_retained_send_wake",
-                                            );
-                                            let pending = reopened
-                                                .retry_pending_push_registration_shares_best_effort()
-                                                .await;
-                                            scheduled_push_retry
-                                                .schedule_after_attempt(pending, &command_tx);
-                                            publish_client_pending_applied_summary(
-                                                &mut reopened,
-                                                &events,
-                                                &account_id_hex,
-                                                &account_label,
-                                            );
-                                            break reopened;
-                                        }
-                                        Err(setup_err) => {
-                                            publish_app_runtime_account_error(
-                                                &events,
-                                                &account_id_hex,
-                                                &account_label,
-                                                account_error_message("runtime restart failed", &setup_err),
-                                            );
-                                        }
-                                    }
-                                };
-                                replay_changes = client.adapter.replay_changes().await;
-                                recovery_runner = client.spawn_recovery_runner().await;
-                                recovery_catching_up =
-                                    client.routing.subscribe_recovery_runner_catching_up();
-                                schedule_pending_convergence_groups(
-                                    &mut scheduled_convergence,
-                                    &mut client,
-                                );
-                                continue 'worker;
+                                )
+                                .await;
                             }
                         }
-                    }
-                    // An idle worker waits for the runner's next turn here; the
-                    // loop's top serves one per pass while other work is ready.
-                    turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
-                        turn.serve(&mut client).await;
-                    }
-                    Ok(()) = recovery_catching_up.changed() => {
-                        client.recovery_status_owed = true;
-                        publish_account_level_changes(&mut client, &events, &account_id_hex, &account_label);
-                    }
-                    _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
-                        avatar_due = false;
-                        let identities = avatar_identities.run(&client, &account_id_hex);
-                        let acquisition = schedule_avatar_acquisition(&client, &media_http, &mut avatar_resumed);
-                        avatar_due |= identities.as_ref().is_ok_and(|more| *more)
-                            || acquisition.as_ref().is_ok_and(|more| *more);
-                        if identities.is_err() || acquisition.is_err() {
-                            tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
-                                "avatar maintenance failed; retrying on the next tick");
-                        }
-                    }
-                    _ = local_submission_wakeups.changed() => { local_submission_due = true; }
-                    _ = tokio::time::sleep_until(local_submission_retry_at),
-                        if local_submission_due && (!local_submission_service_owed
-                            || (pending.is_empty() && commands.is_empty())) => {
-                        let retry = publish_next_local_submission(
-                            &mut client, &app, &shared, &events,
-                            &account_id_hex, &account_label,
-                        ).await;
-                        local_submission_service_owed = false;
-                        local_submission_due = retry.is_some();
-                        if let Some(delay) = retry {
-                            local_submission_retry_at = TokioInstant::now() + delay;
-                            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-                        }
-                    }
-                    result = presentation_wakeups.changed() => {
-                        if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
-                    }
-                    _ = tokio::task::yield_now(), if presentation_due => {
-                        if lifecycle.is_stopping() { continue 'worker; }
-                        avatar_due = true;
-                        presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
-                            Ok(more) => more,
-                            Err(_) => {
-                                tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
-                                    "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
-                                false
-                            }
-                        };
-                    }
-                    _ = attachment_admission.ready(), if attachment_admission.is_waiting() => {
-                        attachment_due = true;
-                    }
-                    _ = tokio::task::yield_now(), if attachment_due => {
-                        if lifecycle.is_stopping() { continue 'worker; }
-                        attachment_due = match attachments::schedule(&client, &shared, &media_http, &mut attachment_admission) {
-                            Ok(more) => more,
-                            Err(_) => {
-                                tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
-                                    "attachment maintenance failed; retrying on next wakeup or tick");
-                                false
-                            }
-                        };
-                    }
-                    // A comparison batch still being admitted takes its next turn as
-                    // soon as commands and live input have had theirs, instead of
-                    // waiting for unrelated input while it holds its recovery credit.
-                    () = admission_retry.wait() => { continue 'worker; }
-                    _ = tokio::task::yield_now(), if admission_retry.ready() && (native_progress || comparison_recovery.as_ref().is_some_and(|job| job.network.is_none() && job.admission.as_ref().is_some_and(|admission| admission.progressed))) => {
-                        continue 'worker;
-                    }
-                    _ = maintenance_tick.tick() => {
-                        local_submission_due = true;
-                        attachment_due = true;
-                        presentation_due = true;
-                        avatar_due = true;
-                        // Periodic maintenance is never urgent, and its longest leg
-                        // runs past the whole shutdown budget: the key-package
-                        // catch-up below is capped at 15s. Skip the tick outright once
-                        // shutdown is requested rather than starting work the drain
-                        // would then have to wait out.
-                        if lifecycle.is_stopping() {
-                            continue 'worker;
-                        }
-                        if comparison_recovery.is_some() {
-                            continue 'worker;
-                        }
-                        let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
-                        if client.backfill_content_reports().is_err() {
-                            tracing::warn!(
-                                target: "marmot_app::account_worker",
-                                method = "maintenance_tick",
-                                "report backfill deferred"
-                            );
-                        }
-                        run_legacy_message_promotion_batch(
-                            &client,
-                            &mut legacy_message_promotion,
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
                         );
-                        // Pairing timers, KeyPackage retries and link settlement.
-                        client.drive_device_pairing().await;
-                        if client.device_unlinked() {
-                            // Nothing more goes out; the next turn stops the worker.
-                            phase.finish(TelemetryOutcome::Success);
-                            continue 'worker;
-                        }
-                        attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
-                        attachments::spawn_legacy_migration(
-                            &client,
-                            &shared,
-                            &mut attachment_admission,
-                        );
-                        if client.key_package_maintenance_requires_catch_up() {
-                            let observation = shared.observer.product().begin(
-                                crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
-                            );
-                            let catch_up = timeout(
-                                Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
-                            ).await;
-                            let outcome = match &catch_up {
-                                Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
-                                Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
-                                Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
-                            };
-                            if let Some(observation) = observation {
-                                observation.finish(outcome.as_str());
-                            }
-                            if client.device_unlinked() {
-                                // The catch-up applied this device's removal:
-                                // nothing more goes out (D67).
-                                phase.finish(TelemetryOutcome::Success);
-                                continue 'worker;
-                            }
-                            match catch_up {
-                                Ok(Ok(summary)) => {
-                                    publish_app_runtime_summary_with_v5(&client,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        &summary,
-                                    );
-                                    start_post_join_history_after_visibility(
-                                        &mut client,
-                                        &summary,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                    )
-                                    .await;
-                                    publish_client_pending_projection_updates(
-                                        &mut client,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                    );
-                                    schedule_pending_convergence_groups(
-                                        &mut scheduled_convergence,
-                                        &mut client,
-                                    );
-                                }
-                                Ok(Err(failure)) => {
-                                    publish_sync_summary_with_audit(&client,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        &failure.partial_summary,
-                                        &shared,
-                                        "key_package_maintenance_catch_up",
-                                    );
-                                    start_post_join_history_after_visibility(
-                                        &mut client,
-                                        &failure.partial_summary,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                    )
-                                    .await;
-                                    publish_app_runtime_account_error(
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        account_error_message(
-                                            "key package maintenance catch-up failed",
-                                            &failure.source,
-                                        ),
-                                    );
-                                }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        target: "marmot_app::runtime",
-                                        method = "key_package_maintenance_catch_up",
-                                        "key package maintenance catch-up reached its time cap"
-                                    );
-                                }
-                            }
-                        }
-                        // A join window ends once T has been counted since its join
-                        // completed, which only time passing shows; the tick counts
-                        // it and notices joins that completed. Repair asks wait for
-                        // the same clock, and replies for their rank's slots.
-                        client.advance_push_join_windows().await;
-                        if client.has_due_push_announce() || client.has_due_push_repair() {
-                            scheduled_push_retry.observe_pending(true, &command_tx);
-                        }
                         scheduled_runtime_group_subscription_refresh.observe_pending(
                             client.has_pending_runtime_group_subscription_refresh(),
                             &command_tx,
                         );
-                        let backfill_armed = client.has_pending_epoch_backfill();
-                        let observation = backfill_armed.then(|| shared.observer.product().begin(
-                            crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
-                        )).flatten();
-                        let backfill_result = match start_pending_recovery_job(
-                            &mut client,
-                            &shared,
-                            EpochBackfillExecutionSeam::Maintenance,
-                        )
-                        .await
-                        {
-                            PendingRecoveryJob::Started {
-                                grant,
-                                execution,
-                                network,
-                            } => {
-                                comparison_recovery = Some(ComparisonRecoveryJob::new(
-                                    *grant,
-                                    execution,
-                                    network,
-                                    observation,
-                                    backfill_armed,
-                                    Some(phase),
-                                    ComparisonRecoveryOrigin::PeriodicMaintenance,
+                        if may_change_push_registration_work {
+                            scheduled_push_retry.observe_pending(
+                                client.has_pending_push_registration_work(),
+                                &command_tx,
+                            );
+                        }
+                    }
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
+                }
+            }
+            // A completed optional retry owes durable admission one turn once
+            // its finite command predecessors have drained. Keep the existing
+            // command/convergence alternation, including blocked predecessors.
+            _ = tokio::time::sleep_until(local_submission_retry_at),
+                if local_submission_service_owed && local_submission_due
+                    && pending.is_empty() && commands.is_empty()
+                    && !lifecycle.is_stopping() => {
+                // Recheck after polling the deadline: a buffered command may
+                // have arrived while the normal command arm was fairness-gated.
+                if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
+                let retry = publish_next_local_submission(
+                    &mut client, &app, &shared, &events,
+                    &account_id_hex, &account_label,
+                ).await;
+                local_submission_service_owed = false;
+                local_submission_due = retry.is_some();
+                if let Some(delay) = retry {
+                    local_submission_retry_at = TokioInstant::now() + delay;
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                }
+            }
+            _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
+                yield_to_convergence = false;
+                let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                let secondary_retry_yield = wait_for_local_submission_or_shutdown(
+                    app.clone(),
+                    account_label.clone(),
+                    shared.local_submission_gate(&account_id_hex),
+                    shared.local_submission_wakeups.subscribe(),
+                    lifecycle.subscribe_shutdown(),
+                ).boxed().shared();
+                let yield_observation = secondary_retry_yield.clone();
+                let mut phase = Some(shared.observer.performance().observe(RuntimeOp::WorkerConvergence));
+                // Recovery owns the live client, but member/roster reads can
+                // use the last committed snapshot while its relay I/O waits.
+                // Mutations retain worker FIFO order; reads use the snapshot.
+                let read_snapshot = capture_group_read_snapshot(
+                    &client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    "runtime scheduled convergence snapshot failed",
+                );
+                Box::pin(serve_snapshot_reads_until(
+                    read_snapshot,
+                    async {
+                        #[cfg(any(test, feature = "test-policy-overrides"))]
+                        if let Some(barrier) = shared.take_next_scheduled_convergence_barrier() {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                        match client.retry_pending_runtime_group_subscription_refresh().await {
+                            Ok(_) => {
+                                // Shutdown is safe here: no engine snapshot guard is live.
+                                if lifecycle.is_stopping() { return; }
+                                let progress = Arc::new(ProjectionPublicationProgress::new(
+                                    events.clone(), &account_id_hex, &account_label,
                                 ));
-                                continue 'worker;
+                                let progress_sink = progress.clone();
+                                let on_publication = Arc::new(move |update| {
+                                    progress_sink.publish(update);
+                                });
+                                let result = client.advance_convergence_with_projection_progress_and_yield(
+                                    &group_id, Some(on_publication), secondary_retry_yield,
+                                ).await;
+                                record_runtime_publication(
+                                    &client,
+                                    marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
+                                    None,
+                                    progress.take_publication(),
+                                );
+                                match result {
+                                    Ok(summary) => {
+                                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
+                                        // A pass that superseded one of this
+                                        // device's own commits reports it
+                                        // through the client's pending
+                                        // buffer; this arm is the only seam
+                                        // that can observe such a pass
+                                        // without a later command to drain
+                                        // it (mdk#1734).
+                                        publish_client_pending_projection_updates(
+                                            &mut client,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                        );
+                                        match client.convergence_schedule_state(&group_id) {
+                                            Ok(state) => scheduled_convergence
+                                                .schedule_after_pass(&group_id, state),
+                                            Err(err) => {
+                                                scheduled_convergence
+                                                    .schedule_retry_groups([group_id.clone()]);
+                                                publish_app_runtime_account_error(
+                                                    &events,
+                                                    &account_id_hex,
+                                                    &account_label,
+                                                    account_error_message(
+                                                        "convergence schedule state failed",
+                                                        &err,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        schedule_pending_convergence_groups(
+                                            &mut scheduled_convergence,
+                                            &mut client,
+                                        );
+                                        let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
+                                        // An existing comparison owns the one
+                                        // account lease. Keep this local pass
+                                        // complete and let that job settle the
+                                        // still-durable recovery debt.
+                                        let backfill_armed = client.has_pending_epoch_backfill();
+                                        let observation = backfill_armed.then(|| shared.observer.product().begin(
+                                            crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                                        )).flatten();
+                                        let backfill_result = if comparison_recovery.is_some() {
+                                            Ok(EpochBackfillRunOutcome::Deferred)
+                                        } else {
+                                            match start_pending_recovery_job(
+                                                &mut client,
+                                                &shared,
+                                                EpochBackfillExecutionSeam::Maintenance,
+                                            ).await {
+                                                PendingRecoveryJob::Started {
+                                                    grant, execution, network,
+                                                } => {
+                                                    comparison_recovery = Some(ComparisonRecoveryJob::new(
+                                                        *grant,
+                                                        execution,
+                                                        network,
+                                                        observation,
+                                                        backfill_armed,
+                                                        Some(phase.take().expect("scheduled phase exists")),
+                                                        ComparisonRecoveryOrigin::PostConvergence {
+                                                            audit_tracker_update,
+                                                        },
+                                                    ));
+                                                    return;
+                                                }
+                                                PendingRecoveryJob::Settled(result) => result,
+                                            }
+                                        };
+                                        let _ = report_pending_epoch_backfill_result(
+                                            &mut client,
+                                            backfill_result,
+                                            backfill_armed,
+                                            observation,
+                                            EpochBackfillReportContext {
+                                                events: &events,
+                                                account_id_hex: &account_id_hex,
+                                                account_label: &account_label,
+                                                shared: &shared,
+                                            },
+                                        ).await;
+                                        if audit_tracker_update {
+                                            shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let mut retry_groups = client.take_pending_convergence_groups();
+                                        retry_groups.push(group_id.clone());
+                                        scheduled_convergence.schedule_retry_groups(retry_groups);
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message("scheduled convergence failed", &err),
+                                        );
+                                        // A failure that spent the pass's budget
+                                        // parks it (mdk#2684); the next turn
+                                        // tells hosts to re-read the group.
+                                        if let Ok(parked) = client.convergence_pass_parked(&group_id) {
+                                            client.note_convergence_park(&group_id, parked);
+                                        }
+                                    }
+                                }
                             }
-                            PendingRecoveryJob::Settled(result) => result,
-                        };
-                        let _ = report_pending_epoch_backfill_result(
+                            Err(err) => {
+                                scheduled_convergence.schedule_retry_groups([group_id]);
+                                publish_app_runtime_account_error(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    account_error_message("scheduled convergence sync failed", &err),
+                                );
+                            }
+                        }
+                    },
+                    &mut commands,
+                    &mut pending,
+                    &app,
+                    &account_label,
+                ))
+                .await;
+                if yield_observation.peek().is_some() {
+                    local_submission_service_owed = true;
+                    // Never erase the ordinary drain's contention/completion
+                    // backoff merely because another optional pass yielded.
+                    if !local_submission_due {
+                        local_submission_due = true;
+                        local_submission_retry_at = TokioInstant::now();
+                    }
+                }
+                #[cfg(test)]
+                tests::secondary_retry_scheduler_tests::pass_tail(&account_id_hex).await;
+
+                if let Some(phase) = phase {
+                    phase.finish(TelemetryOutcome::Success);
+                }
+            }
+            changed = wait_for_replay_change(&mut replay_changes) => {
+                if !changed {
+                    replay_changes = None;
+                    continue 'worker;
+                }
+                if let Err(error) = client.synchronize_native_replay().await {
+                    publish_app_runtime_account_error(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        account_error_message("native replay synchronization failed", &error),
+                    );
+                }
+                publish_account_level_changes(
+                    &mut client, &events, &account_id_hex, &account_label,
+                );
+            }
+            received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
+                #[cfg(test)]
+                if let Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) = &received
+                    && let (Ok(event_id), Some(subscription_id)) = (
+                        <[u8; 32]>::try_from(delivery.message.id.as_slice()),
+                        delivery.source.subscription_id.as_ref(),
+                    )
+                {
+                    let drop_this = shared
+                        .ordinary_drop_once
+                        .lock()
+                        .unwrap()
+                        .take_if(|target| {
+                            target.account_label == account_label && target.event_id == event_id
+                        })
+                        .is_some();
+                    if drop_this {
+                        *shared.ordinary_drop_witness.lock().unwrap() =
+                            Some(subscription_id.clone());
+                        shared.ordinary_delivery_dropped.notify_one();
+                        continue 'worker;
+                    }
+                }
+                // Only the transport wait participates in `select!`. Once a
+                // delivery has been claimed, finish ingest + incidental
+                // publish + projection as one uncancelled worker operation;
+                // commands remain queued until that durable sequence lands.
+                let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
+                    .then(Instant::now);
+                let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
+                let result = match received {
+                    Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
+                        let ingested = client.ingest_received_delivery(*delivery).await;
+                        // Pairing messages arrive among the account's gift
+                        // wraps; answer them while the other device waits.
+                        client.drive_device_pairing().await;
+                        ingested
+                    }
+                    // receive_next_delivery persisted the loss. The owned
+                    // comparison job dispatched below recovers it off the
+                    // worker, never by replaying live subscriptions.
+                    Ok(transport_nostr::AccountDeliveryReceive::Overflow(_)) => {
+                        Ok(SyncSummary::default())
+                    }
+                    Err(err) => Err(err),
+                };
+                if result.is_err() && let Some(started) = delivery_started {
+                    shared.observer.performance().record(
+                        AppPerformanceOperation::InboundDeliveryProjection,
+                        started.elapsed(),
+                        false,
+                    );
+                }
+                receive_observation.finish_app(&result);
+                match result {
+                    Ok(summary) => {
+                        reconnect_backoff.reset();
+                        publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
+                        // An inline convergence pass on a delivered rival can
+                        // supersede one of this device's own commits; the
+                        // report waits in the client's pending buffer and this
+                        // arm has no later command to drain it (mdk#1734).
+                        publish_client_pending_projection_updates(
                             &mut client,
-                            backfill_result, backfill_armed,
-                            observation,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        if let Some(started) = delivery_started {
+                            shared.observer.performance().record(
+                                AppPerformanceOperation::InboundDeliveryProjection,
+                                started.elapsed(),
+                                true,
+                            );
+                        }
+                        if client.device_unlinked() {
+                            // Nothing more goes out; the next turn stops the worker.
+                            continue 'worker;
+                        }
+                        start_post_join_history_after_visibility(
+                            &mut client,
+                            &summary,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        )
+                        .await;
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                        if start_receive_recovery(
+                            &mut client,
+                            &mut comparison_recovery,
+                            &summary,
                             EpochBackfillReportContext {
                                 events: &events,
                                 account_id_hex: &account_id_hex,
                                 account_label: &account_label,
                                 shared: &shared,
                             },
-                        ).await;
-                        finish_periodic_maintenance_after_recovery(
+                        ).await {
+                            continue 'worker;
+                        }
+                        let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
+                        let retry_push_registration = !summary.joined_groups.is_empty();
+                        finish_receive_after_recovery(
                             &mut client,
+                            ReceiveTailContext {
+                                events: &events,
+                                account_id_hex: &account_id_hex,
+                                account_label: &account_label,
+                                shared: &shared,
+                                scheduled_push_retry: &mut scheduled_push_retry,
+                                command_tx: &command_tx,
+                            },
+                            audit_tracker_update, retry_push_registration,
+                        ).await;
+                    }
+                    Err(err) => {
+                        publish_app_runtime_account_error(
                             &events,
                             &account_id_hex,
                             &account_label,
-                            &shared,
-                            &product_backlog,
+                            account_error_message("runtime receive failed", &err),
+                        );
+                        if client.arm_failed_receive_projection_retry() {
+                            // Reopening cannot reconstruct consumed activity events
+                            // or the output of a batch awaiting its state checkpoint.
+                            // Keep the owning client for the bounded projection retry.
+                            scheduled_runtime_group_subscription_refresh.observe_pending(
+                                true, &command_tx,
+                            );
+                            continue 'worker;
+                        }
+                        // The account-session ownership guard is held by
+                        // `AppClient`. Destroy the failed engine before the
+                        // backoff as well as before hydrating its replacement;
+                        // this leaves room for a one-shot client during a
+                        // prolonged transport outage.
+                        let transport_account = client.adapter.account_id().clone();
+                        // Its turns need this client; the reopened one gets
+                        // a runner of its own.
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        drop(client);
+                        client = loop {
+                            let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
+                            let retry_started_at = Instant::now();
+                            let mut retry_delay =
+                                std::pin::pin!(sleep(reconnect_backoff.next_delay()));
+                            loop {
+                                tokio::select! {
+                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                    _ = &mut shutdown => break 'worker,
+                                    _ = &mut retry_delay => break,
+                                    command = commands.recv() => {
+                                        match command {
+                                            Some(
+                                                command @ (AccountWorkerCommand::CatchUp { .. }
+                                                | AccountWorkerCommand::ConnectivityRestored { .. }),
+                                            ) => {
+                                                // Host recovery commands are meaningful without
+                                                // an engine session: retain their responses and use
+                                                // them to end only this stale sleep. Coalesce an
+                                                // already queued burst into the same reopen attempt;
+                                                // new signals can still interrupt later sleeps, so
+                                                // extra attempts remain bounded by host signal rate
+                                                // while the network stays unavailable.
+                                                pending.push_back(command);
+                                                while let Ok(command) = commands.try_recv() {
+                                                    match command {
+                                                        command @ (AccountWorkerCommand::CatchUp { .. }
+                                                        | AccountWorkerCommand::ConnectivityRestored { .. }) => {
+                                                            pending.push_back(command);
+                                                        }
+                                                        AccountWorkerCommand::CaptureSelection { respond, .. } => {
+                                                            shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                                                        }
+                                                        AccountWorkerCommand::ApplySelection { respond, .. } => {
+                                                            shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                                                        }
+                                                        AccountWorkerCommand::DepartSelection { respond, .. } => {
+                                                            shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                                                        }
+                                                        AccountWorkerCommand::CaptureConversation { respond, queued, .. } => {
+                                                            if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
+                                                            let _ = respond.send(Err(ConversationWindowError::NotReady));
+                                                        }
+                                                        command => {
+                                                            shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            drop(command);
+                                                        },
+                                                    }
+                                                }
+                                                tracing::debug!(
+                                                    target: "marmot_app::runtime",
+                                                    method = "account_worker_reconnect",
+                                                    phase = "backoff_wait",
+                                                    outcome = "interrupted",
+                                                    elapsed_ms = u64::try_from(
+                                                        retry_started_at.elapsed().as_millis()
+                                                    )
+                                                    .unwrap_or(u64::MAX),
+                                                    "host recovery interrupted account worker reconnect backoff",
+                                                );
+                                                break;
+                                            }
+                                            Some(AccountWorkerCommand::CaptureSelection { respond, .. }) => {
+                                                shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                                            }
+                                            Some(AccountWorkerCommand::ApplySelection { respond, .. }) => {
+                                                shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                                            }
+                                            Some(AccountWorkerCommand::DepartSelection { respond, .. }) => {
+                                                shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                                            }
+                                            Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
+                                                if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
+                                                let _ = respond.send(Err(ConversationWindowError::NotReady));
+                                            }
+                                            // There is deliberately no engine
+                                            // session during this backoff.
+                                            // Poll the bounded channel and
+                                            // reject callers promptly by
+                                            // dropping their response sender
+                                            // instead of letting the queue fill
+                                            // until host-side timeouts fire.
+                                            Some(command) => {
+                                                shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                drop(command);
+                                            },
+                                            None => break 'worker,
+                                        }
+                                    }
+                                }
+                            }
+                            reconnect_wait.finish(TelemetryOutcome::Success);
+                            let reopen = shared.observer.performance().observe(RuntimeOp::WorkerReopen);
+                            let reopened_result = tokio::select! {
+                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                _ = &mut shutdown => break 'worker,
+                                result = async {
+                                    // The reopened session registers a new signer,
+                                    // so retire the previous session's SDK context.
+                                    relay_plane.retire_account_session_transport(&transport_account).await;
+                                    app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(), None).await
+                                } => result,
+                            };
+                            reopen.finish_app(&reopened_result);
+                            match reopened_result {
+                                Ok(mut reopened) => {
+                                    install_storage_telemetry(&reopened, shared.observer.performance());
+                                    reopened.runtime_telemetry = Some(shared.observer.performance().clone());
+                                    reopened.recovery_credits = shared.recovery_credit_pool();
+                                    #[cfg(test)]
+                                    {
+                                        reopened.test_recovery_selection_witness = shared
+                                            .recovery_selection_witness
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .and_then(|target| {
+                                                (target.account_label == account_label)
+                                                    .then(|| target.sink.clone())
+                                            });
+                                    }
+                                    // A reconnect open is deferred like the
+                                    // startup open; drain the hydration
+                                    // eagerly here — the steady-state loop
+                                    // below answers reads live and must not
+                                    // hand out not-hydrated errors after a
+                                    // mid-session reconnect (mdk#1161).
+                                    if let Err(err) = drain_deferred_hydration(&mut reopened).await
+                                    {
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message(
+                                                "runtime restart hydration failed",
+                                                &err,
+                                            ),
+                                        );
+                                        drop(reopened);
+                                        continue;
+                                    }
+                                    // Reconnect restores transport activation
+                                    // and subscriptions, then resumes the live
+                                    // receive tail. Do not block the command
+                                    // loop on a full catch-up; the maintenance
+                                    // path performs bounded repair syncs when
+                                    // required.
+                                    let telemetry = shared.observer.performance().clone();
+                                    let prepare_transport = tokio::select! {
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                                            reopened.finish_audit_recording();
+                                            break 'worker;
+                                        }
+                                        stop = &mut shutdown => {
+                                            if stop.is_ok() {
+                                                reopened.finish_audit_recording();
+                                            }
+                                            break 'worker;
+                                        }
+                                        result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
+                                    };
+                                    if let Err(transport_err) = prepare_transport {
+                                        publish_app_runtime_account_error(
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            account_error_message(
+                                                "runtime restart transport failed",
+                                                &transport_err,
+                                            ),
+                                        );
+                                        drop(reopened);
+                                        continue;
+                                    }
+                                    app.finish_client_open_network_maintenance(&mut reopened)
+                                        .await;
+                                    match reopened.drain_pending_session_events().await {
+                                        Ok(summary) => {
+                                            publish_app_runtime_summary_with_v5(&reopened,
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                &summary,
+                                            );
+                                            start_post_join_history_after_visibility(
+                                                &mut reopened,
+                                                &summary,
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                            )
+                                            .await;
+                                        }
+                                        Err(error) => {
+                                            publish_app_runtime_account_error(
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                account_error_message(
+                                                    "runtime restart queued-work wake failed",
+                                                    &error,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    // A reopen while the host's network
+                                    // stayed up gets no connectivity edge to
+                                    // release sends backed off by the outage
+                                    // that closed the old transport (mdk#2762).
+                                    wake_retained_sends_after_transport_start(
+                                        &mut reopened,
+                                        "reopen_retained_send_wake",
+                                    );
+                                    let pending = reopened
+                                        .retry_pending_push_registration_shares_best_effort()
+                                        .await;
+                                    scheduled_push_retry
+                                        .schedule_after_attempt(pending, &command_tx);
+                                    publish_client_pending_applied_summary(
+                                        &mut reopened,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                    );
+                                    break reopened;
+                                }
+                                Err(setup_err) => {
+                                    publish_app_runtime_account_error(
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        account_error_message("runtime restart failed", &setup_err),
+                                    );
+                                }
+                            }
+                        };
+                        replay_changes = client.adapter.replay_changes().await;
+                        recovery_runner = client.spawn_recovery_runner().await;
+                        recovery_catching_up =
+                            client.routing.subscribe_recovery_runner_catching_up();
+                        schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
-                        )
-                        .await;
-                        dispatch_history_blobs(&mut client, &media_http);
-
-                        phase.finish(TelemetryOutcome::Success);
+                            &mut client,
+                        );
+                        continue 'worker;
                     }
                 }
+            }
+            // An idle worker waits for the runner's next turn here; the
+            // loop's top serves one per pass while other work is ready.
+            turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                turn.serve(&mut client).await;
+            }
+            Ok(()) = recovery_catching_up.changed() => {
+                client.recovery_status_owed = true;
+                publish_account_level_changes(&mut client, &events, &account_id_hex, &account_label);
+            }
+            _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
+                avatar_due = false;
+                let identities = avatar_identities.run(&client, &account_id_hex);
+                let acquisition = schedule_avatar_acquisition(&client, &media_http, &mut avatar_resumed);
+                avatar_due |= identities.as_ref().is_ok_and(|more| *more)
+                    || acquisition.as_ref().is_ok_and(|more| *more);
+                if identities.is_err() || acquisition.is_err() {
+                    tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
+                        "avatar maintenance failed; retrying on the next tick");
+                }
+            }
+            _ = local_submission_wakeups.changed() => { local_submission_due = true; }
+            _ = tokio::time::sleep_until(local_submission_retry_at),
+                if local_submission_due && (!local_submission_service_owed
+                    || (pending.is_empty() && commands.is_empty())) => {
+                let retry = publish_next_local_submission(
+                    &mut client, &app, &shared, &events,
+                    &account_id_hex, &account_label,
+                ).await;
+                local_submission_service_owed = false;
+                local_submission_due = retry.is_some();
+                if let Some(delay) = retry {
+                    local_submission_retry_at = TokioInstant::now() + delay;
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                }
+            }
+            result = presentation_wakeups.changed() => {
+                if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
+            }
+            _ = tokio::task::yield_now(), if presentation_due => {
+                if lifecycle.is_stopping() { continue 'worker; }
+                avatar_due = true;
+                presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
+                    Ok(more) => more,
+                    Err(_) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
+                            "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
+                        false
+                    }
+                };
+            }
+            _ = attachment_admission.ready(), if attachment_admission.is_waiting() => {
+                attachment_due = true;
+            }
+            _ = tokio::task::yield_now(), if attachment_due => {
+                if lifecycle.is_stopping() { continue 'worker; }
+                attachment_due = match attachments::schedule(&client, &shared, &media_http, &mut attachment_admission) {
+                    Ok(more) => more,
+                    Err(_) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
+                            "attachment maintenance failed; retrying on next wakeup or tick");
+                        false
+                    }
+                };
+            }
+            // A comparison batch still being admitted takes its next turn as
+            // soon as commands and live input have had theirs, instead of
+            // waiting for unrelated input while it holds its recovery credit.
+            () = admission_retry.wait() => { continue 'worker; }
+            _ = tokio::task::yield_now(), if admission_retry.ready() && (native_progress || comparison_recovery.as_ref().is_some_and(|job| job.network.is_none() && job.admission.as_ref().is_some_and(|admission| admission.progressed))) => {
+                continue 'worker;
+            }
+            _ = maintenance_tick.tick() => {
+                local_submission_due = true;
+                attachment_due = true;
+                presentation_due = true;
+                avatar_due = true;
+                // Periodic maintenance is never urgent, and its longest leg
+                // runs past the whole shutdown budget: the key-package
+                // catch-up below is capped at 15s. Skip the tick outright once
+                // shutdown is requested rather than starting work the drain
+                // would then have to wait out.
+                if lifecycle.is_stopping() {
+                    continue 'worker;
+                }
+                if comparison_recovery.is_some() {
+                    continue 'worker;
+                }
+                let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
+                if client.backfill_content_reports().is_err() {
+                    tracing::warn!(
+                        target: "marmot_app::account_worker",
+                        method = "maintenance_tick",
+                        "report backfill deferred"
+                    );
+                }
+                run_legacy_message_promotion_batch(
+                    &client,
+                    &mut legacy_message_promotion,
+                );
+                // Pairing timers, KeyPackage retries and link settlement.
+                client.drive_device_pairing().await;
+                if client.device_unlinked() {
+                    // Nothing more goes out; the next turn stops the worker.
+                    phase.finish(TelemetryOutcome::Success);
+                    continue 'worker;
+                }
+                attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
+                attachments::spawn_legacy_migration(
+                    &client,
+                    &shared,
+                    &mut attachment_admission,
+                );
+                if client.key_package_maintenance_requires_catch_up() {
+                    let observation = shared.observer.product().begin(
+                        crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
+                    );
+                    let catch_up = timeout(
+                        Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
+                    ).await;
+                    let outcome = match &catch_up {
+                        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
+                        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
+                        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+                    };
+                    if let Some(observation) = observation {
+                        observation.finish(outcome.as_str());
+                    }
+                    if client.device_unlinked() {
+                        // The catch-up applied this device's removal:
+                        // nothing more goes out (D67).
+                        phase.finish(TelemetryOutcome::Success);
+                        continue 'worker;
+                    }
+                    match catch_up {
+                        Ok(Ok(summary)) => {
+                            publish_app_runtime_summary_with_v5(&client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &summary,
+                            );
+                            start_post_join_history_after_visibility(
+                                &mut client,
+                                &summary,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            )
+                            .await;
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            schedule_pending_convergence_groups(
+                                &mut scheduled_convergence,
+                                &mut client,
+                            );
+                        }
+                        Ok(Err(failure)) => {
+                            publish_sync_summary_with_audit(&client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &failure.partial_summary,
+                                &shared,
+                                "key_package_maintenance_catch_up",
+                            );
+                            start_post_join_history_after_visibility(
+                                &mut client,
+                                &failure.partial_summary,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            )
+                            .await;
+                            publish_app_runtime_account_error(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                account_error_message(
+                                    "key package maintenance catch-up failed",
+                                    &failure.source,
+                                ),
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app::runtime",
+                                method = "key_package_maintenance_catch_up",
+                                "key package maintenance catch-up reached its time cap"
+                            );
+                        }
+                    }
+                }
+                // A join window ends once T has been counted since its join
+                // completed, which only time passing shows; the tick counts
+                // it and notices joins that completed. Repair asks wait for
+                // the same clock, and replies for their rank's slots.
+                client.advance_push_join_windows().await;
+                if client.has_due_push_announce() || client.has_due_push_repair() {
+                    scheduled_push_retry.observe_pending(true, &command_tx);
+                }
+                scheduled_runtime_group_subscription_refresh.observe_pending(
+                    client.has_pending_runtime_group_subscription_refresh(),
+                    &command_tx,
+                );
+                let backfill_armed = client.has_pending_epoch_backfill();
+                let observation = backfill_armed.then(|| shared.observer.product().begin(
+                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                )).flatten();
+                let backfill_result = match start_pending_recovery_job(
+                    &mut client,
+                    &shared,
+                    EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                {
+                    PendingRecoveryJob::Started {
+                        grant,
+                        execution,
+                        network,
+                    } => {
+                        comparison_recovery = Some(ComparisonRecoveryJob::new(
+                            *grant,
+                            execution,
+                            network,
+                            observation,
+                            backfill_armed,
+                            Some(phase),
+                            ComparisonRecoveryOrigin::PeriodicMaintenance,
+                        ));
+                        continue 'worker;
+                    }
+                    PendingRecoveryJob::Settled(result) => result,
+                };
+                let _ = report_pending_epoch_backfill_result(
+                    &mut client,
+                    backfill_result, backfill_armed,
+                    observation,
+                    EpochBackfillReportContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                    },
+                ).await;
+                finish_periodic_maintenance_after_recovery(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                    &product_backlog,
+                    &mut scheduled_convergence,
+                )
+                .await;
+                dispatch_history_blobs(&mut client, &media_http);
+
+                phase.finish(TelemetryOutcome::Success);
+            }
+        }
     }
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
