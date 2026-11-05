@@ -5121,6 +5121,22 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         replaced: vec![None],
     })
     .unwrap();
+    app.start_small_state().unwrap();
+    store.lock().unwrap().execute_batch(
+        "INSERT INTO small_state_items(group_id_hex,item,version,change_id,flag,unsent,updated_at)
+         VALUES('bb','pin',7,x'01010101010101010101010101010101',1,0,1);"
+    ).unwrap();
+    let kept_items = app.small_state_items().unwrap();
+    assert_eq!(kept_items.len(), 1);
+    let kept_choice = app
+        .record_invitation_decision("bb", [4; 32], false)
+        .unwrap();
+    app.begin_small_state_broadcast(12, 7).unwrap();
+    app.mark_small_state_sent(&kept_items).unwrap();
+    app.mark_invitation_decisions_sent(std::slice::from_ref(&kept_choice))
+        .unwrap();
+    app.small_state_broadcast_request_sent().unwrap();
+    let kept_schedule = app.small_state_schedule().unwrap();
     store.lock().unwrap().execute_batch(
         "INSERT INTO private_key_packages_received VALUES ('unused','old-slot',1,999,x'01',1,NULL);
          INSERT INTO private_key_packages_received VALUES ('taken','old-slot',1,999,x'',1,2);
@@ -5176,6 +5192,14 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap(),
         2
     );
+    assert_eq!(app.small_state_items().unwrap(), kept_items);
+    assert_eq!(app.small_state_schedule().unwrap(), kept_schedule);
+    assert!(app.unsent_small_state_items().unwrap().is_empty());
+    assert_eq!(
+        app.invitation_decision("bb", &[4; 32]).unwrap().as_ref(),
+        Some(&kept_choice)
+    );
+    assert!(app.unsent_invitation_decisions().unwrap().is_empty());
     store
         .lock()
         .unwrap()
@@ -5222,7 +5246,17 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
     );
     let schedule = app.small_state_schedule().unwrap().unwrap();
     assert!(schedule.request_owed && schedule.answer_owed);
-    assert_eq!(schedule.broadcast_at, None);
+    assert_eq!(schedule.last_broadcast, None);
+    assert_eq!(app.small_state_items().unwrap(), kept_items);
+    assert_eq!(app.unsent_small_state_items().unwrap(), kept_items);
+    assert_eq!(
+        app.invitation_decision("bb", &[4; 32]).unwrap().as_ref(),
+        Some(&kept_choice)
+    );
+    assert_eq!(
+        app.unsent_invitation_decisions().unwrap(),
+        vec![kept_choice]
+    );
 
     // A selected removal's ordinary forget is not this reset. Nor is
     // forgetting an ordinary chat: neither may retire account-local debt.

@@ -478,10 +478,10 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         "the actual split copy must have no queued native work"
     );
 
-    // Actual fresh discovery supplies the existing sign-in row. It can
-    // later help convergence heal; the observation is about this current
-    // missing-link snapshot, never permanent disconnection.
-    published_key_package(&mut laptop.client, &relay).await;
+    // Read the authentic publication the relay already holds. Publishing
+    // anew while Laptop still trusts its split copy also announces the KP
+    // in a native group Commit, which can heal the split during pairing.
+    // Observation alone must not introduce that separate producer here.
     phone.client.check_sign_ins().await.unwrap();
     assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
     let sign_ins = phone.client.unrecognized_sign_ins().unwrap();
@@ -533,7 +533,13 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
 
     // A cancelled fresh comparison leaves needs-link; it never restores the
     // discarded copy. Publishing a new reference follows the ordinary owner.
-    published_key_package(&mut laptop.client, &relay).await;
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    let fresh = laptop.client.rotate_key_package().await.unwrap();
+    let fresh_ref = marmot_session::key_package_metadata(&fresh)
+        .unwrap()
+        .key_package_ref_hex;
+    assert_ne!(fresh_ref, used);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
     laptop.op(DeviceLinkOp::Start).await;
     let already_reset = laptop
         .client
@@ -573,6 +579,30 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         Some(used.as_str()),
         "fresh pairing must not name the installed KeyPackage"
     );
+    assert_eq!(
+        current
+            .current_key_package_ref
+            .as_ref()
+            .map(hex::encode)
+            .as_deref(),
+        Some(fresh_ref.as_str())
+    );
+    let private_init_present = laptop
+        .client
+        .runtime
+        .durably_owned_key_packages()
+        .unwrap()
+        .iter()
+        .any(|kp| {
+            marmot_session::key_package_metadata(kp)
+                .unwrap()
+                .key_package_ref_hex
+                == fresh_ref
+        });
+    assert!(
+        private_init_present,
+        "the fresh confirmed reference must still own its private OpenMLS bundle"
+    );
     let own_key = laptop.client.runtime.own_signature_key();
     let selected_members = phone.client.runtime.group_record(&group).unwrap().members;
     let old_leaf_present = selected_members
@@ -586,6 +616,16 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         !old_leaf_present,
         "ordinary fresh admission requires the approver not to retain the old signature key"
     );
+    let exact = phone
+        .client
+        .runtime
+        .own_account_leaf_claims(&group, &phone.roster(&group))
+        .unwrap();
+    assert!(
+        !exact.iter().any(|(key, _)| *key == own_key),
+        "the actual native tree must permit ordinary readmission"
+    );
+
     assert_eq!(
         link(&relay, &mut phone, &mut laptop, "Laptop repaired").await,
         group
