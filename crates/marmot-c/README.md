@@ -401,7 +401,7 @@ and relay-list lookups report the same status.
 
 Use `marmot_pending_welcome_deliveries` for the [shared Welcome delivery contract](../marmot-uniffi/README.md#undelivered-welcomes).
 It returns an owned `MarmotPendingWelcomeDeliveryList`; release the whole result with
-`marmot_pending_welcome_delivery_list_free`. In records and `MarmotEvent::WelcomeDeliveryPending`, read
+`marmot_pending_welcome_delivery_list_free`. In records and the `MARMOT_EVENT_WELCOME_DELIVERY_PENDING` payload, read
 `size_class` only when `has_size_class` is true; false means Unknown. The event payload layout changes, so
 rebuild against the matching header and library. Each list owns its strings; do not free individual fields.
 

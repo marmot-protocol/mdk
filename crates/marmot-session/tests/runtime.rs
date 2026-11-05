@@ -5273,6 +5273,30 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
         effects.welcome_failures[1].message_id
     );
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
+
+    // The startup API supplies no group context. Its failed attempt must
+    // recover that context from this same retained native Welcome, without
+    // manufacturing a new repair obligation or losing the remaining debt.
+    restarted_adapter.accept_next(0);
+    let groupless = runtime
+        .retry_welcome_messages_with_audit_context(
+            vec![outstanding_after_retry[0].1.clone()],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let [failure] = groupless.welcome_failures.as_slice() else {
+        panic!("one failed retained Welcome");
+    };
+    assert!(
+        failure.message_id == effects.welcome_failures[1].message_id,
+        "startup failure keeps its exact Welcome handle"
+    );
+    assert!(
+        failure.group_id.as_ref() == Some(&group_id),
+        "groupless startup retry must recover the stored Welcome group context"
+    );
+    assert_eq!(runtime.outstanding_welcome_deliveries().unwrap().len(), 1);
 }
 
 #[tokio::test]

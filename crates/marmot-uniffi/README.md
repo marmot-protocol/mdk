@@ -913,7 +913,7 @@ is a stable tag such as `not_group_admin`.
 
 ## Undelivered Welcomes
 
-An Add can already be confirmed while its Welcome cannot reach the recipient. Subscribe before creating or
+An Add can already be confirmed while its Welcome remains unacknowledged. Subscribe before creating or
 inviting, then use `pending_welcome_deliveries(account_ref)` to read the current repair handles. The
 `WelcomeDeliveryPending` event and each handle carry optional `size_class`: a coarse serialized-event size
 reported only for a proved all-target size refusal. It does not estimate any relay's configured limit.
