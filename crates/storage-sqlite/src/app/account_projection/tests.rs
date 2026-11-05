@@ -5077,6 +5077,112 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap(),
         1
     );
+
+    // D112: forgetting an ACTIVE trusted device group abandons its local
+    // device-sync preparations in this same transaction. Ordinary chat
+    // content, issued native keys and taken-reference tombstones survive.
+    let repair = cgka_traits::GroupId::new(vec![0xcc]);
+    store
+        .put_group(&crate::base::test_support::sample_group(
+            repair.clone(),
+            2,
+            1,
+        ))
+        .unwrap();
+    let app = store.app_storage();
+    assert!(
+        app.insert_device_group(&crate::DeviceGroupRecord {
+            group_id_hex: "cc".into(),
+            trust: crate::DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some("fresh".into()),
+            recorded_at: 1,
+        })
+        .unwrap()
+    );
+    app.trust_device_group(
+        "cc",
+        crate::DeviceGroupTrust::Creating,
+        crate::DeviceGroupTrust::Created,
+        None,
+        1,
+        &crate::FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    app.put_device_rename(&crate::DeviceRenameRecord {
+        slot_id_hex: "old-slot".into(),
+        label: "Old edit".into(),
+        settings: None,
+        written: vec![[1; 16]],
+        replaced: vec![None],
+    })
+    .unwrap();
+    store.lock().unwrap().execute_batch(
+        "INSERT INTO private_key_packages_received VALUES ('unused','old-slot',1,999,x'01',1,NULL);
+         INSERT INTO private_key_packages_received VALUES ('taken','old-slot',1,999,x'',1,2);
+         INSERT INTO cgka_private_key_packages VALUES (x'ff',1,x'01');
+         INSERT INTO private_key_package_requests VALUES ('old-slot',1,1);
+         CREATE TRIGGER fail_repair_forget BEFORE DELETE ON cgka_groups
+         WHEN OLD.id = x'cc' BEGIN SELECT RAISE(ABORT, 'repair forget failed'); END;"
+    ).unwrap();
+    assert_fails_with(
+        store.forget_group_local(&repair, cgka_traits::Timestamp(100)),
+        "repair forget failed",
+    );
+    assert_eq!(
+        app.device_group("cc").unwrap().unwrap().trust,
+        crate::DeviceGroupTrust::Created
+    );
+    assert!(store.get_group(&repair).is_ok());
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_repair_forget")
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&repair, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        app.device_renames().unwrap().is_empty(),
+        "explicit active-DG reset must retire the old rename intent"
+    );
+    let conn = store.lock().unwrap();
+    for (table, expected) in [
+        ("private_key_packages_received", 1),
+        ("private_key_package_requests", 0),
+        ("cgka_private_key_packages", 1),
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            expected,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT key_package_ref_hex FROM private_key_packages_received",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "taken"
+    );
+    drop(conn);
+    assert!(
+        store
+            .list_groups()
+            .unwrap()
+            .contains(&cgka_traits::GroupId::new(vec![0xbb]))
+    );
 }
 
 #[test]
