@@ -1040,7 +1040,7 @@ impl WritePolicy for RejectThenBlockGiftWraps {
                 return PolicyResult::Accept;
             }
             if self.rejecting.load(Ordering::SeqCst) {
-                return PolicyResult::Reject(self.1.into());
+                return PolicyResult::Reject("injected gift-wrap rejection".into());
             }
             if self.blocking.load(Ordering::SeqCst) {
                 self.entered.notify_one();
@@ -4168,6 +4168,7 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
     let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex;
     let bob_id = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice_id,
@@ -8003,6 +8004,7 @@ async fn accepted_disband_finishes_for_both_members_without_followup_commands() 
     let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex;
     let bob_id = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(&alice_id, "closure", std::slice::from_ref(&bob_id), None)
         .await
@@ -12918,6 +12920,7 @@ async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_rece
     };
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup).await;
+    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -14322,6 +14325,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     // there as well. Invitation resolution must not rely on the local cache.
     runtime.publish_key_package(&carol_id).await.unwrap();
 
+    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice_id,
@@ -16426,6 +16430,7 @@ async fn race_two_admin_profile_edits(
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice_id,
