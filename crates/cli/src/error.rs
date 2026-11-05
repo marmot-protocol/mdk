@@ -1066,19 +1066,35 @@ mod tests {
     #[test]
     fn secret_identity_errors_do_not_echo_nsec_material() {
         let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+        let identity = Some(nsec.to_owned());
         let cases = [
-            WnError::SecretArgumentRejected { command: "login" },
-            WnError::ConflictingSecretInput { command: "login" },
-            WnError::MissingStdinSecret { command: "login" },
-            WnError::InvalidStdinSecret {
-                command: "account create",
-            },
+            (
+                crate::validate_materialized_secret_identity("login", &identity, false)
+                    .expect_err("private argv is refused"),
+                "secret_argument_rejected",
+            ),
+            (
+                crate::read_identity_secret_input("login", &identity, true)
+                    .expect_err("conflicting private input is refused before reading stdin"),
+                "conflicting_secret_input",
+            ),
+            (
+                WnError::MissingStdinSecret { command: "login" },
+                "missing_stdin_secret",
+            ),
+            (
+                WnError::InvalidStdinSecret {
+                    command: "account create",
+                },
+                "invalid_stdin_secret",
+            ),
         ];
-        for err in cases {
+        for (err, code) in cases {
             let message = err.to_string();
             assert!(!message.contains(nsec), "{message}");
-            let json = wn_error_json(&err).to_string();
-            assert!(!json.contains(nsec), "{json}");
+            let json = wn_error_json(&err);
+            assert_eq!(json["code"], code);
+            assert!(!json.to_string().contains(nsec));
         }
     }
 
@@ -1112,10 +1128,82 @@ mod tests {
         let busy = wn_error_json(&WnError::App(AppError::AccountWorkerBusy));
         assert_eq!(busy["code"], "account_worker_busy");
         assert_eq!(busy["safe_to_retry"], true);
+        assert!(busy.get("completion_unknown").is_none());
 
         let timed_out = wn_error_json(&WnError::App(AppError::AccountWorkerResponseTimedOut));
         assert_eq!(timed_out["code"], "account_worker_response_timed_out");
         assert_eq!(timed_out["completion_unknown"], true);
+        assert!(timed_out.get("safe_to_retry").is_none());
+        assert_eq!(
+            timed_out["repair"]["action"],
+            "refresh authoritative state before retrying"
+        );
+    }
+
+    #[test]
+    fn retryable_group_gates_keep_group_context_and_delivery_guidance() {
+        let group_id = "ab".repeat(16);
+        let catching_up = wn_error_json(&WnError::App(AppError::GroupCatchingUp(group_id.clone())));
+        assert_eq!(catching_up["code"], "group_catching_up");
+        assert_eq!(catching_up["group_id"], group_id);
+        let undelivered = wn_error_json(&WnError::App(AppError::GroupCommitUndelivered(
+            group_id.clone(),
+        )));
+        assert_eq!(undelivered["code"], "group_commit_undelivered");
+        assert_eq!(undelivered["group_id"], group_id);
+        assert_eq!(
+            undelivered["next_commands"]["status"],
+            "wn groups commit-delivery <group-hex>"
+        );
+    }
+
+    #[test]
+    fn media_epoch_errors_distinguish_stale_from_unsettled_references() {
+        let stale = wn_error_json(&WnError::App(AppError::MediaReferenceStaleEpoch {
+            source_epoch: 7,
+            current_epoch: 11,
+        }));
+        assert_eq!(stale["code"], "media_reference_stale_epoch");
+        assert_eq!(stale["source_epoch"], 7);
+        assert_eq!(stale["current_epoch"], 11);
+        assert_eq!(
+            stale["repair"]["action"],
+            "wn media upload <group-hex> <file-path> [--send]"
+        );
+        let unsettled = wn_error_json(&WnError::App(AppError::MediaReferenceEpochUnsettled {
+            source_epoch: 13,
+        }));
+        assert_eq!(unsettled["code"], "media_reference_epoch_unsettled");
+        assert_eq!(unsettled["source_epoch"], 13);
+        assert!(unsettled.get("current_epoch").is_none());
+        assert_eq!(
+            unsettled["repair"]["action"],
+            "wn sync, then retry `wn media send`; if the group epoch advanced, `wn media upload <group-hex> <file-path> [--send]`"
+        );
+    }
+
+    #[test]
+    fn cursor_mismatch_errors_identify_the_matching_pair_of_flags() {
+        for (timestamp_flag, message_id_flag) in [
+            ("--before", "--before-message-id"),
+            ("--after", "--after-message-id"),
+        ] {
+            let error = wn_error_json(&WnError::MessagePaginationCursorMismatch {
+                timestamp_flag,
+                message_id_flag,
+            });
+            assert_eq!(error["code"], "message_pagination_cursor_mismatch");
+            assert_eq!(error["timestamp_flag"], timestamp_flag);
+            assert_eq!(error["message_id_flag"], message_id_flag);
+            assert_eq!(
+                error["repair"]["supply_both"],
+                format!("pass {timestamp_flag} and {message_id_flag} together")
+            );
+        }
+        assert_eq!(
+            wn_error_json(&WnError::MessagePaginationConflictingCursors)["code"],
+            "message_pagination_conflicting_cursors"
+        );
     }
 
     #[test]
