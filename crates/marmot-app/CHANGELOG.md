@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preserve configured Blossom server base paths for uploads, synthesized downloads and deletion.
+  Existing endpoints need no migration; explicit download locators and network contact policy are unchanged.
+
 - Invalid device-roster marker edits now return the additive Rust `AccountError::InvalidDeviceRosterEdit`,
   rather than an engine serialization error. Lower-level Rust callers matching those errors should adopt the
   new case. The privacy kind is `account_invalid_device_roster_edit`; the Protocol sync class, CLI `engine_error`
