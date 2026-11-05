@@ -84,7 +84,8 @@ pub enum MarmotEventFfi {
         group_id_hex: String,
         message_id_hex: String,
         recipient_hex: String,
-        /// None means Unknown. Query pending deliveries for later causes;
+        /// Observed size refusal, not non-delivery evidence; earlier legacy
+        /// exposure can be unknown. None means Unknown. Query for later causes;
         /// this notice remains once per process/Welcome.
         size_class: Option<crate::EventSizeClassFfi>,
     },

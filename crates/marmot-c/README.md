@@ -63,6 +63,8 @@ for each release.
 
 `MARMOT_STATUS_EVENT_TOO_LARGE` (119) reports the shared [size-refusal error](../marmot-uniffi/README.md#runtime-lifecycle-threads-and-errors).
 The last-error string contains only the coarse artifact and size class; C has no structured size-error payload.
+For a Welcome, status119 explains the observed attempt, not terminal delivery or proof of no earlier receipt.
+Keep native retry work and confirmed state, including when a crash or expired bookkeeping hides earlier exposure.
 
 ## Rules of the road
 

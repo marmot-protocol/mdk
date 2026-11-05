@@ -232,8 +232,10 @@ pub enum AppError {
     AgentStreamInvalidCandidate(String),
     #[error("publish failed: {0}")]
     Publish(String),
-    /// Every target conclusively refused this artifact for size. Coarse
-    /// metadata only; this is not an assertion about an unknown relay limit.
+    /// Every target refused this artifact for size on the observed attempt.
+    /// A legacy Welcome may have earlier exposure hidden by a crash or expired
+    /// bookkeeping. This proves neither non-delivery nor a terminal outcome;
+    /// keep native retry work and confirmed state. No relay limit is inferred.
     #[error("event too large: {artifact} ({size_class})")]
     EventTooLarge {
         artifact: crate::OversizedArtifact,
@@ -596,7 +598,8 @@ impl AppError {
         )
     }
 
-    /// The same proven size cause through the lower stack's actual wrappers.
+    /// The same observed size cause through the lower stack's actual wrappers.
+    /// For legacy Welcomes it does not rule out earlier exposure.
     /// Direct transport publications have no MLS semantic attribution.
     pub fn as_oversized_event(&self) -> Option<crate::OversizedEvent> {
         match self {

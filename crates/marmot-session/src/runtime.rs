@@ -6180,7 +6180,9 @@ where
         }
         // Diagnostic only: retain legacy publication's conservative exposure,
         // retry and rollback decisions below. Its coarse durable prior-attempt
-        // records cannot reconstruct a definitive earlier refusal.
+        // records cannot reconstruct a definitive earlier refusal. A crash
+        // before finish bookkeeping or expired records can hide an earlier
+        // exposure: this diagnosis explains the observed attempt, not delivery.
         let oversized = OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result);
         let report = match result {
             Ok(report) => report,
@@ -7118,7 +7120,9 @@ pub struct UndeliveredCommit {
 pub struct PublishFailure {
     pub message_id: cgka_traits::MessageId,
     pub reason: String,
-    /// Definitive all-target size refusal; absent for mixed or unknown outcomes.
+    /// All-target size refusal on the observed attempt; absent for mixed or
+    /// unknown outcomes. A legacy Welcome's earlier exposure can be unknown.
+    /// This is not evidence of delivery or non-delivery and never ends retry work.
     pub oversized: Option<OversizedEvent>,
 }
 
@@ -7148,8 +7152,11 @@ impl std::fmt::Display for OversizedArtifact {
     }
 }
 
-/// Privacy-safe explanation of a definitive size refusal, without exact sizes,
-/// identifiers, relay details, or an assertion about an unknown relay limit.
+/// Privacy-safe explanation of an observed all-target size refusal, without
+/// exact sizes, identifiers, relay details, or an inferred relay limit.
+/// Frozen fanouts retain their strong exposure proof. Legacy Welcomes explain
+/// the observed attempt: a crash or expired bookkeeping can hide earlier
+/// exposure, so this does not prove non-delivery or authorize ending retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OversizedEvent {
     pub artifact: OversizedArtifact,
@@ -7256,8 +7263,9 @@ pub struct WelcomeDeliveryFailure {
     /// best-effort.
     pub group_id: Option<GroupId>,
     pub reason: String,
-    /// Coarse size refusal when proved. An absent value means Unknown and is
-    /// evidence of neither delivery nor non-delivery.
+    /// Coarse size refusal on the observed attempt. A legacy Welcome's earlier
+    /// exposure can be unknown after a crash or expired bookkeeping. An absent
+    /// value means Unknown; neither value proves delivery or non-delivery.
     pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 

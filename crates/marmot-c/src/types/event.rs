@@ -309,7 +309,8 @@ pub enum MarmotEvent {
         group_id_hex: *mut c_char,
         message_id_hex: *mut c_char,
         recipient_hex: *mut c_char,
-        /// False means Unknown. Query pending deliveries for later causes;
+        /// Observed refusal, not delivery evidence; earlier legacy exposure can
+        /// be unknown. False means Unknown. Query for later causes;
         /// this notice remains once per process/Welcome.
         has_size_class: bool,
         /// Only meaningful when has_size_class is true.

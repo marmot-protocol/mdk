@@ -1567,7 +1567,8 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
         message_id_hex: String,
         recipient_hex: String,
-        /// Coarse size refusal when proved; None means Unknown. This notice
+        /// Coarse size refusal on the observed attempt; earlier legacy exposure
+        /// can be unknown. None means Unknown, not non-delivery. This notice
         /// stays once per process/Welcome; query pending deliveries for later causes.
         size_class: Option<cgka_traits::EventSizeClass>,
     },

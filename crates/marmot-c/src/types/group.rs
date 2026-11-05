@@ -48,7 +48,8 @@ impl Default for MarmotEventSizeClass {
 c_mirror! {
     /// A retained Welcome repair handle after an Add has already confirmed.
     /// Unknown includes legacy rows and later coarse retry outcomes; it does
-    /// not clear the debt. Requires the matching library and header.
+    /// not clear the debt. A class explains the observed refusal, not delivery:
+    /// earlier legacy exposure can be unknown. Requires the matching library and header.
     MarmotPendingWelcomeDelivery from marmot_uniffi::PendingWelcomeDeliveryFfi,
     list(MarmotPendingWelcomeDeliveryList, marmot_pending_welcome_delivery_list_free) {
         str group_id_hex,

@@ -20,6 +20,8 @@ use crate::errors::MarmotKitError;
 
 /// A retained repair handle for an already-confirmed Add. A missing size
 /// class means Unknown, including old rows or a later coarse legacy retry.
+/// A present class explains the observed refusal, not non-delivery: legacy
+/// bookkeeping may miss earlier exposure after a crash or record expiry.
 /// No annotation changes membership or ends the delivery obligation.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PendingWelcomeDeliveryFfi {

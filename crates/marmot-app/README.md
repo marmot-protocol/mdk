@@ -333,8 +333,10 @@ leave, clears the pending flag, and archives the local projection so normal chat
 
 For outbound Welcomes, canonical group creation or a confirmed Add can succeed while delivery fails. Subscribe to
 `WelcomeDeliveryPending` and read `pending_welcome_deliveries` for the retained repair handles. Their optional
-`size_class` reports only a proved all-target size refusal, without relay details or an assumed relay limit. Missing
-evidence means Unknown. A specific diagnosis may become Unknown after a coarse legacy retry, while the same delivery
+`size_class` explains an all-target size refusal on the observed attempt, without relay details or an assumed relay
+limit. A legacy Welcome can have earlier exposure hidden by a crash or expired bookkeeping: neither a present class
+nor Unknown proves delivery or non-delivery. This also applies to a Welcome `EventTooLarge` error; keep native retry
+work and confirmed state. A specific diagnosis may become Unknown after a coarse legacy retry, while the same delivery
 debt and membership remain. Notices remain once per process/Welcome; use the query or an explicit retry's error for
 later causes. Diagnosis storage is best effort and never owns retries, adds another member, or rolls back the Add.
 
