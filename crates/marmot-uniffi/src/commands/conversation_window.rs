@@ -325,11 +325,12 @@ mod tests {
             target
         );
         // Cancellation of next must not swallow a subsequent draft replacement.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), window.next())
-                .await
-                .is_err()
-        );
+        {
+            // The original Rust method polls the real receiver inline; dropping
+            // this pending wait leaves the next draft replacement available.
+            let mut waiting = Box::pin(window.next());
+            assert!(futures::poll!(&mut waiting).is_pending());
+        }
         let fresh = kit
             .save_message_draft_if_revision(
                 account.clone(),

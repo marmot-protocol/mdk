@@ -1846,7 +1846,8 @@ mod tests {
                 vec![0xaa; length]
             );
         }
-        assert!(welcome_id_bytes("xyz").is_err());
+        assert!(matches!(welcome_id_bytes("xyz"),
+            Err(MarmotKitError::InvalidHex { details }) if details == "invalid Welcome identifier"));
     }
 
     #[test]
@@ -1855,15 +1856,15 @@ mod tests {
             rejoin_token_bytes(&"aa".repeat(32)).unwrap(),
             vec![0xaa; 32]
         );
-        for invalid in [
-            String::new(),
-            "aa".repeat(16),
-            "aa".repeat(33),
-            "zz".repeat(32),
+        for (invalid, expected) in [
+            (String::new(), "rejoin token must contain 32 bytes"),
+            ("aa".repeat(16), "rejoin token must contain 32 bytes"),
+            ("aa".repeat(33), "rejoin token must contain 32 bytes"),
+            ("zz".repeat(32), "invalid rejoin token"),
         ] {
             assert!(matches!(
                 rejoin_token_bytes(&invalid),
-                Err(MarmotKitError::InvalidHex { .. })
+                Err(MarmotKitError::InvalidHex { details }) if details == expected
             ));
         }
     }

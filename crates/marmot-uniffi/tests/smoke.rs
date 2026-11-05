@@ -406,11 +406,26 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
         kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
         "Loyal Crane"
     );
-    let random = kit.random_profile_pseudonym();
-    assert!(
-        random.split_once(' ').is_some(),
-        "random pseudonym should be two words"
+    assert_eq!(
+        kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
+        marmot_app::default_profile_pseudonym(ACCOUNT_ID)
     );
+    let random = kit.random_profile_pseudonym();
+    let (adjective, noun) = random.split_once(' ').expect("adjective noun");
+    assert!(!noun.contains(' '));
+    assert!(
+        adjective
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+    );
+    assert!(
+        noun.chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+    );
+    assert!(adjective.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
+    assert!(noun.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
 }
 
 #[tokio::test]
@@ -482,7 +497,7 @@ async fn delete_group_local_binding_is_public_and_validates_group_hex() {
         .delete_group_local("alice".into(), "not-hex".into())
         .await
         .expect_err("invalid group hex should fail before local delete");
-    assert!(format!("{error}").contains("invalid hex"));
+    assert!(matches!(error, MarmotKitError::InvalidHex { .. }));
 }
 
 #[tokio::test]
@@ -502,7 +517,7 @@ async fn leave_group_binding_is_public_and_validates_group_hex() {
         .leave_group("alice".into(), "not-hex".into())
         .await
         .expect_err("invalid group hex should fail before the leave");
-    assert!(format!("{error}").contains("invalid hex"));
+    assert!(matches!(error, MarmotKitError::InvalidHex { .. }));
 
     let error = kit
         .leave_group("alice".into(), "11".repeat(16))
@@ -533,7 +548,8 @@ async fn group_image_binding_methods_are_public_and_validate_inputs() {
         .expect_err("empty image bytes should use the explicit clear method");
     assert!(matches!(
         empty_upload,
-        MarmotKitError::InvalidMediaReference { .. }
+        MarmotKitError::InvalidMediaReference { details }
+            if details == "group image cannot be empty; use clear_group_image to remove it"
     ));
 
     let upload_error = kit
@@ -545,13 +561,13 @@ async fn group_image_binding_methods_are_public_and_validate_inputs() {
         )
         .await
         .expect_err("invalid group hex should fail before upload");
-    assert!(format!("{upload_error}").contains("invalid hex"));
+    assert!(matches!(upload_error, MarmotKitError::InvalidHex { .. }));
 
     let clear_error = kit
         .clear_group_image("alice".into(), "not-hex".into())
         .await
         .expect_err("invalid group hex should fail before clear");
-    assert!(format!("{clear_error}").contains("invalid hex"));
+    assert!(matches!(clear_error, MarmotKitError::InvalidHex { .. }));
 }
 
 #[tokio::test]
@@ -568,13 +584,20 @@ async fn profile_image_upload_binding_is_public_and_requires_a_known_account() {
     let error = kit
         .upload_profile_image(
             "missing-account".into(),
-            vec![0x89, b'P', b'N', b'G'],
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 96,
+                96, 96, 248, 15, 0, 1, 4, 1, 0, 95, 229, 195, 75, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+                66, 96, 130,
+            ],
             "image/png".into(),
             None,
         )
         .await
         .expect_err("profile image upload must resolve the signing account");
-    assert!(format!("{error}").contains("account"));
+    assert!(
+        matches!(error, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing-account")
+    );
 }
 
 #[tokio::test]
@@ -648,25 +671,28 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         )
         .await
         .expect_err("invalid group hex should fail before sending");
-    assert!(format!("{send_error}").contains("invalid hex"));
+    assert!(matches!(send_error, MarmotKitError::InvalidHex { .. }));
 
     let singular_send_error = kit
         .send_media_reference("alice".into(), "not-hex".into(), reference.clone(), None)
         .await
         .expect_err("singular compatibility helper should validate group hex");
-    assert!(format!("{singular_send_error}").contains("invalid hex"));
+    assert!(matches!(
+        singular_send_error,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let build_error = kit
         .build_media_imeta_tag("alice".into(), "not-hex".into(), reference.clone())
         .await
         .expect_err("optimistic tag builder should validate group hex");
-    assert!(format!("{build_error}").contains("invalid hex"));
+    assert!(matches!(build_error, MarmotKitError::InvalidHex { .. }));
 
     let upload_error = kit
         .upload_media("alice".into(), "not-hex".into(), request)
         .await
         .expect_err("invalid group hex should fail before upload");
-    assert!(format!("{upload_error}").contains("invalid hex"));
+    assert!(matches!(upload_error, MarmotKitError::InvalidHex { .. }));
 
     let tag = MessageTagFfi {
         values: vec![
@@ -716,17 +742,17 @@ async fn relay_list_binding_methods_are_public() {
     .expect("open marmot kit");
     let relays = vec!["wss://relay.invalid.test".to_string()];
 
-    assert!(kit.account_nip65_relays("missing".into()).is_err());
-    assert!(kit.account_inbox_relays("missing".into()).is_err());
+    assert!(matches!(kit.account_nip65_relays("missing".into()),
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing"));
+    assert!(matches!(kit.account_inbox_relays("missing".into()),
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing"));
     assert!(
-        kit.set_account_nip65_relays("missing".into(), relays.clone(), relays.clone())
-            .await
-            .is_err()
+        matches!(kit.set_account_nip65_relays("missing".into(), relays.clone(), relays.clone()).await,
+            Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
     );
     assert!(
-        kit.set_account_inbox_relays("missing".into(), relays.clone(), relays)
-            .await
-            .is_err()
+        matches!(kit.set_account_inbox_relays("missing".into(), relays.clone(), relays).await,
+            Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
     );
 
     assert_eq!(kit.retired_relay_hosts(), vec!["relay.nostr.band"]);
@@ -761,33 +787,31 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
     )
     .expect("open marmot kit");
 
-    assert!(kit.notification_settings("missing".into()).is_err());
+    // Use a real valid server key so the missing-account guard is the
+    // intended contrast even if validation order changes in a later runtime.
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
+    assert!(matches!(kit.notification_settings("missing".into()),
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing"));
     assert!(
-        kit.set_local_notifications_enabled("missing".into(), true)
-            .is_err()
+        matches!(kit.set_local_notifications_enabled("missing".into(), true),
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
     );
     assert!(
-        kit.set_native_push_enabled("missing".into(), true)
-            .await
-            .is_err()
+        matches!(kit.set_native_push_enabled("missing".into(), true).await,
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
     );
-    assert!(kit.push_registration("missing".into()).is_err());
+    assert!(matches!(kit.push_registration("missing".into()),
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing"));
+    assert!(matches!(kit.upsert_push_registration(
+        "missing".into(), PushPlatformFfi::Fcm, "opaque-token".into(), server_pubkey, None,
+    ).await, Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing"));
     assert!(
-        kit.upsert_push_registration(
-            "missing".into(),
-            PushPlatformFfi::Fcm,
-            "opaque-token".into(),
-            "00aa".into(),
-            None,
-        )
-        .await
-        .is_err()
+        matches!(kit.clear_push_registration("missing".into()).await,
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
     );
-    assert!(kit.clear_push_registration("missing".into()).await.is_err());
     assert!(
-        kit.group_push_debug_info("missing".into(), "00aa".into())
-            .await
-            .is_err()
+        matches!(kit.group_push_debug_info("missing".into(), "00aa".into()).await,
+        Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
     );
 
     let collected = kit
@@ -803,11 +827,10 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
 
 #[tokio::test]
 async fn frozen_cursor_persistence_constructor_opens_and_collects() {
-    // The NSE construction surface: a per-push process
-    // opens the kit with the Frozen policy and runs a wake collection. The
-    // cursor semantics themselves are covered in marmot-app
-    // (`tests/cursor_persistence.rs`); the job here is to prove the FFI
-    // constructor + enum cross the boundary and drive the wake path.
+    // Exercise the public Frozen constructor, empty wake, shutdown and reopen.
+    // Effective cursor persistence is owned by marmot-app's
+    // tests/cursor_persistence.rs; an empty wake cannot distinguish a
+    // constructor that ignores the requested policy.
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit = Marmot::new_with_cursor_persistence(
@@ -1058,16 +1081,26 @@ async fn audit_log_binding_posts_tracker_update() {
     kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
         .await
         .expect("enable audit logs");
-    kit.set_audit_log_tracker_config(AuditLogTrackerConfigV4Ffi {
-        endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-        authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
-        source: AuditLogUploadSourceV4Ffi {
-            hardware_model: Some("iPhone17,3".to_owned()),
-            platform: Some("ios".to_owned()),
-            app_version: Some("2026.6.8".to_owned()),
-        },
-    })
-    .expect("configure audit tracker");
+    let returned = kit
+        .set_audit_log_tracker_config(AuditLogTrackerConfigV4Ffi {
+            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
+            source: AuditLogUploadSourceV4Ffi {
+                hardware_model: Some("iPhone17,3".to_owned()),
+                platform: Some("ios".to_owned()),
+                app_version: Some("2026.6.8".to_owned()),
+            },
+        })
+        .expect("configure audit tracker");
+    assert!(
+        returned.authorization_bearer_token.is_none(),
+        "tracker credentials are write-only"
+    );
+    assert_eq!(
+        returned.endpoint.as_deref(),
+        Some(format!("http://{addr}/api/v1/audit-logs/").as_str())
+    );
+    assert_eq!(returned.source.platform.as_deref(), Some("ios"));
 
     let result = kit
         .post_audit_log_tracker_update()
@@ -1113,11 +1146,16 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
     let missing_reaction_account = kit
         .message_reactions("missing".into(), "00aa".into(), "01".repeat(32))
         .expect_err("valid opaque MLS group should reach account lookup");
-    assert!(format!("{missing_reaction_account}").contains("missing"));
+    assert!(
+        matches!(missing_reaction_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
     let invalid_reaction_group = kit
         .message_reactions("missing".into(), String::new(), "01".repeat(32))
         .expect_err("empty group should fail before account lookup");
-    assert!(format!("{invalid_reaction_group}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_reaction_group,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let missing_account = kit
         .timeline_messages(
@@ -1128,7 +1166,9 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
             },
         )
         .expect_err("missing account should fail");
-    assert!(format!("{missing_account}").contains("missing"));
+    assert!(
+        matches!(missing_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 
     let invalid_group = kit
         .timeline_messages(
@@ -1140,7 +1180,7 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
             },
         )
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_group}").contains("invalid hex"));
+    assert!(matches!(invalid_group, MarmotKitError::InvalidHex { .. }));
 
     let invalid_cursor = kit
         .timeline_messages(
@@ -1153,7 +1193,7 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
             },
         )
         .expect_err("invalid cursor hex should fail before account lookup");
-    assert!(format!("{invalid_cursor}").contains("invalid hex"));
+    assert!(matches!(invalid_cursor, MarmotKitError::InvalidHex { .. }));
 
     let subscribe_error = match kit
         .subscribe_timeline_messages("missing".into(), None, Some(25))
@@ -1162,7 +1202,9 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
         Ok(_) => panic!("missing account subscription should fail"),
         Err(err) => err,
     };
-    assert!(format!("{subscribe_error}").contains("missing"));
+    assert!(
+        matches!(subscribe_error, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 }
 
 #[tokio::test]
@@ -1179,53 +1221,74 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
     let missing_account = kit
         .chat_list("missing".into(), false)
         .expect_err("missing account should fail");
-    assert!(format!("{missing_account}").contains("missing"));
+    assert!(
+        matches!(missing_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 
     let invalid_group = kit
         .initialize_chat_read_state("missing".into(), "not-hex".into())
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_group}").contains("invalid hex"));
+    assert!(matches!(invalid_group, MarmotKitError::InvalidHex { .. }));
 
     let invalid_message = kit
         .mark_timeline_message_read("missing".into(), "00aa".into(), "not-hex".into())
         .expect_err("invalid message hex should fail before account lookup");
-    assert!(format!("{invalid_message}").contains("invalid hex"));
+    assert!(matches!(invalid_message, MarmotKitError::InvalidHex { .. }));
 
     let invalid_manual_unread = kit
         .set_chat_manually_unread("missing".into(), "not-hex".into(), true)
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_manual_unread}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_manual_unread,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let invalid_mute_read = kit
         .chat_notification_settings("missing".into(), "not-hex".into())
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_mute_read}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_mute_read,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let invalid_mute_set = kit
         .set_chat_muted("missing".into(), "not-hex".into(), None)
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_mute_set}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_mute_set,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let invalid_mute_clear = kit
         .clear_chat_muted("missing".into(), "not-hex".into())
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_mute_clear}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_mute_clear,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let invalid_chat_list_row = kit
         .chat_list_row("missing".into(), "not-hex".into())
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_chat_list_row}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_chat_list_row,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     let missing_chat_list_row_account = kit
         .chat_list_row("missing".into(), "00aa".into())
         .expect_err("missing account should fail");
-    assert!(format!("{missing_chat_list_row_account}").contains("missing"));
+    assert!(
+        matches!(missing_chat_list_row_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 
     let subscribe_error = match kit.subscribe_chat_list("missing".into(), false).await {
         Ok(_) => panic!("missing account subscription should fail"),
         Err(err) => err,
     };
-    assert!(format!("{subscribe_error}").contains("missing"));
+    assert!(
+        matches!(subscribe_error, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 }
 
 #[test]
@@ -1252,7 +1315,9 @@ fn message_draft_binding_methods_are_public_and_validate_inputs() {
     let missing_account = kit
         .message_drafts("missing".into())
         .expect_err("missing account should fail");
-    assert!(format!("{missing_account}").contains("missing"));
+    assert!(
+        matches!(missing_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 
     for invalid_group in [
         kit.message_draft("missing".into(), "not-hex".into())
@@ -1268,7 +1333,7 @@ fn message_draft_binding_methods_are_public_and_validate_inputs() {
         kit.delete_message_draft("missing".into(), "not-hex".into()),
     ] {
         let error = invalid_group.expect_err("invalid group hex should fail before account lookup");
-        assert!(format!("{error}").contains("invalid hex"));
+        assert!(matches!(error, MarmotKitError::InvalidHex { .. }));
     }
 }
 
@@ -1290,7 +1355,7 @@ async fn message_history_binding_methods_validate_group_hex() {
     let invalid_group = kit
         .messages("missing".into(), Some("not-hex".into()), Some(25), None)
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_group}").contains("invalid hex"));
+    assert!(matches!(invalid_group, MarmotKitError::InvalidHex { .. }));
 
     let invalid_subscribe = match kit
         .subscribe_messages("missing".into(), Some("not-hex".into()), Some(25), None)
@@ -1299,7 +1364,10 @@ async fn message_history_binding_methods_validate_group_hex() {
         Ok(_) => panic!("invalid group hex subscription should fail"),
         Err(err) => err,
     };
-    assert!(format!("{invalid_subscribe}").contains("invalid hex"));
+    assert!(matches!(
+        invalid_subscribe,
+        MarmotKitError::InvalidHex { .. }
+    ));
 
     // Valid hex (even uppercase/whitespace-padded) gets past validation and
     // then fails on the missing account, proving the value was canonicalized
@@ -1307,7 +1375,9 @@ async fn message_history_binding_methods_validate_group_hex() {
     let missing_account = kit
         .messages("missing".into(), Some(" ABCD ".into()), Some(25), None)
         .expect_err("missing account should fail after hex validation");
-    assert!(format!("{missing_account}").contains("missing"));
+    assert!(
+        matches!(missing_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 
     // send_custom_event shares the group-hex-first validation order.
     let invalid_send = kit
@@ -1320,7 +1390,7 @@ async fn message_history_binding_methods_validate_group_hex() {
         )
         .await
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_send}").contains("invalid hex"));
+    assert!(matches!(invalid_send, MarmotKitError::InvalidHex { .. }));
 }
 
 #[tokio::test]
@@ -1341,7 +1411,7 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
         .retry_group_convergence("missing".into(), "not-hex".into())
         .await
         .expect_err("invalid group hex should fail before account lookup");
-    assert!(format!("{invalid_group}").contains("invalid hex"));
+    assert!(matches!(invalid_group, MarmotKitError::InvalidHex { .. }));
 
     // Valid hex gets past validation and then fails on the missing account,
     // proving the value was decoded rather than treated as an opaque string.
@@ -1349,7 +1419,9 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
         .retry_group_convergence("missing".into(), "ABCD".into())
         .await
         .expect_err("missing account should fail after hex validation");
-    assert!(format!("{missing_account}").contains("missing"));
+    assert!(
+        matches!(missing_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 }
 
 #[tokio::test]
@@ -1367,5 +1439,7 @@ async fn retention_sweep_binding_is_public_and_requires_a_known_account() {
         .sweep_expired_retention("missing".into(), 1_750_000_000_000)
         .await
         .expect_err("missing account should fail at the runtime boundary");
-    assert!(format!("{missing_account}").contains("missing"));
+    assert!(
+        matches!(missing_account, MarmotKitError::UnknownAccount { account_ref } if account_ref == "missing")
+    );
 }

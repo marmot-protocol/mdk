@@ -232,11 +232,10 @@ mod tests {
             first.items[0].state,
             AttachmentTransferStateFfi::Unavailable
         ));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
-                .await
-                .is_err()
-        );
+        {
+            let mut waiting = Box::pin(stream.next());
+            assert!(futures::poll!(&mut waiting).is_pending());
+        }
         stream.cancel();
         assert!(stream.next().await.unwrap().is_none());
         assert!(

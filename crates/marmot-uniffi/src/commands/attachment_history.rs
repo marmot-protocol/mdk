@@ -311,11 +311,11 @@ mod tests {
                 AttachmentPageReadFfi::InvalidLimit
             ));
         }
-        assert!(
+        assert!(matches!(
             kit.attachment_history_page(account.clone(), String::new(), 1, None)
-                .await
-                .is_err()
-        );
+                .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
         kit.send_media_attachments(
             account.clone(),
             group.clone(),
@@ -368,10 +368,9 @@ mod tests {
         assert!(fresh.entries.iter().all(|e| e.message_id_hex != deleted));
         upload_task.abort();
         kit.shutdown_and_close().await.unwrap();
-        assert!(
-            kit.attachment_history_page(account, group, 1, None)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            kit.attachment_history_page(account, group, 1, None).await,
+            Err(MarmotKitError::RuntimeStopping)
+        ));
     }
 }

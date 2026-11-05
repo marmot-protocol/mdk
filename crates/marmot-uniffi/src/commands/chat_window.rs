@@ -101,11 +101,9 @@ mod tests {
         assert!(initial.has_more_after);
         assert!(!initial.has_more_before);
         let mut pending = Box::pin(window.next());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut pending)
-                .await
-                .is_err()
-        );
+        // This direct Rust receive reaches the inline receiver on its first
+        // poll, while the independent command handle stays available.
+        assert!(futures::poll!(&mut pending).is_pending());
         let page = tokio::time::timeout(
             Duration::from_secs(5),
             window.page(initial.sequence, ChatListPageDirectionFfi::Forward, 1),
@@ -195,8 +193,9 @@ mod tests {
             .page(initial.sequence, ChatListPageDirectionFfi::Forward, 1)
             .await
             .unwrap();
-        // Give the runtime every chance to hand the update to the waiting call.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The receive annotation keeper separately rejects a spawned wrapper.
+        // This caller-polled receive gets no further poll before cancellation.
+        // The exact following sequence must therefore retain this page update.
         drop(waiting);
         let update = tokio::time::timeout(Duration::from_secs(5), window.__ffi_next())
             .await

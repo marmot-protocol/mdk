@@ -800,7 +800,6 @@ impl Marmot {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use marmot_account::AccountHome;
     use marmot_app::{AccountRelayListBootstrap, MarmotApp, npub_for_account_id};
@@ -950,11 +949,6 @@ mod tests {
             .await
             .expect("seed follow list");
 
-        // Kind-3 is replaceable at second granularity. Keep each update in a
-        // distinct timestamp so this test exercises deterministic relay state
-        // rather than the event-id tie-breaker.
-        tokio::time::sleep(Duration::from_millis(1_050)).await;
-
         let runtime = app.runtime();
         let kit = Marmot { app, runtime };
         let bob_npub = npub_for_account_id(&bob.account_id_hex).expect("bob npub");
@@ -980,8 +974,6 @@ mod tests {
             kit.is_following(alice.label.clone(), carol.account_id_hex.clone())
                 .expect("carol membership")
         );
-
-        tokio::time::sleep(Duration::from_millis(1_050)).await;
 
         let remaining = kit
             .unfollow_user(alice.label.clone(), bob_npub)

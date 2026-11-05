@@ -144,3 +144,71 @@ fn invalid_audit_otlp_config() -> MarmotKitError {
         details: "invalid audit OTLP sender configuration".to_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn audit_otlp_configuration_requires_enabled_fields_and_returns_write_only_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let app = marmot_app::MarmotApp::with_relay(root.path(), "wss://relay.example");
+        let kit = Marmot {
+            runtime: app.runtime(),
+            app,
+        };
+        let configured = AuditOtlpConfigV5Ffi {
+            enabled: true,
+            destination: Some("binding-audit".into()),
+            endpoint: Some("https://collector.example/v1/logs".into()),
+            authorization_bearer_token: Some("host-only-otlp-token".into()),
+            allow_loopback_dev: false,
+        };
+        let returned = kit.set_audit_otlp_config_v5(configured.clone()).unwrap();
+        assert!(returned.enabled);
+        assert_eq!(returned.destination.as_deref(), Some("binding-audit"));
+        assert_eq!(
+            returned.endpoint.as_deref(),
+            Some("https://collector.example/v1/logs")
+        );
+        assert!(!returned.allow_loopback_dev);
+        assert!(returned.authorization_bearer_token.is_none());
+        assert!(
+            !kit.audit_log_settings().unwrap().enabled,
+            "destination configuration does not opt into recording"
+        );
+
+        for missing in ["destination", "endpoint", "token"] {
+            let mut input = configured.clone();
+            match missing {
+                "destination" => input.destination = None,
+                "endpoint" => input.endpoint = None,
+                "token" => input.authorization_bearer_token = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    kit.set_audit_otlp_config_v5(input),
+                    Err(MarmotKitError::Runtime { details }) if details == "invalid audit OTLP sender configuration"
+                ),
+                "enabled configuration accepted missing {missing}"
+            );
+        }
+
+        // Disabled configuration has no active destination requirements, and
+        // still must not echo a supplied credential into the host result.
+        let disabled = kit
+            .set_audit_otlp_config_v5(AuditOtlpConfigV5Ffi {
+                enabled: false,
+                destination: None,
+                endpoint: Some("unused endpoint".into()),
+                authorization_bearer_token: Some("unused-disabled-token".into()),
+                allow_loopback_dev: false,
+            })
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert!(disabled.authorization_bearer_token.is_none());
+        assert!(!kit.audit_log_settings().unwrap().enabled);
+        kit.runtime.shutdown_and_close().await.unwrap();
+    }
+}
