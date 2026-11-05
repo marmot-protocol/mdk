@@ -856,19 +856,33 @@ mod tests {
 
     #[test]
     fn hostile_backtick_details_input_stays_bounded() {
+        // The malformed details fallback is ordinary paragraph text, just as
+        // in bridges_multiline_summary_and_fallback_preserves_text above.
+        let contains_text = |document: &MarkdownDocumentFfi, expected: &str| {
+            document.blocks.iter().any(|block| match block {
+                MarkdownBlockFfi::Paragraph { inlines } => inlines.iter().any(|inline|
+                    matches!(inline, MarkdownInlineFfi::Text { content } if content.contains(expected))),
+                _ => false,
+            })
+        };
         let ticks = "`".repeat(65_519 - "<details>\n\n</details>".len());
         let document = parse_markdown_document(&format!("<details>\n{ticks}\n</details>"));
         assert!(!document.truncated);
         let summary_ticks = "`".repeat(8_192);
-        let document =
-            parse_markdown_document(&format!("<details>\n<summary>{summary_ticks}\n</details>"));
+        let document = parse_markdown_document(&format!(
+            "<details>\n<summary>{summary_ticks}KEEP_UNTERMINATED_SUMMARY\n</details>"
+        ));
         assert!(!document.blocks.is_empty());
-        let mut many_lines = String::from("<details>\n<summary>\n");
+        assert!(contains_text(&document, "KEEP_UNTERMINATED_SUMMARY"));
+        let mut many_lines = String::from("<details>\n<summary>\nKEEP_OPEN_SUMMARY_START\n");
         for _ in 0..4_096 {
             many_lines.push_str("x\n");
         }
+        many_lines.push_str("KEEP_OPEN_SUMMARY_END");
         let document = parse_markdown_document(&many_lines);
         assert!(!document.blocks.is_empty());
+        assert!(contains_text(&document, "KEEP_OPEN_SUMMARY_START"));
+        assert!(contains_text(&document, "KEEP_OPEN_SUMMARY_END"));
     }
 
     #[test]

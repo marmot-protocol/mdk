@@ -254,6 +254,20 @@ mod tests {
         let full = ChatStoragePageFfi::new(vec![chat("aa", 9), chat("bb", 4)], 2);
         assert_eq!(full.chats.len(), 2);
         assert!(full.next_cursor.is_some());
+        assert_eq!(
+            full.next_cursor.as_ref().unwrap().inner,
+            chat("bb", 4).cursor()
+        );
+        assert_eq!(full.chats[0].group_id_hex, "aa");
+        assert_eq!(
+            (full.chats[0].bytes, full.chats[0].attachment_count),
+            (9, 1)
+        );
+        assert_eq!(full.chats[1].group_id_hex, "bb");
+        assert_eq!(
+            (full.chats[1].bytes, full.chats[1].attachment_count),
+            (4, 1)
+        );
         let short = ChatStoragePageFfi::new(vec![chat("cc", 1)], 2);
         assert!(short.next_cursor.is_none());
         let empty = RetainedAttachmentsPageFfi::new(Vec::new(), 2);

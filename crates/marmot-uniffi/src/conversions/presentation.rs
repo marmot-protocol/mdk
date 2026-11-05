@@ -265,3 +265,67 @@ impl From<app::PresentedChatListUpdate> for PresentedChatListUpdateFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_presentations_redact_text_and_references() {
+        let text = PresentationTextFfi::Literal {
+            text: "PRIVATE_TITLE".into(),
+        };
+        let avatar = SelectedAvatarFfi::RemoteImage {
+            url: "https://PRIVATE_HOST/avatar".into(),
+            cache_key: "PRIVATE_CACHE_KEY".into(),
+        };
+        let draft = ChatListDraftPreviewFfi {
+            text: "PRIVATE_DRAFT".into(),
+            text_truncated: false,
+            attachment_count: 1,
+            attachment_kind: Some(super::super::ChatListAttachmentKindFfi::Photo),
+        };
+        let version = PresentationVersionFfi {
+            account_store_epoch: vec![137, 211, 253],
+            revision: 1,
+        };
+        let snapshot = PresentedChatListSnapshotFfi {
+            rows: vec![],
+            presentation_version: version.clone(),
+        };
+        let values: Vec<Box<dyn std::fmt::Debug>> = vec![
+            Box::new(text.clone()),
+            Box::new(avatar.clone()),
+            Box::new(SelectedAvatarFfi::Placeholder {
+                stable_seed: "PRIVATE_SEED".into(),
+                source: PresentationSourceFfi::Group,
+            }),
+            Box::new(ConversationPresentationFfi {
+                title: text,
+                avatar,
+                title_source: PresentationSourceFfi::Group,
+                avatar_source: PresentationSourceFfi::Group,
+                peer_id: Some("PRIVATE_PEER".into()),
+                resolution: PresentationResolutionFfi::Cached,
+            }),
+            Box::new(draft.clone()),
+            Box::new(SelectedChatPreviewFfi::Draft { draft }),
+            Box::new(version),
+            Box::new(snapshot.clone()),
+            Box::new(PresentedChatListUpdateFfi {
+                subscription_generation: "PRIVATE_GENERATION".into(),
+                sequence: 1,
+                snapshot,
+            }),
+        ];
+        for value in values {
+            let formatted = format!("{value:?}");
+            for private in ["PRIVATE_", "137", "211", "253"] {
+                assert!(
+                    !formatted.contains(private),
+                    "presentation debug leaked {private}: {formatted}"
+                );
+            }
+        }
+    }
+}

@@ -1664,6 +1664,21 @@ impl NostrTransportAdapter {
         }
     }
 
+    /// Test hook: change `account_id`'s replay sources, as a new or retired
+    /// REQ would, so its wire generation advances.
+    #[cfg(feature = "test-support")]
+    pub async fn change_replay_sources_for_test(&self, account_id: &MemberId) {
+        if let Some(coverage) = self
+            .state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(account_id)
+        {
+            coverage.change_sources();
+        }
+    }
+
     /// Observe source changes and same-generation admission progress.
     pub async fn replay_changes(
         &self,
