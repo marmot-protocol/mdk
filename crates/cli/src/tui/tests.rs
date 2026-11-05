@@ -3544,10 +3544,237 @@ fn opening_a_chat_marks_it_read_and_clears_the_badge() {
 }
 
 #[test]
+fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(32);
+    for selected in [&account_b, &account_a] {
+        for pane_account in [&account_b, &account_a] {
+            for pane_group in [group.as_str(), "other-group"] {
+                for fails in [false, true] {
+                    let mut app = test_tui_app(test_unused_client(), &account_a);
+                    app.accounts.push(AccountRow {
+                        account_id: account_b.clone(),
+                        npub: "npub1bob".to_owned(),
+                        display_name: None,
+                        local_signing: true,
+                    });
+                    app.selected_account = usize::from(selected == &account_b);
+                    app.messages_account_id = Some(pane_account.clone());
+                    app.messages_group_id = Some(pane_group.to_owned());
+                    app.chats = vec![projected_chat(&group, "general", 5, Some(10))];
+                    app.status = "current context".to_owned();
+                    app.apply_effect_done(EffectDone {
+                        effect: Effect::MarkRead {
+                            account: account_a.clone(),
+                            group: group.clone(),
+                        },
+                        result: if fails {
+                            Err("read failed".to_owned())
+                        } else {
+                            Ok(vec![
+                                serde_json::json!({"unread_count":0,"has_unread":false}),
+                            ])
+                        },
+                    });
+                    let same_account = selected == &account_a;
+                    assert_eq!(
+                        app.chats[0].projection.unread_count,
+                        if same_account && !fails { 0 } else { 5 },
+                        "only the owning account's chat list receives the projection"
+                    );
+                    let retry = pane_account == &account_a && pane_group == group && fails;
+                    assert_eq!(
+                        app.pending_mark_read, retry,
+                        "an old failure must not schedule a read in the new pane"
+                    );
+                    assert_eq!(
+                        app.status,
+                        if retry {
+                            "mark-read failed: read failed"
+                        } else {
+                            "current context"
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn group_diagnostic_completions_belong_to_the_loaded_account_and_group() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(32);
+    for (pane_account, pane_group, applies) in [
+        (account_b.as_str(), group.as_str(), false),
+        (account_a.as_str(), "other-group", false),
+        (account_a.as_str(), group.as_str(), true),
+    ] {
+        for fails in [false, true] {
+            let mut app = test_tui_app(test_unused_client(), &account_b);
+            app.accounts.push(AccountRow {
+                account_id: account_a.clone(),
+                npub: "npub1alice".to_owned(),
+                display_name: None,
+                local_signing: true,
+            });
+            app.messages_account_id = Some(pane_account.to_owned());
+            app.messages_group_id = Some(pane_group.to_owned());
+            let previous = GroupDiagnostics::unavailable(pane_group, "current diagnostics");
+            app.group_diagnostics = Some(previous.clone());
+            app.apply_effect_done(EffectDone {
+                effect: Effect::GroupDiagnostics { account: account_a.clone(), group: group.clone() },
+                result: if fails { Err("diagnostics failed".to_owned()) } else {
+                    Ok(vec![serde_json::json!({"group":{"group_id":group},"mls":{"epoch":7,"member_count":2}})])
+                },
+            });
+            let actual = app.group_diagnostics.as_ref().expect("diagnostics");
+            if !applies {
+                assert_eq!(actual, &previous);
+            } else if fails {
+                assert_eq!(actual.error.as_deref(), Some("diagnostics failed"));
+            } else {
+                assert_eq!(actual.epoch, Some(7));
+            }
+        }
+    }
+}
+
+#[test]
+fn group_detail_completions_do_not_replace_a_new_accounts_same_group_view() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(32);
+    for selected in [&account_b, &account_a] {
+        for fails in [false, true] {
+            let mut app = test_tui_app(test_unused_client(), selected);
+            app.screen = Screen::GroupDetail;
+            app.loading_group_detail = Some(group.clone());
+            app.status = LOADING_GROUP_DETAIL_STATUS.to_owned();
+            app.apply_effect_done(EffectDone {
+                effect: Effect::LoadGroupDetail {
+                    account: account_a.clone(),
+                    group: group.clone(),
+                },
+                result: if fails {
+                    Err("detail failed".to_owned())
+                } else {
+                    Ok(vec![
+                        serde_json::json!({"members":[{"member_id":account_a,"npub":"npubself"}]}),
+                        serde_json::json!({"admins":[]}),
+                        serde_json::json!({"relays":[]}),
+                        serde_json::json!({"profile":{"name":"Account A detail"}}),
+                    ])
+                },
+            });
+            if selected == &account_b {
+                assert!(app.group_detail.is_none());
+                assert_eq!(app.status, LOADING_GROUP_DETAIL_STATUS);
+                assert_eq!(app.loading_group_detail.as_deref(), Some(group.as_str()));
+            } else if fails {
+                assert_eq!(app.status, "error: detail failed");
+            } else {
+                assert_eq!(
+                    app.group_detail.as_ref().expect("detail").name,
+                    "Account A detail"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn user_search_completions_preserve_a_new_accounts_identical_query() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    for selected in [&account_b, &account_a] {
+        for fails in [false, true] {
+            let mut app = test_tui_app(test_unused_client(), selected);
+            app.open_user_search(Some("alice".to_owned()));
+            app.apply_effect_done(EffectDone {
+                effect: Effect::UserSearch { account: account_a.clone(), query: "alice".to_owned() },
+                result: if fails { Err("search failed".to_owned()) } else { Ok(vec![
+                    serde_json::json!({"users":[{"account_id_hex":"dd","npub":"npubdd","radius":1,"matched_field":"name","match_quality":"exact"}]}),
+                    serde_json::json!({"follows":[{"account_id":"dd"}]}),
+                ]) },
+            });
+            let view = app.user_search.as_ref().expect("search view");
+            if selected == &account_b {
+                assert!(view.results.is_empty());
+                assert_eq!(app.status, "searching...");
+                assert_eq!(app.searching_users.as_deref(), Some("alice"));
+            } else {
+                assert!(app.searching_users.is_none());
+                if fails {
+                    assert_eq!(app.status, "error: search failed");
+                } else {
+                    assert_eq!(view.results.len(), 1);
+                    assert!(view.results[0].following);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn message_search_completions_preserve_a_new_panes_identical_query() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(32);
+    for (pane_account, pane_group, applies) in [
+        (account_b.as_str(), group.as_str(), false),
+        (account_a.as_str(), "other-group", false),
+        (account_a.as_str(), group.as_str(), true),
+    ] {
+        for fails in [false, true] {
+            // Selection may differ from the loaded pane after a failed refresh;
+            // message search deliberately resolves its account from that pane.
+            let mut app = test_tui_app(test_unused_client(), &account_b);
+            app.accounts.push(AccountRow {
+                account_id: account_a.clone(),
+                npub: "npub1alice".to_owned(),
+                display_name: None,
+                local_signing: true,
+            });
+            app.messages_account_id = Some(pane_account.to_owned());
+            app.messages_group_id = Some(pane_group.to_owned());
+            app.open_message_search(Some("hello".to_owned()))
+                .expect("open search");
+            app.apply_effect_done(EffectDone {
+                effect: Effect::MessageSearch { account: account_a.clone(), group: group.clone(), query: "hello".to_owned() },
+                result: if fails { Err("search failed".to_owned()) } else {
+                    Ok(vec![serde_json::json!({"messages":[{"message_id":"hit","direction":"received","from":"d","plaintext":"hello","timeline_at":1,"received_at":1}],"has_more_before":true})])
+                },
+            });
+            let view = app.message_search.as_ref().expect("search view");
+            if !applies {
+                assert!(view.results.is_empty());
+                assert_eq!(app.status, "searching...");
+                assert_eq!(app.searching_messages.as_deref(), Some("hello"));
+            } else {
+                assert!(app.searching_messages.is_none());
+                if fails {
+                    assert_eq!(app.status, "error: search failed");
+                } else {
+                    assert_eq!(view.results[0].message_id, "hit");
+                    assert!(view.truncated);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn mark_read_failure_keeps_the_badge_honest() {
     let account_id = "aa".repeat(32);
     let group_id = "bb".repeat(32);
     let mut app = test_tui_app(test_unused_client(), &account_id);
+    // Both production enqueue paths capture the loaded pane's account/group:
+    // tick reads these fields, and fold_load_timeline sets them before enqueue.
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
     app.chats = vec![ChatRow {
         group_id: group_id.clone(),
         name: "general".to_owned(),
@@ -6231,6 +6458,130 @@ fn apply_timeline_event_ignores_projection_for_other_group() {
         vec!["a"],
         "off-group changes are dropped"
     );
+}
+
+#[test]
+fn completed_sends_only_insert_into_the_originating_account_and_group() {
+    // #2956: both accounts can belong to the same MLS group. Resolve the real
+    // send/reply while A owns the pane, then deliver its synthetic completion
+    // after the pane has moved. Queue B's load before resolving the A send:
+    // the shared worker is FIFO, and #2441 leaves A's same-group pane active
+    // while B's load waits. B's load can therefore fold before this A send.
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(32);
+    for reply in [false, true] {
+        for completion in ["without-id", "with-id", "error"] {
+            for (pane_account, pane_group, same_pane) in [
+                (Some(account_b.as_str()), Some(group.as_str()), false),
+                (Some(account_a.as_str()), Some("other-group"), false),
+                (None, None, false),
+                (Some(account_a.as_str()), Some(group.as_str()), true),
+            ] {
+                let mut app = test_tui_app(test_unused_client(), &account_a);
+                app.accounts.push(AccountRow {
+                    account_id: account_b.clone(),
+                    npub: "npub1bob".to_owned(),
+                    display_name: None,
+                    local_signing: true,
+                });
+                app.messages_account_id = Some(account_a.clone());
+                app.messages_group_id = Some(group.clone());
+                app.timeline = vec![timeline_row("parent", 5)];
+                app.daemon.running = false;
+                let switches_account = pane_account == Some(account_b.as_str());
+                if switches_account {
+                    app.selected_account = 1;
+                    app.chats = vec![projected_chat(&group, "general", 0, Some(10))];
+                    app.begin_timeline_load(account_b.clone(), group.clone());
+                    assert_eq!(app.messages_account_id.as_deref(), Some(account_a.as_str()));
+                }
+                let effect = if reply {
+                    app.resolve_reply("hello".to_owned()).expect("reply for A")
+                } else {
+                    app.resolve_send_message("hello".to_owned())
+                        .expect("send for A")
+                };
+                if switches_account {
+                    app.apply_effect_done(EffectDone {
+                        effect: Effect::LoadTimeline {
+                            account: account_b.clone(),
+                            group: group.clone(),
+                        },
+                        result: Ok(vec![
+                            serde_json::json!({"messages":[],"has_more_before":false}),
+                        ]),
+                    });
+                    assert_eq!(app.messages_account_id.as_deref(), Some(account_b.as_str()));
+                    assert_eq!(app.messages_group_id.as_deref(), Some(group.as_str()));
+                }
+                // The matching-pane ID control deliberately keeps selection B:
+                // resolving an optimistic row is about the loaded pane. The
+                // legacy no-ID refresh uses the selected chat/account instead.
+                app.selected_account = usize::from(!same_pane || completion != "without-id");
+                if !switches_account {
+                    app.messages_account_id = pane_account.map(str::to_owned);
+                    app.messages_group_id = pane_group.map(str::to_owned);
+                }
+                app.chats = vec![projected_chat(
+                    pane_group.unwrap_or(&group),
+                    "general",
+                    0,
+                    Some(10),
+                )];
+                if !switches_account {
+                    app.timeline.clear();
+                }
+                let previous_len = app.timeline.len();
+
+                app.apply_effect_done(EffectDone {
+                    effect,
+                    result: match completion {
+                        "with-id" => Ok(vec![
+                            serde_json::json!({"published": 1, "message_ids": ["sent"]}),
+                        ]),
+                        "without-id" => Ok(vec![serde_json::json!({"published": 1})]),
+                        _ => Err("send failed".to_owned()),
+                    },
+                });
+
+                let inserts = same_pane && completion == "with-id";
+                assert_eq!(
+                    app.timeline.len(),
+                    previous_len + usize::from(inserts),
+                    "reply={reply}, completion={completion}, pane_account={pane_account:?}, pane_group={pane_group:?}"
+                );
+                assert_eq!(
+                    app.loading_chat.as_deref(),
+                    (same_pane && completion == "without-id").then_some(group.as_str()),
+                    "only a matching-pane no-ID completion may reload the timeline"
+                );
+                assert_eq!(
+                    app.status,
+                    if completion == "error" {
+                        "error: send failed"
+                    } else if reply {
+                        "sent reply; published=1"
+                    } else {
+                        "sent message; published=1"
+                    },
+                    "completed mutation outcomes remain visible after navigation"
+                );
+                if inserts {
+                    let row = &app.timeline[0];
+                    assert_eq!(row.message_id, "sent");
+                    assert_eq!(row.from, account_a);
+                    assert_eq!(row.display_text, "hello");
+                    assert_eq!(
+                        row.reply
+                            .as_ref()
+                            .map(|reply| reply.reply_to_message_id.as_str()),
+                        reply.then_some("parent")
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

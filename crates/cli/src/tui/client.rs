@@ -397,17 +397,21 @@ impl TuiApp {
             Effect::LoadTimeline { account, group } => {
                 self.fold_load_timeline(account, group, result);
             }
-            Effect::MarkRead { group, .. } => {
-                self.fold_mark_read(group, result);
+            Effect::MarkRead { account, group } => {
+                self.fold_mark_read(account, group, result);
             }
-            Effect::GroupDiagnostics { group, .. } => {
-                self.fold_group_diagnostics(group, result);
+            Effect::GroupDiagnostics { account, group } => {
+                self.fold_group_diagnostics(account, group, result);
             }
-            Effect::UserSearch { query, .. } => {
-                self.fold_user_search(query, result);
+            Effect::UserSearch { account, query } => {
+                self.fold_user_search(account, query, result);
             }
-            Effect::MessageSearch { query, .. } => {
-                self.fold_message_search(query, result);
+            Effect::MessageSearch {
+                account,
+                group,
+                query,
+            } => {
+                self.fold_message_search(account, group, query, result);
             }
             Effect::LoadGroupDetail { account, group } => {
                 self.fold_group_detail(account, group, result);
@@ -520,9 +524,9 @@ impl TuiApp {
     /// Fold a completed send/reply, exactly as the synchronous path did: report
     /// the publish status and, while the pane still shows the target chat, insert
     /// the optimistic row the timeline projection later upserts over by id. A row
-    /// for a chat the user has since left is dropped (the send still happened;
-    /// its group feed surfaces it on return). With no returned id, reload the
-    /// page like the synchronous path did.
+    /// for an account/chat the user has since left is dropped (the send still
+    /// happened; its group feed surfaces it on return). With no returned id,
+    /// reload the page like the synchronous path did.
     fn fold_optimistic_send(
         &mut self,
         account: String,
@@ -540,7 +544,9 @@ impl TuiApp {
             }
         };
         let status = publish_status(action, &result);
-        if self.messages_group_id.as_deref() == Some(group.as_str()) {
+        if self.messages_account_id.as_deref() == Some(account.as_str())
+            && self.messages_group_id.as_deref() == Some(group.as_str())
+        {
             if let Some(message_id) = result
                 .get("message_ids")
                 .and_then(Value::as_array)
@@ -1037,8 +1043,9 @@ impl TuiApp {
     }
 
     /// Fold a completed group-detail load. Dropped if a newer open superseded it
-    /// or the screen was left (`loading_group_detail` is cleared on leave, and
-    /// reloads of the same group keep it set so each reload still folds). The
+    /// or the selected account or screen changed (`loading_group_detail` is
+    /// cleared on leave, and reloads of the same group keep it set so each
+    /// reload still folds). The
     /// four results arrive in `calls()` order: members, admins, relays, show.
     fn fold_group_detail(
         &mut self,
@@ -1048,6 +1055,10 @@ impl TuiApp {
     ) {
         if self.loading_group_detail.as_deref() != Some(group.as_str())
             || !matches!(self.screen, Screen::GroupDetail)
+            || self
+                .selected_account_row()
+                .map(|row| row.account_id.as_str())
+                != Some(account.as_str())
         {
             return;
         }
@@ -1422,12 +1433,26 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Fold a message-search page into the view. Dropped unless its query is still
-    /// the outstanding one, so a superseded query or a left screen cannot
+    /// Fold a message-search page into its account/chat view. Dropped unless its
+    /// query and pane still match, so a superseded query or a left screen cannot
     /// repopulate the list. Landing hits moves focus into them, as user search
     /// does; an empty page leaves focus on the query so it can be edited.
-    fn fold_message_search(&mut self, query: String, result: Result<Vec<Value>, String>) {
-        if self.searching_messages.as_deref() != Some(query.as_str()) {
+    fn fold_message_search(
+        &mut self,
+        account: String,
+        group: String,
+        query: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.searching_messages.as_deref() != Some(query.as_str())
+            || self.messages_account_id.as_deref() != Some(account.as_str())
+            || self.messages_group_id.as_deref() != Some(group.as_str())
+            || self
+                .message_search
+                .as_ref()
+                .map(|view| view.group_id.as_str())
+                != Some(group.as_str())
+        {
             return;
         }
         self.searching_messages = None;
@@ -1490,10 +1515,20 @@ impl TuiApp {
     }
 
     /// Fold a completed user search into the view, dropping a result whose query
-    /// no longer matches the pending search (a newer query superseded it) or
-    /// whose screen has been left.
-    fn fold_user_search(&mut self, query: String, result: Result<Vec<Value>, String>) {
-        if self.searching_users.as_deref() != Some(query.as_str()) {
+    /// no longer matches the pending search (a newer query superseded it), whose
+    /// account is no longer selected, or whose screen has been left.
+    fn fold_user_search(
+        &mut self,
+        account: String,
+        query: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.searching_users.as_deref() != Some(query.as_str())
+            || self
+                .selected_account_row()
+                .map(|row| row.account_id.as_str())
+                != Some(account.as_str())
+        {
             return;
         }
         self.searching_users = None;
@@ -2325,28 +2360,55 @@ impl TuiApp {
     /// Fold a completed mark-read: apply the returned projection to the chat's
     /// row, clearing the badge. The runtime read marker is forward-only, so
     /// re-marking is idempotent. On failure the badge is left honest (never
-    /// zeroed locally) and the mark-read is re-armed for the next tick.
-    fn fold_mark_read(&mut self, group: String, result: Result<Vec<Value>, String>) {
+    /// zeroed locally) and the mark-read is re-armed only for the same loaded pane.
+    fn fold_mark_read(
+        &mut self,
+        account: String,
+        group: String,
+        result: Result<Vec<Value>, String>,
+    ) {
         match single_effect_value(result) {
             Ok(value) => {
-                fold_chat_projection(
-                    &mut self.chats,
-                    &mut self.selected_chat,
-                    &group,
-                    parse_chat_projection(&value),
-                );
+                // The list belongs to the selected account, even if its pane
+                // still shows an earlier account after a failed refresh. A read
+                // of another chat in this same account can still clear its row.
+                if self
+                    .selected_account_row()
+                    .map(|row| row.account_id.as_str())
+                    == Some(account.as_str())
+                {
+                    fold_chat_projection(
+                        &mut self.chats,
+                        &mut self.selected_chat,
+                        &group,
+                        parse_chat_projection(&value),
+                    );
+                }
             }
             Err(err) => {
-                self.pending_mark_read = true;
-                self.set_drain_status(format!("mark-read failed: {err}"));
+                // tick retries the loaded pane, so an old pane's failure must
+                // not schedule work or surface an error for its replacement.
+                if self.messages_account_id.as_deref() == Some(account.as_str())
+                    && self.messages_group_id.as_deref() == Some(group.as_str())
+                {
+                    self.pending_mark_read = true;
+                    self.set_drain_status(format!("mark-read failed: {err}"));
+                }
             }
         }
     }
 
     /// Fold group diagnostics for the loaded chat (the no-daemon fallback),
-    /// dropping the result if the pane has since moved to another group.
-    fn fold_group_diagnostics(&mut self, group: String, result: Result<Vec<Value>, String>) {
-        if self.messages_group_id.as_deref() != Some(group.as_str()) {
+    /// dropping the result if the pane has since moved to another account/chat.
+    fn fold_group_diagnostics(
+        &mut self,
+        account: String,
+        group: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.messages_account_id.as_deref() != Some(account.as_str())
+            || self.messages_group_id.as_deref() != Some(group.as_str())
+        {
             return;
         }
         self.group_diagnostics = Some(match single_effect_value(result) {
