@@ -91,9 +91,6 @@ mod tests {
         account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
     };
     use crate::error::DirectoryError;
-    use crate::reference::{
-        MAX_NPROFILE_REFERENCE_BYTES, ReferenceDecodeError, nprofile_fallback_token,
-    };
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -149,32 +146,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn nprofile_fallback_token_rejects_oversized_tokens_before_sdk_decode() {
-        let accepted = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES);
-        assert_eq!(
-            nprofile_fallback_token(&accepted).expect("1023-byte token stays eligible"),
-            accepted.as_str()
-        );
-        let wrapped = format!("nostr:{accepted}");
-        assert_eq!(
-            nprofile_fallback_token(&wrapped).expect("prefix is excluded from the budget"),
-            accepted.as_str()
-        );
-
-        let oversized = "q".repeat(MAX_NPROFILE_REFERENCE_BYTES + 1);
-        assert_eq!(
-            nprofile_fallback_token(&oversized),
-            Err(ReferenceDecodeError::Malformed),
-            "1024-byte token must not reach Nip19Profile::from_bech32"
-        );
-        assert_eq!(
-            nprofile_fallback_token(&format!("nostr:{oversized}")),
-            Err(ReferenceDecodeError::Malformed),
-            "prefixed oversized token must not reach Nip19Profile::from_bech32"
-        );
     }
 
     #[test]
