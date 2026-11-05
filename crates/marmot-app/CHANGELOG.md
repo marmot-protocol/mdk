@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add select all for the native chat-list views (mdk#2983): `MarmotAppRuntime::chat_list_ids(account, view)` returns
+  every chat ID in the view in display order, beyond any open window, and `revalidate_chat_list_ids(account, view,
+  ids)` returns the still-eligible subset in the caller's order, never adding chats. Pending base rows return
+  `ChatPresentationNotReady` instead of a partial list. No schema or wire change.
+
 - Keep uncertain sends pending for ordinary recovery when later SDK retries or an authentication fallback are
   refused; acknowledgements still succeed.
 

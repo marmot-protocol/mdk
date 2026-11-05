@@ -1,5 +1,4 @@
 use super::*;
-#[cfg(test)]
 use crate::SqliteAccountStorage;
 use rusqlite::params;
 
@@ -22,21 +21,13 @@ fn seed(
     .unwrap();
 }
 
-fn ids(store: &SqliteAppStorage, snapshot: &ChatListSelectionSnapshot) -> Vec<String> {
-    let count = store.chat_list_selection_count(snapshot).unwrap();
-    (0..count)
-        .step_by(50)
-        .flat_map(|offset| {
-            store
-                .chat_list_selection_page(snapshot, offset, 50)
-                .unwrap()
-        })
-        .collect()
+fn strings(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
 }
 
 #[test]
-fn complete_selection_is_independent_of_the_display_limit() {
-    for count in [0, 1, 49, 50, 51, 100, 101, 201, 500] {
+fn ids_cover_the_whole_view_past_the_display_limit() {
+    for count in [0, 1, 50, 51, 200, 201, 500] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let app = store.app_storage();
         for n in 0..count {
@@ -51,30 +42,15 @@ fn complete_selection_is_independent_of_the_display_limit() {
             })
             .unwrap();
         assert_eq!(display.rows.len(), count.min(50));
-        let selection = app
-            .chat_list_selection_snapshot(ChatListView::Chats)
-            .unwrap();
-        assert_eq!(app.chat_list_selection_count(&selection).unwrap(), count);
         assert_eq!(
-            ids(&app, &selection),
+            app.chat_list_ids(ChatListView::Chats).unwrap(),
             (0..count).map(|n| format!("{n:032x}")).collect::<Vec<_>>()
         );
-        assert!(
-            app.chat_list_selection_page(&selection, count, 200)
-                .unwrap()
-                .is_empty()
-        );
-        for (offset, limit) in [(0, 0), (0, 201), (count + 1, 1), (usize::MAX, 1)] {
-            assert!(matches!(
-                app.chat_list_selection_page(&selection, offset, limit),
-                Err(ChatListSelectionError::InvalidPage)
-            ));
-        }
     }
 }
 
 #[test]
-fn native_view_predicates_exclude_ineligible_ids() {
+fn ids_match_each_native_view_and_its_display_page() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     for (id, archive, membership, unread, pending) in [
         ("01", false, "member", 0, false),
@@ -86,20 +62,15 @@ fn native_view_predicates_exclude_ineligible_ids() {
     ] {
         seed(&store, id, archive, membership, unread, pending);
     }
+    let app = store.app_storage();
     for (view, expected) in [
         (ChatListView::Chats, vec!["01", "02", "06"]),
         (ChatListView::Unread, vec!["02"]),
         (ChatListView::Archived, vec!["03"]),
         (ChatListView::Left, vec!["04", "05"]),
     ] {
-        let selection = store
-            .app_storage()
-            .chat_list_selection_snapshot(view)
-            .unwrap();
-        assert_eq!(ids(&store.app_storage(), &selection), expected);
-        // A display page reads the same view.
-        let page = store
-            .app_storage()
+        assert_eq!(app.chat_list_ids(view).unwrap(), expected, "{view:?}");
+        let page = app
             .chat_list_page(crate::ChatListPageQuery {
                 view,
                 limit: 100,
@@ -119,113 +90,46 @@ fn native_view_predicates_exclude_ineligible_ids() {
 }
 
 #[test]
-fn frozen_intent_survives_reordering_and_revalidation_only_removes() {
+fn revalidation_only_removes_and_keeps_the_callers_order() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
-    for id in ["01", "02", "03"] {
+    for id in ["01", "02", "03", "04"] {
         seed(&store, id, false, "member", 1, false);
     }
-    let selection = app
-        .chat_list_selection_snapshot(ChatListView::Chats)
-        .unwrap();
-    seed(&store, "04", false, "member", 1, false);
-    store.lock().unwrap().execute_batch("UPDATE chat_list_rows SET activity_sort_at = 999 WHERE group_id_hex = '03'; UPDATE account_groups SET archived = 1 WHERE group_id_hex = '02'; DELETE FROM chat_list_rows WHERE group_id_hex = '01';").unwrap();
-    assert_eq!(ids(&app, &selection), ["01", "02", "03"]);
-    let validated = app.revalidate_chat_list_selection(&selection).unwrap();
-    assert_eq!(ids(&app, &validated), ["03"]);
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE account_groups SET archived = 0 WHERE group_id_hex = '02'",
-            [],
-        )
-        .unwrap();
+    let selected = strings(&["04", "03", "02", "01", "03", "unknown"]);
+    seed(&store, "05", false, "member", 1, false);
+    store.lock().unwrap().execute_batch("UPDATE chat_list_rows SET activity_sort_at = 999 WHERE group_id_hex = '01'; UPDATE account_groups SET archived = 1 WHERE group_id_hex = '02'; DELETE FROM chat_list_rows WHERE group_id_hex = '03';").unwrap();
     assert_eq!(
-        ids(
-            &app,
-            &app.revalidate_chat_list_selection(&validated).unwrap()
-        ),
-        ["03"]
+        app.revalidate_chat_list_ids(ChatListView::Chats, &selected)
+            .unwrap(),
+        ["04", "01"]
+    );
+    assert_eq!(
+        app.revalidate_chat_list_ids(ChatListView::Archived, &selected)
+            .unwrap(),
+        ["02"]
+    );
+    assert!(
+        app.revalidate_chat_list_ids(ChatListView::Chats, &[])
+            .unwrap()
+            .is_empty()
     );
 }
 
 #[test]
-fn incomplete_base_projection_never_claims_complete_selection() {
+fn pending_base_rows_return_not_ready_instead_of_a_partial_set() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     seed(&store, "01", false, "member", 0, false);
-    let selection = app
-        .chat_list_selection_snapshot(ChatListView::Chats)
-        .unwrap();
     store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('missing', '', 0)", []).unwrap();
     assert!(matches!(
-        app.chat_list_selection_snapshot(ChatListView::Chats),
+        app.chat_list_ids(ChatListView::Chats),
         Err(ChatListSelectionError::ProjectionNotReady)
     ));
     assert!(matches!(
-        app.revalidate_chat_list_selection(&selection),
+        app.revalidate_chat_list_ids(ChatListView::Chats, &strings(&["01"])),
         Err(ChatListSelectionError::ProjectionNotReady)
     ));
-    assert_eq!(app.chat_list_selection_count(&selection).unwrap(), 1);
-}
-
-#[test]
-fn foreign_reopened_and_closed_stores_cannot_use_old_intent() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("account.sqlite3");
-    let key = crate::SqlCipherKey::new("07".repeat(32)).unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    seed(&store, "01", false, "member", 0, false);
-    let selection = store
-        .app_storage()
-        .chat_list_selection_snapshot(ChatListView::Chats)
-        .unwrap();
-    assert_eq!(
-        store
-            .clone()
-            .app_storage()
-            .chat_list_selection_count(&selection)
-            .unwrap(),
-        1
-    );
-    let foreign = SqliteAccountStorage::in_memory().unwrap();
-    let epoch = selection.store_epoch.clone();
-    foreign
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE chat_presentation_meta SET store_epoch = ?1",
-            [epoch],
-        )
-        .unwrap();
-    assert!(matches!(
-        foreign.app_storage().chat_list_selection_count(&selection),
-        Err(ChatListSelectionError::StaleSelection)
-    ));
-    store.close().unwrap();
-    assert!(matches!(
-        store.app_storage().chat_list_selection_count(&selection),
-        Err(ChatListSelectionError::Storage(StorageError::Closed(_)))
-    ));
-    let reopened = SqliteAccountStorage::open_encrypted(&path, &key)
-        .unwrap()
-        .app_storage();
-    assert!(matches!(
-        reopened.chat_list_selection_count(&selection),
-        Err(ChatListSelectionError::StaleSelection)
-    ));
-    assert_eq!(
-        reopened
-            .chat_list_selection_count(
-                &reopened
-                    .chat_list_selection_snapshot(ChatListView::Chats)
-                    .unwrap()
-            )
-            .unwrap(),
-        1
-    );
-    assert!(!format!("{selection:?}").contains("01"));
 }
 
 #[test]
@@ -239,46 +143,15 @@ fn caller_transaction_is_preserved() {
         .execute_batch("BEGIN IMMEDIATE")
         .unwrap();
     seed(&store, "02", false, "member", 1, false);
-    let selection = app
-        .chat_list_selection_snapshot(ChatListView::Chats)
-        .unwrap();
-    assert_eq!(ids(&app, &selection), ["01", "02"]);
+    assert_eq!(
+        app.chat_list_ids(ChatListView::Chats).unwrap(),
+        ["01", "02"]
+    );
     assert!(!store.lock().unwrap().is_autocommit());
     store.lock().unwrap().execute_batch("ROLLBACK").unwrap();
     assert_eq!(
-        ids(
-            &app,
-            &app.revalidate_chat_list_selection(&selection).unwrap()
-        ),
+        app.revalidate_chat_list_ids(ChatListView::Chats, &strings(&["01", "02"]))
+            .unwrap(),
         ["01"]
     );
-}
-
-#[test]
-fn a_store_reset_makes_an_old_selection_stale() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    seed(&store, "01", false, "member", 0, false);
-    let selection = app
-        .chat_list_selection_snapshot(ChatListView::Chats)
-        .unwrap();
-    assert_eq!(app.chat_list_selection_count(&selection).unwrap(), 1);
-
-    store
-        .lock()
-        .unwrap()
-        .execute_batch("UPDATE chat_presentation_meta SET store_epoch = randomblob(16)")
-        .unwrap();
-    assert!(matches!(
-        app.chat_list_selection_count(&selection),
-        Err(ChatListSelectionError::StaleSelection)
-    ));
-    assert!(matches!(
-        app.chat_list_selection_page(&selection, 0, 1),
-        Err(ChatListSelectionError::StaleSelection)
-    ));
-    assert!(matches!(
-        app.revalidate_chat_list_selection(&selection),
-        Err(ChatListSelectionError::StaleSelection)
-    ));
 }

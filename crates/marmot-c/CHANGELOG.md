@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_chat_list_ids` and `marmot_revalidate_chat_list_ids` for select all over a whole chat-list view
+  (mdk#2983). Both return a `MarmotStringList`; free it with `marmot_string_list_free`. Additive.
+
 - Append `MARMOT_STATUS_EVENT_TOO_LARGE` (119) for conclusive shared size refusals. Use the matching header/library;
   the error text is coarse and no structured C payload or record layout changes.
 
