@@ -887,8 +887,8 @@ The group-event firehose distinguishes account-level timeline activity from
 `GroupMemberLeavesRemoved`. MDK applies their membership, pending-send and
 notification effects before host delivery; these events create no system row.
 Use them to refresh presentation, and handle the new variants when regenerating
-Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
-terminal-copy recovery through the managed scheduler.
+Swift/Kotlin bindings. Retained-history engine rollback does not automatically
+recover a local copy that has applied its own removal.
 
 ## Queued sends the group refuses
 
@@ -1062,6 +1062,17 @@ leaf-only and does not demote the account. A recorded Decline remains if a later
 a committed demotion remains if the following Leave fails. Already admitted native work retains its ordinary retry
 owner. A SelfRemove applied without readable sibling attribution establishes no new automatic-Add hold, and later
 repair does not promise to recover that attribution retroactively.
+
+A local chat copy that has applied its own removal stays terminal: later branch changes do not resume convergence
+on that copy. Rejoining requires a fresh valid Welcome that replaces its cryptographic state; an invitation alone is
+not a guarantee of recovery. The remaining members do not promise to recommit every removal forever. An admin's
+account-removal intent has at most two reissues, targeting members still in the selected membership. The rebuilt
+commit must pass the author's current admin-authority check when it is sent; otherwise the queued send is refused
+and retired. Device-removal cleanup has its own current-roster and remembered-key conditions. An eligible chat admin
+can remove a stale member account with `remove_members`, which removes every leaf of that account, including its
+active devices; it is not a per-device cleanup control. Removing a linked device is a separate device-group action.
+Automatic inactivity removal is not available yet. Keep showing the selected membership and removal outcome rather
+than assuming every branch has permanently removed a leaf.
 
 At the maximum decision version, an opposite invitation choice is refused and the held winner remains; ordinary User
 Leave still proceeds without writing another version. Retained invitation generations have no expiry or count cap:
