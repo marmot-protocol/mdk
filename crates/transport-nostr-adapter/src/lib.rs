@@ -1679,6 +1679,22 @@ impl NostrTransportAdapter {
         }
     }
 
+    /// Test hook: mark `account_id`'s replay admission as flushing, or not,
+    /// without waking replay observers — a pending flag that clears with no
+    /// progress signal.
+    #[cfg(feature = "test-support")]
+    pub async fn set_replay_flushing_for_test(&self, account_id: &MemberId, flushing: bool) {
+        if let Some(coverage) = self
+            .state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(account_id)
+        {
+            coverage.flushing = flushing;
+        }
+    }
+
     /// Observe source changes and same-generation admission progress.
     pub async fn replay_changes(
         &self,

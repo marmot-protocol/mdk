@@ -876,13 +876,16 @@ impl From<StorageError> for FreezeError {
 }
 
 /// Everything a native replay synchronization reads that can change between
-/// wakes: the adapter's source generation and its progress within it, the
-/// routing revision, and the durable recovery fence (loss, route and
-/// inventory revisions and every pending obligation's revision).
+/// wakes: the adapter's source generation and its progress within it, whether
+/// admission is still pending, the routing revision, and the durable recovery
+/// fence (loss, route and inventory revisions and every pending obligation's
+/// revision). Pending is kept on its own, so a pass that waited on admission
+/// runs again once it clears, even if nothing woke the progress count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeReplayPassInputs {
     generation: u64,
     progress: u64,
+    pending: bool,
     routing: u64,
     fence: storage_sqlite::RecoveryRevisionFence,
 }
@@ -914,6 +917,7 @@ impl AppClient {
         // A pass over the same inputs as the last unauthorized one would only
         // recompute the same coverage and rewrite the same checkpoint. An
         // unreadable fence never skips.
+        let pending = observation.pending || observation.spill_pending;
         let inputs = self
             .app
             .account_storage(&self.state.label)
@@ -922,6 +926,7 @@ impl AppClient {
             .map(|fence| NativeReplayPassInputs {
                 generation,
                 progress: observation.progress(),
+                pending,
                 routing: self.routing.recovery_revision(),
                 fence,
             });
@@ -942,10 +947,7 @@ impl AppClient {
         // source set (a new generation) or a retry of one that did not
         // authorize, each with or without admission still pending. Success
         // means it authorized the generation (mdk#2923).
-        let reason = match (
-            previous == Some(generation),
-            observation.pending || observation.spill_pending,
-        ) {
+        let reason = match (previous == Some(generation), pending) {
             (false, false) => crate::RuntimePerformanceOperation::ReplaySyncSourcesChanged,
             (false, true) => crate::RuntimePerformanceOperation::ReplaySyncSourcesChangedPending,
             (true, false) => crate::RuntimePerformanceOperation::ReplaySyncRetry,
@@ -2715,6 +2717,54 @@ mod tests {
             spans(Op::ReplaySyncRetry),
             (retries + 1, retry_successes + 1),
             "an authorized generation records nothing"
+        );
+    }
+
+    /// A pass that could not authorize only because admission was still
+    /// pending runs again once pending clears, even when nothing bumps the
+    /// adapter's progress count — the skip does not hold authorization back
+    /// for the five-minute recheck (mdk#2923). In production pending clears
+    /// silently when native ingress releases its last held event or a spill
+    /// settles; the test toggles `flushing` instead, which flips the same
+    /// flag with every other input held fixed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_held_by_pending_admission_reruns_once_it_clears() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.adapter.set_replay_flushing_for_test(true).await;
+        let held = client.adapter.replay_admission().await;
+        let (generation, progress) = (held.generation(), held.progress());
+        assert!(held.pending, "admission is held");
+        drop(held);
+        client.synchronize_native_replay().await.unwrap();
+        assert!(
+            !client.recovery_owner.native_replay_authorizes(generation),
+            "pending admission cannot authorize"
+        );
+        assert!(
+            client.recovery_owner.replay_unchanged.is_some(),
+            "the unauthorized pass is remembered"
+        );
+
+        client.adapter.set_replay_flushing_for_test(false).await;
+        let released = client.adapter.replay_admission().await;
+        assert!(!released.pending);
+        assert_eq!(
+            (released.generation(), released.progress()),
+            (generation, progress),
+            "nothing woke the progress count"
+        );
+        drop(released);
+        client.synchronize_native_replay().await.unwrap();
+        assert!(
+            client.recovery_owner.native_replay_authorizes(generation),
+            "the cleared pending runs the pass again and authorizes"
         );
     }
 

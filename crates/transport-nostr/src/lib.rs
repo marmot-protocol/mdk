@@ -3781,6 +3781,18 @@ impl MarmotRelayPlaneAccountAdapter {
             .await;
     }
 
+    /// Test hook: hold or release this account's replay admission as pending,
+    /// without waking replay observers.
+    #[cfg(feature = "test-support")]
+    pub async fn set_replay_flushing_for_test(&self, flushing: bool) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .set_replay_flushing_for_test(&self.account_id, flushing)
+            .await;
+    }
+
     /// Observe source revisions and admission progress without scheduling IO.
     #[doc(hidden)]
     pub async fn replay_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
