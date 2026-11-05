@@ -718,7 +718,8 @@ mod tests {
             optional_message_id_hex(Some(format!(" {} ", "AB".repeat(32)))).unwrap(),
             Some("ab".repeat(32))
         );
-        assert!(optional_message_id_hex(Some("abcd".into())).is_err());
+        assert!(matches!(optional_message_id_hex(Some("abcd".into())),
+            Err(MarmotKitError::InvalidHex { details }) if details == "expected 32-byte message id, got 2 bytes"));
     }
 
     #[test]
@@ -740,10 +741,12 @@ mod tests {
             Some("abcd".into())
         );
         // Invalid hex is rejected rather than silently yielding empty history.
-        assert!(optional_group_id_hex(Some("nothex".into())).is_err());
+        assert!(matches!(optional_group_id_hex(Some("nothex".into())),
+            Err(MarmotKitError::InvalidHex { details }) if details == "Invalid character 'n' at position 0"));
         // Absurdly large group ids are rejected at the FFI boundary instead of
         // allocating arbitrary host input.
-        assert!(optional_group_id_hex(Some("ab".repeat(1025))).is_err());
+        assert!(matches!(optional_group_id_hex(Some("ab".repeat(1025))),
+            Err(MarmotKitError::InvalidHex { details }) if details == "group id exceeds 1024 bytes"));
     }
 
     #[test]

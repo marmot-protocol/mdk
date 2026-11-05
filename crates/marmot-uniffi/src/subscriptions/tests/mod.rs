@@ -81,7 +81,21 @@ fn cached_conversion_reuses_unchanged_rows_and_never_serves_stale_content() {
         page(vec![record("m1", "edited **bold**"), record("m2", "world")]),
     );
     assert_eq!(third.messages[0].plaintext, "edited **bold**");
-    assert!(!third.messages[0].content_tokens.blocks.is_empty());
+    assert_eq!(
+        third.messages[0].content_tokens.blocks,
+        vec![crate::markdown::MarkdownBlockFfi::Paragraph {
+            inlines: vec![
+                crate::markdown::MarkdownInlineFfi::Text {
+                    content: "edited ".into()
+                },
+                crate::markdown::MarkdownInlineFfi::Strong {
+                    children: vec![crate::markdown::MarkdownInlineFfi::Text {
+                        content: "bold".into()
+                    }]
+                },
+            ],
+        }]
+    );
 
     // Rows that leave the window are pruned so the cache tracks the
     // window cap, not history.

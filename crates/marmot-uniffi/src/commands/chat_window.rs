@@ -101,11 +101,9 @@ mod tests {
         assert!(initial.has_more_after);
         assert!(!initial.has_more_before);
         let mut pending = Box::pin(window.next());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut pending)
-                .await
-                .is_err()
-        );
+        // This direct Rust receive reaches the inline receiver on its first
+        // poll, while the independent command handle stays available.
+        assert!(futures::poll!(&mut pending).is_pending());
         let page = tokio::time::timeout(
             Duration::from_secs(5),
             window.page(initial.sequence, ChatListPageDirectionFfi::Forward, 1),
@@ -195,14 +193,17 @@ mod tests {
             .page(initial.sequence, ChatListPageDirectionFfi::Forward, 1)
             .await
             .unwrap();
-        // Give the runtime every chance to hand the update to the waiting call.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The marker keeper checks the receive annotation. This wait gets
+        // no further caller poll before cancellation. A successful page reply
+        // follows publishing its update, so the next caller poll must see it.
         drop(waiting);
-        let update = tokio::time::timeout(Duration::from_secs(5), window.__ffi_next())
-            .await
-            .expect("the update outlives the cancelled wait")
-            .unwrap()
-            .unwrap();
+        let mut following = Box::pin(window.__ffi_next());
+        let update = match futures::poll!(&mut following) {
+            std::task::Poll::Ready(result) => result.unwrap().unwrap(),
+            std::task::Poll::Pending => {
+                panic!("acknowledged page is ready on the generated caller poll")
+            }
+        };
         assert_eq!(update.sequence, page.sequence);
         kit.runtime.shutdown_and_close().await.unwrap();
     }
