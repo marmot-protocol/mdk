@@ -282,7 +282,9 @@ enum MarmotStatus
    */
   MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118,
   /**
-   * Every current publish target conclusively refused the event for size.
+   * Every current publish target refused the event for size on the observed
+   * attempt. For legacy Welcomes, earlier exposure can be unknown: this is
+   * not proof of non-delivery or a terminal outcome. Keep native retry work.
    * Detail contains only the artifact kind and coarse locally measured size.
    */
   MARMOT_STATUS_EVENT_TOO_LARGE = 119,
@@ -2856,7 +2858,8 @@ typedef struct MarmotGroupCommitDelivery {
 /**
  * A retained Welcome repair handle after an Add has already confirmed.
  * Unknown includes legacy rows and later coarse retry outcomes; it does
- * not clear the debt. Requires the matching library and header.
+ * not clear the debt. A class explains the observed refusal, not delivery:
+ * earlier legacy exposure can be unknown. Requires the matching library and header.
  */
 typedef struct MarmotPendingWelcomeDelivery {
   char *group_id_hex;
@@ -6127,9 +6130,8 @@ typedef enum MarmotEvent_Tag {
   MARMOT_EVENT_ACCOUNT_ERROR,
   MARMOT_EVENT_AGENT_STREAM_ACTIVITY,
   /**
-   * A confirmed create/invite could not deliver a welcome to
-   * `recipient_hex`; that member is unjoinable until the welcome is
-   * re-delivered.
+   * A canonical create or confirmed Add still owes a Welcome to
+   * `recipient_hex`; pending does not prove whether the recipient received it.
    */
   MARMOT_EVENT_WELCOME_DELIVERY_PENDING,
   /**
@@ -6261,7 +6263,8 @@ typedef struct MarmotEvent_WelcomeDeliveryPending_Body {
   char *message_id_hex;
   char *recipient_hex;
   /**
-   * False means Unknown. Query pending deliveries for later causes;
+   * Observed refusal, not delivery evidence; earlier legacy exposure can
+   * be unknown. False means Unknown. Query for later causes;
    * this notice remains once per process/Welcome.
    */
   bool has_size_class;
