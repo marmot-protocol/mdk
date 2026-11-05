@@ -472,7 +472,7 @@ mod tests {
             !app.chat_list_projection_stale
                 .lock()
                 .unwrap()
-                .contains("alice")
+                .is_stale("alice")
         );
         runtime.shutdown_and_close().await.unwrap();
     }

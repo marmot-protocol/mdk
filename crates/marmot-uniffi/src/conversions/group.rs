@@ -824,14 +824,14 @@ mod group_roster_tests {
                 device_count: 2,
             }],
             epoch: 12,
-            roster_revision: 12,
+            roster_revision: 37,
             self_membership: SelfMembership::Removed,
             member_count: 1,
             lifecycle_state: AppGroupLifecycleState::Stable,
         };
         let ffi = group_roster_ffi(roster).expect("ffi roster");
         assert_eq!(ffi.epoch, 12);
-        assert_eq!(ffi.roster_revision, 12);
+        assert_eq!(ffi.roster_revision, 37);
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
         assert_eq!(ffi.members.len(), 1);
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));

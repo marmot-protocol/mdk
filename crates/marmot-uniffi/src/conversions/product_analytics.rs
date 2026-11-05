@@ -336,3 +336,40 @@ impl TryFrom<ProductEventFfi> for app::ProductEvent {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn product_event_rejects_duplicate_property_names() {
+        let property = |name: &str, value: &str| ProductEventPropertyFfi {
+            name: name.into(),
+            value: value.into(),
+        };
+        let event = app::ProductEvent::try_from(ProductEventFfi {
+            name: "finite_event".into(),
+            properties: vec![property("first", "one"), property("second", "two")],
+        })
+        .unwrap();
+        assert_eq!(event.name, "finite_event");
+        assert_eq!(event.properties.len(), 2);
+        assert_eq!(event.properties["first"], "one");
+        assert_eq!(event.properties["second"], "two");
+        // Equal values are duplicates too: neither last-write-wins nor
+        // deduplication may silently change a host observation.
+        for second in ["one", "different"] {
+            let result = app::ProductEvent::try_from(ProductEventFfi {
+                name: "finite_event".into(),
+                properties: vec![property("first", "one"), property("first", second)],
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::MarmotKitError::InvalidProductObservation)
+                ),
+                "duplicate property names must be rejected"
+            );
+        }
+    }
+}

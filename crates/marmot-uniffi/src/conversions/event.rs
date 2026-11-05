@@ -607,6 +607,76 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn convergence_state_events_preserve_context_and_commit_identity() {
+        let events = [
+            GroupEvent::GroupStateInvalidated {
+                group_id: GroupId::new(vec![0x11; 16]),
+                epoch: cgka_traits::EpochId(41),
+                invalidated_commit_id: MessageId::new(vec![0x22; 32]),
+                reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+            },
+            GroupEvent::GroupStateRevalidated {
+                group_id: GroupId::new(vec![0x11; 16]),
+                epoch: cgka_traits::EpochId(42),
+                revalidated_commit_id: MessageId::new(vec![0x33; 32]),
+            },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            let converted =
+                MarmotEventFfi::from(MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+                    account_id_hex: "aa".repeat(32),
+                    account_label: "alice".into(),
+                    event,
+                }));
+            let MarmotEventFfi::GroupEvent {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                event,
+            } = converted
+            else {
+                panic!("expected a group event")
+            };
+            assert_eq!(account_id_hex, "aa".repeat(32));
+            assert_eq!(account_label, "alice");
+            assert_eq!(group_id_hex, "11".repeat(16));
+            match (index, event) {
+                (
+                    0,
+                    GroupEventKindFfi::GroupStateInvalidated {
+                        epoch,
+                        invalidated_commit_id_hex,
+                        reason,
+                    },
+                ) => {
+                    assert_eq!(epoch, 41);
+                    assert_eq!(
+                        invalidated_commit_id_hex,
+                        "22".repeat(32),
+                        "invalidated commit identity"
+                    );
+                    assert_eq!(reason, "superseded_by_branch_selection");
+                }
+                (
+                    1,
+                    GroupEventKindFfi::GroupStateRevalidated {
+                        epoch,
+                        revalidated_commit_id_hex,
+                    },
+                ) => {
+                    assert_eq!(epoch, 42);
+                    assert_eq!(
+                        revalidated_commit_id_hex,
+                        "33".repeat(32),
+                        "revalidated commit identity"
+                    );
+                }
+                (_, other) => panic!("unexpected state event: {other:?}"),
+            }
+        }
+    }
+
     use cgka_traits::{GroupId, MessageId};
 
     use super::*;

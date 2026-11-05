@@ -116,6 +116,167 @@ fn wire(value: TimelineMessageRecordFfi) -> Vec<u8> {
 }
 #[test]
 fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
+    // Prime each row before changing exactly one visible source field. Cold
+    // conversion and cache equivalence are different binding contracts.
+    fn changed(
+        mut row: app::TimelineMessageRecord,
+        change: impl FnOnce(&mut app::TimelineMessageRecord),
+        expected: impl FnOnce(&TimelineMessageRecordFfi),
+    ) {
+        let mut cache = ConversationConversionCache::default();
+        cache.row(&row, false);
+        change(&mut row);
+        let actual = cache.row(&row, false);
+        expected(&actual);
+        assert_eq!(wire(actual), wire(presented_timeline(&row, false)));
+    }
+    // Replacement snapshots coalesce: the cache can miss a send's temporary
+    // local_publish_failed state and see pending -> peer-confirmed endpoints
+    // with the same absent invalidation status and source id.
+    let mut confirmed = record(0);
+    confirmed.direction = "sent".into();
+    changed(
+        confirmed,
+        |row| row.recipient_confirmed = true,
+        |row| {
+            assert!(
+                row.recipient_confirmed,
+                "recipient confirmation stayed stale"
+            )
+        },
+    );
+    // Already-sourced rows from before the retention migration have no
+    // pinned decision. Finalizing the same published send can learn disabled
+    // retention without changing its source, epoch, or timestamps.
+    let mut retention = record(0);
+    retention.direction = "sent".into();
+    retention.source_epoch = Some(7);
+    retention.source_message_id_hex = Some("22".repeat(32));
+    changed(
+        retention.clone(),
+        |row| row.retention_seconds = Some(0),
+        |row| {
+            assert_eq!(
+                row.retention_seconds,
+                Some(0),
+                "retention policy stayed stale"
+            );
+            assert_eq!(row.retention_expires_at, None);
+        },
+    );
+    // A finite decision pins policy and expiry together; a real producer
+    // does not independently repair an expiry once its policy is known.
+    changed(
+        retention,
+        |row| {
+            row.retention_seconds = Some(400);
+            row.retention_expires_at = Some(401);
+        },
+        |row| {
+            assert_eq!(row.retention_seconds, Some(400));
+            assert_eq!(row.retention_expires_at, Some(401));
+        },
+    );
+
+    let mut reply_row = record(0);
+    reply_row.reply_to_message_id_hex = Some("reply-source".into());
+    reply_row.tags = vec![vec!["q".into(), "reply-source".into()]];
+    changed(
+        reply_row,
+        |row| {
+            row.reply_preview = Some(app::TimelineReplyPreview {
+                message_id_hex: "reply-source".into(),
+                sender: "bob".into(),
+                plaintext: "visible reply **new**".into(),
+                kind: 9,
+                tags: vec![],
+                source_epoch: None,
+                media: None,
+                agent_text_stream: None,
+                deleted: false,
+                deletion_source: Default::default(),
+                invalidation_status: None,
+            })
+        },
+        |row| {
+            let preview = row
+                .reply_preview
+                .as_ref()
+                .expect("reply preview stayed stale");
+            assert_eq!(preview.message_id_hex, "reply-source");
+            assert_eq!(preview.plaintext, "visible reply **new**");
+        },
+    );
+
+    let mut poll_row = record(0);
+    poll_row.kind = 1068;
+    poll_row.plaintext = "Which?".into();
+    poll_row.tags = vec![
+        vec!["option".into(), "up".into(), "Up".into()],
+        vec!["option".into(), "down".into(), "Down".into()],
+        vec!["polltype".into(), "singlechoice".into()],
+    ];
+    poll_row.poll = Some(app::PollProjection {
+        question: "Which?".into(),
+        options: vec![
+            app::PollOptionResult {
+                id: "up".into(),
+                label: "Up".into(),
+                votes: 0,
+            },
+            app::PollOptionResult {
+                id: "down".into(),
+                label: "Down".into(),
+                votes: 0,
+            },
+        ],
+        poll_type: app::PollType::SingleChoice,
+        participants: 0,
+        local_selection: vec![],
+        creator: "alice".into(),
+        ends_at: None,
+        open: true,
+    });
+    changed(
+        poll_row,
+        |row| {
+            let poll = row.poll.as_mut().unwrap();
+            poll.options[0].votes = 1;
+            poll.participants = 1;
+            poll.local_selection = vec!["up".into()];
+        },
+        |row| {
+            let poll = row.poll.as_ref().unwrap();
+            assert_eq!(poll.participants, 1, "poll stayed stale");
+            assert_eq!(poll.options[0].votes, 1);
+            assert_eq!(poll.local_selection, ["up"]);
+        },
+    );
+
+    // An accepted edit can leave the displayed text unchanged (a no-op or
+    // reversion); its history metadata still has to advance.
+    let mut edited = record(0);
+    edited.edit = Some(app::TimelineEditSummary {
+        edit_count: 1,
+        latest_edit_message_id_hex: "edit-one".into(),
+        edited_at: 2,
+    });
+    changed(
+        edited,
+        |row| {
+            row.edit = Some(app::TimelineEditSummary {
+                edit_count: 2,
+                latest_edit_message_id_hex: "edit-two".into(),
+                edited_at: 3,
+            })
+        },
+        |row| {
+            let edit = row.edit.as_ref().unwrap();
+            assert_eq!(edit.edit_count, 2, "edit history stayed stale");
+            assert_eq!(edit.latest_edit_message_id_hex, "edit-two");
+            assert_eq!(edit.edited_at, 3);
+        },
+    );
     for size in [50, 200] {
         let mut cache = ConversationConversionCache::default();
         let mut rows: Vec<_> = (0..size).map(record).collect();
@@ -228,6 +389,7 @@ fn prepared_conversion_does_not_cache_stale_system_provenance() {
     assert_eq!(cache.parses, 1);
 }
 
+/// Manual timing only: `cargo nextest run -p marmot-uniffi --run-ignored only -E 'test(=conversions::conversation_window::conversion_cache_tests::bench_prepared_conversation_conversion)'`.
 #[test]
 #[ignore = "host conversion timing; excludes FFI serialization and native UI work"]
 fn bench_prepared_conversation_conversion() {

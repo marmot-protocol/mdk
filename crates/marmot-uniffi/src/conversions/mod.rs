@@ -82,6 +82,72 @@ pub use timeline::*;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redacting_attachment_and_avatar_records_hide_payloads() {
+        let status = AttachmentTransferStatusFfi {
+            reference: Some("PRIVATE_TRANSFER_REFERENCE".into()),
+            state: AttachmentTransferStateFfi::Ready,
+            attempt: 1,
+            received: 3,
+            total: Some(3),
+            retry_at: None,
+        };
+        let values: Vec<Box<dyn std::fmt::Debug>> = vec![
+            Box::new(AttachmentHandoffFfi {
+                lease: "PRIVATE_LEASE".into(),
+                path: "/PRIVATE_PATH/plaintext".into(),
+                byte_count: 3,
+                media_type: "PRIVATE_MEDIA_TYPE".into(),
+                file_name: "PRIVATE_FILE_NAME".into(),
+            }),
+            Box::new(AttachmentLocalTargetFfi {
+                message_id_hex: "PRIVATE_MESSAGE".into(),
+                source_message_id_hex: "PRIVATE_SOURCE".into(),
+                attachment_index: 0,
+            }),
+            Box::new(AttachmentLocalAssetFfi {
+                reference: Some("PRIVATE_ASSET".into()),
+                byte_count: 3,
+            }),
+            Box::new(AttachmentLocalBytesFfi {
+                available: true,
+                bytes: vec![137, 211, 253],
+            }),
+            Box::new(AvatarAssetFfi {
+                target: "PRIVATE_AVATAR_TARGET".into(),
+                reference: Some("PRIVATE_AVATAR_REFERENCE".into()),
+                availability: AvatarAvailabilityFfi::Ready,
+                acquisition: Some(AvatarAcquisitionStateFfi::Idle),
+                content_revision: 1,
+                byte_count: 3,
+            }),
+            Box::new(AvatarBytesFfi {
+                reference: "PRIVATE_AVATAR_REFERENCE".into(),
+                availability: AvatarAvailabilityFfi::Ready,
+                content_revision: 1,
+                byte_count: 3,
+                deferred: false,
+                bytes: vec![137, 211, 253],
+                media_type: Some("PRIVATE_MEDIA_TYPE".into()),
+                width: 1,
+                height: 1,
+            }),
+            Box::new(status.clone()),
+            Box::new(AttachmentTransferSnapshotFfi {
+                items: vec![status],
+            }),
+        ];
+        for value in values {
+            let formatted = format!("{value:?}");
+            for private in ["PRIVATE_", "137", "211", "253"] {
+                assert!(
+                    !formatted.contains(private),
+                    "redacting record leaked {private}: {formatted}"
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::markdown::{MarkdownBlockFfi, MarkdownDocumentFfi, MarkdownInlineFfi};
     use marmot_app::{
@@ -92,7 +158,16 @@ mod tests {
 
     #[test]
     fn count_conversion_saturates_instead_of_wrapping() {
-        assert_eq!(super::saturating_u32(usize::MAX), u32::MAX);
+        for (value, expected) in [
+            (0, 0),
+            (1, 1),
+            (u32::MAX as usize, u32::MAX),
+            (usize::MAX, u32::MAX),
+        ] {
+            assert_eq!(super::saturating_u32(value), expected);
+        }
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(super::saturating_u32(u32::MAX as usize + 1), u32::MAX);
     }
 
     fn group(admins: Vec<&str>) -> AppGroupRecordFfi {

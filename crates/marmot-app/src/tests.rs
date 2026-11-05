@@ -5247,7 +5247,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
         app.chat_list_projection_stale
             .lock()
             .unwrap()
-            .insert("alice".to_owned());
+            .invalidate("alice");
 
         relay.block_next_publish();
         let created = runtime
@@ -5285,7 +5285,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
             app.chat_list_projection_stale
                 .lock()
                 .unwrap()
-                .contains("alice"),
+                .is_stale("alice"),
             "create refreshes only its returned row and must preserve a pre-existing full-list rebuild obligation"
         );
         assert!(
@@ -12414,6 +12414,409 @@ async fn register_external_signer_requires_matching_external_account() {
     assert!(app.has_external_signer(&account.account_id_hex));
 }
 
+/// A checkpoint with nothing pending writes nothing and leaves the chat list
+/// warm; a moved transport cursor, a pending frontier clear or a cursor
+/// beyond the future skew still writes (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    client.runtime_telemetry = Some(telemetry.clone());
+    let skips = || {
+        let count = |op| {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == op)
+                .map_or(0, |snapshot| snapshot.completed)
+        };
+        (
+            count(crate::RuntimePerformanceOperation::ProjectionCheckpointSkipped),
+            count(crate::RuntimePerformanceOperation::ProjectionCheckpointSkippedInvalidated),
+        )
+    };
+    // A second connection to the account database sees every commit the
+    // client makes, as another process would.
+    let probe = {
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+    };
+    let data_version = |probe: &rusqlite::Connection| {
+        probe
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let store_future_cursor = |probe: &rusqlite::Connection| {
+        probe
+            .execute(
+                "UPDATE account_state SET last_transport_timestamp = ?1 WHERE label = 'alice'",
+                [i64::try_from(crate::unix_now_seconds() + 3_600).unwrap()],
+            )
+            .unwrap();
+    };
+    // Whether one save committed, and whether it left the chat list stale.
+    let save = |client: &mut crate::AppClient, probe: &rusqlite::Connection| {
+        {
+            let mut staleness = app.chat_list_projection_stale.lock().unwrap();
+            let generation = staleness.generation("alice");
+            staleness.record_rebuilt("alice", generation);
+        }
+        let before = data_version(probe);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        let stale = app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .is_stale("alice");
+        (data_version(probe) != before, stale)
+    };
+    // Settle whatever the open left pending.
+    save(&mut client, &probe);
+
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "nothing pending: no write"
+    );
+
+    client.checkpointed_transport_timestamp =
+        Some(client.checkpointed_transport_timestamp.unwrap_or(0) + 1);
+    assert_eq!(
+        save(&mut client, &probe),
+        (true, true),
+        "a moved transport cursor is persisted"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and saved only once"
+    );
+
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("aa".repeat(32), 1);
+    assert!(
+        save(&mut client, &probe).1,
+        "a pending frontier clear is persisted"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and cleared by that save"
+    );
+
+    // The clock moved back: a saved cursor beyond the allowed future skew
+    // still needs the save that clamps it, however often it repeats.
+    let future = Some(crate::unix_now_seconds() + 3_600);
+    client.checkpointed_transport_timestamp = future;
+    client.saved_transport_timestamp = future;
+    assert!(save(&mut client, &probe).1, "a future cursor is clamped");
+    assert!(
+        save(&mut client, &probe).1,
+        "on every save until it is in range"
+    );
+
+    // Another process stored a cursor the clock left in the future, while
+    // this client's own cursor is in range: the save still clamps it, and
+    // stops once the stored cursor is back in range.
+    let in_range = Some(crate::unix_now_seconds());
+    client.checkpointed_transport_timestamp = in_range;
+    client.saved_transport_timestamp = in_range;
+    store_future_cursor(&probe);
+    assert!(
+        save(&mut client, &probe).1,
+        "a stored future cursor is clamped"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and once in range, an empty save skips"
+    );
+
+    // A client with no cursor of its own cannot clamp a stored one: its save
+    // carries none and leaves the stored value as is. So a stored future
+    // cursor must not force a save that would only repeat.
+    client.checkpointed_transport_timestamp = None;
+    client.saved_transport_timestamp = None;
+    store_future_cursor(&probe);
+    // The first skip sees that foreign commit and only invalidates.
+    assert!(!save(&mut client, &probe).0, "a cursor-less client skips");
+    assert_eq!(save(&mut client, &probe), (false, false), "every time");
+
+    // Another runtime archives a chat. The skipped checkpoint still
+    // invalidates this runtime's chat list, as the save it replaces did, so
+    // the warmed list picks the change up; then the next skip does not.
+    let group_id = client
+        .create_group("archived elsewhere", &[])
+        .await
+        .unwrap();
+    save(&mut client, &probe);
+    assert_eq!(save(&mut client, &probe), (false, false), "settled");
+    let (skipped, invalidated) = skips();
+    let other = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    other
+        .set_group_archived("alice", &hex::encode(group_id.as_slice()), true)
+        .unwrap();
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "a foreign commit invalidates the chat list without a write"
+    );
+    assert_eq!(save(&mut client, &probe), (false, false), "only once");
+    assert_eq!(
+        skips(),
+        (skipped + 1, invalidated + 1),
+        "each skip counts as invalidating or not"
+    );
+
+    // A foreign commit can land before a reopened client's first
+    // checkpoint. That skip has no version to compare, so it invalidates
+    // too, and the warmed list shows the change.
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let archived = |app: &MarmotApp| {
+        app.chat_list("alice", true)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.group_id_hex == group_hex)
+            .map(|row| row.archived)
+    };
+    assert_eq!(archived(&app), Some(true), "the list is warm");
+    other
+        .set_group_archived("alice", &group_hex, false)
+        .unwrap();
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "the first skip after open invalidates without a write"
+    );
+    assert_eq!(
+        archived(&app),
+        Some(false),
+        "and the list picks the change up"
+    );
+
+    // A foreign commit right after a real save, before anything reads the
+    // version again, is still seen by the next skip: the save records the
+    // version from before it.
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("bb".repeat(32), 1);
+    let archiver = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let racing_group = group_hex.clone();
+    client.test_after_checkpoint_save = Some(Box::new(move || {
+        archiver
+            .set_group_archived("alice", &racing_group, true)
+            .unwrap();
+    }));
+    assert!(save(&mut client, &probe).1, "a real save");
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "a commit just after a save still invalidates the next skip"
+    );
+
+    // Creating a chat refreshes only its own row. A foreign commit before
+    // that save is not covered by it, so the creation's save compares
+    // versions and invalidates the list itself.
+    assert!(!save(&mut client, &probe).0, "settled");
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .set_group_archived("alice", &group_hex, false)
+        .unwrap();
+    {
+        let mut staleness = app.chat_list_projection_stale.lock().unwrap();
+        let generation = staleness.generation("alice");
+        staleness.record_rebuilt("alice", generation);
+    }
+    client.create_group("created after", &[]).await.unwrap();
+    assert!(
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .is_stale("alice"),
+        "a created-row save does not hide an earlier foreign commit"
+    );
+    assert_eq!(
+        archived(&app),
+        Some(false),
+        "and the list shows the other runtime's change"
+    );
+}
+
+/// An invalidation that lands while the chat list is being rebuilt is not
+/// cleared by that rebuild: the rebuild covers only the generation it
+/// snapshotted, so the next read rebuilds again. With checkpoints skipped
+/// on idle ticks, nothing else would re-mark it (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalidation_during_a_chat_list_refresh_survives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("refreshed", &[]).await.unwrap();
+    client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    app.chat_list("alice", true).unwrap();
+    let stale = |app: &MarmotApp| {
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .is_stale("alice")
+    };
+    assert!(!stale(&app), "warm and current");
+
+    app.invalidate_chat_list_projection("alice");
+    let during = app.clone();
+    crate::CHAT_LIST_REFRESH_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            during.invalidate_chat_list_projection("alice");
+        }));
+    });
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        stale(&app),
+        "the invalidation made during the rebuild survives it"
+    );
+
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .set_group_archived("alice", &hex::encode(group.as_slice()), true)
+        .unwrap();
+    let archived = app
+        .chat_list("alice", true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.group_id_hex == hex::encode(group.as_slice()))
+        .map(|row| row.archived);
+    assert_eq!(archived, Some(true), "so the next read rebuilds again");
+    assert!(!stale(&app), "and then the list is current");
+
+    // A refresh still running when the account's caches are evicted, and
+    // then invalidated up to the refresh's own snapshot, cannot mark the
+    // recreated account's list rebuilt: generations never go back.
+    app.invalidate_chat_list_projection("alice");
+    let snapshot = app
+        .chat_list_projection_stale
+        .lock()
+        .unwrap()
+        .generation("alice");
+    let during = app.clone();
+    crate::CHAT_LIST_REFRESH_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            during.drop_account_caches("alice");
+            loop {
+                during.invalidate_chat_list_projection("alice");
+                if during
+                    .chat_list_projection_stale
+                    .lock()
+                    .unwrap()
+                    .generation("alice")
+                    >= snapshot
+                {
+                    break;
+                }
+            }
+        }));
+    });
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        stale(&app),
+        "an evicted incarnation's refresh does not cover a later invalidation"
+    );
+}
+
+/// Leaving a chat updates what the warmed chat list shows on the next read, without waiting for a later
+/// checkpoint save: an idle account may skip that save (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_self_membership_write_reaches_the_warmed_chat_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let _eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice
+        .create_group("left behind", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group)
+    );
+    bob_client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let membership = |app: &MarmotApp| {
+        app.chat_list_row("bob", &group_hex)
+            .unwrap()
+            .map(|row| row.self_membership)
+    };
+    assert_eq!(membership(&app), Some(SelfMembership::Member), "warm");
+
+    // The leave saves its checkpoint before it records `Left`. A chat-list
+    // read between the two rebuilds the list from the old membership, and
+    // no later save is due to mark it stale again.
+    let reader = app.clone();
+    let reader_group = group_hex.clone();
+    bob_client.test_after_checkpoint_save = Some(Box::new(move || {
+        assert_eq!(
+            reader
+                .chat_list_row("bob", &reader_group)
+                .unwrap()
+                .map(|row| row.self_membership),
+            Some(SelfMembership::Member)
+        );
+    }));
+    bob_client.leave_group(&group).await.unwrap();
+    assert_eq!(
+        membership(&app),
+        Some(SelfMembership::Left),
+        "the leave shows without another save"
+    );
+}
+
 #[test]
 fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
     // Regression for mdk#220: removing an account (or rolling back a
@@ -12465,11 +12868,13 @@ fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
             .unwrap()
             .contains(&alice.label)
     );
+    // Eviction advances the chat-list generation rather than dropping it,
+    // so the next incarnation's first read rebuilds (mdk#2923).
     assert!(
-        !app.chat_list_projection_stale
+        app.chat_list_projection_stale
             .lock()
             .unwrap()
-            .contains(&alice.label)
+            .is_stale(&alice.label)
     );
 }
 

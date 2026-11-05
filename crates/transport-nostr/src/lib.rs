@@ -3769,6 +3769,18 @@ impl MarmotRelayPlaneAccountAdapter {
         status
     }
 
+    /// Test hook: advance this account's replay generation, as a source change
+    /// would.
+    #[cfg(feature = "test-support")]
+    pub async fn change_replay_sources_for_test(&self) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .change_replay_sources_for_test(&self.account_id)
+            .await;
+    }
+
     /// Observe source revisions and admission progress without scheduling IO.
     #[doc(hidden)]
     pub async fn replay_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {

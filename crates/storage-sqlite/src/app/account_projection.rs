@@ -921,6 +921,32 @@ impl SqliteAppStorage {
         load_account_groups(&conn, group_id_hex)
     }
 
+    /// SQLite's `data_version` for this connection: it moves whenever another
+    /// connection or process commits to the database, never for this
+    /// connection's own commits. One cached pragma read, no transaction.
+    pub fn foreign_commit_version(&self) -> StorageResult<i64> {
+        self.lock()?
+            .query_row_cached("PRAGMA data_version", [], |row| row.get(0))
+            .storage()
+    }
+
+    /// The persisted transport cursor alone, for a check that needs nothing
+    /// else from the projection. One cached primary-key read in autocommit:
+    /// it opens no transaction and takes no writer lock.
+    pub fn stored_transport_cursor(&self, label: &str) -> StorageResult<Option<u64>> {
+        Ok(self
+            .lock()?
+            .query_row_cached(
+                "SELECT last_transport_timestamp FROM account_state WHERE label = ?1",
+                params![label],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .storage()?
+            .flatten()
+            .and_then(|value| u64::try_from(value).ok()))
+    }
+
     pub fn load_account_projection_state(
         &self,
         label: &str,

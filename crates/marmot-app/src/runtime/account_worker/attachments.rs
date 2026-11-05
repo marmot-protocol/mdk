@@ -75,7 +75,12 @@ pub(super) struct Admission {
 
 /// Starts a media sweep on the blocking pool unless one is still running:
 /// to completion when the worker takes ownership, otherwise one batch.
-fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_complete: bool) {
+fn spawn_media_sweep(
+    admission: &mut Admission,
+    media: AccountMediaStore,
+    until_complete: bool,
+    telemetry: &marmot_observability::PerformanceRecorder,
+) {
     if admission
         .media_sweep
         .as_ref()
@@ -83,18 +88,22 @@ fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_
     {
         return;
     }
+    // Timed on the blocking pool (mdk#2923); a batch that never runs or
+    // panics drops its span, which records it as cancelled.
+    let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
     admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
-        loop {
+        let outcome = loop {
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
-                Ok(_) => break,
+                Ok(_) => break TelemetryOutcome::Success,
                 Err(_) => {
                     tracing::warn!(target: "marmot_app::runtime", method = "media_sweep",
                         "media store sweep deferred");
-                    break;
+                    break TelemetryOutcome::Failure;
                 }
             }
-        }
+        };
+        batch.finish(outcome);
     }));
 }
 /// Starts one page of outgoing upload promotion on the blocking pool unless
@@ -106,6 +115,7 @@ fn spawn_upload_promotion(
     storage: SqliteAccountStorage,
     media: AccountMediaStore,
     updates: AttachmentUpdates,
+    telemetry: &marmot_observability::PerformanceRecorder,
 ) {
     if admission
         .upload_promotion
@@ -115,6 +125,7 @@ fn spawn_upload_promotion(
         return;
     }
     let cursor = admission.upload_cursor.clone();
+    let batch = telemetry.observe(RuntimeOp::WorkerUploadPromotion);
     admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
         let after = cursor
             .lock()
@@ -133,10 +144,12 @@ fn spawn_upload_promotion(
                 if promoted {
                     updates.state_changed();
                 }
+                batch.finish(TelemetryOutcome::Success);
             }
             Err(_) => {
                 tracing::warn!(target: "marmot_app::runtime", method = "outgoing_upload_promotion",
                     "outgoing upload promotion deferred");
+                batch.finish(TelemetryOutcome::Failure);
             }
         }
     }));
@@ -178,6 +191,10 @@ pub(super) fn spawn_legacy_migration(
         admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
     }
     let keep_media_more = admission.keep_media_more.clone();
+    let batch = shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceHousekeepingBatch);
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -197,6 +214,7 @@ pub(super) fn spawn_legacy_migration(
             tracing::warn!(target: "marmot_app::storage_maintenance",
                 method = "migrate_legacy_attachments",
                 "legacy attachment migration batch deferred");
+            batch.finish(TelemetryOutcome::Failure);
             return;
         };
         let account_dir = app.account_dir(&label);
@@ -205,6 +223,7 @@ pub(super) fn spawn_legacy_migration(
         let app_storage = storage.app_storage();
         // "Keep media" first, so bodies past the window are not moved only
         // to be removed.
+        let mut outcome = TelemetryOutcome::Success;
         if sweep_keep_media {
             let deadline = std::time::Instant::now() + KEEP_MEDIA_SWEEP_BUDGET;
             match super::super::attachment_storage::clean_past_keep_window(
@@ -225,6 +244,9 @@ pub(super) fn spawn_legacy_migration(
                     }
                 }
                 Err(_) => {
+                    // Deferred by an error: the batch still runs the rest,
+                    // but its span reports the failure.
+                    outcome = TelemetryOutcome::Failure;
                     keep_media_more.store(true, std::sync::atomic::Ordering::Release);
                     tracing::warn!(target: "marmot_app::storage_maintenance",
                         method = "keep_media_sweep",
@@ -264,6 +286,7 @@ pub(super) fn spawn_legacy_migration(
         {
             compaction_due.store(true, std::sync::atomic::Ordering::Release);
         }
+        batch.finish(outcome);
     }));
 }
 
@@ -559,6 +582,7 @@ pub(super) fn schedule(
                 .app
                 .account_media_store(&client.state.label, &storage)?,
             true,
+            shared.observer.performance(),
         );
     } else {
         spawn_media_sweep(
@@ -567,6 +591,7 @@ pub(super) fn schedule(
                 .app
                 .account_media_store(&client.state.label, &storage)?,
             false,
+            shared.observer.performance(),
         );
     }
     let expired = storage
@@ -592,6 +617,7 @@ pub(super) fn schedule(
             .app
             .account_media_store(&client.state.label, &storage)?,
         shared.attachment_updates.clone(),
+        shared.observer.performance(),
     );
     let resumed = if policy.automatic {
         storage.app_storage().resume_permitted_attachments(

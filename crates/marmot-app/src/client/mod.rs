@@ -770,6 +770,17 @@ pub(super) struct EpochGapWindow {
 }
 
 pub struct AppClient {
+    /// Runs once right after the next projection checkpoint's save, before
+    /// anything else reads storage.
+    #[cfg(test)]
+    pub(crate) test_after_checkpoint_save: Option<Box<dyn FnOnce() + Send + Sync>>,
+    /// Pauses the next full native replay pass after its generation snapshot:
+    /// signals the first sender, then waits for the second.
+    #[cfg(test)]
+    pub(crate) test_replay_sync_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
@@ -1043,6 +1054,15 @@ pub struct AppClient {
     /// the router spills an arrival that falls below the floor it raised:
     /// during the commit's save, and after a live one.
     pub(crate) checkpointed_transport_timestamp: Option<u64>,
+    /// The transport cursor this client last saved, or the one it opened
+    /// with. A checkpoint with nothing else pending and this cursor unchanged
+    /// has nothing to persist and is skipped (mdk#2923).
+    pub(crate) saved_transport_timestamp: Option<u64>,
+    /// The storage connection's foreign-commit version at the last
+    /// checkpoint, saved or skipped. A skip that finds it moved invalidates
+    /// the chat list, as a save would have: another runtime may have changed
+    /// the projection (mdk#2923).
+    pub(crate) observed_commit_version: Option<i64>,
     /// Runs at every transport-cursor seal, before and after, so a test can
     /// land a delivery on either side of the decision.
     #[cfg(test)]
@@ -1543,6 +1563,17 @@ impl AppClient {
         Ok(self.runtime.set_periodic_maintenance_policy(policy)?)
     }
 
+    /// Time one maintenance phase as its own runtime operation (mdk#2923), when
+    /// this client records runtime telemetry.
+    fn maintenance_step(
+        &self,
+        operation: crate::RuntimePerformanceOperation,
+    ) -> Option<marmot_observability::Observation> {
+        self.runtime_telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.observe(operation))
+    }
+
     pub fn pause_maintenance(&mut self) {
         self.runtime.pause_maintenance();
     }
@@ -1608,6 +1639,8 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
+        let app_passes =
+            self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceAppPasses);
         self.drive_sign_ins().await;
         self.drive_small_state().await;
         self.drive_invitation_decisions().await;
@@ -1632,7 +1665,18 @@ impl AppClient {
         .await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
+        finish_maintenance_step(app_passes, marmot_observability::Outcome::Success);
+        let session =
+            self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceSession);
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
+        finish_maintenance_step(
+            session,
+            if effects.is_ok() {
+                marmot_observability::Outcome::Success
+            } else {
+                marmot_observability::Outcome::Failure
+            },
+        );
         self.note_key_package_refresh_overdue();
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
@@ -1757,9 +1801,20 @@ impl AppClient {
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
         // Retention observes recovery evidence once, before any fallible reads.
         // Keep committed activity even if native projection or summary reads fail.
+        let step =
+            self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceEffects);
         let observed = self.observe_native_membership_effects(effects).await;
         let result = observed.and_then(|()| self.summarize_maintenance(effects));
         self.recover_superseded_invites_best_effort().await;
+        // The span covers the whole tail, invite recovery's network work too.
+        finish_maintenance_step(
+            step,
+            if result.is_ok() {
+                marmot_observability::Outcome::Success
+            } else {
+                marmot_observability::Outcome::Failure
+            },
+        );
         result
     }
 
@@ -8504,5 +8559,15 @@ mod poll_send_validation_tests {
             AppError::InvalidAppMessagePayload(message)
                 if message == "poll is closed at the response event timestamp"
         ));
+    }
+}
+
+/// End a [`AppClient::maintenance_step`] observation, if one was started.
+fn finish_maintenance_step(
+    step: Option<marmot_observability::Observation>,
+    outcome: marmot_observability::Outcome,
+) {
+    if let Some(step) = step {
+        step.finish(outcome);
     }
 }
