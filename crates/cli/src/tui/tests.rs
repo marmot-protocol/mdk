@@ -9744,7 +9744,7 @@ fn message_accelerator_under_open_help_dismisses_the_card_and_does_not_act() {
     app.messages_group_id = Some("bb".repeat(32));
     app.timeline = vec![timeline_row("m0", 0)];
     app.status = "reading".to_owned();
-    app.input = Input::from("draft");
+    app.input.set_value("draft");
 
     app.handle_key(char_key('u')).expect("u");
 
