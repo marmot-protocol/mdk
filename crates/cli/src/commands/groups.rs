@@ -1648,8 +1648,8 @@ fn disband_status_json(group: &AppGroupRecord, mls: Option<&AppGroupMlsState>) -
     })
 }
 
-/// Mirror of the MarmotKit `GroupManagementState` derivation so scripts and
-/// the TUI can gate affordances from one runtime read instead of guessing.
+/// Management output keeps its existing shape; Leave hints use the same core
+/// capability selector as native bindings. Commands still recheck live authority.
 fn group_management_json(
     my_account_id_hex: &str,
     group: &AppGroupRecord,
@@ -1673,6 +1673,20 @@ fn group_management_json(
     let lifecycle_terminal = matches!(mls.lifecycle_state, AppGroupLifecycleState::Disbanded);
     let ordinary_actions_enabled = !mls.disbanding && !lifecycle_terminal;
     let leave_request_pending = group.leave_requested_at_ms.is_some();
+    let leave = marmot_app::conversation_presentation::ConversationAuthority {
+        is_member: self_member.is_some(),
+        self_membership: group.self_membership,
+        is_admin: is_self_admin,
+        admin_count,
+        pending_confirmation: group.pending_confirmation,
+        leave_request_pending,
+        lifecycle: mls.lifecycle_state,
+        unrecoverable: group.unrecoverable || mls.unrecoverable,
+        disbanding: mls.disbanding,
+        disbanding_enabled: mls.disbanding_enabled,
+        has_disbanding_blockers: !mls.disbanding_blockers.is_empty(),
+    }
+    .capabilities();
     let stable = matches!(mls.lifecycle_state, AppGroupLifecycleState::Stable);
     let member_actions = members
         .iter()
@@ -1703,13 +1717,8 @@ fn group_management_json(
         "is_self_admin": is_self_admin,
         "is_last_admin": is_last_admin,
         "can_invite": is_self_admin && ordinary_actions_enabled,
-        "can_leave": self_member.is_some()
-            && !is_self_admin
-            && !leave_request_pending
-            && ordinary_actions_enabled,
-        "requires_self_demote_before_leave": self_member.is_some()
-            && is_self_admin
-            && ordinary_actions_enabled,
+        "can_leave": leave.can_leave,
+        "requires_self_demote_before_leave": leave.requires_self_demote_before_leave,
         "leave_request_pending": leave_request_pending,
         "leave_requested_at_ms": group.leave_requested_at_ms,
         "lifecycle_state": mls.lifecycle_state,
@@ -2283,10 +2292,45 @@ mod tests {
         }))
         .expect("sample MLS state");
 
+        assert!(!group.pending_confirmation);
+        assert_eq!(group.self_membership, marmot_app::SelfMembership::Member);
+        group.admin_policy.admins.push(peer.clone());
+        let coadmin = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(coadmin["can_leave"], true);
+        assert_eq!(coadmin["requires_self_demote_before_leave"], false);
+
+        group.pending_confirmation = true;
+        let pending = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(pending["can_leave"], false);
+        assert_eq!(pending["requires_self_demote_before_leave"], false);
+        group.pending_confirmation = false;
+        assert_eq!(group_management_json(&me, &group, &members, &mls), coadmin);
+
+        group.unrecoverable = true;
+        let unrecoverable = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(unrecoverable["can_leave"], false);
+        assert_eq!(unrecoverable["requires_self_demote_before_leave"], false);
+        group.unrecoverable = false;
+        assert_eq!(group_management_json(&me, &group, &members, &mls), coadmin);
+
+        group.leave_requested_at_ms = Some(1);
+        assert_eq!(
+            group_management_json(&me, &group, &members, &mls)["can_leave"],
+            false
+        );
+        group.leave_requested_at_ms = None;
+
+        group.admin_policy.admins = vec![peer.clone()];
+        let nonadmin = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(nonadmin["can_leave"], true);
+        assert_eq!(nonadmin["requires_self_demote_before_leave"], false);
+
+        group.admin_policy.admins = vec![me.clone()];
         let member = group_management_json(&me, &group, &members, &mls);
         assert_eq!(member["is_self_admin"], true);
         assert_eq!(member["can_invite"], true);
-        assert_eq!(member["requires_self_demote_before_leave"], true);
+        assert_eq!(member["can_leave"], false);
+        assert_eq!(member["requires_self_demote_before_leave"], false);
 
         group.self_membership = marmot_app::SelfMembership::Removed;
         let removed = group_management_json(&me, &group, &members, &mls);

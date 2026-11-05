@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Use core Leave capability hints in group-management output and allow TUI Leave confirmation for admins. Core
+  automatically demotes an eligible nonlast admin account and refuses the last active admin before departure effects;
+  manual self-demotion remains supported. `can_leave` is false for unaccepted invitations and unrecoverable groups.
+  Existing JSON fields and command spellings are unchanged.
 - Experimental `devices link start` can move an already linked device; status adds move progress and old-sibling hints,
   and device status includes `moved`. Ordinary chat membership remains in place.
 
@@ -285,6 +289,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   its reply. The existing 60-second startup budget bounds the probe; an unresponsive socket is preserved and no
   competing daemon is started (mdk#2957).
 
+- The TUI keeps `/login` secret input hidden while a quoted argument is still being edited, including leading
+  whitespace inside quotes or an unfinished extra argument (mdk#2955). Submitting an unfinished quote still reports
+  a parse error. Whitespace-padded secrets use stdin for TUI login, and the CLI rejects them as identity arguments.
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
   `delete_group` inside a transaction and only logged the failure; the group id stayed taken.

@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Skip optional founding siblings whose KeyPackage ciphersuite differs from the chat, preserving ordinary creation
+  and its Welcomes. Shared sibling admission reports the mismatch before staging.
 - Retain exact SelfUpdate publication bytes across compatibility restart even when Welcome storage is unavailable.
   Ordinary updates have no Welcome artifacts to discover.
 - Allow member recovery past ownerless ordinary Preparing work and obsolete ordinary source records, including

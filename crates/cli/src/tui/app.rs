@@ -1622,27 +1622,22 @@ impl TuiApp {
         });
     }
 
-    /// The admin-leave guard: an admin cannot leave (info card, sole-admin vs
-    /// step-down message); a non-admin gets the normal confirm popup.
+    /// Confirm before invoking the authoritative Leave command. Core owns
+    /// eligible account demotion and the last-admin refusal.
     fn open_leave_group_popup(&mut self) {
         let Some(view) = &self.group_detail else {
             return;
         };
-        self.popup = Some(
-            match leave_group_decision(view.account_is_admin, view.admin_count) {
-                LeaveDecision::Blocked(message) => Popup::info(CANNOT_LEAVE_TITLE, message),
-                LeaveDecision::Confirm => Popup::Confirm {
-                    purpose: ConfirmPurpose::LeaveGroup {
-                        group_id: view.group_id.clone(),
-                    },
-                    title: "Leave Group".to_owned(),
-                    body: vec![format!(
-                        "Leave {}?",
-                        shorten(&terminal_safe_text(&view.name), 24)
-                    )],
-                },
+        self.popup = Some(Popup::Confirm {
+            purpose: ConfirmPurpose::LeaveGroup {
+                group_id: view.group_id.clone(),
             },
-        );
+            title: "Leave Group".to_owned(),
+            body: vec![format!(
+                "Leave {}?",
+                shorten(&terminal_safe_text(&view.name), 24)
+            )],
+        });
     }
 
     /// Arm the logout popup for the currently selected account, scaling the guard

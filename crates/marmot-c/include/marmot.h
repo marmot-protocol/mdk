@@ -3077,7 +3077,8 @@ typedef struct MarmotChatHistoryImportList {
 
 /**
  * Shown-once recovery words. Clear host copies and promptly free this
- * record; ordinary managed/FFI strings are not secure buffers.
+ * record. Its returned word buffers are erased before release; host
+ * copies and earlier managed/FFI copies are not erased by this free.
  */
 typedef struct MarmotRecoveryWords {
   char **words;
