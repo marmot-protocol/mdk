@@ -530,9 +530,10 @@ impl AppClient {
                 Ok(!keys.iter().any(|known| {
                     known.slot == slot && known.held_as_removed && known.tag_signature_key == key
                 }) && !departures.iter().any(|departure| {
-                    departure.slot == slot
-                        && departure.linked_at == link.linked_at
-                        && departure.tag_signature_key.as_ref() == Some(&key)
+                    // A founding approval and its roster entry can take
+                    // different clock readings. Older same-key evidence
+                    // also withholds this optional display context.
+                    departure.slot == slot && departure.tag_signature_key.as_ref() == Some(&key)
                 }))
             })();
             match context {

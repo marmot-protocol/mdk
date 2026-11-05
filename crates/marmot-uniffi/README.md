@@ -1167,6 +1167,12 @@ security decisions can synchronize again under ordinary rules. It sends no remov
 membership. It is separate from sign-out, account removal and a Move. An already unlinked
 device cannot use it to bypass removal.
 
+Reset acts on this device, not the other slot named by a sign-in row. Check both devices before choosing which local
+copy to discard. If the approver still lists this slot, fresh admission can remain refused; removing that slot writes
+removal evidence and is not a universal shortcut back in. If no other device retains the old group, a later first
+link can create a different group: its discarded roster continuity is not restored. Independently retained local
+backup/security records are kept.
+
 The returned link snapshot has no trusted old copy to restore. Reset does not publish a new KeyPackage. Use the normal
 `rotate_key_package(account_ref)` publication action, then start a fresh code-comparison flow and confirm on both
 devices; the fresh Welcome can join the same group id under the existing exact sender/group/KeyPackage checks. Reset
@@ -1287,8 +1293,8 @@ It is false in ordinary opens without explicit experimental device-group intent.
   trusted group but its settled selected roster no longer lists it. Offer “A slot previously linked here is missing
   from this device's current device list. Open both devices to check the link.” It does not authenticate the current
   publication or prove permanent loss. Known local removal/rejection or matching retained departure evidence suppresses
-  the context; incomplete records, expired evidence, slot reuse and discovery bound it. False means no affirmative
-  local context, not “never linked.” Keep existing Not now/dismiss behavior; silence/decryption failure is not a reset
+  the context, conservatively including older departures of the same slot/key. Incomplete records, expired evidence,
+  slot reuse and discovery also bound it. False means no affirmative local context, not “never linked.” Keep existing Not now/dismiss behavior; silence/decryption failure is not a reset
   signal. The user can explicitly choose [local reset](#explicit-local-device-group-reset-before-fresh-pairing).
 - `answer_sign_in(account_ref, slot_id_hex, response)` takes `NotNow`, `Reject` or `Dismiss`. `Reject` drops the sign-in
   from this device's list and records its slot as rejected in the device group's roster; with no device group yet, it

@@ -694,7 +694,7 @@ To deliberately discard only this device's local hidden device-group copy before
 
 ```sh
 wn --account "$ACCOUNT" devices link reset --confirm
-wn --account "$ACCOUNT" key-package rotate
+wn --account "$ACCOUNT" keys rotate
 wn --account "$ACCOUNT" devices link start
 ```
 
