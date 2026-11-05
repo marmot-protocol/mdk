@@ -441,6 +441,86 @@ mod tests {
     use marmot_uniffi::conversions::SendAcceptDispositionFfi;
 
     #[test]
+    fn pending_welcome_outputs_preserve_diagnosis_and_free_deeply() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        for size_class in [
+            None,
+            Some(marmot_uniffi::EventSizeClassFfi::From128To256Kib),
+        ] {
+            let list: MarmotPendingWelcomeDeliveryList =
+                vec![marmot_uniffi::PendingWelcomeDeliveryFfi {
+                    group_id_hex: "12".repeat(16),
+                    message_id_hex: "34".repeat(32),
+                    recipient_hex: "56".repeat(32),
+                    recorded_at: 7,
+                    size_class,
+                }]
+                .into();
+            unsafe {
+                assert_eq!(list.len, 1);
+                let item = &*list.items;
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(item.group_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "12".repeat(16)
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(item.message_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "34".repeat(32)
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(item.recipient_hex)
+                        .to_str()
+                        .unwrap(),
+                    "56".repeat(32)
+                );
+                assert_eq!(item.recorded_at, 7);
+                assert_eq!(item.has_size_class, size_class.is_some());
+                if size_class.is_some() {
+                    assert_eq!(item.size_class, MarmotEventSizeClass::From128To256Kib);
+                }
+                marmot_pending_welcome_delivery_list_free(boxed(list));
+            }
+            let event = boxed(crate::types::event::MarmotEvent::from(
+                marmot_uniffi::conversions::MarmotEventFfi::WelcomeDeliveryPending {
+                    account_id_hex: "78".repeat(32),
+                    account_label: "alice".into(),
+                    group_id_hex: "12".repeat(16),
+                    message_id_hex: "34".repeat(32),
+                    recipient_hex: "56".repeat(32),
+                    size_class,
+                },
+            ));
+            unsafe {
+                let crate::types::event::MarmotEvent::WelcomeDeliveryPending {
+                    has_size_class,
+                    size_class: class,
+                    ..
+                } = &*event
+                else {
+                    panic!("Welcome pending event");
+                };
+                assert_eq!(*has_size_class, size_class.is_some());
+                if size_class.is_some() {
+                    assert_eq!(*class, MarmotEventSizeClass::From128To256Kib);
+                }
+                crate::types::event::marmot_event_free(event);
+            }
+            #[cfg(feature = "alloc-audit")]
+            assert_eq!(crate::memory::audit::live_allocations(), before);
+        }
+        unsafe {
+            marmot_pending_welcome_delivery_free(std::ptr::null_mut());
+            marmot_pending_welcome_delivery_list_free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
     fn app_component_deep_free() {
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]

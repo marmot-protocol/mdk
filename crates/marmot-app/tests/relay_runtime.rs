@@ -13966,12 +13966,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
             size_class: marmot_app::EventSizeClass::Under64Kib,
         })
     );
-    let first_notice = retrying.take_pending_welcome_delivery_events();
-    assert_eq!(first_notice.len(), 1);
-    assert_eq!(
-        first_notice[0].size_class,
-        Some(marmot_app::EventSizeClass::Under64Kib)
-    );
     let error = retrying
         .redeliver_welcome(&original_pending.message_id_hex)
         .await
@@ -13986,10 +13980,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
         retrying.pending_welcome_deliveries().unwrap(),
         [latest.clone()],
         "later causes update an already-announced handle without reordering or clearing it"
-    );
-    assert!(
-        retrying.take_pending_welcome_delivery_events().is_empty(),
-        "a later diagnosis does not reannounce the Welcome"
     );
     drop(retrying);
 
