@@ -302,7 +302,7 @@
   device won; that one stands (D37). Every roster entry this device creates,
   its own founding entry and every linked device's, carries a fresh rename id, so
   a device linked again after a failed link never inherits a rename kept for
-  its earlier entry. Refused in release builds until the roster's spec lands.
+  its earlier entry. Refused without explicit device-group capability and runtime intent.
 - `AppGroupMlsState.convergence_parked` reports a group whose convergence
   pass spent its failure budget (mdk#2684). Show it as stuck syncing until
   new group activity arrives or the user retries;
@@ -333,7 +333,7 @@
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
   re-read it, since the device group's own events never reach hosts. Both are
-  empty and silent in release builds until the roster's spec lands.
+  empty and silent without explicit device-group capability and runtime intent.
 - Each device sends a heartbeat (kind 457) in the device group at most once
   an hour while it runs, never with a push (mdk#2628 item 3.6). `LinkedDevice`
   gains `last_active_at`, when a sibling's heartbeat last showed it running,
@@ -344,7 +344,7 @@
   device group has held its KeyPackage refresh back for a week (mdk#2628 item
   3.4), so hosts can tell the user before inviters stop treating the device as
   fresh at 30 days. `KeyPackageRefreshOverdueChanged` says to re-read it. Both
-  are false and silent in release builds until the roster's spec lands.
+  are false and silent without explicit device-group capability and runtime intent.
 - `MarmotAppRuntime::unrecognized_sign_ins` lists sign-ins of this account
   that this device does not recognize as `UnrecognizedSignIn`s (mdk#2628 item
   3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
@@ -356,7 +356,7 @@
   that Welcome. A KeyPackage the roster announced for a device's slot in
   the last 30 days counts as that device's, even after a newer announcement
   or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
-  are empty and silent in release builds until the roster's spec lands.
+  are empty and silent without explicit device-group capability and runtime intent.
 - `MarmotAppRuntime::compromise_warning` lists the account's open compromise
   warning on this device as `CompromiseWarningItem`s (mdk#2628 item 3.7a):
   each rejected sign-in, from this device or its device group's roster, and
@@ -366,10 +366,10 @@
   seen, on this device only, and `CompromiseWarningChanged` says to re-read.
   `start_fresh` answers every sign-in from before this device Not now, now and
   later, rejecting nothing, and `started_fresh` says whether the device did so
-  and still has no device group. All are empty, false and silent in release
-  builds until the roster's spec lands.
+  and still has no device group. All are empty, false and silent without explicit
+  device-group capability and runtime intent.
 - Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
-  unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
+  `unreleased-device-pairing` feature, explicit device-group capability and `dev_device_groups` runtime intent. The new device starts a link naming its
   published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their
   descriptions, and its user confirms (`confirm_device_link_match`) or cancels (`cancel_device_link`). A device
   already signed in shows a prompt once it found and checked that KeyPackage; its user chooses Link device with a
