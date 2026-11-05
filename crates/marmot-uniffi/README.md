@@ -27,6 +27,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [undelivered Welcomes](#undelivered-welcomes),
   [turning on account devices](#turning-on-account-devices),
   [backup recovery and background conditions](#backup-recovery-and-background-conditions),
   [group reporting](#group-reporting),
@@ -905,6 +906,24 @@ an admin meanwhile, or the change no longer applies), MDK drops it and emits
 `GroupEventKindFfi::QueuedIntentRefused { intent_id_hex, intent_kind, reason }`
 for that group. Nothing retries it: tell the user, who may try again. `reason`
 is a stable tag such as `not_group_admin`.
+
+## Undelivered Welcomes
+
+An Add can already be confirmed while its Welcome cannot reach the recipient. Subscribe before creating or
+inviting, then use `pending_welcome_deliveries(account_ref)` to read the current repair handles. The
+`WelcomeDeliveryPending` event and each handle carry optional `size_class`: a coarse serialized-event size
+reported only for a proved all-target size refusal. It does not estimate any relay's configured limit.
+`None` means Unknown, including old records, lost diagnostic writes and unrecognized future annotations.
+
+The event remains once per process/Welcome. Later cause changes are obtained from the query, not another event.
+A later coarse legacy retry may replace a specific displayed cause with Unknown while the same debt persists.
+MDK continues its existing retry behavior; this diagnosis neither removes the member nor adds another leaf,
+rolls back the confirmed Add, or declares the obligation terminal. Hosts can distinguish a known size refusal
+from an unexplained delivery problem without receiving relay details or another account's device information.
+
+Regenerate Swift/Kotlin bindings with the matching native library: the event gains a field and the pending
+query returns a new record. The account database adds one nullable annotation to each existing repair row;
+there is no wire change or additional diagnostic network traffic.
 
 ## Members are accounts
 

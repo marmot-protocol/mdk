@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Migration 0177 adds a nullable coarse size diagnosis to existing pending Welcome repair pointers. Old rows remain
+  Unknown; unknown future annotations preserve the pointer. Updating a failure diagnosis retains its existing identity
+  and oldest-first position and adds no retry owner.
+
 ### Breaking changes
 
 - Remove the experimental `SqliteAppStorage::next_received_private_key_package` and

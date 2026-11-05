@@ -120,7 +120,7 @@ impl SqliteAppStorage {
                     row.get(1)?,
                     row.get(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get_ref(4)?.as_str().ok().map(str::to_owned),
                 ))
             })
             .storage()?
@@ -170,7 +170,11 @@ mod tests {
 
     #[test]
     fn re_record_same_message_updates_in_place() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.sqlite3");
+        let key = crate::SqlCipherKey::raw([0xa3; 32]);
+        let account = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let store = account.app_storage();
         store
             .record_pending_welcome_delivery("aa", "bb", "cc", 7)
             .unwrap();
@@ -202,20 +206,36 @@ mod tests {
             .unwrap();
         let mut expected = records[0].clone();
         expected.size_class = diagnosis.size_class;
-        assert_eq!(store.list_pending_welcome_deliveries().unwrap(), [expected]);
+        assert_eq!(
+            store.list_pending_welcome_deliveries().unwrap(),
+            [expected.clone()]
+        );
+        account.close().unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let store = reopened.app_storage();
+        assert_eq!(
+            store.list_pending_welcome_deliveries().unwrap(),
+            [expected],
+            "a known diagnosis survives encrypted reopen"
+        );
         diagnosis.size_class = None;
         store
             .record_pending_welcome_delivery_failure(&diagnosis)
             .unwrap();
         assert_eq!(store.list_pending_welcome_deliveries().unwrap(), records);
-        store.lock().unwrap().execute(
-            "UPDATE app_pending_welcome_delivery SET size_class = 'future_unrecognized_class' WHERE message_id_hex = 'aa'", [],
-        ).unwrap();
-        assert_eq!(
-            store.list_pending_welcome_deliveries().unwrap(),
-            records,
-            "a future annotation must not hide the valid repair pointer"
-        );
+        for unknown in [
+            rusqlite::types::Value::Text("future_unrecognized_class".into()),
+            rusqlite::types::Value::Blob(vec![0xff]),
+        ] {
+            store.lock().unwrap().execute(
+                "UPDATE app_pending_welcome_delivery SET size_class = ?1 WHERE message_id_hex = 'aa'", [unknown],
+            ).unwrap();
+            assert_eq!(
+                store.list_pending_welcome_deliveries().unwrap(),
+                records,
+                "a future annotation must not hide the valid repair pointer"
+            );
+        }
     }
 
     #[test]

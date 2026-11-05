@@ -28,6 +28,7 @@ per feature.
   [chat screens and avatars](#chat-screens-and-avatars),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
   [turning on account devices](#turning-on-account-devices),
+  [undelivered Welcomes](#undelivered-welcomes),
   [backup recovery](#backup-recovery),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
@@ -395,6 +396,14 @@ invitable; the detail ends in `[obsolete_only]` when the recipient must update t
 app. `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` means the lookup ran out of time or
 relay coverage and nothing is known to be missing; offer retry. Directory KeyPackage
 and relay-list lookups report the same status.
+
+## Undelivered Welcomes
+
+Use `marmot_pending_welcome_deliveries` for the [shared Welcome delivery contract](../marmot-uniffi/README.md#undelivered-welcomes).
+It returns an owned `MarmotPendingWelcomeDeliveryList`; release the whole result with
+`marmot_pending_welcome_delivery_list_free`. In records and `MarmotEvent::WelcomeDeliveryPending`, read
+`size_class` only when `has_size_class` is true; false means Unknown. The event payload layout changes, so
+rebuild against the matching header and library. Each list owns its strings; do not free individual fields.
 
 ## Selected chat-list presentation
 

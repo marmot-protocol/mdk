@@ -3,7 +3,12 @@
 ## Unreleased
 
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
-  class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
+  class. Mixed, ambiguous and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
+
+- Retain a best-effort coarse size diagnosis on confirmed Adds whose Welcome remains owed, in pending queries and
+  the existing once-per-process notice. First-attempt legacy Welcomes can report proved size refusals; later coarse
+  retries may replace the cause with Unknown without changing membership or debt. Rust records/events gain an
+  optional field and the account index gains nullable migration 0177; retry/rollback policy and wire formats stay unchanged.
 
 - Skip history-upload endpoints the existing Blossom transport cannot contact, including public HTTP URLs.
   With no eligible endpoint, history follows the existing no-server outcome instead of staying owed until expiry;
