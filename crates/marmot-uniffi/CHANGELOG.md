@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose qualified prior-linked-slot context and explicit local device-group reset for experimental clients. Regenerate matching Swift/Kotlin bindings; ordinary constructors stay disabled. No schema or wire migration.
+
 - Add typed `EventTooLarge` with coarse artifact and size-class enums. Regenerate Swift/Kotlin bindings with the
   matching library; existing error cases and publication lifecycle remain unchanged. No database or wire migration.
 

@@ -5144,6 +5144,43 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         .unwrap()
         .execute_batch("DROP TRIGGER fail_repair_forget")
         .unwrap();
+    // This fault is AFTER preparation retirement, so all of that work and
+    // the native/trust deletion must roll back together as well.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_repair_bootstrap BEFORE INSERT ON small_state_sync
+         BEGIN SELECT RAISE(ABORT, 'repair bootstrap failed'); END;",
+        )
+        .unwrap();
+    assert_fails_with(
+        store.forget_group_local(&repair, cgka_traits::Timestamp(100)),
+        "repair bootstrap failed",
+    );
+    assert_eq!(
+        app.device_group("cc").unwrap().unwrap().trust,
+        crate::DeviceGroupTrust::Created
+    );
+    assert!(store.get_group(&repair).is_ok());
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM private_key_packages_received",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_repair_bootstrap")
+        .unwrap();
     assert!(
         store
             .forget_group_local(&repair, cgka_traits::Timestamp(100))
@@ -5183,6 +5220,62 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap()
             .contains(&cgka_traits::GroupId::new(vec![0xbb]))
     );
+    let schedule = app.small_state_schedule().unwrap().unwrap();
+    assert!(schedule.request_owed && schedule.answer_owed);
+    assert_eq!(schedule.broadcast_at, None);
+
+    // A selected removal's ordinary forget is not this reset. Nor is
+    // forgetting an ordinary chat: neither may retire account-local debt.
+    let removed_id = cgka_traits::GroupId::new(vec![0xdd]);
+    let mut removed = crate::base::test_support::sample_group(removed_id.clone(), 2, 1);
+    removed.removed = true;
+    store.put_group(&removed).unwrap();
+    assert!(
+        app.insert_device_group(&crate::DeviceGroupRecord {
+            group_id_hex: "dd".into(),
+            trust: crate::DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some("old".into()),
+            recorded_at: 1,
+        })
+        .unwrap()
+    );
+    app.trust_device_group(
+        "dd",
+        crate::DeviceGroupTrust::Creating,
+        crate::DeviceGroupTrust::Created,
+        None,
+        1,
+        &crate::FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    app.put_device_rename(&crate::DeviceRenameRecord {
+        slot_id_hex: "kept-slot".into(),
+        label: "Kept".into(),
+        settings: None,
+        written: vec![[2; 16]],
+        replaced: vec![None],
+    })
+    .unwrap();
+    assert!(
+        store
+            .forget_group_local(&removed_id, cgka_traits::Timestamp(101))
+            .unwrap()
+    );
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+    assert!(
+        store
+            .forget_group_local(
+                &cgka_traits::GroupId::new(vec![0xbb]),
+                cgka_traits::Timestamp(101)
+            )
+            .unwrap()
+    );
+    assert_eq!(app.device_renames().unwrap().len(), 1);
 }
 
 #[test]

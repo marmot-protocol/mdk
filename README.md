@@ -72,6 +72,8 @@ The [`wn` guide](crates/cli/README.md) covers configuration, a two-account quick
 command map, the daemon, the TUI, and JSON output for scripting.
 Explicit dev builds can [link and list account devices](crates/cli/README.md#device-linking-dev-builds) through
 `wn devices` and persistent `wnd`, using `--features dev-device-groups` independently of policy-test timing.
+The explicit `wn devices link reset --confirm` action discards only the local hidden device-group copy before fresh
+code pairing; ordinary chat data and credentials survive, while admission and membership limits still apply.
 Ordinary release builds keep this off.
 
 ## Build an app on MDK

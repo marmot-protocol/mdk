@@ -779,6 +779,13 @@ mod experimental_host {
                     }
                     (existing_linked && new_linked).then_some(())
                 });
+                let mut reset = std::ptr::null_mut();
+                check(unsafe {
+                    marmot_reset_device_group_for_repair(clients[2], account.as_ptr(), &mut reset)
+                });
+                assert!(!reset.is_null());
+                assert!(unsafe { (*reset).new_device.is_null() });
+                unsafe { marmot_device_link_snapshot_free(reset) };
                 for (index, client) in clients.into_iter().enumerate().skip(1) {
                     check(unsafe { marmot_c::commands::marmot_client_shutdown_and_close(client) });
                     unsafe { marmot_client_free(client) };

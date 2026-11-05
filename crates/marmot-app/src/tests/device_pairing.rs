@@ -311,9 +311,9 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
     assert!(joins.device_group_joins().unwrap().is_empty());
 }
 
-/// Diagnostic for #2847: a real completed link can be absent from the
-/// approver's selected roster after a deeper pre-Add sibling branch wins.
-/// This checkpoint changes no detection or repair behavior.
+/// A real made link can disappear from the approver's selected roster. Its
+/// local context never authenticates a new publication; explicit reset and
+/// fresh code pairing preserve ordinary chat data through encrypted reopen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     use crate::tests::device_group::converge_device_group;
@@ -557,6 +557,35 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     deliver_new(&mut laptop.client, &relay, &mut replay_cursor).await;
     assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
     assert!(laptop.client.runtime.group_record(&group).is_err());
+    let current = laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        current
+            .current_key_package_ref
+            .as_ref()
+            .map(hex::encode)
+            .as_deref(),
+        Some(used.as_str()),
+        "fresh pairing must not name the installed KeyPackage"
+    );
+    let own_key = laptop.client.runtime.own_signature_key();
+    let selected_members = phone.client.runtime.group_record(&group).unwrap().members;
+    let old_leaf_present = selected_members
+        .iter()
+        .any(|member| member.credential == own_key);
+    eprintln!(
+        "repair_admission_prerequisite: selected_leaf_count={}, old_leaf_present={old_leaf_present}",
+        selected_members.len()
+    );
+    assert!(
+        !old_leaf_present,
+        "ordinary fresh admission requires the approver not to retain the old signature key"
+    );
     assert_eq!(
         link(&relay, &mut phone, &mut laptop, "Laptop repaired").await,
         group

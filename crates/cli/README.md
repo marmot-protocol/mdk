@@ -690,6 +690,20 @@ can stay pending indefinitely while ordinary repair applies, keeping old trust a
 Corrupt or unreadable local move records may need manual local recovery or reset. These conditions do not themselves
 unlink this device. See [move behavior and limits](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
 
+To deliberately discard only this device's local hidden device-group copy before fresh code pairing:
+
+```sh
+wn --account "$ACCOUNT" devices link reset --confirm
+```
+
+This keeps ordinary chats/history/drafts/settings, account credentials and the current slot; it abandons unfinished
+device sync and publishes no removal. It refuses active pairing/Move or unsettled native work (`device_group_busy`),
+possibly indefinitely. No trusted copy returns `no_device_group`. Reset does not guarantee fresh admission: an approver
+that still lists the slot/old leaf, rejects it or is full can refuse. Start ordinary fresh code pairing afterward;
+cancellation/failure can leave needs-link, and no old copy is restored. An already-confirmed fresh Welcome wait retains
+its normal restart behavior. Ordinary chat membership and missing-history repair remain separate. See the
+[shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing).
+
 For this dev-testing build, run **all account commands through a persistent matching daemon**. Select it explicitly
 with `--socket` or exported `WN_SOCKET`, so connection failure is reported instead of falling back to local execution.
 The `devices` commands themselves refuse local execution: without an auto-discovered daemon, their JSON error is

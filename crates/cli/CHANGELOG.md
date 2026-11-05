@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Add dev-only `devices link reset --confirm`, forwarding the shared user-controlled local device-group reset. Ordinary chat data/credentials remain; fresh pairing may be refused by existing admission rules.
+
 - Report conclusive all-target size refusals as JSON `event_too_large` with coarse `artifact` and `size_class`;
   ambiguous and mixed relay failures retain their existing generic error.
 

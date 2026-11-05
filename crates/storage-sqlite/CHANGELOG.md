@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Retire old device-sync preparations atomically only when explicitly forgetting an active trusted nonterminal device-group copy with no unfinished Move. Preserve ordinary chat data, admitted work, issued private keys and taken-reference tombstones; no migration.
+
 ### Breaking changes
 
 - Remove the experimental `SqliteAppStorage::next_received_private_key_package` and
