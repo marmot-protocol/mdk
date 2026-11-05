@@ -435,7 +435,10 @@ impl AppClient {
             } else if group.as_ref().is_none_or(|group| {
                 !group.pending_confirmation || group.self_membership != SelfMembership::Member
             }) || account.leave_request(&group_id)?.is_some()
+                || self.runtime.group_record(&group_id)?.disbanded.is_some()
             {
+                // Canonical disband can retain a pending Member projection.
+                // Retire only this exact decision's work, not its retained value.
                 storage.mark_invitation_decision_applied(decision)?;
             }
         }
