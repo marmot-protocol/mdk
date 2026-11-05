@@ -1111,7 +1111,10 @@ changes any linked device's supplied settings, this device included. Each settin
 from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
 A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
 eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
-does not leave joined chats. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458). With
+three or more devices, it can race another sibling's gap filling and cause extra Add attempts, private-KeyPackage
+consumption, or Commits and convergence passes; selected-parent presence checks and ordinary branch selection still
+apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
 is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
 
