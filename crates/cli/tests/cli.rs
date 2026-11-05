@@ -6076,8 +6076,14 @@ fn chats_mute_suppresses_and_unmute_restores_notifications() {
             "quiet while muted",
         ],
     );
-    // Await this exact message at Bob before checking muted notification output.
-    sync_until_message(home.path(), test_relay_url(), &bob, "quiet while muted");
+    // Await Bob's live projection without a separate sync consuming the message.
+    wait_until_projected_message(
+        home.path(),
+        test_relay_url(),
+        &bob,
+        group_id,
+        "quiet while muted",
+    );
     subscription.assert_no_line_for(Duration::from_secs(2), |line| {
         line["result"]["trigger"] == "Notification"
             && line["result"]["type"] == "notification"
@@ -6115,7 +6121,7 @@ fn chats_mute_suppresses_and_unmute_restores_notifications() {
     );
 
     drop(subscription);
-    daemon.stop();
+    stop_owned_test_daemon(daemon);
 }
 
 #[test]
