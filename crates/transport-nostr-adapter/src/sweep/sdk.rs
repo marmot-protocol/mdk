@@ -235,7 +235,12 @@ impl SweepRelay for SdkSweepRelay {
             Ok(compared) => compared.remote,
             Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
-            Err(NegFailure::Unproven | NegFailure::Local) => return SecondReply::Unproven,
+            Err(NegFailure::Unproven) => return SecondReply::Unproven,
+            // Not the relay's answer: retried like a dropped connection, never
+            // a second the relay cannot prove.
+            Err(NegFailure::Local) => {
+                return SecondReply::Unreachable(UnreachableKind::Disconnected);
+            }
         };
         if ids.len() >= SECOND_NEG_LIMIT {
             return SecondReply::Unproven;
@@ -490,6 +495,41 @@ mod tests {
             SecondReply::Unreachable(UnreachableKind::Disconnected)
         ));
         assert!(sdk.client().relays().all().await.is_empty());
+        sdk.shutdown().await;
+    }
+
+    /// A local fault in a NIP-77 read is not the relay's answer: a second's
+    /// id read retries it like a dropped connection, as a comparison does,
+    /// and never reads it as a second the relay cannot prove.
+    #[tokio::test]
+    async fn a_local_negentropy_fault_is_retried_not_unproven() {
+        let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
+        let endpoint = RelayUrl::parse("wss://local-fault.invalid").unwrap();
+        // In the pool but never connected: nothing is dialed.
+        sdk.client().add_relay(endpoint.clone()).await.unwrap();
+        let relay = SdkSweepRelay::new(
+            &sdk,
+            endpoint,
+            RelayCaps {
+                max_limit: Some(500),
+                negentropy: true,
+            },
+            Duration::from_secs(1),
+        );
+        // A closed NEG credit fails before anything is sent.
+        relay.neg_credit.close();
+        let route = SweepRoute::Group {
+            nostr_group_id: [7; 32],
+        };
+        let range = SweepRange { since: 1, until: 2 };
+        assert!(matches!(
+            CompareRelay::compare(&relay, route, range, &[], 5).await,
+            CompareReply::Unreachable(UnreachableKind::Disconnected)
+        ));
+        assert!(matches!(
+            relay.fetch_second(route, 1, Some(500)).await,
+            SecondReply::Unreachable(UnreachableKind::Disconnected)
+        ));
         sdk.shutdown().await;
     }
 }
