@@ -28,8 +28,9 @@ fn expected_hrp(name: &str) -> NostrHrp {
 
 // Every corpus input is a single line, so each document holds at most one
 // top-level paragraph — but entities can nest inside emphasized spans,
-// inline code and links, so the walk recurses through container inlines
-// rather than trusting the top level alone.
+// links and image alt text, so the walk recurses through container
+// inlines rather than trusting the top level alone. (`Inline::Code` holds
+// a plain `String`, so a code span can never contain an entity.)
 fn collect_top_level_hrps(block: &Block, hrps: &mut Vec<NostrHrp>) {
     let Block::Paragraph { inlines, .. } = block else {
         return;
@@ -71,5 +72,39 @@ fn markdown_recognition_matches_shared_corpus_baseline() {
                 case.name
             ),
         }
+    }
+}
+
+// No corpus row nests an entity inside a container inline, so the
+// recursion above has no baseline coverage. These cases pin it: an entity
+// nested in emphasis, strong, strikethrough, a link's children or an
+// image's alt text is still recognized.
+#[test]
+fn nested_entities_are_recognized_too() {
+    let entity = format!("nostr:{NPUB}");
+    let cases = [
+        ("emphasis", format!("*{entity}*")),
+        ("strong", format!("**{entity}**")),
+        ("strikethrough", format!("~~{entity}~~")),
+        (
+            "link children",
+            format!("[{entity}](https://example.invalid/x.png)"),
+        ),
+        (
+            "image alt text",
+            format!("![{entity}](https://example.invalid/x.png)"),
+        ),
+    ];
+    for (name, markdown) in cases {
+        let document = parse(&markdown);
+        let mut hrps = Vec::new();
+        for block in &document.blocks {
+            collect_top_level_hrps(block, &mut hrps);
+        }
+        assert_eq!(
+            hrps,
+            vec![NostrHrp::Npub],
+            "entity nested in {name} must still be recognized"
+        );
     }
 }

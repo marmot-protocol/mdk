@@ -24,7 +24,9 @@ use nostr_sdk::prelude::PublicKey;
 pub enum ReferenceContext {
     /// Account-id resolution (`account_id_hex_from_ref`): accepts hex keys,
     /// `npub` and `nprofile` (bare or `nostr:`-wrapped). Every other family
-    /// is [`ReferenceDecodeError::UnsupportedFamily`].
+    /// is [`ReferenceDecodeError::Malformed`] — identity decodes only
+    /// `Nip19Profile`, so an `nsec` fails like any other foreign family and
+    /// this context never reports [`ReferenceDecodeError::SecretRejected`].
     Identity,
     /// Public-event preview resolution: accepts bare and `nostr:`-wrapped
     /// hex event ids, `note`, `nevent` and `naddr`. Identity families
@@ -73,7 +75,9 @@ pub enum ReferenceDecodeError {
     Malformed,
     /// A well-formed reference whose family this context does not accept.
     UnsupportedFamily,
-    /// A secret-key reference (`nsec`). Never resolved on any context.
+    /// A secret-key reference (`nsec`). Never resolved on any context; the
+    /// event and prose contexts report it under this reason, while identity
+    /// folds it into [`ReferenceDecodeError::Malformed`].
     SecretRejected,
 }
 
