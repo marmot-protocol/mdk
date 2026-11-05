@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add select all for the native chat-list views (mdk#2983): `MarmotAppRuntime::chat_list_ids(account, view)` returns
+  every chat ID in the view in display order, beyond any open window, and `revalidate_chat_list_ids(account, view,
+  ids)` returns the still-eligible subset in the caller's order, never adding chats. Pending base rows return
+  `ChatPresentationNotReady` instead of a partial list. No schema or wire change.
+
 - Add qualified prior-linked-slot context and explicit user-controlled local device-group reset before fresh pairing. Preserve ordinary local chat data/identity; busy native work may refuse indefinitely and ordinary admission/removal rules still apply. No schema or wire migration.
 
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size

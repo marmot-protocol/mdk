@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `chat_list_ids(account_ref, view)` and `revalidate_chat_list_ids(account_ref, view, group_ids)` for select all
+  over a whole chat-list view (mdk#2983). Hosts keep checkbox state, revalidate before a bulk action, then call the
+  existing per-chat commands. Additive; regenerate bindings to use them.
+
 - Expose qualified prior-linked-slot context and explicit local device-group reset for experimental clients. Regenerate matching Swift/Kotlin bindings; ordinary constructors stay disabled. No schema or wire migration.
 
 - Add typed `EventTooLarge` with coarse artifact and size-class enums. Regenerate Swift/Kotlin bindings with the

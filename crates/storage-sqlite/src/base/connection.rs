@@ -383,16 +383,6 @@ impl SharedConnection {
     }
 }
 
-/// Transient identity without retaining the connection or its database locks.
-#[derive(Clone)]
-pub(crate) struct ConnectionLifetime(std::sync::Weak<SharedConnectionInner>);
-
-impl ConnectionLifetime {
-    pub(crate) fn matches(&self, connection: &SharedConnection) -> bool {
-        self.0.ptr_eq(&Arc::downgrade(&connection.inner))
-    }
-}
-
 struct SharedConnectionInner {
     timing: Mutex<Option<SqliteTimingObserver>>,
     timing_enabled: AtomicBool,
@@ -425,10 +415,6 @@ impl fmt::Debug for SharedConnection {
 }
 
 impl SharedConnection {
-    pub(crate) fn lifetime(&self) -> ConnectionLifetime {
-        ConnectionLifetime(Arc::downgrade(&self.inner))
-    }
-
     fn new(connection: rusqlite::Connection) -> Self {
         Self {
             inner: Arc::new(SharedConnectionInner {
