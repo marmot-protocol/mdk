@@ -2144,6 +2144,7 @@ impl TuiApp {
             selected_account_index(&self.accounts, previous_account_id.as_deref()).unwrap_or(0);
         if self.accounts.is_empty() {
             self.chats.clear();
+            self.chats_account_id = None;
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
@@ -2168,6 +2169,7 @@ impl TuiApp {
     pub(crate) fn refresh_chats(&mut self) -> TuiResult<()> {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chats.clear();
+            self.chats_account_id = None;
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
@@ -2181,6 +2183,7 @@ impl TuiApp {
         };
         if !account.local_signing {
             self.chats.clear();
+            self.chats_account_id = None;
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
@@ -2205,6 +2208,7 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
+        self.chats_account_id = Some(account.account_id.clone());
         sort_chats_by_activity(&mut self.chats);
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
@@ -2387,14 +2391,10 @@ impl TuiApp {
     ) {
         match single_effect_value(result) {
             Ok(value) => {
-                // Admit projections only while their account remains selected.
-                // A failed account refresh can leave the previous list visible;
-                // conservatively retain its badge until a successful refresh.
-                // A different chat in the same selected account still updates.
-                if self
-                    .selected_account_row()
-                    .map(|row| row.account_id.as_str())
-                    == Some(account.as_str())
+                // A failed refresh can leave another account's rows visible even
+                // after selection returns to this account. Only mutate the list
+                // that actually produced these rows, including off-pane chats.
+                if self.chats_account_id.as_deref() == Some(account.as_str())
                 {
                     fold_chat_projection(
                         &mut self.chats,
@@ -2480,6 +2480,9 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
+        // A complete accepted snapshot can legitimately replace a retained
+        // other-account list after a failed foreground refresh.
+        self.chats_account_id = Some(account);
         sort_chats_by_activity(&mut self.chats);
         self.selected_chat = selected_chat_index(&self.chats, previous_group_id.as_deref())
             .unwrap_or_else(|| self.selected_chat.min(self.chats.len().saturating_sub(1)));
@@ -2788,6 +2791,7 @@ impl TuiApp {
         let Some(subscription) = self.chat_subscription.as_ref() else {
             return false;
         };
+        let account_id = subscription.account_id.clone();
         let mut events = Vec::new();
         loop {
             match subscription.rx.try_recv() {
@@ -2807,6 +2811,9 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
+                    if self.chats_account_id.as_deref() != Some(account_id.as_str()) {
+                        continue;
+                    }
                     if let Some(status) = apply_chat_subscription_result(
                         &mut self.chats,
                         &mut self.selected_chat,
@@ -2942,6 +2949,7 @@ impl TuiApp {
         let Some(subscription) = self.timeline_subscription.as_ref() else {
             return false;
         };
+        let account_id = subscription.account_id.clone();
         let mut events = Vec::new();
         loop {
             match subscription.rx.try_recv() {
@@ -2974,12 +2982,17 @@ impl TuiApp {
                         ) {
                             self.pending_mark_read = true;
                         }
-                        fold_chat_projection(
-                            &mut self.chats,
-                            &mut self.selected_chat,
-                            &group_id,
-                            projection,
-                        );
+                        // The loaded pane can still belong to the old account
+                        // while a new account's list is already visible. Keep its
+                        // pane/read handling independent of the list projection.
+                        if self.chats_account_id.as_deref() == Some(account_id.as_str()) {
+                            fold_chat_projection(
+                                &mut self.chats,
+                                &mut self.selected_chat,
+                                &group_id,
+                                projection,
+                            );
+                        }
                     }
                     apply_timeline_event(
                         &mut self.timeline,

@@ -36,6 +36,10 @@ pub(crate) struct TuiApp {
     /// `Enter`; `Esc` discards it.
     pub(crate) picker_selection: usize,
     pub(crate) chats: Vec<ChatRow>,
+    /// Account that produced the last successful complete chat-list snapshot.
+    /// Selection can move before a refresh fails, leaving these rows on screen.
+    /// Incremental updates must match this owner rather than the highlight.
+    pub(crate) chats_account_id: Option<String>,
     pub(crate) selected_chat: usize,
     pub(crate) messages_account_id: Option<String>,
     pub(crate) messages_group_id: Option<String>,
@@ -169,6 +173,7 @@ impl TuiApp {
             selected_account: 0,
             picker_selection: 0,
             chats: Vec::new(),
+            chats_account_id: None,
             selected_chat: 0,
             messages_account_id: None,
             messages_group_id: None,
