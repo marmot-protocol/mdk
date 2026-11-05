@@ -627,7 +627,14 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 async fn terminal_application_fanout_replays_failure_after_restart_before_delete() {
     // None is also the real SDK shape after an earlier ambiguous attempt:
     // reopening must never infer a size proof from the payload or last category.
-    for size_class in [None, Some(cgka_traits::EventSizeClass::Under64Kib)] {
+    for (category, size_class) in [
+        (TransportEndpointRejectionCategory::Blocked, None),
+        (TransportEndpointRejectionCategory::TooLarge, None),
+        (
+            TransportEndpointRejectionCategory::TooLarge,
+            Some(cgka_traits::EventSizeClass::Under64Kib),
+        ),
+    ] {
 
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot terminal app fanout key").unwrap();
@@ -696,7 +703,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
                 endpoint: endpoint.clone(),
                 reason: "relay rejected the event".into(),
                 kind: TransportEndpointFailureKind::TerminalRejected,
-                rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+                rejection_category: Some(category),
             },
         )
         .unwrap();

@@ -157,12 +157,12 @@ every subscription update, or delete lock/database files to recover ownership.
 requested relay, with no acceptance or unresolved outcome. The artifact is Commit, Welcome, ApplicationMessage or
 Other; size classes are coarse diagnostic buckets from under 64 KiB through over 4 MiB, not relay limits. Do not
 infer this error from generic relay text, a timeout, or one refusal among mixed outcomes. Older retained failures,
-unknown relay formats and KeyPackage publication errors that carry only a message remain generic. A successful
-Commit is not undone by a later Welcome publication failure; this error adds no automatic retirement or retry policy.
-Typed causes come from frozen native fanout evidence or a first legacy Welcome attempt with complete strong endpoint
-evidence. Once that legacy record has a prior attempt, its coarse history remains Unknown/generic rather than being
-reconstructed. This also applies to an explicit Rust retry's error; a confirmed create/invite instead exposes a later
-Welcome failure through the pending query/notice without undoing the Add.
+unknown relay formats and KeyPackage publication errors that carry only a message remain generic. Typed causes
+come from frozen native fanout evidence or a first legacy Welcome attempt with complete strong endpoint evidence.
+Once that legacy record has a prior attempt, its coarse history remains Unknown/generic rather than being
+reconstructed. Direct signed-publication helpers may still report generic failures. This also applies to an explicit
+Rust retry's error; a confirmed create/invite instead exposes a later Welcome failure through the pending query/notice
+without undoing the Add. No automatic retirement or retry policy is added.
 
 ### Screen snapshots, paging and ownership
 
