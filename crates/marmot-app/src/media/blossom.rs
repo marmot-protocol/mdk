@@ -2062,6 +2062,13 @@ fn record_download_phase(
     }
 }
 
+/// Apply the real transport's static contact policy to the actual upload URL.
+/// DNS resolution and connection failures remain the transfer's responsibility.
+pub(crate) fn blossom_upload_endpoint_allowed(server: &str, allow_loopback_http: bool) -> bool {
+    blossom_endpoint(server, "upload")
+        .is_ok_and(|(url, _)| validate_blossom_fetch_url(&url, allow_loopback_http).is_ok())
+}
+
 fn blossom_endpoint(server: &str, leaf: &str) -> Result<(Url, String), AppError> {
     let mut url = Url::parse(server.trim())
         .map_err(|_| AppError::BlobStore("invalid Blossom server URL".into()))?;

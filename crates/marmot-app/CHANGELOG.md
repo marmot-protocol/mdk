@@ -5,6 +5,10 @@
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
   class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
 
+- Skip history-upload endpoints the existing Blossom transport cannot contact, including public HTTP URLs.
+  With no eligible endpoint, history follows the existing no-server outcome instead of staying owed until expiry;
+  eligible servers retain ordered fallback and retry. Endpoint wire validity and backup selection are unchanged.
+
 - Preserve configured Blossom server base paths for uploads, synthesized downloads and deletion.
   Existing endpoints need no migration; explicit download locators and network contact policy are unchanged.
 

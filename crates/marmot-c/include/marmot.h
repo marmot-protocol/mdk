@@ -2241,9 +2241,9 @@ typedef struct MarmotLocalCleanupReport {
  */
 typedef struct MarmotWipeOutcome {
   /**
-   * Active MLS groups this account successfully left. A chat this
-   * device is no longer in, its copy removed or disbanded, is neither
-   * left nor reported as a failure.
+   * Active MLS groups whose local leave call succeeded, not confirmed removal.
+   * A chat this device is no longer in, its copy removed or disbanded, is
+   * neither counted nor reported as a failure.
    */
   uint32_t groups_left;
   struct MarmotGroupLeaveFailure *group_leave_failures;
