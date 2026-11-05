@@ -256,6 +256,23 @@ mod tests {
         let account = home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let summary = SyncSummary {
+            joined_groups: vec![GroupId::new(vec![3; 16])],
+            events: vec![
+                cgka_traits::GroupEvent::GroupCreated {
+                    group_id: GroupId::new(vec![3; 16])
+                };
+                2
+            ],
+            projection_updates: vec![
+                marmot_app::AppProjectionUpdate {
+                    group_id_hex: "03".repeat(16),
+                    timeline_messages: Vec::new(),
+                    timeline_changes: Vec::new(),
+                    chat_list_row: None,
+                    chat_list_trigger: Default::default(),
+                };
+                3
+            ],
             epoch_stall_escalations: vec![EpochStallEscalation {
                 group_id: GroupId::new(vec![4; 16]),
                 stalled_epoch: 7,
@@ -264,11 +281,19 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(sync_plain(&summary), "reported 1 epoch stall escalation(s)");
+        assert_eq!(
+            sync_plain(&summary),
+            format!(
+                "joined group {}\nprocessed 2 event(s)\nprocessed 3 projection update(s)\nreported 1 epoch stall escalation(s)",
+                "03".repeat(16)
+            )
+        );
         let rendered = sync_json(&app, account, summary).unwrap();
-        assert_eq!(rendered["projection_updates"], 0);
+        assert_eq!(rendered["joined_groups"], json!(["03".repeat(16)]));
+        assert_eq!(rendered["messages"], json!([]));
+        assert_eq!(rendered["projection_updates"], 3);
         assert_eq!(rendered["epoch_stall_escalations"], 1);
-        assert_eq!(rendered["events"], 0);
+        assert_eq!(rendered["events"], 2);
     }
 
     #[test]

@@ -9,6 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Experimental `devices link start` can move an already linked device; status adds move progress and old-sibling hints,
+  and device status includes `moved`. Ordinary chat membership remains in place.
+
 - Add dev-only `devices list` and `devices link` start/status/confirm-match/approve/cancel commands over the persistent daemon, enabled by the separate default-off `dev-device-groups` Cargo feature. Production timing stays unchanged; ordinary releases keep it off.
 
 ### Added
@@ -277,6 +280,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   relay that is not a `wss://` URL now stops startup with `code=invalid_relay_url` and a `reason=`.
 
 ### Fixed
+
+- Daemon startup no longer waits forever when an existing local peer accepts a readiness probe but never completes
+  its reply. The existing 60-second startup budget bounds the probe; an unresponsive socket is preserved and no
+  competing daemon is started (mdk#2957).
 
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran

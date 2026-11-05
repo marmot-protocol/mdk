@@ -82,6 +82,7 @@ pub(crate) mod backups;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
+mod device_group_moves;
 pub(crate) mod device_heartbeats;
 pub(crate) mod device_pairing;
 mod device_removal;

@@ -446,11 +446,6 @@ impl TuiApp {
         };
     }
 
-    #[cfg(test)]
-    pub(crate) fn apply_effect_done_for_test(&mut self, done: EffectDone) {
-        self.apply_effect_done(done);
-    }
-
     /// Wait for `count` queued effects to finish on the worker and fold each,
     /// for end-to-end tests over a fake `wn`. Panics if the worker stalls.
     #[cfg(test)]

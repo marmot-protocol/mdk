@@ -2,13 +2,24 @@
 
 ## Unreleased
 
+- Add a default-off `dev-device-groups` host capability and explicit experimental constructor. Ordinary constructors
+  remain disabled; opt-in native/generated build outputs are isolated. Existing options layouts remain unchanged.
+
+- Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
+  Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
+  setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.
+
 ### Breaking changes
+
+- Device-link snapshots add owned move views and old-sibling recognition hints; linked-device status appends Moved.
+  `dismiss_device_group_move_sibling` dismisses one hint. Regenerate host bindings and rebuild consumers with the
+  matching native library/header: the snapshot layout changes. Moves remain behind the existing experimental gate.
 
 - Expose recovery-word setup/settings, manual backup restore begin/cancel/status/watch/current-chat hints, and
   account-worker Wi-Fi/charging reports. Closing a restore observer does not cancel work. Timeline and conversation
   rows add typed `history_import_provenance` for Device or Backup while preserving sibling-only `imported_from`.
   Generated host strings remain caller-managed; do not persist or log recovery words.
-  Background writer work defaults closed on every worker start; hosts must report both Wi-Fi and charging to admit
+  Background writer work defaults closed on every new runtime; hosts must report both Wi-Fi and charging to admit
   new passes. Already admitted passes settle after conditions change; manual restore remains independent.
 
 - `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).

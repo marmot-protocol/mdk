@@ -19,3 +19,5 @@ pub(crate) mod views;
 mod wipe;
 
 pub(crate) mod sibling_welcome_resends;
+
+pub(crate) mod device_group_moves;

@@ -622,6 +622,40 @@ impl<S: StorageProvider> Engine<S> {
         Ok(owed)
     }
 
+    /// End pending new delivery of sibling Welcomes when the host cuts
+    /// device-group trust. Only Sent source records retire; delivered records
+    /// remain unchanged. Immutable bodies, carriers and admitted native fanout
+    /// remain intact for ordinary settlement. The caller composes this with
+    /// its trust/debt transaction, including old delivered-Welcome repair timing.
+    pub fn retire_sibling_welcome_deliveries(&self) -> Result<(), EngineError> {
+        self.storage.with_transaction(|store| {
+            for group in store.list_groups()? {
+                // Made also deletes the old resend timing rows, so Processed
+                // Welcomes cannot be re-owed through the host repair path.
+                let mut pending = Vec::new();
+                store.visit_messages_in_states(
+                    &group,
+                    &[MessageState::Sent],
+                    EpochId(0),
+                    &mut |record| {
+                        if matches!(
+                            StoredMessagePayload::decode(&record.payload),
+                            Ok(StoredMessagePayload::OutboundSiblingWelcome { .. })
+                        ) {
+                            pending.push(record.id);
+                        }
+                        true
+                    },
+                )?;
+                // The visitor may hold the storage connection lock.
+                for id in pending {
+                    self.update_stored_message_state(&id, MessageState::Failed)?;
+                }
+            }
+            Ok::<_, EngineError>(())
+        })
+    }
+
     /// Re-owe an already published sibling Welcome after the host's durable
     /// post-publication activity wait. This reuses the exact Welcome and
     /// private KeyPackage; the host must first settle outstanding transport
@@ -671,8 +705,11 @@ impl<S: StorageProvider> Engine<S> {
             self.update_stored_message_state(id, MessageState::Failed)?;
             return Ok(SiblingWelcomeResendOutcome::Complete);
         };
-        if entry.status == cgka_traits::app_components::DeviceStatusV1::Leaving
-            || entry.tag_signature_key.is_none()
+        if matches!(
+            entry.status,
+            cgka_traits::app_components::DeviceStatusV1::Leaving
+                | cgka_traits::app_components::DeviceStatusV1::Moved
+        ) || entry.tag_signature_key.is_none()
         {
             return Ok(SiblingWelcomeResendOutcome::Held);
         }

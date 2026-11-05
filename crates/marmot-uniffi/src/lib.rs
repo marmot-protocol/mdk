@@ -275,6 +275,18 @@ impl MarmotOptions {
     }
 }
 
+/// Check the experimental host capability before acquiring constructor resources.
+/// Shared with the C boundary so unavailable builds never take callback ownership.
+pub fn require_experimental_device_groups() -> Result<(), MarmotKitError> {
+    if cfg!(feature = "dev-device-groups") {
+        Ok(())
+    } else {
+        Err(MarmotKitError::Runtime {
+            details: "experimental_device_groups_unavailable".to_owned(),
+        })
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct Marmot {
     pub(crate) app: MarmotApp,
@@ -293,12 +305,22 @@ impl Marmot {
         relay_urls: Vec<String>,
         options: MarmotOptions,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        let config = options.app_config();
-        let store = options.secret_store.map(|store| {
-            Arc::new(secret_store::ForeignSecretStore::new(store))
-                as Arc<dyn marmot_account::AccountSecretStore>
-        });
-        Self::open(root_path, relay_urls, config, store)
+        Self::open_with_configuration(root_path, relay_urls, options, false)
+    }
+
+    /// Open an explicitly experimental device-group test build. The native
+    /// library must enable `dev-device-groups`; otherwise this fails
+    /// before opening the root or taking ownership of host secret storage.
+    /// Ordinary constructors remain disabled even in a capable library.
+    /// Use matching native and generated bindings, and this constructor for
+    /// every foreground/background opener of the same experimental root.
+    #[uniffi::constructor]
+    pub fn new_with_experimental_device_groups(
+        root_path: String,
+        relay_urls: Vec<String>,
+        options: MarmotOptions,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        Self::open_with_configuration(root_path, relay_urls, options, true)
     }
 
     /// Open with an explicit relay policy and optional host-owned key storage.
@@ -518,10 +540,27 @@ impl Marmot {
 }
 
 impl Marmot {
-    /// Shared open path behind the exported constructors: account home backed
-    /// by `secret_store` (the platform keychain under the deployment's
-    /// keychain service when `None`), app configured by `config`, runtime
-    /// pair.
+    /// Validate intent before constructing a foreign store or opening a root.
+    fn open_with_configuration(
+        root_path: String,
+        relay_urls: Vec<String>,
+        options: MarmotOptions,
+        experimental_device_groups: bool,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        if experimental_device_groups {
+            require_experimental_device_groups()?;
+        }
+        let config = options
+            .app_config()
+            .with_dev_device_groups(experimental_device_groups);
+        let store = options.secret_store.map(|store| {
+            Arc::new(secret_store::ForeignSecretStore::new(store))
+                as Arc<dyn marmot_account::AccountSecretStore>
+        });
+        Self::open(root_path, relay_urls, config, store)
+    }
+
+    /// Account home backed by the host store or deployment's platform keychain.
     fn open(
         root_path: String,
         relay_urls: Vec<String>,
@@ -581,6 +620,21 @@ mod tests {
         importable::<crate::TimelineProjectionUpdateFfi>();
         importable::<crate::TimelineSubscriptionUpdateFfi>();
         importable::<crate::StickerPackFfi>();
+    }
+
+    #[cfg(not(feature = "dev-device-groups"))]
+    #[test]
+    fn an_unavailable_experimental_constructor_never_opens_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("unopened");
+        let result = Marmot::new_with_experimental_device_groups(
+            root.to_str().unwrap().to_owned(),
+            Vec::new(),
+            MarmotOptions::for_deployment(marmot_deployment_neutral()),
+        );
+        assert!(matches!(result, Err(MarmotKitError::Runtime { details })
+            if details == "experimental_device_groups_unavailable"));
+        assert!(!root.exists());
     }
 
     #[test]

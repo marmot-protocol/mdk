@@ -2,12 +2,16 @@
 
 ## Unreleased
 
+- Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
+  Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
+  setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.
+
 - Simplify experimental sibling-Welcome repair to existing current-incarnation heartbeat activity at least ten minutes after actual carrier acceptance (D100). Unknown publication time holds repair; cadence/skew remain best effort. Remove per-message activity proof/alias recovery work.
 
 - Add separate default-off `dev-device-groups` capability for dev CLI dogfooding without policy timing overrides; explicit runtime intent remains required.
 
 - Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
-  writer work, with replacement workers closed by default. Admitted passes settle after conditions change; manual
+  writer work, with new runtimes closed by default. Admitted passes settle after conditions change; manual
   restore stays independent. Add an opaque restore-operation host codec and zeroizing queued confirmation answers.
 
 - Add experimental on-demand history-only backup restore for chats this device currently belongs to, with bounded

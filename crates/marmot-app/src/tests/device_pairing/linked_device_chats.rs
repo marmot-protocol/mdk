@@ -149,7 +149,7 @@ fn joined(device: &Device, chat: &GroupId) -> bool {
     device.client.state_group_record(chat).is_some()
 }
 
-fn account_database(app: &MarmotApp) -> rusqlite::Connection {
+pub(super) fn account_database(app: &MarmotApp) -> rusqlite::Connection {
     let path = app.account_storage_path("alice");
     let keys = app.account_home().load_signing_keys("alice").unwrap();
     let key = app

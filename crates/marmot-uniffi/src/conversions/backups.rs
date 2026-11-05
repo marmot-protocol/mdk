@@ -1,8 +1,8 @@
 //! Backup setup and ephemeral manual-restore host records.
 
 use marmot_app::{
-    BackupHistoryAvailability, BackupRestorePhase, BackupRestoreStatus, BackupSettings,
-    RecoveryWords,
+    BackgroundBackupOutcome, BackupHistoryAvailability, BackupRestorePhase, BackupRestoreStatus,
+    BackupSettings, RecoveryWords,
 };
 
 /// Shown once. Hosts must clear their own managed copies after confirmation
@@ -40,6 +40,21 @@ impl From<BackupSettings> for BackupSettingsFfi {
         Self {
             enabled: value.enabled,
             this_device_writes: value.this_device_writes,
+        }
+    }
+}
+
+/// Completion of one existing or newly admitted due pass, not a publication receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum BackgroundBackupOutcomeFfi {
+    NotStarted,
+    FinishedAttempt,
+}
+impl From<BackgroundBackupOutcome> for BackgroundBackupOutcomeFfi {
+    fn from(value: BackgroundBackupOutcome) -> Self {
+        match value {
+            BackgroundBackupOutcome::NotStarted => Self::NotStarted,
+            BackgroundBackupOutcome::FinishedAttempt => Self::FinishedAttempt,
         }
     }
 }

@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # Build and stage the marmot-c artifact set.
 #
-# Outputs (under <crate>/output/):
+# Outputs (under <crate>/output/, or output-dev-device-groups/
+# with the explicit --dev-device-groups opt-in):
 #   lib/libmarmot_c.so       (cdylib, host target)
 #   lib/libmarmot_c.a        (staticlib, host target)
 #   include/marmot.h         (checked-in cbindgen header, copied)
 #   lib/pkgconfig/marmot-c.pc
 
 set -euo pipefail
+
+DEV_DEVICE_GROUPS=0
+if [[ "${1:-}" == --dev-device-groups && $# == 1 ]]; then
+  DEV_DEVICE_GROUPS=1
+elif [[ $# != 0 ]]; then
+  echo "usage: $0 [--dev-device-groups]" >&2
+  exit 2
+fi
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -32,6 +41,14 @@ CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
 OUT_DIR="$CRATE_DIR/output"
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  if [[ "$TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$WORKSPACE_DIR/$TARGET_DIR"
+  fi
+  TARGET_DIR="$TARGET_DIR/dev-device-groups"
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  OUT_DIR="$CRATE_DIR/output-dev-device-groups"
+fi
 
 CRATE_NAME="marmot-c"
 LIB_BASENAME="marmot_c"
@@ -44,6 +61,10 @@ mkdir -p "$OUT_DIR/lib/pkgconfig" "$OUT_DIR/include"
 
 echo "==> Building release cdylib + staticlib"
 FEATURE_ARGS=()
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  FEATURE_ARGS+=(--features dev-device-groups)
+  echo "==> Experimental device-group capability; ordinary constructors remain disabled"
+fi
 if [[ "${OTLP_EXPORT:-0}" == "1" || "${OTLP_EXPORT:-}" == "true" ]]; then
   FEATURE_ARGS+=(--features otlp-export)
 fi

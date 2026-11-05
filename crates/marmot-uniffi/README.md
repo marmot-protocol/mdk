@@ -12,6 +12,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - [Integration guide and API reference](#integration-guide-and-api-reference): documentation map, ownership, API
   selection, lifecycle, snapshots, diagnostics and compatibility
 - Runtime setup: [runtime options and client label](#runtime-options-and-client-label),
+  [experimental device-group test builds](#experimental-device-group-test-builds),
   [exclusive root ownership](#exclusive-root-ownership), [threading model](#threading-model),
   [service endpoint defaults](#service-endpoint-defaults)
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
@@ -1029,6 +1030,39 @@ minutes returns the same `report_id`. Each account may send 20 reports per hour
 reports. The C ABI mirrors these calls. See the
 [wire format](../../docs/marmot-architecture/moderation-reports.md).
 
+## Experimental device-group test builds
+
+Ordinary constructors keep device groups disabled, including when the native library has the capability compiled in.
+For a controlled host test build, compile `dev-device-groups` and open with
+`Marmot.newWithExperimentalDeviceGroups(rootPath:relayUrls:options:)` (Swift) or
+`Marmot.newWithExperimentalDeviceGroups(rootPath, relayUrls, options)` (Kotlin). This uses the same `MarmotOptions`
+and required deployment as `newWithConfiguration`; relay policy, secret storage, attachment mode, cursor behavior,
+client name and platform retain their usual meanings. A library without this feature returns
+`experimental_device_groups_unavailable` before opening the root or acquiring a secret store. Use this constructor in
+**every** foreground/background opener of the experimental root. This is an opt-in test build, not a release default.
+Production settlement, retry and recovery timing remains unchanged; never enable `test-policy-overrides` in a host
+artifact.
+
+Build matching native libraries and generated bindings from the same source with the explicit flag:
+
+```sh
+./crates/marmot-uniffi/xcframework.sh --dev-device-groups
+./crates/marmot-uniffi/xcframework-macos.sh --dev-device-groups
+./crates/marmot-uniffi/kotlin-bindings.sh --dev-device-groups
+```
+
+Outputs go to `crates/marmot-uniffi/output-dev-device-groups/` (iOS at the root, macOS in `macos/`, Android
+in `android/`). Cargo outputs use an `dev-device-groups/` child of the selected target directory; Apple
+scratch uses `build/dev-device-groups/<platform>/`. The flag precedes any phase, for example
+`xcframework.sh --dev-device-groups generate`; use it for every phase and transfer only matching inputs.
+Ordinary invocations keep their usual outputs and remain incapable. These commands do not publish artifacts or
+change release automation. Copy the matching native library, generated source and platform resources together;
+source support alone does not establish a platform artifact or device test result.
+
+For a native generated-language constructor check, `options-smoke.sh swift` (or `kotlin`) checks the unavailable
+ordinary build; pass `--dev-device-groups` after the language to check an explicitly capable native library.
+These local host checks do not package or validate iOS/Android device artifacts.
+
 ## Linked devices
 
 Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
@@ -1040,8 +1074,8 @@ this device already deleted locally. Private KeyPackage requests follow the ordi
 membership state. Explicit user Leave, including declining an invitation, records the same current-generation Decline
 before departure publication when this device trusts a device group; archive, local deletion, sign-out and removal do
 not create that choice. Unknown admissions or absent trust keep departure leaf-only. A held maximum version skips the new choice, allowing ordinary
-Leave without replacing the retained winner. Invitation decisions use the existing host APIs. Released builds cannot
-enable device groups or provide working linking controls. Custom experimental peers must update together before using
+Leave without replacing the retained winner. Invitation decisions use the existing host APIs. Ordinary constructors keep device groups disabled;
+controlled host test builds use the explicit constructor described above. Custom experimental peers must update together before using
 V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
 
 User Leave automatically demotes a nonlast active admin account before SelfRemove. The last active admin account is
@@ -1072,16 +1106,16 @@ the device group this device trusts, for a Devices screen:
 - `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
   or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
   `Inactive` is the roster's own mark.
-- The list is empty until this device trusts a device group (a single-device account has none), and in every release
-  build until the roster's spec lands.
+- The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
+  without explicit experimental device-group intent.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
   device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
 Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
 `chat_history_imports(account_ref)` lists each held chat's history as `Receiving` (`retrying` once an attempt to get its
-bundle failed) or `Imported`. The list is empty and the event silent in every release build until the roster's spec
-lands. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
+bundle failed) or `Imported`. The list is empty and the event silent in ordinary opens without explicit experimental
+device-group intent. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
 `device_label`. Re-read the list on `MarmotEventFfi::ChatHistoryImportsChanged`, which fires whenever its answer
 changes, a source device's rename or removal included; re-read rows on `LinkedDevicesChanged` for their new names.
 
@@ -1089,7 +1123,7 @@ changes, a source device's rename or removal included; re-read rows on `LinkedDe
 one roster commit in the device group:
 
 - Only the label changes. It is at most 64 bytes of UTF-8; an empty label clears it.
-- It is refused with nothing sent (`DeviceGroupRefused`) in release builds, for a label that is too long, without a
+- It is refused with nothing sent (`DeviceGroupRefused`) in ordinary opens, for a label that is too long, without a
   device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
   in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
   change.
@@ -1114,6 +1148,45 @@ tries the existing recovery of an earlier lost edit and re-reads the roster. Ret
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
 of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
+
+### Moving this device to another device group
+
+In an experimental device-group build, start the same compared-code linking flow on a device that already trusts a
+device group to move only that device. Keep showing the existing group while `DeviceLinkSnapshotFfi.moves` is
+`WaitingForWelcome` or `Joining`. Joining the destination alone does not switch trust: `Made` requires this device's
+first selected authenticated change there. Its trust then switches once, with ordinary full small-state synchronization
+at unchanged versions. Chats and chat membership stay in place; the move does not promise delivery between the two
+device groups. Released binding builds still provide no working linking entry.
+
+At most one confirmed move link is kept, with its Welcome expectation while that Welcome is pending. After restart
+another code comparison can begin, but if the earlier move is still pending at confirmation the new exchange ends
+before this device sends its Confirm (`LinkFailed` locally, `CannotLink` on the answering device). The earlier link
+and any still-live expectation stay unchanged; no second link approval or Add is made.
+
+If this device moves while another device's link it approved is still pending, its old local prompt can end as failed
+and its automatic chat additions can be skipped even if the other device joined. Finish that link before moving when
+its completion and chat additions matter. Moving does not undo the other device's admitted membership.
+
+Each move has an opaque `move_id`. `old_siblings` names recognized devices left in the old group; while
+`question_suppressed` is true, offer to link that device here rather than treating its sign-in as unknown.
+`dismiss_device_group_move_sibling(account_ref, move_id, slot_id_hex)` ends only that local recognition hint; it does
+not remove or link a device. A later confirmed link or selected departure ends the hint too. Slots in
+`overridden_rejection_slots` were already devices in the destination, so that destination entry took precedence over
+an old rejection. Moves carry rejected slots with their original ages, never rejected KeyPackages.
+
+`LinkedDeviceStatusFfi::Moved` is the old group's own status for a moving device; its cleanup leaves the device's
+ordinary chats alone. Already admitted old-group traffic may finish through normal delivery rules before local old-group
+storage is forgotten; there is no immediate-quiet deadline or cancellation promise. Several old siblings can race
+cleanup, costing extra Commits and convergence passes under normal branch selection. A known failed link before Made
+forgets only the destination and keeps old trust. An unrecoverable destination keeps that trust while ordinary repair
+applies; it may stay pending indefinitely and need manual local recovery. While pending, this device cannot confirm
+another move or answer new pairing Requests. Corrupt or unreadable local move facts can
+fail progress/status reads and need manual local recovery or reset followed by a fresh compared-code link. Do not
+infer an unlinked state or expect an unlink notification for those errors, and never reconstruct old trust.
+Recognition hints suppress questions only on the mover. Old siblings can ask “Was this you?” after cleanup; the user
+can dismiss that prompt. An old in-flight chat Add can leave a membership leaf whose Welcome no longer reaches this
+device. Automatic gap filling may not replace that leaf; manual chat membership repair can be needed. Moving adds no
+duplicate-leaf cleanup or recall of admitted Adds.
 
 ### This device unlinked
 
@@ -1150,7 +1223,7 @@ once the KeyPackage this device would publish is still unannounced and its slot'
 Inviters stop treating the device as fresh at 30 days, so tell the user. A routine refresh never shows, and neither
 does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
 which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
-It is false in every release build until the roster's spec lands.
+It is false in ordinary opens without explicit experimental device-group intent.
 
 ## Unrecognized sign-ins
 
@@ -1173,7 +1246,7 @@ It is false in every release build until the roster's spec lands.
   `check_sign_ins(account_ref)` checks now and returns the list after the check.
 - Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
-- The list is empty in every release build until the roster's spec lands.
+- The list is empty in ordinary opens without explicit experimental device-group intent.
 - `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
   sign-in from before this device is answered `NotNow`, now and when one is listed later. It rejects nothing and
   raises no compromise warning, so one of those devices can still link this one. It is refused before the first check
@@ -1200,13 +1273,12 @@ It is false in every release build until the roster's spec lands.
 - The app writes the wording, and never says the account's devices stopped them.
 - Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
   account's worker opens, so it may fire with no visible change.
-- The list is empty in every release build until the roster's spec lands.
+- The list is empty in ordinary opens without explicit experimental device-group intent.
 
 ## Linking a new device
 
 Linking a new device of the account shows the same seven emoji on both devices, and each user confirms. Every call
-returns a `DeviceLinkSnapshotFfi`, and every call is refused in release builds until the pairing and device-group specs
-land:
+returns a `DeviceLinkSnapshotFfi`, and every call requires the explicit experimental build and constructor described above:
 
 - The new device calls `start_device_link(account_ref)` and shows `new_device`: `WaitingForAnswer` (ask the user to
   open the app on a device already signed in), then `Comparing` with the code. Offer "They match"
@@ -1220,11 +1292,12 @@ land:
 - Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
 - `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
   which carries no device, session or group identities. It also fires once each time the account's worker opens or
-  reconnects, which ends any link in progress.
+  reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
+  rather than assuming an interrupted comparison undid an admitted move.
 
 ## Backup recovery and background conditions
 
-These experimental commands require `devDeviceGroups`, which is off by default, and a build with experimental
+Backup setup and manual restore require `devDeviceGroups`, which is off by default, and a build with experimental
 device-group support. MDK owns backup selection, due work, download limits, import validation and membership checks;
 the host supplies platform facts, renders status and obtains recovery words from the user.
 
@@ -1234,12 +1307,18 @@ words at the two returned **1-based** `confirmPositions`, in order, and pass tho
 `turnOffBackups` disables future account backups without deleting existing archives. A busy or failed confirmation
 keeps the core setup available for another try. Read settings again rather than treating a submitted choice as settled.
 
-Report `setBackupBackgroundConditions(accountRef, wifi, charging)` when an account worker starts and whenever either
-fact changes. Background writer work requires **both Wi-Fi and charging**; each replacement worker starts closed until
-the host reports eligible conditions. An admitted backup pass finishes and settles even if either fact becomes false;
-false blocks the next pass, including pointer checks, retries and cleanup. The report wakes MDK's existing dispatcher,
-not a forced backup or a publication receipt. MDK still applies writer, due-time, backoff and resource checks. The host
-owns OS execution opportunities; it need not implement another backup scheduler. Manual restore is independent of these facts.
+Report `setRuntimeBackupBackgroundConditions(wifi, charging)` once per runtime, before workers exist and on
+changes. Background writer work requires **both Wi-Fi and charging**. Reports survive account-worker restarts; a new
+runtime starts closed. An admitted pass settles after false, while later passes wait. The account-shaped
+`setBackupBackgroundConditions` remains a compatibility wrapper that validates the active account before reporting
+the same runtime-wide facts and never starts its worker. Manual restore is independent.
+
+An OS background task can await `runDueBackupPass(accountRef)`: it joins the current pass or tries ordinary due
+admission once. `NotStarted` admits nothing; `FinishedAttempt` means the pass's serialized settlement attempt and
+credit release ended. It is not a publication-success receipt, forced backup, future-due wait or whole-runtime idle
+barrier. Cancelling this caller detaches its wait; worker stop/replacement returns `TransportClosed`. The host
+bounds its OS execution opportunity and supplies fresh facts to each new runtime. Disabled device-group support returns
+`NotStarted` without starting a worker; the fact-report method itself is local and available.
 
 `beginBackupRestore(accountRef, words)` starts one manual history-only operation per account and returns its status.
 Old words remain usable independently of the current backup key; restore never enables backups or changes that key.
