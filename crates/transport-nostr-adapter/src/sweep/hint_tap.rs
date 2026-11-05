@@ -431,6 +431,9 @@ impl ReplyCounts {
             return;
         }
         let frame = text.map_or(Received::Unattributed, Received::read);
+        if matches!(frame, Received::Other) {
+            return;
+        }
         let mut relays = self.lock();
         let Some(replies) = relays.get_mut(relay) else {
             return;
