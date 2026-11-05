@@ -1102,8 +1102,8 @@ pub struct AppClient {
     pub(crate) test_fail_push_announce_owed_write: bool,
     /// Welcomes a publish could not deliver, from any path. The runtime
     /// account worker drains this with the projection updates and broadcasts
-    /// a `WelcomeDeliveryPending` event so callers learn a member is
-    /// unjoinable without polling (mdk#352).
+    /// a `WelcomeDeliveryPending` event so callers learn delivery is still
+    /// owed without polling; it does not prove non-delivery (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
     /// Welcomes already announced as pending by this process, so a Welcome
     /// that keeps failing on each maintenance pass is announced once.
@@ -7517,8 +7517,8 @@ impl AppClient {
     /// delivery, and queue its `WelcomeDeliveryPending` event (mdk#352),
     /// whichever path published it: a create or invite, a commit the runtime
     /// released its Welcomes after, maintenance, or a device link. The added
-    /// member stays in the roster but cannot join until the Welcome is
-    /// re-delivered. Each Welcome is announced once per process; the engine
+    /// member stays in the roster; pending does not prove whether it received
+    /// the Welcome. Each Welcome is announced once per process; the engine
     /// still owes it, so a failed write only leaves the row to the next
     /// reconcile. Later attempts update only the best-effort diagnosis, even
     /// after this process has announced the handle; query it for that change.

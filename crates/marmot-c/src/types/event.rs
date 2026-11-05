@@ -300,9 +300,8 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
-    /// A confirmed create/invite could not deliver a welcome to
-    /// `recipient_hex`; that member is unjoinable until the welcome is
-    /// re-delivered.
+    /// A canonical create or confirmed Add still owes a Welcome to
+    /// `recipient_hex`; pending does not prove whether the recipient received it.
     WelcomeDeliveryPending {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,

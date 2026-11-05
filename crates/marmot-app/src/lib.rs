@@ -1192,9 +1192,9 @@ pub struct MaintenanceRunSummary {
     pub failures: u32,
 }
 
-/// A welcome that a confirmed group create/invite could not deliver to its
-/// recipient (mdk#352). The commit is already durable, so the member is added
-/// but unjoinable until the welcome reaches them. Persisted so the repair
+/// A Welcome still owed after a canonical create or confirmed Add (mdk#352).
+/// Group state is already durable; pending does not prove whether the recipient
+/// received the Welcome. Persisted so the repair
 /// handle survives the call return and a restart; re-deliver it with
 /// [`AppClient::redeliver_welcome`].
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -75,9 +75,8 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
-    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
-    /// that member is in the group but unjoinable until the welcome is
-    /// re-delivered via `redeliver_welcome(message_id_hex)` (mdk#352).
+    /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
+    /// pending does not prove whether the recipient received it (mdk#352).
     WelcomeDeliveryPending {
         account_id_hex: String,
         account_label: String,

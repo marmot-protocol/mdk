@@ -1556,10 +1556,10 @@ pub enum MarmotAppEvent {
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
-    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
-    /// the member is in the group but unjoinable until the welcome is
-    /// re-delivered (mdk#352). Emitted so a UI/CLI/UniFFI subscriber learns a
-    /// member needs repair without polling `pending_welcome_deliveries`. The
+    /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
+    /// this does not prove whether the recipient received it (mdk#352).
+    /// Emitted so a UI/CLI/UniFFI subscriber learns delivery remains pending
+    /// without polling `pending_welcome_deliveries`. The
     /// durable record backs a later `redeliver_welcome(message_id_hex)`.
     WelcomeDeliveryPending {
         account_id_hex: String,

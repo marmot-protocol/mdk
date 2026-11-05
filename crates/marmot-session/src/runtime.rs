@@ -7249,11 +7249,10 @@ pub struct UnresolvedApplicationMessage {
     pub reason: UnresolvedPublishReason,
 }
 
-/// A welcome left undelivered by a confirmed group create/evolution (mdk#352).
+/// A Welcome still owed after a canonical create or confirmed evolution (mdk#352).
 ///
-/// The added member cannot join until the welcome reaches them, and the commit
-/// cannot be rolled back (it is already confirmed and externally visible), so
-/// re-delivery is the only repair. The wrapped welcome stays available in the
+/// Pending does not prove whether the added member received it. Confirmed group
+/// state is not rolled back; ordinary re-delivery remains owed. The wrapped Welcome stays available in the
 /// engine's sent-message store under `message_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WelcomeDeliveryFailure {
