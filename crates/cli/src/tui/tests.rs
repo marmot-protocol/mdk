@@ -7100,7 +7100,6 @@ fn build_group_detail_tags_admins_and_self() {
     );
     assert!(view.members[0].is_admin && view.members[0].is_self);
     assert!(!view.members[1].is_admin && !view.members[1].is_self);
-    assert!(view.account_is_admin);
     assert_eq!(view.relays, vec!["wss://relay.example".to_owned()]);
 }
 
@@ -7167,8 +7166,7 @@ fn open_group_detail_loads_state_and_esc_returns_to_main() {
 
     let view = app.group_detail.as_ref().expect("group detail loaded");
     assert_eq!(view.members.len(), 2);
-    assert!(view.account_is_admin);
-    assert!(view.members[0].is_self);
+    assert!(view.members[0].is_self && view.members[0].is_admin);
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .expect("esc leaves group detail");
@@ -7183,7 +7181,7 @@ fn open_group_detail_loads_state_and_esc_returns_to_main() {
 fn removed_device_with_sibling_admin_on_roster_is_not_self_or_admin() {
     // This device was removed, but another device of the account keeps it on
     // the roster as the sole admin. The detail view must not read that entry
-    // as this device: no "(you)" row, no admin guard on leave.
+    // as this device: no "(you)" row, even though the account has an admin badge.
     let self_id = "aa".repeat(32);
     let bob_id = "bb".repeat(32);
     let response = format!(
@@ -7209,7 +7207,6 @@ fn removed_device_with_sibling_admin_on_roster_is_not_self_or_admin() {
         view.members[0].is_admin,
         "the account is still listed as admin"
     );
-    assert!(!view.account_is_admin);
 
     app.handle_key(char_key('L'))
         .expect("L on a removed device");
@@ -7238,23 +7235,32 @@ fn self_membership_absent_from_group_show_reads_as_member() {
 
 #[test]
 fn group_detail_leave_confirms_before_the_authoritative_command() {
-    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    let self_id = "aa".repeat(32);
+    let peer_id = "bb".repeat(32);
+    let members = vec![
+        (self_id.clone(), "npubself".to_owned()),
+        (peer_id.clone(), "npubpeer".to_owned()),
+    ];
+    let mut app = test_tui_app(test_unused_client(), &self_id);
     app.screen = Screen::GroupDetail;
-    app.group_detail = Some(GroupDetailView {
-        group_id: "g1".to_owned(),
-        name: "Ops".to_owned(),
-        description: String::new(),
-        members: Vec::new(),
-        relays: Vec::new(),
-        account_is_admin: true,
-        selected: 0,
-    });
 
     // The confirmation is a coarse entry to the real command. Core owns
     // demotion and last-admin refusal; the TUI must not block eligible admins.
     for is_admin in [true, false] {
-        let view = app.group_detail.as_mut().unwrap();
-        view.account_is_admin = is_admin;
+        let admins = if is_admin {
+            vec![self_id.clone(), peer_id.clone()]
+        } else {
+            vec![peer_id.clone()]
+        };
+        let view = build_group_detail("g1", "Ops", "", &members, &admins, &[], &self_id, true);
+        let self_row = view
+            .members
+            .iter()
+            .find(|member| member.is_self)
+            .expect("the current member has a self row");
+        assert_eq!(self_row.member_id, self_id);
+        assert_eq!(self_row.is_admin, is_admin);
+        app.group_detail = Some(view);
         app.popup = None;
         app.handle_key(char_key('L'))
             .expect("L opens Leave confirmation");
@@ -7283,7 +7289,6 @@ fn app_on_group_detail(client: WnClient) -> TuiApp {
             is_self: true,
         }],
         relays: Vec::new(),
-        account_is_admin: true,
         selected: 0,
     });
     app
@@ -7447,7 +7452,6 @@ fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
             is_self: false,
         }],
         relays: Vec::new(),
-        account_is_admin: false,
         selected: 0,
     });
 
@@ -7507,7 +7511,6 @@ fn question_mark_in_group_detail_opens_the_help_card() {
         description: String::new(),
         members: Vec::new(),
         relays: Vec::new(),
-        account_is_admin: false,
         selected: 0,
     });
 
@@ -7536,7 +7539,6 @@ fn promote_yourself_is_blocked_with_a_status_not_a_confirm() {
             is_self: true,
         }],
         relays: Vec::new(),
-        account_is_admin: false,
         selected: 0,
     });
 
@@ -7693,7 +7695,6 @@ fn accepting_an_invite_from_group_detail_returns_to_main() {
         description: String::new(),
         members: Vec::new(),
         relays: Vec::new(),
-        account_is_admin: false,
         selected: 0,
     });
 
@@ -7767,7 +7768,6 @@ fn group_detail_frame_shows_members_with_badges_and_relays() {
             },
         ],
         relays: vec!["wss://relay.example".to_owned()],
-        account_is_admin: true,
         selected: 0,
     });
 
@@ -7802,7 +7802,6 @@ fn group_detail_pane_scrolls_the_selected_member_into_view() {
         description: "the ops".to_owned(),
         members,
         relays: vec!["wss://relay.example".to_owned()],
-        account_is_admin: true,
         selected,
     });
 
@@ -7840,7 +7839,6 @@ fn group_detail_reveals_the_relay_section_at_the_end_of_a_long_member_list() {
             "wss://middle.example".to_owned(),
             "wss://last.example".to_owned(),
         ],
-        account_is_admin: true,
         selected,
     });
 

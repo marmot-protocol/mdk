@@ -11,7 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Use core Leave capability hints in group-management output and allow TUI Leave confirmation for admins. Core
   automatically demotes an eligible nonlast admin account and refuses the last active admin before departure effects;
-  manual self-demotion remains supported. Existing JSON fields and command spellings are unchanged.
+  manual self-demotion remains supported. `can_leave` is false for unaccepted invitations and unrecoverable groups.
+  Existing JSON fields and command spellings are unchanged.
 - Experimental `devices link start` can move an already linked device; status adds move progress and old-sibling hints,
   and device status includes `moved`. Ordinary chat membership remains in place.
 

@@ -2064,6 +2064,21 @@ mod tests {
         let coadmin = group_management_json(&me, &group, &members, &mls);
         assert_eq!(coadmin["can_leave"], true);
         assert_eq!(coadmin["requires_self_demote_before_leave"], false);
+
+        group.pending_confirmation = true;
+        let pending = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(pending["can_leave"], false);
+        assert_eq!(pending["requires_self_demote_before_leave"], false);
+        group.pending_confirmation = false;
+        assert_eq!(group_management_json(&me, &group, &members, &mls), coadmin);
+
+        group.unrecoverable = true;
+        let unrecoverable = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(unrecoverable["can_leave"], false);
+        assert_eq!(unrecoverable["requires_self_demote_before_leave"], false);
+        group.unrecoverable = false;
+        assert_eq!(group_management_json(&me, &group, &members, &mls), coadmin);
+
         group.leave_requested_at_ms = Some(1);
         assert_eq!(
             group_management_json(&me, &group, &members, &mls)["can_leave"],

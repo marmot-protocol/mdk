@@ -1140,7 +1140,6 @@ pub(crate) struct GroupDetailView {
     pub(crate) description: String,
     pub(crate) members: Vec<GroupMemberRow>,
     pub(crate) relays: Vec<String>,
-    pub(crate) account_is_admin: bool,
     pub(crate) selected: usize,
 }
 
@@ -1169,8 +1168,8 @@ impl GroupDetailView {
 }
 
 /// Combine a group's members with its admin set into the group-detail view,
-/// tagging each member with admin/self flags and deriving the account's own
-/// admin badge. Leave permission is checked by the core command.
+/// tagging each member with admin/self flags. Leave permission is checked by
+/// the core command.
 ///
 /// `self_is_member` is this device's own membership. Another device of the
 /// account keeps its roster entry after this device's removal, so a removed
@@ -1202,7 +1201,6 @@ pub(crate) fn build_group_detail(
         description: description.to_owned(),
         members,
         relays: relays.to_vec(),
-        account_is_admin: admin_ids.iter().any(|admin| is_self(admin)),
         selected: 0,
     }
 }
