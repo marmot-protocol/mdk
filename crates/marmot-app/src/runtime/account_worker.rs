@@ -562,10 +562,8 @@ pub(crate) enum AccountWorkerCommand {
     TurnOffBackups {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
-    SetBackupBackgroundConditions {
-        wifi: bool,
-        charging: bool,
-        respond: oneshot::Sender<Result<(), AppError>>,
+    RunDueBackupPass {
+        respond: oneshot::Sender<Result<Option<watch::Receiver<bool>>, AppError>>,
     },
     BeginBackupRestore {
         words: crate::BackupRestoreWords,
@@ -1972,9 +1970,13 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
         history_blobs: HistoryBlobFlights::default(),
-        backup_background_allowed: Default::default(),
+        backup_background_conditions: shared.backup_background_conditions.clone(),
         worker_lifetime: media_http_worker_lifetime,
     };
+    let mut backup_condition_updates = client
+        .app
+        .device_groups_enabled()
+        .then(|| shared.backup_background_conditions.subscribe());
     // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
     // Spawned before the deferred commands replay, so a repair among them
     // goes through it; its turns wait until a repair or the loop below
@@ -2515,6 +2517,16 @@ async fn run_app_runtime_account_worker(
                         break 'worker;
                     }
                 }
+            }
+            // Settle ready media before a platform wake admits more work.
+            _ = async {
+                backup_condition_updates
+                    .as_mut()
+                    .expect("enabled backup condition subscription")
+                    .changed()
+                    .await
+            }, if backup_condition_updates.is_some() => {
+                dispatch_backup_pass(&mut client, &media_http);
             }
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
@@ -4536,9 +4548,8 @@ struct MediaHttpContext {
     prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
     /// The history upload and fetch running, at most one of each.
     history_blobs: HistoryBlobFlights,
-    /// Reported platform facts, never persisted. A replacement worker starts
-    /// closed; admitted passes retain their existing settlement contract.
-    backup_background_allowed: std::sync::atomic::AtomicBool,
+    /// Shared latest platform facts; the worker owns no independent copy.
+    backup_background_conditions: watch::Sender<super::BackupBackgroundConditions>,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
@@ -4551,7 +4562,9 @@ struct MediaHttpContext {
 struct HistoryBlobFlights {
     upload: std::sync::atomic::AtomicBool,
     fetch: std::sync::atomic::AtomicBool,
-    backup: std::sync::atomic::AtomicBool,
+    /// Sole completion sender stays on the worker, never in detached HTTP
+    /// jobs. Dropping this context closes pending waits on every worker exit.
+    backup: Mutex<Option<watch::Sender<bool>>>,
     restore: std::sync::atomic::AtomicBool,
 }
 
@@ -4620,8 +4633,9 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
 /// Admit new background backup work only under currently reported host
 /// facts. Once admitted, the whole pass and its settlement finish unchanged.
 fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
-    use std::sync::atomic::Ordering;
-    if !media_http.backup_background_allowed.load(Ordering::Relaxed) {
+    if !client.app.device_groups_enabled()
+        || !media_http.backup_background_conditions.borrow().allowed()
+    {
         return;
     }
     let permit = || {
@@ -4629,15 +4643,11 @@ fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
             .then(|| media_http.permits.clone().try_acquire_owned().ok())
             .flatten()
     };
-    if !media_http.history_blobs.backup.load(Ordering::Relaxed)
-        && let Some(permit) = permit()
-    {
+    let backup_running = media_http.history_blobs.backup.lock().unwrap().is_some();
+    if !backup_running && let Some(permit) = permit() {
         match client.prepare_backup_pass() {
             Ok(Some(pass)) => {
-                media_http
-                    .history_blobs
-                    .backup
-                    .store(true, Ordering::Relaxed);
+                *media_http.history_blobs.backup.lock().unwrap() = Some(watch::channel(false).0);
                 spawn_media_http(
                     media_http,
                     permit,
@@ -5017,10 +5027,10 @@ async fn complete_media_http(
         MediaHttpCompletion::BackupPass(outcome) => {
             client.finish_backup_pass(outcome).await;
             drop(permit);
-            media_http
-                .history_blobs
-                .backup
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let completion = media_http.history_blobs.backup.lock().unwrap().take();
+            if let Some(completion) = completion {
+                completion.send_replace(true);
+            }
             return;
         }
         MediaHttpCompletion::Attachment {
@@ -6519,18 +6529,18 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
-        AccountWorkerCommand::SetBackupBackgroundConditions {
-            wifi,
-            charging,
-            respond,
-        } => Box::pin(async move {
-            media_http
-                .backup_background_allowed
-                .store(wifi && charging, std::sync::atomic::Ordering::Relaxed);
-            if wifi && charging {
-                dispatch_history_blobs(client, media_http);
+        AccountWorkerCommand::RunDueBackupPass { respond } => Box::pin(async move {
+            if !respond.is_closed() {
+                dispatch_backup_pass(client, media_http);
+                let completion = media_http
+                    .history_blobs
+                    .backup
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(watch::Sender::subscribe);
+                let _ = respond.send(Ok(completion));
             }
-            let _ = respond.send(Ok(()));
             true
         }),
         AccountWorkerCommand::BeginBackupRestore { words, respond } => Box::pin(async move {
@@ -9777,7 +9787,10 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
-                backup_background_allowed: Default::default(),
+                backup_background_conditions: watch::channel(
+                    crate::runtime::BackupBackgroundConditions::default(),
+                )
+                .0,
                 worker_lifetime,
             },
             rx,
@@ -11026,7 +11039,10 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
-                backup_background_allowed: Default::default(),
+                backup_background_conditions: watch::channel(
+                    crate::runtime::BackupBackgroundConditions::default(),
+                )
+                .0,
                 worker_lifetime: media_http_worker_lifetime,
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
@@ -12080,7 +12096,10 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
-                backup_background_allowed: Default::default(),
+                backup_background_conditions: watch::channel(
+                    crate::runtime::BackupBackgroundConditions::default(),
+                )
+                .0,
                 worker_lifetime,
             };
             let (command_tx, mut commands) = mpsc::channel(4);

@@ -4,3 +4,6 @@
 /build/
 /generated/
 /output/
+
+# Explicit experimental host test-build artifacts.
+/output-dev-device-groups/

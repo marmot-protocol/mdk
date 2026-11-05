@@ -13,6 +13,7 @@ pub(crate) mod chat_presentation;
 pub(crate) mod compromise_warning;
 pub(crate) mod device_activity;
 pub(crate) mod device_group_messages;
+pub(crate) mod device_group_moves;
 pub(crate) mod device_groups;
 pub(crate) mod device_links;
 pub(crate) mod device_removals;

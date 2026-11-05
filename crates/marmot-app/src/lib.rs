@@ -165,22 +165,22 @@ pub use runtime::{
     AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
     AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
     AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
-    AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
-    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
-    OnboardingCheckOutcome, OnboardingCheckPurpose, OnboardingDeviceDiscovery,
-    OnboardingDevicePackage, OnboardingFinding, OnboardingFindingContext, OnboardingIssue,
-    OnboardingOptions, OnboardingRelayCapability, OnboardingRelayRepair, OnboardingRelayRepairMode,
-    OnboardingRelayTag, OnboardingRelayTagChange, OnboardingRelayTagDisposition,
-    OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
-    OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
-    OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription, RuntimeAccountError,
-    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
-    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    AuditOtlpAttemptOutcome, BackgroundBackupOutcome, CatchUpAccountsSummary,
+    ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport, ManagedAccount, MarmotAppEvent,
+    MarmotAppRuntime, OnboardingAction, OnboardingCheckOutcome, OnboardingCheckPurpose,
+    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding,
+    OnboardingFindingContext, OnboardingIssue, OnboardingOptions, OnboardingRelayCapability,
+    OnboardingRelayRepair, OnboardingRelayRepairMode, OnboardingRelayTag, OnboardingRelayTagChange,
+    OnboardingRelayTagDisposition, OnboardingRelayTagRole, OnboardingRepairProposal,
+    OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
+    OnboardingStepState, OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription,
+    RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
+    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
+    SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
 };
 pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
@@ -235,8 +235,9 @@ pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningRea
 pub use client::device_group::ConfirmedDeviceLink;
 pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
 pub use client::device_pairing::{
-    DeviceLinkChoices, DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt,
-    DeviceLinkPromptState, DeviceLinkSnapshot, NewDeviceLinkState,
+    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkChoices,
+    DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt, DeviceLinkPromptState,
+    DeviceLinkSnapshot, NewDeviceLinkState,
 };
 pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};

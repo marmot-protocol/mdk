@@ -453,3 +453,20 @@ retention and group deletion revoke their sources through the ordinary
 acquisition lifecycle. Host applications resolve artwork through
 [`reaction_attachment`](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork)
 and use the returned source slot with existing acquisition and local-read APIs.
+
+### Experimental device-group moves
+
+Migration 0176 adds finite local move records for every account database, including builds with device groups disabled.
+A validated expected roster Welcome records Joined inside the native join transaction. The session's present-selected
+Made proof then captures old roster facts, switches the one trusted row, retires old App delivery/edit debt and owes the
+existing full small-state broadcast/request in one transaction. Taken private-KeyPackage references remain tombstones;
+rejections carry slot facts, never rejected KeyPackages. Already admitted native group-pinned work is not recalled.
+Detached history results carry their preparation's trust row only in memory and act only while it and their original
+owed revision or received delivery remain current. No persistent history journal is introduced.
+
+Custom `DeviceGroupWelcomeStorage` providers retain the default exact expectation consumption but must adopt the
+transactional admission hook to provide move bookkeeping; the default does not promise move recovery. Updated
+providers must also preserve `Group.device_roster_departures` through group writes and snapshots. Legacy stored groups
+decode with an empty field, without inventing past departure causes; Rust struct-literal constructors need the new
+field. The hook runs only on an actual validated expected DeviceRoster Welcome. Ordinary message receive adds no move query. The native
+Group snapshot adds selected roster-departure metadata only for roster groups; ordinary groups keep the empty default.

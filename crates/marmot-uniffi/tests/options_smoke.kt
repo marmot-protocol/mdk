@@ -10,7 +10,7 @@ private class OptionsStore : SecretStore {
     override fun removeSecret(label: String, accountIdHex: String) {}
 }
 
-fun main() {
+fun main(args: Array<String>) {
     val findings = listOf(
         OnboardingFindingFfi(OnboardingIssueFfi.TIMED_OUT, "wss://example.com",
             OnboardingFindingContextFfi.RECORD_DISCOVERY, OnboardingCheckPurposeFfi.RECORD_LOOKUP,
@@ -50,6 +50,21 @@ fun main() {
     try {
         Marmot.newWithConfiguration(root.path, listOf("ws://127.0.0.1:1"), copy).use { kit ->
             check(kit.listAccounts().isEmpty())
+            val experimentalRoot = root.resolve("experimental")
+            if (args.contains("--dev-device-groups")) {
+                Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path,
+                    listOf("ws://127.0.0.1:1"), copy).use { experimental ->
+                    check(experimental.listAccounts().isEmpty())
+                }
+            } else {
+                try {
+                    Marmot.newWithExperimentalDeviceGroups(experimentalRoot.path, emptyList(), copy).close()
+                    error("default native library accepted experimental construction")
+                } catch (error: MarmotKitException.Runtime) {
+                    check(error.details == "experimental_device_groups_unavailable")
+                    check(!experimentalRoot.exists())
+                }
+            }
         }
     } finally {
         root.deleteRecursively()

@@ -626,7 +626,19 @@ typedef enum MarmotLinkedDeviceStatus {
    * It recorded that it is signing out.
    */
   MARMOT_LINKED_DEVICE_STATUS_LEAVING,
+  /**
+   * It moved to another device group; old cleanup keeps its chats.
+   */
+  MARMOT_LINKED_DEVICE_STATUS_MOVED,
 } MarmotLinkedDeviceStatus;
+
+/**
+ * One due background pass's admission/completion, not publication success.
+ */
+typedef enum MarmotBackgroundBackupOutcome {
+  MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED,
+  MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT,
+} MarmotBackgroundBackupOutcome;
 
 /**
  * Aggregate operation phase. Complete does not prove global recovery or
@@ -707,6 +719,16 @@ typedef enum MarmotDeviceLinkEndReason {
    */
   MARMOT_DEVICE_LINK_END_REASON_LINK_FAILED,
 } MarmotDeviceLinkEndReason;
+
+/**
+ * Local move progress; admission alone is Joining, not Made.
+ */
+typedef enum MarmotDeviceGroupMoveState {
+  MARMOT_DEVICE_GROUP_MOVE_STATE_WAITING_FOR_WELCOME,
+  MARMOT_DEVICE_GROUP_MOVE_STATE_JOINING,
+  MARMOT_DEVICE_GROUP_MOVE_STATE_MADE,
+  MARMOT_DEVICE_GROUP_MOVE_STATE_FAILED,
+} MarmotDeviceGroupMoveState;
 
 /**
  * Why a stored group was quarantined instead of hydrated.
@@ -3244,6 +3266,27 @@ typedef struct MarmotDeviceLinkPrompt {
 } MarmotDeviceLinkPrompt;
 
 /**
+ * Private old-sibling guidance, never authority to Add or trust it.
+ */
+typedef struct MarmotDeviceGroupMoveSibling {
+  char *slot_id_hex;
+  char *label;
+  bool question_suppressed;
+} MarmotDeviceGroupMoveSibling;
+
+/**
+ * Local move progress. Freed with the containing link snapshot.
+ */
+typedef struct MarmotDeviceGroupMoveView {
+  char *move_id;
+  enum MarmotDeviceGroupMoveState state;
+  struct MarmotDeviceGroupMoveSibling *old_siblings;
+  uintptr_t old_siblings_len;
+  char **overridden_rejection_slots;
+  uintptr_t overridden_rejection_slots_len;
+} MarmotDeviceGroupMoveView;
+
+/**
  * Linking as this device shows it. `new_device` is NULL unless this
  * device asked to be linked; `prompts` lists the sign-ins it can link.
  */
@@ -3251,6 +3294,8 @@ typedef struct MarmotDeviceLinkSnapshot {
   struct MarmotNewDeviceLinkState *new_device;
   struct MarmotDeviceLinkPrompt *prompts;
   uintptr_t prompts_len;
+  struct MarmotDeviceGroupMoveView *moves;
+  uintptr_t moves_len;
 } MarmotDeviceLinkSnapshot;
 
 /**
@@ -6093,9 +6138,10 @@ typedef enum MarmotEvent_Tag {
   /**
    * Linking a new device may have changed as this device shows it;
    * re-read `marmot_device_link_snapshot`. Also fires once each time the
-   * account's worker opens or reconnects, which ends any link in
-   * progress. Carries no device, session or group identities, and may
-   * fire with no visible change.
+   * account's worker opens or reconnects. Live comparison sessions are
+   * lost then; admitted moves resume from durable progress. Carries no
+   * device, session or group identities, and may fire with no visible
+   * change.
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
   /**
@@ -7020,6 +7066,23 @@ MarmotStatus marmot_client_new_with_configuration(const char *root_path,
                                                   const struct MarmotClientOptions *options,
                                                   const struct MarmotDeployment *deployment,
                                                   struct MarmotClient **out_client);
+
+/**
+ * Open an explicitly experimental device-group test build, with the same
+ * options and ownership as marmot_client_new_with_configuration. Requires a
+ * library built with `dev-device-groups`; unavailable builds return
+ * MARMOT_STATUS_RUNTIME before opening the root or taking callback ownership.
+ * Normal constructors remain disabled even in a capable library.
+ *
+ * # Safety
+ * Same pointer contracts as marmot_client_new_with_configuration.
+ */
+MarmotStatus marmot_client_new_with_experimental_device_groups(const char *root_path,
+                                                               const char *const *relay_urls,
+                                                               uintptr_t relay_urls_len,
+                                                               const struct MarmotClientOptions *options,
+                                                               const struct MarmotDeployment *deployment,
+                                                               struct MarmotClient **out_client);
 
 /**
  * Start the runtime (reconcile accounts, start workers, subscribe
@@ -8297,8 +8360,7 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
 /**
  * List this account's own devices from the roster of the device group
  * this device trusts: this device first, then by when each was linked.
- * Empty until this device trusts a device group, and always empty in
- * release builds until the roster's spec lands. Re-read on the
+ * Empty until this device trusts a device group, and always empty without explicit dev capability and runtime intent. Re-read on the
  * `LinkedDevicesChanged` event. Free with
  * `marmot_linked_device_list_free`.
  *
@@ -8397,8 +8459,21 @@ MarmotStatus marmot_backup_settings(const struct MarmotClient *client,
                                     struct MarmotBackupSettings **out);
 
 /**
- * Report Wi-Fi/charging on worker start and changes; both are required
- * for new background passes. A replacement worker defaults closed.
+ * Report Wi-Fi/charging once per runtime, before workers and on changes.
+ * Worker replacement retains facts; a new runtime is closed. Starts no worker.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_runtime_backup_background_conditions(const struct MarmotClient *client,
+                                                             uint8_t wifi,
+                                                             uint8_t charging);
+
+/**
+ * Compatibility runtime-wide report: validates an active account first.
  * Admitted work settles after false; manual restoration is unaffected.
  *
  * # Safety
@@ -8411,6 +8486,21 @@ MarmotStatus marmot_set_backup_background_conditions(const struct MarmotClient *
                                                      const char *account_ref,
                                                      uint8_t wifi,
                                                      uint8_t charging);
+
+/**
+ * Block for one current/newly admitted due backup pass through settlement.
+ * FinishedAttempt is not publication success. Worker stop is transport-closed;
+ * caller/host lifetime bounds remain its responsibility.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_run_due_backup_pass(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        enum MarmotBackgroundBackupOutcome *out);
 
 /**
  * Begin manual history-only restore. Words borrowed, never retained by
@@ -8474,7 +8564,7 @@ MarmotStatus marmot_backup_history_availability(const struct MarmotClient *clien
  * Whether this device's KeyPackage refresh is overdue because its device
  * group can't take the announcement that must come first; warn the user
  * while it is. Always false until this device trusts a device group,
- * and in release builds until the device group's spec lands. Re-read on
+ * and without explicit dev capability and runtime intent. Re-read on
  * the `KeyPackageRefreshOverdueChanged` event.
  *
  * # Safety
@@ -8598,8 +8688,7 @@ MarmotStatus marmot_chats_closed_to_linked_devices(const struct MarmotClient *cl
 
 /**
  * List the sign-ins of this account that this device does not
- * recognize, the earliest to appear first. Always empty in release
- * builds until the roster's spec lands. Re-read on the
+ * recognize, the earliest to appear first. Always empty without explicit dev capability and runtime intent. Re-read on the
  * `UnrecognizedSignInsChanged` event. Free with
  * `marmot_unrecognized_sign_in_list_free`.
  *
@@ -8646,7 +8735,7 @@ MarmotStatus marmot_start_fresh(const struct MarmotClient *client, const char *a
 /**
  * Whether this device started fresh and still has no device group, so
  * the host can say that only chats it is invited to from now on are
- * here. Always false in release builds until the roster's spec lands.
+ * here. Always false without explicit dev capability and runtime intent.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8663,7 +8752,7 @@ MarmotStatus marmot_started_fresh(const struct MarmotClient *client,
  * rejection the user has not seen here, the earliest gathered first.
  * Empty when no warning is open. The host writes the wording, and never
  * says the account's devices stopped whoever holds the key. Always empty
- * in release builds until the roster's spec lands. Re-read on the
+ * without explicit dev capability and runtime intent. Re-read on the
  * `CompromiseWarningChanged` event. Free with
  * `marmot_compromise_warning_item_list_free`.
  *
@@ -8693,8 +8782,9 @@ MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client
 
 /**
  * On a new device: ask a device of this account already signed in to
- * link this one. Refused in release builds until the pairing and
- * device-group specs land. Re-read on the `DeviceLinkChanged` event.
+ * link this one, or move this already-linked device to that group.
+ * Explicit experimental build and runtime gates are required. Re-read
+ * on the `DeviceLinkChanged` event; inspect `moves` for Joining/Made.
  * Free with `marmot_device_link_snapshot_free`.
  *
  * # Safety
@@ -8734,6 +8824,22 @@ MarmotStatus marmot_confirm_device_link_match(const struct MarmotClient *client,
 MarmotStatus marmot_cancel_device_link(const struct MarmotClient *client,
                                        const char *account_ref,
                                        struct MarmotDeviceLinkSnapshot **out);
+
+/**
+ * Dismiss one local old-sibling recognition hint. Free the returned
+ * snapshot with `marmot_device_link_snapshot_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_dismiss_device_group_move_sibling(const struct MarmotClient *client,
+                                                      const char *account_ref,
+                                                      const char *move_id,
+                                                      const char *slot_id_hex,
+                                                      struct MarmotDeviceLinkSnapshot **out);
 
 /**
  * On a device already signed in: Link device. `label` is the name the

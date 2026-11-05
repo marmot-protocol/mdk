@@ -208,3 +208,207 @@ async fn a_rewind_keeps_the_keys_the_dropped_branch_listed() {
     assert_eq!(recorded(loser, &gid), lost);
     assert_eq!(recorded(winner, &gid), won);
 }
+
+/// A selected cause belongs to its actual source branch and incarnation, not
+/// the bounded observed-ever tag cache. One apply batch may contain both the
+/// moved state and its RemoveDevice-only cleanup. A longer actual rival and a
+/// native snapshot restore must each restore their own departure projection.
+#[tokio::test]
+async fn moved_departure_follows_selected_source_through_batch_rewind_and_snapshot() {
+    use super::device_tag::{hold_slot, set_own_key};
+    use cgka_traits::app_components::DeviceStatusV1;
+    use cgka_traits::group::DeviceRosterDepartureCause;
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let mut tablet = roster_device(b"alice");
+    let mut observer = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop"), (3, "Tablet"), (4, "Observer")]),
+        &mut [&mut laptop, &mut tablet, &mut observer],
+    )
+    .await;
+    hold_slot(&laptop, slot(2));
+    laptop
+        .engine
+        .set_device_tag_group(Some(gid.clone()))
+        .unwrap();
+    set_own_key(
+        &mut laptop,
+        slot(2),
+        &gid,
+        &mut [&mut phone, &mut tablet, &mut observer],
+    )
+    .await;
+    let source = roster_of(&laptop, &gid).devices[&slot(2)].clone();
+    let key = laptop.engine.own_signature_key();
+    let branch_epoch = tablet.engine.epoch(&gid).unwrap();
+    // The tablet remains on the common source and makes a longer valid rival.
+    let mut rival = Vec::new();
+    for _ in 0..3 {
+        rival.push(
+            send_commit(
+                &mut tablet,
+                SendIntent::SelfUpdate {
+                    group_id: gid.clone(),
+                },
+                &gid,
+            )
+            .await,
+        );
+    }
+    let mut moved = source.clone();
+    moved.status = DeviceStatusV1::Moved;
+    let moved = send_commit(
+        &mut laptop,
+        roster_update(
+            &gid,
+            vec![DeviceRosterOperationV1::SetDevice(slot(2), moved)],
+        ),
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut phone, &moved, &gid).await;
+    let cleanup = send_commit(
+        &mut phone,
+        SendIntent::UnlinkDevice {
+            group_id: gid.clone(),
+            leaf_signature_key: key.clone(),
+            roster_update: super::device_roster::update_bytes(vec![
+                DeviceRosterOperationV1::RemoveDevice(slot(2)),
+            ]),
+        },
+        &gid,
+    )
+    .await;
+    for commit in [&moved, &cleanup] {
+        observer
+            .engine
+            .buffer_openmls_convergence_message_at(&gid, commit.clone(), 500)
+            .unwrap();
+    }
+    let applied = observer
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(applied.accepted_commits.len(), 2, "{applied:?}");
+    let cause = observer
+        .engine
+        .group_record(&gid)
+        .unwrap()
+        .device_roster_departures
+        .into_iter()
+        .find(|d| d.slot == slot(2))
+        .expect("selected Moved cleanup retains its actual source");
+    assert_eq!(cause.cause, DeviceRosterDepartureCause::Moved);
+    assert_eq!(cause.tag_signature_key, Some(key.clone()));
+    assert_eq!(cause.linked_at, source.linked_at);
+    assert_eq!(cause.entry_rename_id, source.rename_id);
+    assert_eq!(cause.source_epoch.0, branch_epoch.0 + 1);
+    assert!(
+        !roster_of(&observer, &gid)
+            .rejected_slots
+            .contains_key(&slot(2))
+    );
+    observer
+        .storage
+        .create_group_snapshot(&gid, "selected-moved-departure")
+        .unwrap();
+    // Real branch selection restores the current entry and clears that branch's
+    // moved cause. Remembered keys remain a separate, non-authoritative cache.
+    for reader in [&mut phone, &mut observer] {
+        for commit in &rival {
+            reader
+                .engine
+                .buffer_openmls_convergence_message_at(&gid, commit.clone(), 500)
+                .unwrap();
+        }
+        reader
+            .engine
+            .converge_stored_openmls_messages_at(&gid, 2_000_000)
+            .unwrap();
+        assert!(roster_of(reader, &gid).devices.contains_key(&slot(2)));
+        assert!(
+            reader
+                .engine
+                .group_record(&gid)
+                .unwrap()
+                .device_roster_departures
+                .iter()
+                .all(|d| d.slot != slot(2))
+        );
+    }
+    assert_eq!(roster_of(&phone, &gid), roster_of(&observer, &gid));
+    // An actual ordinary removal on the new selected branch supersedes the
+    // earlier moved cause even for this same device key and slot.
+    let removal = send_commit(
+        &mut tablet,
+        SendIntent::UnlinkDevice {
+            group_id: gid.clone(),
+            leaf_signature_key: key,
+            roster_update: super::device_roster::update_bytes(vec![
+                DeviceRosterOperationV1::RemoveDevice(slot(2)),
+                DeviceRosterOperationV1::SetRejectedSlot(
+                    slot(2),
+                    RejectedSlotV1 {
+                        reason: RejectedSlotReasonV1::Removed,
+                        rejected_at: 1,
+                        tag_signature_key: source.tag_signature_key.clone(),
+                    },
+                ),
+            ]),
+        },
+        &gid,
+    )
+    .await;
+    let before_removal = observer.engine.epoch(&gid).unwrap();
+    observer.engine.ingest(removal.clone()).await.unwrap();
+    let applied = observer
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 3_000_000)
+        .unwrap();
+    let expected = rival
+        .iter()
+        .chain(std::iter::once(&removal))
+        .map(|commit| hex::encode(hash_id(&commit.payload).as_slice()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        applied.accepted_commits, expected,
+        "selected rival prefix plus its removal"
+    );
+    assert_eq!(observer.engine.epoch(&gid).unwrap().0, before_removal.0 + 1);
+    assert_eq!(
+        observer
+            .engine
+            .group_record(&gid)
+            .unwrap()
+            .device_roster_departures
+            .iter()
+            .find(|d| d.slot == slot(2))
+            .unwrap()
+            .cause,
+        DeviceRosterDepartureCause::Ordinary
+    );
+    observer
+        .storage
+        .rollback_group_to_snapshot(&gid, "selected-moved-departure")
+        .unwrap();
+    let storage = observer.storage.clone();
+    drop(observer);
+    let mut reopened = super::device_roster::roster_device_on(storage, b"alice");
+    reopened.engine.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        reopened
+            .engine
+            .group_record(&gid)
+            .unwrap()
+            .device_roster_departures,
+        vec![cause]
+    );
+    assert!(!roster_of(&reopened, &gid).devices.contains_key(&slot(2)));
+    assert!(
+        !roster_of(&reopened, &gid)
+            .rejected_slots
+            .contains_key(&slot(2))
+    );
+}

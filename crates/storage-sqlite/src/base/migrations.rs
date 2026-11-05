@@ -361,6 +361,8 @@ mod migration_0173_recipient_confirmed_sends;
 
 #[path = "migrations/0174_heartbeat_welcome_repair.rs"]
 mod migration_0174_heartbeat_welcome_repair;
+#[path = "migrations/0176_device_group_moves.rs"]
+mod migration_0176_device_group_moves;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1361,6 +1363,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0175_pending_ref_watermark",
         suspend_foreign_keys: &[],
         apply: migration_0175_pending_ref_watermark::apply,
+    },
+    Migration {
+        version: 176,
+        name: "0176_device_group_moves",
+        suspend_foreign_keys: &[],
+        apply: migration_0176_device_group_moves::apply,
     },
 ];
 

@@ -45,6 +45,9 @@ _Static_assert(MARMOT_SIGN_IN_RESPONSE_DISMISS == 2, "sign-in response ABI value
 _Static_assert(MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN == 0, "compromise warning reason ABI value");
 _Static_assert(MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE == 1, "compromise warning reason ABI value");
 
+_Static_assert(MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED == 0, "backup not-started ABI value");
+_Static_assert(MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT == 1, "backup attempt ABI value");
+
 static int failures = 0;
 
 static void ok(const char *what) {
@@ -198,6 +201,13 @@ int main(int argc, char **argv) {
 
     ok("NULL frees are no-ops");
 
+    /* Prove the always-exported experimental constructor links through the
+       checked-in header in shared and static C consumers. Capability/auth
+       behavior is owned by the real two-host secret_store_client test. */
+    check(marmot_client_new_with_experimental_device_groups(NULL, NULL, 0, NULL, NULL, NULL) ==
+              MARMOT_STATUS_NULL_POINTER,
+          "experimental constructor symbol and output preflight");
+
     /* ---- construct + lifecycle ---------------------------------------- */
     const char *relays[] = {"wss://relay.example.org"};
     st = marmot_client_new(home, relays, 1, NULL, &client);
@@ -217,6 +227,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     ok("client constructed");
+
+    st = marmot_set_runtime_backup_background_conditions(client, 0, 0);
+    check(st == MARMOT_STATUS_OK, "runtime backup facts need no account worker");
+    MarmotBackgroundBackupOutcome backup = MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT;
+    st = marmot_run_due_backup_pass(client, "no-account", &backup);
+    check(st == MARMOT_STATUS_OK && backup == MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED,
+          "disabled background backup returns its completion enum without a worker");
 
     st = marmot_record_host_performance(client,
         MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,

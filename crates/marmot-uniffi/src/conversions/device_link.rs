@@ -1,8 +1,9 @@
 //! Linking a new device of this account, as each device's screen shows it.
 
 use marmot_app::{
-    DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkPrompt, DeviceLinkPromptState,
-    DeviceLinkSnapshot, NewDeviceLinkState,
+    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkEmoji,
+    DeviceLinkEndReason, DeviceLinkPrompt, DeviceLinkPromptState, DeviceLinkSnapshot,
+    NewDeviceLinkState,
 };
 
 /// One emoji of the code.
@@ -197,12 +198,70 @@ impl From<DeviceLinkPrompt> for DeviceLinkPromptFfi {
     }
 }
 
+/// Local move progress. Welcome admission alone is Joining, not Made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DeviceGroupMoveStateFfi {
+    WaitingForWelcome,
+    Joining,
+    Made,
+    Failed,
+}
+
+impl From<DeviceGroupMoveState> for DeviceGroupMoveStateFfi {
+    fn from(value: DeviceGroupMoveState) -> Self {
+        match value {
+            DeviceGroupMoveState::WaitingForWelcome => Self::WaitingForWelcome,
+            DeviceGroupMoveState::Joining => Self::Joining,
+            DeviceGroupMoveState::Made => Self::Made,
+            DeviceGroupMoveState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Previously linked sibling guidance, never authority to Add or trust it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceGroupMoveSiblingFfi {
+    pub slot_id_hex: String,
+    pub label: String,
+    pub question_suppressed: bool,
+}
+
+impl From<DeviceGroupMoveSibling> for DeviceGroupMoveSiblingFfi {
+    fn from(value: DeviceGroupMoveSibling) -> Self {
+        Self {
+            slot_id_hex: value.slot_id_hex,
+            label: value.label,
+            question_suppressed: value.question_suppressed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceGroupMoveViewFfi {
+    pub move_id: String,
+    pub state: DeviceGroupMoveStateFfi,
+    pub old_siblings: Vec<DeviceGroupMoveSiblingFfi>,
+    pub overridden_rejection_slots: Vec<String>,
+}
+
+impl From<DeviceGroupMoveView> for DeviceGroupMoveViewFfi {
+    fn from(value: DeviceGroupMoveView) -> Self {
+        Self {
+            move_id: value.move_id,
+            state: value.state.into(),
+            old_siblings: value.old_siblings.into_iter().map(Into::into).collect(),
+            overridden_rejection_slots: value.overridden_rejection_slots,
+        }
+    }
+}
+
 /// Linking as this device shows it: its own new-device link, if any, and
 /// the prompts for sign-ins it can link.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceLinkSnapshotFfi {
     pub new_device: Option<NewDeviceLinkStateFfi>,
     pub prompts: Vec<DeviceLinkPromptFfi>,
+    pub moves: Vec<DeviceGroupMoveViewFfi>,
 }
 
 impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
@@ -210,6 +269,7 @@ impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
         Self {
             new_device: value.new_device.map(Into::into),
             prompts: value.prompts.into_iter().map(Into::into).collect(),
+            moves: value.moves.into_iter().map(Into::into).collect(),
         }
     }
 }

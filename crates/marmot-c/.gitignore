@@ -3,3 +3,6 @@
 # source of truth for the C surface (CI diff-gates it); nothing else here is.
 /build/
 /output/
+
+# Explicit experimental host test-build artifacts.
+/output-dev-device-groups/

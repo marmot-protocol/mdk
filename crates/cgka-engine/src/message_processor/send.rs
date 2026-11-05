@@ -204,6 +204,21 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_record_removed_slot(group_id, roster_update)
                     .await
             }
+            SendIntent::ImportDeviceGroupRejections {
+                group_id,
+                roster_update,
+            } => {
+                self.do_send_import_device_group_rejections(group_id, roster_update)
+                    .await
+            }
+            SendIntent::MarkDeviceGroupMoved {
+                group_id,
+                slot,
+                expected,
+            } => {
+                self.do_send_mark_device_group_moved(group_id, slot, *expected)
+                    .await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (

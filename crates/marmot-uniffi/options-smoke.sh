@@ -3,6 +3,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 smoke_language="${1:-swift}"
+smoke_features="cli"
+smoke_args=()
+if [[ "${2:-}" == --dev-device-groups && $# == 2 ]]; then
+  smoke_features="cli,dev-device-groups"
+  smoke_args+=(--dev-device-groups)
+elif [[ $# -gt 1 ]]; then
+  echo 'Usage: options-smoke.sh swift|kotlin [--dev-device-groups]' >&2
+  exit 2
+fi
 case "$smoke_language" in
   swift) command -v swiftc >/dev/null ;;
   kotlin)
@@ -11,7 +20,7 @@ case "$smoke_language" in
     ;;
   *) echo 'Usage: options-smoke.sh swift|kotlin' >&2; exit 2 ;;
 esac
-cargo build -p marmot-uniffi --features cli --locked
+cargo build -p marmot-uniffi --features "$smoke_features" --locked
 smoke_target="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug"
 case "$(uname -s)" in
   Darwin) smoke_library="$smoke_target/libmarmot_uniffi.dylib" ;;
@@ -25,10 +34,10 @@ if [[ "$smoke_language" == swift ]]; then
   cat "$smoke_dir/marmot_uniffi.swift" crates/marmot-uniffi/tests/options_smoke.swift > "$smoke_dir/CombinedSmoke.swift"
   swiftc -parse-as-library -I "$smoke_dir" -Xcc "-fmodule-map-file=$smoke_dir/marmot_uniffiFFI.modulemap" \
     -L "$smoke_target" -lmarmot_uniffi "$smoke_dir/CombinedSmoke.swift" -o "$smoke_dir/smoke"
-  DYLD_LIBRARY_PATH="$smoke_target" LD_LIBRARY_PATH="$smoke_target" "$smoke_dir/smoke"
+  DYLD_LIBRARY_PATH="$smoke_target" LD_LIBRARY_PATH="$smoke_target" "$smoke_dir/smoke" ${smoke_args[@]+"${smoke_args[@]}"}
 else
   kotlinc "$smoke_dir/dev/ipf/marmotkit/marmot_uniffi.kt" crates/marmot-uniffi/tests/options_smoke.kt \
     -cp "$MDK_KOTLIN_CLASSPATH" -include-runtime -d "$smoke_dir/smoke.jar"
   java -Djna.library.path="$smoke_target" -cp "$smoke_dir/smoke.jar:$MDK_KOTLIN_CLASSPATH" \
-    dev.ipf.marmotkit.Options_smokeKt
+    dev.ipf.marmotkit.Options_smokeKt ${smoke_args[@]+"${smoke_args[@]}"}
 fi

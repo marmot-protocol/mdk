@@ -428,6 +428,9 @@ jobs:
       - name: Alloc-audit tests
         run: cargo test -p marmot-c --features alloc-audit --locked
 
+      - name: Experimental device-group C host tests
+        run: cargo test -p marmot-c --test secret_store_client --features dev-device-groups --locked
+
       - name: Compile and run debug C smoke test (gcc)
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
