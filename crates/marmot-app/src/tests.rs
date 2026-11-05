@@ -12426,6 +12426,22 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    client.runtime_telemetry = Some(telemetry.clone());
+    let skips = || {
+        let count = |op| {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == op)
+                .map_or(0, |snapshot| snapshot.completed)
+        };
+        (
+            count(crate::RuntimePerformanceOperation::ProjectionCheckpointSkipped),
+            count(crate::RuntimePerformanceOperation::ProjectionCheckpointSkippedInvalidated),
+        )
+    };
     // A second connection to the account database sees every commit the
     // client makes, as another process would.
     let probe = {
@@ -12552,6 +12568,7 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         .unwrap();
     save(&mut client, &probe);
     assert_eq!(save(&mut client, &probe), (false, false), "settled");
+    let (skipped, invalidated) = skips();
     let other = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     other
         .set_group_archived("alice", &hex::encode(group_id.as_slice()), true)
@@ -12562,6 +12579,39 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         "a foreign commit invalidates the chat list without a write"
     );
     assert_eq!(save(&mut client, &probe), (false, false), "only once");
+    assert_eq!(
+        skips(),
+        (skipped + 1, invalidated + 1),
+        "each skip counts as invalidating or not"
+    );
+
+    // A foreign commit can land before a reopened client's first
+    // checkpoint. That skip has no version to compare, so it invalidates
+    // too, and the warmed list shows the change.
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let archived = |app: &MarmotApp| {
+        app.chat_list("alice", true)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.group_id_hex == group_hex)
+            .map(|row| row.archived)
+    };
+    assert_eq!(archived(&app), Some(true), "the list is warm");
+    other
+        .set_group_archived("alice", &group_hex, false)
+        .unwrap();
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "the first skip after open invalidates without a write"
+    );
+    assert_eq!(
+        archived(&app),
+        Some(false),
+        "and the list picks the change up"
+    );
 }
 
 #[test]

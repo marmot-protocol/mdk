@@ -21,7 +21,10 @@ pub(super) const PARTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
 /// Whether any partial has passed its expiry, answered from the
 /// `attachment_partial_expiry` index.
 pub(crate) const EXPIRED_PARTIAL_PROBE: &str =
-    "SELECT EXISTS(SELECT 1 FROM attachment_partial WHERE expires_at<=?1)";
+    "SELECT EXISTS(SELECT 1 FROM attachment_partial p WHERE p.expires_at<=?1
+     AND NOT (p.expires_at>?2 AND EXISTS(SELECT 1 FROM attachment_acquisition q
+         WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
+         AND q.storage_blocked_headroom IS NOT NULL)))";
 /// Longest a storage-parked job keeps its prefix, measured from its latest
 /// park. A parked prefix is exempt from the idle expiry until then, so it
 /// survives while the user frees space, but it cannot hold its disk and its
@@ -484,12 +487,15 @@ impl SqliteAppStorage {
             .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
         let conn = self.lock()?;
         // Probe before compiling the DELETE, as for expired acquisitions
-        // (mdk#2923). The probe ignores the storage-blocked exemption, so it
-        // may admit a DELETE that removes nothing, never skip one that would.
+        // (mdk#2923). The probe uses the DELETE's own eligibility, storage-
+        // parked exemption included, so a parked prefix still inside its
+        // exemption does not run the DELETE on every pass.
         let expired: bool = conn
-            .query_row_cached(EXPIRED_PARTIAL_PROBE, params![u64_to_i64(now)?], |row| {
-                row.get(0)
-            })
+            .query_row_cached(
+                EXPIRED_PARTIAL_PROBE,
+                params![u64_to_i64(now)?, u64_to_i64(exempt_after)?],
+                |row| row.get(0),
+            )
             .storage()?;
         if !expired {
             return Ok(0);

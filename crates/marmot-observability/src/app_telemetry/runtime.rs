@@ -109,6 +109,8 @@ operations! {
     StorageTransaction => "storage_transaction",
     StorageWriteBegin => "storage_write_begin",
     ProjectionCheckpoint => "projection_checkpoint",
+    ProjectionCheckpointSkipped => "projection_checkpoint_skipped",
+    ProjectionCheckpointSkippedInvalidated => "projection_checkpoint_skipped_invalidated",
     HostConversationLocalVisible => "host_conversation_local_visible",
     HostConversationComposerReady => "host_conversation_composer_ready",
     HostLinuxStartupBeforeVault => "host_linux_startup_before_vault",

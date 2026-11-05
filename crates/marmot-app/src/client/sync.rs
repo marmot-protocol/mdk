@@ -6968,23 +6968,38 @@ impl AppClient {
     /// A skipped checkpoint still invalidates the chat list when another
     /// connection committed since the last checkpoint: the save it replaces marked
     /// the list stale, and that was how a change another runtime made, such
-    /// as archiving a chat, reached this runtime's warmed list. Commits by
-    /// this process's engine connection also move the version, so this can
-    /// invalidate more often than needed, never less.
+    /// as archiving a chat, reached this runtime's warmed list. The first
+    /// skip after open, or after a failed read, has no version to compare
+    /// and invalidates too. Commits by this process's engine connection also
+    /// move the version, so this can invalidate more often than needed,
+    /// never less.
     fn invalidate_chat_list_after_foreign_commit(
         &mut self,
         storage: Option<storage_sqlite::SqliteAccountStorage>,
     ) {
         let version =
             storage.and_then(|storage| storage.app_storage().foreign_commit_version().ok());
-        if version.is_none()
-            || self
-                .observed_commit_version
-                .is_some_and(|previous| Some(previous) != version)
-        {
+        // An unknown previous version, the first skip after open or after a
+        // failed read, cannot rule out a foreign commit before it, so it
+        // invalidates too: at most one extra rebuild per open.
+        let invalidate = version.is_none() || self.observed_commit_version != version;
+        if invalidate {
             self.app.invalidate_chat_list_projection(&self.state.label);
         }
         self.observed_commit_version = version;
+        // Zero-duration counts: how often a skip still costs a chat-list
+        // rebuild tells whether something commits on idle ticks.
+        if let Some(telemetry) = self.runtime_telemetry.as_ref() {
+            telemetry.record_runtime(
+                if invalidate {
+                    RuntimeOp::ProjectionCheckpointSkippedInvalidated
+                } else {
+                    RuntimeOp::ProjectionCheckpointSkipped
+                },
+                std::time::Duration::ZERO,
+                TelemetryOutcome::Success,
+            );
+        }
     }
 
     /// Withdraw app rows when the engine actually discarded this device's queue.
