@@ -262,7 +262,9 @@ for reconnect/backoff and relay status mechanics.
   id or payload past the watch.
 - The same tap counts, per REQ, the EVENT frames its relay sends before that REQ's EOSE, valid or not, on the
   connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
-  `NostrRelayClient::reply_sent_nothing` as it dispatches each EOSE, and the live count keeps the answer as
+  `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE
+  for the id not yet asked about, true only if that is also the newest (the SDK may have re-sent the id and had it
+  answered before the dispatch); every EOSE frame is counted, even with no count open. The live count keeps the answer as
   `ReplayLiveCount::sent_nothing` only when the SDK counted nothing either; `marmot-app` lets only that empty count
   prove its window. Err toward unknown: a frame the tap cannot tie to one REQ while counts are open (an unreadable EVENT
   id, an oversized EOSE, a binary frame) spoils every open count on its connection; a REQ re-sent on the same

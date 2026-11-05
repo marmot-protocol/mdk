@@ -151,13 +151,14 @@ impl EoseHints {
         self.relays.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether `endpoint` sent no EVENT frame at all for the REQ
-    /// `subscription_id` before that REQ's EOSE, as read off the wire. False
-    /// while unknown or unanswered, and once another REQ re-used the id.
+    /// Ask once about each EOSE for `subscription_id` the client dispatches
+    /// from `endpoint`, in the order it dispatches them: whether the relay
+    /// sent no EVENT frame at all for the REQ that EOSE ended, before it, as
+    /// read off the wire. False whenever the tap cannot tell, including for
+    /// an EOSE older than another one read for the id since.
     pub(crate) fn sent_nothing(&self, endpoint: &RelayUrl, subscription_id: &str) -> bool {
         self.replies
-            .answered(<&Url>::from(endpoint).as_str(), subscription_id)
-            == Some(0)
+            .ask(<&Url>::from(endpoint).as_str(), subscription_id)
     }
 
     /// A frame the client sends `relay`: the first one-filter REQ carrying a
@@ -242,15 +243,25 @@ impl EoseHints {
 }
 
 /// Most REQs whose replies the tap counts on one relay. Past it the oldest
-/// goes, and its EOSE reads as unknown.
+/// goes, and every EOSE ask about it answers false.
 const MAX_REPLIES_PER_RELAY: usize = 1024;
 
 /// What each relay sent for each REQ the client sent it, by relay URL as the
 /// transport connects to it, then by subscription id.
+///
+/// The client asks about each EOSE as it dispatches it, an arbitrary time
+/// after the tap read it; by then the SDK may have sent the id's REQ again
+/// and the relay answered that one too. So each id counts the EOSE frames
+/// read for it and not yet asked about, across the REQs that re-use it. An
+/// ask answers the oldest of them, since the client dispatches EOSEs in the
+/// order the relay sent them, and says the relay sent nothing only when that
+/// EOSE is also the newest, and it ended the current REQ's count at zero.
+/// An ask the tap cannot match to an EOSE it read answers false, and so do
+/// the rest of the id's asks while a frame stays unmatched.
 #[derive(Default)]
 struct ReplyCounts {
-    /// Counts still waiting for their EOSE, on every relay. With none,
-    /// received frames skip the lock.
+    /// Counts still waiting for their EOSE, on every relay. With none, frames
+    /// other than an EOSE skip the lock.
     open: AtomicUsize,
     relays: Mutex<HashMap<String, RelayReplies>>,
 }
@@ -258,8 +269,8 @@ struct ReplyCounts {
 #[derive(Default)]
 struct RelayReplies {
     by_id: HashMap<String, Reply>,
-    /// Ids in the order their REQs went out, with each REQ's stamp. An entry
-    /// whose stamp is no longer its id's was replaced.
+    /// Ids in the order their entries were made, with each entry's stamp. An
+    /// entry whose stamp is no longer its id's was replaced.
     order: VecDeque<(u64, String)>,
     next_stamp: u64,
 }
@@ -271,6 +282,13 @@ struct Reply {
     connection: u64,
     stamp: u64,
     state: ReplyState,
+    /// EOSE frames read for this id, under this REQ or an earlier one, that
+    /// no ask has answered yet.
+    unasked: usize,
+    /// The newest of them ended this REQ's count.
+    newest_answers: bool,
+    /// The client closed the id: the entry goes once its asks are answered.
+    closed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,30 +316,67 @@ impl ReplyState {
     }
 }
 
-/// What one received frame can do to the counts on its connection.
+/// What one received frame can do to the counts.
 enum Received {
     Event(String),
     Eose(String),
     Closed(String),
     /// Ends and counts nothing.
     Other,
-    /// It may be any open REQ's EVENT or EOSE.
+    /// An EOSE too long for the tap to read: the SDK may still end any REQ
+    /// with it, and the client may ask about it.
+    UnreadableEose,
+    /// A frame the SDK cannot dispatch, but the relay may have meant as any
+    /// open REQ's EVENT; a binary frame too.
     Unattributed,
 }
 
 impl Received {
-    /// Read the frame as the SDK would dispatch it. Anything that could be an
-    /// open REQ's EVENT or EOSE but cannot be tied to its id is
-    /// [`Received::Unattributed`].
+    /// Read the frame as the SDK would dispatch it.
     fn read(text: &str) -> Self {
         match head_verb(text).as_deref() {
             None => Self::Unattributed,
             Some("EVENT") => second_string(text).map_or(Self::Unattributed, Self::Event),
-            Some("EOSE") if text.len() > MAX_EOSE_FRAME => Self::Unattributed,
+            Some("EOSE") if text.len() > MAX_EOSE_FRAME => Self::UnreadableEose,
             Some("EOSE") => read_eose(text).map_or(Self::Other, |(id, _)| Self::Eose(id)),
             Some("CLOSED") => second_string(text).map_or(Self::Other, Self::Closed),
             Some(_) => Self::Other,
         }
+    }
+}
+
+impl RelayReplies {
+    /// Make `id`'s entry, replacing any earlier one, and evict the oldest
+    /// past the bound. Returns what the entry replaced, and what left the
+    /// open set.
+    fn insert(&mut self, id: &str, reply: Reply) -> Vec<ReplyState> {
+        let mut left = Vec::new();
+        if let Some(previous) = self.by_id.insert(id.to_owned(), reply) {
+            left.push(previous.state);
+        }
+        self.order.push_back((reply.stamp, id.to_owned()));
+        while self.by_id.len() > MAX_REPLIES_PER_RELAY
+            || self.order.len() > 2 * MAX_REPLIES_PER_RELAY
+        {
+            let Some((stamp, id)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .by_id
+                .get(&id)
+                .is_some_and(|reply| reply.stamp == stamp)
+                && let Some(evicted) = self.by_id.remove(&id)
+            {
+                left.push(evicted.state);
+            }
+        }
+        left
+    }
+
+    fn stamp(&mut self) -> u64 {
+        let stamp = self.next_stamp;
+        self.next_stamp += 1;
+        stamp
     }
 }
 
@@ -354,8 +409,7 @@ impl ReplyCounts {
     fn opened(&self, relay: &str, connection: u64, id: &str) {
         let mut relays = self.lock();
         let replies = relays.entry(relay.to_owned()).or_default();
-        let stamp = replies.next_stamp;
-        replies.next_stamp += 1;
+        let stamp = replies.stamp();
         let previous = replies.by_id.get(id).copied();
         // On the same connection, an EOSE still owed to the REQ this one
         // replaces could not be told from this one's.
@@ -366,41 +420,25 @@ impl ReplyCounts {
         } else {
             ReplyState::Open { events: 0 }
         };
-        if let Some(previous) = previous {
-            self.leaving(previous.state);
-        }
         if state.is_open() {
             self.open.fetch_add(1, Ordering::AcqRel);
         }
-        replies.by_id.insert(
-            id.to_owned(),
-            Reply {
-                connection,
-                stamp,
-                state,
-            },
-        );
-        replies.order.push_back((stamp, id.to_owned()));
-        while replies.by_id.len() > MAX_REPLIES_PER_RELAY
-            || replies.order.len() > 2 * MAX_REPLIES_PER_RELAY
-        {
-            let Some((stamp, id)) = replies.order.pop_front() else {
-                break;
-            };
-            if replies
-                .by_id
-                .get(&id)
-                .is_some_and(|reply| reply.stamp == stamp)
-                && let Some(evicted) = replies.by_id.remove(&id)
-            {
-                self.leaving(evicted.state);
-            }
+        let reply = Reply {
+            connection,
+            stamp,
+            state,
+            unasked: previous.map_or(0, |previous| previous.unasked),
+            newest_answers: false,
+            closed: false,
+        };
+        for left in replies.insert(id, reply) {
+            self.leaving(left);
         }
     }
 
     /// The client closed `id`. Its EOSE may still be on the way, so a count
     /// that could still be answered stays, as unknown, until the id's next
-    /// REQ replaces it.
+    /// REQ replaces it; one still to be asked about stays until it is.
     fn closed_by_client(&self, relay: &str, id: &str) {
         let mut relays = self.lock();
         let Some(replies) = relays.get_mut(relay) else {
@@ -412,6 +450,9 @@ impl ReplyCounts {
         if reply.state.may_answer() {
             self.leaving(reply.state);
             reply.state = ReplyState::Unknown;
+            reply.closed = true;
+        } else if reply.unasked > 0 {
+            reply.closed = true;
         } else {
             replies.by_id.remove(id);
         }
@@ -427,30 +468,36 @@ impl ReplyCounts {
     /// A frame `relay` sends on `connection`; `None` for a binary frame,
     /// which the SDK ignores but the relay may have meant as anything.
     fn received(&self, relay: &str, connection: u64, text: Option<&str>) {
-        if self.open.load(Ordering::Acquire) == 0 {
-            return;
-        }
         let frame = text.map_or(Received::Unattributed, Received::read);
-        if matches!(frame, Received::Other) {
-            return;
+        match frame {
+            Received::Other => return,
+            // The client may ask about any EOSE, counted or not.
+            Received::Eose(_) | Received::UnreadableEose => {}
+            _ if self.open.load(Ordering::Acquire) == 0 => return,
+            _ => {}
         }
         let mut relays = self.lock();
-        let Some(replies) = relays.get_mut(relay) else {
-            return;
-        };
-        let (id, next) = match &frame {
+        let replies = relays.entry(relay.to_owned()).or_default();
+        let (id, end) = match &frame {
             Received::Event(id) => (id, None),
-            Received::Eose(id) => (id, Some(Answer::Eose)),
-            Received::Closed(id) => (id, Some(Answer::Refused)),
+            Received::Eose(id) => {
+                self.eose(replies, connection, id);
+                return;
+            }
+            Received::Closed(id) => (id, Some(ReplyState::Refused)),
             Received::Other => return,
-            Received::Unattributed => {
-                for reply in replies
-                    .by_id
-                    .values_mut()
-                    .filter(|reply| reply.connection == connection && reply.state.is_open())
-                {
-                    self.leaving(reply.state);
-                    reply.state = ReplyState::Unknown;
+            Received::UnreadableEose | Received::Unattributed => {
+                for reply in replies.by_id.values_mut() {
+                    if reply.connection == connection && reply.state.is_open() {
+                        self.leaving(reply.state);
+                        reply.state = ReplyState::Unknown;
+                    }
+                    // It may be any id's EOSE, and its ask can be told from
+                    // none of theirs.
+                    if matches!(frame, Received::UnreadableEose) {
+                        reply.unasked += 1;
+                        reply.newest_answers = false;
+                    }
                 }
                 return;
             }
@@ -465,30 +512,66 @@ impl ReplyCounts {
         let ReplyState::Open { events } = reply.state else {
             return;
         };
-        reply.state = match next {
-            None => ReplyState::Open { events: events + 1 },
-            Some(Answer::Eose) => ReplyState::Answered { events },
-            Some(Answer::Refused) => ReplyState::Refused,
-        };
-        if next.is_some() {
+        reply.state = end.unwrap_or(ReplyState::Open { events: events + 1 });
+        if end.is_some() {
             self.open.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
-    /// The EVENT frames `relay` sent for `id` before its EOSE, once answered.
-    fn answered(&self, relay: &str, id: &str) -> Option<usize> {
-        match self.lock().get(relay)?.by_id.get(id)?.state {
-            ReplyState::Answered { events } => Some(events),
-            ReplyState::Open { .. } | ReplyState::Refused | ReplyState::Unknown => None,
+    /// An EOSE for `id` on `connection`: one more ask to answer, and the end
+    /// of the REQ's count when it is open on this connection.
+    fn eose(&self, replies: &mut RelayReplies, connection: u64, id: &str) {
+        if let Some(reply) = replies.by_id.get_mut(id) {
+            reply.unasked += 1;
+            reply.newest_answers = false;
+            if reply.connection == connection
+                && let ReplyState::Open { events } = reply.state
+            {
+                reply.state = ReplyState::Answered { events };
+                reply.newest_answers = true;
+                self.open.fetch_sub(1, Ordering::AcqRel);
+            }
+            return;
+        }
+        // No REQ the tap knows of: keep the ask, so a later REQ with the id
+        // cannot answer it.
+        let stamp = replies.stamp();
+        let reply = Reply {
+            connection,
+            stamp,
+            state: ReplyState::Unknown,
+            unasked: 1,
+            newest_answers: false,
+            closed: true,
+        };
+        for left in replies.insert(id, reply) {
+            self.leaving(left);
         }
     }
-}
 
-/// How a frame ends an open count.
-#[derive(Clone, Copy)]
-enum Answer {
-    Eose,
-    Refused,
+    /// Answer the oldest EOSE read for `id` on `relay` that no ask has
+    /// answered yet: whether the relay sent no EVENT frame before it, for the
+    /// REQ it ended.
+    fn ask(&self, relay: &str, id: &str) -> bool {
+        let mut relays = self.lock();
+        let Some(replies) = relays.get_mut(relay) else {
+            return false;
+        };
+        let Some(reply) = replies.by_id.get_mut(id) else {
+            return false;
+        };
+        let Some(unasked) = reply.unasked.checked_sub(1) else {
+            return false;
+        };
+        reply.unasked = unasked;
+        let sent_nothing = unasked == 0
+            && reply.newest_answers
+            && reply.state == ReplyState::Answered { events: 0 };
+        if unasked == 0 && reply.closed && !reply.state.may_answer() {
+            replies.by_id.remove(id);
+        }
+        sent_nothing
+    }
 }
 
 /// The longest subscription id token the tap reads from an EVENT or CLOSED
@@ -1027,15 +1110,14 @@ mod tests {
                 .replies
                 .received(&key(), connection, Some(&format!(r#"["EOSE","{id}"]"#)));
         }
+        // Once answered, a count is not spoiled.
+        hints.replies.received(&key(), 1, None);
         assert!(!hints.sent_nothing(&relay(), "live"));
         assert!(!hints.sent_nothing(&relay(), "next"));
         assert!(
             hints.sent_nothing(&relay(), "elsewhere"),
             "only counts open on the frame's connection"
         );
-        // Once answered, a count is not spoiled.
-        hints.replies.received(&key(), 1, None);
-        assert!(hints.sent_nothing(&relay(), "elsewhere"));
         assert_eq!(hints.replies.open.load(Ordering::Acquire), 0);
     }
 
@@ -1056,21 +1138,96 @@ mod tests {
         assert_eq!(hints.replies.open.load(Ordering::Acquire), 0);
     }
 
+    /// The client dispatches each EOSE an arbitrary time after the tap read
+    /// it: by then the SDK may have sent the REQ again on a new connection,
+    /// and the relay answered that one empty. Each ask answers only its own
+    /// EOSE (mdk#2660 round 8).
+    #[test]
+    fn an_eose_answers_only_the_ask_its_dispatch_makes() {
+        let resent_and_answered = |hints: &EoseHints| {
+            hints.replies.sent(&key(), 1, &req("live", vec![filter(0)]));
+            hints.replies.received(&key(), 1, Some(LIVE_EOSE));
+        };
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        hints
+            .replies
+            .received(&key(), 0, Some(r#"["EVENT","live",{}]"#));
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        resent_and_answered(&hints);
+        assert!(
+            !hints.sent_nothing(&relay(), "live"),
+            "the first EOSE's relay sent an EVENT frame"
+        );
+        assert!(
+            hints.sent_nothing(&relay(), "live"),
+            "the second's sent none"
+        );
+        assert!(
+            !hints.sent_nothing(&relay(), "live"),
+            "no EOSE left to ask about"
+        );
+
+        // Asked before the REQ goes out again, each EOSE still gets its own.
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        hints
+            .replies
+            .received(&key(), 0, Some(r#"["EVENT","live",{}]"#));
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        assert!(!hints.sent_nothing(&relay(), "live"));
+        resent_and_answered(&hints);
+        assert!(hints.sent_nothing(&relay(), "live"));
+
+        // An EOSE for an id with no REQ the tap knows of keeps its ask from
+        // the next REQ's answer.
+        let hints = EoseHints::default();
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        resent_and_answered(&hints);
+        assert!(!hints.sent_nothing(&relay(), "live"));
+        assert!(hints.sent_nothing(&relay(), "live"));
+
+        // An EOSE too long to read may be any id's, so no ask is matched
+        // to the answered one any more.
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        let padding = serde_json::to_string(&vec!["x"; MAX_EOSE_FRAME]).unwrap();
+        hints.replies.received(
+            &key(),
+            0,
+            Some(&format!(r#"["EOSE","other",["more",{padding}]]"#)),
+        );
+        assert!(!hints.sent_nothing(&relay(), "live"));
+        assert!(!hints.sent_nothing(&relay(), "live"));
+
+        // Asks with no EOSE read answer nothing.
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        assert!(!hints.sent_nothing(&relay(), "live"));
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        assert!(hints.sent_nothing(&relay(), "live"));
+    }
+
     #[test]
     fn an_id_reused_while_its_relay_may_still_answer_is_unknown() {
+        // Every EOSE is asked about at the end, in order, as a lagging
+        // dispatcher would.
         let after = |frames: &[(bool, &str)]| {
             let hints = EoseHints::default();
+            let mut eoses = 0;
             for (sent, frame) in frames {
                 if *sent {
                     hints.replies.sent(&key(), 0, frame);
                 } else {
+                    eoses += usize::from(*frame == LIVE_EOSE);
                     hints.replies.received(&key(), 0, Some(frame));
                 }
             }
-            (
-                hints.sent_nothing(&relay(), "live"),
-                hints.replies.open.load(Ordering::Acquire),
-            )
+            let asks = (0..eoses)
+                .map(|_| hints.sent_nothing(&relay(), "live"))
+                .collect::<Vec<_>>();
+            (asks, hints.replies.open.load(Ordering::Acquire))
         };
         let req = req("live", vec![filter(0)]);
         let close = ClientMessage::close(SubscriptionId::new("live")).as_json();
@@ -1087,12 +1244,12 @@ mod tests {
         // Sent again before its EOSE: the next EOSE may answer either REQ.
         assert_eq!(
             run(vec![sent(&req), sent(&req), got(LIVE_EOSE)]),
-            (false, 0)
+            (vec![false], 0)
         );
         // Closed by the client: its EOSE may still be on the way.
         assert_eq!(
             run(vec![sent(&req), sent(&close), sent(&req), got(LIVE_EOSE)]),
-            (false, 0)
+            (vec![false], 0)
         );
         // Unknown stays unknown when sent again on the same connection.
         assert_eq!(
@@ -1102,13 +1259,14 @@ mod tests {
                 sent(&req),
                 got(LIVE_EOSE)
             ]),
-            (false, 0)
+            (vec![false], 0)
         );
         // After its EOSE, or after the relay refused it, nothing more is owed
-        // to it, so the next REQ with the id counts afresh.
+        // to it, so the next REQ with the id counts afresh; the first EOSE's
+        // ask is still its own.
         assert_eq!(
             run(vec![sent(&req), got(LIVE_EOSE), sent(&req), got(LIVE_EOSE)]),
-            (true, 0)
+            (vec![false, true], 0)
         );
         assert_eq!(
             run(vec![
@@ -1117,12 +1275,13 @@ mod tests {
                 sent(&req),
                 got(LIVE_EOSE),
             ]),
-            (true, 0)
+            (vec![true], 0)
         );
-        // An answered count the client closes is forgotten.
+        // A count the client closes before its EOSE is asked about still
+        // answers that ask, as a join's restart does.
         assert_eq!(
             run(vec![sent(&req), got(LIVE_EOSE), sent(&close)]),
-            (false, 0)
+            (vec![true], 0)
         );
     }
 

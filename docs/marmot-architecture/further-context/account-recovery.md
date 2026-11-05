@@ -592,7 +592,9 @@ through the second before the request. The tap answers only when it can tie ever
 REQ. A frame it cannot attribute while the REQ is open (an EVENT whose id it cannot read, an
 EOSE too long to read, a binary frame), an id re-sent on the connection while the relay may
 still answer the earlier REQ, or a count evicted from its bound leaves the answer unknown, and
-the count proves nothing. A non-empty count keeps the rule above. Without this, each join, which
+the count proves nothing. The client dispatches an EOSE some time after the tap reads it, and by
+then the id may have gone out again and been answered anew, so the tap answers each dispatched
+EOSE in order and only for the newest one it read. A non-empty count keeps the rule above. Without this, each join, which
 restarts every live REQ, left every quiet route a sliver between the two REQs that only a sweep
 could prove: one attempt per route per relay per join, so a burst of joins spent the account's
 hourly budget (mdk#2660).

@@ -889,11 +889,14 @@ pub trait NostrRelayClient: Send + Sync {
 
     /// Whether `endpoint` sent no EVENT frame at all, valid or not, for the
     /// REQ `subscription_id` before that REQ's EOSE, as read off the wire of
-    /// `account`'s pool. Asked as that EOSE is dispatched. A live count that
-    /// delivered nothing proves its window only on this answer, so an
-    /// implementation must err toward false: when it cannot read the wire,
-    /// cannot tell the REQ from another with its id, or has no context for
-    /// the account.
+    /// `account`'s pool. Asked once for each EOSE the client dispatches, in
+    /// the order it dispatches them, and each answer is about that EOSE alone:
+    /// by the time it is dispatched the id may have gone out again and been
+    /// answered anew. A live count that delivered nothing proves its window
+    /// only on this answer, so an implementation must err toward false: when
+    /// it cannot read the wire, cannot tell the REQ from another with its id,
+    /// cannot tie the ask to one EOSE it read, or has no context for the
+    /// account.
     async fn reply_sent_nothing(
         &self,
         _account: Option<&MemberId>,
