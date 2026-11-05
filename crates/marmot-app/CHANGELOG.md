@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep uncertain SDK sends pending for ordinary recovery when a later internal retry is refused; acknowledgements
+  still succeed. This covers one SDK call. Authentication fallback between calls remains an unresolved boundary.
+
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
   class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
 
