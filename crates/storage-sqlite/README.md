@@ -332,8 +332,8 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   revision and one probe a newer loss can earn) or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
   byte budget, each unit's parked and retired spans and the capture ranges it fences (migration 0135) sit beside it. `settle_recovery_unit` applies one quantum's
   outcome in one transaction with policy values the caller passes; `settle_recovery_unit_saturated` also records
-  whether an answered quantum stopped on a second its relay cannot prove (`saturated`, migration 0151), which only
-  an answered quantum sets or clears; a unit's debt is the route goal minus that relay's
+  the second an answered quantum stopped on because its relay cannot prove it (`saturated_second`, migration 0151),
+  which only an answered quantum sets or clears and a change in the relay's recorded caps clears; a unit's debt is the route goal minus that relay's
   coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
   coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
   write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. A re-check

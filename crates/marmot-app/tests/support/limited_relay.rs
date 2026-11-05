@@ -1,4 +1,5 @@
-//! Shared relay fixture with a truthful NIP-11 page limit.
+//! Shared relay fixture with a truthful NIP-11 page: the filter limit the
+//! relay enforces, or none when it enforces none.
 //!
 //! Tests of ingestion and projection must reach those seams without depending
 //! on unknown-cap, tied-second replay fences. Unknown-limit behavior has its
@@ -23,9 +24,25 @@ impl Drop for TestRelay {
 }
 
 pub(crate) async fn mock_relay() -> (TestRelay, String) {
+    relay_publishing(Some(500)).await
+}
+
+/// A relay that enforces and publishes `limit`, or publishes a page with no
+/// limit and enforces none.
+pub(crate) async fn relay_publishing(limit: Option<usize>) -> (TestRelay, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    let relay = LocalRelay::new(RelayBuilder::default().max_filter_limit(500));
+    let (builder, body) = match limit {
+        Some(limit) => (
+            RelayBuilder::default().max_filter_limit(limit),
+            format!(r#"{{"supported_nips":[],"limitation":{{"max_limit":{limit}}}}}"#),
+        ),
+        None => (
+            RelayBuilder::default(),
+            r#"{"supported_nips":[]}"#.to_owned(),
+        ),
+    };
+    let relay = LocalRelay::new(builder);
     relay.run().await.unwrap();
     let upstream = relay.url().await.to_string();
     let upstream = upstream
@@ -41,6 +58,7 @@ pub(crate) async fn mock_relay() -> (TestRelay, String) {
                 accepted = listener.accept() => {
                     let (mut client, _) = accepted.unwrap();
                     let upstream = upstream.clone();
+                    let body = body.clone();
                     connections.spawn(async move {
                         let mut header = Vec::new();
                         let read_header = async {
@@ -58,7 +76,6 @@ pub(crate) async fn mock_relay() -> (TestRelay, String) {
                                 name.eq_ignore_ascii_case("accept") && value.contains("application/nostr+json"))
                         });
                         if info {
-                            let body = r#"{"supported_nips":[],"limitation":{"max_limit":500}}"#;
                             let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = client.write_all(reply.as_bytes()).await;
                         } else if let Ok(mut server) = TcpStream::connect(&upstream).await

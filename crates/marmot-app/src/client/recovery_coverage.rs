@@ -510,6 +510,42 @@ fn retention_floor(now: u64) -> u64 {
     now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS)
 }
 
+/// How far the retention floor moves before the recovery runner's debt turns
+/// prune the ledger again: history that leaves the window ages out within
+/// about this long, and no turn but the first in this span pays for a prune.
+const RUNNER_RETENTION_PRUNE_STEP_SECS: u64 = 60 * 60;
+
+impl AppClient {
+    /// Age the ledger out of the retention window, as grant settlement's
+    /// shadow report did before the runner owned debt (mdk#2660 5g): what a
+    /// current route still owes below the floor joins its parked remainder,
+    /// coverage, released seconds and capture debt below it go, and goals
+    /// rise to it. A capture the relays never answered then fences nothing
+    /// older than the window. The process's first debt turn prunes, then one
+    /// each time the floor has moved [`RUNNER_RETENTION_PRUNE_STEP_SECS`].
+    pub(crate) fn prune_runner_retention(
+        &mut self,
+        app: &SqliteAppStorage,
+        now: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
+        let floor = retention_floor(now);
+        if self
+            .runner_pruned_floor
+            .is_some_and(|pruned| floor < pruned.saturating_add(RUNNER_RETENTION_PRUNE_STEP_SECS))
+        {
+            return Ok(());
+        }
+        let certifying = self
+            .current_coverage_routes()
+            .into_iter()
+            .map(|current| (current.route, current.required))
+            .collect::<Vec<_>>();
+        app.prune_recovery_coverage(floor, &certifying)?;
+        self.runner_pruned_floor = Some(floor);
+        Ok(())
+    }
+}
+
 fn log_failure(method: &'static str, error: &AppError) {
     tracing::warn!(target: TARGET, method = method, error_kind = error.privacy_safe_kind(),
         "coverage ledger write skipped");

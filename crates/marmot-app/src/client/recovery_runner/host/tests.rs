@@ -185,6 +185,71 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
     surveyed.await.unwrap()
 }
 
+/// One real debt turn on `client`: the fences it answers, as release points.
+async fn debt_turn_fences(client: &mut AppClient) -> Vec<u64> {
+    let AccountRunner {
+        runner, mut turns, ..
+    } = client.build_recovery_runner().await;
+    let host = runner.host.clone();
+    let fenced = tokio::spawn(async move {
+        host.debt_turn(super::super::admission::live_fences)
+            .await
+            .expect("the debt turn was served")
+            .expect("the fences were read")
+    });
+    turns.recv().await.unwrap().serve(client).await;
+    let fences = fenced.await.unwrap();
+    fences
+        .into_iter()
+        .map(|fence| fence.release_before)
+        .collect()
+}
+
+/// The runner's debt turns age the ledger out of the retention window, as
+/// grant settlement did before the runner owned debt: a capture its relay
+/// never answered, older than the window, joins its route's parked remainder
+/// and fences nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        mut client,
+        storage,
+        _dir,
+        _pump,
+        ..
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    let route = group_routes(&client).pop().unwrap();
+    let relay = transport_nostr::canonical_relay("wss://a.example");
+    let now = unix_now_seconds();
+    let aged = storage_sqlite::RecoveryCoverageRange {
+        since_seconds: now - 32 * DAY,
+        until_seconds: now - 31 * DAY,
+    };
+    ledger
+        .widen_recovery_coverage_goals(std::slice::from_ref(&route), aged.since_seconds)
+        .unwrap();
+    ledger
+        .set_recovery_unit_fences(&route, &relay, &[aged])
+        .unwrap();
+
+    assert_eq!(debt_turn_fences(&mut client).await, Vec::<u64>::new());
+    let remainders = ledger.recovery_coverage_remainders().unwrap();
+    let [remainder] = remainders.as_slice() else {
+        panic!("one parked remainder, not {}", remainders.len());
+    };
+    assert_eq!(remainder.route, route);
+    assert_eq!(remainder.range.since_seconds, aged.since_seconds);
+    assert!(remainder.range.until_seconds >= aged.until_seconds);
+}
+
 /// A cursor-present reopen must owe a group added after cold start on each
 /// relay. A quiet replay cannot erase that gap, and only proving both relays
 /// clears the group's catching-up status (mdk#2862).
@@ -503,6 +568,8 @@ async fn one_shot_sync(dir: &std::path::Path, url: &str) -> crate::SyncSummary {
     summary
 }
 
+use crate::tests::limited_relay as published_relay;
+
 /// A one-shot sync, as `wn sync` runs it, shows a message sent just before
 /// it. A fresh client owes the gap since its last sync, so its group's live
 /// REQ is fenced until its pass answers that gap. This relay publishes no cap
@@ -513,8 +580,7 @@ async fn one_shot_sync(dir: &std::path::Path, url: &str) -> crate::SyncSummary {
 /// its client, and no number of one-shot syncs showed the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_syncs_read_what_their_pass_released() {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
+    let (_relay, url) = published_relay::relay_publishing(None).await;
     let bob_dir = tempfile::tempdir().unwrap();
     let bob = crate::AccountHome::open(bob_dir.path())
         .create_account("bob")

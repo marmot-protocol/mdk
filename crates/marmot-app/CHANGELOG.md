@@ -9,8 +9,11 @@
   group's fetched backlog is admitted, so history appears in order and none of it is lost to a newer message
   opened first; an empty reply holds nothing. Held live messages carry over when joining a group restarts the
   subscription, and stay held while the account's hourly recovery budget pauses the runner or while no relay serves
-  the group and one may still return its history. A relay that cannot prove a busy second (no published limit, no
-  negentropy) releases the group instead of holding it. A directly owned client's `sync()` now also reads the live
+  the group and one may still return its history. A relay that publishes no limit and no negentropy cannot prove a
+  busy second, and releases the group instead of holding it; a relay whose information document cannot be read
+  holds the group until its unit gives up, since it may still prove that second. Notification wakes
+  (`CursorPersistence::Frozen`) fetch no history unless the host asks for full-history repair, and history older
+  than the 30-day window stops holding live messages. A directly owned client's `sync()` now also reads the live
   messages its in-place recovery pass releases.
   `account_recovery_status` now reports groups catching up, and audit `unproven_history` rows are now produced.
 

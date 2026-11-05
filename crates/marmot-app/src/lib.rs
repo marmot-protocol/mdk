@@ -2243,6 +2243,7 @@ impl MarmotApp {
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
             runner_preparation_owed: false,
+            runner_pruned_floor: None,
             #[cfg(test)]
             fail_next_runner_preparation: false,
             checkpointed_transport_timestamp,

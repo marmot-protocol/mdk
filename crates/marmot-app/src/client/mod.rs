@@ -1034,6 +1034,9 @@ pub struct AppClient {
     /// succeeded since. While it is owed the worker starts no runner; the
     /// paced subscription-refresh retry prepares again.
     pub(crate) runner_preparation_owed: bool,
+    /// The retention floor the recovery runner's debt turns last pruned the
+    /// ledger to in this process, if any did.
+    pub(crate) runner_pruned_floor: Option<u64>,
     /// One-shot failure of the recovery runner's ownership preparation.
     #[cfg(test)]
     pub(crate) fail_next_runner_preparation: bool,

@@ -11,16 +11,19 @@
 //!   it owes after its live tail.
 //! - **Leaving the frontier.** A unit stops holding the frontier once its
 //!   last quantum ended without progress (no progress, unreachable, refused)
-//!   or stopped on a second its relay cannot prove (saturated, even after
-//!   advancing), and while its relay cools down or it is broken or retired.
+//!   or stopped on the first second it owes because its relay cannot prove
+//!   it under the caps the relay published (saturated, even after advancing),
+//!   and while its relay cools down or it is broken or retired. An answer its
+//!   deadline cut, or a relay whose caps were never read, saturates nothing.
 //!   What it stages later is late input. When no unit serves its group (each
 //!   has left, and none is an active one with nothing left to fetch), the
 //!   group is stranded: each of its units still pursuing its debt holds the
 //!   frontier again, so nothing newer opens ahead of history its relay may
 //!   still return, through unreachable spells, cooldowns and answers cut
-//!   short. A saturated unit's relay cannot give that history (asking again
-//!   stops on the same second), and a broken unit's debt is parked, so
-//!   neither holds anything.
+//!   short. A saturated unit's relay cannot give that second while its caps
+//!   stand (asking again stops there), and a broken unit's debt is parked, so
+//!   neither holds anything. Saturation names its second: a unit that owes an
+//!   earlier one first, or whose relay publishes other caps, pursues again.
 //! - **Backpressure.** A relay at a group's staging bound (its events or
 //!   bytes for the group), or any relay while the account is at its own, is
 //!   not eligible while another unit holds the group's frontier, until that
@@ -514,11 +517,19 @@ impl<'t> Admission<'t> {
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;
                 let unit = turn.app.recovery_unit(&route.route, relay)?;
-                let left = self.relay_left(relay)? || unit.as_ref().is_some_and(unit_left);
+                let position = debt.first().map(|range| range.since_seconds);
+                // Its relay could not prove the first second it still owes,
+                // under the caps it still publishes.
+                let saturated = unit
+                    .as_ref()
+                    .is_some_and(|unit| saturated_at(unit, position));
+                let left = self.relay_left(relay)?
+                    || unit.as_ref().is_some_and(|unit| unit_left(unit, saturated));
                 let state = unit.as_ref().map(|unit| unit.state);
-                let pursued = unit.as_ref().is_none_or(|unit| {
-                    !unit.saturated && !matches!(unit.state, RecoveryUnitState::Broken(_))
-                });
+                let pursued = !saturated
+                    && unit
+                        .as_ref()
+                        .is_none_or(|unit| !matches!(unit.state, RecoveryUnitState::Broken(_)));
                 let key = UnitKey {
                     route: route.route.clone(),
                     relay: relay.clone(),
@@ -535,7 +546,6 @@ impl<'t> Admission<'t> {
                             .copied(),
                     )
                     .collect();
-                let position = debt.first().map(|range| range.since_seconds);
                 let captures = merge(captures);
                 let (mut fences, first_owed) = owed(captures.clone(), &debt);
                 let mut first_staged = None;
@@ -596,11 +606,23 @@ impl<'t> Admission<'t> {
     /// leaving the frontier is never a coverage certificate.
     pub(super) fn source_left_frontier(
         &mut self,
-        route: &TransportReconciliationRoute,
+        route: &RunnerRoute,
         relay: &'t str,
     ) -> StorageResult<bool> {
-        let unit = self.turn.app.recovery_unit(route, relay)?;
-        Ok(self.relay_left(relay)? || unit.as_ref().is_some_and(unit_left))
+        let turn = self.turn;
+        let unit = turn.app.recovery_unit(&route.route, relay)?;
+        let position = match &unit {
+            Some(unit) if unit.saturated_second.is_some() => turn
+                .app
+                .recovery_unit_debt(&route.route, relay, turn.owed_until(route, relay))?
+                .first()
+                .map(|range| range.since_seconds),
+            _ => None,
+        };
+        Ok(self.relay_left(relay)?
+            || unit
+                .as_ref()
+                .is_some_and(|unit| unit_left(unit, saturated_at(unit, position))))
     }
 
     /// Whether this group's already fetched prefix can still be admitted.
@@ -637,10 +659,18 @@ impl<'t> Admission<'t> {
     }
 }
 
-/// Whether a unit's last quantum ended without progress or stopped on a
-/// second its relay cannot prove, or it is broken or retired.
-fn unit_left(unit: &RecoveryUnit) -> bool {
-    unit.no_progress > 0 || unit.saturated || unit.state != RecoveryUnitState::Active
+/// Whether the unit's relay could not prove `position`, the first second it
+/// still owes, under the caps it still publishes.
+fn saturated_at(unit: &RecoveryUnit, position: Option<u64>) -> bool {
+    unit.saturated_second
+        .is_some_and(|second| Some(second) == position)
+}
+
+/// Whether a unit's last quantum ended without progress or stopped on the
+/// second it still owes first because its relay cannot prove it
+/// (`saturated`), or it is broken or retired.
+fn unit_left(unit: &RecoveryUnit, saturated: bool) -> bool {
+    unit.no_progress > 0 || saturated || unit.state != RecoveryUnitState::Active
 }
 
 /// Admission order: `(created_at, id)`.

@@ -531,7 +531,7 @@ in `marmot-app` fills it from facts the owner already has:
 | A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
 | An explicit history request | Every current route's goal widens to the retained window |
 | A pending epoch gap | The group's routes' goals widen to their standing floors |
-| Every settlement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder |
+| Every settlement, and the recovery runner's first debt turn in a process and then each hour of floor movement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder |
 
 **Standing floors.** The Welcome time is a soft signal (`Group::local_copy_welcome_created_at`):
 an application message carries its sender's compose time, so one composed offline before the
@@ -734,6 +734,10 @@ its next attempt time. Each quantum's outcome is one transaction:
 | Refused | Breaks at once and parks its debt | — | Charged |
 | Unanswered, local failure | — | — | Refunded |
 
+A quantum whose every slice was proven but whose coverage an un-cover took back during the
+fetch (a post-join collection or an imported loss) is unanswered too: not its relay's doing, so
+the unit is due again at once and keeps holding its group's frontier.
+
 An attempt is charged when it begins, so a process that dies mid-quantum still counts it.
 A runner stopped mid-quantum while storage is open, by a reconnect or a dropped pass, refunds
 the attempt as unanswered instead, unless the quantum's own settle came in time. A full
@@ -774,7 +778,10 @@ With runner ownership (`recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
 exit, a quantum in flight included. A directly owned client runs one pass in place from
 `sync()` and from `next_event()` when it meets delivery loss. No worker reads what that pass's
-fence answer releases, so `sync()` reads it before returning. Sweeps go over the account's own
+fence answer releases, so `sync()` reads it before returning. In a wake-collection process
+(`CursorPersistence::Frozen`, a notification extension) the runner still admits staged history
+and answers the live fences, but fetches only for an explicit full-history repair, the one
+recovery that posture allows. Sweeps go over the account's own
 relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
 widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
 wake only makes it read the ledger again. A unit is one (route,
@@ -887,9 +894,13 @@ the others then goes in as late input. Once no required relay serves a group (ea
 and none is an active unit with nothing left to fetch), the group is stranded: each unit still
 pursuing its debt holds the frontier again, through unreachable spells, cooldowns and answers
 cut short at their deadline, so nothing newer goes ahead of history its relay may still return.
-Two units hold nothing. A saturated one, whose last answered quantum stopped on a second its
-relay cannot prove (no published cap and no NIP-77 proof; migration 0151), would stop on the
-same second if asked again, and a broken unit's debt is parked. The group's frames go once each
+Two units hold nothing. A saturated one, whose last answered quantum stopped on the first
+second it owes because its relay cannot prove it under the caps the relay published (no cap and
+no NIP-77 proof; migration 0151 records that second), would stop on the same second if asked
+again while those caps stand. It pursues again once it owes an earlier second first or the
+relay's recorded caps change. An answer its deadline cut saturates nothing, and nor does a relay
+whose caps were never read: a document that failed to load is not a relay that cannot prove the
+second. A broken unit's debt is parked. The group's frames go once each
 holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests four events, one
 worker command each, so commands and live input go between them. An event the engine keeps no
 trace of stays staged, and its group waits behind it on the local-failure backoff while other

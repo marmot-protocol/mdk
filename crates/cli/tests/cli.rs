@@ -16,8 +16,8 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
 };
 use nostr::nips::nip19::ToBech32;
+use nostr_relay_builder::LocalRelay;
 use nostr_relay_builder::builder::{PolicyResult, RelayBuilder, WritePolicy};
-use nostr_relay_builder::{LocalRelay, MockRelay};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, QuicBrokerServer};
@@ -27,15 +27,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
-    _relay: TestRelayHandle,
+    _relay: LocalRelay,
     url: String,
 }
 
-#[allow(dead_code)]
-enum TestRelayHandle {
-    Mock(MockRelay),
-    Local(LocalRelay),
-}
+/// The filter limit every test relay enforces and publishes on its
+/// information page, as White Noise's relays do.
+const RELAY_FILTER_LIMIT: usize = 500;
 
 #[derive(Default)]
 struct RecordingKind5State {
@@ -141,46 +139,27 @@ fn kind5_tag_targets<'a>(tags: impl IntoIterator<Item = &'a [String]>) -> Vec<St
 
 impl TestRelay {
     fn new() -> Self {
-        Self::from_mock()
+        Self::from_local_builder(RelayBuilder::default())
     }
 
     fn with_write_policy(policy: impl WritePolicy + 'static) -> Self {
         Self::from_local_builder(RelayBuilder::default().write_policy(policy))
     }
 
-    fn from_mock() -> Self {
-        let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
-        let mut last_error = None;
-        let relay = (0..8)
-            .find_map(|attempt| match runtime.block_on(MockRelay::run()) {
-                Ok(relay) => Some(relay),
-                Err(err) => {
-                    eprintln!("mock relay startup attempt {} failed: {err}", attempt + 1);
-                    last_error = Some(err);
-                    std::thread::sleep(Duration::from_millis(25));
-                    None
-                }
-            })
-            .unwrap_or_else(|| panic!("mock relay should start: {last_error:?}"));
-        let url = runtime.block_on(relay.url()).to_string();
-        Self {
-            _runtime: runtime,
-            _relay: TestRelayHandle::Mock(relay),
-            url,
-        }
-    }
-
     fn from_local_builder(builder: RelayBuilder) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
-        let relay = LocalRelay::new(builder);
+        let relay = LocalRelay::new(builder.max_filter_limit(RELAY_FILTER_LIMIT));
         let mut last_error = None;
         for attempt in 0..8 {
             match runtime.block_on(relay.run()) {
                 Ok(()) => {
-                    let url = runtime.block_on(relay.url()).to_string();
+                    let url = publish_relay_information(
+                        &runtime,
+                        &runtime.block_on(relay.url()).to_string(),
+                    );
                     return Self {
                         _runtime: runtime,
-                        _relay: TestRelayHandle::Local(relay),
+                        _relay: relay,
                         url,
                     };
                 }
@@ -246,6 +225,67 @@ impl TestRelay {
             .flat_map(|event| kind5_event_targets(&event))
             .collect()
     }
+}
+
+/// Serve a relay information page (NIP-11) in front of the relay at
+/// `upstream`, as deployed relays do, and return the front's URL: the page
+/// publishes [`RELAY_FILTER_LIMIT`], which the relay enforces, and claims no
+/// NIPs. The account's recovery runner proves history against the caps a
+/// relay publishes; a relay whose caps it cannot read never lets a group's
+/// held live input past a second it cannot prove.
+fn publish_relay_information(runtime: &tokio::runtime::Runtime, upstream: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = upstream
+        .trim_start_matches("ws://")
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind relay information front");
+    let url = format!(
+        "ws://{}",
+        listener
+            .local_addr()
+            .expect("relay information front address")
+    );
+    runtime.spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut header = Vec::new();
+                while !header.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    match client.read(&mut bytes).await {
+                        Ok(read) if read > 0 && header.len() + read <= 8192 => {
+                            header.extend_from_slice(&bytes[..read]);
+                        }
+                        _ => return,
+                    }
+                }
+                let information = String::from_utf8_lossy(&header).lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("accept")
+                            && value.contains("application/nostr+json")
+                    })
+                });
+                if information {
+                    let body = format!(
+                        r#"{{"supported_nips":[],"limitation":{{"max_limit":{RELAY_FILTER_LIMIT}}}}}"#
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client.write_all(reply.as_bytes()).await;
+                } else if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await
+                    && server.write_all(&header).await.is_ok()
+                {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    url
 }
 
 struct TestBlossom {

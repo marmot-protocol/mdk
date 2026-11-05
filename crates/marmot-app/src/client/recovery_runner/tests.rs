@@ -1896,10 +1896,54 @@ async fn recovery_runner_accounts_share_two_credits() {
     assert_eq!(available_credits(&credits), 2);
 }
 
-/// A unit is saturated only when its sweep stopped on a second its relay
-/// cannot prove: asking again stops there too. An answer cut short at the
-/// quantum's deadline may still return history, so it is not, and a quantum
-/// that gets past the second clears the flag.
+/// A quantum whose proven slices an un-cover took back during the fetch
+/// (post-join collection, imported loss) did not fail on its relay: it is
+/// unanswered, keeps no backoff, and is due again at once, so its debt holds
+/// the frontier instead of leaving it for a backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_retries_at_once_when_an_uncover_takes_back_its_proof() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(every([1; 32], floor, t0, 10 * 60))
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    host.tails.stand(&route, RELAY, t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    relay.gate.hold_from(0);
+    let (outcome, ()) = tokio::join!(async { ran(runner.step().await).outcome }, async {
+        wait_until("a held request", WAIT, || relay.gate.waiting() == 1).await;
+        account
+            .app
+            .uncover_recovery_coverage(std::slice::from_ref(&route), floor)
+            .unwrap();
+        relay.gate.open();
+    });
+    assert_eq!(outcome, Outcome::Unanswered);
+    let unit = account.unit(&route, RELAY);
+    assert_eq!(unit.no_progress, 0);
+    assert!(unit.next_attempt_at_seconds <= clock.now(), "due at once");
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    assert!(account.debt(&route, RELAY, t0 - 1).is_empty());
+}
+
+/// A unit records the second its sweep stopped on only when its relay
+/// cannot prove it under caps the relay published: asking again stops there
+/// too. A sweep on caps never read cannot tell an unprovable second from a
+/// document that failed to load, a failed read sweeps on the caps recorded
+/// last, an answer cut short at the quantum's deadline may still return
+/// history, and a quantum that gets past the second clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_saturates_a_unit_only_on_an_unprovable_second() {
     let account = account();
@@ -1921,81 +1965,37 @@ async fn recovery_runner_saturates_a_unit_only_on_an_unprovable_second() {
         ..test_policy()
     };
     let (mut runner, _handle) = runner(&host, policy);
+    let saturated = || account.unit(&route, RELAY).saturated_second;
+    let due = || clock.advance_to(account.unit(&route, RELAY).next_attempt_at_seconds);
+
+    host.caps_unknown.store(true, Ordering::SeqCst);
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    assert_eq!(saturated(), None, "caps never read");
+
+    host.caps_unknown.store(false, Ordering::SeqCst);
+    due();
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    assert_eq!(saturated(), Some(floor), "stopped on the second");
+
+    host.caps_unknown.store(true, Ordering::SeqCst);
+    due();
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    assert_eq!(saturated(), Some(floor), "the caps it published last");
+    host.caps_unknown.store(false, Ordering::SeqCst);
 
     // The relay answers the first slice, then holds the next request past
     // the quantum's deadline.
-    relay.gate.hold_from(1);
+    relay.gate.hold_from(relay.requests() + 1);
+    due();
     assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
-    assert!(!account.unit(&route, RELAY).saturated, "only cut short");
+    assert_eq!(saturated(), None, "only cut short");
     relay.gate.open();
-
-    clock.advance_to(account.unit(&route, RELAY).next_attempt_at_seconds);
-    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
-    assert!(
-        account.unit(&route, RELAY).saturated,
-        "stopped on the second"
-    );
 
     // Live traffic proves that second, and the next quantum proves the rest.
     account.live_boundary(&route, RELAY, floor, floor);
-    clock.advance_to(account.unit(&route, RELAY).next_attempt_at_seconds);
+    due();
     assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
-    assert!(!account.unit(&route, RELAY).saturated);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_runner_live_traffic_never_resets_backoff() {
-    let account = account();
-    let clock = Clock::new();
-    let t0 = clock.now();
-    let route = group(1);
-    let floor = t0 - HOUR;
-    let relay = stalling_relay([1; 32], floor).build();
-    let host = TestHost::new(
-        &account,
-        &clock,
-        vec![required(&route, &[RELAY])],
-        &[&relay],
-    );
-    account.goal(&route, floor);
-    host.tails.stand(&route, RELAY, t0);
-    let (mut runner, _handle) = runner(&host, test_policy());
-
-    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
-    let unit = account.unit(&route, RELAY);
-    assert_eq!((unit.no_progress, unit.backoff_step), (1, 1));
-    let retry = unit.next_attempt_at_seconds;
-
-    // Live traffic proves the rest of the hour on the same relay.
-    account.live_boundary(&route, RELAY, floor + 1, t0 - 1);
-    assert_eq!(idle(runner.step().await), Some(retry));
-    let unit = account.unit(&route, RELAY);
-    assert_eq!(
-        (
-            unit.no_progress,
-            unit.backoff_step,
-            unit.next_attempt_at_seconds
-        ),
-        (1, 1, retry)
-    );
-
-    clock.advance_to(retry);
-    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
-    let unit = account.unit(&route, RELAY);
-    assert_eq!((unit.no_progress, unit.backoff_step), (2, 2));
-
-    // Live traffic proves the stalled second itself while the next quantum's
-    // request waits. That is not the quantum's progress.
-    clock.advance_to(unit.next_attempt_at_seconds);
-    relay.gate.hold_from(relay.requests());
-    let stepping = tokio::spawn(async move { ran(runner.step().await).outcome });
-    wait_until("the held request", WAIT, || relay.gate.waiting() == 1).await;
-    account.live_boundary(&route, RELAY, floor, floor);
-    relay.gate.open();
-    assert_eq!(stepping.await.unwrap(), Outcome::NoProgress);
-    let unit = account.unit(&route, RELAY);
-    assert_eq!((unit.no_progress, unit.backoff_step), (3, 3));
-    assert!(account.debt(&route, RELAY, t0 - 1).is_empty());
+    assert_eq!(saturated(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3690,15 +3690,21 @@ impl TwoSources {
         vec![(vec![self.route.clone()], self.since)]
     }
 
-    /// Settle a quantum on `relay` with `outcome`, saturated or not.
+    /// Settle a quantum on `relay` with `outcome`, stopped or not on the
+    /// first second the relay owes because the relay cannot prove it.
     fn settle(&self, relay: &str, outcome: Outcome, saturated: bool) -> RecoveryUnit {
+        let first_owed = self
+            .account
+            .debt(&self.route, relay, self.clock.now())
+            .first()
+            .map(|range| range.since_seconds);
         self.account
             .app
             .settle_recovery_unit_saturated(
                 &self.route,
                 relay,
                 outcome,
-                saturated,
+                first_owed.filter(|_| saturated),
                 &test_policy().unit,
                 self.clock.now(),
             )
@@ -3746,7 +3752,8 @@ async fn recovery_runner_keeps_a_stranded_groups_fence_while_its_relays_may_retu
 
     // A stops on a second it cannot prove; B, whose capture fences, still
     // pursues its debt.
-    assert!(case.settle(RELAY, Outcome::NoProgress, true).saturated);
+    let a = case.settle(RELAY, Outcome::NoProgress, true);
+    assert!(a.saturated_second.is_some());
     assert_eq!(case.host.fences().await, case.held());
 
     // B breaks, and nothing holds the frames.
@@ -3762,7 +3769,8 @@ async fn recovery_runner_keeps_a_stranded_groups_fence_while_its_relays_may_retu
 /// A relay that stopped on a second it cannot prove leaves the frontier
 /// even when its quantum advanced first, so a group whose relays all did is
 /// let go in the same pass: holding it would only wait for the units to
-/// break.
+/// break. Once that second is proven another way, the relay owes history it
+/// can return again, and its capture fences once more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_lets_a_group_go_once_its_relays_stop_on_unprovable_seconds() {
     let case = TwoSources::new();
@@ -3771,12 +3779,48 @@ async fn recovery_runner_lets_a_group_go_once_its_relays_stop_on_unprovable_seco
         runner.admit(None).await,
         Ok(Drained { due: None, .. })
     ));
-    assert!(case.settle(RELAY, Outcome::Advanced, true).saturated);
-    assert!(!case.settle(OTHER_RELAY, Outcome::Advanced, false).saturated);
+    assert!(
+        case.settle(RELAY, Outcome::Advanced, true)
+            .saturated_second
+            .is_some()
+    );
+    assert!(
+        case.settle(OTHER_RELAY, Outcome::Advanced, false)
+            .saturated_second
+            .is_none()
+    );
     assert_eq!(case.host.fences().await, case.held(), "B still serves");
 
-    assert!(case.settle(OTHER_RELAY, Outcome::Advanced, true).saturated);
+    assert!(
+        case.settle(OTHER_RELAY, Outcome::Advanced, true)
+            .saturated_second
+            .is_some()
+    );
     assert!(case.host.fences().await.is_empty());
+
+    case.account
+        .live_boundary(&case.route, OTHER_RELAY, case.since, case.since);
+    assert_eq!(
+        case.host.fences().await,
+        vec![(vec![case.route.clone()], case.since + 1)]
+    );
+}
+
+/// A wake-collection runner fetches only for an explicit repair: its steps
+/// and passes leave due units waiting, while their debt turns still answer
+/// the group's fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_fetches_nothing_unasked_in_a_wake_collection_process() {
+    let case = TwoSources::new();
+    let policy = RecoveryRunnerPolicy {
+        fetches_unasked: false,
+        ..test_policy()
+    };
+    let (mut runner, _handle) = runner(&case.host, policy);
+    assert!(matches!(runner.step().await, Step::Idle { .. }));
+    assert_eq!(runner.run_pass(WAIT).await.quanta, 0);
+    assert_eq!(case.a.requests() + case.b.requests(), 0);
+    assert_eq!(case.host.fences().await, case.held());
 }
 
 /// A source with nothing left to fetch still serves its group, whatever its

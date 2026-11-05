@@ -191,6 +191,9 @@ impl RunnerHost for AccountRunnerHost {
                 if let Err(error) = client.settle_recovery_route_changes(&app, now) {
                     return Some(Err(error));
                 }
+                if let Err(error) = client.prune_runner_retention(&app, now) {
+                    return Some(Err(error));
+                }
                 let tails = client.recovery_runner_live_tails(&app, now).await;
                 let mut routes = client.recovery_runner_routes();
                 if inbox.is_none() {
@@ -425,7 +428,10 @@ impl AppClient {
             account_id,
             catching_up: self.routing.recovery_runner_catching_up(),
         };
-        let policy = RecoveryRunnerPolicy::default();
+        let policy = RecoveryRunnerPolicy {
+            fetches_unasked: self.app.cursor_persistence() == crate::CursorPersistence::Advance,
+            ..RecoveryRunnerPolicy::default()
+        };
         let (runner, handle) = RecoveryRunner::waking_on(
             Arc::new(host),
             policy,

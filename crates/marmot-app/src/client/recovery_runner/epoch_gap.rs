@@ -93,7 +93,7 @@ pub(super) fn advance(
                         turn.owed_until(route, relay),
                     )?;
                     answered |= covered;
-                    if !covered && !admission.source_left_frontier(&route.route, relay)? {
+                    if !covered && !admission.source_left_frontier(route, relay)? {
                         complete = false;
                     }
                 }

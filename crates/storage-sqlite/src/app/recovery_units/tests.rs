@@ -878,28 +878,48 @@ fn the_cursor_is_the_first_second_the_relay_leaves_uncovered() {
 
 /// A fence, slicing, re-check progress, parks, relay health and the budget
 /// survive closing and reopening the database.
-/// Only an answered quantum sets or clears a unit's saturated flag: an
-/// unanswered quantum, a local failure and a re-arm leave it as it was.
+/// Only an answered quantum sets or clears a unit's saturated second: an
+/// unanswered quantum, a local failure and a re-arm leave it as it was. A
+/// known caps read clears it on a unit planned with other caps, and neither
+/// an unknown read nor the same caps again do.
 #[test]
-fn only_an_answer_sets_or_clears_saturation() {
+fn only_an_answer_or_new_caps_change_saturation() {
     use RecoveryUnitOutcome as Outcome;
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
     let route = group(1);
+    let caps = RecoveryRelayCaps {
+        max_limit: None,
+        negentropy: false,
+    };
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let second = Some(NOW - 500);
     let settle = |outcome, saturated| {
-        app.begin_recovery_unit_attempt(&route, RELAY, None, NOW)
+        app.begin_recovery_unit_attempt(&route, RELAY, Some(caps), NOW)
             .unwrap();
         app.settle_recovery_unit_saturated(&route, RELAY, outcome, saturated, &POLICY, NOW)
             .unwrap()
-            .saturated
+            .saturated_second
     };
-    assert!(settle(Outcome::NoProgress, true));
-    assert!(settle(Outcome::Unanswered, false));
-    assert!(settle(Outcome::LocalFailure, false));
+    assert_eq!(settle(Outcome::NoProgress, second), second);
+    assert_eq!(settle(Outcome::Unanswered, None), second);
+    assert_eq!(settle(Outcome::LocalFailure, None), second);
     app.rearm_all_recovery_units().unwrap();
-    assert!(unit(&app, &route, RELAY).saturated);
-    assert!(!settle(Outcome::Advanced, false));
+    assert_eq!(unit(&app, &route, RELAY).saturated_second, second);
+    assert_eq!(settle(Outcome::Advanced, None), None);
+
+    assert_eq!(settle(Outcome::NoProgress, second), second);
+    app.record_recovery_relay_caps(RELAY, None, NOW).unwrap();
+    app.record_recovery_relay_caps(RELAY, Some(caps), NOW)
+        .unwrap();
+    assert_eq!(unit(&app, &route, RELAY).saturated_second, second);
+    let negentropy = RecoveryRelayCaps {
+        negentropy: true,
+        ..caps
+    };
+    app.record_recovery_relay_caps(RELAY, Some(negentropy), NOW)
+        .unwrap();
+    assert_eq!(unit(&app, &route, RELAY).saturated_second, None);
 }
 
 #[test]
@@ -948,7 +968,7 @@ fn state_survives_a_reopen() {
                 &route,
                 RELAY,
                 RecoveryUnitOutcome::NoProgress,
-                true,
+                Some(NOW - 500),
                 &POLICY,
                 NOW,
             )

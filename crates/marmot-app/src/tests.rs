@@ -26317,6 +26317,11 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
 #[path = "tests/conversation_cold_open.rs"]
 mod conversation_cold_open;
 
+/// The integration tests' relay with a truthful information page, shared with
+/// unit tests that need its published caps.
+#[path = "../tests/support/limited_relay.rs"]
+pub(crate) mod limited_relay;
+
 /// Undecryptable traffic older than this copy's Welcome is not stall evidence.
 ///
 /// The detector's undecryptable signal means "this device is behind the group".

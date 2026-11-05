@@ -748,6 +748,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if let Some(step) = self.report_pause(survey.paused_until, now).await {
             return step;
         }
+        // A wake-collection process admits and fences, but fetches only for
+        // an explicit repair.
+        if !self.policy.fetches_unasked && pass.is_none_or(|bound| bound.repair_until.is_none()) {
+            return Step::Idle {
+                next_due: admission_due,
+            };
+        }
         let mut hints = self.hints.borrow().clone();
         hints.held.append(&mut survey.fenced);
         hints.window.append(&mut survey.window);
@@ -837,7 +844,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                         (report, Some(facts))
                     }
                     None => {
-                        let caps = caps.unwrap_or_default();
+                        let caps = plan.caps.unwrap_or_default();
                         let report =
                             quantum::run(host, &plan, caps, deadline, &preempt, &policy).await;
                         (report, None)

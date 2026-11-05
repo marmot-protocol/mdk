@@ -5000,7 +5000,6 @@ mod tests {
             crate::MarmotAppConfig::white_noise()
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
-        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5015,7 +5014,12 @@ mod tests {
             .unwrap();
         storage.synchronize_account_delivery_loss("alice").unwrap();
         let debt = storage.recovery_revision_fence().unwrap();
-        let retry = storage.recovery_retry_state().unwrap();
+        let attempts = || {
+            storage
+                .recovery_account_usage(unix_now_seconds())
+                .unwrap()
+                .attempts
+        };
         let mut caller = ExplicitRecoveryPermit::default();
         assert!(
             client
@@ -5028,16 +5032,14 @@ mod tests {
                 .is_none()
         );
         assert!(!caller.spent);
+        // The sync's runner pass admits and fences, but fetches nothing.
         client.sync().await.unwrap();
         assert_eq!(storage.recovery_revision_fence().unwrap(), debt);
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
-        // The distinct supported repair API still authorizes one attempt, but
-        // this backend cannot certify it or release unresolved loss.
+        assert_eq!(attempts(), 0);
+        // The distinct supported repair API still runs, but this backend
+        // cannot certify it or release unresolved loss.
         assert!(client.repair_full_history().await.is_err());
-        assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
-            retry.attempt_serial + 1
-        );
+        assert_eq!(attempts(), 1);
         assert!(
             storage
                 .account_delivery_recovery("alice")

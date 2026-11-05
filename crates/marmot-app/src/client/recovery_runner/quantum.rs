@@ -443,7 +443,8 @@ pub(super) fn classify(
         // A stale mark or a gone worker; a store failure is local, above.
         SweepEnd::SinkFailed | SweepEnd::StoreFailed => Outcome::Unanswered,
         // Every slice was proven, but none newly covered: someone else proved
-        // them first, or a loss during the fetch took them back.
+        // them first, or a loss during the fetch took them back (which
+        // `settle` reads as unanswered once it sees the mark moved).
         SweepEnd::Finished if still_owed => Outcome::NoProgress,
         SweepEnd::Finished => Outcome::NothingOwed,
         SweepEnd::Cancelled => Outcome::Unanswered,
@@ -472,14 +473,26 @@ pub(super) fn settle(
     } else {
         true
     };
-    let outcome = classify(
-        report.end,
-        report.answers > 0,
-        report.rate_limited,
-        report.newly_covered_seconds,
-        report.stop,
-        still_owed,
-    );
+    // Every slice was proven, but an un-cover during the fetch took them
+    // back: not the relay's doing, and a fresh mark fixes it, as it does a
+    // stale one. The debt stays on the frontier and is retried at once.
+    let taken_back = report.end == SweepEnd::Finished
+        && report.newly_covered_seconds == 0
+        && report.proved_seconds > 0
+        && still_owed
+        && turn.app.recovery_coverage_mark()? != plan.mark;
+    let outcome = if taken_back {
+        RecoveryUnitOutcome::Unanswered
+    } else {
+        classify(
+            report.end,
+            report.answers > 0,
+            report.rate_limited,
+            report.newly_covered_seconds,
+            report.stop,
+            still_owed,
+        )
+    };
     if plan.best_effort {
         return Ok(outcome);
     }
@@ -499,15 +512,22 @@ pub(super) fn settle(
             turn.now,
         )?;
     }
-    // A sweep that stopped on a second its relay cannot prove stops there
-    // again next time; a comparison that ran out of budget only paused.
-    let saturated =
-        plan.compare.is_none() && matches!(report.end, SweepEnd::SaturatedSecond { .. });
+    // A sweep that stopped on a second its relay cannot prove, under caps
+    // the relay published, stops there again while those caps stand. A
+    // comparison that ran out of budget only paused, and a sweep on unknown
+    // caps cannot tell an unprovable second from a document that failed to
+    // load.
+    let saturated_second = match report.end {
+        SweepEnd::SaturatedSecond { second } if plan.compare.is_none() && plan.caps.is_some() => {
+            Some(second)
+        }
+        _ => None,
+    };
     turn.app.settle_recovery_unit_saturated(
         &key.route,
         &key.relay,
         outcome,
-        saturated,
+        saturated_second,
         &policy.unit,
         turn.now,
     )?;

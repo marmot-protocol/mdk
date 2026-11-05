@@ -78,6 +78,13 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) fences_per_unit: usize,
     pub(crate) sweep: SweepPolicy,
     pub(crate) recheck_interval_seconds: u64,
+    /// Whether due units fetch on their own. Off in a wake-collection
+    /// (`CursorPersistence::Frozen`) process, where only an explicit
+    /// full-history repair fetches history, as `authorize_account_recovery`
+    /// allows there: the runner still admits what earlier quanta staged and
+    /// answers the live fences, so a group's live frames are released once
+    /// nothing older is owed ahead of them.
+    pub(crate) fetches_unasked: bool,
 }
 
 impl Default for RecoveryRunnerPolicy {
@@ -108,6 +115,7 @@ impl Default for RecoveryRunnerPolicy {
             fences_per_unit: RUNNER_FENCES_PER_UNIT,
             sweep: SweepPolicy::default(),
             recheck_interval_seconds: RUNNER_RECHECK_INTERVAL_SECS,
+            fetches_unasked: true,
         }
     }
 }

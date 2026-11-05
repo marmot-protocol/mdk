@@ -926,8 +926,7 @@ async fn runner_owned_history_starts_grace_without_fabricating_coverage() {
     );
 }
 
-#[path = "../../../../tests/support/limited_relay.rs"]
-mod post_join_relay;
+use crate::tests::limited_relay as post_join_relay;
 
 /// Actual SDK acquisition, encrypted history admission, durable completion,
 /// and client replacement at the app handoff. The capped relay supplies wire
