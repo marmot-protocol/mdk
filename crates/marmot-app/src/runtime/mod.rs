@@ -4449,6 +4449,21 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Explicitly discard this device's quiet trusted device-group copy
+    /// before fresh code pairing. Preserves this account's credentials, slot
+    /// and ordinary chat data. Unfinished device sync is abandoned; this
+    /// publishes no removal and repairs no ordinary-chat membership.
+    /// Refuses active pairing/Move or unsettled native work with
+    /// `device_group_busy`; settlement may take indefinitely. Cancellation
+    /// after reset does not restore the discarded copy. Requires device groups.
+    pub async fn reset_device_group_for_repair(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::ResetForRepair)
+            .await
+    }
+
     /// On the new device: the user says both screens show the same emoji.
     pub async fn confirm_device_link_match(
         &self,

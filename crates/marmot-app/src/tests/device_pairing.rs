@@ -319,6 +319,35 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     use crate::tests::device_group::converge_device_group;
 
     let (relay, [mut phone, mut tablet, mut laptop]) = alice_devices::<3>().await;
+    // A real ordinary chat and its local content must survive resetting only
+    // the hidden device group. This uses the same existing three-device world.
+    let chat = laptop
+        .client
+        .create_group("Keep my chat", &[])
+        .await
+        .unwrap();
+    let message = crate::tests::device_group::history_delivery::send_text(
+        &mut laptop.client,
+        &chat,
+        "Keep my local history",
+    )
+    .await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let saved_draft = laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .save_message_draft(&chat_hex, "Keep my unfinished message", None, &[])
+        .unwrap();
+    let saved_settings = laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .set_chat_muted(&chat_hex, None)
+        .unwrap();
+    let account_id = laptop.client.runtime.self_id().clone();
     let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
     let pre_add_epoch = tablet.client.runtime.group_record(&group).unwrap().epoch;
     let tablet_slot_hex = tablet.slot_hex();
@@ -465,6 +494,80 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     assert!(
         missing.previously_linked_here,
         "the actual retained made link must annotate this missing slot"
+    );
+
+    let used = made.key_package_ref_hex.clone();
+    let reset = laptop.op(DeviceLinkOp::ResetForRepair).await;
+    assert_eq!(reset.new_device, None);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    assert!(
+        !laptop.client.device_unlinked(),
+        "an explicit local reset is not a removal"
+    );
+    assert!(laptop.client.runtime.group_record(&chat).is_ok());
+    laptop = reopen(laptop).await;
+    assert_eq!(laptop.slot_hex(), laptop_slot_hex);
+    assert_eq!(laptop.client.runtime.self_id(), &account_id);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    let app = laptop.app.account_storage("alice").unwrap().app_storage();
+    assert!(app.timeline_message(&chat_hex, &message).unwrap().is_some());
+    assert!(app.message_draft(&chat_hex).unwrap().as_ref() == Some(&saved_draft));
+    assert_eq!(
+        app.chat_notification_settings(&chat_hex).unwrap(),
+        saved_settings
+    );
+    assert!(laptop.client.runtime.group_record(&chat).is_ok());
+
+    // A cancelled fresh comparison leaves needs-link; it never restores the
+    // discarded copy. Publishing a new reference follows the ordinary owner.
+    published_key_package(&mut laptop.client, &relay).await;
+    laptop.op(DeviceLinkOp::Start).await;
+    assert!(matches!(
+        laptop
+            .client
+            .device_link(DeviceLinkOp::ResetForRepair)
+            .await,
+        Err(AppError::DeviceGroupRefused("device_group_busy"))
+    ));
+    laptop.op(DeviceLinkOp::Cancel).await;
+    laptop = reopen(laptop).await;
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    // Re-deliver the real relay history, including the old Welcome. Existing
+    // replay/authentication owners, not an inferred unlink signal, reject it.
+    let mut replay_cursor = 0;
+    deliver_new(&mut laptop.client, &relay, &mut replay_cursor).await;
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    assert_eq!(
+        link(&relay, &mut phone, &mut laptop, "Laptop repaired").await,
+        group
+    );
+    assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
+    let repaired = link_record(&phone, &group, &laptop_slot_hex);
+    assert_eq!(repaired.outcome, DeviceLinkOutcome::Linked);
+    assert_ne!(repaired.key_package_ref_hex, used);
+    assert_eq!(laptop.slot_hex(), laptop_slot_hex);
+    assert!(phone.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(laptop.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(
+        !phone
+            .client
+            .unrecognized_sign_ins()
+            .unwrap()
+            .iter()
+            .any(|row| row.slot_id_hex == laptop_slot_hex && row.previously_linked_here)
+    );
+    assert!(
+        laptop
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .timeline_message(&chat_hex, &message)
+            .unwrap()
+            .is_some()
     );
 }
 

@@ -83,6 +83,11 @@ impl SqliteAccountStorage {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .storage()?;
+                // Read the old trust/lifecycle before any deletion. Only an
+                // explicit abandonment of an active trusted device group owns
+                // the account-local device-sync preparations below.
+                let reset_device_sync =
+                    forget && active_trusted_device_group_forget(&tx, group_id_hex, &group_id)?;
                 let mut deleted =
                     retire_all_encrypted_media_secrets_for_group_tx(&tx, group_id_hex)?;
                 let prior_nostr_routes_json = tx
@@ -228,6 +233,9 @@ impl SqliteAccountStorage {
                         )
                         .storage()?;
                     }
+                    if reset_device_sync {
+                        retire_device_sync_preparations(&tx, at)?;
+                    }
                     self.connection.note_openmls_write();
                 }
                 if deleted > 0 {
@@ -281,4 +289,71 @@ impl SqliteAccountStorage {
             }),
         }
     }
+}
+
+/// Removal/failed-link cleanup is terminal; a Move has already cut old
+/// trust. Neither owns this deliberate active-copy reset's extra cleanup.
+fn active_trusted_device_group_forget(
+    tx: &rusqlite::Transaction<'_>,
+    group_hex: &str,
+    group_id: &[u8],
+) -> StorageResult<bool> {
+    let record: Option<Vec<u8>> = tx
+        .query_row_cached(
+            "SELECT g.record FROM cgka_groups g JOIN device_groups d
+         ON d.group_id_hex = ?1 WHERE g.id = ?2 AND d.trust IN ('created','linked')",
+            params![group_hex, group_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    let group: cgka_traits::Group = crate::deserialize(&record)?;
+    if group.is_terminal() {
+        return Ok(false);
+    }
+    let moving: bool = tx
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM device_group_moves WHERE phase != 3
+         AND (original_id = ?1 OR destination_id = ?1))",
+            params![group_id],
+            |row| row.get(0),
+        )
+        .storage()?;
+    Ok(!moving)
+}
+
+/// These are local preparations sourced solely from the old trusted device
+/// group. Keep ordinary-chat admitted work, issued private key material,
+/// consumed-reference tombstones and all shared values/security decisions.
+fn retire_device_sync_preparations(
+    tx: &rusqlite::Transaction<'_>,
+    at: cgka_traits::Timestamp,
+) -> StorageResult<()> {
+    tx.execute_batch(
+        "DELETE FROM device_renames;
+        DELETE FROM private_key_packages_received WHERE taken_at IS NULL;
+        DELETE FROM private_key_package_requests;
+        DELETE FROM sibling_welcomes_received;
+        DELETE FROM cgka_sibling_adds;
+        DELETE FROM history_deliveries_owed;
+        DELETE FROM history_deliveries_parked;
+        DELETE FROM history_delivery_sends;
+        DELETE FROM sibling_welcome_resends;
+        DELETE FROM device_activity;
+        DELETE FROM device_heartbeat_sent;
+        UPDATE small_state_items SET unsent = 1 WHERE unsent = 0;
+        UPDATE invitation_decisions SET unsent = 1 WHERE unsent = 0;",
+    )
+    .storage()?;
+    tx.execute_cached(
+        "INSERT INTO small_state_sync(id,started_at,request_owed,answer_owed)
+         VALUES(1,?1,1,1) ON CONFLICT(id) DO UPDATE SET started_at=excluded.started_at,
+         broadcast_at=NULL,broadcast_tip=NULL,request_owed=1,answer_owed=1",
+        params![u64_to_i64(at.0)?],
+    )
+    .storage()?;
+    Ok(())
 }
