@@ -511,7 +511,7 @@ async fn upload_blossom_body(
     // server that cannot prove it stored this exact body fails over.
     require_descriptor_digest_and_size: bool,
 ) -> Result<String, AppError> {
-    let (upload_url, server_host) = blossom_upload_endpoint(server)?;
+    let (upload_url, server_host) = blossom_endpoint(server, "upload")?;
     let authorization =
         blossom_authorization_header(signer, &server_host, blob_hash_hex, "upload", "Upload Blob")
             .await?;
@@ -599,8 +599,7 @@ pub(crate) async fn delete_blossom_blob(
     signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
 ) -> Result<(), AppError> {
-    let (mut url, server_host) = blossom_upload_endpoint(server)?;
-    url.set_path(blob_hash_hex);
+    let (url, server_host) = blossom_endpoint(server, blob_hash_hex)?;
     let authorization =
         blossom_authorization_header(signer, &server_host, blob_hash_hex, "delete", "Delete Blob")
             .await?;
@@ -2063,7 +2062,7 @@ fn record_download_phase(
     }
 }
 
-fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
+fn blossom_endpoint(server: &str, leaf: &str) -> Result<(Url, String), AppError> {
     let mut url = Url::parse(server.trim())
         .map_err(|_| AppError::BlobStore("invalid Blossom server URL".into()))?;
     match url.scheme() {
@@ -2078,10 +2077,14 @@ fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
         .host_str()
         .ok_or_else(|| AppError::BlobStore("Blossom server URL is missing a host".into()))?
         .to_ascii_lowercase();
-    url.set_path("upload");
+    set_blossom_path(&mut url, leaf);
+    Ok((url, host))
+}
+
+fn set_blossom_path(url: &mut Url, leaf: &str) {
+    url.set_path(leaf);
     url.set_query(None);
     url.set_fragment(None);
-    Ok((url, host))
 }
 
 pub(crate) fn blossom_blob_url(server: &str, encrypted_hash_hex: &str) -> String {
@@ -2096,9 +2099,7 @@ pub(super) fn blossom_blob_url_with_extension(
     let suffix = extension.unwrap_or_default();
     match Url::parse(server.trim()) {
         Ok(mut url) => {
-            url.set_path(&format!("{hash_hex}{suffix}"));
-            url.set_query(None);
-            url.set_fragment(None);
+            set_blossom_path(&mut url, &format!("{hash_hex}{suffix}"));
             url.to_string()
         }
         Err(_) => format!("{}/{}{}", server.trim_end_matches('/'), hash_hex, suffix),
@@ -2174,5 +2175,50 @@ fn reqwest_upload_error(err: reqwest::Error) -> AppError {
         AppError::MediaUploadTimedOut
     } else {
         reqwest_blob_error(err)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn blossom_operation_urls_preserve_the_server_base_path() {
+        let hash = "ab".repeat(32);
+        for (server, root) in [
+            ("https://media.example", "https://media.example"),
+            ("https://media.example/", "https://media.example"),
+            ("https://media.example/media", "https://media.example/media"),
+            (
+                "https://media.example/media/?q=1#part",
+                "https://media.example/media",
+            ),
+            (
+                "  https://MEDIA.EXAMPLE:443/nested/%2Ffiles///?q=1#part  ",
+                "https://media.example/nested/%2Ffiles",
+            ),
+            (
+                "http://127.0.0.1:8080/media/",
+                "http://127.0.0.1:8080/media",
+            ),
+        ] {
+            let (upload, _) = blossom_endpoint(server, "upload").unwrap();
+            let (delete, _) = blossom_endpoint(server, &hash).unwrap();
+            assert_eq!(
+                (
+                    upload.to_string(),
+                    blossom_blob_url_with_extension(server, &hash, None),
+                    blossom_blob_url(server, &hash),
+                    delete.to_string(),
+                ),
+                (
+                    format!("{root}/upload"),
+                    format!("{root}/{hash}"),
+                    format!("{root}/{hash}.bin"),
+                    format!("{root}/{hash}"),
+                ),
+                "upload, synthesized fetch and deletion must stay under the configured server base",
+            );
+        }
     }
 }
