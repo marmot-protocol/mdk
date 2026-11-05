@@ -357,6 +357,20 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
 
     let linked_group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     assert!(linked_group == group);
+    // Have an ordinary unconsumed publication BEFORE the split, so both
+    // discovery and the busy-comparison control use real existing supply.
+    // Its announcement is fully delivered before Tablet's deeper fork wins.
+    let replacement = laptop.client.rotate_key_package().await.unwrap();
+    let replacement_ref = marmot_session::key_package_metadata(&replacement)
+        .unwrap()
+        .key_package_ref_hex;
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 8).await;
+    assert_eq!(
+        phone.roster(&group).devices[&laptop_slot]
+            .announced_key_package
+            .as_deref(),
+        Some(hex::decode(&replacement_ref).unwrap().as_slice())
+    );
     let made = link_record(&phone, &group, &laptop_slot_hex);
     assert_eq!(made.outcome, DeviceLinkOutcome::Linked);
     assert!(made.decided_at.is_some());
@@ -539,6 +553,7 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         .unwrap()
         .key_package_ref_hex;
     assert_ne!(fresh_ref, used);
+    assert_ne!(fresh_ref, replacement_ref);
     assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
     laptop.op(DeviceLinkOp::Start).await;
     let already_reset = laptop
