@@ -186,7 +186,7 @@
   account's devices, this one included, with one roster commit in the device
   group (mdk#2628 item 3.6). It is refused with nothing sent while the device
   group has an earlier change in flight (`device_group_busy`; retry later),
-  and in release builds until the roster's spec lands. A rename whose commit
+  and without explicit device-group capability and runtime intent. A rename whose commit
   loses a fork is made again later, unless another rename of that device
   won.
 
@@ -198,32 +198,29 @@
   `confirm_device_link_match` and `cancel_device_link` on the new device,
   `link_device` and `decline_device_link` on a device already signed in, and
   `device_link_snapshot`, each returning a `DeviceLinkSnapshotFfi`. Re-read it
-  on `DeviceLinkChanged`. Every call is refused in release builds until the
-  pairing and device-group specs land.
+  on `DeviceLinkChanged`. Every call is refused without the experimental device-group entry point and its build capability.
 
 - `linked_devices(account_ref)` returns this account's own devices as
   `LinkedDeviceFfi` records, from the roster of the device group this device
   trusts, this device first (mdk#2628 item 3.1). Re-read it on
-  `LinkedDevicesChanged`. It is empty in release builds until the roster's
-  spec lands.
+  `LinkedDevicesChanged`. It is empty without explicit device-group capability and runtime intent.
 - `LinkedDeviceFfi` adds `last_active_at`, when a heartbeat last showed a
   sibling running, and `inactive`, this device's own judgement 30 days after
   the later of that and when it first found the sibling in the roster
   (mdk#2628 item 3.6). Each device sends a heartbeat in the device group at
-  most once an hour while it runs. Release builds show neither.
+  most once an hour while it runs. Neither is shown without explicit device-group capability and runtime intent.
 
 - `key_package_refresh_overdue(account_ref)` says when this device's device
   group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
   so the app can tell the user before inviters stop treating the device as
   fresh at 30 days. Re-read it on `KeyPackageRefreshOverdueChanged`. It is
-  false in release builds until the roster's spec lands.
+  false without explicit device-group capability and runtime intent.
 
 - `unrecognized_sign_ins(account_ref)` returns sign-ins of this account that
   this device does not recognize as `UnrecognizedSignInFfi` records (mdk#2628
   item 3.2). `answer_sign_in(account_ref, slot_id_hex, response)` answers one
   with a `SignInResponseFfi`, and `check_sign_ins(account_ref)` checks now.
-  Re-read the list on `UnrecognizedSignInsChanged`. It is empty in release
-  builds until the roster's spec lands.
+  Re-read the list on `UnrecognizedSignInsChanged`. It is empty without explicit device-group capability and runtime intent.
 
 - `compromise_warning(account_ref)` returns the account's open compromise
   warning on this device as `CompromiseWarningItemFfi` records (mdk#2628 item
@@ -231,8 +228,7 @@
   device. Re-read it on `CompromiseWarningChanged`. `start_fresh(account_ref)`
   answers every sign-in from before this device Not now without rejecting
   any, and `started_fresh(account_ref)` says whether the device did so and
-  still has no device group. All are empty or false in release builds until
-  the roster's spec lands.
+  still has no device group. All are empty or false without explicit device-group capability and runtime intent.
 
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
