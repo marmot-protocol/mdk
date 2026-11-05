@@ -2491,6 +2491,224 @@ async fn abort_all_shuts_down_a_runtime_whose_start_was_cancelled() {
     );
 }
 
+struct AbortDaemonTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortDaemonTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Retain an accepted connection after decoding its request. The test decides
+/// when the peer releases it, independently of the client's readiness budget.
+fn unresponsive_daemon_peer(
+    socket: &Path,
+) -> (
+    JoinHandle<()>,
+    oneshot::Receiver<DaemonRequest>,
+    oneshot::Sender<()>,
+) {
+    let listener = fs_private::bind_unix_listener_private(socket, DAEMON_SOCKET_MODE)
+        .expect("bind private peer socket");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let listener = UnixListener::from_std(listener).expect("async peer listener");
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept readiness probe");
+        let request = read_daemon_request(&mut stream)
+            .await
+            .expect("decode readiness request");
+        entered_tx.send(request).expect("acknowledge request entry");
+        release_rx.await.expect("test releases peer");
+        drop(stream);
+        drop(listener);
+    });
+    (peer, entered_rx, release_tx)
+}
+
+/// Pause only after the peer has acknowledged real request entry. Starting
+/// paused could advance a client deadline before the socket I/O is scheduled.
+async fn observe_readiness_deadline<T>(probe: &mut JoinHandle<T>) -> Option<T> {
+    tokio::time::pause();
+    tokio::time::advance(DAEMON_START_TIMEOUT + Duration::from_secs(1)).await;
+    match tokio::time::timeout(Duration::from_secs(1), &mut *probe).await {
+        Ok(result) => Some(result.expect("readiness probe task does not panic")),
+        Err(_) => {
+            // Cancel before releasing the peer: on the original source a
+            // released Status could otherwise continue into daemon spawning.
+            probe.abort();
+            let _ = probe.await;
+            None
+        }
+    }
+}
+
+#[tokio::test]
+async fn daemon_start_bounds_an_existing_unresponsive_peer_without_spawning() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("wnd.sock");
+    let (peer, entered, release) = unresponsive_daemon_peer(&socket);
+    let _peer_guard = AbortDaemonTaskOnDrop(peer.abort_handle());
+    let original_socket = std::fs::symlink_metadata(&socket).expect("peer socket metadata");
+    let mut start = {
+        let home = home.path().to_owned();
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            start_daemon(
+                &daemon_test_cli(crate::Command::Daemon {
+                    command: DaemonCommand::Start {
+                        data_dir: None,
+                        discovery_relays: vec!["wss://relay.example".to_owned()],
+                        default_account_relays: Vec::new(),
+                        logs_dir: None,
+                    },
+                }),
+                &home,
+                &socket,
+                vec!["wss://relay.example".to_owned()],
+                Vec::new(),
+                None,
+            )
+            .await
+        })
+    };
+    let _start_guard = AbortDaemonTaskOnDrop(start.abort_handle());
+    let request = tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("start reaches the existing peer")
+        .expect("peer acknowledges the request");
+    assert!(matches!(request, DaemonRequest::Status), "{request:?}");
+
+    let output = observe_readiness_deadline(&mut start).await;
+    let retained_socket = std::fs::symlink_metadata(&socket).expect("existing socket retained");
+    let no_spawn_artifacts =
+        !default_log_path(home.path()).exists() && !default_pid_path(home.path()).exists();
+    assert!(!peer.is_finished(), "peer remains open until released");
+    release.send(()).expect("release peer");
+    peer.await.expect("peer task does not panic");
+
+    assert_eq!(retained_socket.ino(), original_socket.ino());
+    assert_eq!(retained_socket.dev(), original_socket.dev());
+    assert!(
+        no_spawn_artifacts,
+        "start must not spawn a competing daemon"
+    );
+    let output = output.expect(
+        "start must report an unresponsive existing peer within its readiness budget (mdk#2957)",
+    );
+    assert_eq!(output.code, 1, "{output:?}");
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).expect("start JSON");
+    assert_eq!(value["error"]["code"], "daemon_unavailable", "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("did not respond"),
+        "{value}"
+    );
+}
+
+#[tokio::test]
+async fn daemon_stale_socket_probe_times_out_without_unlinking_a_live_peer() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("wnd.sock");
+    let (peer, entered, release) = unresponsive_daemon_peer(&socket);
+    let _peer_guard = AbortDaemonTaskOnDrop(peer.abort_handle());
+    let original_socket = std::fs::symlink_metadata(&socket).expect("peer socket metadata");
+    let mut probe = {
+        let socket = socket.clone();
+        tokio::spawn(async move { remove_stale_socket(&socket).await })
+    };
+    let _probe_guard = AbortDaemonTaskOnDrop(probe.abort_handle());
+    let request = tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("stale check reaches the existing peer")
+        .expect("peer acknowledges the request");
+    assert!(matches!(request, DaemonRequest::Ping), "{request:?}");
+
+    let result = observe_readiness_deadline(&mut probe).await;
+    let retained_socket = std::fs::symlink_metadata(&socket).expect("existing socket retained");
+    assert!(!peer.is_finished(), "peer remains open until released");
+    release.send(()).expect("release peer");
+    peer.await.expect("peer task does not panic");
+
+    assert_eq!(retained_socket.ino(), original_socket.ino());
+    assert_eq!(retained_socket.dev(), original_socket.dev());
+    let error = result
+        .expect("stale check must finish within the readiness budget (mdk#2957)")
+        .expect_err("an unresponsive peer must block socket replacement");
+    let error = error.downcast_ref::<std::io::Error>().expect("I/O error");
+    assert_eq!(error.kind(), ErrorKind::TimedOut, "{error}");
+    assert!(error.to_string().contains("did not respond"), "{error}");
+}
+
+#[tokio::test]
+async fn daemon_existing_socket_checks_distinguish_ready_refused_and_absent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    for stale in [false, true] {
+        let socket = home
+            .path()
+            .join(if stale { "stale.sock" } else { "absent.sock" });
+        if stale {
+            drop(
+                fs_private::bind_unix_listener_private(&socket, DAEMON_SOCKET_MODE)
+                    .expect("create refused socket"),
+            );
+            assert!(socket.exists(), "closed listener leaves its socket file");
+        }
+        remove_stale_socket(&socket)
+            .await
+            .expect("stale or absent socket is safe");
+        assert!(!socket.exists(), "stale socket is removed");
+    }
+
+    let socket = home.path().join("ready.sock");
+    let peer = fake_daemon_status(&socket, Some(std::process::id()), 0);
+    let _peer_guard = AbortDaemonTaskOnDrop(peer.abort_handle());
+    let output = start_daemon(
+        &daemon_test_cli(crate::Command::Daemon {
+            command: DaemonCommand::Start {
+                data_dir: None,
+                discovery_relays: vec!["wss://relay.example".to_owned()],
+                default_account_relays: Vec::new(),
+                logs_dir: None,
+            },
+        }),
+        home.path(),
+        &socket,
+        vec!["wss://relay.example".to_owned()],
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_eq!(output.code, 0, "{output:?}");
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).expect("start JSON");
+    assert_eq!(value["result"]["running"], true, "{value}");
+    assert_eq!(value["result"]["pid"], std::process::id(), "{value}");
+
+    let error = remove_stale_socket(&socket)
+        .await
+        .expect_err("ready socket remains occupied");
+    let error = error.downcast_ref::<std::io::Error>().expect("I/O error");
+    assert_eq!(error.kind(), ErrorKind::AddrInUse, "{error}");
+    assert!(
+        error.to_string().contains("daemon already running"),
+        "{error}"
+    );
+    assert!(socket.exists());
+    assert!(!default_log_path(home.path()).exists());
+    assert!(!default_pid_path(home.path()).exists());
+    peer.abort();
+    let _ = peer.await;
+}
+
 #[test]
 fn daemon_start_timeout_override_is_available_in_explicit_test_builds() {
     assert_eq!(

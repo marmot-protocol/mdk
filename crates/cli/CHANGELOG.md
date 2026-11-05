@@ -281,6 +281,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Daemon startup no longer waits forever when an existing local peer accepts a readiness probe but never completes
+  its reply. The existing 60-second startup budget bounds the probe; an unresponsive socket is preserved and no
+  competing daemon is started (mdk#2957).
+
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
   `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
