@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Isolate unreadable per-device settings when adding linked devices to chats or sending their history, so healthy
+  siblings still progress. Keep the unreadable target's history owed and use the existing Blossom preparation backoff.
+  Settings holds, history expiry, publish-failure behavior and host APIs are unchanged; no migration is needed.
+
 - Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
   Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
   setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.

@@ -341,13 +341,19 @@ impl AppClient {
         }
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let mut sent = 0;
+        let mut first_error = None;
         for owed in storage.unsent_history_deliveries()? {
             // One going through Blossom is the upload's.
             if owed.blossom_due_at.is_some() {
                 continue;
             }
-            if !self.history_settings_ready(&exchange, &owed)? {
-                continue;
+            match self.history_settings_ready(&exchange, &owed) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
             }
             let events = match self.inline_history_deliveries(&exchange, &owed) {
                 Ok(Some(events)) => events,
@@ -378,7 +384,7 @@ impl AppClient {
                     .send_device_group_event(&exchange.group_id, event)
                     .await?
                 {
-                    return Ok(());
+                    return first_error.map_or(Ok(()), Err);
                 }
                 sent += 1;
             }
@@ -392,7 +398,7 @@ impl AppClient {
                 "history deliveries sent"
             );
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Readiness is checked before D76's terminal destination checks: a local
@@ -582,8 +588,13 @@ impl AppClient {
             storage.defer_blossom_history_delivery(owed, retry_at)
         };
         for owed in storage.due_blossom_history_deliveries(unix_now_seconds())? {
-            if !self.history_settings_ready(&exchange, &owed)? {
-                continue;
+            match self.history_settings_ready(&exchange, &owed) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    defer_unprepared(&owed, error)?;
+                    continue;
+                }
             }
             let prepared = self
                 .history_destination(&exchange, &owed)
