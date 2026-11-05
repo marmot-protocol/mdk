@@ -2,7 +2,7 @@
 //! only through bounded owned pages after the worker's SQL snapshot is released.
 use super::*;
 mod departure;
-use crate::chat_selection::capture::{CaptureRequest, PreparedCapture};
+use crate::chat_selection::capture::{CaptureError, CaptureRequest, PreparedCapture};
 use crate::chat_selection::presentation::owned_text;
 pub use departure::{ChatSelectionDepartureReport, ChatSelectionDepartureStep};
 
@@ -274,9 +274,9 @@ impl MarmotAppRuntime {
         let account = self
             .accounts
             .resolve(account_ref)
-            .map_err(|_| crate::chat_selection::capture::CaptureError::Closed)?;
+            .map_err(|_| CaptureError::Closed)?;
         if open.context.host.account_id_hex != account.account_id_hex {
-            return Err(crate::chat_selection::capture::CaptureError::Closed.into());
+            return Err(CaptureError::Closed.into());
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = CancelOnDrop(cancelled.clone());
@@ -318,7 +318,7 @@ impl MarmotAppRuntime {
             Ok((reader, owner_epoch))
         })
         .await
-        .map_err(|_| crate::chat_selection::capture::CaptureError::Closed)?;
+        .map_err(|_| CaptureError::Closed)?;
         let (reader, owner_epoch) = reader;
         let selected = if prepared.presentation.is_none() {
             Some(sorted_resolved_ids(&prepared)?)
@@ -387,6 +387,17 @@ fn reserved_ids(capacity: usize) -> Result<Vec<String>, ChatListSelectionError> 
         .map_err(|_| crate::chat_selection::presentation::PresentationError::ResourceExhausted)?;
     Ok(ids)
 }
+fn copy_ids<'a>(
+    ids: impl IntoIterator<Item = &'a String>,
+    capacity: usize,
+) -> Result<Vec<String>, ChatListSelectionError> {
+    let mut copied = reserved_ids(capacity)?;
+    for id in ids {
+        copied.push(owned_text(id)?);
+    }
+    Ok(copied)
+}
+
 fn retained_ids_cost<'a>(
     ids: impl Iterator<Item = &'a String>,
 ) -> Result<(usize, usize), ChatListSelectionError> {
@@ -434,6 +445,23 @@ pub(super) fn admit_owner_witness(
 }
 
 impl CompleteState {
+    async fn capture_checked(
+        &self,
+        request: CaptureRequest,
+        mismatch_error: ChatListSelectionError,
+    ) -> Result<crate::client::BoundSelectionCapture, ChatListSelectionError> {
+        let bound = self
+            .manager
+            .capture_selection_context(&self.reader.label, request)
+            .await?;
+        if !bound.owner.shares_connection_with(&self.reader.storage)
+            || bound.owner_epoch != self.owner_epoch
+        {
+            return Err(mismatch_error);
+        }
+        Ok(bound)
+    }
+
     async fn check(&self) -> Result<(), ChatListSelectionError> {
         let reader = self.reader.clone();
         let flag = self.request.cancelled.clone();
@@ -452,7 +480,7 @@ impl CompleteState {
             reader.check(&flag)
         })
         .await
-        .map_err(|_| crate::chat_selection::capture::CaptureError::Closed)?;
+        .map_err(|_| CaptureError::Closed)?;
         Ok(())
     }
     fn require_revision(&self, revision: u64) -> Result<(), ChatListSelectionError> {
@@ -533,14 +561,8 @@ impl CompleteState {
                 request.overlays = context.overlays;
                 request.capture_now_ms = crate::notifications::unix_now_ms();
                 let mut bound = self
-                    .manager
-                    .capture_selection_context(&self.reader.label, request.clone())
+                    .capture_checked(request.clone(), ChatListSelectionError::Closed)
                     .await?;
-                if !bound.owner.shares_connection_with(&self.reader.storage)
-                    || bound.owner_epoch != self.owner_epoch
-                {
-                    return Err(ChatListSelectionError::Closed);
-                }
                 let reused = match bound.prepared.presentation.as_mut() {
                     None => true,
                     Some(pending) => match self.proof.as_ref().map(|proof| pending.reuse_proof(proof)) {
@@ -553,26 +575,14 @@ impl CompleteState {
                     // Reissue one complete remaining-original capture; a stale
                     // page never turns into a successful prefix or broad scope.
                     let selected = self.selected.as_ref().expect("resolved folder assignment");
-                    let mut all = Vec::new();
-                    all.try_reserve_exact(selected.len()).map_err(|_| {
-                        crate::chat_selection::presentation::PresentationError::ResourceExhausted
-                    })?;
-                    for id in selected {
-                        all.push(owned_text(id)?);
-                    }
+                    let all = copy_ids(selected, selected.len())?;
                     request.original_ids = Some(all);
                     request.revision = revision
                         .checked_add(1)
                         .ok_or(ChatListSelectionError::StaleRevision)?;
                     let full = self
-                        .manager
-                        .capture_selection_context(&self.reader.label, request.clone())
+                        .capture_checked(request.clone(), ChatListSelectionError::Closed)
                         .await?;
-                    if !full.owner.shares_connection_with(&self.reader.storage)
-                        || full.owner_epoch != self.owner_epoch
-                    {
-                        return Err(ChatListSelectionError::Closed);
-                    }
                     let prepared = full.prepared;
                     let selected = if prepared.presentation.is_none() {
                         Some(sorted_resolved_ids(&prepared)?)
@@ -754,14 +764,8 @@ impl CompleteState {
                 request.overlays = context.overlays;
                 request.capture_now_ms = crate::notifications::unix_now_ms();
                 let bound = self
-                    .manager
-                    .capture_selection_context(&self.reader.label, request.clone())
+                    .capture_checked(request.clone(), CaptureError::Closed.into())
                     .await?;
-                if !bound.owner.shares_connection_with(&self.reader.storage)
-                    || bound.owner_epoch != self.owner_epoch
-                {
-                    return Err(crate::chat_selection::capture::CaptureError::Closed.into());
-                }
                 let prepared = bound.prepared;
                 let selected = if prepared.presentation.is_none() {
                     Some(sorted_resolved_ids(&prepared)?)
@@ -851,15 +855,7 @@ impl CompleteState {
                     .selected
                     .as_ref()
                     .ok_or(ChatListSelectionError::IncompletePresentation)?;
-                let mut original_ids = Vec::new();
-                original_ids
-                    .try_reserve_exact(selected.len().min(200))
-                    .map_err(|_| {
-                        crate::chat_selection::presentation::PresentationError::ResourceExhausted
-                    })?;
-                for id in selected.iter().take(200) {
-                    original_ids.push(owned_text(id)?);
-                }
+                let original_ids = copy_ids(selected.iter().take(200), selected.len().min(200))?;
                 let proof = self.proof.clone();
                 let mut request = self.request.clone();
                 request.revision = revision
@@ -893,7 +889,7 @@ impl CompleteState {
                 let result = match result {
                     Ok(value) => value,
                     Err(error) => {
-                        if error != crate::chat_selection::capture::CaptureError::Closed {
+                        if error != CaptureError::Closed {
                             // Source-owned non-closed errors are returned only
                             // before the first mutation's preallocated loop.
                             self.mutation_uncertain = false;
@@ -922,14 +918,8 @@ impl CompleteState {
                         request.original_ids = Some(all);
                         request.capture_now_ms = crate::notifications::unix_now_ms();
                         let full = self
-                            .manager
-                            .capture_selection_context(&self.reader.label, request.clone())
+                            .capture_checked(request.clone(), ChatListSelectionError::Closed)
                             .await?;
-                        if !full.owner.shares_connection_with(&self.reader.storage)
-                            || full.owner_epoch != self.owner_epoch
-                        {
-                            return Err(ChatListSelectionError::Closed);
-                        }
                         self.request = request;
                         self.prepared = full.prepared;
                         self.selected = None;
@@ -987,13 +977,7 @@ impl CompleteState {
                     );
                 }
                 let slice = &ids[offset..offset.saturating_add(limit).min(ids.len())];
-                let mut group_ids = Vec::new();
-                group_ids.try_reserve_exact(slice.len()).map_err(|_| {
-                    crate::chat_selection::presentation::PresentationError::ResourceExhausted
-                })?;
-                for id in slice {
-                    group_ids.push(owned_text(id)?);
-                }
+                let group_ids = copy_ids(slice, slice.len())?;
                 return Ok(Response::Page(ChatListSelectionPage {
                     revision,
                     group_ids,
@@ -1074,21 +1058,13 @@ impl CompleteState {
                     return Err(ChatListSelectionError::IncompletePresentation);
                 }
                 if context.host.account_id_hex != self.request.host.account_id_hex {
-                    return Err(crate::chat_selection::capture::CaptureError::Closed.into());
+                    return Err(CaptureError::Closed.into());
                 }
                 let selected = self
                     .selected
                     .as_ref()
                     .ok_or(ChatListSelectionError::IncompletePresentation)?;
-                let mut original_ids = Vec::new();
-                original_ids
-                    .try_reserve_exact(selected.len())
-                    .map_err(|_| {
-                        crate::chat_selection::presentation::PresentationError::ResourceExhausted
-                    })?;
-                for id in selected {
-                    original_ids.push(owned_text(id)?);
-                }
+                let original_ids = copy_ids(selected, selected.len())?;
                 let mut request = self.request.clone();
                 request.revision = revision
                     .checked_add(1)
@@ -1099,14 +1075,8 @@ impl CompleteState {
                 request.overlays = context.overlays;
                 request.capture_now_ms = crate::notifications::unix_now_ms();
                 let bound = self
-                    .manager
-                    .capture_selection_context(&self.reader.label, request.clone())
+                    .capture_checked(request.clone(), CaptureError::Closed.into())
                     .await?;
-                if !bound.owner.shares_connection_with(&self.reader.storage)
-                    || bound.owner_epoch != self.owner_epoch
-                {
-                    return Err(crate::chat_selection::capture::CaptureError::Closed.into());
-                }
                 let prepared = bound.prepared;
                 let selected = if prepared.presentation.is_none() {
                     Some(sorted_resolved_ids(&prepared)?)

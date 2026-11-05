@@ -240,23 +240,11 @@ impl CompleteState {
                     return Err(ChatListSelectionError::Closed);
                 }
                 let selected = self.selected.as_ref().expect("resolved before admission");
-                let mut all = Vec::new();
-                all.try_reserve_exact(selected.len()).map_err(|_| {
-                    crate::chat_selection::presentation::PresentationError::ResourceExhausted
-                })?;
-                for id in selected {
-                    all.push(owned_text(id)?);
-                }
+                let all = copy_ids(selected, selected.len())?;
                 request.original_ids = Some(all);
                 let full = self
-                    .manager
-                    .capture_selection_context(&self.reader.label, request.clone())
+                    .capture_checked(request.clone(), ChatListSelectionError::Closed)
                     .await?;
-                if !full.owner.shares_connection_with(&self.reader.storage)
-                    || full.owner_epoch != self.owner_epoch
-                {
-                    return Err(ChatListSelectionError::Closed);
-                }
                 self.request = request;
                 self.prepared = full.prepared;
                 self.selected = None;
