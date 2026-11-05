@@ -523,7 +523,7 @@ in `marmot-app` fills it from facts the owner already has:
 | --- | --- |
 | Every account open, with or without a transport cursor | Every current route's goal widens to its standing floor, directly in the ledger. No extra incremental-history obligation is created for the old owner when a cursor exists |
 | A route becomes current, including a group join or route addition | At the runner's routing-change settlement, before its next debt read, current routes' goals widen to their standing floors. Existing wider goals and durable coverage stay intact |
-| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
+| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing, unless the wire showed its relay sent no EVENT frame before EOSE, and then it proves from the REQ's `since`. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
 | A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
@@ -581,10 +581,21 @@ counts them (expired, deleted or replaced events, bad signatures, frames it cann
 a count is only a lower bound on what the relay sent and cannot show that a reply was not cut.
 The rule assumes relays cut a reply newest first, as NIP-01 asks of a `limit`: every stored
 event newer than the oldest one counted was then sent. A relay that cuts any other way breaks
-that assumption, and the ledger cannot see it. A count with no event proves nothing, and live
-boundaries read no NIP-11 limit. An API that reported the raw frames each REQ received before
-EOSE could later add back, on top of this rule, a proof from the REQ's `since` for a reply
-under the relay's limit.
+that assumption, and the ledger cannot see it. Live boundaries read no NIP-11 limit, and a count
+with no event proves nothing on its own.
+
+The wire can say more than the count. The account pool's WebSocket tap, the one that reads the
+sweep's hints, also counts the EVENT frames each REQ's relay sends before that REQ's EOSE,
+valid or not, on the connection the REQ went out on. A relay that sent none cut nothing, so a
+count with no event whose tap count is zero proves its whole window, from the REQ's `since`
+through the second before the request. The tap answers only when it can tie every frame to one
+REQ. A frame it cannot attribute while the REQ is open (an EVENT whose id it cannot read, an
+EOSE too long to read, a binary frame), an id re-sent on the connection while the relay may
+still answer the earlier REQ, or a count evicted from its bound leaves the answer unknown, and
+the count proves nothing. A non-empty count keeps the rule above. Without this, each join, which
+restarts every live REQ, left every quiet route a sliver between the two REQs that only a sweep
+could prove: one attempt per route per relay per join, so a burst of joins spent the account's
+hourly budget (mdk#2660).
 
 Past the request an open REQ vouches only while it lasts, and nothing proves when it stopped
 delivering: a connection can die silently, and a frozen process notices nothing. So each
@@ -710,9 +721,10 @@ Known disagreements, expected until later phases remove their cause:
   connected account that recovered from loss owes the time since that generation's request,
   as unowed debt, until a comparison proves it, or its next generation's EOSE does on a
   route busy enough to count an event older than that time.
-- **Quiet windows.** A live count with no event proves nothing, so where replay admission
-  settles an obligation over a window with no events, the ledger keeps it as unowed debt
-  until a comparison proves it.
+- **Quiet windows.** A live count with no event proves nothing unless the wire showed its
+  relay sent nothing, so where replay admission settles an obligation over a window with no
+  events and the tap could not vouch for the reply, the ledger keeps it as unowed debt until a
+  comparison proves it.
 - **Required relays only.** A certificate is recorded for the route's required relays, and a
   scope is compared on its required relays; a scope with none is not comparable. Live
   boundaries are recorded for every endpoint that admitted one.
@@ -931,7 +943,8 @@ as admission and survey errors schedules another attempt, without an immediate s
 or a separate retry timer. Existing capture fences stay in force while preparation waits.
 
 Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
-that its relay's non-empty count left unproven. An empty count's range is cold-start debt,
+that its relay's non-empty count left unproven. An empty count's range, unless the wire proved
+it, is cold-start debt,
 owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
 group's held frames may go below the first second its fencing relays still owe in their
 capture (`live_fences`), and a relay off the frontier fences nothing unless its group is

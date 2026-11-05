@@ -1,4 +1,6 @@
-//! NIP-67 `more` hints for the sweep's own REQs, read off the wire.
+//! What the wire says that nostr-sdk does not pass on: NIP-67 `more` hints
+//! for the sweep's own REQs, and whether a REQ's relay sent any EVENT frame
+//! before its EOSE.
 //!
 //! nostr-sdk keeps EOSE's first two elements and drops NIP-67's third, and an
 //! acquisition's REQ id never reaches its caller. [`HintTransport`] wraps the
@@ -29,12 +31,28 @@
 //!   which the tap never parses: it reads frames before the SDK's size check.
 //!
 //! With no watch live, frames skip the tap's lock.
+//!
+//! The tap also counts the EVENT frames each REQ's relay sends before that
+//! REQ's EOSE, valid or not ([`ReplyCounts`]). nostr-sdk drops some frames
+//! without a word (an expired event, one its database deleted), so a live
+//! REQ that delivered nothing may still have been cut; one whose relay sent
+//! no EVENT frame at all was not ([`EoseHints::sent_nothing`]). Only frames
+//! from the connection the REQ went out on count. A count is unknown, and
+//! proves nothing, when:
+//!
+//! - the relay sends a frame the tap cannot tie to one REQ while the count
+//!   is open: an EVENT whose id it cannot read, an EOSE too long to read, a
+//!   binary frame;
+//! - a REQ re-uses the id on the same connection while the relay may still
+//!   answer the earlier one, or after the client closed it;
+//! - more REQs went to the relay since than the tap keeps
+//!   ([`MAX_REPLIES_PER_RELAY`]).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_wsocket::Message;
@@ -44,13 +62,18 @@ use nostr_sdk::prelude::{ClientMessage, Filter, RelayUrl, Url};
 use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
 use serde_json::Value;
 
-/// Hints for live watches, shared by every connection of one client.
+/// Hints for live watches and every REQ's reply count, shared by every
+/// connection of one client.
 #[derive(Default)]
 pub(crate) struct EoseHints {
     /// Watches registered and not yet dropped.
     live: AtomicUsize,
     /// By relay URL, as the transport is asked to connect to it.
     relays: Mutex<HashMap<String, RelayWatches>>,
+    /// What each REQ's relay sent before its EOSE.
+    replies: ReplyCounts,
+    /// Numbers each connection the transport opens.
+    connections: AtomicU64,
 }
 
 #[derive(Default)]
@@ -126,6 +149,15 @@ impl EoseHints {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RelayWatches>> {
         self.relays.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `endpoint` sent no EVENT frame at all for the REQ
+    /// `subscription_id` before that REQ's EOSE, as read off the wire. False
+    /// while unknown or unanswered, and once another REQ re-used the id.
+    pub(crate) fn sent_nothing(&self, endpoint: &RelayUrl, subscription_id: &str) -> bool {
+        self.replies
+            .answered(<&Url>::from(endpoint).as_str(), subscription_id)
+            == Some(0)
     }
 
     /// A frame the client sends `relay`: the first one-filter REQ carrying a
@@ -207,6 +239,283 @@ impl EoseHints {
         }
         self.live.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// Most REQs whose replies the tap counts on one relay. Past it the oldest
+/// goes, and its EOSE reads as unknown.
+const MAX_REPLIES_PER_RELAY: usize = 1024;
+
+/// What each relay sent for each REQ the client sent it, by relay URL as the
+/// transport connects to it, then by subscription id.
+#[derive(Default)]
+struct ReplyCounts {
+    /// Counts still waiting for their EOSE, on every relay. With none,
+    /// received frames skip the lock.
+    open: AtomicUsize,
+    relays: Mutex<HashMap<String, RelayReplies>>,
+}
+
+#[derive(Default)]
+struct RelayReplies {
+    by_id: HashMap<String, Reply>,
+    /// Ids in the order their REQs went out, with each REQ's stamp. An entry
+    /// whose stamp is no longer its id's was replaced.
+    order: VecDeque<(u64, String)>,
+    next_stamp: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Reply {
+    /// The connection the REQ went out on. Frames from another connection
+    /// do not answer it.
+    connection: u64,
+    stamp: u64,
+    state: ReplyState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyState {
+    /// EVENT frames counted so far.
+    Open { events: usize },
+    /// EVENT frames counted before the EOSE.
+    Answered { events: usize },
+    /// The relay refused it with CLOSED; nothing more comes for it.
+    Refused,
+    /// Its count cannot be known: a frame the tap could not attribute came
+    /// while it was open, or a reply to an earlier REQ with its id may still
+    /// be on the way.
+    Unknown,
+}
+
+impl ReplyState {
+    fn is_open(self) -> bool {
+        matches!(self, Self::Open { .. })
+    }
+
+    /// Whether the relay may still send this REQ's EOSE.
+    fn may_answer(self) -> bool {
+        matches!(self, Self::Open { .. } | Self::Unknown)
+    }
+}
+
+/// What one received frame can do to the counts on its connection.
+enum Received {
+    Event(String),
+    Eose(String),
+    Closed(String),
+    /// Ends and counts nothing.
+    Other,
+    /// It may be any open REQ's EVENT or EOSE.
+    Unattributed,
+}
+
+impl Received {
+    /// Read the frame as the SDK would dispatch it. Anything that could be an
+    /// open REQ's EVENT or EOSE but cannot be tied to its id is
+    /// [`Received::Unattributed`].
+    fn read(text: &str) -> Self {
+        match head_verb(text).as_deref() {
+            None => Self::Unattributed,
+            Some("EVENT") => second_string(text).map_or(Self::Unattributed, Self::Event),
+            Some("EOSE") if text.len() > MAX_EOSE_FRAME => Self::Unattributed,
+            Some("EOSE") => read_eose(text).map_or(Self::Other, |(id, _)| Self::Eose(id)),
+            Some("CLOSED") => second_string(text).map_or(Self::Other, Self::Closed),
+            Some(_) => Self::Other,
+        }
+    }
+}
+
+impl ReplyCounts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RelayReplies>> {
+        self.relays.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A frame the client sends `relay` on `connection`: a REQ opens a count
+    /// for its id, replacing any earlier one, and a CLOSE ends it.
+    fn sent(&self, relay: &str, connection: u64, text: &str) {
+        match head_verb(text).as_deref() {
+            Some("REQ") => {
+                if let Ok(ClientMessage::Req {
+                    subscription_id, ..
+                }) = ClientMessage::from_json(text)
+                {
+                    self.opened(relay, connection, subscription_id.as_str());
+                }
+            }
+            Some("CLOSE") => {
+                if let Ok(ClientMessage::Close(subscription_id)) = ClientMessage::from_json(text) {
+                    self.closed_by_client(relay, subscription_id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn opened(&self, relay: &str, connection: u64, id: &str) {
+        let mut relays = self.lock();
+        let replies = relays.entry(relay.to_owned()).or_default();
+        let stamp = replies.next_stamp;
+        replies.next_stamp += 1;
+        let previous = replies.by_id.get(id).copied();
+        // On the same connection, an EOSE still owed to the REQ this one
+        // replaces could not be told from this one's.
+        let state = if previous
+            .is_some_and(|reply| reply.connection == connection && reply.state.may_answer())
+        {
+            ReplyState::Unknown
+        } else {
+            ReplyState::Open { events: 0 }
+        };
+        if let Some(previous) = previous {
+            self.leaving(previous.state);
+        }
+        if state.is_open() {
+            self.open.fetch_add(1, Ordering::AcqRel);
+        }
+        replies.by_id.insert(
+            id.to_owned(),
+            Reply {
+                connection,
+                stamp,
+                state,
+            },
+        );
+        replies.order.push_back((stamp, id.to_owned()));
+        while replies.by_id.len() > MAX_REPLIES_PER_RELAY
+            || replies.order.len() > 2 * MAX_REPLIES_PER_RELAY
+        {
+            let Some((stamp, id)) = replies.order.pop_front() else {
+                break;
+            };
+            if replies
+                .by_id
+                .get(&id)
+                .is_some_and(|reply| reply.stamp == stamp)
+                && let Some(evicted) = replies.by_id.remove(&id)
+            {
+                self.leaving(evicted.state);
+            }
+        }
+    }
+
+    /// The client closed `id`. Its EOSE may still be on the way, so a count
+    /// that could still be answered stays, as unknown, until the id's next
+    /// REQ replaces it.
+    fn closed_by_client(&self, relay: &str, id: &str) {
+        let mut relays = self.lock();
+        let Some(replies) = relays.get_mut(relay) else {
+            return;
+        };
+        let Some(reply) = replies.by_id.get_mut(id) else {
+            return;
+        };
+        if reply.state.may_answer() {
+            self.leaving(reply.state);
+            reply.state = ReplyState::Unknown;
+        } else {
+            replies.by_id.remove(id);
+        }
+    }
+
+    /// A count leaves the open set, if it was in it.
+    fn leaving(&self, state: ReplyState) {
+        if state.is_open() {
+            self.open.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A frame `relay` sends on `connection`; `None` for a binary frame,
+    /// which the SDK ignores but the relay may have meant as anything.
+    fn received(&self, relay: &str, connection: u64, text: Option<&str>) {
+        if self.open.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let frame = text.map_or(Received::Unattributed, Received::read);
+        let mut relays = self.lock();
+        let Some(replies) = relays.get_mut(relay) else {
+            return;
+        };
+        let (id, next) = match &frame {
+            Received::Event(id) => (id, None),
+            Received::Eose(id) => (id, Some(Answer::Eose)),
+            Received::Closed(id) => (id, Some(Answer::Refused)),
+            Received::Other => return,
+            Received::Unattributed => {
+                for reply in replies
+                    .by_id
+                    .values_mut()
+                    .filter(|reply| reply.connection == connection && reply.state.is_open())
+                {
+                    self.leaving(reply.state);
+                    reply.state = ReplyState::Unknown;
+                }
+                return;
+            }
+        };
+        let Some(reply) = replies
+            .by_id
+            .get_mut(id.as_str())
+            .filter(|reply| reply.connection == connection)
+        else {
+            return;
+        };
+        let ReplyState::Open { events } = reply.state else {
+            return;
+        };
+        reply.state = match next {
+            None => ReplyState::Open { events: events + 1 },
+            Some(Answer::Eose) => ReplyState::Answered { events },
+            Some(Answer::Refused) => ReplyState::Refused,
+        };
+        if next.is_some() {
+            self.open.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The EVENT frames `relay` sent for `id` before its EOSE, once answered.
+    fn answered(&self, relay: &str, id: &str) -> Option<usize> {
+        match self.lock().get(relay)?.by_id.get(id)?.state {
+            ReplyState::Answered { events } => Some(events),
+            ReplyState::Open { .. } | ReplyState::Refused | ReplyState::Unknown => None,
+        }
+    }
+}
+
+/// How a frame ends an open count.
+#[derive(Clone, Copy)]
+enum Answer {
+    Eose,
+    Refused,
+}
+
+/// The longest subscription id token the tap reads from an EVENT or CLOSED
+/// frame: a 64-character id with every character escaped is 384 bytes.
+const MAX_ID_TOKEN: usize = 400;
+
+/// A frame's second element decoded as JSON decodes it, when the frame is an
+/// array whose first two elements are strings and the second is short enough
+/// to be a subscription id.
+fn second_string(text: &str) -> Option<String> {
+    let rest = text.trim_start().strip_prefix('[')?.trim_start();
+    let (_, rest) = string_token(rest, MAX_VERB_TOKEN)?;
+    let rest = rest.trim_start().strip_prefix(',')?.trim_start();
+    let (token, _) = string_token(rest, MAX_ID_TOKEN)?;
+    serde_json::from_str::<String>(token).ok()
+}
+
+/// The JSON string token `text` starts with, quotes included, and the rest,
+/// when it closes within `max` bytes.
+fn string_token(text: &str, max: usize) -> Option<(&str, &str)> {
+    let body = text.strip_prefix('"')?;
+    let mut escaped = false;
+    for (index, byte) in body.bytes().enumerate().take(max) {
+        match byte {
+            b'"' if !escaped => return Some(text.split_at(index + 2)),
+            b'\\' if !escaped => escaped = true,
+            _ => escaped = false,
+        }
+    }
+    None
 }
 
 /// The longest EOSE frame the tap parses. A real one is a subscription id of
@@ -325,20 +634,26 @@ impl WebSocketTransport for HintTransport {
         Box::pin(async move {
             let (sink, stream) = self.transport.connect(url, proxy).await?;
             let relay: Arc<str> = Arc::from(url.as_str());
+            let connection = self.hints.connections.fetch_add(1, Ordering::Relaxed);
             let (sent_hints, sent_relay) = (self.hints.clone(), relay.clone());
             // Text frames only: the SDK ignores the rest, and `as_text` would
             // read a binary frame as one.
             let sink: WebSocketSink = Box::pin(sink.with(move |message: Message| {
                 if let Message::Text(text) = &message {
                     sent_hints.sent(&sent_relay, text);
+                    sent_hints.replies.sent(&sent_relay, connection, text);
                 }
                 future::ready(Ok::<_, nostr_sdk::error::Error>(message))
             }));
             let hints = self.hints.clone();
-            let stream: WebSocketStream = Box::pin(stream.inspect(move |item| {
-                if let Ok(Message::Text(text)) = item {
+            let stream: WebSocketStream = Box::pin(stream.inspect(move |item| match item {
+                Ok(Message::Text(text)) => {
                     hints.received(&relay, text);
+                    hints.replies.received(&relay, connection, Some(text));
                 }
+                // The SDK ignores it, but a reply count cannot.
+                Ok(Message::Binary(_)) => hints.replies.received(&relay, connection, None),
+                _ => {}
             }));
             Ok((sink, stream))
         })
@@ -610,6 +925,290 @@ mod tests {
         assert!(later.more());
     }
 
+    /// Whether the tap reads REQ "live" on [`RELAY`] as answered with no
+    /// EVENT frame, after `frames` on the connection it went out on.
+    fn sent_nothing_after(frames: &[&str]) -> bool {
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        for frame in frames {
+            hints.replies.received(&key(), 0, Some(frame));
+        }
+        hints.sent_nothing(&relay(), "live")
+    }
+
+    const LIVE_EOSE: &str = r#"["EOSE","live"]"#;
+
+    #[test]
+    fn a_reply_sent_nothing_only_with_no_event_frame_before_its_eose() {
+        assert!(sent_nothing_after(&[LIVE_EOSE]));
+        // Other REQs' frames, frames that end nothing, and the REQ's own
+        // live events after its EOSE change nothing.
+        assert!(sent_nothing_after(&[
+            r#"["EVENT","other",{}]"#,
+            r#"["NOTICE","live"]"#,
+            r#"["OK","live",true,""]"#,
+            r#"["EOSE","other"]"#,
+            LIVE_EOSE,
+            r#"["EVENT","live",{}]"#,
+        ]));
+
+        // Any EVENT frame for it counts, valid or not, however its id is
+        // spelled: the SDK may have dropped it without a word.
+        let escaped_id = format!(r#"["EVENT","{}",{{}}]"#, escaped("live"));
+        for event in [
+            r#"["EVENT","live",{}]"#,
+            r#"["EVENT","live",7]"#,
+            r#"["EVENT","live"]"#,
+            r#" [ "EVENT" , "live" ]"#,
+            escaped_id.as_str(),
+        ] {
+            assert!(!sent_nothing_after(&[event, LIVE_EOSE]), "{event}");
+        }
+
+        // Unanswered, refused, or answered after being refused.
+        assert!(!sent_nothing_after(&[]));
+        let closed = r#"["CLOSED","live","auth-required: sign in"]"#;
+        assert!(!sent_nothing_after(&[closed]));
+        assert!(!sent_nothing_after(&[closed, LIVE_EOSE]));
+        // An EOSE the tap cannot read ends nothing: the count stays open.
+        assert!(!sent_nothing_after(&[r#"["EOSE",7]"#]));
+
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        assert_eq!(hints.replies.open.load(Ordering::Acquire), 1);
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        assert_eq!(
+            hints.replies.open.load(Ordering::Acquire),
+            0,
+            "answered counts leave received frames lock-free"
+        );
+        assert!(!hints.sent_nothing(&relay(), "other"));
+        assert!(
+            !hints.sent_nothing(
+                &RelayUrl::parse("wss://elsewhere.example.com").unwrap(),
+                "live"
+            ),
+            "another relay's REQ with the id"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_tap_cannot_tie_to_one_req_leaves_open_counts_unknown() {
+        let padding = serde_json::to_string(&vec!["x"; MAX_EOSE_FRAME]).unwrap();
+        let oversized = format!(r#"["EOSE","other",["more",{padding}]]"#);
+        let long_id = format!(r#"["EVENT","{}",{{}}]"#, "i".repeat(MAX_ID_TOKEN + 1));
+        for spoiler in [
+            r#"["EVENT",7,{}]"#,
+            r#"{"EVENT":"live"}"#,
+            r#"[1,"EVENT"]"#,
+            "not json",
+            oversized.as_str(),
+            long_id.as_str(),
+        ] {
+            assert!(!sent_nothing_after(&[spoiler, LIVE_EOSE]), "{spoiler}");
+        }
+
+        let hints = EoseHints::default();
+        for id in ["live", "next"] {
+            hints.replies.sent(&key(), 0, &req(id, vec![filter(0)]));
+        }
+        hints
+            .replies
+            .sent(&key(), 1, &req("elsewhere", vec![filter(0)]));
+        // A binary frame: the SDK ignores it, but the relay may have meant
+        // it as either REQ's EOSE.
+        hints.replies.received(&key(), 0, None);
+        for id in ["live", "next", "elsewhere"] {
+            let connection = u64::from(id == "elsewhere");
+            hints
+                .replies
+                .received(&key(), connection, Some(&format!(r#"["EOSE","{id}"]"#)));
+        }
+        assert!(!hints.sent_nothing(&relay(), "live"));
+        assert!(!hints.sent_nothing(&relay(), "next"));
+        assert!(
+            hints.sent_nothing(&relay(), "elsewhere"),
+            "only counts open on the frame's connection"
+        );
+        // Once answered, a count is not spoiled.
+        hints.replies.received(&key(), 1, None);
+        assert!(hints.sent_nothing(&relay(), "elsewhere"));
+        assert_eq!(hints.replies.open.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_reply_counts_only_on_the_connection_its_req_went_out_on() {
+        let hints = EoseHints::default();
+        hints.replies.sent(&key(), 0, &req("live", vec![filter(0)]));
+        // The SDK sends it again on a new connection; the old connection's
+        // frames answer nothing.
+        hints.replies.sent(&key(), 1, &req("live", vec![filter(0)]));
+        hints.replies.received(&key(), 0, Some(LIVE_EOSE));
+        assert!(!hints.sent_nothing(&relay(), "live"));
+        hints
+            .replies
+            .received(&key(), 0, Some(r#"["EVENT","live",{}]"#));
+        hints.replies.received(&key(), 1, Some(LIVE_EOSE));
+        assert!(hints.sent_nothing(&relay(), "live"));
+        assert_eq!(hints.replies.open.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_id_reused_while_its_relay_may_still_answer_is_unknown() {
+        let after = |frames: &[(bool, &str)]| {
+            let hints = EoseHints::default();
+            for (sent, frame) in frames {
+                if *sent {
+                    hints.replies.sent(&key(), 0, frame);
+                } else {
+                    hints.replies.received(&key(), 0, Some(frame));
+                }
+            }
+            (
+                hints.sent_nothing(&relay(), "live"),
+                hints.replies.open.load(Ordering::Acquire),
+            )
+        };
+        let req = req("live", vec![filter(0)]);
+        let close = ClientMessage::close(SubscriptionId::new("live")).as_json();
+        let sent = |frame: &str| (true, frame.to_owned());
+        let got = |frame: &str| (false, frame.to_owned());
+        let run = |frames: Vec<(bool, String)>| {
+            after(
+                &frames
+                    .iter()
+                    .map(|(sent, frame)| (*sent, frame.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // Sent again before its EOSE: the next EOSE may answer either REQ.
+        assert_eq!(
+            run(vec![sent(&req), sent(&req), got(LIVE_EOSE)]),
+            (false, 0)
+        );
+        // Closed by the client: its EOSE may still be on the way.
+        assert_eq!(
+            run(vec![sent(&req), sent(&close), sent(&req), got(LIVE_EOSE)]),
+            (false, 0)
+        );
+        // Unknown stays unknown when sent again on the same connection.
+        assert_eq!(
+            run(vec![
+                sent(&req),
+                got("not json"),
+                sent(&req),
+                got(LIVE_EOSE)
+            ]),
+            (false, 0)
+        );
+        // After its EOSE, or after the relay refused it, nothing more is owed
+        // to it, so the next REQ with the id counts afresh.
+        assert_eq!(
+            run(vec![sent(&req), got(LIVE_EOSE), sent(&req), got(LIVE_EOSE)]),
+            (true, 0)
+        );
+        assert_eq!(
+            run(vec![
+                sent(&req),
+                got(r#"["CLOSED","live","auth-required: sign in"]"#),
+                sent(&req),
+                got(LIVE_EOSE),
+            ]),
+            (true, 0)
+        );
+        // An answered count the client closes is forgotten.
+        assert_eq!(
+            run(vec![sent(&req), got(LIVE_EOSE), sent(&close)]),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn counts_are_bounded_per_relay() {
+        let hints = EoseHints::default();
+        for n in 0..=MAX_REPLIES_PER_RELAY {
+            hints
+                .replies
+                .sent(&key(), 0, &req(&format!("req-{n}"), vec![filter(0)]));
+        }
+        assert_eq!(
+            hints.replies.open.load(Ordering::Acquire),
+            MAX_REPLIES_PER_RELAY,
+            "the evicted count left the open set"
+        );
+        for n in [0, MAX_REPLIES_PER_RELAY] {
+            hints
+                .replies
+                .received(&key(), 0, Some(&format!(r#"["EOSE","req-{n}"]"#)));
+        }
+        assert!(!hints.sent_nothing(&relay(), "req-0"), "evicted");
+        assert!(hints.sent_nothing(&relay(), &format!("req-{MAX_REPLIES_PER_RELAY}")));
+
+        // One id sent again and again keeps one count and a bounded order.
+        let again = req("again", vec![filter(0)]);
+        for _ in 0..3 * MAX_REPLIES_PER_RELAY {
+            hints
+                .replies
+                .received(&key(), 0, Some(r#"["EOSE","again"]"#));
+            hints.replies.sent(&key(), 0, &again);
+        }
+        let relays = hints.replies.lock();
+        let replies = &relays[&key()];
+        assert!(replies.by_id.len() <= MAX_REPLIES_PER_RELAY);
+        assert!(replies.order.len() <= 2 * MAX_REPLIES_PER_RELAY);
+    }
+
+    #[tokio::test]
+    async fn the_transport_counts_each_connections_replies() {
+        let hints = Arc::new(EoseHints::default());
+        let transport = HintTransport::new(
+            Arc::new(Scripted(Mutex::new(vec![
+                Message::Text(r#"["EOSE","quiet"]"#.to_owned()),
+                Message::Text(r#"["EVENT","busy",{}]"#.to_owned()),
+                Message::Text(r#"["EOSE","busy"]"#.to_owned()),
+                Message::Binary(br#"["EOSE","late"]"#.to_vec()),
+                Message::Text(r#"["EOSE","late"]"#.to_owned()),
+            ]))),
+            hints.clone(),
+        );
+        let (mut sink, mut stream) = transport
+            .connect(<&Url>::from(&relay()), None)
+            .await
+            .unwrap();
+        // A binary REQ is not one the SDK sent.
+        sink.send(Message::Binary(req("binary", vec![filter(0)]).into_bytes()))
+            .await
+            .unwrap();
+        for id in ["quiet", "busy", "late"] {
+            sink.send(Message::Text(req(id, vec![filter(0)])))
+                .await
+                .unwrap();
+        }
+        while let Some(frame) = stream.next().await {
+            frame.unwrap();
+        }
+        assert!(hints.sent_nothing(&relay(), "quiet"));
+        assert!(!hints.sent_nothing(&relay(), "busy"));
+        assert!(
+            !hints.sent_nothing(&relay(), "late"),
+            "a binary frame may have been its EOSE"
+        );
+        assert!(!hints.lock().contains_key(&key()), "no watch was involved");
+        assert!(!hints.replies.lock()[&key()].by_id.contains_key("binary"));
+
+        // The next connection's REQ with the id is not answered by the
+        // first's EOSE.
+        let (mut again, _) = transport
+            .connect(<&Url>::from(&relay()), None)
+            .await
+            .unwrap();
+        again
+            .send(Message::Text(req("quiet", vec![filter(0)])))
+            .await
+            .unwrap();
+        assert!(!hints.sent_nothing(&relay(), "quiet"));
+    }
+
     #[derive(Debug)]
     struct Scripted(Mutex<Vec<Message>>);
 
@@ -624,10 +1223,9 @@ mod tests {
         let hints = Arc::new(EoseHints::default());
         let watch = hints.watch(&endpoint, &filter);
         let endpoint_text = <&Url>::from(&endpoint).as_str();
-        hints.sent(
-            endpoint_text,
-            &req("private-subscription-secret", vec![filter]),
-        );
+        let secret_req = req("private-subscription-secret", vec![filter]);
+        hints.sent(endpoint_text, &secret_req);
+        hints.replies.sent(endpoint_text, 0, &secret_req);
         let transport =
             HintTransport::new(Arc::new(Scripted(Mutex::new(Vec::new()))), hints.clone());
 

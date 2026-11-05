@@ -1536,9 +1536,10 @@ pub struct NostrSdkRelayClient {
     /// Clones share a pool's per-canonical-relay NEG allowance. Independently
     /// built account pools get their own credits, just like their sockets.
     neg_credits: Arc<StdMutex<HashMap<RelayUrl, Arc<Semaphore>>>>,
-    /// NIP-67 hints the sweep's REQs read off the wire. Only clients built
+    /// NIP-67 hints the sweep's REQs read off the wire, and whether each
+    /// REQ's relay sent any EVENT frame before its EOSE. Only clients built
     /// through [`Self::from_builder`] have the tap; the rest prove slices by
-    /// counting.
+    /// counting, and their empty live counts prove nothing.
     eose_hints: Option<Arc<EoseHints>>,
     /// Test-only: select every route in ID order, to exercise the cursor alone.
     #[cfg(test)]
@@ -1874,10 +1875,16 @@ async fn dispatch_sdk_notification(
                     }
                 }
                 RelayMessage::EndOfStoredEvents(subscription_id) => {
+                    let endpoint = TransportEndpoint(relay_url.to_string());
+                    let sent_nothing = adapter
+                        .relay_client
+                        .reply_sent_nothing(account_id, &endpoint, subscription_id.as_str())
+                        .await;
                     adapter
-                        .handle_relay_eose(
-                            TransportEndpoint(relay_url.to_string()),
+                        .handle_relay_eose_reply(
+                            endpoint,
                             subscription_id.to_string(),
+                            sent_nothing,
                         )
                         .await;
                 }
@@ -5026,6 +5033,35 @@ impl NostrRelayClient for NostrSdkRelayClient {
         self.frontier.connection(&url)
     }
 
+    async fn reply_sent_nothing(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        let Ok(url) = RelayUrl::parse(endpoint.as_str()) else {
+            return false;
+        };
+        if self.require_account_context {
+            let Some(account) = account else {
+                return false;
+            };
+            return self
+                .account_clients
+                .read()
+                .await
+                .get(account)
+                .and_then(|client| client.eose_hints.as_ref())
+                .is_some_and(|hints| hints.sent_nothing(&url, subscription_id));
+        }
+        if self.account_id.is_some() && self.account_id.as_ref() != account {
+            return false;
+        }
+        self.eose_hints
+            .as_ref()
+            .is_some_and(|hints| hints.sent_nothing(&url, subscription_id))
+    }
+
     fn notification_loss(
         &self,
     ) -> Result<watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError> {
@@ -8116,6 +8152,83 @@ mod tests {
         assert_eq!(streaming_counts(&adapter, &account_id).await, 0);
         root.shutdown().await;
         relay.shutdown();
+    }
+
+    /// nostr-sdk drops an event frame it cannot verify without a word, so
+    /// only the wire tells a live REQ whose relay sent nothing from one whose
+    /// relay sent something the SDK dropped (mdk#2660). An account pool reads
+    /// its own wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_count_knows_whether_its_relay_sent_anything() {
+        let mut wire = ReplayWire::new().await;
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let forwarder = account.spawn_notification_forwarder(adapter.clone());
+        let route = vec![0xC4; 32];
+        adapter
+            .activate_account(crate::TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![wire.endpoint.clone()],
+                group_subscriptions: vec![crate::TransportGroupSubscription {
+                    group_id: cgka_traits::GroupId::new(vec![0xC4; 16]),
+                    transport_group_id: route.clone(),
+                    endpoints: vec![wire.endpoint.clone()],
+                    retained_since: None,
+                }],
+                since: Some(Timestamp(100)),
+            })
+            .await
+            .unwrap();
+        // The group REQ's relay sends one stored event whose content no
+        // longer matches its id; the inbox REQ's relay sends none.
+        let mut tampered = serde_json::to_value(stored_group_event(&route, 500)).unwrap();
+        tampered["content"] = "tampered".into();
+        for _ in 0..2 {
+            let request = wire.recv_kind("REQ").await;
+            let id = request[1].as_str().unwrap();
+            if request[2]["#h"].is_array() {
+                wire.send(serde_json::json!(["EVENT", id, tampered])).await;
+            }
+            wire.send(serde_json::json!(["EOSE", id])).await;
+        }
+        let counts = timeout(Duration::from_secs(5), async {
+            loop {
+                let status = adapter.take_replay_status(&account_id).await;
+                let counts = status
+                    .sources()
+                    .filter_map(|source| {
+                        let group = source.group_routes().next().is_some();
+                        let count = source.endpoints().next()?.live_count()?;
+                        Some((group, count))
+                    })
+                    .collect::<Vec<_>>();
+                if counts.len() == 2 {
+                    break counts;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both REQs count their EOSE");
+        for (group, count) in counts {
+            assert_eq!(
+                count.events, 0,
+                "the SDK delivered nothing (group: {group})"
+            );
+            assert_eq!(
+                count.sent_nothing, !group,
+                "only the wire shows the group's relay sent a frame"
+            );
+        }
+        forwarder.abort();
+        let _ = forwarder.await;
+        root.shutdown().await;
     }
 
     /// Live counts whose REQ the relay client still reports streaming.

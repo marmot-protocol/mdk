@@ -9,7 +9,9 @@
   backlog is admitted, so history appears in order and none of it is lost to a newer message opened first; an empty
   reply holds nothing. Held live messages carry over when joining a group restarts the subscription, and stay held
   while the account's hourly recovery budget pauses the runner or while no relay serves the group and one may still
-  return its history. A relay that publishes no limit and no negentropy cannot prove a busy second, and releases the
+  return its history. A subscription whose relay sends nothing before its end of stored events now proves its whole
+  window, read off the wire, so a burst of group joins no longer owes every quiet group a few seconds of history
+  and spends that budget. A relay that publishes no limit and no negentropy cannot prove a busy second, and releases the
   group instead of holding it; a relay whose information document cannot be read holds the group until its unit
   gives up, since it may still prove that second, and so does a relay that lists a second's messages and then
   withholds one, sends a malformed negentropy message, or repeats an event until a fetch is cut short. Notification

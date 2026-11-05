@@ -33,7 +33,10 @@ struct SwitchingRelay {
     counts: Arc<TextCounts>,
 }
 
-async fn switching_relay(backend: String) -> SwitchingRelay {
+/// A WebSocket proxy to `backend` that can refuse NIP-77 and counts what
+/// crosses it. `information` is the NIP-11 page it serves to a request that
+/// asks for one; with `None` such a request fails the WebSocket handshake.
+async fn switching_relay(backend: String, information: Option<&'static str>) -> SwitchingRelay {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let reject_negentropy = Arc::new(AtomicBool::new(true));
@@ -46,6 +49,12 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
             let tally = tally.clone();
             let backend = backend.clone();
             tokio::spawn(async move {
+                if let Some(page) = information
+                    && let Some(header) = asks_for_information(&stream).await
+                {
+                    serve_information(stream, header, page).await;
+                    return;
+                }
                 let Ok(client) = accept_async(stream).await else {
                     return;
                 };
@@ -152,6 +161,52 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
     }
 }
 
+/// The length of the request header on `stream` when it asks for the NIP-11
+/// page, read without consuming it, so a WebSocket upgrade still sees it.
+async fn asks_for_information(stream: &tokio::net::TcpStream) -> Option<usize> {
+    let mut header = [0; 8192];
+    let length = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = stream.peek(&mut header).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            if let Some(end) = header[..read].windows(4).position(|w| w == b"\r\n\r\n") {
+                return Some(end + 4);
+            }
+            if read == header.len() {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .ok()
+    .flatten()?;
+    String::from_utf8_lossy(&header[..length])
+        .lines()
+        .any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("accept") && value.contains("application/nostr+json")
+            })
+        })
+        .then_some(length)
+}
+
+async fn serve_information(mut stream: tokio::net::TcpStream, header: usize, page: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = vec![0; header];
+    if stream.read_exact(&mut request).await.is_err() {
+        return;
+    }
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    let _ = stream.write_all(reply.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_commit_700_recovers() {
     late_commit_recovery(false).await;
@@ -175,9 +230,21 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         events: true,
         max_events: Some(8_192),
     });
-    let backend = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    // White Noise's relays publish the cap they enforce. On a relay whose
+    // page cannot be read, a group whose events share one second holds its
+    // live input until the unit gives up (unknown caps never saturate),
+    // which this history proof is not about.
+    let backend = LocalRelay::new(
+        RelayBuilder::default()
+            .database(database.clone())
+            .max_filter_limit(500),
+    );
     backend.run().await.unwrap();
-    let proxy = switching_relay(backend.url().await.to_string()).await;
+    let proxy = switching_relay(
+        backend.url().await.to_string(),
+        Some(r#"{"supported_nips":[],"limitation":{"max_limit":500}}"#),
+    )
+    .await;
     let url = proxy.url.clone();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -471,10 +538,7 @@ async fn late_commit_recovery(publish_after_cover: bool) {
     );
     {
         let history = proxy.counts.group_history_requests.lock().unwrap();
-        assert!(
-            history.len() > 1,
-            "recovery must pass the newest page after NEG refusal"
-        );
+        assert!(history.len() > 1, "recovery must page past the newest page");
         assert!(
             history
                 .iter()
@@ -550,8 +614,8 @@ async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() 
         .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
         .await
         .unwrap();
-    let left = switching_relay(left_backend.url().await.to_string()).await;
-    let right = switching_relay(right_backend.url().await.to_string()).await;
+    let left = switching_relay(left_backend.url().await.to_string(), None).await;
+    let right = switching_relay(right_backend.url().await.to_string(), None).await;
     let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
     for url in [&left.url, &right.url] {
         sdk.client().add_relay(url.as_str()).await.unwrap();

@@ -650,7 +650,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
-  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
+  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. The one
+  exception is `ReplayLiveCount::sent_nothing`: the account pool's wire tap saw no EVENT frame for the REQ before its
+  EOSE, so the empty count proves from the REQ's `since` (`live_boundary_since`). Never derive it from anything but
+  the wire. It keeps a join from owing each quiet route a sliver
+  (`a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins`). Read the
   un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
   loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
   after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a

@@ -887,6 +887,22 @@ pub trait NostrRelayClient: Send + Sync {
         None
     }
 
+    /// Whether `endpoint` sent no EVENT frame at all, valid or not, for the
+    /// REQ `subscription_id` before that REQ's EOSE, as read off the wire of
+    /// `account`'s pool. Asked as that EOSE is dispatched. A live count that
+    /// delivered nothing proves its window only on this answer, so an
+    /// implementation must err toward false: when it cannot read the wire,
+    /// cannot tell the REQ from another with its id, or has no context for
+    /// the account.
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        _subscription_id: &str,
+    ) -> bool {
+        false
+    }
+
     /// Optional bounded, request-scoped history operation. Implementations must
     /// validate the complete owned request before issuing any network work and
     /// return one terminal outcome for every requested endpoint. Cancellation
@@ -2719,11 +2735,26 @@ impl NostrTransportAdapter {
     /// That relay's coverage then waits while older pages are fetched in the
     /// background and delivered like reconciled events.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
+        self.handle_relay_eose_reply(endpoint, subscription_id, false)
+            .await;
+    }
+
+    /// [`Self::handle_relay_eose`], when the wire showed whether the relay
+    /// sent any EVENT frame for the REQ before this EOSE
+    /// ([`NostrRelayClient::reply_sent_nothing`]).
+    pub(crate) async fn handle_relay_eose_reply(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        sent_nothing: bool,
+    ) {
         let now_ms = self.now_ms();
-        self.state
-            .write()
-            .await
-            .record_subscription_eose(&subscription_id, &endpoint, now_ms);
+        self.state.write().await.record_subscription_eose(
+            &subscription_id,
+            &endpoint,
+            now_ms,
+            sent_nothing,
+        );
 
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -4018,9 +4049,11 @@ impl ReplayEndpoint {
         }
     }
 
-    /// What this serial's EOSE counted in `stored`, as a live count.
-    fn eose_count(&self, stored: StoredReplay) -> ReplayLiveCount {
+    /// What this serial's EOSE counted in `stored`, as a live count;
+    /// `sent_nothing` when the wire showed no EVENT frame before it.
+    fn eose_count(&self, stored: StoredReplay, sent_nothing: bool) -> ReplayLiveCount {
         ReplayLiveCount {
+            sent_nothing: sent_nothing && stored.events == 0,
             events: stored.events,
             oldest: stored.oldest,
             requested_at: self.requested_at,
@@ -5731,11 +5764,24 @@ impl AccountReplayCoverage {
         );
     }
 
+    #[cfg(test)]
     fn record_eose(
         &mut self,
         id: &str,
         relay: RelayIndex,
         now_ms: u64,
+    ) -> Option<(ReplayWindow, u64)> {
+        self.record_eose_reply(id, relay, now_ms, false)
+    }
+
+    /// Record `relay`'s EOSE for `id`; `sent_nothing` when the wire showed
+    /// it sent no EVENT frame for the REQ before it.
+    fn record_eose_reply(
+        &mut self,
+        id: &str,
+        relay: RelayIndex,
+        now_ms: u64,
+        sent_nothing: bool,
     ) -> Option<(ReplayWindow, u64)> {
         if !self
             .subscriptions
@@ -5786,7 +5832,7 @@ impl AccountReplayCoverage {
                 .and_then(|relays| relays.get_mut(&relay))
                 && let Some(recount) = endpoint.recount.take()
             {
-                endpoint.install_live_count(endpoint.eose_count(recount));
+                endpoint.install_live_count(endpoint.eose_count(recount, sent_nothing));
                 self.arm_fence(id, relay);
             }
             return None;
@@ -5797,7 +5843,7 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
             .filter(|endpoint| !endpoint.stopped)
         {
-            endpoint.install_live_count(endpoint.eose_count(stored));
+            endpoint.install_live_count(endpoint.eose_count(stored, sent_nothing));
             self.arm_fence(id, relay);
         }
         let delegated = self.recovery_delegated;
@@ -7078,11 +7124,14 @@ impl AdapterState {
         subscription_id: &str,
         endpoint: &TransportEndpoint,
         now_ms: u64,
+        sent_nothing: bool,
     ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
         for (account_id, coverage) in &mut self.account_replay_coverage {
-            if let Some((window, until)) = coverage.record_eose(subscription_id, relay, now_ms) {
+            if let Some((window, until)) =
+                coverage.record_eose_reply(subscription_id, relay, now_ms, sent_nothing)
+            {
                 let serial = coverage.endpoint_deadlines[subscription_id][&relay].serial;
                 coverage.queue_capture(ReplayPaging {
                     account_id: account_id.clone(),
@@ -8224,6 +8273,7 @@ mod batch_tests {
             oldest: Some(120),
             requested_at,
             live_from: requested_at,
+            sent_nothing: false,
         };
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.boundary_admitted);
@@ -8497,6 +8547,35 @@ mod batch_tests {
         assert!(endpoint.ended_count.is_some());
     }
 
+    /// The wire's word that a relay sent no EVENT frame rides on the live
+    /// count of the EOSE it came with, and only when the SDK counted nothing
+    /// either. A reply the SDK restores after a kept `CLOSED` takes its own
+    /// EOSE's word.
+    #[tokio::test]
+    async fn a_live_count_carries_what_the_wire_showed() {
+        let (mut coverage, id, _) = replay_coverage(2);
+        let sent_nothing = |coverage: &AccountReplayCoverage, relay| {
+            coverage.endpoint_deadlines[&id][&RelayIndex(relay)]
+                .live_count
+                .map(|count| count.sent_nothing)
+        };
+        coverage.record_eose_reply(&id, RelayIndex(1), 0, true);
+        assert_eq!(sent_nothing(&coverage, 1), Some(true));
+        coverage.record_stored_event(&id, RelayIndex(2), 150);
+        coverage.record_eose_reply(&id, RelayIndex(2), 0, true);
+        assert_eq!(
+            sent_nothing(&coverage, 2),
+            Some(false),
+            "the SDK counted an event"
+        );
+
+        for wire in [false, true] {
+            coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+            coverage.record_eose_reply(&id, RelayIndex(1), 0, wire);
+            assert_eq!(sent_nothing(&coverage, 1), Some(wire), "restored");
+        }
+    }
+
     /// A `CLOSED` the SDK keeps (AUTH, a rate limit) stops the count until the
     /// REQ it sends again reaches EOSE; that reply counts afresh, before or
     /// after the serial's first EOSE, and streams from that EOSE. A dropped
@@ -8609,6 +8688,7 @@ mod batch_tests {
                 oldest: Some(1_000),
                 requested_at: endpoint.requested_at,
                 live_from: endpoint.requested_at,
+                sent_nothing: false,
             })
         );
     }

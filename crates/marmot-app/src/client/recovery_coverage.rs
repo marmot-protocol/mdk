@@ -414,11 +414,16 @@ impl AppClient {
 /// everything newer than the oldest one it sent reached the client; the
 /// count says nothing about how many it sent, because the SDK drops some
 /// frames (an expired event, one its database deleted) without a word, so
-/// even a short reply may have been cut. An empty count proves nothing.
+/// even a short reply may have been cut. An empty count proves nothing,
+/// unless the wire showed the relay sent no EVENT frame at all
+/// ([`ReplayLiveCount::sent_nothing`]): a relay that sent nothing cut
+/// nothing, so the count proves its whole window from `since`.
 fn live_boundary_since(since: u64, count: &ReplayLiveCount) -> Option<u64> {
+    if count.events == 0 {
+        return count.sent_nothing.then_some(since);
+    }
     count
         .oldest
-        .filter(|_| count.events > 0)
         .map(|oldest| oldest.saturating_add(1).max(since))
 }
 

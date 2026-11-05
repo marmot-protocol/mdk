@@ -33,6 +33,16 @@ fn count(events: usize, oldest: Option<u64>) -> ReplayLiveCount {
         oldest,
         requested_at: REQUESTED,
         live_from: REQUESTED,
+        sent_nothing: false,
+    }
+}
+
+/// An empty count whose relay sent no EVENT frame at all, as the wire tap
+/// read it.
+fn sent_nothing() -> ReplayLiveCount {
+    ReplayLiveCount {
+        sent_nothing: true,
+        ..count(0, None)
     }
 }
 
@@ -73,10 +83,12 @@ fn inbox_owed_until(live: &LiveCoverage, facts: &[LiveCountFact], now: u64) -> u
 
 /// A count proves only what is newer than the oldest event the client saw,
 /// and never before the REQ's own `since`, however many events it holds: the
-/// SDK may have dropped frames the relay sent. An empty count proves nothing.
+/// SDK may have dropped frames the relay sent. An empty count proves nothing
+/// unless the wire showed its relay sent nothing.
 #[test]
 fn a_count_proves_only_above_its_oldest_event() {
     assert_eq!(live_boundary_since(100, &count(0, None)), None);
+    assert_eq!(live_boundary_since(100, &sent_nothing()), Some(100));
     assert_eq!(live_boundary_since(100, &count(3, Some(150))), Some(151));
     assert_eq!(
         live_boundary_since(100, &count(500, Some(150))),
@@ -136,6 +148,25 @@ fn an_empty_count_proves_nothing_but_keeps_its_tail() {
     let live = LiveCoverage::opened_at(None);
     assert_eq!(durable(&live, &facts), [None]);
     assert_eq!(inbox_owed_until(&live, &facts, 5_000), REQUESTED - 1);
+}
+
+/// A relay that sent no EVENT frame before its EOSE cut nothing, so its count
+/// proves the REQ's whole window from its `since` to the second before the
+/// request (mdk#2660: without this, every REQ a join restarts left each
+/// quiet route a sliver of owed seconds). A REQ the relay pool sent again
+/// still vouches only from its EOSE.
+#[test]
+fn a_count_whose_relay_sent_nothing_proves_its_whole_window() {
+    let live = LiveCoverage::opened_at(None);
+    let facts = [fact(vec![INBOX], sent_nothing(), false)];
+    assert_eq!(durable(&live, &facts), [Some((100, REQUESTED - 1))]);
+    assert_eq!(inbox_owed_until(&live, &facts, 5_000), REQUESTED - 1);
+
+    let mut resent = sent_nothing();
+    resent.live_from = REQUESTED + 400;
+    let facts = [fact(vec![INBOX], resent, false)];
+    assert_eq!(durable(&live, &facts), [Some((100, REQUESTED - 1))]);
+    assert_eq!(inbox_owed_until(&live, &facts, 5_000), REQUESTED + 399);
 }
 
 /// With every event it returned from the request on, the relay may have cut

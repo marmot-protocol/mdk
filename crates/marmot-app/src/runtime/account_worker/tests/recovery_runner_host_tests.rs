@@ -836,3 +836,96 @@ async fn successive_group_joins_lose_nothing_and_catch_up() {
         .unwrap()
         .unwrap();
 }
+
+/// Every join restarts the account's live REQs. With a short rebuild
+/// lookback, each restarted REQ starts after its quiet group's last event and
+/// finds nothing. A relay that sent no event before EOSE proves the REQ's
+/// whole window, so a join leaves no sliver owed on the routes it restarted,
+/// and recovery grows with the joins, not with joins times routes. Counting
+/// only what the SDK delivered left each quiet route a sliver per join: a
+/// burst of joins tripped the account's hourly breaker, and the fences then
+/// held every live message (mdk#2660).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins() {
+    const GROUPS: u64 = 12;
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let creator = home.create_account("creator").unwrap();
+    let joiner = home.create_account("joiner").unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let mut app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config)
+        .with_recovery_runner_ownership_for_test(true);
+    app.relay_plane =
+        crate::MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
+    crate::tests::remember_test_member_inbox(&app, &joiner.account_id_hex, &url);
+    let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    let _credits = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package(&joiner.label).await.unwrap();
+    let storage = app.account_storage(&joiner.label).unwrap().app_storage();
+    let mut groups = Vec::new();
+    for index in 0..GROUPS {
+        let group = hex::encode(
+            runtime
+                .create_group_with_options(
+                    &creator.label,
+                    &format!("quiet {index}"),
+                    std::slice::from_ref(&joiner.account_id_hex),
+                    AppCreateGroupOptions {
+                        relays: Some(vec![url.clone()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        // One join at a time, so each restarts the REQs of every group
+        // joined before it, and the next group's commit lands in a later
+        // second, past the earlier groups' last events.
+        timeout(Duration::from_secs(20), async {
+            while app.group(&joiner.label, &group).unwrap().is_none() {
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the joiner joins");
+        let joined = crate::unix_now_seconds();
+        while crate::unix_now_seconds() <= joined + 1 {
+            sleep(Duration::from_millis(20)).await;
+        }
+        groups.push(group);
+    }
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let status = runtime.account_recovery_status(&joiner.label).await;
+            if status.is_ok_and(|status| {
+                status.catching_up_group_ids_hex.is_empty() && !status.inbox_catching_up
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every joined group and the inbox catch up");
+    let attempts = storage
+        .recovery_account_usage(crate::unix_now_seconds())
+        .unwrap()
+        .attempts;
+    // About one per join (12 when measured), with slack. A sliver per
+    // restarted route cost about GROUPS * GROUPS / 2 (68 and 76 measured).
+    assert!(
+        attempts <= 2 * GROUPS,
+        "{attempts} attempts for {GROUPS} quiet joins"
+    );
+    timeout(SETTLE, runtime.shutdown_and_close())
+        .await
+        .unwrap()
+        .unwrap();
+}
