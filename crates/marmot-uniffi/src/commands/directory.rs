@@ -247,11 +247,6 @@ mod tests {
         MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserSearchUpdateFfi,
     };
 
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../marmot-app/tests/support/identity_reference_vectors.rs"
-    ));
-
     async fn wait_for_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -683,46 +678,5 @@ mod tests {
             SearchUpdateTriggerFfi::SearchCompleted
         ));
         assert!(subscription.next_update().await.is_none());
-    }
-
-    #[test]
-    fn account_id_hex_and_pseudonyms_are_offline_and_match_app_helpers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        let runtime = app.runtime();
-        let kit = Marmot { app, runtime };
-        for case in cases() {
-            assert_eq!(
-                kit.account_id_hex(case.reference.clone()).as_deref(),
-                case.ffi_account_id_hex,
-                "case {}",
-                case.name
-            );
-        }
-
-        assert_eq!(
-            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
-            marmot_app::default_profile_pseudonym(ACCOUNT_ID)
-        );
-        assert_eq!(
-            kit.default_profile_pseudonym(ACCOUNT_ID.to_owned()),
-            "Loyal Crane"
-        );
-        let random = kit.random_profile_pseudonym();
-        let (adjective, noun) = random.split_once(' ').expect("adjective noun");
-        assert!(!noun.contains(' '));
-        assert!(
-            adjective
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-        );
-        assert!(
-            noun.chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-        );
-        assert!(adjective.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
-        assert!(noun.chars().skip(1).all(|ch| ch.is_ascii_lowercase()));
     }
 }

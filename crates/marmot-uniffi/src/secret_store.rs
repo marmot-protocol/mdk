@@ -133,12 +133,13 @@ fn account_home_error(error: MarmotKitError) -> marmot_account::AccountHomeError
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     use super::*;
 
     struct MapStore {
-        entries: Mutex<Vec<(String, String)>>,
+        entries: Mutex<BTreeMap<(String, String), String>>,
     }
 
     impl SecretStore for MapStore {
@@ -147,50 +148,59 @@ mod tests {
                 .entries
                 .lock()
                 .unwrap()
-                .iter()
+                .keys()
                 .any(|(key, _)| *key == label))
         }
 
         fn has_secret_for_account_id(
             &self,
-            _account_id_hex: String,
+            account_id_hex: String,
         ) -> Result<bool, MarmotKitError> {
-            Ok(false)
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(_, id)| *id == account_id_hex))
         }
 
         fn write_secret(
             &self,
             label: String,
-            _account_id_hex: String,
+            account_id_hex: String,
             secret_key_hex: String,
         ) -> Result<(), MarmotKitError> {
-            self.entries.lock().unwrap().push((label, secret_key_hex));
+            self.entries
+                .lock()
+                .unwrap()
+                .insert((label, account_id_hex), secret_key_hex);
             Ok(())
         }
 
         fn load_secret(
             &self,
             label: String,
-            _account_id_hex: String,
+            account_id_hex: String,
         ) -> Result<String, MarmotKitError> {
             self.entries
                 .lock()
                 .unwrap()
-                .iter()
-                .find(|(key, _)| *key == label)
-                .map(|(_, secret)| secret.clone())
-                .ok_or(MarmotKitError::SecretNotFound { details: label })
+                .get(&(label, account_id_hex.clone()))
+                .cloned()
+                .ok_or(MarmotKitError::SecretNotFound {
+                    details: account_id_hex,
+                })
         }
 
         fn remove_secret(
             &self,
             label: String,
-            _account_id_hex: String,
+            account_id_hex: String,
         ) -> Result<(), MarmotKitError> {
             self.entries
                 .lock()
                 .unwrap()
-                .retain(|(key, _)| *key != label);
+                .remove(&(label, account_id_hex));
             Ok(())
         }
     }
@@ -208,25 +218,90 @@ mod tests {
 
     #[test]
     fn foreign_store_roundtrips_the_signing_key() {
-        let store = ForeignSecretStore::new(Arc::new(MapStore {
-            entries: Mutex::new(Vec::new()),
-        }));
+        let host = Arc::new(MapStore {
+            entries: Mutex::new(BTreeMap::new()),
+        });
+        let store = ForeignSecretStore::new(host.clone());
         let keys = nostr::prelude::Keys::generate();
         let account = summary(&keys);
 
         assert!(!store.has_secret_for_label(&account.label).unwrap());
         store.write_secret(&account, &keys).unwrap();
         assert!(store.has_secret_for_label(&account.label).unwrap());
+        assert!(
+            store
+                .has_secret_for_account_id(&account.account_id_hex)
+                .unwrap()
+        );
+        let other_keys = nostr::prelude::Keys::generate();
+        let other_account = summary(&other_keys);
+        assert_eq!(
+            other_account.label, account.label,
+            "different roots may reuse a host label"
+        );
+        assert!(
+            !store
+                .has_secret_for_account_id(&other_account.account_id_hex)
+                .unwrap()
+        );
+        store.write_secret(&other_account, &other_keys).unwrap();
+        assert!(
+            host.entries
+                .lock()
+                .unwrap()
+                .get(&(account.label.clone(), account.account_id_hex.clone()))
+                .is_some_and(|secret| secret == &keys.secret_key().to_secret_hex()),
+            "host received the wrong first identity slot"
+        );
+        assert!(
+            host.entries
+                .lock()
+                .unwrap()
+                .get(&(
+                    other_account.label.clone(),
+                    other_account.account_id_hex.clone()
+                ))
+                .is_some_and(|secret| secret == &other_keys.secret_key().to_secret_hex()),
+            "host received the wrong second identity slot"
+        );
+        assert_eq!(
+            store.load_secret(&other_account).unwrap().secret_key(),
+            other_keys.secret_key()
+        );
         assert_eq!(
             store.load_secret(&account).unwrap().secret_key(),
             keys.secret_key()
         );
 
         store.remove_secret(&account).unwrap();
+        assert!(
+            !store
+                .has_secret_for_account_id(&account.account_id_hex)
+                .unwrap()
+        );
+        assert!(
+            store
+                .has_secret_for_account_id(&other_account.account_id_hex)
+                .unwrap()
+        );
+        assert!(store.has_secret_for_label(&account.label).unwrap());
+        assert_eq!(
+            store.load_secret(&other_account).unwrap().secret_key(),
+            other_keys.secret_key()
+        );
+        store.remove_secret(&other_account).unwrap();
         assert!(!store.has_secret_for_label(&account.label).unwrap());
         assert!(matches!(
             store.load_secret(&account),
             Err(marmot_account::AccountHomeError::SecretNotFound(_))
+        ));
+        host.entries.lock().unwrap().insert(
+            (account.label.clone(), account.account_id_hex.clone()),
+            "not-a-secret-key".into(),
+        );
+        assert!(matches!(
+            store.load_secret(&account),
+            Err(marmot_account::AccountHomeError::InvalidSecretKey)
         ));
     }
 
