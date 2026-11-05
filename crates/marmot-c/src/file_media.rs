@@ -404,14 +404,15 @@ mod tests {
             unsafe { request.to_ffi() },
             Err(MarmotStatus::NullPointer)
         ));
-        request.attachments = &item;
         let invalid = [0xffu8, 0];
         item.file_name = invalid.as_ptr().cast();
+        request.attachments = &item;
         assert!(matches!(
             unsafe { request.to_ffi() },
             Err(MarmotStatus::InvalidUtf8)
         ));
         item.file_name = std::ptr::null();
+        request.attachments = &item;
         assert!(matches!(
             unsafe { request.to_ffi() },
             Err(MarmotStatus::NullPointer)
