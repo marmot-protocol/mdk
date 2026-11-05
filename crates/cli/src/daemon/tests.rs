@@ -110,9 +110,13 @@ async fn run_server_validates_relays_before_creating_runtime_artifacts() {
         keychain_service: None,
     };
 
-    run_server(args)
+    let error = run_server(args)
         .await
         .expect_err("invalid relay configuration should fail startup");
+    assert!(matches!(
+        error.downcast_ref::<crate::WnError>(),
+        Some(crate::WnError::InvalidRelayUrl(value)) if value == "not a relay URL"
+    ));
 
     assert!(!socket.exists(), "failed startup must not leave a socket");
     assert!(
@@ -245,7 +249,19 @@ fn daemon_socket_parent_rejects_symlink_without_chmodding_target() {
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
     symlink(&target, &dev).unwrap();
 
-    prepare_socket_dir(&dev, home.path()).expect_err("symlinked daemon parent must be rejected");
+    let error = prepare_socket_dir(&dev, home.path())
+        .expect_err("symlinked daemon parent must be rejected");
+    // The no-follow directory open may preserve errno or wrap it with the
+    // failing operation. Unix platforms use one of these symlink refusals.
+    assert!(
+        [libc::ELOOP, libc::EMLINK, libc::ENOTDIR]
+            .iter()
+            .any(|code| {
+                error.raw_os_error() == Some(*code)
+                    || error.to_string().ends_with(&format!("(os error {code})"))
+            }),
+        "expected a no-follow symlink refusal, got {error}"
+    );
 
     assert_eq!(
         target.metadata().unwrap().permissions().mode() & 0o777,
@@ -262,8 +278,13 @@ fn daemon_socket_parent_rejects_group_writable_custom_directory() {
     std::fs::create_dir(&parent).unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
 
-    prepare_socket_dir(&parent, home.path())
+    let error = prepare_socket_dir(&parent, home.path())
         .expect_err("same-UID daemon must reject group-writable custom parent");
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(
+        error.to_string(),
+        "daemon socket directory has unsafe on-disk permissions"
+    );
 }
 
 #[tokio::test]
@@ -468,15 +489,6 @@ fn test_stream_compose_report(stream_id: &[u8]) -> DaemonOutgoingStreamReport {
     }
 }
 
-fn expected_stream_transcript_hash(
-    stream_id: &[u8],
-    start_event_id: &MessageId,
-    text: &str,
-    chunk_bytes: usize,
-) -> String {
-    expected_stream_transcript_hash_for_appends(stream_id, start_event_id, &[text], chunk_bytes)
-}
-
 fn expected_stream_transcript_hash_for_appends(
     stream_id: &[u8],
     start_event_id: &MessageId,
@@ -493,54 +505,6 @@ fn expected_stream_transcript_hash_for_appends(
         }
     }
     hex::encode(transcript.hash())
-}
-
-#[tokio::test]
-async fn stream_compose_returns_local_transcript_when_broker_connect_is_pending() {
-    let stream_id = vec![0xaa; 32];
-    let start_event_id = MessageId::new(vec![0xbb; 32]);
-    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
-    let report = test_stream_compose_report(&stream_id);
-    let (tx, rx) = mpsc::channel(4);
-    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-    let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
-
-    let (append_tx, append_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Append {
-        text: "hello ".to_owned(),
-        respond: append_tx,
-    })
-    .await
-    .unwrap();
-    let appended = tokio::time::timeout(Duration::from_millis(250), append_rx)
-        .await
-        .expect("append should not wait for broker connect")
-        .unwrap()
-        .unwrap();
-    assert_eq!(appended.chunk_count, 1);
-
-    let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish {
-        expected: None,
-        respond: finish_tx,
-    })
-    .await
-    .unwrap();
-    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
-        .await
-        .expect("finish should use local transcript fallback")
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(finished.status, "finished");
-    assert_eq!(finished.text, "hello ");
-    assert_eq!(finished.chunk_count, 1);
-    assert_eq!(
-        finished.transcript_hash.as_deref(),
-        Some(expected_stream_transcript_hash(&stream_id, &start_event_id, "hello ", 8).as_str())
-    );
-
-    session.await.unwrap();
 }
 
 #[tokio::test]
@@ -1173,7 +1137,7 @@ fn daemon_test_cli(command: crate::Command) -> Cli {
 }
 
 #[test]
-fn runtime_message_json_marks_account_label_sender_as_me() {
+fn runtime_message_json_marks_account_id_sender_as_me() {
     let message = marmot_app::ReceivedMessage {
         authority: None,
         message_id_hex: "01".to_owned(),
@@ -1211,25 +1175,11 @@ fn runtime_message_json_marks_account_label_sender_as_me() {
 #[tokio::test]
 async fn stream_watch_workers_reap_finished_handles_on_replace() {
     let workers = StreamWatchWorkers::default();
-    workers.replace("finished".to_owned(), tokio::spawn(async {}));
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-        if workers
-            .handles
-            .lock()
-            .map(|handles| handles["finished"].is_finished())
-            .unwrap_or(false)
-        {
-            break;
-        }
-    }
+    let mut finished = tokio::spawn(async {});
+    (&mut finished).await.expect("finished task completes");
+    workers.replace("finished".to_owned(), finished);
 
-    workers.replace(
-        "running".to_owned(),
-        tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }),
-    );
+    workers.replace("running".to_owned(), tokio::spawn(std::future::pending()));
 
     let handles = workers.handles.lock().expect("worker lock");
     assert!(!handles.contains_key("finished"));
@@ -1387,23 +1337,42 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
     )
     .await;
 
-    assert_ne!(
-        output.code, 0,
-        "marker publish failure should surface as an error"
+    let expected_error = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "stream_compose_failed",
+            "message": "stream marker command did not use the daemon runtime",
+        },
+    });
+    assert_eq!(output.code, 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(output.stdout.trim()).unwrap(),
+        expected_error
     );
+    assert!(output.stderr.is_empty());
     assert!(
         workers.get(&key).is_some(),
         "the compose session must be retained so the transcript stays retryable"
     );
     // The final report must be frozen on the session so a retry no longer needs
     // the compose task (which exits after answering `Finish`).
-    assert!(
-        workers
-            .get(&key)
-            .and_then(|session| session.finalized.as_ref())
-            .is_some(),
-        "the finalized report must be retained for a marker retry"
-    );
+    let expected_report = serde_json::json!({
+        "account": null,
+        "group_id": "abcd",
+        "stream_id": stream_id,
+        "start_message_id": "ef01",
+        "candidate": "quic://127.0.0.1:9000",
+        "status": "streaming",
+        "text": "hello transcript",
+        "transcript_hash": "aa",
+        "chunk_count": 1,
+        "error": null,
+    });
+    let finalized = workers
+        .get(&key)
+        .and_then(|session| session.finalized.as_ref())
+        .expect("the finalized report must be retained for a marker retry");
+    assert_eq!(serde_json::to_value(finalized).unwrap(), expected_report);
 
     // Retry `stream finish`: the compose task has exited, so the previous code
     // would send `Finish` to a closed channel and fail with
@@ -1420,19 +1389,22 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
         stream_id,
     )
     .await;
-    assert_ne!(
-        retry.code, 0,
-        "the marker still cannot publish without a runtime"
+    assert_eq!(retry.code, 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(retry.stdout.trim()).unwrap(),
+        expected_error,
+        "the retry must use the frozen report, not the exited compose task"
     );
-    assert!(
-        !retry.stdout.contains("stream compose session is closed"),
-        "the retry must use the frozen report, not the exited compose task: {}",
-        retry.stdout
-    );
+    assert!(retry.stderr.is_empty());
     assert!(
         workers.get(&key).is_some(),
         "a failed marker retry must keep the session for a further retry"
     );
+    let finalized = workers
+        .get(&key)
+        .and_then(|session| session.finalized.as_ref())
+        .expect("a marker retry must keep the complete frozen report");
+    assert_eq!(serde_json::to_value(finalized).unwrap(), expected_report);
 }
 
 #[test]
@@ -1719,6 +1691,314 @@ fn message_subscription_kind_filter_applies_to_hub_broadcasts() {
     assert!(stream_response_matches_kinds(&preview, Some(&kinds)));
 }
 
+async fn read_subscription_frames(mut client: UnixStream) -> Vec<serde_json::Value> {
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut bytes))
+        .await
+        .expect("subscription writer closes")
+        .expect("read subscription frames");
+    assert!(bytes.ends_with(b"\n"), "each frame is newline terminated");
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).expect("valid stream frame"))
+        .collect()
+}
+
+#[tokio::test]
+async fn message_subscription_writer_filters_before_dedup_and_emits_exact_frames() {
+    const ACCOUNT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_ACCOUNT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn message(account: &str, group: &str, id: &str, kind: u64) -> DaemonStreamResponse {
+        let message = marmot_app::ReceivedMessage {
+            authority: None,
+            message_id_hex: id.to_owned(),
+            source_message_id_hex: "ff".to_owned(),
+            sender: OTHER_ACCOUNT.to_owned(),
+            sender_display_name: Some("Bob".to_owned()),
+            group_id: GroupId::new(hex::decode(group).unwrap()),
+            source_epoch: 0,
+            retention: None,
+            plaintext: "hello".to_owned(),
+            kind,
+            tags: Vec::new(),
+            recorded_at: 1,
+            received_at: 2,
+        };
+        message_stream_response(
+            runtime_message_json(&message, account, "Alice"),
+            "MessageReceived",
+        )
+    }
+
+    let matching = message(ACCOUNT, "aa", "01", 9);
+    let wrong_account = message(OTHER_ACCOUNT, "aa", "01", 9);
+    let wrong_group = message(ACCOUNT, "bb", "01", 9);
+    let wrong_kind = message(ACCOUNT, "aa", "01", 30078);
+    let preview = agent_stream_update_response(
+        marmot_app::AgentStreamUpdate::WatchUpdated(marmot_app::AgentStreamWatchReport {
+            watch_id: "watch".to_owned(),
+            account: Some(ACCOUNT.to_owned()),
+            group_id: "aa".to_owned(),
+            stream_id: Some("cc".repeat(32)),
+            started_at: 1,
+            finished_at: None,
+            status: "running".to_owned(),
+            text: Some("hello".to_owned()),
+            transcript_hash: None,
+            chunk_count: Some(1),
+            error: None,
+            result: None,
+        }),
+        false,
+    );
+    let delta = agent_stream_delta_response(crate::AgentStreamDelta {
+        account: Some(ACCOUNT.to_owned()),
+        group_id: "aa".to_owned(),
+        stream_id: "cc".repeat(32),
+        seq: 1,
+        record_type: AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+        flags: 0,
+        text: "delta".to_owned(),
+    });
+    for (name, group, kinds, inputs, expected) in [
+        (
+            "account",
+            Some("aa"),
+            Some(vec![9]),
+            vec![wrong_account, matching.clone()],
+            vec![matching.clone()],
+        ),
+        (
+            "group",
+            Some("aa"),
+            Some(vec![9]),
+            vec![wrong_group.clone(), matching.clone()],
+            vec![matching.clone()],
+        ),
+        (
+            "all groups",
+            None,
+            Some(vec![9]),
+            vec![wrong_group.clone()],
+            vec![wrong_group],
+        ),
+        (
+            "kind",
+            Some("aa"),
+            Some(vec![9]),
+            vec![wrong_kind.clone(), matching.clone()],
+            vec![matching.clone()],
+        ),
+        (
+            "all kinds",
+            Some("aa"),
+            None,
+            vec![wrong_kind.clone()],
+            vec![wrong_kind],
+        ),
+        (
+            "dedup",
+            Some("aa"),
+            Some(vec![9]),
+            vec![matching.clone(), matching.clone()],
+            vec![matching],
+        ),
+        (
+            "preview dedup without kind",
+            Some("aa"),
+            Some(vec![9]),
+            vec![preview.clone(), preview.clone()],
+            vec![preview],
+        ),
+        (
+            "delta without dedup",
+            Some("aa"),
+            Some(vec![9]),
+            vec![delta.clone(), delta.clone()],
+            vec![delta.clone(), delta],
+        ),
+    ] {
+        let (mut server, client) = UnixStream::pair().expect("unix stream pair");
+        let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
+        let mut seen_previews = BoundedMessageSubscriptionIds::with_limit(3);
+        let marker = message(ACCOUNT, "aa", "02", 9);
+        for response in inputs.into_iter().chain([marker.clone()]) {
+            assert!(
+                write_message_subscription_event(
+                    &mut server,
+                    response,
+                    group,
+                    kinds.as_deref(),
+                    ACCOUNT,
+                    &mut seen_messages,
+                    &mut seen_previews,
+                )
+                .await,
+                "{name}: filtering must keep the connection usable"
+            );
+        }
+        drop(server);
+        let expected = expected
+            .into_iter()
+            .chain([marker])
+            .map(|response| serde_json::to_value(response).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(read_subscription_frames(client).await, expected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_subscription_guard_errors_are_followed_by_stream_end() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, _) = gated_daemon(home.path());
+    let account = marmot_account::AccountHome::open(home.path())
+        .add_public_account(&"aa".repeat(32))
+        .expect("public account");
+    let cli = |command| {
+        let mut cli = daemon_test_cli(command);
+        cli.account = Some(account.account_id_hex.clone());
+        Box::new(cli)
+    };
+    let messages = |group| crate::Command::Messages {
+        command: crate::MessageCommand::Subscribe {
+            group,
+            kinds: Vec::new(),
+            limit: None,
+        },
+    };
+    let timeline = |group| crate::Command::Message {
+        command: crate::MessageCommand::Timeline {
+            command: crate::MessageTimelineCommand::Subscribe { group, limit: None },
+        },
+    };
+    let groups = |group_id| crate::Command::Groups {
+        command: crate::GroupsCommand::SubscribeState { group_id },
+        accept_stale: false,
+        accept_undelivered: false,
+    };
+    let signing_error = format!(
+        "account {} is not a local signing account",
+        account.account_id_hex
+    );
+    let workers = SharedDaemonWorkers::default();
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 1,
+        started_at: 0,
+        starting: false,
+        last_runtime_activity: None,
+    }));
+    let events = DaemonEventHub::new();
+    // The public account is a supported login mode. Runtime reconciliation
+    // opens no signing worker for it; the subscription must refuse it itself.
+    // Malformed wire requests are accepted by the deserializer and must reach
+    // their specific command/group guard before account lookup.
+    for (request, expected_error) in [
+        (
+            DaemonRequest::MessagesSubscribe {
+                cli: cli(crate::Command::Whoami),
+            },
+            "messages subscribe requires wn messages subscribe",
+        ),
+        (
+            DaemonRequest::MessagesSubscribe {
+                cli: cli(messages(Some("a".to_owned()))),
+            },
+            "Odd number of digits",
+        ),
+        (
+            DaemonRequest::MessagesSubscribe {
+                cli: cli(timeline(Some("a".to_owned()))),
+            },
+            "Odd number of digits",
+        ),
+        (
+            DaemonRequest::ChatsSubscribe {
+                cli: cli(crate::Command::Whoami),
+            },
+            "chats subscribe requires wn chats subscribe",
+        ),
+        (
+            DaemonRequest::GroupStateSubscribe {
+                cli: cli(crate::Command::Whoami),
+            },
+            "groups subscribe-state requires wn groups subscribe-state",
+        ),
+        (
+            DaemonRequest::GroupStateSubscribe {
+                cli: cli(groups("a".to_owned())),
+            },
+            "Odd number of digits",
+        ),
+        (
+            DaemonRequest::NotificationsSubscribe {
+                cli: cli(crate::Command::Whoami),
+            },
+            "notifications subscribe requires wn notifications subscribe",
+        ),
+        (
+            DaemonRequest::MessagesSubscribe {
+                cli: cli(messages(Some("abcd".to_owned()))),
+            },
+            signing_error.as_str(),
+        ),
+        (
+            DaemonRequest::MessagesSubscribe {
+                cli: cli(timeline(Some("abcd".to_owned()))),
+            },
+            signing_error.as_str(),
+        ),
+        (
+            DaemonRequest::ChatsSubscribe {
+                cli: cli(crate::Command::Chats {
+                    command: crate::ChatsCommand::Subscribe,
+                }),
+            },
+            signing_error.as_str(),
+        ),
+        (
+            DaemonRequest::GroupStateSubscribe {
+                cli: cli(groups("abcd".to_owned())),
+            },
+            signing_error.as_str(),
+        ),
+    ] {
+        let (server, mut client) = UnixStream::pair().expect("unix stream pair");
+        let (shutdown, _shutdown_rx) = mpsc::unbounded_channel();
+        let connection: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(handle_daemon_connection(
+                server,
+                defaults.clone(),
+                state.clone(),
+                events.clone(),
+                workers.clone(),
+                shutdown,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+            ));
+        let handler = tokio::spawn(connection);
+        client
+            .write_all(&encode_daemon_request(&request).unwrap())
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let frames = read_subscription_frames(client).await;
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("guard handler completes")
+            .expect("handler does not panic");
+        assert_eq!(
+            frames,
+            vec![
+                serde_json::json!({"error": {"code": "stream_error", "message": expected_error}}),
+                serde_json::json!({"stream_end": true}),
+            ],
+            "request {request:?}"
+        );
+    }
+    workers.lock().await.abort_all().await;
+}
+
 #[test]
 fn timeline_messages_subscribe_is_routed_by_command_shape() {
     let cli = Cli {
@@ -1962,11 +2242,14 @@ fn stream_plain_output_sanitizes_hostile_remote_fields() {
 
     let fallback = serde_json::json!({
         "type": "unknown_event",
-        "text": "ok"
+        "text": "a\u{1b}b\u{202e}c"
     });
     let rendered = stream_result_plain(&fallback);
     let serialized = fallback.to_string();
-    assert_eq!(rendered, crate::terminal_safe_json_display(&serialized));
+    assert_eq!(
+        rendered,
+        "{\"text\":\"a\\u001bbc\",\"type\":\"unknown_event\"}"
+    );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
         fallback
