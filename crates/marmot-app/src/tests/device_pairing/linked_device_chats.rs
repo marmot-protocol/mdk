@@ -353,7 +353,7 @@ async fn receive_account_choice(
 }
 
 /// One real external Add admits both linked copies with one generation.
-async fn invite_account_for_leave(
+async fn invite_account_pending(
     relay: &Arc<ScriptedPushRelayClient>,
     phone: &mut Device,
     laptop: &mut Device,
@@ -403,9 +403,22 @@ async fn invite_account_for_leave(
     for device in [&mut *phone, &mut *laptop] {
         deliver_new(&mut device.client, relay, &mut device.cursor).await;
         device.client.sync().await.unwrap();
-        device.client.accept_group_invite(&chat).unwrap();
     }
     (dir, bob, chat)
+}
+
+async fn invite_account_for_leave(
+    relay: &Arc<ScriptedPushRelayClient>,
+    phone: &mut Device,
+    laptop: &mut Device,
+    admin: bool,
+    relays: Option<Vec<String>>,
+) -> (tempfile::TempDir, AppClient, GroupId) {
+    let invitation = invite_account_pending(relay, phone, laptop, admin, relays).await;
+    for device in [phone, laptop] {
+        device.client.accept_group_invite(&invitation.2).unwrap();
+    }
+    invitation
 }
 
 async fn await_account_departure(
@@ -923,6 +936,128 @@ async fn a_deferred_worker_attributes_an_accepted_sibling_departure() {
     assert!(
         recorded,
         "the first deferred startup drain must retain the authenticated sibling departure"
+    );
+}
+
+/// A canonical disband can keep a pending Member projection. A later
+/// authenticated Accept retains its value but owes no acceptance of that tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_accept_retires_only_its_disbanded_invitation_work() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, mut bob, chat) =
+        invite_account_pending(&relay, &mut phone, &mut laptop, false, None).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let account = phone.app.account_storage("alice").unwrap();
+    let generation = account
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert!(
+        phone
+            .client
+            .state_group_record(&chat)
+            .unwrap()
+            .pending_confirmation
+    );
+
+    bob.disband_group(&chat).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let effects = bob.runtime.advance_convergence(&chat).await.unwrap();
+            bob.observe_drained_session_events(&effects).await.unwrap();
+            deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+            let effects = phone
+                .client
+                .runtime
+                .advance_convergence(&chat)
+                .await
+                .unwrap();
+            phone
+                .client
+                .observe_drained_session_events(&effects)
+                .await
+                .unwrap();
+            if phone
+                .client
+                .runtime
+                .group_record(&chat)
+                .unwrap()
+                .disbanded
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual external-admin disband canonically settles");
+    let native = phone.client.runtime.group_record(&chat).unwrap();
+    assert!(native.disbanded.is_some());
+    assert!(!native.removed && !native.unrecoverable);
+    let saved = phone.app.group("alice", &chat_hex).unwrap().unwrap();
+    assert!(saved.disbanded && saved.pending_confirmation);
+    assert_eq!(saved.self_membership, crate::SelfMembership::Member);
+    assert!(account.leave_request(&chat).unwrap().is_none());
+    assert_eq!(
+        account
+            .invitation_admission(&chat)
+            .unwrap()
+            .unwrap()
+            .generation,
+        generation
+    );
+
+    receive_account_choice(&relay, &mut laptop, &mut phone, &chat, 1, false).await;
+    let storage = account.app_storage();
+    let decision = storage
+        .invitation_decision(&chat_hex, &generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.version, 1);
+    assert!(!decision.declined);
+    assert!(
+        storage
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision == decision && work.apply_owed && !work.decline_owed)
+    );
+    let unsent = storage.unsent_invitation_decisions().unwrap();
+
+    phone.client.drive_invitation_decisions().await;
+    assert!(
+        !storage
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision == decision && work.apply_owed),
+        "canonical disband ends only this acceptance work"
+    );
+    assert_eq!(
+        storage.invitation_decision(&chat_hex, &generation).unwrap(),
+        Some(decision)
+    );
+    assert_eq!(storage.unsent_invitation_decisions().unwrap(), unsent);
+    assert!(account.leave_request(&chat).unwrap().is_none());
+    let saved = phone.app.group("alice", &chat_hex).unwrap().unwrap();
+    assert!(
+        saved.disbanded && saved.pending_confirmation,
+        "retiring work does not accept or rewrite the terminal projection"
+    );
+    phone.client.drive_invitation_decisions().await;
+    assert!(
+        !storage
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision.group_id_hex == chat_hex
+                && work.decision.generation == generation
+                && work.apply_owed)
     );
 }
 
