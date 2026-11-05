@@ -2237,6 +2237,7 @@ impl MarmotApp {
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
             saved_transport_timestamp: checkpointed_transport_timestamp,
+            observed_commit_version: None,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -6460,6 +6461,16 @@ impl MarmotApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(state.label.clone());
         Ok(())
+    }
+
+    /// Rebuild `label`'s chat list on its next read and wake presentation,
+    /// without writing anything.
+    pub(crate) fn invalidate_chat_list_projection(&self, label: &str) {
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(label.to_owned());
+        self.presentation_signals.wake();
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(

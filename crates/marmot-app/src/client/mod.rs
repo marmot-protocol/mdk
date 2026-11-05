@@ -1051,6 +1051,11 @@ pub struct AppClient {
     /// with. A checkpoint with nothing else pending and this cursor unchanged
     /// has nothing to persist and is skipped (mdk#2923).
     pub(crate) saved_transport_timestamp: Option<u64>,
+    /// The storage connection's foreign-commit version at the last
+    /// checkpoint, saved or skipped. A skip that finds it moved invalidates
+    /// the chat list, as a save would have: another runtime may have changed
+    /// the projection (mdk#2923).
+    pub(crate) observed_commit_version: Option<i64>,
     /// Runs at every transport-cursor seal, before and after, so a test can
     /// land a delivery on either side of the decision.
     #[cfg(test)]

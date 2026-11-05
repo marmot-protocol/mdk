@@ -223,6 +223,7 @@ pub(super) fn spawn_legacy_migration(
         let app_storage = storage.app_storage();
         // "Keep media" first, so bodies past the window are not moved only
         // to be removed.
+        let mut outcome = TelemetryOutcome::Success;
         if sweep_keep_media {
             let deadline = std::time::Instant::now() + KEEP_MEDIA_SWEEP_BUDGET;
             match super::super::attachment_storage::clean_past_keep_window(
@@ -243,6 +244,9 @@ pub(super) fn spawn_legacy_migration(
                     }
                 }
                 Err(_) => {
+                    // Deferred by an error: the batch still runs the rest,
+                    // but its span reports the failure.
+                    outcome = TelemetryOutcome::Failure;
                     keep_media_more.store(true, std::sync::atomic::Ordering::Release);
                     tracing::warn!(target: "marmot_app::storage_maintenance",
                         method = "keep_media_sweep",
@@ -282,7 +286,7 @@ pub(super) fn spawn_legacy_migration(
         {
             compaction_due.store(true, std::sync::atomic::Ordering::Release);
         }
-        batch.finish(TelemetryOutcome::Success);
+        batch.finish(outcome);
     }));
 }
 

@@ -12426,50 +12426,9 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let stale = |app: &MarmotApp| {
-        app.chat_list_projection_stale
-            .lock()
-            .unwrap()
-            .contains("alice")
-    };
-    let saves = |client: &mut crate::AppClient| {
-        app.chat_list_projection_stale.lock().unwrap().clear();
-        client
-            .save_state_with_pending_local_group_deletion_frontier_clears()
-            .unwrap();
-        stale(&app)
-    };
-    // Settle whatever the open left pending.
-    saves(&mut client);
-
-    assert!(!saves(&mut client), "nothing pending: no write");
-
-    client.checkpointed_transport_timestamp =
-        Some(client.checkpointed_transport_timestamp.unwrap_or(0) + 1);
-    assert!(saves(&mut client), "a moved transport cursor is persisted");
-    assert!(!saves(&mut client), "and saved only once");
-
-    client
-        .pending_local_group_deletion_frontier_clears
-        .insert("aa".repeat(32), 1);
-    assert!(saves(&mut client), "a pending frontier clear is persisted");
-    assert!(!saves(&mut client), "and cleared by that save");
-
-    // The clock moved back: a saved cursor beyond the allowed future skew
-    // still needs the save that clamps it, however often it repeats.
-    let future = Some(crate::unix_now_seconds() + 3_600);
-    client.checkpointed_transport_timestamp = future;
-    client.saved_transport_timestamp = future;
-    assert!(saves(&mut client), "a future cursor is clamped");
-    assert!(saves(&mut client), "on every save until it is in range");
-
-    // Another process stored a cursor the clock left in the future, while
-    // this client's own cursor is in range: the save still clamps it, and
-    // stops once the stored cursor is back in range.
-    let in_range = Some(crate::unix_now_seconds());
-    client.checkpointed_transport_timestamp = in_range;
-    client.saved_transport_timestamp = in_range;
-    {
+    // A second connection to the account database sees every commit the
+    // client makes, as another process would.
+    let probe = {
         let path = app.account_storage_path("alice");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let key = app
@@ -12483,17 +12442,126 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         )
         .unwrap();
         connection
+    };
+    let data_version = |probe: &rusqlite::Connection| {
+        probe
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let store_future_cursor = |probe: &rusqlite::Connection| {
+        probe
             .execute(
                 "UPDATE account_state SET last_transport_timestamp = ?1 WHERE label = 'alice'",
                 [i64::try_from(crate::unix_now_seconds() + 3_600).unwrap()],
             )
             .unwrap();
-    }
-    assert!(saves(&mut client), "a stored future cursor is clamped");
+    };
+    // Whether one save committed, and whether it left the chat list stale.
+    let save = |client: &mut crate::AppClient, probe: &rusqlite::Connection| {
+        app.chat_list_projection_stale.lock().unwrap().clear();
+        let before = data_version(probe);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        let stale = app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice");
+        (data_version(probe) != before, stale)
+    };
+    // Settle whatever the open left pending.
+    save(&mut client, &probe);
+
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "nothing pending: no write"
+    );
+
+    client.checkpointed_transport_timestamp =
+        Some(client.checkpointed_transport_timestamp.unwrap_or(0) + 1);
+    assert_eq!(
+        save(&mut client, &probe),
+        (true, true),
+        "a moved transport cursor is persisted"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and saved only once"
+    );
+
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("aa".repeat(32), 1);
     assert!(
-        !saves(&mut client),
+        save(&mut client, &probe).1,
+        "a pending frontier clear is persisted"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and cleared by that save"
+    );
+
+    // The clock moved back: a saved cursor beyond the allowed future skew
+    // still needs the save that clamps it, however often it repeats.
+    let future = Some(crate::unix_now_seconds() + 3_600);
+    client.checkpointed_transport_timestamp = future;
+    client.saved_transport_timestamp = future;
+    assert!(save(&mut client, &probe).1, "a future cursor is clamped");
+    assert!(
+        save(&mut client, &probe).1,
+        "on every save until it is in range"
+    );
+
+    // Another process stored a cursor the clock left in the future, while
+    // this client's own cursor is in range: the save still clamps it, and
+    // stops once the stored cursor is back in range.
+    let in_range = Some(crate::unix_now_seconds());
+    client.checkpointed_transport_timestamp = in_range;
+    client.saved_transport_timestamp = in_range;
+    store_future_cursor(&probe);
+    assert!(
+        save(&mut client, &probe).1,
+        "a stored future cursor is clamped"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
         "and once in range, an empty save skips"
     );
+
+    // A client with no cursor of its own cannot clamp a stored one: its save
+    // carries none and leaves the stored value as is. So a stored future
+    // cursor must not force a save that would only repeat.
+    client.checkpointed_transport_timestamp = None;
+    client.saved_transport_timestamp = None;
+    store_future_cursor(&probe);
+    // The first skip sees that foreign commit and only invalidates.
+    assert!(!save(&mut client, &probe).0, "a cursor-less client skips");
+    assert_eq!(save(&mut client, &probe), (false, false), "every time");
+
+    // Another runtime archives a chat. The skipped checkpoint still
+    // invalidates this runtime's chat list, as the save it replaces did, so
+    // the warmed list picks the change up; then the next skip does not.
+    let group_id = client
+        .create_group("archived elsewhere", &[])
+        .await
+        .unwrap();
+    save(&mut client, &probe);
+    assert_eq!(save(&mut client, &probe), (false, false), "settled");
+    let other = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    other
+        .set_group_archived("alice", &hex::encode(group_id.as_slice()), true)
+        .unwrap();
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "a foreign commit invalidates the chat list without a write"
+    );
+    assert_eq!(save(&mut client, &probe), (false, false), "only once");
 }
 
 #[test]

@@ -713,7 +713,9 @@
   one call was about a third of the app's CPU. A projection checkpoint with
   nothing to persist is skipped, so a tick no longer commits an empty delta,
   marks the chat list stale and re-runs the presentation, avatar and attachment
-  passes.
+  passes. A skipped checkpoint still marks the chat list stale when another
+  connection committed since the last checkpoint, so a change another runtime
+  made, such as archiving a chat, still reaches this runtime's list.
 
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging

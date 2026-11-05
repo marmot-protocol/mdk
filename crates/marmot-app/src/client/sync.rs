@@ -6761,6 +6761,7 @@ impl AppClient {
         // another attachment pass (mdk#2923).
         let max_cursor =
             unix_now_seconds().saturating_add(crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs());
+        let storage = self.app.account_storage(&self.state.label);
         let nothing_to_persist = changed_groups == 0
             && pending_acks == 0
             && pending_frontiers == 0
@@ -6768,17 +6769,22 @@ impl AppClient {
             && self.checkpointed_transport_timestamp == self.saved_transport_timestamp
             // A cursor beyond the allowed future skew (the clock moved back)
             // still needs the save that clamps it, whether this client saved
-            // it or another process did.
-            && self.saved_transport_timestamp.is_none_or(|cursor| cursor <= max_cursor)
-            && self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(storage
-                        .app_storage()
-                        .stored_transport_cursor(&self.state.label)?)
-                })
-                .is_ok_and(|stored| stored.is_none_or(|cursor| cursor <= max_cursor));
+            // it or another process did. Only a save that carries a cursor
+            // can clamp a stored one: with none, the save leaves it as is, so
+            // a stored future cursor alone does not force it.
+            && self.saved_transport_timestamp.is_none_or(|cursor| {
+                cursor <= max_cursor
+                    && storage
+                        .as_ref()
+                        .map_err(|_| ())
+                        .and_then(|storage| {
+                            storage
+                                .app_storage()
+                                .stored_transport_cursor(&self.state.label)
+                                .map_err(|_| ())
+                        })
+                        .is_ok_and(|stored| stored.is_none_or(|cursor| cursor <= max_cursor))
+            });
         // Receipts synchronize once per save: released receipts can add seen
         // events, and a retry of a failed synchronization could succeed and
         // hide the failure. The save below reuses this result, so an error
@@ -6789,6 +6795,7 @@ impl AppClient {
                 Ok(receipts) => {
                     let seen_events = receipts.pending_seen_events();
                     if seen_events.is_empty() {
+                        self.invalidate_chat_list_after_foreign_commit(storage.ok());
                         self.flush_live_v5_events();
                         return Ok(None);
                     }
@@ -6910,6 +6917,13 @@ impl AppClient {
         if let Some(observation) = observation {
             observation.finish_app(&result);
         }
+        if result.is_ok() {
+            // This save marked the chat list stale, so it covers every
+            // foreign commit up to here.
+            self.observed_commit_version = storage
+                .ok()
+                .and_then(|storage| storage.app_storage().foreign_commit_version().ok());
+        }
         if let Some(probe) = &mut self.audit_v5_probe {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
         }
@@ -6949,6 +6963,28 @@ impl AppClient {
             });
         }
         result
+    }
+
+    /// A skipped checkpoint still invalidates the chat list when another
+    /// connection committed since the last checkpoint: the save it replaces marked
+    /// the list stale, and that was how a change another runtime made, such
+    /// as archiving a chat, reached this runtime's warmed list. Commits by
+    /// this process's engine connection also move the version, so this can
+    /// invalidate more often than needed, never less.
+    fn invalidate_chat_list_after_foreign_commit(
+        &mut self,
+        storage: Option<storage_sqlite::SqliteAccountStorage>,
+    ) {
+        let version =
+            storage.and_then(|storage| storage.app_storage().foreign_commit_version().ok());
+        if version.is_none()
+            || self
+                .observed_commit_version
+                .is_some_and(|previous| Some(previous) != version)
+        {
+            self.app.invalidate_chat_list_projection(&self.state.label);
+        }
+        self.observed_commit_version = version;
     }
 
     /// Withdraw app rows when the engine actually discarded this device's queue.
