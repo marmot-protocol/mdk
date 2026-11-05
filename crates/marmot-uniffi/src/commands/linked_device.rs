@@ -11,8 +11,7 @@ use crate::errors::MarmotKitError;
 impl Marmot {
     /// This account's own devices, from the roster of the device group this
     /// device trusts: this device first, then by when each was linked. Empty
-    /// until this device trusts a device group, and always empty in release
-    /// builds until the roster's spec lands. Refresh on `LinkedDevicesChanged`.
+    /// until this device trusts a device group, and always empty without explicit dev capability and runtime intent. Refresh on `LinkedDevicesChanged`.
     pub async fn linked_devices(
         &self,
         account_ref: String,
@@ -29,8 +28,7 @@ impl Marmot {
     /// Whether this device's KeyPackage refresh is overdue because its
     /// device group can't take the announcement that must come first. While
     /// it is, warn the user: after 30 days inviters stop treating this device
-    /// as fresh. Always false until this device trusts a device group, and in
-    /// release builds until the device group's spec lands. Refresh on
+    /// as fresh. Always false until this device trusts a device group, and without explicit dev capability and runtime intent. Refresh on
     /// `KeyPackageRefreshOverdueChanged`.
     pub async fn key_package_refresh_overdue(
         &self,
@@ -46,7 +44,7 @@ impl Marmot {
     /// `slot_id_hex` from `linked_devices`: one roster commit in the device
     /// group. Any device may rename any device. The label is at most 64
     /// bytes of UTF-8; empty clears it. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds), `label_too_long`,
+    /// `roster_unsupported` (device groups unavailable for this client), `label_too_long`,
     /// `no_device_group`, `unknown_device`, `roster_unavailable`, or
     /// `device_group_busy` while the device group has an earlier change in
     /// flight (retry later). A rename whose commit loses a fork is made again
@@ -98,7 +96,7 @@ impl Marmot {
     /// recorded at once and carried out as the device group allows;
     /// `linked_devices` shows the device with `removal_pending` until the
     /// device group takes it. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds), `no_device_group`,
+    /// `roster_unsupported` (device groups unavailable for this client), `no_device_group`,
     /// `unknown_device`, `this_device` (sign out instead),
     /// `device_link_pending` while the device's link may still fail, or
     /// `roster_unavailable`. Refresh on `LinkedDevicesChanged`.
@@ -117,8 +115,7 @@ impl Marmot {
     /// longer has, because the chat doesn't take a same-account removal; a
     /// chat admin can remove it. The device is one this account removed, or
     /// one its device group stopped listing, as after a failed link. Zero
-    /// until this device trusts a device group, and always zero in release
-    /// builds until the device group's spec lands. Read it when showing the
+    /// until this device trusts a device group, and always zero without explicit dev capability and runtime intent. Read it when showing the
     /// device list; it is not evented.
     pub async fn removed_device_leftover_chats(
         &self,
@@ -141,8 +138,7 @@ impl Marmot {
     /// KeyPackages don't meet is passed over and not counted, so zero
     /// does not mean the new device reaches every chat. A chat admin can
     /// turn the component on; removing a device frees its leaves.
-    /// Zero until this device trusts a device group, and always zero in
-    /// release builds until the device group's spec lands. Read it when
+    /// Zero until this device trusts a device group, and always zero without explicit dev capability and runtime intent. Read it when
     /// showing the device list; it is not evented.
     pub async fn chats_closed_to_linked_devices(
         &self,

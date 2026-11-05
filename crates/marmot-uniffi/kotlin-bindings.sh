@@ -15,11 +15,18 @@
 
 set -euo pipefail
 
+# Explicit opt-in only: keep ordinary release invocations and output untouched.
+DEV_DEVICE_GROUPS=0
+if [[ "${1:-}" == --dev-device-groups ]]; then
+  DEV_DEVICE_GROUPS=1
+  shift
+fi
+
 # Native jobs need no host library or generator. Generation needs no NDK.
 MODE="${1:-all}"
 case "$MODE" in
   all|generate|native) [[ $# -le 1 ]] || { echo "expected at most one phase" >&2; exit 2; } ;;
-  *) echo "usage: $0 [all|generate|native]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--dev-device-groups] [all|generate|native]" >&2; exit 2 ;;
 esac
 
 # Force rustup's cargo to win over any Homebrew-installed cargo so Android
@@ -40,6 +47,11 @@ if [[ "$TARGET_DIR" != /* ]]; then
   TARGET_DIR="$WORKSPACE_DIR/$TARGET_DIR"
 fi
 OUT_DIR="$CRATE_DIR/output/android"
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  TARGET_DIR="$TARGET_DIR/dev-device-groups"
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  OUT_DIR="$CRATE_DIR/output-dev-device-groups/android"
+fi
 KOTLIN_OUT_DIR="$OUT_DIR/kotlin"
 JNI_OUT_DIR="$OUT_DIR/jniLibs"
 
@@ -59,6 +71,12 @@ fi
 if [[ "${PRODUCT_ANALYTICS_EXPORT:-0}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
   FEATURE_ARGS+=(--features product-analytics-export)
   BINDGEN_FEATURES="${BINDGEN_FEATURES},product-analytics-export"
+fi
+
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  FEATURE_ARGS+=(--features dev-device-groups)
+  BINDGEN_FEATURES="${BINDGEN_FEATURES},dev-device-groups"
+  echo "==> Experimental device-group capability; ordinary constructors remain disabled"
 fi
 
 

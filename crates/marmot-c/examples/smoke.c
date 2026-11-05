@@ -201,6 +201,13 @@ int main(int argc, char **argv) {
 
     ok("NULL frees are no-ops");
 
+    /* Prove the always-exported experimental constructor links through the
+       checked-in header in shared and static C consumers. Capability/auth
+       behavior is owned by the real two-host secret_store_client test. */
+    check(marmot_client_new_with_experimental_device_groups(NULL, NULL, 0, NULL, NULL, NULL) ==
+              MARMOT_STATUS_NULL_POINTER,
+          "experimental constructor symbol and output preflight");
+
     /* ---- construct + lifecycle ---------------------------------------- */
     const char *relays[] = {"wss://relay.example.org"};
     st = marmot_client_new(home, relays, 1, NULL, &client);

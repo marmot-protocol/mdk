@@ -1,6 +1,6 @@
 //! Linking a new device of this account: the code both screens show, then
-//! joining or moving to the answering device's group. Released builds keep
-//! this off; explicit experimental builds also require the runtime dev gate.
+//! joining or moving to the answering device's group. Requires an explicitly capable
+//! experimental library and the experimental constructor; normal opens refuse it.
 
 use crate::Marmot;
 use crate::conversions::DeviceLinkSnapshotFfi;
