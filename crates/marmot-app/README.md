@@ -513,11 +513,14 @@ the user removes it from one of them. The other devices show it as `LinkedDevice
 A device removed while it signs out finishes signing out and is not unlinked.
 Signing out targets this device only; it does not submit an account-wide Leave decision or automatically change the
 account's admin rights. An active-admin account cannot use SelfRemove, even when another admin exists, so an admin
-chat can retain this device's leaf. Changing that account's admin status separately affects all its devices; if it
-is the last active admin, another account must first become an active admin before it can leave.
+chat can retain this device's leaf. Changing that account's admin status separately affects all its devices. Before
+the account can leave the chat entirely, another account must be an active admin; an eligible sibling can still
+remove this device while the account remains an admin.
 
-Sibling assistance applies only to chats that support same-account device removal and have the required tagged
-leaves. `groups_left_to_siblings` records a handoff, not confirmation that removal completed. The call still attempts
+Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
+roster entry already carrying its tag signature key. It applies only to chats that support same-account device
+removal and have the required tagged leaves. `groups_left_to_siblings` records a handoff, not confirmation that removal
+completed. `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
 local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
 `local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
 
