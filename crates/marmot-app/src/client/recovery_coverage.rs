@@ -140,7 +140,7 @@ impl LiveCoverage {
         mark: Option<RecoveryCoverageMark>,
         adapter: &MarmotRelayPlaneAccountAdapter,
     ) -> Self {
-        let (_, _, inherited) = observe_live_counts(&adapter.replay_admission().await);
+        let (_, _, inherited) = observe_live_counts(&adapter.replay_admission().await, true);
         Self {
             mark,
             broken: inherited.into_keys().collect(),
@@ -381,7 +381,7 @@ impl AppClient {
     /// runner's host reads this with each debt turn's tails (from 5g).
     pub(crate) async fn recovery_runner_live_counts(&self) -> LiveCountRead {
         let observation = self.adapter.replay_admission().await;
-        let (_, facts, _) = observe_live_counts(&observation);
+        let (_, facts, _) = observe_live_counts(&observation, self.app.vouches_for_relay_replies());
         LiveCountRead {
             ticket: observation.fence_ticket(),
             counts: facts.iter().map(LiveCountFact::live_count).collect(),
@@ -432,6 +432,7 @@ fn live_boundary_since(since: u64, count: &ReplayLiveCount) -> Option<u64> {
 /// and every generation it reports with the routes its filter carries.
 fn observe_live_counts(
     observation: &ReplayAdmissionStatus<'_>,
+    vouched: bool,
 ) -> (
     bool,
     Vec<LiveCountFact>,
@@ -457,7 +458,7 @@ fn observe_live_counts(
             .collect::<Vec<_>>();
         for endpoint in source.endpoints() {
             let relay = transport_nostr::canonical_relay(endpoint.endpoint().as_str());
-            let mut fact = |generation, count, ended| {
+            let mut fact = |generation, count: Option<ReplayLiveCount>, ended| {
                 let key = (source.id().to_owned(), relay.clone(), generation);
                 present.insert(key.clone(), routes.clone());
                 if let Some(count) = count {
@@ -465,7 +466,10 @@ fn observe_live_counts(
                         key,
                         routes: routes.clone(),
                         since: source.since(),
-                        count,
+                        count: ReplayLiveCount {
+                            sent_nothing: count.sent_nothing && vouched,
+                            ..count
+                        },
                         ended,
                         placed,
                         held: held.clone(),
@@ -1029,7 +1033,7 @@ impl AppClient {
         };
         let (input_placed, facts, present) = {
             let observation = self.adapter.replay_admission().await;
-            observe_live_counts(&observation)
+            observe_live_counts(&observation, self.app.vouches_for_relay_replies())
         };
         live.broken.retain(|key| present.contains_key(key));
         live.settled.retain(|key, _| present.contains_key(key));
@@ -1080,7 +1084,7 @@ impl AppClient {
         // count this observation saw.
         let (input_placed, streaming, _) = {
             let observation = self.adapter.replay_admission().await;
-            observe_live_counts(&observation)
+            observe_live_counts(&observation, self.app.vouches_for_relay_replies())
         };
         if !input_placed || self.delivery_loss_blocks_cursor() {
             return;

@@ -82,7 +82,9 @@ impl QueryPolicy for HeldSweep {
 }
 
 /// One account with one group on `url`, whose route owes the last hour, and
-/// the runtime that serves it with the gate as given.
+/// the runtime that serves it with the gate as given. Its relay replies are
+/// ones the wire tap cannot vouch for: the quiet group's own empty live REQs
+/// would otherwise prove the hour it owes.
 struct GatedWorker {
     _dir: tempfile::TempDir,
     app: MarmotApp,
@@ -102,7 +104,8 @@ impl GatedWorker {
             .unwrap();
         let config =
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
-        let app = MarmotApp::with_relay_and_config(dir.path(), url.to_owned(), config.clone());
+        let app = MarmotApp::with_relay_and_config(dir.path(), url.to_owned(), config.clone())
+            .with_unvouched_relay_replies_for_test();
         let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
         let group = runtime
@@ -138,7 +141,9 @@ impl GatedWorker {
                 crate::unix_now_seconds() - HOUR,
             )
             .unwrap();
-        let app = app.with_recovery_runner_ownership_for_test(gate);
+        let app = app
+            .with_recovery_runner_ownership_for_test(gate)
+            .with_unvouched_relay_replies_for_test();
         let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
         let credits = runtime
             .shared_services()

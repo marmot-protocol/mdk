@@ -457,7 +457,7 @@ async fn a_tail_lapses_when_the_connection_changes_during_the_write() {
     let later = unix_now_seconds() + HOUR;
     let reads = || fixture.relay.connection_reads.load(SeqCst);
     let before = reads();
-    let _ = observe_live_counts(&fixture.client.adapter.replay_admission().await);
+    let _ = observe_live_counts(&fixture.client.adapter.replay_admission().await, true);
     let per_look = reads() - before;
     assert!(per_look > 0, "a look asks the client about each open count");
     // The recorder's first look sees the connection; every read after it

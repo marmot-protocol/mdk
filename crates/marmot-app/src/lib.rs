@@ -584,6 +584,9 @@ pub struct MarmotApp {
     /// The internal `runner_owns_debt` gate; see
     /// [`Self::recovery_runner_owns_debt`].
     recovery_runner_owns_debt: bool,
+    /// See [`Self::with_unvouched_relay_replies_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    unvouched_relay_replies: bool,
     config: MarmotAppConfig,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
@@ -1636,6 +1639,29 @@ impl MarmotApp {
         self
     }
 
+    /// Treat every live reply this app's accounts read as one the account
+    /// pool's wire tap could not vouch for, as from a relay that sends a
+    /// frame the tap cannot attribute: an empty live count then proves
+    /// nothing (`ReplayLiveCount::sent_nothing`). For runner fixtures that
+    /// seed debt on a quiet group, which the group's own empty live REQ
+    /// would otherwise prove. Call it before cloning the app.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_unvouched_relay_replies_for_test(mut self) -> Self {
+        self.unvouched_relay_replies = true;
+        self
+    }
+
+    /// Whether live counts keep the wire tap's answer: always, outside
+    /// fixtures that opt out.
+    pub(crate) fn vouches_for_relay_replies(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.unvouched_relay_replies {
+            return false;
+        }
+        true
+    }
+
     /// The internal `runner_owns_debt` gate: whether the recovery runner runs
     /// for this app's accounts.
     pub(crate) fn recovery_runner_owns_debt(&self) -> bool {
@@ -1727,6 +1753,8 @@ impl MarmotApp {
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
             recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
+            #[cfg(any(test, feature = "test-support"))]
+            unvouched_relay_replies: false,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
@@ -1840,6 +1868,8 @@ impl MarmotApp {
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
             recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
+            #[cfg(any(test, feature = "test-support"))]
+            unvouched_relay_replies: false,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),

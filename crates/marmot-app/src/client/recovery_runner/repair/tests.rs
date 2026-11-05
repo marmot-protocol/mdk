@@ -95,7 +95,11 @@ async fn client(
         relay.url().await.to_string(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
-    let app = app.with_recovery_runner_ownership_for_test(gate);
+    // The quiet group's own empty live REQ would prove the history these
+    // tests owe, so its replies are ones the wire tap cannot vouch for.
+    let app = app
+        .with_recovery_runner_ownership_for_test(gate)
+        .with_unvouched_relay_replies_for_test();
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("repair", &[]).await.unwrap();
     let route = client
