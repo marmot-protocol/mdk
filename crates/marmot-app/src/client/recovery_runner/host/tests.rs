@@ -513,8 +513,10 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(groups.len(), 2);
     let storage = app.account_storage("alice").unwrap().app_storage();
     let started = unix_now_seconds();
+    // A loss owes the last hour: the quiet groups' live REQs, which their
+    // relay answered with nothing, already proved it.
     storage
-        .widen_recovery_coverage_goals(&groups, started - HOUR)
+        .uncover_recovery_coverage(&groups, started - HOUR)
         .unwrap();
     let before = storage.recovery_account_usage(started).unwrap().attempts;
     // Fresh service markers make this pass observable even when setup's
@@ -868,8 +870,10 @@ async fn held_client(
     let (dir, app, mut client) = direct_client_on(relay.url().await.to_string(), true).await;
     client.create_group("held", &[]).await.unwrap();
     let storage = app.account_storage("alice").unwrap().app_storage();
+    // A loss owes the last hour: the quiet group's live REQ, which its relay
+    // answered with nothing, already proved it.
     storage
-        .widen_recovery_coverage_goals(&group_routes(&client), unix_now_seconds() - HOUR)
+        .uncover_recovery_coverage(&group_routes(&client), unix_now_seconds() - HOUR)
         .unwrap();
     cover_inbox(&client, &storage);
     (dir, relay, client, storage)
