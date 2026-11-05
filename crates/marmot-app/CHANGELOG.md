@@ -7,6 +7,9 @@
   ids)` returns the still-eligible subset in the caller's order, never adding chats. Pending base rows return
   `ChatPresentationNotReady` instead of a partial list. No schema or wire change.
 
+- Keep uncertain sends pending for ordinary recovery when later SDK retries or an authentication fallback are
+  refused; acknowledgements still succeed.
+
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
   class. Mixed, ambiguous and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
 

@@ -4297,14 +4297,17 @@ impl NostrSdkRelayClient {
                     });
                 }
                 Ok(Err(mut failure)) => {
-                    // The last explicit reply cannot prove what an earlier
-                    // unacknowledged attempt did. Withhold the endpoint proof
-                    // too, so durable fanout reconstruction stays conservative.
-                    if earlier_ambiguous_attempt {
-                        failure.size_class = None;
-                    }
+                    let terminal_rejection =
+                        failure.kind == TransportEndpointFailureKind::TerminalRejected;
                     earlier_ambiguous_attempt |=
                         failure.kind == TransportEndpointFailureKind::PossiblyExposed;
+                    // A later refusal describes only that attempt: preserve
+                    // earlier uncertainty for the owner, and withhold size
+                    // proof even when this reply stops internal retries.
+                    if earlier_ambiguous_attempt {
+                        failure.kind = TransportEndpointFailureKind::PossiblyExposed;
+                        failure.size_class = None;
+                    }
                     // An anonymous connection cannot satisfy NIP-42 by waiting
                     // and resending. Return its explicit rejection so the
                     // account owner can perform its authenticated fallback.
@@ -4325,7 +4328,7 @@ impl NostrSdkRelayClient {
                     // `blocked:`, `invalid:`, `pow:`, `restricted:` and the
                     // like are the relay's final answer for this event;
                     // resending only repeats the rejection (mdk#2270).
-                    if failure.kind == TransportEndpointFailureKind::TerminalRejected {
+                    if terminal_rejection {
                         return Err(failure);
                     }
                     last_failure = failure;
@@ -12078,6 +12081,58 @@ mod tests {
         }
     }
 
+    /// Internal retries cannot erase uncertainty, but a later acknowledgement
+    /// still confirms publication. A definite refusal still stops sending.
+    #[tokio::test]
+    async fn publication_retries_preserve_uncertainty_without_hiding_success() {
+        for (last_reply, category, expected_attempts) in [
+            (
+                "invalid: bad event",
+                Some(TransportEndpointRejectionCategory::Invalid),
+                2,
+            ),
+            (
+                "rate-limited: try later",
+                Some(TransportEndpointRejectionCategory::RateLimited),
+                SDK_RELAY_PUBLISH_ATTEMPTS,
+            ),
+            ("", None, 2),
+        ] {
+            let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
+                Arc::new(AtomicBool::new(true)),
+                vec!["error: publication unavailable", last_reply],
+            )
+            .await;
+            let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+            let result = sdk
+                .publish_event(
+                    std::slice::from_ref(&endpoint),
+                    &signed_group_event_dto(),
+                    1,
+                )
+                .await;
+            assert_eq!(attempts.lock().await.len(), expected_attempts);
+            if let Some(category) = category {
+                let error = result.expect_err("the relay never acknowledged the publication");
+                let failures = error.publish_endpoint_failures();
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].endpoint, endpoint);
+                assert_eq!(failures[0].rejection_category, Some(category));
+                assert_eq!(
+                    failures[0].kind,
+                    TransportEndpointFailureKind::PossiblyExposed,
+                    "a later refusal cannot rule out exposure during an earlier attempt"
+                );
+            } else {
+                let outcome = result.expect("a later acknowledgement confirms publication");
+                assert_eq!(outcome.accepted.len(), 1);
+                assert_eq!(outcome.accepted[0].endpoint, endpoint);
+                assert!(outcome.failed.is_empty());
+            }
+            sdk.client().shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn a_size_reply_after_an_ambiguous_attempt_keeps_size_proof_unknown() {
         let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
@@ -12104,6 +12159,11 @@ mod tests {
         assert_eq!(
             failure.endpoint_failures[0].rejection_category,
             Some(TransportEndpointRejectionCategory::TooLarge)
+        );
+        assert_eq!(
+            failure.endpoint_failures[0].kind,
+            TransportEndpointFailureKind::PossiblyExposed,
+            "the final size refusal cannot erase an earlier ambiguous attempt"
         );
         assert_eq!(
             failure.endpoint_failures[0].size_class, None,
@@ -13542,12 +13602,9 @@ mod tests {
                             attempts.push(tokio::time::Instant::now());
                             index
                         };
-                        let rejected = limited.load(Ordering::Relaxed);
-                        let reason = if rejected {
-                            reasons[index.min(reasons.len() - 1)]
-                        } else {
-                            ""
-                        };
+                        let reason = reasons[index.min(reasons.len() - 1)];
+                        let rejected = limited.load(Ordering::Relaxed) && !reason.is_empty();
+                        let reason = if rejected { reason } else { "" };
                         let response = serde_json::json!(["OK", value[1]["id"], !rejected, reason]);
                         if socket.send(response.to_string().into()).await.is_err() {
                             return;

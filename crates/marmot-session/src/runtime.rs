@@ -7301,6 +7301,10 @@ fn v5_failed_endpoint_result(
         .filter(|category| {
             !(failure.kind == TransportEndpointFailureKind::NotExposed
                 && *category == TransportEndpointRejectionCategory::TooLarge)
+                // V5 describes the cumulative outcome, not merely the last
+                // refusal after an earlier uncertain attempt.
+                && (failure.kind != TransportEndpointFailureKind::PossiblyExposed
+                    || *category == TransportEndpointRejectionCategory::Error)
         })
         .map(|category| match category {
             TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
@@ -7369,6 +7373,73 @@ fn v5_failed_endpoint_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_failure_projection_keeps_cumulative_uncertainty() {
+        use audit_v5::{EndpointFailureKind as AuditFailure, RejectionCategory as AuditCategory};
+        use cgka_traits::{
+            TransportEndpointFailureKind as Failure, TransportEndpointRejectionCategory as Category,
+        };
+
+        for (kind, category, expected_kind, expected_category) in [
+            (
+                Failure::PossiblyExposed,
+                None,
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::Error),
+                AuditFailure::PossiblyExposed,
+                Some(AuditCategory::Error),
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::Invalid),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::TooLarge),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::RateLimited),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::AuthRequired),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::TerminalRejected,
+                Some(Category::Invalid),
+                AuditFailure::TerminalRejected,
+                Some(AuditCategory::Invalid),
+            ),
+        ] {
+            let failure = TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://relay.example/".into()),
+                reason: "publication refused".into(),
+                kind,
+                rejection_category: category,
+                size_class: None,
+            };
+            let result = v5_failed_endpoint_result(&failure).unwrap_or_else(|| {
+                panic!("the audit must retain the endpoint for {kind:?}/{category:?}")
+            });
+            assert_eq!(result.status, audit_v5::EndpointStatus::Failed);
+            assert_eq!(result.failure_kind, Some(expected_kind));
+            assert_eq!(result.rejection_category, expected_category);
+        }
+    }
 
     fn failed_frozen_fanout(kind: TransportEndpointFailureKind) -> OutboundFanout {
         let group_id = GroupId::new(vec![0x11; 16]);
