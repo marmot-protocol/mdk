@@ -236,6 +236,7 @@ impl SweepRelay for SdkSweepRelay {
             Err(NegFailure::Closed(reason)) => return SecondReply::Closed(reason),
             Err(NegFailure::Unreachable(kind)) => return SecondReply::Unreachable(kind),
             Err(NegFailure::Unproven) => return SecondReply::Unproven,
+            Err(NegFailure::Inconclusive) => return SecondReply::Inconclusive,
             // Not the relay's answer: retried like a dropped connection, never
             // a second the relay cannot prove.
             Err(NegFailure::Local) => {
@@ -289,7 +290,7 @@ impl SweepRelay for SdkSweepRelay {
             // now; it may have dropped the event since listing it, so a
             // later attempt may prove the second.
             if got.len() != asked.len() {
-                return SecondReply::Withheld;
+                return SecondReply::Inconclusive;
             }
             events.extend(got);
         }
@@ -342,7 +343,8 @@ impl CompareRelay for SdkSweepRelay {
             },
             Err(NegFailure::Closed(reason)) => CompareReply::Closed(reason),
             Err(NegFailure::Unreachable(kind)) => CompareReply::Unreachable(kind),
-            Err(NegFailure::Unproven) => CompareReply::Unsupported,
+            // A comparison falls back to a sweep either way.
+            Err(NegFailure::Unproven | NegFailure::Inconclusive) => CompareReply::Unsupported,
             // Not the relay's fault: retried like a dropped connection.
             Err(NegFailure::Local) => CompareReply::Unreachable(UnreachableKind::Disconnected),
         }
@@ -394,8 +396,11 @@ impl CompareRelay for SdkSweepRelay {
 pub(crate) enum NegFailure {
     Closed(ClosedReason),
     Unreachable(UnreachableKind),
-    /// No NIP-77, or a protocol error: the second stays unproven.
+    /// The relay said it lacks NIP-77: the second stays unproven.
     Unproven,
+    /// An exchange that proved nothing this time (a malformed message, an
+    /// SDK protocol error): a later attempt may complete it.
+    Inconclusive,
     /// A local fault, not the relay's.
     Local,
 }

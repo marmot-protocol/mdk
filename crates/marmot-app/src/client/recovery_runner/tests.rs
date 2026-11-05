@@ -804,7 +804,7 @@ impl ModelRelay {
             })
             .is_ok()
         {
-            SecondReply::Withheld
+            SecondReply::Inconclusive
         } else {
             SecondReply::Complete(self.matching(route, second, second))
         }
@@ -3872,21 +3872,26 @@ async fn recovery_runner_lets_a_group_go_once_its_relays_stop_on_unprovable_seco
     );
 }
 
-/// A wake-collection runner fetches what its live input waits on: the group
-/// whose frames a fence holds is swept and its frames released, while another
-/// group's debt waits for an Advance process or an explicit repair.
+/// A wake-collection runner fetches what its live input waits on: every route
+/// of the group whose frames a fence holds, including a retained route whose
+/// older debt no capture covers but whose position holds the group's shared
+/// frontier, so the captured history is admitted and the frames released.
+/// Another group's debt waits for an Advance process or an explicit repair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_fetches_only_held_groups_in_a_wake_collection_process() {
     let account = account();
     let clock = Clock::new();
     let t0 = clock.now();
-    let (held, quiet) = (group(1), group(2));
+    let (held, retained, quiet) = (group(1), group(3), group(2));
     let floor = t0 - HOUR;
     let since = t0 - 30 * 60;
     let oldest = t0 - 25 * 60;
     let requested = t0 - 20 * 60;
-    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
-    for route in [&held, &quiet] {
+    let captured = since + 60;
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(vec![event([1; 32], captured)])
+        .build();
+    for route in [&held, &retained, &quiet] {
         account.goal(route, floor);
     }
     account.live_boundary(&held, RELAY, floor, since - 1);
@@ -3894,10 +3899,16 @@ async fn recovery_runner_fetches_only_held_groups_in_a_wake_collection_process()
     let host = TestHost::new(
         &account,
         &clock,
-        vec![required(&held, &[RELAY]), required(&quiet, &[RELAY])],
+        vec![
+            shared(&held, &[RELAY]),
+            shared(&retained, &[RELAY]),
+            required(&quiet, &[RELAY]),
+        ],
         &[&relay],
     );
-    host.tails.stand(&held, RELAY, requested);
+    for route in [&held, &retained] {
+        host.tails.stand(route, RELAY, requested);
+    }
     host.set_counts(vec![LiveCount {
         routes: vec![held.clone()],
         relay: RELAY.to_owned(),
@@ -3909,10 +3920,14 @@ async fn recovery_runner_fetches_only_held_groups_in_a_wake_collection_process()
         ..test_policy()
     };
     let (mut runner, _handle) = runner(&host, policy);
-    assert_eq!(host.fences().await, vec![(vec![held.clone()], since)]);
-    run_until_idle(&mut runner, 10).await;
-    assert!(relay.requests() > 0);
+    assert_eq!(
+        host.fences().await,
+        vec![(vec![held.clone(), retained.clone()], since)]
+    );
+    run_until_idle(&mut runner, 20).await;
     assert!(account.debt(&held, RELAY, requested - 1).is_empty());
+    assert!(account.debt(&retained, RELAY, requested - 1).is_empty());
+    assert_eq!(account.admitted_events(), 1);
     assert!(host.fences().await.is_empty());
     assert_eq!(
         account

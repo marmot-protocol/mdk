@@ -274,43 +274,65 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
     assert_eq!(fixture.limit.stats().max_req_limit_seen, 500);
 }
 
-/// A relay that lists a busy second's ids and then withholds one has not
-/// shown the second unprovable: the sweep ends on a withheld second, not a
-/// saturated one, and asking again under the same caps proves it.
+/// A NIP-77 relay that answers a busy second inconclusively, by listing its
+/// ids and then withholding one or by sending a NEG-MSG the client cannot
+/// parse, has not shown the second unprovable: the sweep ends on an
+/// inconclusive second, not a saturated one, and asking again under the same
+/// caps proves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_withheld_listed_id_is_retried_not_saturated() {
-    let fixture = Fixture::new().await;
-    let (events, wanted, burst) = backlog();
-    fixture.store(&events).await;
-    fixture.limit.withhold_id_fetch_events(1);
-    let relay = fixture.relay();
-    let store = MemoryStore::default();
-    let mut sink = Sink::default();
-    let report = run_sweep(
-        request(range()),
-        &relay,
-        &mut sink,
-        &store,
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(fixture.limit.stats().withheld_id_events, 1);
-    assert_eq!(
-        report.end,
-        SweepEnd::WithheldSecond { second: burst },
-        "{report:?}"
-    );
-    assert_eq!(report.cursor.map(|cursor| cursor.next_since), Some(burst));
-    let report = run_sweep(
-        request(range()),
-        &relay,
-        &mut sink,
-        &store,
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
-    assert_once_in_order(&sink, &wanted);
+async fn an_inconclusive_second_is_retried_not_saturated() {
+    for fault in ["withheld id", "malformed NEG-MSG"] {
+        let fixture = Fixture::new().await;
+        let (events, wanted, burst) = backlog();
+        fixture.store(&events).await;
+        if fault == "withheld id" {
+            fixture.limit.withhold_id_fetch_events(1);
+        } else {
+            fixture.limit.set_neg_fault(NegFault::MalformedReply);
+        }
+        let relay = fixture.relay();
+        let store = MemoryStore::default();
+        let mut sink = Sink::default();
+        let report = run_sweep(
+            request(range()),
+            &relay,
+            &mut sink,
+            &store,
+            &CancellationToken::new(),
+        )
+        .await;
+        let stats = fixture.limit.stats();
+        assert_eq!(
+            (stats.withheld_id_events, stats.malformed_neg_replies > 0),
+            if fault == "withheld id" {
+                (1, false)
+            } else {
+                (0, true)
+            },
+            "{fault}"
+        );
+        assert_eq!(
+            report.end,
+            SweepEnd::InconclusiveSecond { second: burst },
+            "{fault}: {report:?}"
+        );
+        assert_eq!(
+            report.cursor.map(|cursor| cursor.next_since),
+            Some(burst),
+            "{fault}"
+        );
+        fixture.limit.set_neg_fault(NegFault::None);
+        let report = run_sweep(
+            request(range()),
+            &relay,
+            &mut sink,
+            &store,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.end, SweepEnd::Finished, "{fault}: {report:?}");
+        assert_once_in_order(&sink, &wanted);
+    }
 }
 
 /// A relay's full raw page can lose an event at SDK validation. Its 499

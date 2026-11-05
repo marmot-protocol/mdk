@@ -319,21 +319,18 @@ impl<'t> Admission<'t> {
         Ok(usage.events >= bounds.group_events || usage.bytes >= bounds.group_bytes)
     }
 
-    /// The routes whose units hold their group's live frames behind a fence:
-    /// the runner serves them first.
+    /// Every route of each group whose live frames a fence holds: the runner
+    /// serves them first. A route owing older history outside any capture
+    /// still holds the group's shared frontier, so the fence waits on it too.
     pub(super) fn fenced_routes(
         &mut self,
     ) -> StorageResult<BTreeSet<TransportReconciliationRoute>> {
         let mut routes = BTreeSet::new();
         for key in self.fence_groups()? {
             let group = self.group(&key)?;
-            routes.extend(
-                group
-                    .members
-                    .iter()
-                    .filter(|member| member.holds_live_frames().is_some())
-                    .map(|member| member.key.route.clone()),
-            );
+            if group.release_before().is_some() {
+                routes.extend(group.routes.iter().cloned());
+            }
         }
         Ok(routes)
     }

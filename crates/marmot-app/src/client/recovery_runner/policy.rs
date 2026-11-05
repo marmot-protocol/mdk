@@ -79,9 +79,10 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) sweep: SweepPolicy,
     pub(crate) recheck_interval_seconds: u64,
     /// Whether every due unit fetches on its own. Off in a wake-collection
-    /// (`CursorPersistence::Frozen`) process, which fetches only for routes
-    /// whose live frames a fence holds, so the messages that woke it can be
-    /// shown, and otherwise only for an explicit full-history repair, as
+    /// (`CursorPersistence::Frozen`) process, which fetches only for the
+    /// routes of groups whose live frames a fence holds (every route of such
+    /// a group, since they share its frontier), so the messages that woke it
+    /// can be shown, and otherwise only for an explicit full-history repair, as
     /// `authorize_account_recovery` allows there. Other debt (a loss, a
     /// joined group's history, the standing window) waits for an Advance
     /// process.

@@ -82,6 +82,9 @@ pub enum NegFault {
     /// SDK's first-reply timeout nor its idle timeout ends the sync, so the
     /// caller's overall deadline must do so.
     FingerprintLoop,
+    /// Answer every NEG-OPEN with a NEG-MSG that is not hex: an exchange the
+    /// client cannot parse, from a relay that does speak NIP-77.
+    MalformedReply,
 }
 
 /// How a refused REQ is answered.
@@ -226,6 +229,8 @@ pub struct LimitStats {
     pub stalled_frames: usize,
     /// EVENT frames dropped from exact-id REQs by `withhold_id_fetch_events`.
     pub withheld_id_events: usize,
+    /// NEG-OPENs answered by `NegFault::MalformedReply`.
+    pub malformed_neg_replies: usize,
 }
 
 impl LimitStats {
@@ -903,6 +908,16 @@ fn inspect_client_frame(
                     };
                     Verdict::Refuse {
                         reply: serde_json::json!(["NOTICE", notice]).to_string(),
+                        upstream: replaced
+                            .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
+                    }
+                }
+                // No session opens on the relay, so none is counted.
+                None if fault == NegFault::MalformedReply => {
+                    shared.stats.malformed_neg_replies += 1;
+                    shared.refresh(connection);
+                    Verdict::Refuse {
+                        reply: serde_json::json!(["NEG-MSG", id, "zz"]).to_string(),
                         upstream: replaced
                             .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
                     }

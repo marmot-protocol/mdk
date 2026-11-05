@@ -153,7 +153,7 @@ impl RunnerRoute {
 #[derive(Clone, Default)]
 pub(crate) struct PriorityHints {
     /// Groups whose live frames are held behind a fence. Each survey adds
-    /// the routes its own fences hold.
+    /// every route of each group its own fences hold.
     pub(crate) held: BTreeSet<TransportReconciliationRoute>,
     /// Groups with an open conversation window. Each survey adds the routes
     /// whose group has one open.
@@ -752,8 +752,8 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         hints.held.append(&mut survey.fenced);
         hints.window.append(&mut survey.window);
         // A wake-collection process fetches only what its live input waits
-        // on: the units of routes whose frames a fence holds. Other debt waits
-        // for an Advance process or an explicit repair.
+        // on: the units of every route of a group whose frames a fence holds.
+        // Other debt waits for an Advance process or an explicit repair.
         if !self.policy.fetches_unasked && pass.is_none_or(|bound| bound.repair_until.is_none()) {
             survey
                 .candidates

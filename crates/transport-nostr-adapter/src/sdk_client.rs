@@ -5755,12 +5755,43 @@ async fn sync_watching_neg_cap(
     credits: Arc<Semaphore>,
     deadline: tokio::time::Instant,
 ) -> Result<nostr_sdk::relay::SyncSummary, NostrReconciliationFailure> {
+    sync_watching_neg_cap_detailed(relay, filter, items, options, credits, deadline)
+        .await
+        .map_err(|error| error.failure)
+}
+
+/// A failed NIP-77 sync: its reconciliation class, and whether the SDK
+/// reported a protocol error. A malformed exchange is not the relay saying it
+/// lacks NIP-77, and a later attempt may complete it.
+struct NegSyncError {
+    failure: NostrReconciliationFailure,
+    malformed: bool,
+}
+
+impl From<NostrReconciliationFailure> for NegSyncError {
+    fn from(failure: NostrReconciliationFailure) -> Self {
+        Self {
+            failure,
+            malformed: false,
+        }
+    }
+}
+
+/// As [`sync_watching_neg_cap`], keeping a protocol error apart.
+async fn sync_watching_neg_cap_detailed(
+    relay: &Relay,
+    filter: Filter,
+    items: Vec<(EventId, NostrTimestamp)>,
+    options: SyncOptions,
+    credits: Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+) -> Result<nostr_sdk::relay::SyncSummary, NegSyncError> {
     let _permit = timeout_at(deadline, credits.acquire_owned())
         .await
         .map_err(|_| NostrReconciliationFailure::RouteTimeout)?
         .map_err(|_| NostrReconciliationFailure::LocalError)?;
     if tokio::time::Instant::now() >= deadline {
-        return Err(NostrReconciliationFailure::RouteTimeout);
+        return Err(NostrReconciliationFailure::RouteTimeout.into());
     }
     // Declare the SDK future after the permit: on cancellation it drops first,
     // spawning SyncCleanup's async close task before releasing the credit.
@@ -5788,7 +5819,10 @@ async fn sync_watching_neg_cap(
             }
         }
     }
-    result.map_err(|error| sync_failure(&error, cap_notice))
+    result.map_err(|error| NegSyncError {
+        failure: sync_failure(&error, cap_notice),
+        malformed: matches!(error.kind(), SdkErrorKind::Protocol),
+    })
 }
 
 /// The time-sliced sweep's per-endpoint NEG credit: the same one
@@ -5828,29 +5862,51 @@ pub(crate) async fn neg_sync_dry_run(
 ) -> Result<NegCompared, crate::sweep::NegFailure> {
     use crate::sweep::{ClosedReason, NegFailure, UnreachableKind};
     let local = items.len();
-    match sync_watching_neg_cap(relay, filter, items, options, credits, deadline).await {
+    let failure = match sync_watching_neg_cap_detailed(
+        relay, filter, items, options, credits, deadline,
+    )
+    .await
+    {
         // Every relay item matches a local one or is missing locally.
-        Ok(summary) => Ok(NegCompared {
-            relay_set: local.saturating_sub(summary.local.len()) + summary.remote.len(),
-            remote: summary.remote,
-        }),
-        Err(NostrReconciliationFailure::NegErr(category)) => {
-            Err(NegFailure::Closed(ClosedReason(category)))
+        Ok(summary) => {
+            return Ok(NegCompared {
+                relay_set: local.saturating_sub(summary.local.len()) + summary.remote.len(),
+                remote: summary.remote,
+            });
         }
+        // A malformed exchange proved nothing this time; it is not a
+        // relay without NIP-77.
+        Err(NegSyncError {
+            malformed: true, ..
+        }) => return Err(NegFailure::Inconclusive),
+        Err(NegSyncError { failure, .. }) => failure,
+    };
+    Err(match failure {
+        NostrReconciliationFailure::NegErr(category) => NegFailure::Closed(ClosedReason(category)),
         // The cap NOTICE is a transient refusal, waited out like a rate limit.
-        Err(NostrReconciliationFailure::NegCapNotice) => Err(NegFailure::Closed(ClosedReason(
-            Some(TransportEndpointRejectionCategory::RateLimited),
+        NostrReconciliationFailure::NegCapNotice => NegFailure::Closed(ClosedReason(Some(
+            TransportEndpointRejectionCategory::RateLimited,
         ))),
-        Err(
-            NostrReconciliationFailure::FirstReplyTimeout
-            | NostrReconciliationFailure::RouteTimeout,
-        ) => Err(NegFailure::Unreachable(UnreachableKind::TimedOut)),
-        Err(NostrReconciliationFailure::NotOperational | NostrReconciliationFailure::NotInPool) => {
-            Err(NegFailure::Unreachable(UnreachableKind::Disconnected))
+        NostrReconciliationFailure::FirstReplyTimeout
+        | NostrReconciliationFailure::RouteTimeout => {
+            NegFailure::Unreachable(UnreachableKind::TimedOut)
         }
-        Err(NostrReconciliationFailure::LocalError) => Err(NegFailure::Local),
-        Err(_) => Err(NegFailure::Unproven),
-    }
+        NostrReconciliationFailure::NotOperational | NostrReconciliationFailure::NotInPool => {
+            NegFailure::Unreachable(UnreachableKind::Disconnected)
+        }
+        NostrReconciliationFailure::LocalError => NegFailure::Local,
+        // Only the relay's own word that it lacks NIP-77 leaves the second
+        // unproven; with a protocol error kept apart above, that is what
+        // remains of this class.
+        NostrReconciliationFailure::NegentropyUnsupported => NegFailure::Unproven,
+        // No NIP-77 sync ends in these. Any that did proved nothing this
+        // time, and a later attempt may complete it.
+        NostrReconciliationFailure::LimitReached
+        | NostrReconciliationFailure::IdFetchRefused
+        | NostrReconciliationFailure::UnrequestedEvent
+        | NostrReconciliationFailure::Withheld
+        | NostrReconciliationFailure::PassLimit => NegFailure::Inconclusive,
+    })
 }
 
 fn is_neg_cap_notice(notification: &nostr_sdk::relay::RelayNotification) -> bool {
