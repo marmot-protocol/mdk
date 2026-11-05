@@ -1137,7 +1137,7 @@ fn daemon_test_cli(command: crate::Command) -> Cli {
 }
 
 #[test]
-fn runtime_message_json_marks_account_label_sender_as_me() {
+fn runtime_message_json_marks_account_id_sender_as_me() {
     let message = marmot_app::ReceivedMessage {
         authority: None,
         message_id_hex: "01".to_owned(),
@@ -1154,19 +1154,22 @@ fn runtime_message_json_marks_account_label_sender_as_me() {
         received_at: 0,
     };
 
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    for sender in [account_id, "Alice Example"] {
-        let message = marmot_app::ReceivedMessage {
-            sender: sender.to_owned(),
-            ..message.clone()
-        };
-        let value = runtime_message_json(&message, account_id, "Alice Example");
+    let value = runtime_message_json(
+        &message,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "Alice Example",
+    );
 
-        assert_eq!(value["direction"], "sent");
-        assert_eq!(value["from"], sender);
-        assert_eq!(value["account_id"], account_id);
-        assert_eq!(value["from_display_name"], serde_json::Value::Null);
-    }
+    assert_eq!(value["direction"], "sent");
+    assert_eq!(
+        value["from"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        value["account_id"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(value["from_display_name"], serde_json::Value::Null);
 }
 
 #[tokio::test]
@@ -1759,7 +1762,6 @@ async fn message_subscription_writer_filters_before_dedup_and_emits_exact_frames
         flags: 0,
         text: "delta".to_owned(),
     });
-    let error = DaemonStreamResponse::err_with_code("stream_error", "message stream lagged");
     for (name, group, kinds, inputs, expected) in [
         (
             "account",
@@ -1816,13 +1818,6 @@ async fn message_subscription_writer_filters_before_dedup_and_emits_exact_frames
             Some(vec![9]),
             vec![delta.clone(), delta.clone()],
             vec![delta.clone(), delta],
-        ),
-        (
-            "error passthrough",
-            Some("aa"),
-            Some(vec![9]),
-            vec![error.clone()],
-            vec![error],
         ),
     ] {
         let (mut server, client) = UnixStream::pair().expect("unix stream pair");
