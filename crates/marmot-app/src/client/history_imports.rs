@@ -7,7 +7,7 @@
 //!   read: storage keeps the roster's names for this connection only, and
 //!   this device gives it them whenever it reads the roster for the linked
 //!   devices, each time those may have changed, and before an import while
-//!   that change is not yet announced. A name is empty for a device that has
+//!   that change is not yet announced or a previous refresh failed. A name is empty for a device that has
 //!   none, is no longer on the roster, or before this device first read the
 //!   roster; a host then says "another device".
 //! - [`AppClient::chat_history_imports`] lists each held chat whose history
@@ -93,11 +93,13 @@ impl AppClient {
 
     /// Give storage the roster's device names, so imported rows name their
     /// source. Called whenever the linked devices may have changed, and by
-    /// an import before that change is announced. Nothing while device
+    /// an import before that change is announced. Failed reads or writes
+    /// stay due after the change event is drained. Nothing while device
     /// groups are off; no names while no device group is trusted; a roster
     /// that can't be read keeps the names given last.
-    pub(crate) fn refresh_device_labels(&mut self) {
-        if !self.app.device_groups_enabled() {
+    pub(crate) fn refresh_device_labels(&mut self, linked_devices_changed: bool) {
+        self.device_labels_refresh_due |= linked_devices_changed;
+        if !self.app.device_groups_enabled() || !self.device_labels_refresh_due {
             return;
         }
         match self.trusted_device_roster() {
@@ -112,7 +114,7 @@ impl AppClient {
     }
 
     /// Give storage the device names in `roster`, or none without one.
-    pub(crate) fn give_device_labels(&self, roster: Option<&DeviceRosterV1>) {
+    pub(crate) fn give_device_labels(&mut self, roster: Option<&DeviceRosterV1>) {
         let labels: Vec<(DeviceSlotId, String)> = roster
             .map(|roster| {
                 roster
@@ -126,6 +128,13 @@ impl AppClient {
             .app
             .account_storage(&self.state.label)
             .and_then(|storage| Ok(storage.app_storage().set_device_labels(&labels)?));
+        // The latest import answer need not change when older timeline rows
+        // acquire new names. Reuse the roster's existing row-refresh cue once
+        // deferred work succeeds, including after its original cue was drained.
+        if self.device_labels_refresh_due && set.is_ok() {
+            self.linked_devices_changed = true;
+        }
+        self.device_labels_refresh_due = set.is_err();
         if let Err(error) = set {
             tracing::warn!(
                 target: TRACE_TARGET,

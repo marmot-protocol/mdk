@@ -1099,6 +1099,7 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         laptop.linked_devices().unwrap(),
         vec![new_device(true), founder(false)]
     );
+    laptop.take_linked_devices_changed();
 
     // Two more devices, linked earlier than both, with every field set.
     let phone_slot_bytes: [u8; 32] = hex::decode(&phone_slot).unwrap().try_into().unwrap();
