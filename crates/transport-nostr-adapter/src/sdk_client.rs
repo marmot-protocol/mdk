@@ -11928,6 +11928,44 @@ mod tests {
         }
     }
 
+    /// One publication reports every attempt's exposure, including an earlier
+    /// unknown reply hidden by a later definite refusal from the same relay.
+    #[tokio::test]
+    async fn an_ambiguous_attempt_survives_a_later_terminal_rejection() {
+        let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
+            Arc::new(AtomicBool::new(true)),
+            vec!["error: publication unavailable", "invalid: bad event"],
+        )
+        .await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let error = sdk
+            .publish_event(
+                std::slice::from_ref(&endpoint),
+                &signed_group_event_dto(),
+                1,
+            )
+            .await
+            .expect_err("the relay never acknowledged the publication");
+        let failures = error.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].endpoint, endpoint);
+        assert_eq!(
+            attempts.lock().await.len(),
+            2,
+            "the unknown reply is retried, then the definite refusal stops sending"
+        );
+        assert_eq!(
+            failures[0].rejection_category,
+            Some(TransportEndpointRejectionCategory::Invalid)
+        );
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::PossiblyExposed,
+            "a later refusal cannot rule out exposure during an earlier attempt"
+        );
+        sdk.client().shutdown().await;
+    }
+
     #[tokio::test]
     async fn rate_limit_reuses_socket() {
         let limited = Arc::new(AtomicBool::new(true));
@@ -13312,6 +13350,19 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<tokio::time::Instant>>>,
     ) {
+        counting_publish_relay_rejection_sequence(limited, vec![reason]).await
+    }
+
+    async fn counting_publish_relay_rejection_sequence(
+        limited: Arc<AtomicBool>,
+        reasons: Vec<&'static str>,
+    ) -> (
+        TransportEndpoint,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<tokio::time::Instant>>>,
+    ) {
+        assert!(!reasons.is_empty());
+        let reasons = Arc::new(reasons);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -13323,6 +13374,7 @@ mod tests {
                 let connections = server_connections.clone();
                 let attempts = server_attempts.clone();
                 let limited = limited.clone();
+                let reasons = reasons.clone();
                 tokio::spawn(async move {
                     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -13338,9 +13390,18 @@ mod tests {
                         if value[0] != "EVENT" {
                             continue;
                         }
-                        attempts.lock().await.push(tokio::time::Instant::now());
+                        let index = {
+                            let mut attempts = attempts.lock().await;
+                            let index = attempts.len();
+                            attempts.push(tokio::time::Instant::now());
+                            index
+                        };
                         let rejected = limited.load(Ordering::Relaxed);
-                        let reason = if rejected { reason } else { "" };
+                        let reason = if rejected {
+                            reasons[index.min(reasons.len() - 1)]
+                        } else {
+                            ""
+                        };
                         let response = serde_json::json!(["OK", value[1]["id"], !rejected, reason]);
                         if socket.send(response.to_string().into()).await.is_err() {
                             return;
