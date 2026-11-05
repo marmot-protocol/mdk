@@ -197,6 +197,40 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backup_bindings_preserve_the_gate_tokens_and_observer_lifetime() {
+        // The query is already held at real I/O. Check the binding's wait
+        // before release, but settle the query before a failing assertion.
+        async fn settle_held_pass(kit: &Marmot, account: &str, policy: &HeldPointer) {
+            let mut completion = Box::pin(kit.run_due_backup_pass(account.into()));
+            let mut before_release = futures::poll!(&mut completion);
+            if before_release.is_pending() {
+                kit.backup_settings(account.into()).await.unwrap();
+                before_release = futures::poll!(&mut completion);
+            }
+            let held = before_release.is_pending();
+            policy.release.notify_one();
+            let outcome = match before_release {
+                std::task::Poll::Ready(outcome) => outcome,
+                std::task::Poll::Pending => {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), completion)
+                        .await
+                        .expect("the released pass settles")
+                }
+            };
+            if !held {
+                // Cleanup for an early-return regression in the thin wrapper.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    kit.runtime.run_due_backup_pass(account),
+                )
+                .await;
+            }
+            assert!(held, "the binding returned before the held pass settled");
+            assert_eq!(
+                outcome.unwrap(),
+                BackgroundBackupOutcomeFfi::FinishedAttempt
+            );
+        }
+
         let policy = HeldPointer::default();
         let relay = LocalRelay::new(RelayBuilder::default().query_policy(policy.clone()));
         relay.run().await.unwrap();
@@ -205,10 +239,14 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay_url = relay.url().await.to_string();
+        let mut deployment = marmot_app::MarmotDeployment::white_noise();
+        // A real pass still reads its pointer, without uploading any archive.
+        deployment.new_group_media_endpoints.clear();
         let app = marmot_app::MarmotApp::with_relay_and_config(
             root.path(),
             relay_url.clone(),
             marmot_app::MarmotAppConfig::white_noise()
+                .with_deployment(deployment)
                 .with_allow_loopback_relay_endpoints(true)
                 .with_directory_relay_urls(vec![relay_url])
                 .with_dev_device_groups(true),
@@ -240,6 +278,10 @@ mod tests {
         let words = match kit.begin_recovery_words("alice".into()).await {
             Ok(words) => words,
             Err(MarmotKitError::Runtime { details }) if details.contains("roster_unsupported") => {
+                assert!(
+                    !cfg!(feature = "dev-device-groups"),
+                    "the explicit dev build must exercise active backup forwarding"
+                );
                 // A default dependency build cannot enable the experimental
                 // core gate through this wrapper. CI's existing app-policy
                 // feature union takes the active-operation branch below.
@@ -280,6 +322,66 @@ mod tests {
             BackgroundBackupOutcomeFfi::NotStarted,
             "the reported closed facts gate background work, not manual restore"
         );
+
+        kit.set_runtime_backup_background_conditions(true, true)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            policy.entered.notified(),
+        )
+        .await
+        .expect("runtime facts reach the real pointer-reading pass");
+        kit.set_backup_background_conditions("alice".into(), false, false)
+            .await
+            .unwrap();
+        settle_held_pass(&kit, "alice", &policy).await;
+
+        // A fresh account's enabled backup remains due: a closing report must
+        // reach the runtime, rather than merely report NotStarted after Alice
+        // has already moved her next scheduled pass into the future.
+        marmot_account::AccountHome::open(root.path())
+            .create_account("bob")
+            .unwrap();
+        let bob_words = kit.begin_recovery_words("bob".into()).await.unwrap();
+        let bob_answers = bob_words
+            .confirm_positions
+            .iter()
+            .map(|at| bob_words.words[*at as usize - 1].clone())
+            .collect();
+        kit.confirm_recovery_words("bob".into(), bob_answers)
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let completion = kit.run_due_backup_pass("bob".into());
+            tokio::pin!(completion);
+            tokio::select! {
+                outcome = &mut completion => outcome,
+                () = policy.entered.notified() => {
+                    // Settle a wrongly admitted pass before asserting below.
+                    policy.release.notify_one();
+                    completion.await
+                }
+            }
+        })
+        .await
+        .expect("closed admission answers, or a wrong pass can be released")
+        .unwrap();
+        assert_eq!(closed, BackgroundBackupOutcomeFfi::NotStarted);
+        kit.set_backup_background_conditions("bob".into(), true, true)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            policy.entered.notified(),
+        )
+        .await
+        .expect("compatibility facts reach the real pointer-reading pass");
+        settle_held_pass(&kit, "bob", &policy).await;
+        kit.set_runtime_backup_background_conditions(false, false)
+            .await
+            .unwrap();
+
         let phrase = words.words.join(" ");
         let first = kit
             .begin_backup_restore("alice".into(), phrase.clone())
