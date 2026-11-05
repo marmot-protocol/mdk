@@ -130,7 +130,7 @@ mod tests {
         let _guard = audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let before = audit::live_allocations();
-        for anchor in [
+        for (expected, anchor) in [
             ChatListAnchorOutcomeFfi::Top,
             ChatListAnchorOutcomeFfi::Retained {
                 group_id_hex: "aa".into(),
@@ -141,7 +141,10 @@ mod tests {
                 index: 1,
             },
             ChatListAnchorOutcomeFfi::Reset,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let snapshot = ChatListWindowSnapshotFfi {
                 subscription_generation: "generation".into(),
                 sequence: 42,
@@ -154,6 +157,39 @@ mod tests {
             let mirror: MarmotChatListWindowSnapshot = snapshot.into();
             assert_eq!(mirror.sequence, 42);
             assert_eq!(mirror.view, MarmotChatListView::Unread);
+            assert!(mirror.has_more_before);
+            assert!(!mirror.has_more_after);
+            match (expected, &mirror.anchor) {
+                (0, MarmotChatListAnchorOutcome::Top) | (3, MarmotChatListAnchorOutcome::Reset) => {
+                }
+                (
+                    1,
+                    MarmotChatListAnchorOutcome::Retained {
+                        group_id_hex,
+                        index,
+                    },
+                ) => {
+                    assert_eq!(*index, 0);
+                    assert_eq!(
+                        unsafe { std::ffi::CStr::from_ptr(*group_id_hex) }.to_bytes(),
+                        b"aa"
+                    );
+                }
+                (
+                    2,
+                    MarmotChatListAnchorOutcome::Recovered {
+                        group_id_hex,
+                        index,
+                    },
+                ) => {
+                    assert_eq!(*index, 1);
+                    assert_eq!(
+                        unsafe { std::ffi::CStr::from_ptr(*group_id_hex) }.to_bytes(),
+                        b"bb"
+                    );
+                }
+                _ => panic!("anchor tag does not match source row {expected}"),
+            }
             unsafe {
                 marmot_chat_list_window_snapshot_free(boxed(mirror));
             }
@@ -193,6 +229,30 @@ mod tests {
         assert!(
             matches!(unsafe{&(*mirror.accounts).state}, MarmotAccountAttentionState::Ready {total} if total.unread_count==u64::MAX && total.unread_mention_count==3)
         );
+        for (expected, entry) in
+            unsafe { std::slice::from_raw_parts(mirror.accounts, mirror.accounts_len) }
+                .iter()
+                .enumerate()
+        {
+            match (expected, &entry.state) {
+                (0, MarmotAccountAttentionState::Ready { total }) => {
+                    assert_eq!(total.unread_count, u64::MAX);
+                    assert_eq!(total.unread_mention_count, 3);
+                    assert_eq!(total.unread_conversations, 2);
+                    assert_eq!(total.attention_only_conversations, 1);
+                }
+                (1, MarmotAccountAttentionState::Unavailable { reason }) => {
+                    assert_eq!(*reason, MarmotAccountAttentionUnavailable::Preparing)
+                }
+                (2, MarmotAccountAttentionState::Unavailable { reason }) => {
+                    assert_eq!(*reason, MarmotAccountAttentionUnavailable::ReadFailed)
+                }
+                (3, MarmotAccountAttentionState::Unavailable { reason }) => {
+                    assert_eq!(*reason, MarmotAccountAttentionUnavailable::Resetting)
+                }
+                _ => panic!("availability tag does not match source row {expected}"),
+            }
+        }
         unsafe {
             marmot_account_attention_snapshot_free(boxed(mirror));
             marmot_account_attention_snapshot_free(std::ptr::null_mut());

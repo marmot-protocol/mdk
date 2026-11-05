@@ -99,6 +99,22 @@ across the boundary. That deserves its own focused design + tests rather than a 
   not just a changelog entry. Follow `release.md#release-documentation` and keep the matching
   header/library requirement explicit. Source support is not proof of artifact or client validation.
 
+## Test ownership
+
+- Keep shared command preflight proof at the real valid-state archive owner in `tests/out_pointer_preflight.rs`.
+  The generated `c_cmd!` record wrappers share that guard; per-export NULL smokes do not each prove mutation ordering.
+  The queued-read owner must retain an actual queued item and an independently identified produced fence; an empty
+  stream timeout or constructor success alone does not prove that a failed output delivery preserves an item.
+- `subscriptions.rs` owns the generic callback pump's borrowed nested payload, deep-free after callback return,
+  natural-close terminal NULL, and cancellation of a receive that actually returned `Pending`. Clearing a callback
+  requests cancellation; observe task completion separately before reclaiming callback context. Do not infer receive
+  entry from a spawned thread or add production observation hooks for test ordering.
+- Keep recovery-word root erasure proof through the actual public deep-free dispatch. A private test allocator may
+  inspect selected still-live buffers immediately before their real deallocator; never read freed memory. Detached
+  helper zeroization and balanced allocation counts alone do not prove root dispatch erases the retained words.
+- Tagged DTO tables must fail when a source row maps to the wrong tag, then assert its literal payload before free.
+  Conditional payload checks that silently skip a different variant do not own the conversion contract.
+
 ## Verification
 
 ```sh

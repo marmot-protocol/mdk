@@ -3929,6 +3929,187 @@ mod identity_pointer_tests {
     }
 
     #[test]
+    fn shared_delivery_and_borrowed_shapes_preserve_values_and_ownership() {
+        use super::*;
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        unsafe {
+            let bytes = [0u8, 255, 7];
+            assert_eq!(byte_array(bytes.as_ptr(), bytes.len()), Ok(bytes.to_vec()));
+            assert_eq!(byte_array(bytes.as_ptr(), 0), Ok(vec![]));
+            assert_eq!(byte_array(std::ptr::null(), 0), Ok(vec![]));
+            assert_eq!(
+                byte_array(std::ptr::null(), 1),
+                Err(MarmotStatus::NullPointer)
+            );
+            let numbers = [1u64, u64::MAX];
+            assert_eq!(
+                struct_array(numbers.as_ptr(), numbers.len(), |value| Ok(*value)),
+                Ok(numbers.to_vec())
+            );
+            assert_eq!(
+                struct_array::<u64, _, u64>(std::ptr::null(), 0, |value| Ok(*value)),
+                Ok(vec![])
+            );
+            assert_eq!(
+                struct_array::<u64, _, u64>(std::ptr::null(), 1, |value| Ok(*value)),
+                Err(MarmotStatus::NullPointer)
+            );
+            assert_eq!(
+                struct_array(numbers.as_ptr(), numbers.len(), |_| Err::<u64, _>(
+                    MarmotStatus::InvalidArgument
+                )),
+                Err(MarmotStatus::InvalidArgument)
+            );
+            let mut root: *mut MarmotStringList = std::ptr::null_mut();
+            assert_eq!(
+                deliver(Ok(vec!["nested 🦀".to_owned()]), &mut root),
+                MarmotStatus::Ok
+            );
+            assert!(!root.is_null());
+            assert_eq!((*root).len, 1);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*(*root).items).to_str().unwrap(),
+                "nested 🦀"
+            );
+            crate::types::common::marmot_string_list_free(root);
+            assert_eq!(
+                deliver::<_, MarmotStringList>(
+                    Ok(vec!["discarded".to_owned()]),
+                    std::ptr::null_mut()
+                ),
+                MarmotStatus::NullPointer
+            );
+            root = std::ptr::dangling_mut();
+            assert_eq!(
+                deliver_opt::<Vec<String>, _>(Ok(None), &mut root),
+                MarmotStatus::Ok
+            );
+            assert!(root.is_null());
+            assert_eq!(
+                deliver_opt(Ok(Some(vec!["present".to_owned()])), &mut root),
+                MarmotStatus::Ok
+            );
+            assert_eq!((*root).len, 1);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*(*root).items).to_bytes(),
+                b"present"
+            );
+            crate::types::common::marmot_string_list_free(root);
+            assert_eq!(
+                deliver_opt::<_, MarmotStringList>(
+                    Ok(Some(vec!["discarded".to_owned()])),
+                    std::ptr::null_mut()
+                ),
+                MarmotStatus::NullPointer
+            );
+            let mut text = std::ptr::null_mut();
+            assert_eq!(
+                deliver_string(Ok("owned 🦀".into()), &mut text),
+                MarmotStatus::Ok
+            );
+            assert_eq!(std::ffi::CStr::from_ptr(text).to_str().unwrap(), "owned 🦀");
+            crate::memory::free_c_string(text);
+            assert_eq!(
+                deliver_string(Ok("discarded".into()), std::ptr::null_mut()),
+                MarmotStatus::NullPointer
+            );
+            for value in [None, Some(""), Some("optional")] {
+                text = std::ptr::dangling_mut();
+                assert_eq!(
+                    deliver_opt_string(Ok(value.map(str::to_owned)), &mut text),
+                    MarmotStatus::Ok
+                );
+                if let Some(expected) = value {
+                    assert!(!text.is_null());
+                    assert_eq!(std::ffi::CStr::from_ptr(text).to_str().unwrap(), expected);
+                } else {
+                    assert!(text.is_null());
+                }
+                crate::memory::free_c_string(text);
+            }
+            assert_eq!(
+                deliver_opt_string(Ok(Some("discarded".into())), std::ptr::null_mut()),
+                MarmotStatus::NullPointer
+            );
+            let mut data = std::ptr::null_mut();
+            let mut len = usize::MAX;
+            assert_eq!(
+                deliver_bytes(Ok(bytes.to_vec()), &mut data, &mut len),
+                MarmotStatus::Ok
+            );
+            assert_eq!(std::slice::from_raw_parts(data, len), bytes);
+            crate::marmot_bytes_free(data, len);
+            assert_eq!(
+                deliver_bytes(Ok(vec![]), &mut data, &mut len),
+                MarmotStatus::Ok
+            );
+            assert!(data.is_null());
+            assert_eq!(len, 0);
+            assert_eq!(
+                deliver_bytes(Ok(bytes.to_vec()), std::ptr::null_mut(), &mut len),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(
+                deliver_bytes(Ok(bytes.to_vec()), &mut data, std::ptr::null_mut()),
+                MarmotStatus::NullPointer
+            );
+            let mut scalar = 0u64;
+            assert_eq!(deliver_scalar(Ok(u64::MAX), &mut scalar), MarmotStatus::Ok);
+            assert_eq!(scalar, u64::MAX);
+            assert_eq!(
+                deliver_scalar(Ok(7u64), std::ptr::null_mut()),
+                MarmotStatus::NullPointer
+            );
+            let mut state = crate::types::account::MarmotSendAcceptDisposition::Published;
+            assert_eq!(
+                deliver_enum(
+                    Ok(marmot_uniffi::conversions::SendAcceptDispositionFfi::CompletionUnknown),
+                    &mut state
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                state,
+                crate::types::account::MarmotSendAcceptDisposition::CompletionUnknown
+            );
+            assert_eq!(deliver_unit(Ok(())), MarmotStatus::Ok);
+            let error = || MarmotKitError::GroupInviteNotPending;
+            assert_eq!(
+                deliver::<Vec<String>, MarmotStringList>(Err(error()), std::ptr::null_mut()),
+                MarmotStatus::GroupInviteNotPending
+            );
+            assert_eq!(
+                deliver_opt::<Vec<String>, MarmotStringList>(Err(error()), std::ptr::null_mut()),
+                MarmotStatus::GroupInviteNotPending
+            );
+            assert_eq!(
+                deliver_scalar::<u64>(Err(error()), std::ptr::null_mut()),
+                MarmotStatus::GroupInviteNotPending
+            );
+            assert_eq!(
+                deliver_string(Err(error()), std::ptr::null_mut()),
+                MarmotStatus::GroupInviteNotPending
+            );
+            assert_eq!(
+                deliver_opt_string(Err(error()), std::ptr::null_mut()),
+                MarmotStatus::GroupInviteNotPending
+            );
+            assert_eq!(
+                deliver_bytes(Err(error()), std::ptr::null_mut(), std::ptr::null_mut()),
+                MarmotStatus::GroupInviteNotPending
+            );
+            assert_eq!(
+                deliver_unit(Err(error())),
+                MarmotStatus::GroupInviteNotPending
+            );
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
+
+    #[test]
     fn deliver_plain_opt_string_balances_owned_output() {
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
@@ -3940,7 +4121,31 @@ mod identity_pointer_tests {
             MarmotStatus::Ok
         );
         assert!(!out.is_null());
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes(),
+            b"Loyal Crane"
+        );
         unsafe { crate::memory::free_c_string(out) };
+        out = std::ptr::dangling_mut();
+        assert_eq!(
+            super::deliver_plain_opt_string(None, &raw mut out),
+            MarmotStatus::Ok
+        );
+        assert!(out.is_null(), "absence is a NULL output");
+        assert_eq!(
+            super::deliver_plain_opt_string(Some(String::new()), &raw mut out),
+            MarmotStatus::Ok
+        );
+        assert!(
+            !out.is_null(),
+            "an empty present value still owns a C string"
+        );
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes(), b"");
+        unsafe { crate::memory::free_c_string(out) };
+        assert_eq!(
+            super::deliver_plain_opt_string(Some("discarded".into()), std::ptr::null_mut()),
+            MarmotStatus::NullPointer
+        );
 
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), start);

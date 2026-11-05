@@ -646,6 +646,18 @@ mod tests {
             110,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
+        assert_eq!(MarmotStatus::GroupInviteNotPending as i32, 61);
+        assert_eq!(MarmotStatus::MissingMemberInboxRoute as i32, 62);
+        assert_eq!(
+            status_from_error(&MarmotKitError::GroupInviteNotPending),
+            MarmotStatus::GroupInviteNotPending
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MissingMemberInboxRoute {
+                account: "a".into()
+            }),
+            MarmotStatus::MissingMemberInboxRoute
+        );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
         assert_eq!(
             status_from_error(&MarmotKitError::ModerationReportingNotConfigured) as i32,
@@ -760,5 +772,34 @@ mod tests {
             })
             .collect();
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn last_error_details_are_consumed_only_on_the_calling_thread() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        set_last_error("host-thread-detail");
+        let threads: Vec<_> = ["worker-one-detail", "worker-two-detail"]
+            .into_iter()
+            .map(|detail| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    set_last_error(detail);
+                    barrier.wait();
+                    let own = take_last_error();
+                    let consumed = take_last_error();
+                    (detail, own, consumed)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let host = take_last_error();
+        let host_consumed = take_last_error();
+        for thread in threads {
+            let (expected, own, consumed) = thread.join().unwrap();
+            assert_eq!(own.as_deref(), Some(expected));
+            assert!(consumed.is_none());
+        }
+        assert_eq!(host.as_deref(), Some("host-thread-detail"));
+        assert!(host_consumed.is_none());
     }
 }

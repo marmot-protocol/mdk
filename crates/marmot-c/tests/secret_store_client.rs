@@ -210,6 +210,47 @@ fn client_name_constructor_validates_arguments_without_taking_store_ownership() 
     };
     assert_eq!(status, MarmotStatus::InvalidArgument);
     assert!(client.is_null());
+
+    unsafe extern "C" fn count_destroy(data: *mut c_void) {
+        unsafe { &*(data as *const std::sync::atomic::AtomicUsize) }.fetch_add(1, Ordering::SeqCst);
+    }
+    let destroyed = std::sync::atomic::AtomicUsize::new(0);
+    let store = MarmotSecretStore {
+        user_data: (&destroyed as *const std::sync::atomic::AtomicUsize)
+            .cast_mut()
+            .cast(),
+        has_secret_for_label: Some(has),
+        has_secret_for_account_id: Some(has),
+        write_secret: Some(write_secret),
+        load_secret: Some(load_secret),
+        remove_secret: Some(remove_secret),
+        free_secret: Some(free_secret),
+        destroy: Some(count_destroy),
+    };
+    client = std::ptr::dangling_mut();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_client_name(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            name.as_ptr(),
+            marmot_c::types::notification::MarmotCursorPersistence::Advance as u32,
+            &store,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
+            &raw mut client,
+        )
+    };
+    assert_eq!(
+        status,
+        MarmotStatus::NullPointer,
+        "valid cursor reaches the later required root guard"
+    );
+    assert!(client.is_null());
+    assert_eq!(
+        destroyed.load(Ordering::SeqCst),
+        0,
+        "accepted vtable remains host-owned after failure"
+    );
 }
 
 #[test]
