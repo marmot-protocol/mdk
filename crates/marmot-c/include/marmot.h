@@ -12017,6 +12017,39 @@ MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *clie
                                                  struct MarmotNativeStartupSnapshot **out);
 
 /**
+ * Select all: every chat ID in `view` (a MarmotChatListView discriminant), in
+ * display order, including chats beyond any open window; the count is the
+ * list length. Returns `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY`, never a
+ * partial list, while base rows are still being prepared; retry later. Free
+ * with `marmot_string_list_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, and out writable.
+ */
+MarmotStatus marmot_chat_list_ids(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  uint32_t view,
+                                  struct MarmotStringList **out);
+
+/**
+ * The subset of `group_ids` still in `view`, in the caller's order with
+ * duplicates dropped. Only removes; chats that joined the view since are never
+ * added. Call it right before a bulk action, then run the existing per-chat
+ * commands, which still check their own preconditions. Free with
+ * `marmot_string_list_free`.
+ *
+ * # Safety
+ * The client must be live, `group_ids` must hold `group_ids_len` valid
+ * strings (or be NULL with length 0), and out must be writable.
+ */
+MarmotStatus marmot_revalidate_chat_list_ids(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             uint32_t view,
+                                             const char *const *group_ids,
+                                             uintptr_t group_ids_len,
+                                             struct MarmotStringList **out);
+
+/**
  * White Noise's deployment, the one White Noise's clients pass to every
  * constructor. Free with marmot_deployment_free; a client constructed with
  * it keeps its own copy.

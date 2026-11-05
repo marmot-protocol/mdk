@@ -9,6 +9,12 @@
 
 ### Breaking changes
 
+- Replace the unused stateful chat-list selection snapshot with stateless `chat_list_ids(view)` and
+  `revalidate_chat_list_ids(view, ids)` (mdk#2983). Remove `ChatListSelectionSnapshot`,
+  `chat_list_selection_snapshot`, `chat_list_selection_count`, `chat_list_selection_page`,
+  `revalidate_chat_list_selection` and the `InvalidPage`/`StaleSelection` error cases; no caller used them.
+  No schema, wire or host-binding format changes.
+
 - Remove the experimental `SqliteAppStorage::next_received_private_key_package` and
   `take_received_private_key_package` conveniences. Rust source/nightly consumers should read
   `received_private_key_packages_from`, validate their selected record, then call

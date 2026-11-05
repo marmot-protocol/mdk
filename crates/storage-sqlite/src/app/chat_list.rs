@@ -27,7 +27,7 @@ pub use pages::{
     ChatListView,
 };
 use rusqlite::{Connection, OptionalExtension, Params, params};
-pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
+pub use selection::ChatListSelectionError;
 use serde::{Deserialize, Serialize};
 pub use small_state::{
     MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateBroadcast, SmallStateItem,

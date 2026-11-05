@@ -1119,6 +1119,30 @@ Bind to one account/view. None defaults to 50; explicit sizes must be 1–100.
 
 [Source](src/commands/chat_window.rs#L10)
 
+### `Marmot::chat_list_ids`
+
+**Current.**
+
+```rust
+pub async fn chat_list_ids( &self, account_ref: String, view: ChatListViewFfi, ) -> Result<Vec<String>, MarmotKitError>
+```
+
+Select all: every chat ID in the view, in display order, including chats beyond the open window. The count is the list length. Use it for "select all" and bulk-action counts instead of the window's rows, which are bounded. While base rows are still being prepared it fails with `ChatPresentationNotReady` rather than returning a partial list; keep the action disabled and retry. The list is a snapshot: keep it as host checkbox state and call `revalidate_chat_list_ids` before acting.
+
+[Source](src/commands/chat_window.rs#L26)
+
+### `Marmot::revalidate_chat_list_ids`
+
+**Current.**
+
+```rust
+pub async fn revalidate_chat_list_ids( &self, account_ref: String, view: ChatListViewFfi, group_ids: Vec<String>, ) -> Result<Vec<String>, MarmotKitError>
+```
+
+The subset of a host selection still in the view, in the caller's order with duplicates dropped. It only removes: chats that joined the view after the selection was read are never added. IDs are normalized to lowercase hex, and a malformed ID fails the call with `InvalidHex`. Call it right before a bulk action, then run the existing per-chat commands (archive, local delete, leave), which still check their own preconditions; this read does not lock the selection.
+
+[Source](src/commands/chat_window.rs#L40)
+
 ### `Marmot::subscribe_account_attention`
 
 **Current.**
@@ -1129,7 +1153,7 @@ pub async fn subscribe_account_attention( &self, ) -> Result<Arc<AccountAttentio
 
 Signed-in local/external accounts, independent of any list or active worker.
 
-[Source](src/commands/chat_window.rs#L23)
+[Source](src/commands/chat_window.rs#L52)
 
 </details>
 

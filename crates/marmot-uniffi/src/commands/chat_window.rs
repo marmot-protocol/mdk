@@ -19,6 +19,35 @@ impl Marmot {
                 .await?,
         ))
     }
+    /// Select all: every chat ID in `view`, in display order, including chats
+    /// beyond any open window; the count is the list length. Fails with
+    /// `ChatPresentationNotReady`, never a partial list, while base rows are
+    /// still being prepared; retry later.
+    pub async fn chat_list_ids(
+        &self,
+        account_ref: String,
+        view: ChatListViewFfi,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .chat_list_ids(&account_ref, view.into())
+            .await?)
+    }
+    /// The subset of `group_ids` still in `view`, in the caller's order with
+    /// duplicates dropped. Only removes; chats that joined the view since are
+    /// never added. Call it right before a bulk action, then run the existing
+    /// per-chat commands, which still check their own preconditions.
+    pub async fn revalidate_chat_list_ids(
+        &self,
+        account_ref: String,
+        view: ChatListViewFfi,
+        group_ids: Vec<String>,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .revalidate_chat_list_ids(&account_ref, view.into(), group_ids)
+            .await?)
+    }
     /// Signed-in local/external accounts, independent of any list or active worker.
     pub async fn subscribe_account_attention(
         &self,
@@ -175,6 +204,70 @@ mod tests {
             window.return_to_top(last.sequence).await,
             Err(MarmotKitError::ChatWindowClosed)
         ));
+    }
+
+    /// Select all reads the whole view, not the open window, and revalidation
+    /// only removes, keeping the caller's order.
+    #[tokio::test]
+    async fn select_all_covers_the_view_beyond_the_window_and_revalidation_only_removes() {
+        let (_relay, _dir, kit, account) = kit_with_groups(&["One", "Two", "Three"]).await;
+        let window = kit
+            .open_chat_list_window(account.clone(), ChatListViewFfi::Chats, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(window.snapshot().unwrap().rows.len(), 1);
+        let full = kit
+            .open_chat_list_window(account.clone(), ChatListViewFfi::Chats, None)
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let ids = kit
+            .chat_list_ids(account.clone(), ChatListViewFfi::Chats)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            full.rows
+                .iter()
+                .map(|row| row.row.group_id_hex.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ids.len(), 3);
+
+        kit.set_group_archived(account.clone(), ids[1].clone(), true)
+            .await
+            .unwrap();
+        let selected = vec![
+            ids[2].to_uppercase(),
+            ids[1].clone(),
+            ids[0].clone(),
+            ids[2].clone(),
+        ];
+        assert_eq!(
+            kit.revalidate_chat_list_ids(account.clone(), ChatListViewFfi::Chats, selected.clone())
+                .await
+                .unwrap(),
+            [ids[2].clone(), ids[0].clone()]
+        );
+        assert_eq!(
+            kit.revalidate_chat_list_ids(account.clone(), ChatListViewFfi::Archived, selected)
+                .await
+                .unwrap(),
+            [ids[1].clone()]
+        );
+        assert_eq!(
+            kit.chat_list_ids(account.clone(), ChatListViewFfi::Archived)
+                .await
+                .unwrap(),
+            [ids[1].clone()]
+        );
+        assert!(matches!(
+            kit.revalidate_chat_list_ids(account, ChatListViewFfi::Chats, vec!["not hex".into()])
+                .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
+        kit.runtime.shutdown_and_close().await.unwrap();
     }
 
     /// A Kotlin caller can cancel a waiting `next()`. The update that arrives

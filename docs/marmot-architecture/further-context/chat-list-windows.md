@@ -1,7 +1,7 @@
 ---
 title: "Bounded live chat-list windows"
 created: 2026-09-14
-updated: 2026-09-15
+updated: 2026-11-05
 status: implementation
 ---
 
@@ -102,6 +102,22 @@ invitation once without treating its messages as unread. Acceptance preserves ar
 atomically restores membership and archive eligibility and updates the account
 worker's in-memory intent. Consented rejoin restores once; replay cannot undo a
 subsequent explicit archive. Existing membership push-share side effects remain.
+
+## Select all
+
+A window holds at most 200 rows, so hosts must not derive "select all" or a bulk
+action's count from it. `chat_list_ids(account, view)` returns every ID in the
+view in display order from one read, using the view's indexed predicate; its cost
+grows with the view's chats, never with history. While base rows are pending it
+returns `ChatPresentationNotReady`, never a partial set, after repairing one bounded
+batch as a window read does. `revalidate_chat_list_ids(account, view, ids)` returns
+the still-eligible subset in the caller's order with duplicates dropped, and never
+adds chats that joined the view since.
+
+Both calls are stateless. The host keeps checkbox state, revalidates right before a
+bulk action, then calls the existing per-chat commands, which check their own
+preconditions. Custom folders and search extend these calls with a typed query in
+[#2983](https://github.com/marmot-protocol/mdk/issues/2983).
 
 M3 owns independent account attention summaries; M4 provides the
 [native binding contracts and consumer handoff](chat-projections-native.md). Full-dataset search and custom folders keep their existing

@@ -6594,3 +6594,28 @@ Create an observer for initial snapshot and later aggregate revisions. Free the 
 [Header contract](include/marmot.h#L13286)
 
 </details>
+
+<details>
+<summary>Chat-list selection</summary>
+
+### `marmot_chat_list_ids`
+
+```c
+MarmotStatus marmot_chat_list_ids(const struct MarmotClient *client, const char *account_ref, uint32_t view, struct MarmotStringList **out);
+```
+
+Select all: every chat ID in a MarmotChatListView, in display order, beyond any open window; `len` is the count. Returns `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY`, never a partial list, while base rows are being prepared. Free with `marmot_string_list_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotchat_list_ids) · [Header contract](include/marmot.h#L11960)
+
+### `marmot_revalidate_chat_list_ids`
+
+```c
+MarmotStatus marmot_revalidate_chat_list_ids(const struct MarmotClient *client, const char *account_ref, uint32_t view, const char *const *group_ids, uintptr_t group_ids_len, struct MarmotStringList **out);
+```
+
+The subset of a host selection still in the view, in the caller's order with duplicates dropped; never adds chats. Call before a bulk action, then use the per-chat commands. The input array is borrowed. Free the result with `marmot_string_list_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotrevalidate_chat_list_ids) · [Header contract](include/marmot.h#L11976)
+
+</details>
