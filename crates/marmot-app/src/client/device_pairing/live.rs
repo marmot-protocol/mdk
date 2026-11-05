@@ -398,7 +398,7 @@ impl AppClient {
         self.runtime.set_key_package_announcement_group(None);
         let _ = self.runtime.set_device_tag_group(None);
         let inbox = self.device_pairing.inbox.take();
-        self.device_pairing = DevicePairing::new(inbox);
+        *self.device_pairing = DevicePairing::new(inbox);
         self.note_device_roster_changed();
         self.device_link_changed = true;
         self.chat_history_imports_changed = true;

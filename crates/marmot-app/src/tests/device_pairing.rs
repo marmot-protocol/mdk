@@ -508,7 +508,7 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     assert!(laptop.client.runtime.group_record(&chat).is_ok());
     laptop = reopen(laptop).await;
     assert_eq!(laptop.slot_hex(), laptop_slot_hex);
-    assert_eq!(laptop.client.runtime.self_id(), &account_id);
+    assert_eq!(laptop.client.runtime.self_id(), account_id);
     assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
     let app = laptop.app.account_storage("alice").unwrap().app_storage();
     assert!(app.timeline_message(&chat_hex, &message).unwrap().is_some());
