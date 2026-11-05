@@ -3321,20 +3321,22 @@ mod tests {
 
     /// A user's full-history repair does not wait behind a capture serving
     /// past the cutoff (mdk#2923): cutting it ends the pass at once, the
-    /// capture `Cancelled`, charging no park streak. Scaled down: twelve
-    /// groups at 100 ms a page against a 300 ms cutoff, cut at 500 ms.
+    /// capture `Cancelled`, charging no park streak. Scaled down: 24 groups
+    /// at 300 ms a page (about 7 s to finish) against a 1 s cutoff, by which
+    /// the relay has answered about three pages, cut at 1.5 s. Real time, so
+    /// both margins are wide: the pass must return within 1 s of the cut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cut_serving_capture_ends_its_pass_at_once() {
         let (_dir, app, relay, mut client) = native_fixture().await;
         client.prepare_transport().await.unwrap();
-        for index in 0..12 {
+        for index in 0..24 {
             client
                 .create_group(&format!("cut {index}"), &[])
                 .await
                 .unwrap();
         }
         client.sync_runtime_groups().await.unwrap();
-        answer_captures_after(&relay, Duration::from_millis(100));
+        answer_captures_after(&relay, Duration::from_millis(300));
         let storage = app.account_storage("alice").unwrap();
         client.recovery_owner.test_advance_to_retry(&storage);
         let mut permit = ExplicitRecoveryPermit::default();
@@ -3351,21 +3353,21 @@ mod tests {
         let credit = Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
             .unwrap();
-        let started = std::time::Instant::now();
         let mut job = crate::client::sync::ComparisonNetworkJob::start_automatic_at(
             &client,
             &grant,
             credit,
-            tokio::time::Instant::now() + Duration::from_millis(300),
+            tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let cut = std::time::Instant::now();
         job.cut_capture();
         let (_credit, network) = job.wait().await.unwrap();
         assert!(
-            started.elapsed() < Duration::from_millis(1000),
-            "the pass returned at the cut: {:?}",
-            started.elapsed()
+            cut.elapsed() < Duration::from_secs(1),
+            "the pass returned at the cut, not after the ~7 s capture: {:?}",
+            cut.elapsed()
         );
         assert_eq!(
             network.capture_outcome_for_test(),
