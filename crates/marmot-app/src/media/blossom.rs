@@ -2082,7 +2082,8 @@ fn blossom_endpoint(server: &str, leaf: &str) -> Result<(Url, String), AppError>
 }
 
 fn set_blossom_path(url: &mut Url, leaf: &str) {
-    url.set_path(leaf);
+    let path = format!("{}/{}", url.path().trim_end_matches('/'), leaf);
+    url.set_path(&path);
     url.set_query(None);
     url.set_fragment(None);
 }
