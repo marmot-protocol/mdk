@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- Isolate unreadable per-device settings when adding linked devices to chats or sending their history, so healthy
-  siblings still progress. Keep the unreadable target's history owed and use the existing Blossom preparation backoff.
-  Settings holds, history expiry, publish-failure behavior and host APIs are unchanged; no migration is needed.
+- Invalid device-roster marker edits now return the additive Rust `AccountError::InvalidDeviceRosterEdit`,
+  rather than an engine serialization error. Lower-level Rust callers matching those errors should adopt the
+  new case. The privacy kind is `account_invalid_device_roster_edit`; the Protocol sync class, CLI `engine_error`
+  code and foreign Runtime categories are unchanged. No schema, wire or foreign ABI migration is required.
 
 - Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
   Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
@@ -142,6 +143,10 @@
 - Add `MarmotAppRuntime::update_linked_device_settings` with optional settings, resolved against the current roster. Rename and settings edits share D37 recovery; an earlier lost edit is recovered before accepting another. History remains limited to future sibling Adds and remaining owed transfers (mdk#2628 D86).
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
   earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
+- Isolate unreadable per-device settings when adding linked devices to chats or sending their history, so healthy
+  siblings still progress. Keep the unreadable target's history owed and use the existing Blossom preparation backoff.
+  Settings holds, history expiry, publish-failure behavior and host APIs are unchanged; no migration is needed.
 
 - A published sibling Welcome lost before joining is eligible for best-effort
   repair once the target's heartbeat-based last activity for its current roster

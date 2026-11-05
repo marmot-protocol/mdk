@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- Add `SiblingAddRefusal::AlreadyPresent` for selected-tree sibling presence. Experimental Rust callers with exhaustive
+  matches must handle the new variant; another KeyPackage cannot resolve it. No stored or wire encoding changes.
+
 - Remove D90-only authenticated device-group source types and `MessageStorage` observation/content-association
   methods; ordinary processed-wrapper markers remain. `PublicationObservation` retains only immutable actual
   acceptance time, with the retired serialized order ignored on read (D100).

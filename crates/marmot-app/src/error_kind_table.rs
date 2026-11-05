@@ -179,6 +179,34 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
         },
     );
 
+    push_engine_wrappings(
+        &mut rows,
+        "serialization failure",
+        || EngineError::Serialize("encoding failed".into()),
+        HostAnswers {
+            marmotkit: "Runtime",
+            c_status: "Runtime",
+            cli_code: "engine_error",
+            sync_class: SyncErrorClass::Protocol,
+            privacy_kind: "serialize",
+            wipe_reason: "session error",
+            read_marker_code: "read_marker_failed:session",
+        },
+    );
+    rows.push(row(
+        "invalid device roster edit".into(),
+        AppError::from(AccountError::InvalidDeviceRosterEdit),
+        HostAnswers {
+            marmotkit: "Runtime",
+            c_status: "Runtime",
+            cli_code: "engine_error",
+            sync_class: SyncErrorClass::Protocol,
+            privacy_kind: "account_invalid_device_roster_edit",
+            wipe_reason: "account error",
+            read_marker_code: "read_marker_failed:account",
+        },
+    ));
+
     // The signing hook reports a rejection as an identity-proof failure.
     // Opening the session reports the hook's error again, as text inside
     // `Other`, because the engine builds the device identity with a `String`
