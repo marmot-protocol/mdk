@@ -779,9 +779,11 @@ spawns the runner with itself, serves its turns between its other work and stops
 exit, a quantum in flight included. A directly owned client runs one pass in place from
 `sync()` and from `next_event()` when it meets delivery loss. No worker reads what that pass's
 fence answer releases, so `sync()` reads it before returning. In a wake-collection process
-(`CursorPersistence::Frozen`, a notification extension) the runner still admits staged history
-and answers the live fences, but fetches only for an explicit full-history repair, the one
-recovery that posture allows. Sweeps go over the account's own
+(`CursorPersistence::Frozen`, a notification extension) the runner admits staged history and
+answers the live fences, but fetches only for routes whose live frames a fence holds, so the
+messages that woke the process can be shown, and otherwise only for an explicit full-history
+repair, the one recovery that posture allows. A loss, a joined group's history and the standing
+window wait for an Advance process. Sweeps go over the account's own
 relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
 widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
 wake only makes it read the ledger again. A unit is one (route,

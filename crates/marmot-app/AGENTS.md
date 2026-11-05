@@ -752,11 +752,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   still the first it owes. A quantum whose proven slices an un-cover took back mid-fetch settles as unanswered: due
   again at once, holding its fence. Every debt turn first prunes the ledger to the retention floor (once per hour of
   floor movement per process), so a capture older than the window fences nothing. A wake-collection
-  (`CursorPersistence::Frozen`) process's runner admits and answers fences but fetches only for an explicit
-  full-history repair (`fetches_unasked`). The runner reads live counts through its own `LiveCount`, never the
-  coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
-  with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a
-  successful debt turn. Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`
+  (`CursorPersistence::Frozen`) process's runner admits and answers fences but fetches only for routes whose live
+  frames a fence holds, or for an explicit full-history repair (`fetches_unasked`). The runner reads live counts
+  through its own `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted
+  counts into it with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that
+  ticket after a successful debt turn.
+  Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`
   plus `enable_live_fences` before any native input or REQ. Both native backward-paging entry points are then off
   for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
   repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry

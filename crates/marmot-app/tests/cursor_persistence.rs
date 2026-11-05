@@ -38,20 +38,16 @@ use marmot_app::{
     AppMessageQuery, AuditLogSettings, CursorPersistence, MarmotApp, MarmotAppConfig,
     MarmotAppEvent, MarmotAppRuntime,
 };
-use nostr_relay_builder::MockRelay;
 use tokio::time::sleep;
+
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
 
 /// How long a cold boot's initial catch-up is allowed to take. The integration
 /// test runs inside a workspace-wide nextest partition, where concurrent
 /// crypto, SQLite, and relay tests can delay the current-thread runtime well
 /// beyond the relay adapter's own waits without indicating a stuck catch-up.
 const CATCH_UP_DEADLINE: Duration = Duration::from_secs(30);
-
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
-}
 
 fn open_store(
     dir: &tempfile::TempDir,
@@ -188,7 +184,9 @@ fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
 }
 
 async fn frozen_wake_collection_body() {
-    let (_relay, url) = mock_relay().await;
+    // A truthful cap lets the frozen boot's runner prove the offline gap; a
+    // relay with an unreadable information document holds it instead.
+    let (_relay, url) = limited_relay::mock_relay().await;
 
     // --- bob: the account whose durable cursor is under test (own store) ---
     let dir_bob = tempfile::tempdir().unwrap();

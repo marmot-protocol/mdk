@@ -748,16 +748,20 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         if let Some(step) = self.report_pause(survey.paused_until, now).await {
             return step;
         }
-        // A wake-collection process admits and fences, but fetches only for
-        // an explicit repair.
-        if !self.policy.fetches_unasked && pass.is_none_or(|bound| bound.repair_until.is_none()) {
-            return Step::Idle {
-                next_due: admission_due,
-            };
-        }
         let mut hints = self.hints.borrow().clone();
         hints.held.append(&mut survey.fenced);
         hints.window.append(&mut survey.window);
+        // A wake-collection process fetches only what its live input waits
+        // on: the units of routes whose frames a fence holds. Other debt waits
+        // for an Advance process or an explicit repair.
+        if !self.policy.fetches_unasked && pass.is_none_or(|bound| bound.repair_until.is_none()) {
+            survey
+                .candidates
+                .retain(|candidate| hints.held.contains(&candidate.key.route));
+            survey
+                .rechecks
+                .retain(|candidate| hints.held.contains(&candidate.key.route));
+        }
         let candidate = match select::pick(survey, &mut self.memory, &hints, now, new_round) {
             Pick::Unit(candidate) => candidate,
             Pick::Idle { next_due } => {

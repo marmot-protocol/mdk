@@ -78,12 +78,13 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) fences_per_unit: usize,
     pub(crate) sweep: SweepPolicy,
     pub(crate) recheck_interval_seconds: u64,
-    /// Whether due units fetch on their own. Off in a wake-collection
-    /// (`CursorPersistence::Frozen`) process, where only an explicit
-    /// full-history repair fetches history, as `authorize_account_recovery`
-    /// allows there: the runner still admits what earlier quanta staged and
-    /// answers the live fences, so a group's live frames are released once
-    /// nothing older is owed ahead of them.
+    /// Whether every due unit fetches on its own. Off in a wake-collection
+    /// (`CursorPersistence::Frozen`) process, which fetches only for routes
+    /// whose live frames a fence holds, so the messages that woke it can be
+    /// shown, and otherwise only for an explicit full-history repair, as
+    /// `authorize_account_recovery` allows there. Other debt (a loss, a
+    /// joined group's history, the standing window) waits for an Advance
+    /// process.
     pub(crate) fetches_unasked: bool,
 }
 
