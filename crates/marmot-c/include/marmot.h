@@ -2856,7 +2856,7 @@ typedef struct MarmotGroupCommitDelivery {
 } MarmotGroupCommitDelivery;
 
 /**
- * A retained Welcome repair handle after an Add has already confirmed.
+ * A retained Welcome repair handle after a canonical create or confirmed Add.
  * Unknown includes legacy rows and later coarse retry outcomes; it does
  * not clear the debt. A class explains the observed refusal, not delivery:
  * earlier legacy exposure can be unknown. Requires the matching library and header.
@@ -8326,7 +8326,7 @@ MarmotStatus marmot_group_commit_delivery(const struct MarmotClient *client,
                                           struct MarmotGroupCommitDelivery **out);
 
 /**
- * Confirmed Adds whose Welcome is still owed, oldest first. Coarse size
+ * Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
  * evidence is diagnostic only. A false has_size_class means Unknown,
  * including old rows or a later coarse legacy retry. The pending notice
  * remains once per process/Welcome; query for later causes. Free the list
