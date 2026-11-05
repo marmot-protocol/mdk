@@ -3319,6 +3319,66 @@ mod tests {
         assert!(!source_admitted(&client, "inbox").await);
     }
 
+    /// A user's full-history repair does not wait behind a capture serving
+    /// past the cutoff (mdk#2923): cutting it ends the pass at once, the
+    /// capture `Cancelled`, charging no park streak. Scaled down: twelve
+    /// groups at 100 ms a page against a 300 ms cutoff, cut at 500 ms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_serving_capture_ends_its_pass_at_once() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        for index in 0..12 {
+            client
+                .create_group(&format!("cut {index}"), &[])
+                .await
+                .unwrap();
+        }
+        client.sync_runtime_groups().await.unwrap();
+        answer_captures_after(&relay, Duration::from_millis(100));
+        let storage = app.account_storage("alice").unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let mut permit = ExplicitRecoveryPermit::default();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .await
+            .unwrap()
+            .expect("the native goal is owed");
+        assert!(!grant.replay_capture.is_empty());
+        let execution = client.begin_comparison_grant(&grant).await.unwrap();
+        let credit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut job = crate::client::sync::ComparisonNetworkJob::start_automatic_at(
+            &client,
+            &grant,
+            credit,
+            tokio::time::Instant::now() + Duration::from_millis(300),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        job.cut_capture();
+        let (_credit, network) = job.wait().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "the pass returned at the cut: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            network.capture_outcome_for_test(),
+            Some(transport_nostr_adapter::ReplayCaptureOutcome::Cancelled)
+        );
+        client
+            .admit_comparison_inline(None, grant, execution, network)
+            .await
+            .unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        assert!(!client.recovery_owner.replay_complete);
+    }
+
     /// A replay capture the relay closes on every attempt (`RelayClosed`, an
     /// unserved pass), granted alongside an incremental-history obligation whose
     /// comparison re-certifies each pass with one required relay not

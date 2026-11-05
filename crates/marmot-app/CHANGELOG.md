@@ -762,7 +762,9 @@
   been answered for 30 seconds, or 10 minutes after the capture started, and
   the recovery credit is held until then. A relay that has not answered a page
   by the cutoff is still cut there, and a capture with a cut source still ends
-  cancelled, charging no park streak. Explicit repairs keep the hard cut.
+  cancelled, charging no park streak. Explicit repairs keep the hard cut, and a
+  full-history repair requested while such a capture runs cuts it at once
+  instead of waiting behind it.
 
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging

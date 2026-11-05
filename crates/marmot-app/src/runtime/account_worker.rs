@@ -2382,6 +2382,18 @@ async fn run_app_runtime_account_worker(
                 &group_id,
             );
         }
+        // A user's full-history repair waits for the running pass and
+        // refetches its history itself: it never waits behind a capture that
+        // is serving past the pass cutoff (mdk#2923).
+        if pending
+            .iter()
+            .any(AccountWorkerCommand::waits_for_recovery_job)
+            && let Some(network) = comparison_recovery
+                .as_ref()
+                .and_then(|job| job.network.as_ref())
+        {
+            network.cut_capture();
+        }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         #[cfg(test)]

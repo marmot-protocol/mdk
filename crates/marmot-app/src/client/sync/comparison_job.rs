@@ -303,6 +303,9 @@ impl ComparisonNetworkResult {
 /// Dropping the worker's handle cancels I/O and drops all unadmitted events.
 pub(crate) struct ComparisonNetworkJob {
     handle: JoinHandle<(Arc<OwnedSemaphorePermit>, ComparisonNetworkResult)>,
+    /// An automatic pass's owner capture, which may run past the cutoff while
+    /// its relay serves pages. Cancelling it cuts the capture now.
+    capture: Option<NostrAcquisitionCancellation>,
 }
 
 impl Drop for ComparisonNetworkJob {
@@ -643,6 +646,17 @@ fn keep_window_progress(
 }
 
 impl ComparisonNetworkJob {
+    /// Cut this pass's owner capture now, if it may outlive its cutoff: a
+    /// user's full-history repair waits for the pass, and refetches that
+    /// history itself, so it does not wait behind a serving capture
+    /// (mdk#2923). The capture ends `Cancelled`, charging no park streak,
+    /// and the pass returns as soon as its comparison has.
+    pub(crate) fn cut_capture(&self) {
+        if let Some(capture) = &self.capture {
+            capture.cancel();
+        }
+    }
+
     /// Cancel the request and wait until its future has dropped the shared credit.
     pub(crate) async fn abort_and_wait(mut self) {
         self.handle.abort();
@@ -683,12 +697,13 @@ impl ComparisonNetworkJob {
     /// at most), so a large backlog is not cut on every attempt (mdk#2923).
     ///
     /// The job, and everything that waits for it, lasts as long: the
-    /// recovery credit, a full-history repair and the commands queued behind
-    /// one (apart from reads), the maintenance tick's main leg, which skips
-    /// while a job runs, and the tail of the receive or convergence pass that
+    /// recovery credit, the maintenance tick's main leg, which skips while a
+    /// job runs, and the tail of the receive or convergence pass that
     /// started the job (the push-registration retry for newly joined groups,
-    /// the audit-tracker update). Other commands are still served. Callers
-    /// that wait in place use [`Self::start`].
+    /// the audit-tracker update). A full-history repair still waits for the
+    /// pass's comparison and admission, but not behind a serving capture:
+    /// the worker cuts it ([`Self::cut_capture`]). Other commands are still
+    /// served. Callers that wait in place use [`Self::start`].
     pub(crate) fn start_automatic(
         client: &AppClient,
         grant: &AttemptGrant,
@@ -776,6 +791,8 @@ impl ComparisonNetworkJob {
         );
         let attempt_serial = grant.reservation.attempt_serial;
         let credit = Arc::new(credit);
+        let capture_cut = capture_outlives_cutoff.then(NostrAcquisitionCancellation::new);
+        let task_capture_cut = capture_cut.clone();
         let replay_capture = ReplayCapturePlan {
             attempt_serial,
             sources: grant.replay_capture.clone(),
@@ -806,15 +823,16 @@ impl ComparisonNetworkJob {
                     return None;
                 }
                 if tokio::time::Instant::now() < deadline {
-                    let cancellation = NostrAcquisitionCancellation::new();
-                    let _cancel_on_drop = cancellation.clone().drop_guard();
-                    if capture_outlives_cutoff {
+                    if let Some(cancellation) = task_capture_cut {
+                        let _cancel_on_drop = cancellation.clone().drop_guard();
                         return Some(
                             adapter
                                 .capture_replay_until(replay_capture, cancellation, deadline)
                                 .await,
                         );
                     }
+                    let cancellation = NostrAcquisitionCancellation::new();
+                    let _cancel_on_drop = cancellation.clone().drop_guard();
                     let capture = adapter.capture_replay(replay_capture, cancellation.clone());
                     tokio::pin!(capture);
                     let captured = tokio::select! {
@@ -1013,7 +1031,10 @@ impl ComparisonNetworkJob {
             let (capture, routes) = tokio::join!(capture, compare);
             (credit, ComparisonNetworkResult { routes, capture })
         });
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            capture: capture_cut,
+        })
     }
 
     pub(crate) async fn wait(
@@ -2045,7 +2066,10 @@ mod tests {
                 )
             }
         });
-        let job = ComparisonNetworkJob { handle };
+        let job = ComparisonNetworkJob {
+            handle,
+            capture: None,
+        };
         waiting.await;
         drop(job);
         // abort() has only requested cancellation. The task still owns the
@@ -2085,7 +2109,10 @@ mod tests {
                 )
             }
         });
-        let job = ComparisonNetworkJob { handle };
+        let job = ComparisonNetworkJob {
+            handle,
+            capture: None,
+        };
         waiting.await;
         assert_eq!(capacity.available_permits(), 0);
         job.abort_and_wait().await;
@@ -2117,7 +2144,12 @@ mod tests {
                 },
             )
         });
-        ComparisonNetworkJob { handle }.abort_and_wait().await;
+        ComparisonNetworkJob {
+            handle,
+            capture: None,
+        }
+        .abort_and_wait()
+        .await;
         assert_eq!(capacity.available_permits(), 0);
         drop(capture_cleanup_credit);
         assert_eq!(capacity.available_permits(), 1);
