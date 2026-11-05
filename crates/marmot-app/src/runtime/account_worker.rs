@@ -8849,8 +8849,9 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call, after giving storage the roster's
-/// device names again; one `KeyPackageRefreshOverdueChanged` for a
+/// device-group trust since the last call, or a completed deferred device-name
+/// refresh, after giving storage the roster's device names again; one
+/// `KeyPackageRefreshOverdueChanged` for a
 /// maintenance pass that changed the overdue-refresh answer; one
 /// `DeviceLinkChanged` for a change in linking a new device; and one
 /// `ChatHistoryImportsChanged` for a change in chat history from another
