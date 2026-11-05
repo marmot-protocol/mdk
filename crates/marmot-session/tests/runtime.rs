@@ -582,6 +582,7 @@ impl TransportAdapter for RecordingAdapter {
                         .iter()
                         .cloned()
                         .map(|endpoint| TransportEndpointFailure {
+                            size_class: None,
                             reason: reasons
                                 .iter()
                                 .find(|(reasoned, _)| reasoned == &endpoint)
@@ -643,6 +644,7 @@ impl TransportAdapter for RecordingAdapter {
                     .filter(|endpoint| !accepted_endpoints.contains(endpoint))
                     .cloned()
                     .map(|endpoint| TransportEndpointFailure {
+                        size_class: None,
                         endpoint,
                         reason: "injected explicit relay rejection".into(),
                         kind: TransportEndpointFailureKind::TerminalRejected,

@@ -2580,6 +2580,16 @@ pub(crate) fn fail_if_publish_failed(
 }
 
 pub(crate) fn publish_failure_error(failures: &[marmot_session::PublishFailure]) -> AppError {
+    if let Some(cause) = failures.first().and_then(|failure| failure.oversized)
+        && failures
+            .iter()
+            .all(|failure| failure.oversized == Some(cause))
+    {
+        return AppError::EventTooLarge {
+            artifact: cause.artifact,
+            size_class: cause.size_class,
+        };
+    }
     AppError::Publish(
         failures
             .iter()
@@ -2917,6 +2927,7 @@ mod fail_if_publish_failed_tests {
 
     fn failure(reason: &str) -> PublishFailure {
         PublishFailure {
+            oversized: None,
             message_id: MessageId::new(vec![0xab; 32]),
             reason: reason.to_owned(),
         }
@@ -3075,6 +3086,60 @@ mod fail_if_publish_failed_tests {
 
     // The hard-error message joins all failure reasons, unchanged from the
     // original contract.
+    #[test]
+    fn only_matching_definitive_size_failures_become_a_typed_error() {
+        let cause = marmot_session::OversizedEvent {
+            artifact: crate::OversizedArtifact::Commit,
+            size_class: crate::EventSizeClass::Under64Kib,
+        };
+        let mut first = failure("relay rejected event (too-large)");
+        first.oversized = Some(cause);
+        let mut second = first.clone();
+        let mut effects = AccountDeviceEffects {
+            failures: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::EventTooLarge {
+                artifact: crate::OversizedArtifact::Commit,
+                size_class: crate::EventSizeClass::Under64Kib,
+            })
+        ));
+        second.oversized = None;
+        effects.failures[1] = second.clone();
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+        second.oversized = Some(marmot_session::OversizedEvent {
+            artifact: cause.artifact,
+            size_class: crate::EventSizeClass::Over4Mib,
+        });
+        effects.failures[1] = second.clone();
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+        second.oversized = Some(marmot_session::OversizedEvent {
+            artifact: crate::OversizedArtifact::Welcome,
+            size_class: cause.size_class,
+        });
+        effects.failures[1] = second;
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+        effects.failures = vec![first];
+        effects.pending.push(PendingResolution::Confirmed {
+            pending: pending_ref(),
+        });
+        assert!(
+            fail_if_publish_failed(&effects).is_ok(),
+            "typed cause never replaces an already confirmed outcome"
+        );
+    }
+
     #[test]
     fn hard_error_joins_all_failure_reasons() {
         let mut effects = AccountDeviceEffects::default();

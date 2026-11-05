@@ -232,6 +232,13 @@ pub enum AppError {
     AgentStreamInvalidCandidate(String),
     #[error("publish failed: {0}")]
     Publish(String),
+    /// Every target conclusively refused this artifact for size. Coarse
+    /// metadata only; this is not an assertion about an unknown relay limit.
+    #[error("event too large: {artifact} ({size_class})")]
+    EventTooLarge {
+        artifact: crate::OversizedArtifact,
+        size_class: crate::EventSizeClass,
+    },
     #[error("default relays are required to publish account relay lists")]
     MissingDefaultRelays,
     #[error("missing account relay lists: {0:?}")]
@@ -524,7 +531,14 @@ impl From<TransportAdapterError> for AppError {
         if is_external_signer_rejection(&error) {
             Self::ExternalSignerRejected
         } else {
-            Self::Transport(error)
+            let wrapped = Self::Transport(error);
+            match wrapped.as_oversized_event() {
+                Some(cause) => Self::EventTooLarge {
+                    artifact: cause.artifact,
+                    size_class: cause.size_class,
+                },
+                None => wrapped,
+            }
         }
     }
 }
@@ -534,7 +548,14 @@ impl From<AccountError> for AppError {
         if is_external_signer_rejection(&error) {
             Self::ExternalSignerRejected
         } else {
-            Self::Account(error)
+            let wrapped = Self::Account(error);
+            match wrapped.as_oversized_event() {
+                Some(cause) => Self::EventTooLarge {
+                    artifact: cause.artifact,
+                    size_class: cause.size_class,
+                },
+                None => wrapped,
+            }
         }
     }
 }
@@ -575,7 +596,34 @@ impl AppError {
         )
     }
 
+    /// The same proven size cause through the lower stack's actual wrappers.
+    /// Direct transport publications have no MLS semantic attribution.
+    pub fn as_oversized_event(&self) -> Option<crate::OversizedEvent> {
+        match self {
+            Self::EventTooLarge {
+                artifact,
+                size_class,
+            } => Some(crate::OversizedEvent {
+                artifact: *artifact,
+                size_class: *size_class,
+            }),
+            Self::Transport(TransportAdapterError::PublishEndpoints(failure))
+            | Self::Account(AccountError::Transport(TransportAdapterError::PublishEndpoints(
+                failure,
+            ))) => failure
+                .event_size_class
+                .map(|size_class| crate::OversizedEvent {
+                    artifact: crate::OversizedArtifact::Other,
+                    size_class,
+                }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn privacy_safe_kind(&self) -> &'static str {
+        if self.as_oversized_event().is_some() {
+            return "event_too_large";
+        }
         match self {
             Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),
@@ -618,6 +666,7 @@ impl AppError {
             Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",
             Self::AgentStreamInvalidCandidate(_) => "agent_stream_invalid_candidate",
             Self::Publish(_) => "publish",
+            Self::EventTooLarge { .. } => "event_too_large",
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
             Self::UserBlocked => "user_blocked",
@@ -706,6 +755,9 @@ impl AppError {
 
     /// Broad, bounded cause derived only from typed variants.
     pub(crate) fn sync_error_class(&self) -> SyncErrorClass {
+        if self.as_oversized_event().is_some() {
+            return SyncErrorClass::Protocol;
+        }
         match self {
             Self::Storage(error) => storage_error_class(error),
             Self::Sqlite(error) => match error.sqlite_error_code() {

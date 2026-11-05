@@ -147,6 +147,7 @@ mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
 
+pub use cgka_traits::EventSizeClass;
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
@@ -155,7 +156,7 @@ pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
 pub use marmot_session::{
     AccountError, AccountIdentityProofRequest, AccountIdentityProofSigner, MaintenanceTiming,
-    SessionError,
+    OversizedArtifact, OversizedEvent, SessionError,
 };
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
