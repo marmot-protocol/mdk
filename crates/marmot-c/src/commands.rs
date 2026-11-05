@@ -4144,3 +4144,69 @@ c_cmd! {
     sync fn marmot_set_startup_diagnostics_enabled(enabled: flag) -> unit = set_startup_diagnostics_enabled;
     sync fn marmot_startup_diagnostics_snapshot() -> rec(MarmotNativeStartupSnapshot) = startup_diagnostics_snapshot;
 }
+
+/// Select all: every chat ID in `view` (a MarmotChatListView discriminant), in
+/// display order, including chats beyond any open window; the count is the
+/// list length. Returns `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY`, never a
+/// partial list, while base rows are still being prepared; retry later. Free
+/// with `marmot_string_list_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_chat_list_ids(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    view: u32,
+    out: *mut *mut MarmotStringList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let view = try_arg!(crate::types::chat_window::MarmotChatListView::from_c(view)).to_ffi();
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.chat_list_ids(account_ref, view)),
+                out,
+            )
+        }
+    })
+}
+
+/// The subset of `group_ids` still in `view`, in the caller's order with
+/// duplicates dropped. Only removes; chats that joined the view since are never
+/// added. Call it right before a bulk action, then run the existing per-chat
+/// commands, which still check their own preconditions. Free with
+/// `marmot_string_list_free`.
+///
+/// # Safety
+/// The client must be live, `group_ids` must hold `group_ids_len` valid
+/// strings (or be NULL with length 0), and out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_revalidate_chat_list_ids(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    view: u32,
+    group_ids: *const *const c_char,
+    group_ids_len: usize,
+    out: *mut *mut MarmotStringList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let view = try_arg!(crate::types::chat_window::MarmotChatListView::from_c(view)).to_ffi();
+        let group_ids = try_arg!(unsafe { str_array(group_ids, group_ids_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.revalidate_chat_list_ids(
+                    account_ref,
+                    view,
+                    group_ids,
+                )),
+                out,
+            )
+        }
+    })
+}
