@@ -797,8 +797,7 @@ c_cmd! {
 
     /// List this account's own devices from the roster of the device group
     /// this device trusts: this device first, then by when each was linked.
-    /// Empty until this device trusts a device group, and always empty in
-    /// release builds until the roster's spec lands. Re-read on the
+    /// Empty until this device trusts a device group, and always empty without explicit dev capability and runtime intent. Re-read on the
     /// `LinkedDevicesChanged` event. Free with
     /// `marmot_linked_device_list_free`.
     async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
@@ -849,7 +848,7 @@ c_cmd! {
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first; warn the user
     /// while it is. Always false until this device trusts a device group,
-    /// and in release builds until the device group's spec lands. Re-read on
+    /// and without explicit dev capability and runtime intent. Re-read on
     /// the `KeyPackageRefreshOverdueChanged` event.
     async fn marmot_key_package_refresh_overdue(account_ref: str) -> scalar(bool) = key_package_refresh_overdue;
     /// Rename one of this account's devices, this one included, by its
@@ -902,8 +901,7 @@ c_cmd! {
     async fn marmot_chats_closed_to_linked_devices(account_ref: str) -> scalar(u32) = chats_closed_to_linked_devices;
 
     /// List the sign-ins of this account that this device does not
-    /// recognize, the earliest to appear first. Always empty in release
-    /// builds until the roster's spec lands. Re-read on the
+    /// recognize, the earliest to appear first. Always empty without explicit dev capability and runtime intent. Re-read on the
     /// `UnrecognizedSignInsChanged` event. Free with
     /// `marmot_unrecognized_sign_in_list_free`.
     async fn marmot_unrecognized_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = unrecognized_sign_ins;
@@ -922,14 +920,14 @@ c_cmd! {
 
     /// Whether this device started fresh and still has no device group, so
     /// the host can say that only chats it is invited to from now on are
-    /// here. Always false in release builds until the roster's spec lands.
+    /// here. Always false without explicit dev capability and runtime intent.
     async fn marmot_started_fresh(account_ref: str) -> scalar(bool) = started_fresh;
 
     /// List the account's open compromise warning on this device: each
     /// rejection the user has not seen here, the earliest gathered first.
     /// Empty when no warning is open. The host writes the wording, and never
     /// says the account's devices stopped whoever holds the key. Always empty
-    /// in release builds until the roster's spec lands. Re-read on the
+    /// without explicit dev capability and runtime intent. Re-read on the
     /// `CompromiseWarningChanged` event. Free with
     /// `marmot_compromise_warning_item_list_free`.
     async fn marmot_compromise_warning(account_ref: str) -> rec(MarmotCompromiseWarningItemList) = compromise_warning;

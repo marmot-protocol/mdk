@@ -10,6 +10,8 @@ name = "marmot_c"
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [features]
+# Explicit host test-build capability; never enables convergence timing overrides.
+dev-device-groups = ["marmot-uniffi/dev-device-groups"]
 otlp-export = ["marmot-uniffi/otlp-export"]
 product-analytics-export = ["marmot-uniffi/product-analytics-export"]
 default = []
