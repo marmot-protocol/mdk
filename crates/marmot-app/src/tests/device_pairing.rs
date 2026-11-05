@@ -311,6 +311,145 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
     assert!(joins.device_group_joins().unwrap().is_empty());
 }
 
+/// Diagnostic for #2847: a real completed link can be absent from the
+/// approver's selected roster after a deeper pre-Add sibling branch wins.
+/// This checkpoint changes no detection or repair behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
+    use crate::tests::device_group::converge_device_group;
+
+    let (relay, [mut phone, mut tablet, mut laptop]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    let pre_add_epoch = tablet.client.runtime.group_record(&group).unwrap().epoch;
+    let tablet_slot_hex = tablet.slot_hex();
+    let tablet_slot: [u8; 32] = hex::decode(&tablet_slot_hex).unwrap().try_into().unwrap();
+    let laptop_slot_hex = laptop.slot_hex();
+    let laptop_slot: [u8; 32] = hex::decode(&laptop_slot_hex).unwrap().try_into().unwrap();
+
+    let linked_group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    assert!(linked_group == group);
+    let made = link_record(&phone, &group, &laptop_slot_hex);
+    assert_eq!(made.outcome, DeviceLinkOutcome::Linked);
+    assert!(made.decided_at.is_some());
+    assert!(phone.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(matches!(
+        phone.client.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        !phone
+            .client
+            .runtime
+            .has_pending_convergence_inputs(&group)
+            .unwrap()
+    );
+    let linked_epoch = phone.client.runtime.group_record(&group).unwrap().epoch;
+    assert!(linked_epoch > pre_add_epoch);
+    assert!(tablet.client.runtime.group_record(&group).unwrap().epoch == pre_add_epoch);
+    assert!(!tablet.roster(&group).devices.contains_key(&laptop_slot));
+
+    // No Laptop traffic was delivered to Tablet. Each real own roster edit
+    // advances its branch from the epoch before the Add, without constructing
+    // a replacement roster or touching stored branch state.
+    let mut winning_label = String::new();
+    for index in 1..=4 {
+        if tablet.client.runtime.group_record(&group).unwrap().epoch > linked_epoch {
+            break;
+        }
+        winning_label = format!("Tablet branch {index}");
+        tablet
+            .client
+            .rename_linked_device(&tablet_slot_hex, &winning_label)
+            .await
+            .unwrap();
+    }
+    let branch_epoch = tablet.client.runtime.group_record(&group).unwrap().epoch;
+    assert!(
+        branch_epoch > linked_epoch,
+        "the genuine sibling branch must be deeper"
+    );
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 8).await;
+    let selected = phone.roster(&group);
+    let selected_deeper_branch = selected
+        .devices
+        .get(&tablet_slot)
+        .is_some_and(|entry| entry.label == winning_label)
+        && phone.client.runtime.group_record(&group).unwrap().epoch >= branch_epoch;
+    let approver_lists_target = selected.devices.contains_key(&laptop_slot);
+    let durable_link_unchanged = link_record(&phone, &group, &laptop_slot_hex) == made;
+    eprintln!(
+        "completed_link_loss: selected_deeper_branch={selected_deeper_branch}, approver_lists_target={approver_lists_target}, durable_link_unchanged={durable_link_unchanged}"
+    );
+    assert!(
+        selected_deeper_branch,
+        "normal branch selection must choose the genuine deeper branch"
+    );
+    assert!(
+        !approver_lists_target,
+        "the selected pre-Add branch does not admit Laptop"
+    );
+    assert!(
+        durable_link_unchanged,
+        "a made approval remains durable Linked after branch selection"
+    );
+
+    // Present those actual published commits to Laptop as well. It joined
+    // after their fork point, so a removal notification must not be inferred
+    // merely from another device selecting a branch it cannot follow.
+    converge_device_group(&mut laptop.client, &relay, &mut laptop.cursor, &group, 8).await;
+    let target_group_retained = laptop.client.runtime.group_record(&group).is_ok();
+    let target_lists_own_key =
+        laptop
+            .roster(&group)
+            .devices
+            .get(&laptop_slot)
+            .is_some_and(|entry| {
+                entry.tag_signature_key.as_ref() == Some(&laptop.client.runtime.own_signature_key())
+            });
+    let target_unlinked = laptop.client.device_unlinked();
+    let target_still_trusts = laptop.trust(&group) == Some(DeviceGroupTrust::Linked);
+    let target_view = laptop.op(DeviceLinkOp::Read).await;
+    let target_view_linked = target_view.new_device == Some(NewDeviceLinkState::Linked);
+    eprintln!(
+        "completed_link_loss: target_group_retained={target_group_retained}, target_lists_own_key={target_lists_own_key}, target_unlinked={target_unlinked}, target_still_trusts={target_still_trusts}, target_view_linked={target_view_linked}"
+    );
+    assert!(target_group_retained && target_lists_own_key && target_still_trusts);
+    assert!(
+        !target_unlinked,
+        "no selected removal has unlinked the target"
+    );
+    assert!(
+        target_view_linked,
+        "the current pairing view has no failed-link/removal notice"
+    );
+
+    // Prerequisite for the explicit local reset: these are the real
+    // existing helpers used by old-copy cleanup, including accepted native
+    // application bookkeeping awaiting its App ACK. No retained row is
+    // removed or synthetic acknowledgement supplied to make them quiet.
+    let pending_fanout = laptop
+        .client
+        .runtime
+        .has_pending_outbound_fanouts(&group)
+        .unwrap();
+    let queued_intent = laptop
+        .client
+        .runtime
+        .has_queued_outbound_intents(&group)
+        .unwrap();
+    eprintln!(
+        "repair_reset_prerequisite: pending_fanout={pending_fanout}, queued_intent={queued_intent}"
+    );
+    assert!(
+        !pending_fanout,
+        "the actual split copy must have no unsettled native fanout or accepted bookkeeping"
+    );
+    assert!(
+        !queued_intent,
+        "the actual split copy must have no queued native work"
+    );
+}
+
 /// A later link adds the new device to the device group in one commit, by a
 /// device that joined through a Welcome. First ready wins: the other
 /// sibling's session ends, and its prompt then says who added the device.
