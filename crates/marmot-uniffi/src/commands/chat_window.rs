@@ -1,5 +1,5 @@
 //! Additive native entry points for C4's bounded lists and independent summaries.
-use crate::conversions::ChatListViewFfi;
+use crate::conversions::{ChatListViewFfi, ChatListViewQueryFfi};
 use crate::subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription};
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
@@ -7,45 +7,80 @@ use std::sync::Arc;
 #[uniffi::export]
 impl Marmot {
     /// Bind to one account/view. None defaults to 50; explicit sizes must be 1–100.
+    /// Same as `open_chat_list_query_window` with an unfiltered query.
     pub async fn open_chat_list_window(
         &self,
         account_ref: String,
         view: ChatListViewFfi,
         initial_rows: Option<u32>,
     ) -> Result<Arc<ChatListWindowSubscription>, MarmotKitError> {
+        self.open_chat_list_query_window(account_ref, view.into(), initial_rows)
+            .await
+    }
+    /// A live window over every chat `query` matches. The filter runs in SQL
+    /// before paging, so chats beyond the window still count. A chat enters or
+    /// leaves the window as soon as a fact its filter tests changes. None
+    /// defaults to 50 rows; explicit sizes must be 1–100. An invalid query fails
+    /// with `InvalidChatListQuery`, a malformed group ID with `InvalidHex`.
+    pub async fn open_chat_list_query_window(
+        &self,
+        account_ref: String,
+        query: ChatListViewQueryFfi,
+        initial_rows: Option<u32>,
+    ) -> Result<Arc<ChatListWindowSubscription>, MarmotKitError> {
+        let query = marmot_app::ChatListViewQuery::try_from(query)?;
         Ok(ChatListWindowSubscription::new(
             self.runtime
-                .open_chat_list_window(&account_ref, view.into(), initial_rows.map(|n| n as usize))
+                .open_chat_list_window(&account_ref, query, initial_rows.map(|n| n as usize))
                 .await?,
         ))
     }
-    /// Select all: every chat ID in `view`, in display order, including chats
-    /// beyond any open window; the count is the list length. Fails with
-    /// `ChatPresentationNotReady`, never a partial list, while base rows are
-    /// still being prepared; retry later.
+    /// Select all: every chat ID in `view`. Same as `chat_list_query_ids` with
+    /// an unfiltered query.
     pub async fn chat_list_ids(
         &self,
         account_ref: String,
         view: ChatListViewFfi,
     ) -> Result<Vec<String>, MarmotKitError> {
-        Ok(self
-            .runtime
-            .chat_list_ids(&account_ref, view.into())
-            .await?)
+        self.chat_list_query_ids(account_ref, view.into()).await
     }
-    /// The subset of `group_ids` still in `view`, in the caller's order with
-    /// duplicates dropped. Only removes; chats that joined the view since are
-    /// never added. Call it right before a bulk action, then run the existing
-    /// per-chat commands, which still check their own preconditions.
+    /// Select all: every chat ID `query` matches, in display order, including
+    /// chats beyond any open window; the count is the list length. Fails with
+    /// `ChatPresentationNotReady`, never a partial list, while base rows are
+    /// still being prepared; retry later.
+    pub async fn chat_list_query_ids(
+        &self,
+        account_ref: String,
+        query: ChatListViewQueryFfi,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        let query = marmot_app::ChatListViewQuery::try_from(query)?;
+        Ok(self.runtime.chat_list_ids(&account_ref, query).await?)
+    }
+    /// The subset of `group_ids` still in `view`. Same as
+    /// `revalidate_chat_list_query_ids` with an unfiltered query.
     pub async fn revalidate_chat_list_ids(
         &self,
         account_ref: String,
         view: ChatListViewFfi,
         group_ids: Vec<String>,
     ) -> Result<Vec<String>, MarmotKitError> {
+        self.revalidate_chat_list_query_ids(account_ref, view.into(), group_ids)
+            .await
+    }
+    /// The subset of `group_ids` still matching `query`, in the caller's order
+    /// with duplicates dropped. Only removes; chats that matched since are never
+    /// added. Call it right before a bulk action, then run the existing per-chat
+    /// commands, which still check their own preconditions.
+    pub async fn revalidate_chat_list_query_ids(
+        &self,
+        account_ref: String,
+        query: ChatListViewQueryFfi,
+        group_ids: Vec<String>,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        let query = marmot_app::ChatListViewQuery::try_from(query)?;
         Ok(self
             .runtime
-            .revalidate_chat_list_ids(&account_ref, view.into(), group_ids)
+            .revalidate_chat_list_ids(&account_ref, query, group_ids)
             .await?)
     }
     /// Signed-in local/external accounts, independent of any list or active worker.
@@ -266,6 +301,82 @@ mod tests {
             kit.revalidate_chat_list_ids(account, ChatListViewFfi::Chats, vec!["not hex".into()])
                 .await,
             Err(MarmotKitError::InvalidHex { .. })
+        ));
+        kit.runtime.shutdown_and_close().await.unwrap();
+    }
+
+    /// The node-list query reaches the same SQL filter for the window, select
+    /// all and revalidation, and a malformed node list is a typed refusal.
+    #[tokio::test]
+    async fn filtered_queries_cross_the_binding_as_node_lists() {
+        let (_relay, _dir, kit, account) = kit_with_groups(&["One", "Two", "Three"]).await;
+        let all = kit
+            .chat_list_ids(account.clone(), ChatListViewFfi::Chats)
+            .await
+            .unwrap();
+        kit.set_chat_manually_unread(account.clone(), all[0].clone(), true)
+            .unwrap();
+        let query = ChatListViewQueryFfi {
+            view: ChatListViewFfi::Chats,
+            filter: vec![
+                ChatListFilterNodeFfi::Any {
+                    children: vec![1, 2],
+                },
+                ChatListFilterNodeFfi::Condition {
+                    condition: ChatListConditionFfi::ManualUnread,
+                },
+                ChatListFilterNodeFfi::GroupIds {
+                    group_ids: vec![all[2].to_uppercase()],
+                },
+            ],
+        };
+        let expected = [all[0].clone(), all[2].clone()];
+        let window = kit
+            .open_chat_list_query_window(account.clone(), query.clone(), None)
+            .await
+            .unwrap();
+        let rows = window.snapshot().unwrap().rows;
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.row.group_id_hex.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            kit.chat_list_query_ids(account.clone(), query.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            kit.revalidate_chat_list_query_ids(account.clone(), query, all.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        let shared = ChatListViewQueryFfi {
+            view: ChatListViewFfi::Chats,
+            filter: vec![
+                ChatListFilterNodeFfi::All {
+                    children: vec![1, 1],
+                },
+                ChatListFilterNodeFfi::Condition {
+                    condition: ChatListConditionFfi::Pinned,
+                },
+            ],
+        };
+        assert!(matches!(
+            kit.chat_list_query_ids(account.clone(), shared.clone())
+                .await,
+            Err(MarmotKitError::InvalidChatListQuery {
+                reason: ChatListQueryErrorFfi::SharedChild
+            })
+        ));
+        assert!(matches!(
+            kit.open_chat_list_query_window(account, shared, None).await,
+            Err(MarmotKitError::InvalidChatListQuery {
+                reason: ChatListQueryErrorFfi::SharedChild
+            })
         ));
         kit.runtime.shutdown_and_close().await.unwrap();
     }

@@ -3057,6 +3057,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::IdentityKeyMismatch
         | AppError::InvalidKeyPackageEvent(_)
         | AppError::InvalidDirectorySearch(_)
+        | AppError::InvalidChatListQuery(_)
         | AppError::InvalidGroupProfile(_)
         | AppError::InvalidAppComponent(_)
         | AppError::InvalidNostrRouting(_)

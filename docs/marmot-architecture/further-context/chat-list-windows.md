@@ -14,8 +14,9 @@ presentation. It adds no migration or second conversation store.
 
 ## Ownership and delivery
 
-A handle belongs to one account, account-store lifetime, and `ChatListView`:
-Chats, Unread, Archived or Left. Open attaches runtime and presentation
+A handle belongs to one account, account-store lifetime, and chat-list query: a
+`ChatListView` (Chats, Unread, Archived or Left) optionally narrowed by a filter
+(see [Queries](#queries)). Open attaches runtime and presentation
 invalidations before reading the initial window. The new path never opens the
 legacy full-list subscription or performs its readiness/full-list read.
 
@@ -103,21 +104,72 @@ atomically restores membership and archive eligibility and updates the account
 worker's in-memory intent. Consented rejoin restores once; replay cannot undo a
 subsequent explicit archive. Existing membership push-share side effects remain.
 
+## Queries
+
+A chat-list query ([#2983](https://github.com/marmot-protocol/mdk/issues/2983)) is
+a base view plus an optional filter: `All`, `Any` and `Not` over leaf conditions.
+In Rust it is the `ChatListViewQuery` tree; a `ChatListView` converts into the
+unfiltered query, so the four views are the predefined queries and fixed-view
+calls are unchanged. UniFFI and C carry the filter as a flat node list: node 0 is
+the root, and every other node is the child of exactly one node listed before it,
+which makes the list acyclic with a single root by construction.
+`ChatListFilter::from_nodes` checks that shape (child in range, after its parent,
+not shared, every node reachable). UniFFI uses the node list too, so both bindings
+share one shape.
+
+Leaves are the facts the chat list already stores, each matching what the
+presented row shows: scope (active, archived, left, pending invitation); unread,
+manual unread and mention, which never match invitations or Left chats because
+their badges are hidden; pinned; pending leave and disbanding; a draft with
+non-blank text or an attachment; a last message showing a pending or failed send
+(an older unresolved send behind newer history does not count, as the row does
+not show it); and a group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
+`All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`, and an included ID
+never adds a chat outside the base view. An empty `All` matches every chat in the
+view and an empty `Any` none. Kind, mute, chat text, message text and people are
+later slices of #2983.
+
+A query has at most 8 levels, 64 nodes and 500 group IDs in all. Over a bound, or
+with a malformed node list, every consumer fails with `InvalidChatListQuery`
+before reading; host group IDs are normalized like any other host group ID.
+
+The filter compiles to SQL appended to the view's condition, ahead of keyset
+paging, with every value bound as a parameter. Reads still walk the view's page
+index in display order; each leaf is a `chat_list_rows` column or one keyed
+lookup per chat (account groups, engine leave and disband records, and the draft
+tables). Cost grows with the chats in the view, never with history. Cursors
+belong to the exact query that produced them.
+
+Filtered results are consistent within one read: each window read, `chat_list_ids`
+and `revalidate_chat_list_ids`. Only fixed-view cursors continue across reads;
+storage refuses a cursor with a filter (`FilteredCursorUnsupported`) up front,
+because the navigation revision that makes cursors stale covers the views'
+inputs, not drafts, manual unread, mentions, delivery state, invitations or
+leave and disband records. Cross-read filtered paging would need revision
+triggers on each of those inputs, a follow-up only if a host needs it. Windows
+never page with stored cursors, so they are unaffected.
+
+Windows re-read on almost every account change already. Drafts are the exception:
+a draft change wakes a window only when the chat is visible, unless the window's
+filter tests drafts, in which case any draft change in the account re-reads it.
+
 ## Select all
 
 A window holds at most 200 rows, so hosts must not derive "select all" or a bulk
-action's count from it. `chat_list_ids(account, view)` returns every ID in the
-view in display order from one read, using the view's indexed predicate; its cost
-grows with the view's chats, never with history. While base rows are pending it
-returns `ChatPresentationNotReady`, never a partial set, after repairing one bounded
-batch as a window read does. `revalidate_chat_list_ids(account, view, ids)` returns
-the still-eligible subset in the caller's order with duplicates dropped, and never
-adds chats that joined the view since.
+action's count from it. `chat_list_ids(account, query)` returns every ID the query
+matches in display order from one read, through the same compiled condition the
+window pages through; its cost grows with the view's chats, never with history.
+While base rows are pending it returns `ChatPresentationNotReady`, never a partial
+set, after repairing one bounded batch as a window read does.
+`revalidate_chat_list_ids(account, query, ids)` returns the still-matching subset
+in the caller's order with duplicates dropped, and never adds chats that matched
+since. The bindings name the query forms `open_chat_list_query_window`,
+`chat_list_query_ids` and `revalidate_chat_list_query_ids`; the fixed-view forms
+remain.
 
 Both calls are stateless. The host keeps checkbox state, revalidates right before a
 bulk action, then calls the existing per-chat commands, which check their own
-preconditions. Custom folders and search extend these calls with a typed query in
-[#2983](https://github.com/marmot-protocol/mdk/issues/2983).
+preconditions.
 
 M3 owns independent account attention summaries; M4 provides the
 [native binding contracts and consumer handoff](chat-projections-native.md). Full-dataset search and custom folders keep their existing

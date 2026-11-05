@@ -202,6 +202,9 @@ pub enum MarmotStatus {
     /// not proof of non-delivery or a terminal outcome. Keep native retry work.
     /// Detail contains only the artifact kind and coarse locally measured size.
     EventTooLarge = 119,
+    /// A chat-list query broke a size bound or its node list was not one tree.
+    /// Detail names the `MarmotChatListQueryError`; nothing was read.
+    InvalidChatListQuery = 120,
 }
 
 thread_local! {
@@ -324,6 +327,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::FollowListTooLarge => MarmotStatus::FollowListTooLarge,
         MarmotKitError::EventTooLarge { .. } => MarmotStatus::EventTooLarge,
+        MarmotKitError::InvalidChatListQuery { .. } => MarmotStatus::InvalidChatListQuery,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
         MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
@@ -449,6 +453,9 @@ mod tests {
             MarmotKitError::ChatWindowClosed,
             MarmotKitError::ChatWindowQuery {
                 details: "query".into(),
+            },
+            MarmotKitError::InvalidChatListQuery {
+                reason: marmot_uniffi::conversions::ChatListQueryErrorFfi::SharedChild,
             },
             MarmotKitError::ConsentRequired,
             MarmotKitError::InvalidProductAnalyticsConfiguration,
@@ -643,7 +650,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            110,
+            111,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

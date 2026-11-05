@@ -1,7 +1,7 @@
 ---
 title: "Native chat-list and account-attention handoff"
 created: 2026-09-14
-updated: 2026-10-17
+updated: 2026-11-05
 status: implementation
 ---
 
@@ -46,6 +46,15 @@ complete-row contract is broader than the selected identity/navigation work.
    departed/departing chats add nothing. Missing accounts have left the signed-in
    set. Do not substitute zero for unavailable entries or derive totals from loaded
    list rows. Counters are coherent per account, not across all databases at once.
+
+Custom folders and filtered lists open `openChatListQueryWindow(accountRef, query,
+initialRows)` with a `ChatListViewQueryFfi`: a base view plus a flat filter node
+list (node 0 is the root; children are later indices; see the
+[query rules](chat-list-windows.md#queries)). The handle and snapshots are the same
+as for a fixed view. `chatListQueryIds` and `revalidateChatListQueryIds` take the
+same query for select all, so a folder's list, count and selection agree. C uses
+`marmot_open_chat_list_query_window`, `marmot_chat_list_query_ids` and
+`marmot_revalidate_chat_list_query_ids` with a borrowed `MarmotChatListViewQuery`.
 
 The native snapshot deliberately does not serialize the Rust storage `first` and
 `last` cursors. They are internal boundaries owned by the window actor; no native

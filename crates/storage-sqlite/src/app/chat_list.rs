@@ -1,5 +1,6 @@
 mod attention;
 mod pages;
+mod query;
 mod selection;
 mod small_state;
 mod window;
@@ -25,6 +26,10 @@ use cgka_traits::storage::{StorageError, StorageResult};
 pub use pages::{
     ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
     ChatListView,
+};
+pub use query::{
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListQueryError, ChatListViewQuery,
+    MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,
 };
 use rusqlite::{Connection, OptionalExtension, Params, params};
 pub use selection::ChatListSelectionError;

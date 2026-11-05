@@ -1117,7 +1117,7 @@ pub async fn open_chat_list_window( &self, account_ref: String, view: ChatListVi
 
 Bind to one account/view. None defaults to 50; explicit sizes must be 1–100.
 
-[Source](src/commands/chat_window.rs#L10)
+[Source](src/commands/chat_window.rs#L11)
 
 ### `Marmot::chat_list_ids`
 
@@ -1129,7 +1129,7 @@ pub async fn chat_list_ids( &self, account_ref: String, view: ChatListViewFfi, )
 
 Select all: every chat ID in the view, in display order, including chats beyond the open window. The count is the list length. Use it for "select all" and bulk-action counts instead of the window's rows, which are bounded. While base rows are still being prepared it fails with `ChatPresentationNotReady` rather than returning a partial list; keep the action disabled and retry. The list is a snapshot: keep it as host checkbox state and call `revalidate_chat_list_ids` before acting.
 
-[Source](src/commands/chat_window.rs#L26)
+[Source](src/commands/chat_window.rs#L40)
 
 ### `Marmot::revalidate_chat_list_ids`
 
@@ -1141,7 +1141,43 @@ pub async fn revalidate_chat_list_ids( &self, account_ref: String, view: ChatLis
 
 The subset of a host selection still in the view, in the caller's order with duplicates dropped. It only removes: chats that joined the view after the selection was read are never added. IDs are normalized to lowercase hex, and a malformed ID fails the call with `InvalidHex`. Call it right before a bulk action, then run the existing per-chat commands (archive, local delete, leave), which still check their own preconditions; this read does not lock the selection.
 
-[Source](src/commands/chat_window.rs#L40)
+[Source](src/commands/chat_window.rs#L61)
+
+### `Marmot::open_chat_list_query_window`
+
+**Current.**
+
+```rust
+pub async fn open_chat_list_query_window( &self, account_ref: String, query: ChatListViewQueryFfi, initial_rows: Option<u32>, ) -> Result<Arc<ChatListWindowSubscription>, MarmotKitError>
+```
+
+`open_chat_list_window` narrowed by a filter: the same subscription, window policy and commands over the chats a `ChatListViewQueryFfi` matches. The query is a base `view` plus `filter`, a flat node list where node 0 is the root and every other node is the child of exactly one node listed before it; an empty list means no filter. `All`, `Any` and `Not` combine `Condition` leaves (scope, unread, manual unread, mention, pinned, pending leave, disbanding, has draft, pending or failed send) and `GroupIds`; an empty `All` matches every chat in the view and an empty `Any` none. Folder include/exclude lists are ordinary nodes, for example `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`. A malformed node list or a query over 8 levels, 64 nodes or 500 group IDs fails with `InvalidChatListQuery` before any read; a malformed group ID fails with `InvalidHex`. Use the same query value for the window, `chat_list_query_ids` and `revalidate_chat_list_query_ids` so list, count and selection agree.
+
+[Source](src/commands/chat_window.rs#L25)
+
+### `Marmot::chat_list_query_ids`
+
+**Current.**
+
+```rust
+pub async fn chat_list_query_ids( &self, account_ref: String, query: ChatListViewQueryFfi, ) -> Result<Vec<String>, MarmotKitError>
+```
+
+Select all for a filtered query: every chat ID the query matches, in display order, beyond the open window, from the same compiled condition the window pages through. Same readiness and snapshot rules as `chat_list_ids`, and the same query validation as `open_chat_list_query_window`.
+
+[Source](src/commands/chat_window.rs#L51)
+
+### `Marmot::revalidate_chat_list_query_ids`
+
+**Current.**
+
+```rust
+pub async fn revalidate_chat_list_query_ids( &self, account_ref: String, query: ChatListViewQueryFfi, group_ids: Vec<String>, ) -> Result<Vec<String>, MarmotKitError>
+```
+
+`revalidate_chat_list_ids` for a filtered query: the subset of a host selection that still matches, in the caller's order with duplicates dropped, never adding chats. Call it with the query the selection was read under, right before a bulk action.
+
+[Source](src/commands/chat_window.rs#L74)
 
 ### `Marmot::subscribe_account_attention`
 
@@ -1153,7 +1189,7 @@ pub async fn subscribe_account_attention( &self, ) -> Result<Arc<AccountAttentio
 
 Signed-in local/external accounts, independent of any list or active worker.
 
-[Source](src/commands/chat_window.rs#L52)
+[Source](src/commands/chat_window.rs#L87)
 
 </details>
 

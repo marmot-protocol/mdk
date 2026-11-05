@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add filtered chat-list queries (mdk#2983): `marmot_open_chat_list_query_window`, `marmot_chat_list_query_ids` and
+  `marmot_revalidate_chat_list_query_ids` take a borrowed `MarmotChatListViewQuery` whose filter is an array of
+  `MarmotChatListFilterNode` (kind and condition are `uint32_t` discriminants). Append
+  `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY` (120) for over-bound or malformed node arrays. Fixed-view functions are
+  unchanged. Use the matching header/library.
+
 - Add `marmot_chat_list_ids` and `marmot_revalidate_chat_list_ids` for select all over a whole chat-list view
   (mdk#2983). Both return a `MarmotStringList`; free it with `marmot_string_list_free`. Additive.
 
