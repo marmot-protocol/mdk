@@ -497,6 +497,18 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     );
 
     let used = made.key_package_ref_hex.clone();
+    // Refuse an active comparison while the old trusted copy still exists.
+    laptop.op(DeviceLinkOp::Start).await;
+    let busy = laptop
+        .client
+        .device_link(DeviceLinkOp::ResetForRepair)
+        .await;
+    assert!(
+        matches!(busy, Err(AppError::DeviceGroupRefused("device_group_busy"))),
+        "{busy:?}"
+    );
+    assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
+    laptop.op(DeviceLinkOp::Cancel).await;
     let reset = laptop.op(DeviceLinkOp::ResetForRepair).await;
     assert_eq!(reset.new_device, None);
     assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
@@ -523,13 +535,18 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
     // discarded copy. Publishing a new reference follows the ordinary owner.
     published_key_package(&mut laptop.client, &relay).await;
     laptop.op(DeviceLinkOp::Start).await;
-    assert!(matches!(
-        laptop
-            .client
-            .device_link(DeviceLinkOp::ResetForRepair)
-            .await,
-        Err(AppError::DeviceGroupRefused("device_group_busy"))
-    ));
+    let already_reset = laptop
+        .client
+        .device_link(DeviceLinkOp::ResetForRepair)
+        .await;
+    assert!(
+        matches!(
+            already_reset,
+            Err(AppError::DeviceGroupRefused("no_device_group"))
+        ),
+        "{already_reset:?}"
+    );
+    assert!(laptop.op(DeviceLinkOp::Read).await.new_device.is_some());
     laptop.op(DeviceLinkOp::Cancel).await;
     laptop = reopen(laptop).await;
     assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
