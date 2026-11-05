@@ -715,7 +715,14 @@
   marks the chat list stale and re-runs the presentation, avatar and attachment
   passes. A skipped checkpoint still marks the chat list stale when another
   connection committed since the last checkpoint, so a change another runtime
-  made, such as archiving a chat, still reaches this runtime's list.
+  made, such as archiving a chat, still reaches this runtime's list. The
+  chat list's stale mark is now a per-account generation: a refresh records
+  only the generation it started from, so an invalidation made while it runs
+  is kept, which the skipped 15 s save used to restore. Evicting an account's
+  caches now marks its chat list stale instead of clearing the mark. Writing
+  the account's own membership in a chat (leave, decline, removal, rejoin)
+  now marks the chat list stale itself, instead of waiting for a checkpoint
+  save that an idle account may skip.
 
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging

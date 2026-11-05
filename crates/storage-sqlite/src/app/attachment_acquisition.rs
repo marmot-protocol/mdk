@@ -19,10 +19,28 @@ pub const MAX_RETAINED_FILE_ATTACHMENT_BYTES: u64 = 900 * 1024 * 1024;
 pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
 pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
 
+/// An expired acquisition. The probe and the prune `DELETE` share this one
+/// predicate and its named parameter, so they cannot drift apart (mdk#2923).
+macro_rules! expired_acquisition {
+    () => {
+        "expires_at<=:now"
+    };
+}
+
 /// Whether any acquisition has expired, answered from the
 /// `attachment_acquisition_expiry` index.
-pub(crate) const EXPIRED_ACQUISITION_PROBE: &str =
-    "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE expires_at<=?1)";
+pub(crate) const EXPIRED_ACQUISITION_PROBE: &str = concat!(
+    "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE ",
+    expired_acquisition!(),
+    ")"
+);
+/// Up to `:limit` expired acquisitions, oldest expiry first.
+const EXPIRED_ACQUISITION_PRUNE: &str = concat!(
+    "DELETE FROM attachment_acquisition WHERE token IN (
+     SELECT token FROM attachment_acquisition WHERE ",
+    expired_acquisition!(),
+    " ORDER BY expires_at,token LIMIT :limit)"
+);
 const MAX_DESCRIPTOR_BYTES: usize = 16384;
 /// Consecutive local-readiness deferrals before a job fails. With 15-second
 /// doubling this spans about eight minutes: far beyond the normal readiness lag
@@ -993,16 +1011,18 @@ impl SqliteAppStorage {
         // codes every trigger and foreign-key action on the table, which
         // costs far more than the indexed probe (mdk#2923).
         let expired: bool = conn
-            .query_row_cached(EXPIRED_ACQUISITION_PROBE, params![now], |row| row.get(0))
+            .query_row_cached(
+                EXPIRED_ACQUISITION_PROBE,
+                rusqlite::named_params! { ":now": now },
+                |row| row.get(0),
+            )
             .storage()?;
         if !expired {
             return Ok(0);
         }
         conn.execute_cached(
-            "DELETE FROM attachment_acquisition WHERE token IN (
-             SELECT token FROM attachment_acquisition WHERE expires_at<=?1
-             ORDER BY expires_at,token LIMIT ?2)",
-            params![now, limit as i64],
+            EXPIRED_ACQUISITION_PRUNE,
+            rusqlite::named_params! { ":now": now, ":limit": limit as i64 },
         )
         .storage()
     }

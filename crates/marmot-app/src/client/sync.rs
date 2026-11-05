@@ -7304,7 +7304,9 @@ impl AppClient {
             group.self_membership = SelfMembership::Member;
         }
         self.mark_group_projection_dirty(group_id);
-        self.app.presentation_signals.wake();
+        // The durable restore already changed what the chat-list row shows:
+        // rebuild it on the next read instead of after the next save.
+        self.app.invalidate_chat_list_projection(&self.state.label);
     }
 
     fn display_names_for_events(

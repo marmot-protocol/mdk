@@ -646,8 +646,6 @@ pub struct MarmotApp {
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<ChatListStaleness>>,
-    /// Runs once inside the next chat-list refresh, after its generation
-    /// snapshot and before it records the rebuild.
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
     product_analytics: marmot_observability::ProductRecorder,
@@ -4611,7 +4609,10 @@ impl MarmotApp {
             return Ok(());
         }
         storage.set_group_self_membership(group_id_hex, membership)?;
-        self.presentation_signals.wake();
+        // The chat-list row keeps its own copy of the membership. Nothing
+        // else rewrites it, and an idle account may skip the checkpoint save
+        // that used to mark the list stale (mdk#2923).
+        self.invalidate_chat_list_projection(&account.label);
         Ok(())
     }
 
@@ -8246,20 +8247,6 @@ impl ChatListStaleness {
     /// snapshot and can never mark a later invalidation rebuilt.
     fn forget(&mut self, label: &str) {
         self.invalidate(label);
-    }
-
-    /// Whether `label` is stale; the name tests used for the old set.
-    #[cfg(test)]
-    fn contains(&self, label: &str) -> bool {
-        self.is_stale(label)
-    }
-
-    /// Treat every account as rebuilt, so a test sees only later marks.
-    #[cfg(test)]
-    fn clear(&mut self) {
-        for (generation, rebuilt) in self.0.values_mut() {
-            *rebuilt = *generation;
-        }
     }
 }
 

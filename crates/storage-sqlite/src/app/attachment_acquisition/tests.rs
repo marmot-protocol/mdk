@@ -3722,7 +3722,10 @@ fn storage_parked_checkpoints_are_exempt_from_idle_expiry() {
             .unwrap()
             .query_row(
                 super::partial::EXPIRED_PARTIAL_PROBE,
-                rusqlite::params![now as i64, exempt_after as i64],
+                rusqlite::named_params! {
+                    ":now": now as i64,
+                    ":exempt_after": exempt_after as i64,
+                },
                 |row| row.get(0),
             )
             .unwrap()
