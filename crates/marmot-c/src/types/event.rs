@@ -4,7 +4,7 @@ use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{GroupEventKindFfi, MarmotEventFfi};
 
-use super::group::MarmotAppGroupHydrationQuarantineReason;
+use super::group::{MarmotAppGroupHydrationQuarantineReason, MarmotEventSizeClass};
 use super::message::MarmotRuntimeMessageReceived;
 use super::timeline::MarmotRuntimeProjectionUpdate;
 use crate::memory::{CFree, free_c_string, owned_c_string, owned_opt_c_string};
@@ -309,6 +309,11 @@ pub enum MarmotEvent {
         group_id_hex: *mut c_char,
         message_id_hex: *mut c_char,
         recipient_hex: *mut c_char,
+        /// False means Unknown. Query pending deliveries for later causes;
+        /// this notice remains once per process/Welcome.
+        has_size_class: bool,
+        /// Only meaningful when has_size_class is true.
+        size_class: MarmotEventSizeClass,
     },
     /// This device armed `arms` epoch-gap backfills with no catch-up in
     /// between: the group cannot catch up; re-syncing is recommended.
@@ -474,12 +479,15 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 group_id_hex,
                 message_id_hex,
                 recipient_hex,
+                size_class,
             } => Self::WelcomeDeliveryPending {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
                 group_id_hex: owned_c_string(group_id_hex),
                 message_id_hex: owned_c_string(message_id_hex),
                 recipient_hex: owned_c_string(recipient_hex),
+                has_size_class: size_class.is_some(),
+                size_class: size_class.map(Into::into).unwrap_or_default(),
             },
             F::EpochStallEscalated {
                 account_id_hex,
@@ -667,6 +675,7 @@ impl CFree for MarmotEvent {
                     group_id_hex,
                     message_id_hex,
                     recipient_hex,
+                    ..
                 } => {
                     free_c_string(*account_id_hex);
                     free_c_string(*account_label);

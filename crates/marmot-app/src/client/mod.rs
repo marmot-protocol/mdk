@@ -7520,8 +7520,8 @@ impl AppClient {
     /// member stays in the roster but cannot join until the Welcome is
     /// re-delivered. Each Welcome is announced once per process; the engine
     /// still owes it, so a failed write only leaves the row to the next
-    /// reconcile. A failure without a group (the startup retry's) is left to
-    /// that reconcile too.
+    /// reconcile. Later attempts update only the best-effort diagnosis, even
+    /// after this process has announced the handle; query it for that change.
     pub(crate) fn note_welcome_delivery_failures(
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
@@ -7531,12 +7531,6 @@ impl AppClient {
             let Some(group_id) = &failure.group_id else {
                 continue;
             };
-            if !self
-                .announced_welcome_failures
-                .insert(failure.message_id.clone())
-            {
-                continue;
-            }
             let message_id_hex = hex::encode(failure.message_id.as_slice());
             let group_id_hex = hex::encode(group_id.as_slice());
             let recipient_hex = hex::encode(failure.recipient.as_slice());
@@ -7544,12 +7538,17 @@ impl AppClient {
                 .app
                 .account_storage(&self.state.label)
                 .and_then(|storage| {
-                    Ok(storage.app_storage().record_pending_welcome_delivery(
-                        &message_id_hex,
-                        &group_id_hex,
-                        &recipient_hex,
-                        recorded_at,
-                    )?)
+                    Ok(storage
+                        .app_storage()
+                        .record_pending_welcome_delivery_failure(
+                            &storage_sqlite::PendingWelcomeDeliveryRecord {
+                                message_id_hex: message_id_hex.clone(),
+                                group_id_hex: group_id_hex.clone(),
+                                recipient_hex: recipient_hex.clone(),
+                                recorded_at,
+                                size_class: failure.size_class,
+                            },
+                        )?)
                 });
             if let Err(error) = recorded {
                 tracing::warn!(
@@ -7559,9 +7558,15 @@ impl AppClient {
                     "pending Welcome delivery left to the next reconcile"
                 );
             }
+            if !self
+                .announced_welcome_failures
+                .insert(failure.message_id.clone())
+            {
+                continue;
+            }
             self.pending_welcome_delivery_events
                 .push(PendingWelcomeDelivery {
-                    size_class: None,
+                    size_class: failure.size_class,
                     group_id_hex,
                     message_id_hex,
                     recipient_hex,
@@ -7966,7 +7971,7 @@ impl AppClient {
             .into_iter()
             .filter(|record| self.host_may_see_group_hex(&record.group_id_hex))
             .map(|record| PendingWelcomeDelivery {
-                size_class: None,
+                size_class: record.size_class,
                 group_id_hex: record.group_id_hex,
                 message_id_hex: record.message_id_hex,
                 recipient_hex: record.recipient_hex,
@@ -7991,6 +7996,7 @@ impl AppClient {
         let work = async move {
             let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
             let effects = self.runtime.redeliver_welcome(&message_id).await?;
+            self.note_welcome_delivery_failures(&effects);
             // Only clear the durable pending record once every "still undelivered"
             // signal agrees the welcome landed: no PublishFailure, no structured
             // WelcomeDeliveryFailure, and a report that met its ack threshold.

@@ -55,23 +55,49 @@ impl SqliteAppStorage {
         for record in records {
             tx.execute_cached(
                 "INSERT INTO app_pending_welcome_delivery (
-                    message_id_hex, group_id_hex, recipient_hex, recorded_at
+                    message_id_hex, group_id_hex, recipient_hex, recorded_at, size_class
                  )
-                 VALUES (?1, ?2, ?3, ?4)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(message_id_hex) DO UPDATE SET
                     group_id_hex = excluded.group_id_hex,
                     recipient_hex = excluded.recipient_hex,
-                    recorded_at = excluded.recorded_at",
+                    recorded_at = excluded.recorded_at,
+                    size_class = excluded.size_class",
                 params![
                     record.message_id_hex,
                     record.group_id_hex,
                     record.recipient_hex,
-                    u64_to_i64(record.recorded_at)?
+                    u64_to_i64(record.recorded_at)?,
+                    record.size_class.map(cgka_traits::EventSizeClass::as_str)
                 ],
             )
             .storage()?;
         }
         tx.commit().storage()?;
+        Ok(())
+    }
+
+    /// Note a failed attempt without changing an existing repair handle's
+    /// identity or oldest-first position. This annotation never owns retries.
+    pub fn record_pending_welcome_delivery_failure(
+        &self,
+        record: &PendingWelcomeDeliveryRecord,
+    ) -> StorageResult<()> {
+        self.lock()?
+            .execute_cached(
+                "INSERT INTO app_pending_welcome_delivery (
+                    message_id_hex, group_id_hex, recipient_hex, recorded_at, size_class
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(message_id_hex) DO UPDATE SET size_class = excluded.size_class",
+                params![
+                    record.message_id_hex,
+                    record.group_id_hex,
+                    record.recipient_hex,
+                    u64_to_i64(record.recorded_at)?,
+                    record.size_class.map(cgka_traits::EventSizeClass::as_str)
+                ],
+            )
+            .storage()?;
         Ok(())
     }
 
@@ -82,14 +108,20 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT message_id_hex, group_id_hex, recipient_hex, recorded_at
+                "SELECT message_id_hex, group_id_hex, recipient_hex, recorded_at, size_class
                  FROM app_pending_welcome_delivery
                  ORDER BY recorded_at ASC, message_id_hex ASC",
             )
             .storage()?;
         let records = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
             })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
@@ -97,9 +129,12 @@ impl SqliteAppStorage {
         records
             .into_iter()
             .map(
-                |(message_id_hex, group_id_hex, recipient_hex, recorded_at)| {
+                |(message_id_hex, group_id_hex, recipient_hex, recorded_at, size_class)| {
                     Ok(PendingWelcomeDeliveryRecord {
-                        size_class: None,
+                        // Old rows and unknown future annotations keep their
+                        // repair pointer; only the diagnosis becomes Unknown.
+                        size_class: size_class
+                            .and_then(|value| serde_json::from_value(value.into()).ok()),
                         message_id_hex,
                         group_id_hex,
                         recipient_hex,
@@ -154,6 +189,32 @@ mod tests {
                 recipient_hex: "cc2".to_owned(),
                 recorded_at: 9,
             }
+        );
+        let mut diagnosis = PendingWelcomeDeliveryRecord {
+            message_id_hex: "aa".into(),
+            group_id_hex: "must-not-replace-group".into(),
+            recipient_hex: "must-not-replace-recipient".into(),
+            recorded_at: 99,
+            size_class: Some(cgka_traits::EventSizeClass::From128To256Kib),
+        };
+        store
+            .record_pending_welcome_delivery_failure(&diagnosis)
+            .unwrap();
+        let mut expected = records[0].clone();
+        expected.size_class = diagnosis.size_class;
+        assert_eq!(store.list_pending_welcome_deliveries().unwrap(), [expected]);
+        diagnosis.size_class = None;
+        store
+            .record_pending_welcome_delivery_failure(&diagnosis)
+            .unwrap();
+        assert_eq!(store.list_pending_welcome_deliveries().unwrap(), records);
+        store.lock().unwrap().execute(
+            "UPDATE app_pending_welcome_delivery SET size_class = 'future_unrecognized_class' WHERE message_id_hex = 'aa'", [],
+        ).unwrap();
+        assert_eq!(
+            store.list_pending_welcome_deliveries().unwrap(),
+            records,
+            "a future annotation must not hide the valid repair pointer"
         );
     }
 

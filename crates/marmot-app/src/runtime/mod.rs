@@ -1567,6 +1567,9 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
         message_id_hex: String,
         recipient_hex: String,
+        /// Coarse size refusal when proved; None means Unknown. This notice
+        /// stays once per process/Welcome; query pending deliveries for later causes.
+        size_class: Option<cgka_traits::EventSizeClass>,
     },
     /// This device has armed `arms` epoch-gap backfills for `group_id` without
     /// catching up: it is still stalled at `stalled_epoch` while the group has

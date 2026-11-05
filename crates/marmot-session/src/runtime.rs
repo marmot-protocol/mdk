@@ -5709,7 +5709,7 @@ where
                 && let Some(recipient) = welcome_recipient(&fanout.request().message)
             {
                 output.welcome_failures.push(WelcomeDeliveryFailure {
-                    size_class: None,
+                    size_class: OversizedEvent::of_fanout(&fanout).map(|cause| cause.size_class),
                     message_id: fanout.message_id().clone(),
                     recipient,
                     group_id: fanout.group_id().cloned(),
@@ -6178,6 +6178,10 @@ where
                 StorageError::Busy("injected finish-stage failure".into()),
             )));
         }
+        // Diagnostic only: retain legacy publication's conservative exposure,
+        // retry and rollback decisions below. Its coarse durable prior-attempt
+        // records cannot reconstruct a definitive earlier refusal.
+        let oversized = OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result);
         let report = match result {
             Ok(report) => report,
             Err(error) => {
@@ -6269,7 +6273,7 @@ where
                     },
                 );
                 output.failures.push(PublishFailure {
-                    oversized: None,
+                    oversized,
                     message_id,
                     reason: error.to_string(),
                 });
@@ -6353,7 +6357,7 @@ where
                 },
             );
             output.failures.push(PublishFailure {
-                oversized: None,
+                oversized,
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
             });
@@ -7153,6 +7157,35 @@ pub struct OversizedEvent {
 }
 
 impl OversizedEvent {
+    fn of_first_legacy_welcome_attempt(
+        fanout: &DurableTransportFanout,
+        result: &Result<TransportPublishReport, TransportAdapterError>,
+    ) -> Option<Self> {
+        if !matches!(
+            fanout.exact_message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) || fanout.possible_exposure
+            || fanout.targets.iter().any(|target| {
+                target.attempt_count != 0 || target.state == TransportFanoutAttemptState::Accepted
+            })
+        {
+            return None;
+        }
+        let failures: &[TransportEndpointFailure] = match result {
+            Ok(report) if report.accepted.is_empty() => &report.failed,
+            Ok(_) => return None,
+            Err(error) => error.publish_endpoint_failures(),
+        };
+        let size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+            fanout.target.endpoints(),
+            failures,
+        )?;
+        Some(Self {
+            artifact: OversizedArtifact::Welcome,
+            size_class,
+        })
+    }
+
     fn of_fanout(fanout: &OutboundFanout) -> Option<Self> {
         if fanout.possible_exposure()
             || fanout.outcome().accepted_targets != 0

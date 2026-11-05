@@ -23,6 +23,43 @@ use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, optional_str, required_str};
 
+c_enum! {
+    /// Coarse serialized event size, not an inferred relay limit. Only read
+    /// when the corresponding has_size_class flag is true.
+    MarmotEventSizeClass from marmot_uniffi::EventSizeClassFfi {
+        Under64Kib,
+        From64To128Kib,
+        From128To256Kib,
+        From256To512Kib,
+        From512KibTo1Mib,
+        From1To2Mib,
+        From2To4Mib,
+        Over4Mib,
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for MarmotEventSizeClass {
+    fn default() -> Self {
+        Self::Under64Kib
+    }
+}
+
+c_mirror! {
+    /// A retained Welcome repair handle after an Add has already confirmed.
+    /// Unknown includes legacy rows and later coarse retry outcomes; it does
+    /// not clear the debt. Requires the matching library and header.
+    MarmotPendingWelcomeDelivery from marmot_uniffi::PendingWelcomeDeliveryFfi,
+    free marmot_pending_welcome_delivery_free,
+    list(MarmotPendingWelcomeDeliveryList, marmot_pending_welcome_delivery_list_free) {
+        str group_id_hex,
+        str message_id_hex,
+        str recipient_hex,
+        copy recorded_at: u64,
+        opt_copy has_size_class/size_class: MarmotEventSizeClass,
+    }
+}
+
 c_mirror! {
     /// Opaque application-owned group state. Empty data is distinct from absence.
     MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_group_app_component_free {

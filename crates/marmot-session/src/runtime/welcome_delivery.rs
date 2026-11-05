@@ -437,14 +437,26 @@ where
         // `publish_one` pushes exactly one `PublishFailure` on each failing
         // path (routing, adapter, required_acks); the defensive fallback only
         // guards against that contract changing.
-        let reason = output
-            .failures
-            .get(failures_before..)
-            .and_then(<[PublishFailure]>::last)
+        let failure = output.failures.get(failures_before..).and_then(|failures| {
+            failures
+                .iter()
+                .rev()
+                .find(|failure| failure.message_id == message_id)
+        });
+        let reason = failure
             .map(|failure| failure.reason.clone())
             .unwrap_or_else(|| "welcome publish failed".into());
+        let group_id = group_id.or_else(|| {
+            self.session
+                .stored_sent_welcome(&message_id)
+                .ok()
+                .map(|(group_id, _)| group_id)
+        });
         WelcomeDeliveryFailure {
-            size_class: None,
+            size_class: failure
+                .and_then(|failure| failure.oversized)
+                .filter(|cause| cause.artifact == super::OversizedArtifact::Welcome)
+                .map(|cause| cause.size_class),
             message_id,
             recipient,
             group_id,

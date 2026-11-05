@@ -40,6 +40,7 @@ pub use deployment::{
 // the C ABI can never drift from the Swift/Kotlin surface.
 pub mod conversions;
 pub use conversions::AttachmentAcquisitionModeFfi;
+pub use conversions::PendingWelcomeDeliveryFfi;
 mod errors;
 mod external_signer;
 mod markdown;

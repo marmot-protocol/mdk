@@ -8948,6 +8948,7 @@ fn publish_pending_welcome_delivery_events(
             group_id: GroupId::new(group_id_bytes),
             message_id_hex: pending.message_id_hex,
             recipient_hex: pending.recipient_hex,
+            size_class: pending.size_class,
         });
     }
 }

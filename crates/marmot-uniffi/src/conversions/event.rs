@@ -84,6 +84,9 @@ pub enum MarmotEventFfi {
         group_id_hex: String,
         message_id_hex: String,
         recipient_hex: String,
+        /// None means Unknown. Query pending deliveries for later causes;
+        /// this notice remains once per process/Welcome.
+        size_class: Option<crate::EventSizeClassFfi>,
     },
     /// This device armed `arms` epoch-gap history backfills for the group with
     /// no sign in between that it caught up: it is still at `stalled_epoch`.
@@ -501,12 +504,14 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 group_id,
                 message_id_hex,
                 recipient_hex,
+                size_class,
             } => Self::WelcomeDeliveryPending {
                 account_id_hex,
                 account_label,
                 group_id_hex: hex::encode(group_id.as_slice()),
                 message_id_hex,
                 recipient_hex,
+                size_class: size_class.map(Into::into),
             },
             MarmotAppEvent::EpochStallEscalated {
                 account_id_hex,
