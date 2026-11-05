@@ -11,12 +11,14 @@
 //! effective screen badge values, account summaries or native bindings. Those follow in M2-M4.
 //! Account attention reuses these keys and additionally counts active pending invitations;
 //! the Unread list continues to exclude invitations.
+use super::query::{ChatListQueryError, ChatListViewQuery, CompiledQuery};
 use crate::base::connection::CachedSql;
 use crate::{ChatListRow, SqliteAppStorage, SqliteResultExt, deserialize};
 use cgka_traits::storage::StorageError;
 use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus, LeaveRequest};
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatListView {
@@ -38,13 +40,14 @@ pub enum ChatListPageDirection {
 
 /// Opaque account-local boundary. Not a resumable cross-restart sync token.
 /// Any navigation change in this account invalidates it, including changes in another view.
+/// It belongs to the exact query (view and filter) that produced it.
 /// Staleness is normal under traffic: runtime windows must reconcile using stable anchors,
 /// not retry the same cursor or append an independently recovered page to an old window.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChatListCursor {
     store_epoch: Vec<u8>,
     revision: i64,
-    view: ChatListView,
+    query: Arc<ChatListViewQuery>,
     key: SortKey,
 }
 
@@ -87,19 +90,29 @@ impl ChatListView {
     }
 }
 
+// Filter parameters come first (`?1..?n`); boundary keys and the limit follow.
 fn navigation_sql(
-    view: ChatListView,
+    query: &CompiledQuery,
     relation: Option<&str>,
     direction: ChatListPageDirection,
     exists: bool,
 ) -> String {
+    let n = query.params.len();
     let boundary = relation
-        .map(|op| format!(" AND {KEY} {op} (?1, ?2, ?3, ?4)"))
+        .map(|op| {
+            format!(
+                " AND {KEY} {op} (?{}, ?{}, ?{}, ?{})",
+                n + 1,
+                n + 2,
+                n + 3,
+                n + 4
+            )
+        })
         .unwrap_or_default();
     let from = format!(
         "FROM chat_list_rows INDEXED BY {} WHERE {}{boundary}",
-        view.index(),
-        view.predicate()
+        query.view.index(),
+        query.predicate
     );
     if exists {
         return format!("SELECT EXISTS(SELECT 1 {from})");
@@ -111,7 +124,7 @@ fn navigation_sql(
     };
     format!(
         "SELECT {KEY_COLUMNS} {from} ORDER BY {order} LIMIT ?{}",
-        if relation.is_some() { 5 } else { 1 }
+        n + if relation.is_some() { 5 } else { 1 }
     )
 }
 
@@ -126,14 +139,14 @@ fn key_params(key: &SortKey) -> Vec<Value> {
 
 fn has_rows(
     tx: &Connection,
-    view: ChatListView,
+    query: &CompiledQuery,
     key: &SortKey,
     relation: &str,
 ) -> Result<bool, ChatListPageError> {
     Ok(tx
         .query_row_cached(
-            &navigation_sql(view, Some(relation), ChatListPageDirection::Forward, true),
-            params_from_iter(key_params(key)),
+            &navigation_sql(query, Some(relation), ChatListPageDirection::Forward, true),
+            params_from_iter(query.params.iter().cloned().chain(key_params(key))),
             |r| r.get(0),
         )
         .storage()?)
@@ -147,7 +160,7 @@ impl std::fmt::Debug for ChatListCursor {
 
 #[derive(Clone, Debug)]
 pub struct ChatListPageQuery {
-    pub view: ChatListView,
+    pub query: ChatListViewQuery,
     pub limit: usize,
     pub direction: ChatListPageDirection,
     pub cursor: Option<ChatListCursor>,
@@ -170,12 +183,20 @@ pub enum ChatListPageError {
         "chat window requires 1 to 200 rows, at most 200 anchors, and an anchor position within the window"
     )]
     InvalidWindowQuery,
-    #[error("chat cursor belongs to a different account store or view")]
+    #[error("chat cursor belongs to a different account store or query")]
     CursorMismatch,
     #[error("chat list ordering or membership changed; refresh the window")]
     StaleCursor,
-    #[error("chat anchor is absent or no longer matches the selected view")]
+    /// A cursor passed with a filtered query. Filtered results are consistent
+    /// only within one read: the cursor revision does not cover every filter
+    /// input, so a later page could silently skip a chat. Restarting would hit
+    /// this error again; read filtered pages in one window or ID read instead.
+    #[error("filtered chat-list queries do not support cursors across reads")]
+    FilteredCursorUnsupported,
+    #[error("chat anchor is absent or no longer matches the selected query")]
     AnchorUnavailable,
+    #[error(transparent)]
+    InvalidQuery(#[from] ChatListQueryError),
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -189,14 +210,14 @@ impl SqliteAppStorage {
     /// neighboring identity without inferring disappearance from an empty successful page.
     pub fn chat_list_page_from_anchor(
         &self,
-        view: ChatListView,
+        query: impl Into<ChatListViewQuery>,
         group: &str,
         limit: usize,
         direction: ChatListPageDirection,
     ) -> Result<ChatListPage, ChatListPageError> {
         self.read_chat_list_page(
             ChatListPageQuery {
-                view,
+                query: query.into(),
                 limit,
                 direction,
                 cursor: None,
@@ -210,6 +231,8 @@ impl SqliteAppStorage {
     /// Limits are 1..=100. With no cursor, Forward starts at the top and Backward at the end.
     /// Returned rows always follow display order. Any membership/order change conservatively
     /// invalidates existing cursors; runtime windows must refresh, never splice stale pages.
+    /// Cursors continue fixed-view (unfiltered) queries only: a cursor with a filter returns
+    /// `FilteredCursorUnsupported`, since filtered results are consistent within one read.
     /// Raw read intent is preserved here; screen-effective badge suppression belongs to the
     /// additive presented window contract, not a mutation of stored unread state.
     pub fn chat_list_page(
@@ -226,6 +249,11 @@ impl SqliteAppStorage {
         if !(1..=100).contains(&query.limit) {
             return Err(ChatListPageError::InvalidLimit);
         }
+        // Decided from the request alone, never from revision timing: the
+        // navigation revision covers the fixed views' inputs, not every filter's.
+        if query.cursor.is_some() && query.query.filter.is_some() {
+            return Err(ChatListPageError::FilteredCursorUnsupported);
+        }
         self.connection
             .with_deferred_read(|conn| read_page_tx(conn, query, anchor))
     }
@@ -238,11 +266,16 @@ pub(super) fn read_page_tx(
     mut query: ChatListPageQuery,
     anchor: Option<&str>,
 ) -> Result<ChatListPage, ChatListPageError> {
+    let compiled = query.query.compile()?;
+    let identity = match &query.cursor {
+        Some(cursor) if *cursor.query == query.query => cursor.query.clone(),
+        _ => Arc::new(query.query.clone()),
+    };
     let (store_epoch, revision): (Vec<u8>, i64) = tx.query_row_cached(
             "SELECT p.store_epoch, n.revision FROM chat_presentation_meta p, chat_list_navigation_meta n WHERE p.id = 1 AND n.id = 1",
             [], |r|Ok((r.get(0)?, r.get(1)?))).storage()?;
     if let Some(cursor) = &query.cursor {
-        if cursor.store_epoch != store_epoch || cursor.view != query.view {
+        if cursor.store_epoch != store_epoch || *cursor.query != query.query {
             return Err(ChatListPageError::CursorMismatch);
         }
         if cursor.revision != revision {
@@ -253,10 +286,11 @@ pub(super) fn read_page_tx(
         let key = tx
                 .query_row_cached(
                     &format!(
-                        "SELECT {KEY_COLUMNS} FROM chat_list_rows WHERE lower(group_id_hex) = lower(?1) AND {}",
-                        query.view.predicate()
+                        "SELECT {KEY_COLUMNS} FROM chat_list_rows WHERE {} AND lower(group_id_hex) = lower(?{})",
+                        compiled.predicate,
+                        compiled.params.len() + 1
                     ),
-                    [group],
+                    params_from_iter(compiled.params.iter().cloned().chain([Value::from(group.to_owned())])),
                     |r| {
                         Ok(SortKey {
                             section: r.get(0)?,
@@ -272,7 +306,7 @@ pub(super) fn read_page_tx(
         query.cursor = Some(ChatListCursor {
             store_epoch: store_epoch.clone(),
             revision,
-            view: query.view,
+            query: identity.clone(),
             key,
         });
     }
@@ -285,19 +319,17 @@ pub(super) fn read_page_tx(
             (ChatListPageDirection::Backward, true) => "<=",
             (ChatListPageDirection::Backward, false) => "<",
         });
-    let mut parameters = query
-        .cursor
-        .as_ref()
-        .map(|c| key_params(&c.key))
-        .unwrap_or_default();
+    let mut parameters = compiled.params.clone();
+    parameters.extend(
+        query
+            .cursor
+            .as_ref()
+            .map(|c| key_params(&c.key))
+            .unwrap_or_default(),
+    );
     parameters.push((query.limit as i64).into());
     let mut statement = tx
-        .prepare_cached(&navigation_sql(
-            query.view,
-            relation,
-            query.direction,
-            false,
-        ))
+        .prepare_cached(&navigation_sql(&compiled, relation, query.direction, false))
         .storage()?;
     let mut keys = statement
         .query_map(params_from_iter(parameters), |r| {
@@ -318,21 +350,21 @@ pub(super) fn read_page_tx(
     let cursor = |key: &SortKey| ChatListCursor {
         store_epoch: store_epoch.clone(),
         revision,
-        view: query.view,
+        query: identity.clone(),
         key: key.clone(),
     };
     let first = keys.first().map(&cursor);
     let last = keys.last().map(cursor);
     let (has_more_before, has_more_after) = match (keys.first(), keys.last()) {
         (Some(first), Some(last)) => (
-            has_rows(tx, query.view, first, "<")?,
-            has_rows(tx, query.view, last, ">")?,
+            has_rows(tx, &compiled, first, "<")?,
+            has_rows(tx, &compiled, last, ">")?,
         ),
         _ => match &query.cursor {
             Some(c) if query.direction == ChatListPageDirection::Forward => {
-                (has_rows(tx, query.view, &c.key, "<=")?, false)
+                (has_rows(tx, &compiled, &c.key, "<=")?, false)
             }
-            Some(c) => (false, has_rows(tx, query.view, &c.key, ">=")?),
+            Some(c) => (false, has_rows(tx, &compiled, &c.key, ">=")?),
             None => (false, false),
         },
     };

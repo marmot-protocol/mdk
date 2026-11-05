@@ -172,6 +172,10 @@ pub enum AppError {
     DirectConversationIndexNotReady,
     #[error("chat presentation preparation is incomplete; retry after local maintenance")]
     ChatPresentationNotReady,
+    /// A chat-list query broke a size bound or its node list was not one tree.
+    /// Nothing was read.
+    #[error("invalid chat-list query: {0}")]
+    InvalidChatListQuery(storage_sqlite::ChatListQueryError),
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
     #[error("invalid public event reference batch: {0}")]
@@ -650,6 +654,7 @@ impl AppError {
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::ChatPresentationNotReady => "chat_presentation_not_ready",
+            Self::InvalidChatListQuery(_) => "invalid_chat_list_query",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
             Self::InvalidPublicEventReferences(_) => "invalid_public_event_references",

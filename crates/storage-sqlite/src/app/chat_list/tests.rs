@@ -172,7 +172,7 @@ fn assert_preview_retention(
     rows.push(app.chat_list_row(GROUP).unwrap().unwrap());
     rows.extend(
         app.chat_list_page(crate::ChatListPageQuery {
-            view: crate::ChatListView::Chats,
+            query: crate::ChatListView::Chats.into(),
             limit: 10,
             direction: crate::ChatListPageDirection::Forward,
             cursor: None,
@@ -5091,7 +5091,7 @@ fn debug_output_hides_avatar_keys_and_cursor_positions() {
     store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let cursor = store
         .chat_list_page(ChatListPageQuery {
-            view: ChatListView::Chats,
+            query: ChatListView::Chats.into(),
             limit: 10,
             direction: ChatListPageDirection::Forward,
             cursor: None,

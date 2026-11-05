@@ -1,4 +1,5 @@
 use super::*;
+use crate::ChatListView;
 use crate::SqliteAccountStorage;
 use rusqlite::params;
 
@@ -35,7 +36,7 @@ fn ids_cover_the_whole_view_past_the_display_limit() {
         }
         let display = app
             .chat_list_page(crate::ChatListPageQuery {
-                view: ChatListView::Chats,
+                query: ChatListView::Chats.into(),
                 limit: 50,
                 direction: crate::ChatListPageDirection::Forward,
                 cursor: None,
@@ -72,7 +73,7 @@ fn ids_match_each_native_view_and_its_display_page() {
         assert_eq!(app.chat_list_ids(view).unwrap(), expected, "{view:?}");
         let page = app
             .chat_list_page(crate::ChatListPageQuery {
-                view,
+                query: view.into(),
                 limit: 100,
                 direction: crate::ChatListPageDirection::Forward,
                 cursor: None,

@@ -3160,7 +3160,7 @@ unsafe fn byte_array(ptr: *const u8, len: usize) -> Result<Vec<u8>, MarmotStatus
 }
 
 /// Borrow-check a required input-struct pointer.
-unsafe fn borrowed<'a, T>(ptr: *const T) -> Result<&'a T, MarmotStatus> {
+pub(crate) unsafe fn borrowed<'a, T>(ptr: *const T) -> Result<&'a T, MarmotStatus> {
     if ptr.is_null() {
         crate::status::set_last_error("required struct argument was NULL");
         return Err(MarmotStatus::NullPointer);
@@ -4416,6 +4416,76 @@ pub unsafe extern "C" fn marmot_revalidate_chat_list_ids(
                 client.block_on(client.marmot.revalidate_chat_list_ids(
                     account_ref,
                     view,
+                    group_ids,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Select all for a filtered query: every chat ID `query` matches, in display
+/// order, including chats beyond any open window; the count is the list
+/// length. `query` is borrowed. Returns `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY`
+/// for a query over a size bound or a node array that is not one tree, and
+/// `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY`, never a partial list, while base
+/// rows are still being prepared. Free with `marmot_string_list_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, `query` a valid
+/// `MarmotChatListViewQuery`, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_chat_list_query_ids(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    query: *const crate::types::chat_window::MarmotChatListViewQuery,
+    out: *mut *mut MarmotStringList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let query = try_arg!(unsafe { borrowed(query) });
+        let query = try_arg!(unsafe { query.to_ffi() });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.chat_list_query_ids(account_ref, query)),
+                out,
+            )
+        }
+    })
+}
+
+/// The subset of `group_ids` still matching `query`, in the caller's order with
+/// duplicates dropped. Only removes; chats that matched since are never added.
+/// Call it right before a bulk action, then run the existing per-chat commands.
+/// Free with `marmot_string_list_free`.
+///
+/// # Safety
+/// The client must be live, `query` a valid `MarmotChatListViewQuery`,
+/// `group_ids` must hold `group_ids_len` valid strings (or be NULL with length
+/// 0), and out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_revalidate_chat_list_query_ids(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    query: *const crate::types::chat_window::MarmotChatListViewQuery,
+    group_ids: *const *const c_char,
+    group_ids_len: usize,
+    out: *mut *mut MarmotStringList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let query = try_arg!(unsafe { borrowed(query) });
+        let query = try_arg!(unsafe { query.to_ffi() });
+        let group_ids = try_arg!(unsafe { str_array(group_ids, group_ids_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.revalidate_chat_list_query_ids(
+                    account_ref,
+                    query,
                     group_ids,
                 )),
                 out,

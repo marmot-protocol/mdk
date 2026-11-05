@@ -1012,7 +1012,8 @@ async fn invalid_window_query_is_distinct_from_readiness() {
         label: "alice".into(),
         account_id: f.account_id.clone(),
         store_epoch: vec![],
-        view: ChatListView::Chats,
+        query: ChatListView::Chats.into(),
+        drafts_anywhere: false,
     };
     let result = reader
         .read(
@@ -1674,4 +1675,164 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
         assert_eq!(capabilities.participation, participation);
         assert!(!capabilities.can_leave && !capabilities.requires_self_demote_before_leave);
     }
+}
+
+fn filtered(filter: ChatListFilter) -> ChatListViewQuery {
+    ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(filter),
+    }
+}
+
+/// Drafts otherwise wake a window only for visible rows. A filter on drafts
+/// must re-read when a chat off screen gains or loses one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_filtered_window_rereads_on_an_off_screen_draft_change() {
+    let f = Fixture::new(5);
+    let mut window = f
+        .runtime
+        .open_chat_list_window(
+            "alice",
+            filtered(ChatListFilter::Condition(ChatListCondition::HasDraft)),
+            Some(3),
+        )
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    f.app
+        .save_message_draft("alice", "0003", "later", None, vec![])
+        .unwrap();
+    assert_eq!(ids(&next(&mut window).await), ["0003"]);
+    f.app.delete_message_draft("alice", "0003").unwrap();
+    assert!(next(&mut window).await.rows.is_empty());
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Chats enter and leave a filtered window as the filtered fact changes, the
+/// window always equals the head of the same query's complete ID set, and no
+/// row appears twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_window_tracks_chats_entering_and_leaving_without_duplicates() {
+    let f = Fixture::new(30);
+    let query = filtered(ChatListFilter::All(vec![
+        ChatListFilter::Condition(ChatListCondition::ManualUnread),
+        // Host IDs are normalized before the read.
+        ChatListFilter::Not(Box::new(ChatListFilter::GroupIds(vec!["001A".into()]))),
+    ]));
+    let mut window = f
+        .runtime
+        .open_chat_list_window("alice", query.clone(), Some(4))
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    let check = |snapshot: &ChatListWindowSnapshot, all: &[String]| {
+        let shown = ids(snapshot);
+        let unique = shown.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), shown.len(), "duplicate rows: {shown:?}");
+        assert_eq!(
+            shown,
+            all[..shown.len()]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot.has_more_after, all.len() > shown.len());
+    };
+    let mut entered = Vec::new();
+    let mut current = window.snapshot.clone();
+    for id in ["0012", "0003", "001a", "0017", "0008", "001c"] {
+        f.mark_unread(id);
+        if id != "001a" {
+            entered.push(id);
+        }
+        let all = f
+            .runtime
+            .chat_list_ids("alice", query.clone())
+            .await
+            .unwrap();
+        let mut expected = entered.clone();
+        expected.sort();
+        assert_eq!(all, expected);
+        let head = all[..all.len().min(4)]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let more = all.len() > head.len();
+        // An excluded chat changes nothing, so no replacement is published.
+        if ids(&current) != head || current.has_more_after != more {
+            current = next_where(&mut window, |w| ids(w) == head && w.has_more_after == more).await;
+        }
+        check(&current, &all);
+    }
+    // Hold the second row as the anchor, then make it leave the filter: the
+    // window recovers on a neighbor rather than splicing a stale page.
+    let handle = window.window_handle();
+    let anchored = handle
+        .set_visible_anchor(current.sequence, "0008")
+        .await
+        .unwrap();
+    assert!(matches!(
+        anchored.anchor,
+        ChatListAnchorOutcome::Retained { index: 1, .. }
+    ));
+    f.store
+        .app_storage()
+        .set_chat_manually_unread(&f.account_id, "0008", false, &|_, _| false)
+        .unwrap();
+    f.signal();
+    let left = next_where(&mut window, |w| !ids(w).contains(&"0008")).await;
+    assert!(matches!(
+        left.anchor,
+        ChatListAnchorOutcome::Recovered { .. }
+    ));
+    let all = f
+        .runtime
+        .chat_list_ids("alice", query.clone())
+        .await
+        .unwrap();
+    assert_eq!(all, ["0003", "0012", "0017", "001c"]);
+    check(&left, &all);
+    assert_eq!(
+        f.runtime
+            .revalidate_chat_list_ids(
+                "alice",
+                query,
+                vec!["001C".into(), "0008".into(), "001a".into()]
+            )
+            .await
+            .unwrap(),
+        ["001c"]
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_queries_fail_before_any_read() {
+    let f = Fixture::new(2);
+    let too_many = filtered(ChatListFilter::GroupIds(vec![
+        "00".into();
+        MAX_CHAT_LIST_FILTER_GROUP_IDS
+            + 1
+    ]));
+    assert!(matches!(
+        f.runtime.open_chat_list_window("alice", too_many.clone(), None).await,
+        Err(ChatListWindowError::App(error))
+            if matches!(error.as_ref(), AppError::InvalidChatListQuery(ChatListQueryError::TooManyGroupIds))
+    ));
+    assert!(matches!(
+        f.runtime.chat_list_ids("alice", too_many).await,
+        Err(AppError::InvalidChatListQuery(
+            ChatListQueryError::TooManyGroupIds
+        ))
+    ));
+    assert!(matches!(
+        f.runtime
+            .chat_list_ids(
+                "alice",
+                filtered(ChatListFilter::GroupIds(vec!["zz".into()]))
+            )
+            .await,
+        Err(AppError::Hex(_))
+    ));
+    f.runtime.shutdown_and_close().await.unwrap();
 }

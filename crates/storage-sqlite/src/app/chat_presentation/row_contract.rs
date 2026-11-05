@@ -84,19 +84,23 @@ impl ChatListRowActions {
     }
 }
 
+/// Unicode White_Space, matching Rust `str::trim`. A draft is shown (and the
+/// chat-list `HasDraft` filter matches) only when its content trimmed of these
+/// is non-empty or it has an attachment.
+pub(crate) const DRAFT_WHITE_SPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+
 pub(crate) fn selected_preview_tx(
     conn: &rusqlite::Connection,
     row: &ChatListRow,
 ) -> StorageResult<SelectedChatPreview> {
-    // Unicode White_Space matches Rust str::trim. SQL bounds the returned text
-    // before Rust allocation; even a huge selected draft never crosses this boundary whole.
-    const WHITE_SPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+    // SQL bounds the returned text before Rust allocation; even a huge
+    // selected draft never crosses this boundary whole.
     let bytes: Option<Vec<u8>> = conn
         .query_row_cached(
             "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'') FROM message_drafts WHERE group_id_hex=?1",
             params![
                 row.group_id_hex,
-                WHITE_SPACE,
+                DRAFT_WHITE_SPACE,
                 ((CHAT_LIST_DRAFT_PREVIEW_CHARS + 1) * 4) as i64
             ],
             |r| r.get(0),
