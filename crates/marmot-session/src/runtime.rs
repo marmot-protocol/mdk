@@ -7256,7 +7256,8 @@ pub struct WelcomeDeliveryFailure {
     /// best-effort.
     pub group_id: Option<GroupId>,
     pub reason: String,
-    /// Coarse size refusal when proved; absent means Unknown, never delivered.
+    /// Coarse size refusal when proved. An absent value means Unknown and is
+    /// evidence of neither delivery nor non-delivery.
     pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 

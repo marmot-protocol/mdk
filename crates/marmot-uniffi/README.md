@@ -925,8 +925,8 @@ MDK continues its existing retry behavior; this diagnosis neither removes the me
 rolls back the confirmed Add, or declares the obligation terminal. Hosts can distinguish a known size refusal
 from an unexplained delivery problem without receiving relay details or another account's device information.
 
-Regenerate Swift/Kotlin bindings with the matching native library: the event gains a field and the pending
-query returns a new record. The account database adds one nullable annotation to each existing repair row;
+The event gains a field and the pending query returns a new record. The account database adds one nullable
+annotation to each existing repair row;
 older native builds supporting only schema 0176 cannot reopen the migrated database. There is no wire change or
 additional diagnostic network traffic.
 
