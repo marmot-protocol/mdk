@@ -146,9 +146,9 @@ impl AppClient {
     /// Take a message from a device-group event and hand it to the feature
     /// that owns its kind. Anything else is ignored, and so is anything that
     /// feature finds not addressed to this device. A refused message is
-    /// logged and dropped. An error means a sibling Welcome could not be
-    /// checked or kept: the event's projection fails and is retried, as any
-    /// failed projection write is.
+    /// logged and dropped. An error checking or keeping a sibling Welcome, or
+    /// a non-refusal history-delivery error, fails the event's projection and is
+    /// retried, as any failed projection write is.
     pub(crate) fn observe_device_group_event(
         &mut self,
         event: &GroupEvent,

@@ -530,18 +530,20 @@ mod tests {
     #[test]
     fn conversation_host_outcomes_and_runtime_snapshots_cross_bindings() {
         let telemetry = marmot_app::AppPerformanceTelemetry::default();
-        for outcome in [
-            HostPerformanceOutcomeFfi::Success,
-            HostPerformanceOutcomeFfi::Failure,
-            HostPerformanceOutcomeFfi::Cancelled,
-            HostPerformanceOutcomeFfi::Timeout,
-            HostPerformanceOutcomeFfi::Unavailable,
+        for (outcome, count) in [
+            (HostPerformanceOutcomeFfi::Success, 1),
+            (HostPerformanceOutcomeFfi::Failure, 2),
+            (HostPerformanceOutcomeFfi::Cancelled, 3),
+            (HostPerformanceOutcomeFfi::Timeout, 4),
+            (HostPerformanceOutcomeFfi::Unavailable, 5),
         ] {
-            telemetry.record_host_performance(
-                HostPerformanceOperationFfi::ConversationComposerReady.into(),
-                Duration::from_millis(100),
-                outcome.into(),
-            );
+            for _ in 0..count {
+                telemetry.record_host_performance(
+                    HostPerformanceOperationFfi::ConversationComposerReady.into(),
+                    Duration::from_millis(100),
+                    outcome.into(),
+                );
+            }
         }
         let snapshot: AppPerformanceSnapshotFfi = telemetry.snapshot().into();
         assert_eq!(
@@ -559,7 +561,7 @@ mod tests {
             .iter()
             .find(|s| s.operation == "host_conversation_composer_ready")
             .unwrap();
-        assert_eq!((s.started, s.completed, s.in_flight), (5, 5, 0));
+        assert_eq!((s.started, s.completed, s.in_flight), (15, 15, 0));
         assert_eq!(
             (
                 s.successes,
@@ -568,9 +570,9 @@ mod tests {
                 s.timeouts,
                 s.not_ready
             ),
-            (1, 1, 1, 1, 1)
+            (1, 2, 3, 4, 5)
         );
-        assert_eq!(s.duration_ms.sum_ms, 500);
+        assert_eq!(s.duration_ms.sum_ms, 1_500);
     }
 
     #[test]
@@ -615,12 +617,26 @@ mod tests {
                 marmot_app::HostPerformanceOutcome::Success,
             );
         }
+        telemetry.record_host_performance(
+            HostPerformanceOperationFfi::InboundMessageVisible.into(),
+            Duration::from_millis(150),
+            marmot_app::HostPerformanceOutcome::Failure,
+        );
         let snapshot: AppPerformanceSnapshotFfi = telemetry.snapshot().into();
         assert_eq!(
             snapshot.host_outbound_message_visible.duration_ms.sum_ms,
             75
         );
         assert_eq!(snapshot.host_inbound_message_visible.successes, 1);
+        assert_eq!(snapshot.host_inbound_message_visible.attempts, 2);
+        assert_eq!(snapshot.host_inbound_message_visible.failures, 1);
+        assert_eq!(
+            snapshot.host_inbound_message_visible.duration_ms.sum_ms,
+            225
+        );
+        assert_eq!(snapshot.host_outbound_message_visible.attempts, 1);
+        assert_eq!(snapshot.host_outbound_message_visible.successes, 1);
+        assert_eq!(snapshot.host_outbound_message_visible.failures, 0);
     }
 
     #[test]

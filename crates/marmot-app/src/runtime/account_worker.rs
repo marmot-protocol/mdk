@@ -2262,7 +2262,12 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                         )
                         .await;
+                        let step = shared
+                            .observer
+                            .performance()
+                            .observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
                         dispatch_history_blobs(&mut client, &media_http);
+                        step.finish(TelemetryOutcome::Success);
                     }
                     ComparisonRecoveryOrigin::PostConvergence {
                         audit_tracker_update,
@@ -3265,8 +3270,14 @@ async fn run_app_runtime_account_worker(
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
                 avatar_due = false;
+                let step = shared.observer.performance().observe(RuntimeOp::WorkerAvatarPass);
                 let identities = avatar_identities.run(&client, &account_id_hex);
                 let acquisition = schedule_avatar_acquisition(&client, &media_http, &mut avatar_resumed);
+                step.finish(if identities.is_ok() && acquisition.is_ok() {
+                    TelemetryOutcome::Success
+                } else {
+                    TelemetryOutcome::Failure
+                });
                 avatar_due |= identities.as_ref().is_ok_and(|more| *more)
                     || acquisition.as_ref().is_ok_and(|more| *more);
                 if identities.is_err() || acquisition.is_err() {
@@ -3295,7 +3306,10 @@ async fn run_app_runtime_account_worker(
             _ = tokio::task::yield_now(), if presentation_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
                 avatar_due = true;
-                presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
+                let step = shared.observer.performance().observe(RuntimeOp::WorkerPresentationPass);
+                let presentation = presentation_maintenance.run(&client, &account_id_hex);
+                step.finish_app(&presentation);
+                presentation_due = match presentation {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
@@ -3309,7 +3323,10 @@ async fn run_app_runtime_account_worker(
             }
             _ = tokio::task::yield_now(), if attachment_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
-                attachment_due = match attachments::schedule(&client, &shared, &media_http, &mut attachment_admission) {
+                let step = shared.observer.performance().observe(RuntimeOp::WorkerAttachmentPass);
+                let attachment = attachments::schedule(&client, &shared, &media_http, &mut attachment_admission);
+                step.finish_app(&attachment);
+                attachment_due = match attachment {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
@@ -3342,17 +3359,25 @@ async fn run_app_runtime_account_worker(
                     continue 'worker;
                 }
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
-                if client.backfill_content_reports().is_err() {
+                // Each phase below is also timed on its own, so a profile can
+                // name the one an idle tick spends its time in (mdk#2923).
+                let telemetry = shared.observer.performance().clone();
+                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
+                let backfill = client.backfill_content_reports();
+                step.finish_app(&backfill);
+                if backfill.is_err() {
                     tracing::warn!(
                         target: "marmot_app::account_worker",
                         method = "maintenance_tick",
                         "report backfill deferred"
                     );
                 }
+                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
                 run_legacy_message_promotion_batch(
                     &client,
                     &mut legacy_message_promotion,
                 );
+                step.finish(TelemetryOutcome::Success);
                 // Pairing timers, KeyPackage retries and link settlement.
                 client.drive_device_pairing().await;
                 if client.device_unlinked() {
@@ -3360,13 +3385,16 @@ async fn run_app_runtime_account_worker(
                     phase.finish(TelemetryOutcome::Success);
                     continue 'worker;
                 }
+                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
                 attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
+                step.finish(TelemetryOutcome::Success);
                 attachments::spawn_legacy_migration(
                     &client,
                     &shared,
                     &mut attachment_admission,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
                     let observation = shared.observer.product().begin(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
                     );
@@ -3378,6 +3406,11 @@ async fn run_app_runtime_account_worker(
                         Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
                         Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
                     };
+                    step.finish(match outcome {
+                        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
+                        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
+                        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
+                    });
                     if let Some(observation) = observation {
                         observation.finish(outcome.as_str());
                     }
@@ -3454,14 +3487,17 @@ async fn run_app_runtime_account_worker(
                 // completed, which only time passing shows; the tick counts
                 // it and notices joins that completed. Repair asks wait for
                 // the same clock, and replies for their rank's slots.
+                let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
                 client.advance_push_join_windows().await;
                 if client.has_due_push_announce() || client.has_due_push_repair() {
                     scheduled_push_retry.observe_pending(true, &command_tx);
                 }
+                step.finish(TelemetryOutcome::Success);
                 scheduled_runtime_group_subscription_refresh.observe_pending(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
                 );
+                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceRecovery);
                 let backfill_armed = client.has_pending_epoch_backfill();
                 let observation = backfill_armed.then(|| shared.observer.product().begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
@@ -3478,6 +3514,7 @@ async fn run_app_runtime_account_worker(
                         execution,
                         network,
                     } => {
+                        step.finish(TelemetryOutcome::Success);
                         comparison_recovery = Some(ComparisonRecoveryJob::new(
                             *grant,
                             execution,
@@ -3491,6 +3528,11 @@ async fn run_app_runtime_account_worker(
                     }
                     PendingRecoveryJob::Settled(result) => result,
                 };
+                let selection = if backfill_result.is_ok() {
+                    TelemetryOutcome::Success
+                } else {
+                    TelemetryOutcome::Failure
+                };
                 let _ = report_pending_epoch_backfill_result(
                     &mut client,
                     backfill_result, backfill_armed,
@@ -3502,6 +3544,7 @@ async fn run_app_runtime_account_worker(
                         shared: &shared,
                     },
                 ).await;
+                step.finish(selection);
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
                     &events,
@@ -3512,7 +3555,9 @@ async fn run_app_runtime_account_worker(
                     &mut scheduled_convergence,
                 )
                 .await;
+                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
                 dispatch_history_blobs(&mut client, &media_http);
+                step.finish(TelemetryOutcome::Success);
 
                 phase.finish(TelemetryOutcome::Success);
             }
@@ -3704,7 +3749,11 @@ async fn finish_periodic_maintenance_after_recovery(
     product_backlog: &marmot_observability::ProductBacklogSource,
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
-    if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
+    let telemetry = shared.observer.performance();
+    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePostJoin);
+    let post_join = client.advance_post_join_maintenance_subscriptions().await;
+    step.finish_app(&post_join);
+    if let Err(err) = post_join {
         publish_app_runtime_account_error(
             events,
             account_id_hex,
@@ -3713,7 +3762,10 @@ async fn finish_periodic_maintenance_after_recovery(
         );
     }
     let backlog_permit = shared.observer.product().permit();
-    match client.run_due_maintenance().await {
+    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceDue);
+    let due = client.run_due_maintenance().await;
+    step.finish_app(&due);
+    match due {
         Ok(summary) => {
             if let Some(permit) = &backlog_permit {
                 product_backlog.sample(

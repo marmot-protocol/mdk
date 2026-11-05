@@ -530,8 +530,8 @@ impl AppClient {
 
     /// The Blossom servers this device uploads `chat`'s history to: the
     /// chat's Blossom endpoints, each named as a delivery can name it, once,
-    /// loopback ones only in a build that allows them. Refused when there are
-    /// none.
+    /// allowed by the transport's static contact policy. Refused when there
+    /// are none; DNS and transfer failures still retry.
     fn history_blossom_servers(&self, chat: &GroupId) -> Result<Vec<String>, AppError> {
         let allow_loopback = self.app.allow_loopback_blob_endpoints();
         // A lookup failure stays an error, to retry; a chat with no media
@@ -544,7 +544,7 @@ impl AppClient {
             .into_iter()
             .filter(|endpoint| endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1)
             .filter_map(|endpoint| blossom_server_for_endpoint(&endpoint.base_url))
-            .filter(|server| allow_loopback || !crate::media::is_loopback_http_endpoint(server))
+            .filter(|server| crate::media::blossom_upload_endpoint_allowed(server, allow_loopback))
             .fold(Vec::new(), |mut servers, server| {
                 if !servers.contains(&server) {
                     servers.push(server);

@@ -551,6 +551,11 @@
 
 ### Fixed
 
+- `prune_expired_attachment_acquisitions` and `prune_attachment_partials`
+  answer "nothing expired" from their expiry indexes and run their cached
+  `DELETE` only when a row has expired. Compiling that `DELETE` coded every
+  trigger and foreign-key action on the table on every call (mdk#2923).
+
 - `delete_group` joins a caller's `with_transaction` instead of beginning its
   own, which failed inside one, so the engine's cleanup of a failed group
   creation now removes the group's MLS state.

@@ -887,8 +887,8 @@ The group-event firehose distinguishes account-level timeline activity from
 `GroupMemberLeavesRemoved`. MDK applies their membership, pending-send and
 notification effects before host delivery; these events create no system row.
 Use them to refresh presentation, and handle the new variants when regenerating
-Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
-terminal-copy recovery through the managed scheduler.
+Swift/Kotlin bindings. Retained-history engine rollback does not automatically
+recover a local copy that has applied its own removal.
 
 ## Queued sends the group refuses
 
@@ -1063,6 +1063,17 @@ a committed demotion remains if the following Leave fails. Already admitted nati
 owner. A SelfRemove applied without readable sibling attribution establishes no new automatic-Add hold, and later
 repair does not promise to recover that attribution retroactively.
 
+A local chat copy that has applied its own removal stays terminal: later branch changes do not resume convergence
+on that copy. Rejoining requires a fresh valid Welcome that replaces its cryptographic state; an invitation alone is
+not a guarantee of recovery. The remaining members do not promise to recommit every removal forever. An admin's
+account-removal intent has at most two reissues, targeting members still in the selected membership. The rebuilt
+commit must pass the author's current admin-authority check when it is sent; otherwise the queued send is refused
+and retired. Device-removal cleanup has its own current-roster and remembered-key conditions. An eligible chat admin
+can remove a stale member account with `remove_members`, which removes every leaf of that account, including its
+active devices; it is not a per-device cleanup control. Removing a linked device is a separate device-group action.
+Automatic inactivity removal is not available yet. Keep showing the selected membership and removal outcome rather
+than assuming every branch has permanently removed a leaf.
+
 At the maximum decision version, an opposite invitation choice is refused and the held winner remains; ordinary User
 Leave still proceeds without writing another version. Retained invitation generations have no expiry or count cap:
 a malicious currently linked device can inflate stored decisions and broadcast pages.
@@ -1125,7 +1136,9 @@ This does not recall deliveries already handed off or change what another device
 A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
-of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
+of that device wins as a whole, even if it changed a different toggle. Once an edit is retired because another edit
+stands or the device leaves the roster, a later branch that removes that rival does not restore the retired local
+choice. To apply it again, edit the device once it is listed in the selected roster. Refresh the displayed label and flags on
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
 
 ### Moving this device to another device group
@@ -1193,6 +1206,20 @@ signing out too (mdk#2628):
   `group_leave_failures`, and sets `siblings_not_reached`. Tell the user their other devices couldn't be asked, and
   that those devices may still list this one until the user removes it from one of them.
 - The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
+
+Signing out is device-only and does not submit an account-wide Leave decision or automatically demote the account.
+An active-admin account cannot self-remove, even with another admin present, so this device's leaf can remain in an
+admin chat. A separate admin-policy change affects the account on all its devices. Before the account can leave the
+chat entirely, another account must be an active admin; an eligible sibling can still remove this device while the
+account remains an admin. This limit also applies without linked devices.
+
+Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
+roster entry already carrying its tag signature key. Removal also needs a chat that supports same-account device
+removal and the required tagged leaves;
+`groups_left_to_siblings` is a handoff, not a completed-removal receipt. `groups_left` counts successful local leave
+calls, not confirmed membership removal. The call still attempts local account deletion after remote leave
+failures. Show the chats in `group_leave_failures` and check `local_cleanup.completed` independently; local cleanup
+completion does not establish that this device left every chat.
 
 ### Overdue KeyPackage refresh
 

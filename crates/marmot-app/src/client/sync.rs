@@ -6834,6 +6834,55 @@ impl AppClient {
         let pending_inputs = self.pending_seen_event_count;
         let pending_acks = self.pending_application_event_acks.len();
         let pending_frontiers = self.pending_local_group_deletion_frontier_clears.len();
+        // Nothing to persist: maintenance saves after every tick. Skipping the
+        // write also skips the chat-list stale mark and presentation wake,
+        // which would otherwise force a full chat-list rebuild and set off
+        // another attachment pass (mdk#2923).
+        let max_cursor =
+            unix_now_seconds().saturating_add(crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs());
+        let storage = self.app.account_storage(&self.state.label);
+        let nothing_to_persist = changed_groups == 0
+            && pending_acks == 0
+            && pending_frontiers == 0
+            && created_group_id_hex.is_none()
+            && self.checkpointed_transport_timestamp == self.saved_transport_timestamp
+            // A cursor beyond the allowed future skew (the clock moved back)
+            // still needs the save that clamps it, whether this client saved
+            // it or another process did. Only a save that carries a cursor
+            // can clamp a stored one: with none, the save leaves it as is, so
+            // a stored future cursor alone does not force it.
+            && self.saved_transport_timestamp.is_none_or(|cursor| {
+                cursor <= max_cursor
+                    && storage
+                        .as_ref()
+                        .map_err(|_| ())
+                        .and_then(|storage| {
+                            storage
+                                .app_storage()
+                                .stored_transport_cursor(&self.state.label)
+                                .map_err(|_| ())
+                        })
+                        .is_ok_and(|stored| stored.is_none_or(|cursor| cursor <= max_cursor))
+            });
+        // Receipts synchronize once per save: released receipts can add seen
+        // events, and a retry of a failed synchronization could succeed and
+        // hide the failure. The save below reuses this result, so an error
+        // still fails the save and records its span.
+        let mut synchronized_seen_events = None;
+        if nothing_to_persist {
+            match self.transport_receipts() {
+                Ok(receipts) => {
+                    let seen_events = receipts.pending_seen_events();
+                    if seen_events.is_empty() {
+                        self.invalidate_chat_list_after_foreign_commit(storage.ok());
+                        self.flush_live_v5_events();
+                        return Ok(None);
+                    }
+                    synchronized_seen_events = Some(Ok(seen_events));
+                }
+                Err(error) => synchronized_seen_events = Some(Err(error)),
+            }
+        }
         let message_ref = (pending_acks == 1)
             .then(|| self.pending_application_event_acks.iter().next())
             .flatten()
@@ -6874,6 +6923,14 @@ impl AppClient {
         #[cfg(not(test))]
         let audit_fail_before_commit = false;
         let mut known_not_committed = audit_fail_before_commit;
+        // Taken before the save: a foreign commit during or after it stays
+        // visible to the next skip, at the cost of one extra rebuild. A read
+        // after the save could already include a commit the chat list
+        // rebuilt before (mdk#2923).
+        let pre_save_commit_version = storage
+            .as_ref()
+            .ok()
+            .and_then(|storage| storage.app_storage().foreign_commit_version().ok());
         let result = (|| {
             #[cfg(test)]
             if audit_fail_before_commit {
@@ -6881,8 +6938,11 @@ impl AppClient {
                     "injected v5 probe checkpoint failure".into(),
                 ));
             }
-            let seen_events = match self.transport_receipts() {
-                Ok(receipts) => receipts.pending_seen_events(),
+            let seen_events = match synchronized_seen_events.take().unwrap_or_else(|| {
+                self.transport_receipts()
+                    .map(|receipts| receipts.pending_seen_events())
+            }) {
+                Ok(seen_events) => seen_events,
                 Err(error) => {
                     // This failed before either projection save entry point.
                     // The checkpoint itself therefore did not commit.
@@ -6934,6 +6994,7 @@ impl AppClient {
                 )?;
                 None
             };
+            self.saved_transport_timestamp = self.checkpointed_transport_timestamp;
             self.pending_seen_event_count = 0;
             self.pending_group_projection_updates.clear();
             self.pending_local_group_deletion_frontier_clears.clear();
@@ -6942,6 +7003,24 @@ impl AppClient {
         })();
         if let Some(observation) = observation {
             observation.finish_app(&result);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.test_after_checkpoint_save.take() {
+            hook();
+        }
+        if result.is_ok() {
+            // A delta save marks the whole chat list stale, so it covers
+            // every foreign commit before it. A created-row save refreshes
+            // only its new row (the whole list only when other groups were
+            // dirty too), so it compares versions as a skip does: a foreign
+            // commit since the last checkpoint invalidates the list here.
+            if created_group_id_hex.is_some()
+                && (pre_save_commit_version.is_none()
+                    || self.observed_commit_version != pre_save_commit_version)
+            {
+                self.app.invalidate_chat_list_projection(&self.state.label);
+            }
+            self.observed_commit_version = pre_save_commit_version;
         }
         if let Some(probe) = &mut self.audit_v5_probe {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
@@ -6982,6 +7061,43 @@ impl AppClient {
             });
         }
         result
+    }
+
+    /// A skipped checkpoint still invalidates the chat list when another
+    /// connection committed since the last checkpoint: the save it replaces marked
+    /// the list stale, and that was how a change another runtime made, such
+    /// as archiving a chat, reached this runtime's warmed list. The first
+    /// skip after open, or after a failed read, has no version to compare
+    /// and invalidates too. Commits by this process's engine connection also
+    /// move the version, so this can invalidate more often than needed,
+    /// never less.
+    fn invalidate_chat_list_after_foreign_commit(
+        &mut self,
+        storage: Option<storage_sqlite::SqliteAccountStorage>,
+    ) {
+        let version =
+            storage.and_then(|storage| storage.app_storage().foreign_commit_version().ok());
+        // An unknown previous version, the first skip after open or after a
+        // failed read, cannot rule out a foreign commit before it, so it
+        // invalidates too: at most one extra rebuild per open.
+        let invalidate = version.is_none() || self.observed_commit_version != version;
+        if invalidate {
+            self.app.invalidate_chat_list_projection(&self.state.label);
+        }
+        self.observed_commit_version = version;
+        // Zero-duration counts: how often a skip still costs a chat-list
+        // rebuild tells whether something commits on idle ticks.
+        if let Some(telemetry) = self.runtime_telemetry.as_ref() {
+            telemetry.record_runtime(
+                if invalidate {
+                    RuntimeOp::ProjectionCheckpointSkippedInvalidated
+                } else {
+                    RuntimeOp::ProjectionCheckpointSkipped
+                },
+                std::time::Duration::ZERO,
+                TelemetryOutcome::Success,
+            );
+        }
     }
 
     /// Withdraw app rows when the engine actually discarded this device's queue.
@@ -7267,7 +7383,9 @@ impl AppClient {
             group.self_membership = SelfMembership::Member;
         }
         self.mark_group_projection_dirty(group_id);
-        self.app.presentation_signals.wake();
+        // The durable restore already changed what the chat-list row shows:
+        // rebuild it on the next read instead of after the next save.
+        self.app.invalidate_chat_list_projection(&self.state.label);
     }
 
     fn display_names_for_events(
