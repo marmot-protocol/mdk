@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Invalid device-roster marker edits now return the additive Rust `AccountError::InvalidDeviceRosterEdit`,
+  rather than an engine serialization error. Lower-level Rust callers matching those errors should adopt the
+  new case. The privacy kind is `account_invalid_device_roster_edit`; the Protocol sync class, CLI `engine_error`
+  code and foreign Runtime categories are unchanged. No schema, wire or foreign ABI migration is required.
+
 - Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
   Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
   setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.
