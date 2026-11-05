@@ -38,7 +38,9 @@ mod group_image;
 mod host_safety;
 
 use blossom::{blossom_content_hash_from_url, upload_blossom_blob_with_content_type};
-pub(crate) use blossom::{delete_blossom_blob, upload_blossom_blob};
+pub(crate) use blossom::{
+    blossom_upload_endpoint_allowed, delete_blossom_blob, upload_blossom_blob,
+};
 use crypto::{
     canonical_media_type_v1, canonical_media_type_v2, media_nonce_from_reference,
     validate_sha256_hex,
