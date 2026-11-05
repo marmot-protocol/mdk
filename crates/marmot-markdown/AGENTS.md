@@ -8,7 +8,7 @@ Markdown parser and typed AST for app message rendering. For the human overview,
 - Keep this crate independent from CGKA engine, storage, transport, and runtime state.
 - Parse plaintext message content into a display-oriented AST only; do not define wire format or persistence policy here.
 - Keep the parser dependency-light. Runtime dependencies are `serde`, `idna` (strict
-  internationalized-host validation) and `unicode-script` (CJK/Thai prose ambiguity); avoid adding a URL/network stack. `serde_json` is a dev-dependency only. `unsafe_code` is forbidden.
+  internationalized-host validation) and `unicode-script` (Han/Hiragana/Katakana/Thai prose ambiguity); avoid adding a URL/network stack. `serde_json` is a dev-dependency only. `unsafe_code` is forbidden.
 - Preserve nostr-aware inline handling and reject ergonomic rendering for private-key entities.
 - Add parser behavior with golden/unit coverage before exposing it through FFI (`marmot-app` / `marmot-uniffi`).
 

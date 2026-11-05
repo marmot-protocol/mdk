@@ -138,7 +138,9 @@ ASCII host. Root recognition is an offline display heuristic, not evidence that 
 site exists or is safe. Explicit Markdown links, code and escapes take precedence.
 As with scheme-qualified autolinks, entities and math syntax inside an inferred
 URL suffix remain literal URL data. Internal suffix punctuation is retained; terminal
-quote and sentence punctuation is excluded. A token containing a backslash is not inferred.
+quote and sentence punctuation is excluded. Balanced ASCII and fullwidth parentheses
+remain part of the suffix. This extra punctuation trimming applies only to inferred URLs.
+A token containing a backslash is not inferred.
 
 Bare `.pdf`, `.md`, `.zip`, `.mov`, `.py`, `.rs`, `.sh`, `.pl`, `.java` and `.so`
 names remain text, case-insensitively, even when the ending is a delegated root. This applies to bare inference only: an explicit
