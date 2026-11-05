@@ -6930,8 +6930,17 @@ impl AppClient {
             hook();
         }
         if result.is_ok() {
-            // This save marked the chat list stale, so it covers every
-            // foreign commit before it.
+            // A delta save marks the whole chat list stale, so it covers
+            // every foreign commit before it. A created-row save refreshes
+            // only its new row (the whole list only when other groups were
+            // dirty too), so it compares versions as a skip does: a foreign
+            // commit since the last checkpoint invalidates the list here.
+            if created_group_id_hex.is_some()
+                && (pre_save_commit_version.is_none()
+                    || self.observed_commit_version != pre_save_commit_version)
+            {
+                self.app.invalidate_chat_list_projection(&self.state.label);
+            }
             self.observed_commit_version = pre_save_commit_version;
         }
         if let Some(probe) = &mut self.audit_v5_probe {

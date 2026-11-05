@@ -12632,6 +12632,28 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         (false, true),
         "a commit just after a save still invalidates the next skip"
     );
+
+    // Creating a chat refreshes only its own row. A foreign commit before
+    // that save is not covered by it, so the creation's save compares
+    // versions and invalidates the list itself.
+    assert!(!save(&mut client, &probe).0, "settled");
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .set_group_archived("alice", &group_hex, false)
+        .unwrap();
+    app.chat_list_projection_stale.lock().unwrap().clear();
+    client.create_group("created after", &[]).await.unwrap();
+    assert!(
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice"),
+        "a created-row save does not hide an earlier foreign commit"
+    );
+    assert_eq!(
+        archived(&app),
+        Some(false),
+        "and the list shows the other runtime's change"
+    );
 }
 
 #[test]
