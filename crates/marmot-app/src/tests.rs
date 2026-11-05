@@ -543,6 +543,9 @@ pub(crate) struct ScriptedPushRelayClient {
     /// `Cancelled` if its cancellation comes first — a relay slower than the
     /// caller's cutoff.
     pub(crate) acquisition_delay: std::sync::Mutex<Option<std::time::Duration>>,
+    /// Inbox acquisitions never answer: each ends `Cancelled` only when its
+    /// cancellation comes. Group acquisitions answer as scripted.
+    pub(crate) silent_inbox: std::sync::atomic::AtomicBool,
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
@@ -1231,6 +1234,29 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         self.acquisition_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.acquisition_entered.notify_one();
+        if self.silent_inbox.load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(
+                request.scope,
+                transport_nostr_adapter::NostrAcquisitionScope::AccountInboxWindow { .. }
+            )
+        {
+            cancellation.cancelled().await;
+            return Ok(transport_nostr_adapter::NostrAcquisitionResult {
+                endpoints: request
+                    .endpoints
+                    .into_iter()
+                    .map(
+                        |endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                            endpoint,
+                            session_generation: None,
+                            events: Vec::new(),
+                            end: transport_nostr_adapter::NostrAcquisitionEnd::Cancelled,
+                            stats: Default::default(),
+                        },
+                    )
+                    .collect(),
+            });
+        }
         let delay = *self.acquisition_delay.lock().unwrap();
         if self
             .acquisition_block

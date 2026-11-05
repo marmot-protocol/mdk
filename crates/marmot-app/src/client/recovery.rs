@@ -3056,131 +3056,267 @@ mod tests {
         );
     }
 
-    /// The capture loop seen online on a Pixel 9a (mdk#2923): a native
-    /// capture rides the comparison's pass cutoff, one 10 s quantum in
-    /// production, which cancels it mid-page. A relay that answers, but takes
-    /// longer than the cutoff, is then cut on every attempt. Each attempt
-    /// restarts the source, so the paging never resumes, and the goal parks
-    /// at the attempt cap with a "history incomplete" notice although the
-    /// relay was serving it. Scaled down here: the relay answers after
-    /// 400 ms against a 200 ms cutoff. The same relay with a cutoff it fits
-    /// in admits the source on the first attempt.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_relay_slower_than_the_pass_cutoff_is_cut_until_the_goal_parks() {
-        let answered = |relay: &crate::tests::ScriptedPushRelayClient| {
-            let endpoints = relay
-                .accepted_subscriptions()
-                .into_iter()
-                .flat_map(|source| source.endpoints().to_vec())
-                .map(
-                    |endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
-                        endpoint,
-                        session_generation: None,
-                        events: Vec::new(),
-                        end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
-                        stats: Default::default(),
-                    },
-                )
-                .collect();
-            *relay.acquisition_result.lock().unwrap() =
-                Some(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
-            *relay.acquisition_delay.lock().unwrap() = Some(Duration::from_millis(400));
-        };
-        // One pass under `cutoff`: returns the native goal and whether the
-        // pass admitted the native sources.
-        async fn pass(
-            client: &mut AppClient,
-            storage: &SqliteAccountStorage,
-            cutoff: Duration,
-        ) -> Option<([u8; 16], bool)> {
-            client.recovery_owner.test_advance_to_retry(storage);
-            let mut permit = ExplicitRecoveryPermit::default();
-            let grant = client
-                .authorize_account_recovery(
-                    Some(&mut permit),
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-                )
-                .await
-                .unwrap()?;
-            let native = grant.plan().unwrap().iter().find_map(|obligation| {
-                (obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
-                    .then_some(obligation.id)
-            })?;
-            assert!(!grant.replay_capture.is_empty());
-            let execution = client.begin_comparison_grant(&grant).await.unwrap();
-            let credit = Arc::new(tokio::sync::Semaphore::new(1))
-                .try_acquire_owned()
-                .unwrap();
-            let mut job = crate::client::sync::ComparisonNetworkJob::start(
-                client,
-                &grant,
-                credit,
-                tokio::time::Instant::now() + cutoff,
-                None,
+    /// Script `relay` to answer every capture page with the end of its
+    /// stored events, each page after `delay`.
+    fn answer_captures_after(relay: &crate::tests::ScriptedPushRelayClient, delay: Duration) {
+        let endpoints = relay
+            .accepted_subscriptions()
+            .into_iter()
+            .flat_map(|source| source.endpoints().to_vec())
+            .map(
+                |endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint,
+                    session_generation: None,
+                    events: Vec::new(),
+                    end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                    stats: Default::default(),
+                },
             )
+            .collect();
+        *relay.acquisition_result.lock().unwrap() =
+            Some(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+        *relay.acquisition_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// How one test pass cuts its owner capture.
+    #[derive(Clone, Copy)]
+    enum Cutoff {
+        /// The cutoff cuts the whole capture: explicit repairs, and every
+        /// pass before mdk#2923.
+        Hard(Duration),
+        /// An automatic pass: the cutoff cuts only sources whose relay has
+        /// not answered a page.
+        Automatic(Duration),
+    }
+
+    /// One recovery pass under `cutoff`, scaled down from production's 10 s
+    /// quantum. Returns the native replay goal, the capture's outcome, and
+    /// whether the pass admitted the native sources.
+    async fn capture_pass(
+        client: &mut AppClient,
+        storage: &SqliteAccountStorage,
+        cutoff: Cutoff,
+    ) -> Option<(
+        [u8; 16],
+        Option<transport_nostr_adapter::ReplayCaptureOutcome>,
+        bool,
+    )> {
+        use crate::client::sync::ComparisonNetworkJob;
+        client.recovery_owner.test_advance_to_retry(storage);
+        let mut permit = ExplicitRecoveryPermit::default();
+        let grant = client
+            .authorize_account_recovery(
+                Some(&mut permit),
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .await
+            .unwrap()?;
+        let native = grant.plan().unwrap().iter().find_map(|obligation| {
+            (obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
+                .then_some(obligation.id)
+        })?;
+        assert!(!grant.replay_capture.is_empty());
+        let execution = client.begin_comparison_grant(&grant).await.unwrap();
+        let credit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
             .unwrap();
-            let (_credit, network) = job.wait().await.unwrap();
-            client
-                .admit_comparison_inline(None, grant, execution, network)
-                .await
-                .unwrap();
-            client.synchronize_native_replay().await.unwrap();
-            Some((native, client.recovery_owner.replay_complete))
+        let now = tokio::time::Instant::now();
+        let mut job = match cutoff {
+            Cutoff::Hard(after) => {
+                ComparisonNetworkJob::start(client, &grant, credit, now + after, None)
+            }
+            Cutoff::Automatic(after) => {
+                ComparisonNetworkJob::start_automatic_at(client, &grant, credit, now + after)
+            }
         }
+        .unwrap();
+        let (_credit, network) = job.wait().await.unwrap();
+        let outcome = network.capture_outcome_for_test();
+        client
+            .admit_comparison_inline(None, grant, execution, network)
+            .await
+            .unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        Some((native, outcome, client.recovery_owner.replay_complete))
+    }
 
-        // Control: a cutoff the relay fits in admits on the first attempt.
-        {
-            let (_dir, app, relay, mut client) = native_fixture().await;
-            client.prepare_transport().await.unwrap();
-            answered(&relay);
-            let storage = app.account_storage("alice").unwrap();
-            let (_, admitted) = pass(&mut client, &storage, Duration::from_secs(5))
-                .await
-                .expect("the native goal is owed");
-            assert!(admitted, "a relay inside the cutoff serves the capture");
-        }
+    /// Whether the account's current native replay source for `kind`
+    /// (`"inbox"` or `"group-batch"`) is admitted.
+    async fn source_admitted(client: &AppClient, kind: &str) -> bool {
+        let status = client.adapter.replay_admission().await;
+        let sources = status
+            .sources()
+            .filter(|source| source.id().contains(kind))
+            .map(|source| source.admitted())
+            .collect::<Vec<_>>();
+        assert!(!sources.is_empty(), "no {kind} source");
+        sources.into_iter().all(|admitted| admitted)
+    }
 
+    /// The capture loop seen online on a Pixel 9a (mdk#2923): a native
+    /// capture shared the comparison's pass cutoff, one 10 s quantum, so a
+    /// relay paging a group batch's backlog was cut on every attempt until
+    /// the goal parked with a false "history incomplete" notice. A relay that
+    /// has answered a page by the cutoff now keeps paging past it. Scaled
+    /// down: twelve groups, each page answered after 50 ms, against a 300 ms
+    /// cutoff. The same relay under a hard cut, as before, is cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_serving_past_the_pass_cutoff_finishes_its_capture() {
         let (_dir, app, relay, mut client) = native_fixture().await;
         client.prepare_transport().await.unwrap();
-        answered(&relay);
-        let storage = app.account_storage("alice").unwrap();
-        let mut native = None;
-        let mut attempts = 0;
-        while let Some((id, admitted)) =
-            pass(&mut client, &storage, Duration::from_millis(200)).await
-        {
-            attempts += 1;
-            native = Some(id);
-            assert!(
-                !admitted,
-                "a relay slower than the cutoff is cut (attempt {attempts})"
-            );
-            let parked = storage
-                .app_storage()
-                .recovery_obligation_status(id)
-                .unwrap()
-                .unwrap()
-                .eligibility
-                == storage_sqlite::RecoveryEligibility::NeedsDeepRepair;
-            if parked {
-                break;
-            }
-            assert!(attempts < 40, "the goal never parked");
-        }
-        assert!(native.is_some(), "the capture was granted");
-        assert_eq!(
-            attempts,
-            storage_sqlite::RECOVERY_PARK_AFTER_ATTEMPTS,
-            "a cut capture spends no unserved streak, so only the attempt cap parks it"
-        );
-        assert!(
+        for index in 0..12 {
             client
-                .history_notices()
-                .unwrap()
-                .iter()
-                .any(|notice| notice.cause == crate::HistoryNoticeCause::IncrementalHistory),
-            "the parked goal shows a history notice, though the relay was serving"
+                .create_group(&format!("backlog {index}"), &[])
+                .await
+                .unwrap();
+        }
+        client.sync_runtime_groups().await.unwrap();
+        answer_captures_after(&relay, Duration::from_millis(50));
+        let storage = app.account_storage("alice").unwrap();
+        let cutoff = Duration::from_millis(300);
+
+        let (_, outcome, admitted) = capture_pass(&mut client, &storage, Cutoff::Hard(cutoff))
+            .await
+            .expect("the native goal is owed");
+        assert_eq!(
+            outcome,
+            Some(transport_nostr_adapter::ReplayCaptureOutcome::Cancelled),
+            "control: a hard cut stops the serving relay, as every pass did"
         );
+        assert!(!admitted);
+
+        let started = std::time::Instant::now();
+        let (native, outcome, admitted) =
+            capture_pass(&mut client, &storage, Cutoff::Automatic(cutoff))
+                .await
+                .expect("the native goal is still owed");
+        assert!(
+            started.elapsed() > cutoff,
+            "the capture needed longer than its cutoff"
+        );
+        assert_eq!(
+            outcome,
+            Some(transport_nostr_adapter::ReplayCaptureOutcome::Complete),
+            "a relay serving pages is not cut at the pass cutoff"
+        );
+        assert!(admitted, "the finished capture admits the native sources");
+        assert_ne!(
+            storage
+                .app_storage()
+                .recovery_obligation_status(native)
+                .unwrap()
+                .map(|status| status.eligibility),
+            Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair),
+            "nothing parks"
+        );
+        assert!(client.history_notices().unwrap().is_empty());
+    }
+
+    /// The rule turns on a page arriving before the cutoff: a relay whose
+    /// first page alone takes longer than the cutoff has not answered, so it
+    /// is still cut there, as before (mdk#2923). Scaled down: one page in
+    /// 400 ms against a 200 ms cutoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_page_slower_than_the_pass_cutoff_is_still_cut() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        answer_captures_after(&relay, Duration::from_millis(400));
+        let storage = app.account_storage("alice").unwrap();
+        let (_, outcome, admitted) = capture_pass(
+            &mut client,
+            &storage,
+            Cutoff::Automatic(Duration::from_millis(200)),
+        )
+        .await
+        .expect("the native goal is owed");
+        assert_eq!(
+            outcome,
+            Some(transport_nostr_adapter::ReplayCaptureOutcome::Cancelled)
+        );
+        assert!(!admitted);
+    }
+
+    /// A relay that never answers is still cut at the pass cutoff (mdk#2660),
+    /// not held to the capture's own bounds, and the cut charges no park
+    /// streak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_that_never_answers_is_still_cut_at_the_pass_cutoff() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        client.create_group("silent", &[]).await.unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        answer_captures_after(&relay, Duration::from_secs(3600));
+        let storage = app.account_storage("alice").unwrap();
+        let started = std::time::Instant::now();
+        let (native, outcome, admitted) = capture_pass(
+            &mut client,
+            &storage,
+            Cutoff::Automatic(Duration::from_millis(200)),
+        )
+        .await
+        .expect("the native goal is owed");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cut at the cutoff: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome,
+            Some(transport_nostr_adapter::ReplayCaptureOutcome::Cancelled)
+        );
+        assert!(!admitted);
+        assert_ne!(
+            storage
+                .app_storage()
+                .recovery_obligation_status(native)
+                .unwrap()
+                .map(|status| status.eligibility),
+            Some(storage_sqlite::RecoveryEligibility::NeedsDeepRepair),
+        );
+    }
+
+    /// A capture split at the cutoff (mdk#2923): the inbox relay never
+    /// answers and is cut there, while the group batch, answering a page every
+    /// 50 ms, keeps paging past it and is admitted. The capture ends
+    /// `Cancelled` only once the group batch settles, so the cut source
+    /// charges no park streak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_split_capture_keeps_the_serving_source_and_cuts_the_silent_one() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        for index in 0..12 {
+            client
+                .create_group(&format!("split {index}"), &[])
+                .await
+                .unwrap();
+        }
+        client.sync_runtime_groups().await.unwrap();
+        answer_captures_after(&relay, Duration::from_millis(50));
+        relay
+            .silent_inbox
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let storage = app.account_storage("alice").unwrap();
+        let cutoff = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let (_, outcome, admitted) = capture_pass(&mut client, &storage, Cutoff::Automatic(cutoff))
+            .await
+            .expect("the native goal is owed");
+        assert!(
+            started.elapsed() > Duration::from_millis(12 * 50),
+            "the capture waited for the serving source: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome,
+            Some(transport_nostr_adapter::ReplayCaptureOutcome::Cancelled),
+            "a cut source keeps the capture cancelled, charging no park streak"
+        );
+        assert!(!admitted, "the cut inbox is still owed");
+        assert!(
+            source_admitted(&client, "group-batch").await,
+            "the serving group batch was admitted past the cutoff"
+        );
+        assert!(!source_admitted(&client, "inbox").await);
     }
 
     /// A replay capture the relay closes on every attempt (`RelayClosed`, an

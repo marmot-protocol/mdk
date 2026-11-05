@@ -175,6 +175,21 @@ const REPLAY_PAGE_LIMITS: NostrAcquisitionLimits = NostrAcquisitionLimits {
     max_duration: Duration::from_secs(30),
 };
 
+/// Once the owner's pass cutoff has passed, an owner capture whose relays are
+/// still serving it ends when no source has had a page answered for this
+/// long (mdk#2923). The clock runs from each answer's arrival, so it also
+/// spends that page's admission and any peer-release wait after it, which a
+/// route's own page deadline does not. Each route's deadline alone would let
+/// a relay that stalls on every route hold the owner's recovery credit for
+/// one page duration per route.
+const REPLAY_CAPTURE_IDLE: Duration = REPLAY_PAGE_LIMITS.max_duration;
+
+/// The longest an owner capture with a cutoff runs, however steadily its
+/// relays answer. Only a credit bound: one account's capture holds one of the
+/// process's recovery credits while it runs. A backlog that needs longer is
+/// cut here, as every capture was at the cutoff before (mdk#2923).
+const REPLAY_CAPTURE_MAX: Duration = Duration::from_secs(10 * 60);
+
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1869,8 +1884,28 @@ impl NostrTransportAdapter {
     pub async fn capture_replay(
         &self,
         account_id: &MemberId,
+        plan: ReplayCapturePlan,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<ReplayCaptureOutcome, TransportAdapterError> {
+        self.capture_replay_until(account_id, plan, cancellation, None)
+            .await
+    }
+
+    /// [`Self::capture_replay`] under the owner's pass `cutoff` (mdk#2923).
+    /// At the cutoff, a source whose relay has not answered a page is cut,
+    /// as the whole capture was before. A source whose relay has answered
+    /// keeps paging, so a relay serving a large backlog is not cut on every
+    /// attempt. It ends when it finishes, when no source has answered a page
+    /// for [`REPLAY_CAPTURE_IDLE`], or at [`REPLAY_CAPTURE_MAX`] from the
+    /// capture's start. If any source was cut, the capture ends `Cancelled`,
+    /// which charges no park streak, and what the answering sources admitted
+    /// is kept.
+    pub async fn capture_replay_until(
+        &self,
+        account_id: &MemberId,
         mut plan: ReplayCapturePlan,
         cancellation: NostrAcquisitionCancellation,
+        cutoff: Option<tokio::time::Instant>,
     ) -> Result<ReplayCaptureOutcome, TransportAdapterError> {
         if cancellation.is_cancelled() {
             return Ok(ReplayCaptureOutcome::Cancelled);
@@ -1978,6 +2013,8 @@ impl NostrTransportAdapter {
                     serial: plan.attempt_serial,
                     sources,
                     cancellation: operation.clone(),
+                    started: tokio::time::Instant::now(),
+                    cut: std::sync::atomic::AtomicBool::new(false),
                 });
                 coverage.attempt = Some(attempt.clone());
                 (
@@ -1992,15 +2029,20 @@ impl NostrTransportAdapter {
             cancellation: Some(operation.clone()),
             wake,
         };
+        let bounded = cutoff.is_some();
+        let mut cutoff = cutoff;
         loop {
-            let outcome = {
+            let (outcome, answered_at) = {
                 let state = self.state.read().await;
-                state
-                    .account_replay_coverage
-                    .get(&account)
-                    .map_or(Some(ReplayCaptureOutcome::Stale), |coverage| {
-                        coverage.capture_outcome(&attempt)
-                    })
+                state.account_replay_coverage.get(&account).map_or(
+                    (Some(ReplayCaptureOutcome::Stale), None),
+                    |coverage| {
+                        (
+                            coverage.capture_outcome(&attempt),
+                            coverage.capture_answered_at(&attempt),
+                        )
+                    },
+                )
             };
             if let Some(outcome) = outcome {
                 if matches!(
@@ -2011,10 +2053,43 @@ impl NostrTransportAdapter {
                 }
                 return Ok(outcome);
             }
+            // Past the cutoff, only serving sources are left: bound them by
+            // how recently a page was answered and by the capture's age.
+            let limit = (bounded && cutoff.is_none()).then(|| {
+                let now = tokio::time::Instant::now();
+                answered_at
+                    .map_or(now, |at| at + REPLAY_CAPTURE_IDLE)
+                    .min(attempt.started + REPLAY_CAPTURE_MAX)
+            });
+            if limit.is_some_and(|limit| tokio::time::Instant::now() >= limit) {
+                operation.cancel();
+            }
+            let wake_at = cutoff.or(limit);
+            let timer = async move {
+                match wake_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Ok(ReplayCaptureOutcome::Cancelled),
                 _ = operation.cancelled() => return Ok(ReplayCaptureOutcome::Cancelled),
+                // Past the cutoff, the next turn rechecks the limits.
+                () = timer => {
+                    if cutoff.take().is_some() {
+                        let mut state = self.state.write().await;
+                        let answering = state
+                            .account_replay_coverage
+                            .get_mut(&account)
+                            .is_some_and(|coverage| coverage.cut_unanswered_capture(&attempt));
+                        if !answering {
+                            // No relay is serving it: cut the whole capture,
+                            // as the cutoff always did.
+                            operation.cancel();
+                        }
+                    }
+                }
                 changed = changes.changed() => {
                     if changed.is_err() {
                         return Ok(ReplayCaptureOutcome::Stale);
@@ -3075,6 +3150,28 @@ impl ReplaySupervisor {
                     return PagedWindow::Incomplete;
                 }
             };
+            if paging.credit.is_some()
+                && (!page.events.is_empty()
+                    || page.end == NostrAcquisitionEnd::RequestPolicySatisfied)
+            {
+                // The relay is serving this owner capture, so the owner's
+                // pass cutoff no longer cuts it (mdk#2923).
+                let Some(state) = self.state.upgrade() else {
+                    return PagedWindow::Closed;
+                };
+                let mut guard = state.write().await;
+                if let Some(endpoint) = guard
+                    .account_replay_coverage
+                    .get_mut(&self.account_id)
+                    .and_then(|coverage| {
+                        coverage.endpoint_deadlines.get_mut(&paging.subscription_id)
+                    })
+                    .and_then(|relays| relays.get_mut(&paging.relay))
+                    .filter(|endpoint| endpoint.serial == paging.serial)
+                {
+                    endpoint.capture_answered_at = Some(tokio::time::Instant::now());
+                }
+            }
             let received = page.events.len();
             let oldest = page.events.iter().map(|event| event.created_at).min();
             for event in page.events {
@@ -3870,6 +3967,11 @@ struct ReplayAttempt {
     serial: u64,
     sources: Vec<ReplayCapture>,
     cancellation: NostrAcquisitionCancellation,
+    /// When the first waiter accepted this attempt.
+    started: tokio::time::Instant,
+    /// The owner's cutoff cut a source whose relay had not answered: the
+    /// capture ends `Cancelled` once its answering sources settle.
+    cut: std::sync::atomic::AtomicBool,
 }
 
 struct ReplayWaiter {
@@ -3932,6 +4034,11 @@ struct ReplayEndpoint {
     /// The account owner's grant, not native clamp paging, owns this
     /// source's current capture, or its last one the owner cut.
     owner_capture: bool,
+    /// When the relay last answered a page of this serial's owner capture
+    /// with events or the end of its stored events. An answered capture
+    /// outlives the owner's pass cutoff while it keeps answering, within
+    /// [`REPLAY_CAPTURE_IDLE`] and [`REPLAY_CAPTURE_MAX`] (mdk#2923).
+    capture_answered_at: Option<tokio::time::Instant>,
     /// The oldest loss floor a cut owner capture left unrecorded because the
     /// source still awaited the owner. Only a finished capture clears it;
     /// any other way the source is readmitted or retired records it.
@@ -4351,6 +4458,53 @@ impl AccountReplayCoverage {
         self.admit_fence_armings(&admitted);
     }
 
+    /// At the owner's cutoff, cut each of `attempt`'s sources still capturing
+    /// whose relay has not answered a page. Returns whether any source's
+    /// relay is answering; if none is, the caller cuts the whole capture.
+    fn cut_unanswered_capture(&mut self, attempt: &ReplayAttempt) -> bool {
+        let mut answering = false;
+        let mut unanswered = Vec::new();
+        for source in &attempt.sources {
+            let Some(endpoint) = self
+                .endpoint_deadlines
+                .get(source.token.request.as_ref())
+                .and_then(|relays| relays.get(&source.token.relay))
+                .filter(|endpoint| endpoint.serial == source.serial && endpoint.capturing)
+            else {
+                continue;
+            };
+            if endpoint.capture_answered_at.is_some() {
+                answering = true;
+            } else {
+                unanswered.push(endpoint.cancellation.clone());
+            }
+        }
+        if answering && !unanswered.is_empty() {
+            attempt
+                .cut
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            for cancellation in unanswered {
+                cancellation.cancel();
+            }
+        }
+        answering
+    }
+
+    /// When a relay last answered a page of `attempt`'s current sources.
+    fn capture_answered_at(&self, attempt: &ReplayAttempt) -> Option<tokio::time::Instant> {
+        attempt
+            .sources
+            .iter()
+            .filter_map(|source| {
+                self.endpoint_deadlines
+                    .get(source.token.request.as_ref())
+                    .and_then(|relays| relays.get(&source.token.relay))
+                    .filter(|endpoint| endpoint.serial == source.serial)
+                    .and_then(|endpoint| endpoint.capture_answered_at)
+            })
+            .max()
+    }
+
     fn capture_outcome(&self, attempt: &ReplayAttempt) -> Option<ReplayCaptureOutcome> {
         let mut active = false;
         let mut admitted = true;
@@ -4374,6 +4528,11 @@ impl AccountReplayCoverage {
             {
                 completion = ReplayCaptureOutcome::Incomplete;
             }
+        }
+        if attempt.cut.load(std::sync::atomic::Ordering::Relaxed) {
+            // What the answering sources admitted stays admitted, but a cut
+            // source never asked its relay to finish.
+            return (!active).then_some(ReplayCaptureOutcome::Cancelled);
         }
         if !active && admitted {
             Some(ReplayCaptureOutcome::Complete)
@@ -4698,6 +4857,7 @@ impl AccountReplayCoverage {
                             boundary_admitted: false,
                             queued: None,
                             owner_capture: false,
+                            capture_answered_at: None,
                             loss_debt: None,
                             requested_at,
                             live_count: None,
@@ -5613,6 +5773,7 @@ impl AccountReplayCoverage {
         endpoint.serial = serial;
         endpoint.capturing = restart != ReplayStart::Connection;
         endpoint.owner_capture = restart == ReplayStart::Capture;
+        endpoint.capture_answered_at = None;
         endpoint.queued = None;
         endpoint.cancellation.cancel();
         endpoint.cancellation = self.cancellation.child_token();

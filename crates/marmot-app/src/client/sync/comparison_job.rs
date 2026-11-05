@@ -246,6 +246,14 @@ pub(crate) struct ComparisonNetworkResult {
 }
 
 impl ComparisonNetworkResult {
+    /// The owner capture's outcome, if it ran and did not fail.
+    #[cfg(test)]
+    pub(crate) fn capture_outcome_for_test(&self) -> Option<ReplayCaptureOutcome> {
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.as_ref().ok().copied())
+    }
+
     /// What each route's relays returned, for a pass discarded before any
     /// admission exists: counts only, nothing admitted or certified. A route
     /// counts as answered only when its comparison ran and every failed relay
@@ -647,12 +655,74 @@ impl ComparisonNetworkJob {
     }
 
     /// Start the grant's comparison off the worker. A route the pass has not
-    /// reached by `deadline` is skipped and keeps its debt.
+    /// reached by `deadline` is skipped and keeps its debt, and the owner
+    /// capture is cut there too. An explicit repair needs this hard cut: its
+    /// admission budget starts at `deadline`.
     pub(crate) fn start(
         client: &AppClient,
         grant: &AttemptGrant,
         credit: OwnedSemaphorePermit,
         deadline: tokio::time::Instant,
+        #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
+    ) -> Result<Self, AppError> {
+        Self::start_with(
+            client,
+            grant,
+            credit,
+            deadline,
+            false,
+            #[cfg(test)]
+            witness,
+        )
+    }
+
+    /// Start an automatic pass, one quantum long, for the worker's
+    /// interleaved recovery job. Its owner capture is cut at the quantum only
+    /// where a relay has not answered a page. A relay that is serving pages
+    /// keeps going within the adapter's capture bounds (30 s idle, 10 minutes
+    /// at most), so a large backlog is not cut on every attempt (mdk#2923).
+    ///
+    /// The job, and everything that waits for it, lasts as long: the
+    /// recovery credit, a full-history repair and the commands queued behind
+    /// one (apart from reads), the maintenance tick's main leg, which skips
+    /// while a job runs, and the tail of the receive or convergence pass that
+    /// started the job (the push-registration retry for newly joined groups,
+    /// the audit-tracker update). Other commands are still served. Callers
+    /// that wait in place use [`Self::start`].
+    pub(crate) fn start_automatic(
+        client: &AppClient,
+        grant: &AttemptGrant,
+        credit: OwnedSemaphorePermit,
+        #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
+    ) -> Result<Self, AppError> {
+        Self::start_with(
+            client,
+            grant,
+            credit,
+            Self::automatic_deadline(),
+            true,
+            #[cfg(test)]
+            witness,
+        )
+    }
+
+    /// [`Self::start_automatic`] with a scaled-down cutoff.
+    #[cfg(test)]
+    pub(crate) fn start_automatic_at(
+        client: &AppClient,
+        grant: &AttemptGrant,
+        credit: OwnedSemaphorePermit,
+        cutoff: tokio::time::Instant,
+    ) -> Result<Self, AppError> {
+        Self::start_with(client, grant, credit, cutoff, true, None)
+    }
+
+    fn start_with(
+        client: &AppClient,
+        grant: &AttemptGrant,
+        credit: OwnedSemaphorePermit,
+        deadline: tokio::time::Instant,
+        capture_outlives_cutoff: bool,
         #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
     ) -> Result<Self, AppError> {
         let storage = client.app.account_storage(&client.state.label)?;
@@ -725,8 +795,12 @@ impl ComparisonNetworkJob {
                     .store(attempt_serial, Ordering::SeqCst);
                 ActiveCounter::new(witness.active_jobs.clone())
             });
-            // Native capture and comparison share the cutoff, not each other's
-            // wait. A quiet original REQ must not consume the whole pass first.
+            // Native capture and comparison start together, so a quiet
+            // original REQ cannot consume the pass first: the cutoff cuts a
+            // source whose relay has not answered. On an automatic pass, one
+            // whose relay is serving pages keeps going past it, within the
+            // adapter's capture bounds (mdk#2923). The credit is held until
+            // accepted acquisition has released its requests.
             let capture = async {
                 if replay_capture.sources.is_empty() {
                     return None;
@@ -734,6 +808,13 @@ impl ComparisonNetworkJob {
                 if tokio::time::Instant::now() < deadline {
                     let cancellation = NostrAcquisitionCancellation::new();
                     let _cancel_on_drop = cancellation.clone().drop_guard();
+                    if capture_outlives_cutoff {
+                        return Some(
+                            adapter
+                                .capture_replay_until(replay_capture, cancellation, deadline)
+                                .await,
+                        );
+                    }
                     let capture = adapter.capture_replay(replay_capture, cancellation.clone());
                     tokio::pin!(capture);
                     let captured = tokio::select! {
@@ -1495,6 +1576,10 @@ impl AppClient {
         control: Option<&FullHistoryRepairControl<'_>>,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         let execution = self.begin_comparison_grant(&grant).await?;
+        // Callers here wait in place, and an explicit repair's admission
+        // budget starts at its network deadline: the capture keeps the hard
+        // cut. Only the worker's interleaved pass lets a serving capture run
+        // on (`start_automatic`).
         let deadline = control.map_or_else(
             ComparisonNetworkJob::automatic_deadline,
             FullHistoryRepairControl::network_deadline,

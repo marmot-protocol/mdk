@@ -7395,6 +7395,131 @@ async fn local_publish_joins_native_history_and_fans_out_once_per_account_route(
     ));
 }
 
+/// A relay that answered before the owner's cutoff keeps paging past it,
+/// but stops holding the capture once it goes quiet (mdk#2923). Each route
+/// has its own 30 s page deadline, so without the capture's idle bound a
+/// relay that stalls on every route would hold the credit 30 s per route.
+/// Here the first of three routes answers after 2 s and the other two never
+/// do: the capture ends one page duration after that answer (32 s), not when
+/// the third route's own deadline would end it.
+#[tokio::test(start_paused = true)]
+async fn a_capture_that_answered_then_stalled_ends_one_page_duration_later() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC5; 32]);
+    let groups = [0xC6, 0xC8, 0xCA].map(sync_fixture_group);
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: groups.to_vec(),
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .unwrap();
+    // The first route's page ends its stored events after 2 s; every later
+    // page never comes.
+    relay
+        .pages
+        .lock()
+        .unwrap()
+        .push_back((NostrAcquisitionEnd::RequestPolicySatisfied, Vec::new()));
+    relay.acquisition_delays.lock().unwrap().extend([
+        Duration::from_secs(2),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    ]);
+    let credits = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut plan = capture_plan(&adapter, &account, 1).await;
+    assert_eq!(
+        plan.sources.len(),
+        1,
+        "one batch source carries the three routes"
+    );
+    plan.credit = Arc::new(credits.clone().acquire_owned().await.unwrap());
+    let started = tokio::time::Instant::now();
+    let cutoff = started + Duration::from_secs(5);
+    let outcome = adapter
+        .capture_replay_until(
+            &account,
+            plan,
+            NostrAcquisitionCancellation::new(),
+            Some(cutoff),
+        )
+        .await
+        .unwrap();
+    let ended = started.elapsed();
+    assert!(
+        relay.acquisitions.lock().unwrap().len() >= 2,
+        "it paged past the cutoff"
+    );
+    assert!(
+        ended >= Duration::from_secs(32) && ended < Duration::from_secs(33),
+        "ends one page duration after the last answer: {ended:?}"
+    );
+    assert_eq!(outcome, ReplayCaptureOutcome::Cancelled);
+    wait_until("the stalled capture frees its credit", || {
+        credits.available_permits() == 1
+    })
+    .await;
+}
+
+/// The idle clock restarts on every answered page (mdk#2923): a relay that
+/// answers each route after 20 s (at 20, 40 and 60 s, the first inside a
+/// 25 s cutoff) is never idle for a full page duration, so its capture runs
+/// to completion instead of being cut 30 s after its first answer (50 s).
+#[tokio::test(start_paused = true)]
+async fn a_capture_answering_every_twenty_seconds_runs_past_the_idle_bound() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xD5; 32]);
+    let groups = [0xD6, 0xD8, 0xDA].map(sync_fixture_group);
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: groups.to_vec(),
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .unwrap();
+    for _ in &groups {
+        relay
+            .pages
+            .lock()
+            .unwrap()
+            .push_back((NostrAcquisitionEnd::RequestPolicySatisfied, Vec::new()));
+    }
+    relay
+        .acquisition_delays
+        .lock()
+        .unwrap()
+        .extend([Duration::from_secs(20); 3]);
+    let plan = capture_plan(&adapter, &account, 1).await;
+    assert_eq!(
+        plan.sources.len(),
+        1,
+        "one batch source carries the three routes"
+    );
+    let started = tokio::time::Instant::now();
+    let outcome = adapter
+        .capture_replay_until(
+            &account,
+            plan,
+            NostrAcquisitionCancellation::new(),
+            Some(started + Duration::from_secs(25)),
+        )
+        .await
+        .unwrap();
+    let ended = started.elapsed();
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 3);
+    assert!(
+        ended >= Duration::from_secs(60),
+        "ran past the idle bound: {ended:?}"
+    );
+    assert_eq!(outcome, ReplayCaptureOutcome::Complete);
+}
+
 /// A comparison deadline cuts the owner capture between pages. The page it
 /// already fetched is the obligation's own re-fetch: the cut mints no loss
 /// (which would restart the obligation), the source stays unadmitted, and the

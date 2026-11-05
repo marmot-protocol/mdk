@@ -3819,6 +3819,23 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
+    /// [`Self::capture_replay`] under the owner's pass `cutoff`: a relay that
+    /// has answered a page keeps paging past it, until it finishes, goes idle,
+    /// or reaches the adapter's capture cap.
+    pub async fn capture_replay_until(
+        &self,
+        plan: ReplayCapturePlan,
+        cancellation: NostrAcquisitionCancellation,
+        cutoff: tokio::time::Instant,
+    ) -> Result<ReplayCaptureOutcome, TransportAdapterError> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .capture_replay_until(&self.account_id, plan, cancellation, Some(cutoff))
+            .await
+    }
+
     /// Hold this account's groups' live frames behind the owner's fences from
     /// now on (mdk#2660). Call it before activation, so the first counts are
     /// held too.

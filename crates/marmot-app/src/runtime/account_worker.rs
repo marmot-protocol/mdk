@@ -1489,6 +1489,8 @@ async fn run_app_runtime_account_worker(
                     .begin_comparison_grant(&grant)
                     .await
                     .map_err(unknown)?;
+                // The startup continuation defers most commands until this
+                // pass returns, so its capture keeps the hard cut.
                 let network = match ComparisonNetworkJob::start(
                     &client,
                     &grant,
@@ -3641,11 +3643,10 @@ async fn start_pending_recovery_job(
             return PendingRecoveryJob::Settled(Err(error));
         }
     };
-    match ComparisonNetworkJob::start(
+    match ComparisonNetworkJob::start_automatic(
         client,
         &grant,
         credit,
-        ComparisonNetworkJob::automatic_deadline(),
         #[cfg(test)]
         shared
             .comparison_activity_witness

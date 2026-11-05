@@ -753,6 +753,17 @@
   with a required relay that is not admitted no longer counts as progress, so
   that obligation backs off instead of being granted again every 30 seconds.
 
+- A relay serving a recovery capture is no longer cut at the pass cutoff
+  (mdk#2923). The capture used to share the comparison's 10 s cutoff, so a
+  relay paging a large backlog was cut on every attempt, each attempt restarted
+  its subscription, and the goal parked with a false "history incomplete"
+  notice. On an automatic pass, a source whose relay has answered a page by the
+  cutoff now keeps paging past it. It stops when it finishes, when no page has
+  been answered for 30 seconds, or 10 minutes after the capture started, and
+  the recovery credit is held until then. A relay that has not answered a page
+  by the cutoff is still cut there, and a capture with a cut source still ends
+  cancelled, charging no park streak. Explicit repairs keep the hard cut.
+
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging
   unusable artwork. Authenticated carried keys and retained canonical source
