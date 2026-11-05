@@ -20,6 +20,17 @@ macro_rules! redact {
     };
 }
 
+macro_rules! enums {
+    ($ffi:ident, $app:ident, $($variant:ident),+) => {
+        impl From<$ffi> for app::$app {
+            fn from(v: $ffi) -> Self { match v { $($ffi::$variant => Self::$variant),+ } }
+        }
+        impl From<app::$app> for $ffi {
+            fn from(v: app::$app) -> Self { match v { $(app::$app::$variant => Self::$variant),+ } }
+        }
+    };
+}
+
 mod product_analytics;
 pub use product_analytics::*;
 mod account;

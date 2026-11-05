@@ -17,40 +17,21 @@ pub enum ChatSelectionFieldFfi {
     Title,
     Participants,
 }
-impl From<ChatSelectionFieldFfi> for app::ChatSelectionField {
-    fn from(v: ChatSelectionFieldFfi) -> Self {
-        match v {
-            ChatSelectionFieldFfi::Unread => Self::Unread,
-            ChatSelectionFieldFfi::Mentions => Self::Mentions,
-            ChatSelectionFieldFfi::Muted => Self::Muted,
-            ChatSelectionFieldFfi::Pinned => Self::Pinned,
-            ChatSelectionFieldFfi::Archived => Self::Archived,
-            ChatSelectionFieldFfi::Type => Self::Type,
-            ChatSelectionFieldFfi::Accepted => Self::Accepted,
-            ChatSelectionFieldFfi::Draft => Self::Draft,
-            ChatSelectionFieldFfi::PendingSend => Self::PendingSend,
-            ChatSelectionFieldFfi::Title => Self::Title,
-            ChatSelectionFieldFfi::Participants => Self::Participants,
-        }
-    }
-}
-impl From<app::ChatSelectionField> for ChatSelectionFieldFfi {
-    fn from(v: app::ChatSelectionField) -> Self {
-        match v {
-            app::ChatSelectionField::Unread => Self::Unread,
-            app::ChatSelectionField::Mentions => Self::Mentions,
-            app::ChatSelectionField::Muted => Self::Muted,
-            app::ChatSelectionField::Pinned => Self::Pinned,
-            app::ChatSelectionField::Archived => Self::Archived,
-            app::ChatSelectionField::Type => Self::Type,
-            app::ChatSelectionField::Accepted => Self::Accepted,
-            app::ChatSelectionField::Draft => Self::Draft,
-            app::ChatSelectionField::PendingSend => Self::PendingSend,
-            app::ChatSelectionField::Title => Self::Title,
-            app::ChatSelectionField::Participants => Self::Participants,
-        }
-    }
-}
+enums!(
+    ChatSelectionFieldFfi,
+    ChatSelectionField,
+    Unread,
+    Mentions,
+    Muted,
+    Pinned,
+    Archived,
+    Type,
+    Accepted,
+    Draft,
+    PendingSend,
+    Title,
+    Participants
+);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ChatSelectionModeFfi {
     Present,
@@ -62,55 +43,29 @@ pub enum ChatSelectionModeFfi {
     Excludes,
     Contains,
 }
-impl From<ChatSelectionModeFfi> for app::ChatSelectionMode {
-    fn from(v: ChatSelectionModeFfi) -> Self {
-        match v {
-            ChatSelectionModeFfi::Present => Self::Present,
-            ChatSelectionModeFfi::None => Self::None,
-            ChatSelectionModeFfi::Direct => Self::Direct,
-            ChatSelectionModeFfi::Group => Self::Group,
-            ChatSelectionModeFfi::AnyOf => Self::AnyOf,
-            ChatSelectionModeFfi::AllOf => Self::AllOf,
-            ChatSelectionModeFfi::Excludes => Self::Excludes,
-            ChatSelectionModeFfi::Contains => Self::Contains,
-        }
-    }
-}
-impl From<app::ChatSelectionMode> for ChatSelectionModeFfi {
-    fn from(v: app::ChatSelectionMode) -> Self {
-        match v {
-            app::ChatSelectionMode::Present => Self::Present,
-            app::ChatSelectionMode::None => Self::None,
-            app::ChatSelectionMode::Direct => Self::Direct,
-            app::ChatSelectionMode::Group => Self::Group,
-            app::ChatSelectionMode::AnyOf => Self::AnyOf,
-            app::ChatSelectionMode::AllOf => Self::AllOf,
-            app::ChatSelectionMode::Excludes => Self::Excludes,
-            app::ChatSelectionMode::Contains => Self::Contains,
-        }
-    }
-}
+enums!(
+    ChatSelectionModeFfi,
+    ChatSelectionMode,
+    Present,
+    None,
+    Direct,
+    Group,
+    AnyOf,
+    AllOf,
+    Excludes,
+    Contains
+);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ChatSelectionSendingFfi {
     Sending,
     SuppressNative,
 }
-impl From<ChatSelectionSendingFfi> for app::ChatSelectionSending {
-    fn from(v: ChatSelectionSendingFfi) -> Self {
-        match v {
-            ChatSelectionSendingFfi::Sending => Self::Sending,
-            ChatSelectionSendingFfi::SuppressNative => Self::SuppressNative,
-        }
-    }
-}
-impl From<app::ChatSelectionSending> for ChatSelectionSendingFfi {
-    fn from(v: app::ChatSelectionSending) -> Self {
-        match v {
-            app::ChatSelectionSending::Sending => Self::Sending,
-            app::ChatSelectionSending::SuppressNative => Self::SuppressNative,
-        }
-    }
-}
+enums!(
+    ChatSelectionSendingFfi,
+    ChatSelectionSending,
+    Sending,
+    SuppressNative
+);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ChatSelectionLeafKindFfi {
     TitleContains,
@@ -119,28 +74,15 @@ pub enum ChatSelectionLeafKindFfi {
     LegacyPeerEquals,
     ChatSearch,
 }
-impl From<ChatSelectionLeafKindFfi> for app::ChatSelectionLeafKind {
-    fn from(v: ChatSelectionLeafKindFfi) -> Self {
-        match v {
-            ChatSelectionLeafKindFfi::TitleContains => Self::TitleContains,
-            ChatSelectionLeafKindFfi::LegacyKeyword => Self::LegacyKeyword,
-            ChatSelectionLeafKindFfi::IsDirect => Self::IsDirect,
-            ChatSelectionLeafKindFfi::LegacyPeerEquals => Self::LegacyPeerEquals,
-            ChatSelectionLeafKindFfi::ChatSearch => Self::ChatSearch,
-        }
-    }
-}
-impl From<app::ChatSelectionLeafKind> for ChatSelectionLeafKindFfi {
-    fn from(v: app::ChatSelectionLeafKind) -> Self {
-        match v {
-            app::ChatSelectionLeafKind::TitleContains => Self::TitleContains,
-            app::ChatSelectionLeafKind::LegacyKeyword => Self::LegacyKeyword,
-            app::ChatSelectionLeafKind::IsDirect => Self::IsDirect,
-            app::ChatSelectionLeafKind::LegacyPeerEquals => Self::LegacyPeerEquals,
-            app::ChatSelectionLeafKind::ChatSearch => Self::ChatSearch,
-        }
-    }
-}
+enums!(
+    ChatSelectionLeafKindFfi,
+    ChatSelectionLeafKind,
+    TitleContains,
+    LegacyKeyword,
+    IsDirect,
+    LegacyPeerEquals,
+    ChatSearch
+);
 #[derive(Clone, uniffi::Enum)]
 pub enum ChatSelectionPredicateFfi {
     Group {

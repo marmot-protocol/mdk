@@ -14,16 +14,6 @@ pub enum ChatListPageDirectionFfi {
     Forward,
     Backward,
 }
-macro_rules! enums {
-    ($ffi:ident, $app:ident, $($variant:ident),+) => {
-        impl From<$ffi> for app::$app {
-            fn from(v: $ffi) -> Self { match v { $($ffi::$variant => Self::$variant),+ } }
-        }
-        impl From<app::$app> for $ffi {
-            fn from(v: app::$app) -> Self { match v { $(app::$app::$variant => Self::$variant),+ } }
-        }
-    };
-}
 enums!(ChatListViewFfi, ChatListView, Chats, Unread, Archived, Left);
 enums!(
     ChatListPageDirectionFfi,
