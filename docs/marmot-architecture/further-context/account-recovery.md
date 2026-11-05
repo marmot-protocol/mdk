@@ -900,7 +900,9 @@ no NIP-77 proof; migration 0151 records that second), would stop on the same sec
 again while those caps stand. It pursues again once it owes an earlier second first or the
 relay's recorded caps change. An answer its deadline cut saturates nothing, and nor does a relay
 whose caps were never read: a document that failed to load is not a relay that cannot prove the
-second. A broken unit's debt is parked. The group's frames go once each
+second. Nor does a second whose NIP-77 ids the relay listed and then did not all return: the
+event may have gone in between, so the sweep ends on a withheld second and asks again on the
+backoff. A broken unit's debt is parked. The group's frames go once each
 holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests four events, one
 worker command each, so commands and live input go between them. An event the engine keeps no
 trace of stays staged, and its group waits behind it on the local-failure backoff while other

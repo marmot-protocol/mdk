@@ -274,6 +274,45 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
     assert_eq!(fixture.limit.stats().max_req_limit_seen, 500);
 }
 
+/// A relay that lists a busy second's ids and then withholds one has not
+/// shown the second unprovable: the sweep ends on a withheld second, not a
+/// saturated one, and asking again under the same caps proves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_listed_id_is_retried_not_saturated() {
+    let fixture = Fixture::new().await;
+    let (events, wanted, burst) = backlog();
+    fixture.store(&events).await;
+    fixture.limit.withhold_id_fetch_events(1);
+    let relay = fixture.relay();
+    let store = MemoryStore::default();
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(range()),
+        &relay,
+        &mut sink,
+        &store,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(fixture.limit.stats().withheld_id_events, 1);
+    assert_eq!(
+        report.end,
+        SweepEnd::WithheldSecond { second: burst },
+        "{report:?}"
+    );
+    assert_eq!(report.cursor.map(|cursor| cursor.next_since), Some(burst));
+    let report = run_sweep(
+        request(range()),
+        &relay,
+        &mut sink,
+        &store,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
+    assert_once_in_order(&sink, &wanted);
+}
+
 /// A relay's full raw page can lose an event at SDK validation. Its 499
 /// accepted events are not a below-cap certificate: every one of the 1,200
 /// valid historical events must still be swept and admitted exactly once.

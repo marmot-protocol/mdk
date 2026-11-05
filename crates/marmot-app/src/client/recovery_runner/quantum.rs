@@ -180,7 +180,9 @@ impl SweepRelay for Metered<'_> {
         match &reply {
             SecondReply::Complete(events) => self.read(events, false),
             SecondReply::Closed(reason) => self.read(&[], is_rate_limit(reason)),
-            SecondReply::Unproven | SecondReply::Unreachable(_) => self.read(&[], false),
+            SecondReply::Unproven | SecondReply::Withheld | SecondReply::Unreachable(_) => {
+                self.read(&[], false)
+            }
         }
         reply
     }
@@ -452,7 +454,9 @@ pub(super) fn classify(
         // rate limited and never cleared.
         SweepEnd::DeadlineReached if rate_limited => Outcome::RateLimited,
         SweepEnd::DeadlineReached if !answered => Outcome::Unanswered,
-        SweepEnd::DeadlineReached | SweepEnd::SaturatedSecond { .. } => Outcome::NoProgress,
+        SweepEnd::DeadlineReached
+        | SweepEnd::SaturatedSecond { .. }
+        | SweepEnd::WithheldSecond { .. } => Outcome::NoProgress,
         SweepEnd::RateLimited => Outcome::RateLimited,
         SweepEnd::Refused(_) => Outcome::Refused,
         SweepEnd::Unreachable(_) => Outcome::Unreachable,
@@ -567,6 +571,7 @@ pub(super) fn end_label(end: SweepEnd) -> &'static str {
         SweepEnd::DeadlineReached => "deadline",
         SweepEnd::Cancelled => "cancelled",
         SweepEnd::SaturatedSecond { .. } => "saturated_second",
+        SweepEnd::WithheldSecond { .. } => "withheld_second",
         SweepEnd::RateLimited => "rate_limited",
         SweepEnd::Refused(_) => "refused",
         SweepEnd::Unreachable(_) => "unreachable",

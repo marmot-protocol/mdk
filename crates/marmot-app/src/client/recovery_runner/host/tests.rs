@@ -241,11 +241,17 @@ async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
         .unwrap();
 
     assert_eq!(debt_turn_fences(&mut client).await, Vec::<u64>::new());
-    let remainders = ledger.recovery_coverage_remainders().unwrap();
+    // Another route's goal may slip a second below the floor while the
+    // fixture starts; only this route's parked history is under test.
+    let remainders = ledger
+        .recovery_coverage_remainders()
+        .unwrap()
+        .into_iter()
+        .filter(|remainder| remainder.route == route)
+        .collect::<Vec<_>>();
     let [remainder] = remainders.as_slice() else {
         panic!("one parked remainder, not {}", remainders.len());
     };
-    assert_eq!(remainder.route, route);
     assert_eq!(remainder.range.since_seconds, aged.since_seconds);
     assert!(remainder.range.until_seconds >= aged.until_seconds);
 }

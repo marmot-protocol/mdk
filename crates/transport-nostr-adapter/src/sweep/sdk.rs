@@ -285,9 +285,11 @@ impl SweepRelay for SdkSweepRelay {
                 .into_iter()
                 .filter(|event| asked.contains(&event.id))
                 .collect::<Vec<Event>>();
-            // A relay that claimed an id and then withheld it proves nothing.
+            // A relay that claimed an id and then withheld it proves nothing
+            // now; it may have dropped the event since listing it, so a
+            // later attempt may prove the second.
             if got.len() != asked.len() {
-                return SecondReply::Unproven;
+                return SecondReply::Withheld;
             }
             events.extend(got);
         }

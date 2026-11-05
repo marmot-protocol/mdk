@@ -224,6 +224,8 @@ pub struct LimitStats {
     /// and CLOSED frames held back once it stalled.
     pub events_before_stall: usize,
     pub stalled_frames: usize,
+    /// EVENT frames dropped from exact-id REQs by `withhold_id_fetch_events`.
+    pub withheld_id_events: usize,
 }
 
 impl LimitStats {
@@ -331,6 +333,8 @@ struct ConnectionState {
     neg: HashSet<String>,
     /// REQs that get a NIP-67 hint, until their EOSE.
     hinted: HashMap<String, HintedReq>,
+    /// REQs naming exact event ids, until the upstream closes them.
+    id_fetches: HashSet<String>,
 }
 
 /// One hinted REQ: the limit its client sees and the events sent so far.
@@ -361,6 +365,8 @@ struct Shared {
     /// Upstream EVENT frames to forward before every later EVENT, EOSE and
     /// CLOSED is held back.
     stall_after_events: Option<usize>,
+    /// Upstream EVENT frames answering exact-id REQs still to drop.
+    withhold_id_events: usize,
 }
 
 impl Shared {
@@ -579,6 +585,15 @@ impl LimitRelay {
         shared.stats.stalled_frames = 0;
     }
 
+    /// Drop the next `events` upstream EVENT frames that answer a REQ naming
+    /// exact ids, across connections, and still forward its EOSE: a relay
+    /// that listed an id over NIP-77 and then withheld it.
+    pub fn withhold_id_fetch_events(&self, events: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.withhold_id_events = events;
+        shared.stats.withheld_id_events = 0;
+    }
+
     /// Switch the injected NEG behaviour for every connection.
     pub fn set_neg_fault(&self, fault: NegFault) {
         self.shared.lock().unwrap().neg_fault = Some(fault);
@@ -767,6 +782,15 @@ fn inspect_client_frame(
                     let mut clamped = false;
                     let hinted = config.eose_hints && frame.len() == 3;
                     shared.states[connection].hinted.remove(&id);
+                    if frame
+                        .iter()
+                        .skip(2)
+                        .any(|filter| filter.get("ids").is_some())
+                    {
+                        shared.states[connection].id_fetches.insert(id.clone());
+                    } else {
+                        shared.states[connection].id_fetches.remove(&id);
+                    }
                     for filter in frame.iter_mut().skip(2) {
                         if let Some(default) = config.req_default_limit
                             && filter.get("limit").is_none()
@@ -959,6 +983,11 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
     }
     match verb {
         "EVENT" => {
+            if shared.withhold_id_events > 0 && shared.states[connection].id_fetches.contains(id) {
+                shared.withhold_id_events -= 1;
+                shared.stats.withheld_id_events += 1;
+                return RelayVerdict::Drop;
+            }
             if let Some(req) = shared.states[connection].hinted.get_mut(id) {
                 req.sent += 1;
                 if req.limit.is_some_and(|limit| req.sent > limit) {
@@ -981,6 +1010,7 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
         }
         "CLOSED" => {
             shared.states[connection].hinted.remove(id);
+            shared.states[connection].id_fetches.remove(id);
             if shared.states[connection].active.remove(id) {
                 shared.stats.upstream_closed += 1;
             }

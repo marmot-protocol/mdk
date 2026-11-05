@@ -11,7 +11,8 @@
   subscription, and stay held while the account's hourly recovery budget pauses the runner or while no relay serves
   the group and one may still return its history. A relay that publishes no limit and no negentropy cannot prove a
   busy second, and releases the group instead of holding it; a relay whose information document cannot be read
-  holds the group until its unit gives up, since it may still prove that second. Notification wakes
+  holds the group until its unit gives up, since it may still prove that second, and so does a relay that lists a
+  second's messages and then withholds one. Notification wakes
   (`CursorPersistence::Frozen`) fetch no history unless the host asks for full-history repair, and history older
   than the 30-day window stops holding live messages. A directly owned client's `sync()` now also reads the live
   messages its in-place recovery pass releases.

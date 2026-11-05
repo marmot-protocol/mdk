@@ -577,6 +577,8 @@ struct ModelRelay {
     /// It refuses every read of an inbox's gift wraps, as a relay that
     /// restricts kind 1059 to authenticated recipients does.
     refusing_inbox: bool,
+    /// How many second fetches still find a listed id gone.
+    withholding: AtomicUsize,
 }
 
 impl ModelRelay {
@@ -604,7 +606,15 @@ impl ModelRelay {
             comparisons: Mutex::new(Vec::new()),
             fetched_ids: Mutex::new(Vec::new()),
             refusing_inbox: false,
+            withholding: AtomicUsize::new(0),
         }
+    }
+
+    /// Its next `fetches` second fetches each find an id it listed gone, as
+    /// an event deleted or expired between the listing and the fetch.
+    fn withholding_ids(self, fetches: usize) -> Self {
+        self.withholding.store(fetches, Ordering::SeqCst);
+        self
     }
 
     fn refusing_inbox(mut self) -> Self {
@@ -785,10 +795,18 @@ impl ModelRelay {
             Some(ClosedOrUnreachable::RateLimited) => return SecondReply::Closed(rate_limited()),
             None => {}
         }
-        if self.negentropy {
-            SecondReply::Complete(self.matching(route, second, second))
-        } else {
+        if !self.negentropy {
             SecondReply::Unproven
+        } else if self
+            .withholding
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            SecondReply::Withheld
+        } else {
+            SecondReply::Complete(self.matching(route, second, second))
         }
     }
 
@@ -1996,6 +2014,54 @@ async fn recovery_runner_saturates_a_unit_only_on_an_unprovable_second() {
     due();
     assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
     assert_eq!(saturated(), None);
+}
+
+/// An id the relay listed for a second and then did not return (an event
+/// deleted or expired in between) is not a second the relay cannot prove:
+/// the next attempt, under the same caps, may prove it. The unit saturates
+/// nothing, and its stranded group stays fenced until that attempt does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_keeps_fencing_a_second_whose_listed_ids_were_withheld() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let busy = t0 - 30 * 60;
+    let requested = t0 - 20 * 60;
+    let relay = ModelRelay::new(RELAY, caps(2, true))
+        .with_events((0..3).map(|_| event([1; 32], busy)).collect())
+        .withholding_ids(1)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, RELAY, floor, busy - 1);
+    host.tails.stand(&route, RELAY, requested);
+    host.set_counts(vec![LiveCount {
+        routes: vec![route.clone()],
+        relay: RELAY.to_owned(),
+        since: busy,
+        oldest_seen: Some(t0 - 25 * 60),
+    }]);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let held = vec![(vec![route.clone()], busy)];
+    assert_eq!(host.fences().await, held);
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    let unit = account.unit(&route, RELAY);
+    assert_eq!(unit.saturated_second, None);
+    assert_eq!(host.fences().await, held, "the next attempt may prove it");
+
+    clock.advance_to(unit.next_attempt_at_seconds);
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    assert!(account.debt(&route, RELAY, requested - 1).is_empty());
+    run_until_idle(&mut runner, 10).await;
+    assert!(host.fences().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
