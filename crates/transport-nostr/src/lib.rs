@@ -3299,6 +3299,7 @@ impl MarmotRelayPlaneAccountAdapter {
         let deadline = tokio::time::Instant::now() + ACCOUNT_PUBLISH_WAIT;
         let required_acks = required_acks.max(1);
         let unknown = |endpoint: &TransportEndpoint| TransportEndpointFailure {
+            size_class: None,
             endpoint: endpoint.clone(),
             reason: "publish acknowledgement unknown".to_owned(),
             kind: TransportEndpointFailureKind::PossiblyExposed,

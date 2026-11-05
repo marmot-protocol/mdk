@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add typed `EventTooLarge` with coarse artifact and size-class enums. Regenerate Swift/Kotlin bindings with the
+  matching library; existing error cases and publication lifecycle remain unchanged. No database or wire migration.
+
 - Add a default-off `dev-device-groups` host capability and explicit experimental constructor. Ordinary constructors
   remain disabled; opt-in native/generated build outputs are isolated. Existing options layouts remain unchanged.
 

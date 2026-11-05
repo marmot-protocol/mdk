@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `TooLarge` endpoint rejection, coarse `EventSizeClass`, and optional size evidence on endpoint and aggregate
+  publish failures. Rust struct literals and exhaustive matches must adopt the new fields/case. Old retained JSON
+  remains readable with unknown evidence; older readers may reject newly written rejection variants. No schema or wire change.
+
 ### Breaking changes
 
 - Add `SiblingAddRefusal::AlreadyPresent` for selected-tree sibling presence. Experimental Rust callers with exhaustive

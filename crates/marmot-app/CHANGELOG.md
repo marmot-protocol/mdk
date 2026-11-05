@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
+  class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
+
 - Invalid device-roster marker edits now return the additive Rust `AccountError::InvalidDeviceRosterEdit`,
   rather than an engine serialization error. Lower-level Rust callers matching those errors should adopt the
   new case. The privacy kind is `account_invalid_device_roster_edit`; the Protocol sync class, CLI `engine_error`

@@ -60,6 +60,9 @@ union tag or function requires regenerating `marmot.h`, recompiling consumers an
 See [the changelog](CHANGELOG.md) for record-layout changes and upgrade requirements
 for each release.
 
+`MARMOT_STATUS_EVENT_TOO_LARGE` (119) reports the shared [size-refusal error](../marmot-uniffi/README.md#runtime-lifecycle-threads-and-errors).
+The last-error string contains only the coarse artifact and size class; C has no structured size-error payload.
+
 ## Rules of the road
 
 - Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is

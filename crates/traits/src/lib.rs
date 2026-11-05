@@ -124,14 +124,14 @@ pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 pub use transport_adapter::{
-    FanoutMlsState, FanoutPendingKind, FanoutTargetStatus, OutboundApplicationMessage,
-    OutboundFanout, OutboundFanoutOutcome, PublicationObservation, TransportAccountActivation,
-    TransportAdapter, TransportAdapterError, TransportDelivery, TransportDeliveryPlane,
-    TransportDeliverySource, TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
-    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
-    TransportGroupSubscription, TransportGroupSync, TransportPublishFailure,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,
-    collapse_publish_failure_summaries,
+    EventSizeClass, FanoutMlsState, FanoutPendingKind, FanoutTargetStatus,
+    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, PublicationObservation,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointAckKind,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
+    TransportEndpointRejectionCategory, TransportGroupSubscription, TransportGroupSync,
+    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget, TransportWireMetadata, collapse_publish_failure_summaries,
 };
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;

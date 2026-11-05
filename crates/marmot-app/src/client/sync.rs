@@ -8619,6 +8619,7 @@ mod runtime_group_subscription_refresh_tests {
                     origin_commit_id: Some(cgka_traits::MessageId::new(vec![0x73; 32])),
                 });
                 effects.failures.push(marmot_session::PublishFailure {
+                    oversized: None,
                     message_id: cgka_traits::MessageId::new(vec![0x74; 32]),
                     reason: "primary publication failure".into(),
                 });

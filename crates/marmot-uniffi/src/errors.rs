@@ -31,6 +31,86 @@ impl std::fmt::Display for MissingKeyPackageReasonFfi {
     }
 }
 
+/// What MDK was publishing when a relay refused the event as too large.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OversizedArtifactFfi {
+    /// A group change such as an invite, a removal or an update.
+    Commit,
+    /// The Welcome that lets an invitee join.
+    Welcome,
+    /// A chat message or another application message.
+    ApplicationMessage,
+    /// Any other group event.
+    Other,
+}
+
+impl From<marmot_app::OversizedArtifact> for OversizedArtifactFfi {
+    fn from(value: marmot_app::OversizedArtifact) -> Self {
+        match value {
+            marmot_app::OversizedArtifact::Commit => Self::Commit,
+            marmot_app::OversizedArtifact::Welcome => Self::Welcome,
+            marmot_app::OversizedArtifact::ApplicationMessage => Self::ApplicationMessage,
+            marmot_app::OversizedArtifact::Other => Self::Other,
+        }
+    }
+}
+
+/// A coarse bucket for the size of an event a relay refused as too large.
+/// These diagnostic buckets do not assert a relay's configured limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum EventSizeClassFfi {
+    Under64Kib,
+    From64To128Kib,
+    From128To256Kib,
+    From256To512Kib,
+    From512KibTo1Mib,
+    From1To2Mib,
+    From2To4Mib,
+    Over4Mib,
+}
+
+impl From<marmot_app::EventSizeClass> for EventSizeClassFfi {
+    fn from(value: marmot_app::EventSizeClass) -> Self {
+        use marmot_app::EventSizeClass as Class;
+        match value {
+            Class::Under64Kib => Self::Under64Kib,
+            Class::From64To128Kib => Self::From64To128Kib,
+            Class::From128To256Kib => Self::From128To256Kib,
+            Class::From256To512Kib => Self::From256To512Kib,
+            Class::From512KibTo1Mib => Self::From512KibTo1Mib,
+            Class::From1To2Mib => Self::From1To2Mib,
+            Class::From2To4Mib => Self::From2To4Mib,
+            Class::Over4Mib => Self::Over4Mib,
+        }
+    }
+}
+
+impl std::fmt::Display for OversizedArtifactFfi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Commit => "commit",
+            Self::Welcome => "welcome",
+            Self::ApplicationMessage => "application_message",
+            Self::Other => "other",
+        })
+    }
+}
+
+impl std::fmt::Display for EventSizeClassFfi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Under64Kib => "under_64_kib",
+            Self::From64To128Kib => "from_64_to_128_kib",
+            Self::From128To256Kib => "from_128_to_256_kib",
+            Self::From256To512Kib => "from_256_to_512_kib",
+            Self::From512KibTo1Mib => "from_512_kib_to_1_mib",
+            Self::From1To2Mib => "from_1_to_2_mib",
+            Self::From2To4Mib => "from_2_to_4_mib",
+            Self::Over4Mib => "over_4_mib",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
     #[error("user is blocked")]
@@ -182,6 +262,13 @@ pub enum MarmotKitError {
     DirectoryLookupIncomplete { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
+    /// All current targets conclusively refused this artifact for size. Only
+    /// coarse locally measured metadata is exposed; no relay limit is inferred.
+    #[error("event too large: {artifact} ({size_class})")]
+    EventTooLarge {
+        artifact: OversizedArtifactFfi,
+        size_class: EventSizeClassFfi,
+    },
     /// No current kind-3 event was found on the account's known outbox/default
     /// relays. Retrying after directory/relay recovery is safe; publishing from
     /// an assumed empty list is not.
@@ -470,6 +557,12 @@ impl From<marmot_app::DirectoryError> for MarmotKitError {
 
 impl From<&AppError> for MarmotKitError {
     fn from(value: &AppError) -> Self {
+        if let Some(cause) = value.as_oversized_event() {
+            return Self::EventTooLarge {
+                artifact: cause.artifact.into(),
+                size_class: cause.size_class.into(),
+            };
+        }
         if let Some(err) = value.as_engine_error() {
             return Self::from_engine_error(err);
         }
@@ -646,6 +739,13 @@ impl From<&AppError> for MarmotKitError {
             },
             AppError::Publish(details) => Self::Publish {
                 details: details.clone(),
+            },
+            AppError::EventTooLarge {
+                artifact,
+                size_class,
+            } => Self::EventTooLarge {
+                artifact: (*artifact).into(),
+                size_class: (*size_class).into(),
             },
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
             AppError::FollowListTooLarge => Self::FollowListTooLarge,

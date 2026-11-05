@@ -3854,12 +3854,14 @@ fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_cate
             hostile_summary,
             vec![
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://relay-a.example".into()),
                     reason: hostile_reason.to_owned(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
                     rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
                 },
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://relay-b.example".into()),
                     reason: hostile_reason.to_owned(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
