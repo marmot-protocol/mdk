@@ -163,3 +163,11 @@ just e2e-test
 
 For cross-crate changes, widen as the root `AGENTS.md` Verification section describes; GitHub CI runs the
 dependents' tests.
+
+- Read-marker journeys must use ids returned by real sends and establish observed canonical source-epoch order;
+  process order or elapsed time does not guarantee accepted-history order.
+- To assert a semantic account-worker error, keep the runtime alive and fence startup with a hosted read queued on
+  that same worker (for example, `keys maintenance-status`). Cold startup may correctly return `AccountWorkerBusy`;
+  daemon `sync` restarts the selected worker and is not a readiness fence.
+- New daemon fixture phases must wait for and reap both the owned daemon and its stop client within the existing
+  shutdown grace before guard fallback. Preserve subsequent fresh-process reads and existing failure cleanup.
