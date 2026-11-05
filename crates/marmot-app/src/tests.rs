@@ -12462,6 +12462,38 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
     client.saved_transport_timestamp = future;
     assert!(saves(&mut client), "a future cursor is clamped");
     assert!(saves(&mut client), "on every save until it is in range");
+
+    // Another process stored a cursor the clock left in the future, while
+    // this client's own cursor is in range: the save still clamps it, and
+    // stops once the stored cursor is back in range.
+    let in_range = Some(crate::unix_now_seconds());
+    client.checkpointed_transport_timestamp = in_range;
+    client.saved_transport_timestamp = in_range;
+    {
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE account_state SET last_transport_timestamp = ?1 WHERE label = 'alice'",
+                [i64::try_from(crate::unix_now_seconds() + 3_600).unwrap()],
+            )
+            .unwrap();
+    }
+    assert!(saves(&mut client), "a stored future cursor is clamped");
+    assert!(
+        !saves(&mut client),
+        "and once in range, an empty save skips"
+    );
 }
 
 #[test]

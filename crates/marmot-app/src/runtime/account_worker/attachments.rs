@@ -73,18 +73,6 @@ pub(super) struct Admission {
     keep_media_more: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// A blocking-pool batch timed as one runtime operation (mdk#2923): it ends as
-/// a success however the batch returns, and the dropped task records nothing.
-struct TimedBatch(Option<Observation>);
-
-impl Drop for TimedBatch {
-    fn drop(&mut self) {
-        if let Some(observation) = self.0.take() {
-            observation.finish(TelemetryOutcome::Success);
-        }
-    }
-}
-
 /// Starts a media sweep on the blocking pool unless one is still running:
 /// to completion when the worker takes ownership, otherwise one batch.
 fn spawn_media_sweep(
@@ -100,20 +88,22 @@ fn spawn_media_sweep(
     {
         return;
     }
-    let batch = TimedBatch(Some(telemetry.observe(RuntimeOp::WorkerMediaSweep)));
+    // Timed on the blocking pool (mdk#2923); a batch that never runs or
+    // panics drops its span, which records it as cancelled.
+    let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
     admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
-        let _batch = batch;
-        loop {
+        let outcome = loop {
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
-                Ok(_) => break,
+                Ok(_) => break TelemetryOutcome::Success,
                 Err(_) => {
                     tracing::warn!(target: "marmot_app::runtime", method = "media_sweep",
                         "media store sweep deferred");
-                    break;
+                    break TelemetryOutcome::Failure;
                 }
             }
-        }
+        };
+        batch.finish(outcome);
     }));
 }
 /// Starts one page of outgoing upload promotion on the blocking pool unless
@@ -135,9 +125,8 @@ fn spawn_upload_promotion(
         return;
     }
     let cursor = admission.upload_cursor.clone();
-    let batch = TimedBatch(Some(telemetry.observe(RuntimeOp::WorkerUploadPromotion)));
+    let batch = telemetry.observe(RuntimeOp::WorkerUploadPromotion);
     admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
-        let _batch = batch;
         let after = cursor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -155,10 +144,12 @@ fn spawn_upload_promotion(
                 if promoted {
                     updates.state_changed();
                 }
+                batch.finish(TelemetryOutcome::Success);
             }
             Err(_) => {
                 tracing::warn!(target: "marmot_app::runtime", method = "outgoing_upload_promotion",
                     "outgoing upload promotion deferred");
+                batch.finish(TelemetryOutcome::Failure);
             }
         }
     }));
@@ -200,14 +191,11 @@ pub(super) fn spawn_legacy_migration(
         admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
     }
     let keep_media_more = admission.keep_media_more.clone();
-    let batch = TimedBatch(Some(
-        shared
-            .observer
-            .performance()
-            .observe(RuntimeOp::WorkerMaintenanceHousekeepingBatch),
-    ));
+    let batch = shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceHousekeepingBatch);
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
-        let _batch = batch;
         let started = (|| {
             let storage = app.account_storage(&label)?;
             let media = app.account_media_store(&label, &storage)?;
@@ -226,6 +214,7 @@ pub(super) fn spawn_legacy_migration(
             tracing::warn!(target: "marmot_app::storage_maintenance",
                 method = "migrate_legacy_attachments",
                 "legacy attachment migration batch deferred");
+            batch.finish(TelemetryOutcome::Failure);
             return;
         };
         let account_dir = app.account_dir(&label);
@@ -293,6 +282,7 @@ pub(super) fn spawn_legacy_migration(
         {
             compaction_due.store(true, std::sync::atomic::Ordering::Release);
         }
+        batch.finish(TelemetryOutcome::Success);
     }));
 }
 

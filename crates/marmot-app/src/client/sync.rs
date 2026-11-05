@@ -6758,25 +6758,44 @@ impl AppClient {
         // Nothing to persist: maintenance saves after every tick. Skipping the
         // write also skips the chat-list stale mark and presentation wake,
         // which would otherwise force a full chat-list rebuild and set off
-        // another attachment pass (mdk#2923). Receipts synchronize first, as
-        // the save below would: released receipts can add seen events, and
-        // closed storage still fails the save.
-        if changed_groups == 0
+        // another attachment pass (mdk#2923).
+        let max_cursor =
+            unix_now_seconds().saturating_add(crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs());
+        let nothing_to_persist = changed_groups == 0
             && pending_acks == 0
             && pending_frontiers == 0
             && created_group_id_hex.is_none()
             && self.checkpointed_transport_timestamp == self.saved_transport_timestamp
-            // A saved cursor beyond the allowed future skew (the clock moved
-            // back) still needs the save that clamps it.
-            && self.saved_transport_timestamp.is_none_or(|cursor| {
-                cursor
-                    <= unix_now_seconds()
-                        .saturating_add(crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs())
-            })
-            && self.transport_receipts()?.pending_seen_events().is_empty()
-        {
-            self.flush_live_v5_events();
-            return Ok(None);
+            // A cursor beyond the allowed future skew (the clock moved back)
+            // still needs the save that clamps it, whether this client saved
+            // it or another process did.
+            && self.saved_transport_timestamp.is_none_or(|cursor| cursor <= max_cursor)
+            && self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    Ok(storage
+                        .app_storage()
+                        .stored_transport_cursor(&self.state.label)?)
+                })
+                .is_ok_and(|stored| stored.is_none_or(|cursor| cursor <= max_cursor));
+        // Receipts synchronize once per save: released receipts can add seen
+        // events, and a retry of a failed synchronization could succeed and
+        // hide the failure. The save below reuses this result, so an error
+        // still fails the save and records its span.
+        let mut synchronized_seen_events = None;
+        if nothing_to_persist {
+            match self.transport_receipts() {
+                Ok(receipts) => {
+                    let seen_events = receipts.pending_seen_events();
+                    if seen_events.is_empty() {
+                        self.flush_live_v5_events();
+                        return Ok(None);
+                    }
+                    synchronized_seen_events = Some(Ok(seen_events));
+                }
+                Err(error) => synchronized_seen_events = Some(Err(error)),
+            }
         }
         let message_ref = (pending_acks == 1)
             .then(|| self.pending_application_event_acks.iter().next())
@@ -6825,8 +6844,11 @@ impl AppClient {
                     "injected v5 probe checkpoint failure".into(),
                 ));
             }
-            let seen_events = match self.transport_receipts() {
-                Ok(receipts) => receipts.pending_seen_events(),
+            let seen_events = match synchronized_seen_events.take().unwrap_or_else(|| {
+                self.transport_receipts()
+                    .map(|receipts| receipts.pending_seen_events())
+            }) {
+                Ok(seen_events) => seen_events,
                 Err(error) => {
                     // This failed before either projection save entry point.
                     // The checkpoint itself therefore did not commit.

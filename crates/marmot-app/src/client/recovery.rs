@@ -875,13 +875,16 @@ impl AppClient {
     /// adapter guard. The cursor seal rechecks the copied generation and current
     /// pending/loss facts; this is never exhaustive history or loss evidence.
     pub(crate) async fn synchronize_native_replay(&mut self) -> Result<(), AppError> {
-        let (generation, pending) = {
-            let observation = self.adapter.replay_admission().await;
-            (
-                observation.generation(),
-                observation.pending || observation.spill_pending,
-            )
-        };
+        let adapter = self.adapter.clone();
+        let observation = adapter.replay_admission().await;
+        let generation = observation.generation();
+        // The generation this pass synchronizes, recorded from the same
+        // guarded snapshot it classifies and processes: the next full pass for
+        // a later one counts as a source change (mdk#2923 telemetry).
+        let previous = self
+            .recovery_owner
+            .replay_observed_generation
+            .replace(generation);
         if self.recovery_owner.native_replay_authorizes(generation) {
             return Ok(());
         }
@@ -889,8 +892,10 @@ impl AppClient {
         // source set (a new generation) or a retry of one that did not
         // authorize, each with or without admission still pending. Success
         // means it authorized the generation (mdk#2923).
-        let same_generation = self.recovery_owner.replay_observed_generation == Some(generation);
-        let reason = match (same_generation, pending) {
+        let reason = match (
+            previous == Some(generation),
+            observation.pending || observation.spill_pending,
+        ) {
             (false, false) => crate::RuntimePerformanceOperation::ReplaySyncSourcesChanged,
             (false, true) => crate::RuntimePerformanceOperation::ReplaySyncSourcesChangedPending,
             (true, false) => crate::RuntimePerformanceOperation::ReplaySyncRetry,
@@ -900,14 +905,11 @@ impl AppClient {
             .runtime_telemetry
             .as_ref()
             .map(|telemetry| telemetry.observe(reason));
-        // Until the pass takes its own snapshot, the generation seen here is
-        // the best record, so a pass cancelled before then still counts.
-        self.recovery_owner.replay_observed_generation = Some(generation);
-        let result = self.synchronize_native_replay_sources().await;
-        // The adapter may have moved on while this ran; the pass succeeded if
-        // the generation it holds now is authorized.
-        let current = self.adapter.replay_admission().await.generation();
+        let result = self.synchronize_native_replay_sources(observation).await;
         if let Some(span) = span {
+            // The adapter may have moved on while this ran; the pass succeeded
+            // if the generation it holds now is authorized.
+            let current = self.adapter.replay_admission().await.generation();
             span.finish(match &result {
                 Err(_) => marmot_observability::Outcome::Failure,
                 Ok(()) if self.recovery_owner.native_replay_authorizes(current) => {
@@ -919,18 +921,14 @@ impl AppClient {
         result
     }
 
-    async fn synchronize_native_replay_sources(&mut self) -> Result<(), AppError> {
+    /// One full synchronization of `observation`, a guarded snapshot whose
+    /// generation is not authorized yet.
+    async fn synchronize_native_replay_sources(
+        &mut self,
+        observation: transport_nostr_adapter::ReplayAdmissionStatus<'_>,
+    ) -> Result<(), AppError> {
         use sha2::{Digest, Sha256};
-        let adapter = self.adapter.clone();
-        let observation = adapter.replay_admission().await;
         let generation = observation.generation();
-        // The generation this pass synchronizes: the next full pass for a
-        // later one counts as a source change, even if the adapter moves on
-        // before this pass finishes (mdk#2923 telemetry).
-        self.recovery_owner.replay_observed_generation = Some(generation);
-        if self.recovery_owner.native_replay_authorizes(generation) {
-            return Ok(());
-        }
         // Every failed write/CAS leaves cached authorization invalid. Copied
         // observations can only authorize their own guarded generation.
         self.recovery_owner.replay_generation = None;

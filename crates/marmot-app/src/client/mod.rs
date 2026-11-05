@@ -1792,16 +1792,17 @@ impl AppClient {
         let step =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceEffects);
         let observed = self.observe_native_membership_effects(effects).await;
+        let result = observed.and_then(|()| self.summarize_maintenance(effects));
+        self.recover_superseded_invites_best_effort().await;
+        // The span covers the whole tail, invite recovery's network work too.
         finish_maintenance_step(
             step,
-            if observed.is_ok() {
+            if result.is_ok() {
                 marmot_observability::Outcome::Success
             } else {
                 marmot_observability::Outcome::Failure
             },
         );
-        let result = observed.and_then(|()| self.summarize_maintenance(effects));
-        self.recover_superseded_invites_best_effort().await;
         result
     }
 
