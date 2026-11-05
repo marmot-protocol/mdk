@@ -1568,6 +1568,69 @@ async fn an_add_to_the_device_group_owes_no_history() {
     );
 }
 
+/// Exercise the existing native paired fixture's read failure and actual
+/// history import, then restore the same group without generating a roster event.
+async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, chat: &GroupId) {
+    let account = devices.laptop_app.account_storage("alice").unwrap();
+    let saved_group = cgka_traits::storage::GroupStorage::get_group(&account, &group).unwrap();
+    // Only the device group's durable record is unreadable; the ordinary
+    // chat and its native history import remain available.
+    storage(&devices.laptop_app)
+        .execute_batch_for_test(&format!(
+            "UPDATE cgka_groups SET record = X'00' WHERE id = X'{}'",
+            hex::encode(group.as_slice())
+        ))
+        .unwrap();
+    assert!(matches!(
+        devices.laptop.trusted_device_roster(),
+        Err(AppError::DeviceGroupRefused("roster_unavailable"))
+    ));
+    assert!(
+        !device_group_seam(&mut devices.laptop),
+        "an unreadable roster cannot change the displayed import names"
+    );
+    assert!(!devices.laptop.take_linked_devices_changed());
+    assert!(matches!(
+        &history_state(&devices.laptop, chat)[..],
+        [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(devices, "Phone")
+    ));
+
+    let during_failure = send_text(&mut devices.phone, &chat, "import during roster failure").await;
+    let bundle = devices
+        .phone
+        .export_chat_history(&chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let imported = devices
+        .laptop
+        .import_history_bundle(
+            &chat,
+            &slot_of(&devices.phone),
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            &sealed.ciphertext,
+        )
+        .unwrap()
+        .expect("the real chat's new history imports despite the unreadable roster");
+    assert_eq!(
+        imported
+            .timeline_messages
+            .iter()
+            .find(|row| row.message_id_hex == during_failure)
+            .unwrap()
+            .imported_from,
+        Some(phone_named(&devices, "Phone"))
+    );
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the new import is announced"
+    );
+    assert!(!device_group_seam(&mut devices.laptop));
+
+    cgka_traits::storage::GroupStorage::put_group(&account, &saved_group).unwrap();
+}
+
 /// Each imported row names the device it came from, by the name the roster
 /// gives it now, and a live row names none; the import and the chat's
 /// history state reach hosts the same way. An import names its source even
@@ -1577,7 +1640,7 @@ async fn an_add_to_the_device_group_owes_no_history() {
 /// previous names and retries at the next seam, without another roster change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_imported_row_names_the_device_it_came_from() {
-    let (mut devices, group, chat, first) = history_devices().await;
+    let (mut devices, group, chat, first) = Box::pin(history_devices()).await;
     let chat_hex = hex::encode(chat.as_slice());
     name_phone(&mut devices, &group, "Phone").await;
     add_laptop(&mut devices, &chat).await;
@@ -1641,64 +1704,8 @@ async fn an_imported_row_names_the_device_it_came_from() {
     );
 
     name_phone(&mut devices, &group, "Old phone").await;
-    let account = devices.laptop_app.account_storage("alice").unwrap();
-    let saved_group = cgka_traits::storage::GroupStorage::get_group(&account, &group).unwrap();
-    // Only the device group's durable record is unreadable; the ordinary
-    // chat and its native history import remain available.
-    storage(&devices.laptop_app)
-        .execute_batch_for_test(&format!(
-            "UPDATE cgka_groups SET record = X'00' WHERE id = X'{}'",
-            hex::encode(group.as_slice())
-        ))
-        .unwrap();
-    assert!(matches!(
-        devices.laptop.trusted_device_roster(),
-        Err(AppError::DeviceGroupRefused("roster_unavailable"))
-    ));
-    assert!(
-        !device_group_seam(&mut devices.laptop),
-        "an unreadable roster cannot change the displayed import names"
-    );
-    assert!(!devices.laptop.take_linked_devices_changed());
-    assert_eq!(
-        sources(&devices),
-        [Some(phone_named(&devices, "Phone")), None]
-    );
-
-    let during_failure = send_text(&mut devices.phone, &chat, "import during roster failure").await;
-    let bundle = devices
-        .phone
-        .export_chat_history(&chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
-        .unwrap()
-        .unwrap();
-    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
-    let imported = devices
-        .laptop
-        .import_history_bundle(
-            &chat,
-            &slot_of(&devices.phone),
-            &sealed.key,
-            &sealed.ciphertext_sha256,
-            &sealed.ciphertext,
-        )
-        .unwrap()
-        .expect("the real chat's new history imports despite the unreadable roster");
-    assert_eq!(
-        imported
-            .timeline_messages
-            .iter()
-            .find(|row| row.message_id_hex == during_failure)
-            .unwrap()
-            .imported_from,
-        Some(phone_named(&devices, "Phone"))
-    );
-    assert!(
-        device_group_seam(&mut devices.laptop),
-        "the new import is announced"
-    );
-    assert!(!device_group_seam(&mut devices.laptop));
-
-    cgka_traits::storage::GroupStorage::put_group(&account, &saved_group).unwrap();
+    // Keep the added fault phase out of this already-composed test future.
+    Box::pin(import_while_roster_read_fails(&mut devices, &group, &chat)).await;
     assert!(
         device_group_seam(&mut devices.laptop),
         "the recovered names are announced without another roster event"
