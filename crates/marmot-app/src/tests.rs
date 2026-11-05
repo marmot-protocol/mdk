@@ -5247,7 +5247,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
         app.chat_list_projection_stale
             .lock()
             .unwrap()
-            .insert("alice".to_owned());
+            .invalidate("alice");
 
         relay.block_next_publish();
         let created = runtime
@@ -12654,6 +12654,58 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         Some(false),
         "and the list shows the other runtime's change"
     );
+}
+
+/// An invalidation that lands while the chat list is being rebuilt is not
+/// cleared by that rebuild: the rebuild covers only the generation it
+/// snapshotted, so the next read rebuilds again. With checkpoints skipped
+/// on idle ticks, nothing else would re-mark it (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalidation_during_a_chat_list_refresh_survives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("refreshed", &[]).await.unwrap();
+    client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    app.chat_list("alice", true).unwrap();
+    let stale = |app: &MarmotApp| {
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice")
+    };
+    assert!(!stale(&app), "warm and current");
+
+    app.invalidate_chat_list_projection("alice");
+    let during = app.clone();
+    crate::CHAT_LIST_REFRESH_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            during.invalidate_chat_list_projection("alice");
+        }));
+    });
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        stale(&app),
+        "the invalidation made during the rebuild survives it"
+    );
+
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .set_group_archived("alice", &hex::encode(group.as_slice()), true)
+        .unwrap();
+    let archived = app
+        .chat_list("alice", true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.group_id_hex == hex::encode(group.as_slice()))
+        .map(|row| row.archived);
+    assert_eq!(archived, Some(true), "so the next read rebuilds again");
+    assert!(!stale(&app), "and then the list is current");
 }
 
 #[test]
