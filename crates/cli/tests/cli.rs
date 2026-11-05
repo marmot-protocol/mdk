@@ -9683,6 +9683,12 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     );
     let group_id = created["group_id"].as_str().expect("group id");
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+    // Management checks an active member, not an auto-joined invitation that
+    // still awaits this device's consent under the shared capability selector.
+    run_json(
+        home.path(),
+        &["--account", &bob, "groups", "accept", group_id],
+    );
 
     let recovery = run_json(
         home.path(),
@@ -9808,7 +9814,7 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     assert_eq!(alice_management["is_last_admin"], true);
     assert_eq!(alice_management["can_invite"], true);
     assert_eq!(alice_management["can_leave"], false);
-    assert_eq!(alice_management["requires_self_demote_before_leave"], true);
+    assert_eq!(alice_management["requires_self_demote_before_leave"], false);
     assert_eq!(alice_management["lifecycle_state"], "stable");
     assert_eq!(alice_management["disbanding"], false);
     assert_eq!(
@@ -9825,6 +9831,7 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     assert_eq!(bob_management["is_self_admin"], false);
     assert_eq!(bob_management["can_invite"], false);
     assert_eq!(bob_management["can_leave"], true);
+    assert_eq!(bob_management["requires_self_demote_before_leave"], false);
     assert_eq!(bob_management["can_disband"], false);
 }
 

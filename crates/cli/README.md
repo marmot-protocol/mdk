@@ -315,7 +315,14 @@ grants admin to an invitee inside the same invite commit. An `--admin` that is n
 `initial_admin_not_invited` before anything is published. Invite results carry an `initial_admins` list.
 `groups management` mirrors the MarmotKit management state (`is_self_admin`, `can_invite`, `can_leave`,
 `requires_self_demote_before_leave`, `can_enable_disbanding`, `can_disband`, `disbanding_blockers`, per-member
-`member_actions`) from one runtime read.
+`member_actions`). Leave hints use the shared core capability selector and remain advisory; the command rechecks
+current authority. `can_leave` is false for unaccepted invitations and unrecoverable groups.
+`requires_self_demote_before_leave` is false: `groups leave` automatically demotes an eligible
+nonlast admin account before its ordinary departure. The last active admin account is refused before a new shared
+invitation choice or departure publication; promote another account first. TUI `L` confirms and invokes this same
+command, including its last-admin refusal, rather than requiring manual demotion. The independent `groups self-demote`
+command remains available. A committed demotion remains if a later departure fails. An admitted Leave can still be
+settling; success is not proof every device departed.
 
 **Retention.** `groups retention <group-hex>` shows the disappearing-message policy (`disappearing_message_secs`,
 `enabled`, and the full `message_retention` component). `--set <duration>` publishes a component update: a bare integer
@@ -922,9 +929,10 @@ crashed session are swept at startup.
 
 - **Group detail** (`g`): members with admin badges and a `(you)` marker, relay hints, name, and description. `j`/`k`
   move the member selection; `a` searches for someone to add; `A` adds by npub/hex (`groups add-members`); `x` removes
-  the selected member; `P` promotes them to admin; `R` renames the group; `L` leaves; `I` opens invites. Admins cannot
-  leave: `L` shows a "Cannot Leave Group" card (sole admins must promote another member first; co-admins must step
-  down). A non-admin confirms, and on success the chat leaves the list. `Esc` returns to the main view.
+  the selected member; `P` promotes them to admin; `R` renames the group; `L` opens Leave confirmation for admins and
+  non-admins; `I` opens invites. Leave runs `groups leave`: core demotes an eligible nonlast admin and refuses the last
+  active admin, who must promote another account first. On success the TUI returns to the chat list, though departure
+  can still be settling. `Esc` returns to the main view.
 - **Invites** (`I`): pending invites from `groups invites`. `a` or `Enter` accepts and opens the chat, `d` declines,
   `Esc` closes. The picker stays open until no invites remain; with none it shows an info card.
 - **User search** (`s`, or `/users [query]`): a one-shot `users search` over your follow graph (default radius `0..1`).
