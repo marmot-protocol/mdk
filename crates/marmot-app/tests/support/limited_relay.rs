@@ -30,17 +30,23 @@ pub(crate) async fn mock_relay() -> (TestRelay, String) {
 /// A relay that enforces and publishes `limit`, or publishes a page with no
 /// limit and enforces none.
 pub(crate) async fn relay_publishing(limit: Option<usize>) -> (TestRelay, String) {
+    relay_publishing_with(RelayBuilder::default(), limit).await
+}
+
+/// As [`relay_publishing`], over a relay built from `builder` (a write
+/// policy, say).
+pub(crate) async fn relay_publishing_with(
+    builder: RelayBuilder,
+    limit: Option<usize>,
+) -> (TestRelay, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     let (builder, body) = match limit {
         Some(limit) => (
-            RelayBuilder::default().max_filter_limit(limit),
+            builder.max_filter_limit(limit),
             format!(r#"{{"supported_nips":[],"limitation":{{"max_limit":{limit}}}}}"#),
         ),
-        None => (
-            RelayBuilder::default(),
-            r#"{"supported_nips":[]}"#.to_owned(),
-        ),
+        None => (builder, r#"{"supported_nips":[]}"#.to_owned()),
     };
     let relay = LocalRelay::new(builder);
     relay.run().await.unwrap();

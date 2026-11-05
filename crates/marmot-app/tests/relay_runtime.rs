@@ -33,7 +33,7 @@ use marmot_forensics::v5::{EndpointRef, Record as V5Record};
 use nostr_relay_builder::prelude::{
     BoxedFuture, Kind as OldKind, PolicyResult, QueryPolicy, WritePolicy,
 };
-use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
+use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
@@ -546,13 +546,18 @@ async fn publish_socket_isolation() {
     );
 }
 
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
+use limited_relay::TestRelay;
+
+/// The fixture relay publishes the cap it enforces, as White Noise's relays
+/// do: a relay whose information document cannot be read holds a group's
+/// live input until its recovery unit gives up, a contract of its own.
+async fn mock_relay() -> (TestRelay, String) {
+    limited_relay::mock_relay().await
 }
 
-async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+async fn mock_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
     // Opt in at ordinary app fixtures; shared relay/setup helpers also serve
     // ignored diagnostics and nightly replay, which keep their original settings.
     storage_sqlite::relax_storage_for_test_process();
@@ -585,7 +590,7 @@ async fn sync_to_epoch(client: &mut marmot_app::AppClient, group: &GroupId, epoc
     .expect("recipient did not settle the committed group epoch");
 }
 
-async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+async fn mock_audit_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
     storage_sqlite::relax_storage_for_test_process();
     let (relay, url) = mock_relay().await;
     let app = MarmotApp::try_with_relays_and_account_home_and_config(
@@ -8590,7 +8595,8 @@ async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
     // No relay remains to confirm whether bob's message was accepted. The
     // attempt can take up to the adapter's ~20s publish overall-wait
     // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports completion unknown.
-    relay.shutdown();
+    // Dropping the fixture closes its listener and every connection.
+    drop(relay);
     let unresolved = bob
         .send(&group_id, b"bob unresolved")
         .await
@@ -13963,9 +13969,11 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let welcome_policy = RejectThenBlockGiftWraps::new();
-    let relay = LocalRelay::new(RelayBuilder::default().write_policy(welcome_policy.clone()));
-    relay.run().await.unwrap();
-    let url = relay.url().await.to_string();
+    let (_relay, url) = limited_relay::relay_publishing_with(
+        RelayBuilder::default().write_policy(welcome_policy.clone()),
+        Some(500),
+    )
+    .await;
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
@@ -15395,7 +15403,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
 // acknowledgements, not only directory-cache fixtures.
 async fn onboarding_fixture() -> (
     tempfile::TempDir,
-    MockRelay,
+    TestRelay,
     MarmotApp,
     MarmotAppRuntime,
     Keys,
