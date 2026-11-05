@@ -1977,6 +1977,46 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Finish a newly added direct-child daemon phase without interrupting either
+/// process's normal exit; the guard still owns bounded failure cleanup.
+fn stop_owned_test_daemon(mut daemon: DaemonGuard) {
+    let mut stop = KillOnDrop::spawn(
+        Command::new(env!("CARGO_BIN_EXE_wn"))
+            .arg("--socket")
+            .arg(&daemon.socket)
+            .arg("--json")
+            .args(["daemon", "stop"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let deadline = Instant::now() + DAEMON_STOP_GRACE;
+    loop {
+        // wn stop waits for the daemon pid to disappear, so reap our child
+        // while waiting for the stop client rather than leaving a zombie.
+        let daemon_exited = !daemon.running();
+        let stop_exited = stop
+            .child()
+            .try_wait()
+            .expect("stop client status")
+            .is_some();
+        if daemon_exited && stop_exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned daemon and stop client did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let stopped = stop.output();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        command_output_summary(&stopped)
+    );
+    daemon.stop();
+}
+
 /// The pids of running `wnd` processes started with `--socket <socket>`. A
 /// zombie has no arguments left to match, so it is never returned.
 fn wnd_pids_for_socket(socket: &std::path::Path) -> Vec<libc::pid_t> {
@@ -5719,7 +5759,7 @@ fn groups_leave_publishes_self_remove() {
         );
         std::thread::sleep(POLL_INTERVAL);
     }
-    daemon.stop();
+    stop_owned_test_daemon(daemon);
     let retained = run_json_with_relay(
         home.path(),
         relay_url,
@@ -9684,10 +9724,50 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
         ],
     );
     assert_eq!(bad_token["code"], "invalid_rejoin_token");
+    // Decline rejects startup catch-up as busy before it validates the offer.
+    // Keep one real actor and wait for its deferred read to finish startup.
+    // A CLI sync would restart that actor; the hosted key-status read does not.
+    let socket = wn_cli::daemon::default_socket_path(home.path());
+    let socket_arg = socket.to_str().expect("socket path");
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .args(["--secret-store", "file"])
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
+    let ready = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &alice,
+            "keys",
+            "maintenance-status",
+        ],
+    );
+    assert_eq!(ready["account_id"], alice);
+    assert!(ready["key_package_maintenance"].is_object());
     let declined = run_json_error(
         home.path(),
-        &["--account", &alice, "groups", "decline-rejoin", &welcome_id],
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &alice,
+            "groups",
+            "decline-rejoin",
+            &welcome_id,
+        ],
     );
+    stop_owned_test_daemon(daemon);
     assert_eq!(declined["code"], "engine_error");
     assert_eq!(declined["message"], "invalid welcome");
 
