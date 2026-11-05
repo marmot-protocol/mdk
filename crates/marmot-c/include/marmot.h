@@ -3082,6 +3082,12 @@ typedef struct MarmotUnrecognizedSignIn {
   bool signed_in;
   enum MarmotUnrecognizedSignInState state;
   char *linked_by_slot_id_hex;
+  /**
+   * Retained local made approval missing from this selected roster;
+   * not identity authentication or proof of permanent loss. False
+   * means no affirmative local context, not that it was never linked.
+   */
+  bool previously_linked_here;
 } MarmotUnrecognizedSignIn;
 
 /**
@@ -8802,6 +8808,23 @@ MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client
 MarmotStatus marmot_start_device_link(const struct MarmotClient *client,
                                       const char *account_ref,
                                       struct MarmotDeviceLinkSnapshot **out);
+
+/**
+ * Explicit local device-group reset before fresh code pairing. Keeps
+ * credentials, slot and ordinary chat data; abandons unfinished device
+ * sync without removing any member. Active pairing/Move or unsettled
+ * native work can refuse indefinitely. Requires experimental gates.
+ * Free with `marmot_device_link_snapshot_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reset_device_group_for_repair(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  struct MarmotDeviceLinkSnapshot **out);
 
 /**
  * On the new device: the user says both screens show the same emoji.
