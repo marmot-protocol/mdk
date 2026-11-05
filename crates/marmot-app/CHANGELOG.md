@@ -144,6 +144,10 @@
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
   earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
 
+- Isolate unreadable per-device settings when adding linked devices to chats or sending their history, so healthy
+  siblings still progress. Keep the unreadable target's history owed and use the existing Blossom preparation backoff.
+  Settings holds, history expiry, publish-failure behavior and host APIs are unchanged; no migration is needed.
+
 - A published sibling Welcome lost before joining is eligible for best-effort
   repair once the target's heartbeat-based last activity for its current roster
   incarnation is at least 600 seconds after the latest carrier's first accepted
