@@ -40,7 +40,7 @@ pub enum OversizedArtifactFfi {
     Welcome,
     /// A chat message or another application message.
     ApplicationMessage,
-    /// Any other group event.
+    /// Any other transport event.
     Other,
 }
 

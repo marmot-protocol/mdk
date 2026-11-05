@@ -3095,8 +3095,10 @@ mod fail_if_publish_failed_tests {
         let mut first = failure("relay rejected event (too-large)");
         first.oversized = Some(cause);
         let mut second = first.clone();
-        let mut effects = AccountDeviceEffects::default();
-        effects.failures = vec![first.clone(), second.clone()];
+        let mut effects = AccountDeviceEffects {
+            failures: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
         assert!(matches!(
             fail_if_publish_failed(&effects),
             Err(AppError::EventTooLarge {
