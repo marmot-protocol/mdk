@@ -281,6 +281,11 @@ enum MarmotStatus
    * Restart the authenticated recovery challenge; do not retry the grant.
    */
   MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118,
+  /**
+   * Every current publish target conclusively refused the event for size.
+   * Detail contains only the artifact kind and coarse locally measured size.
+   */
+  MARMOT_STATUS_EVENT_TOO_LARGE = 119,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

@@ -4229,7 +4229,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L303)
+[Source](src/lib.rs#L305)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4239,7 +4239,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L318)
+[Source](src/lib.rs#L320)
 
 ### `Marmot::new_with_options`
 
@@ -4251,7 +4251,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L329)
+[Source](src/lib.rs#L331)
 
 ### `Marmot::new`
 
@@ -4263,7 +4263,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L358)
+[Source](src/lib.rs#L360)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4275,7 +4275,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L384)
+[Source](src/lib.rs#L386)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4287,7 +4287,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L415)
+[Source](src/lib.rs#L417)
 
 ### `Marmot::new_with_client_name`
 
@@ -4299,7 +4299,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L436)
+[Source](src/lib.rs#L438)
 
 ### `Marmot::start`
 
@@ -4311,7 +4311,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L474)
+[Source](src/lib.rs#L476)
 
 ### `Marmot::shutdown`
 
@@ -4323,7 +4323,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L486)
+[Source](src/lib.rs#L488)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4335,7 +4335,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L522)
+[Source](src/lib.rs#L524)
 
 ### `Marmot::storage_is_closed`
 
@@ -4347,7 +4347,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L530)
+[Source](src/lib.rs#L532)
 
 ### `Marmot::is_stopping`
 
@@ -4359,7 +4359,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L537)
+[Source](src/lib.rs#L539)
 
 </details>
 

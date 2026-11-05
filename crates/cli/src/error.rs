@@ -659,6 +659,14 @@ fn account_home_error_json(err: &AccountHomeError) -> Value {
 }
 
 fn app_error_json(err: &AppError) -> Value {
+    if let Some(cause) = err.as_oversized_event() {
+        return json!({
+            "code": "event_too_large",
+            "message": format!("event too large: {} ({})", cause.artifact, cause.size_class),
+            "artifact": cause.artifact.as_str(),
+            "size_class": cause.size_class.as_str(),
+        });
+    }
     if let Some(engine_error) = err.as_engine_error() {
         return engine_error_json(engine_error);
     }
@@ -793,6 +801,15 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "publish_failed",
             "message": err.to_string(),
             "reason": reason,
+        }),
+        AppError::EventTooLarge {
+            artifact,
+            size_class,
+        } => json!({
+            "code": "event_too_large",
+            "message": err.to_string(),
+            "artifact": artifact.as_str(),
+            "size_class": size_class.as_str(),
         }),
         AppError::MissingDefaultRelays => json!({
             "code": "missing_default_relays",

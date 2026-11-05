@@ -1236,6 +1236,9 @@ pub struct SignOutOutcome {
 /// exactly those identifiers, so we never interpolate `err` here — we classify
 /// it into a fixed phrase instead.
 pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
+    if err.as_oversized_event().is_some() {
+        return "relay publish failed".to_owned();
+    }
     // An engine failure gets one phrase whichever lower-stack layer carried
     // it (mdk#2602).
     if let Some(engine) = err.as_engine_error() {
@@ -1258,7 +1261,7 @@ pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
             return "transport error".to_owned();
         }
         AppError::TransportClosed => "transport error",
-        AppError::Publish(_) => "relay publish failed",
+        AppError::Publish(_) | AppError::EventTooLarge { .. } => "relay publish failed",
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "local storage error"
         }

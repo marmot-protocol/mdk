@@ -4400,6 +4400,7 @@ where
             } else {
                 let reason = "insufficient publish acknowledgements".to_owned();
                 output.failures.push(PublishFailure {
+                    oversized: OversizedEvent::of_fanout(&fanout),
                     message_id: fanout
                         .published_message_id()
                         .unwrap_or_else(|| fanout.message_id())
@@ -5221,6 +5222,7 @@ where
                         );
                         if !report.met_required_acks() {
                             output.failures.push(PublishFailure {
+                                oversized: None,
                                 message_id: report.message_id.clone(),
                                 reason: "fanout endpoint did not acknowledge".into(),
                             });
@@ -5244,6 +5246,7 @@ where
                             target.failure_code = Some("adapter_error".into());
                         }
                         output.failures.push(PublishFailure {
+                            oversized: None,
                             message_id: message_id.clone(),
                             reason: "fanout adapter error".into(),
                         });
@@ -5335,6 +5338,7 @@ where
                 Ok(target) => target,
                 Err(error) => {
                     output.failures.push(PublishFailure {
+                        oversized: None,
                         message_id: message.id,
                         reason: error.to_string(),
                     });
@@ -5686,6 +5690,7 @@ where
             } else if !status.met_required_acks {
                 let reason = "insufficient publish acknowledgements".to_owned();
                 output.failures.push(PublishFailure {
+                    oversized: OversizedEvent::of_fanout(&fanout),
                     message_id: report.message_id.clone(),
                     reason: reason.clone(),
                 });
@@ -5947,6 +5952,7 @@ where
                         },
                     );
                     output.failures.push(PublishFailure {
+                        oversized: None,
                         message_id,
                         reason: e.to_string(),
                     });
@@ -6262,6 +6268,7 @@ where
                     },
                 );
                 output.failures.push(PublishFailure {
+                    oversized: None,
                     message_id,
                     reason: error.to_string(),
                 });
@@ -6345,6 +6352,7 @@ where
                 },
             );
             output.failures.push(PublishFailure {
+                oversized: None,
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
             });
@@ -6514,6 +6522,7 @@ fn publish_target_with_endpoints(
 
 fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointFailure {
     TransportEndpointFailure {
+        size_class: None,
         endpoint,
         reason: "publish acknowledgement unknown".into(),
         kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -6575,6 +6584,7 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
             cgka_traits::FanoutTargetStatus::Failed => {
                 failed.push(fanout.target_failure(index).cloned().unwrap_or_else(|| {
                     TransportEndpointFailure {
+                        size_class: None,
                         endpoint: endpoint.clone(),
                         reason: "publish attempt failed before exposure".into(),
                         kind: TransportEndpointFailureKind::NotExposed,
@@ -7103,6 +7113,79 @@ pub struct UndeliveredCommit {
 pub struct PublishFailure {
     pub message_id: cgka_traits::MessageId,
     pub reason: String,
+    /// Definitive all-target size refusal; absent for mixed or unknown outcomes.
+    pub oversized: Option<OversizedEvent>,
+}
+
+/// Semantic artifact known by the publication owner, never inferred from ciphertext.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OversizedArtifact {
+    Commit,
+    Welcome,
+    ApplicationMessage,
+    Other,
+}
+
+impl OversizedArtifact {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Welcome => "welcome",
+            Self::ApplicationMessage => "application_message",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for OversizedArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Privacy-safe explanation of a definitive size refusal, without exact sizes,
+/// identifiers, relay details, or an assertion about an unknown relay limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OversizedEvent {
+    pub artifact: OversizedArtifact,
+    pub size_class: cgka_traits::EventSizeClass,
+}
+
+impl OversizedEvent {
+    fn of_fanout(fanout: &OutboundFanout) -> Option<Self> {
+        if fanout.possible_exposure()
+            || fanout.outcome().accepted_targets != 0
+            || fanout.outcome().outstanding_targets != 0
+        {
+            return None;
+        }
+        let failures = (0..fanout.request().target.endpoints().len())
+            .map(|index| fanout.target_failure(index).cloned())
+            .collect::<Option<Vec<_>>>()?;
+        let size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+            fanout.request().target.endpoints(),
+            &failures,
+        )?;
+        let artifact = if matches!(
+            fanout.request().message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) {
+            OversizedArtifact::Welcome
+        } else if fanout.application_message().is_some() {
+            OversizedArtifact::ApplicationMessage
+        } else if matches!(
+            fanout.pending_kind(),
+            Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband)
+        ) {
+            OversizedArtifact::Commit
+        } else {
+            OversizedArtifact::Other
+        };
+        Some(Self {
+            artifact,
+            size_class,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7169,19 +7252,32 @@ fn v5_failed_endpoint_result(
     failure: &TransportEndpointFailure,
 ) -> Option<audit_v5::EndpointResult> {
     let endpoint_ref = v5_endpoint_ref(&failure.endpoint)?;
-    let rejection_category = failure.rejection_category.map(|category| match category {
-        TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
-        TransportEndpointRejectionCategory::Pow => audit_v5::RejectionCategory::Pow,
-        TransportEndpointRejectionCategory::Blocked => audit_v5::RejectionCategory::Blocked,
-        TransportEndpointRejectionCategory::RateLimited => audit_v5::RejectionCategory::RateLimited,
-        TransportEndpointRejectionCategory::Invalid => audit_v5::RejectionCategory::Invalid,
-        TransportEndpointRejectionCategory::Error => audit_v5::RejectionCategory::Error,
-        TransportEndpointRejectionCategory::Unsupported => audit_v5::RejectionCategory::Unsupported,
-        TransportEndpointRejectionCategory::AuthRequired => {
-            audit_v5::RejectionCategory::AuthRequired
-        }
-        TransportEndpointRejectionCategory::Restricted => audit_v5::RejectionCategory::Restricted,
-    });
+    let rejection_category = failure
+        .rejection_category
+        .filter(|category| {
+            !(failure.kind == TransportEndpointFailureKind::NotExposed
+                && *category == TransportEndpointRejectionCategory::TooLarge)
+        })
+        .map(|category| match category {
+            TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
+            TransportEndpointRejectionCategory::Pow => audit_v5::RejectionCategory::Pow,
+            TransportEndpointRejectionCategory::Blocked => audit_v5::RejectionCategory::Blocked,
+            TransportEndpointRejectionCategory::RateLimited => {
+                audit_v5::RejectionCategory::RateLimited
+            }
+            TransportEndpointRejectionCategory::Invalid => audit_v5::RejectionCategory::Invalid,
+            TransportEndpointRejectionCategory::Error => audit_v5::RejectionCategory::Error,
+            TransportEndpointRejectionCategory::Unsupported => {
+                audit_v5::RejectionCategory::Unsupported
+            }
+            TransportEndpointRejectionCategory::AuthRequired => {
+                audit_v5::RejectionCategory::AuthRequired
+            }
+            TransportEndpointRejectionCategory::Restricted => {
+                audit_v5::RejectionCategory::Restricted
+            }
+            TransportEndpointRejectionCategory::TooLarge => audit_v5::RejectionCategory::Invalid,
+        });
     let failure_kind = match failure.kind {
         TransportEndpointFailureKind::TerminalRejected => {
             audit_v5::EndpointFailureKind::TerminalRejected
@@ -7259,6 +7355,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint,
                     reason: "test failure".into(),
                     kind,
@@ -7278,6 +7375,26 @@ mod tests {
         let ambiguous = failed_frozen_fanout(TransportEndpointFailureKind::PossiblyExposed);
         assert!(!frozen_fanout_target_retry_due(&ambiguous, 0, 30_999));
         assert!(frozen_fanout_target_retry_due(&ambiguous, 0, 31_000));
+    }
+
+    #[test]
+    fn size_refusal_does_not_override_prior_possible_exposure() {
+        let mut fanout = failed_frozen_fanout(TransportEndpointFailureKind::PossiblyExposed);
+        fanout.mark_attempt_started_at(0, 2_000).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    endpoint: fanout.request().target.endpoints()[0].clone(),
+                    reason: "relay rejected event (too-large)".into(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
+                    rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+                    size_class: Some(cgka_traits::EventSizeClass::Under64Kib),
+                },
+            )
+            .unwrap();
+        assert!(fanout.possible_exposure());
+        assert_eq!(OversizedEvent::of_fanout(&fanout), None);
     }
 
     fn published_message(id: u8) -> PublishedApplicationMessage {

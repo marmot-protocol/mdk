@@ -821,7 +821,7 @@ pub(super) fn refusal_category(
         Category::Pow => SubscriptionRefusalCategory::Pow,
         Category::Blocked => SubscriptionRefusalCategory::Blocked,
         Category::RateLimited => SubscriptionRefusalCategory::RateLimited,
-        Category::Invalid => SubscriptionRefusalCategory::Invalid,
+        Category::Invalid | Category::TooLarge => SubscriptionRefusalCategory::Invalid,
         Category::Error => SubscriptionRefusalCategory::Error,
         Category::Unsupported => SubscriptionRefusalCategory::Unsupported,
         Category::AuthRequired => SubscriptionRefusalCategory::AuthRequired,
