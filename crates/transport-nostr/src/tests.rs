@@ -6518,6 +6518,7 @@ impl nostr_relay_builder::prelude::WritePolicy for PublicAckGate {
 enum PublishCompletion {
     Return,
     Hold,
+    FailureReceipt,
 }
 
 struct ObservedPublishClient {
@@ -6618,7 +6619,166 @@ impl NostrRelayClient for ObservedPublishClient {
                 std::future::pending::<()>().await;
             }
         }
-        result
+        match result {
+            Err(TransportAdapterError::PublishEndpoints(failure))
+                if matches!(self.completion, PublishCompletion::FailureReceipt) =>
+            {
+                // Supplied publishers may return a receipt below quorum. Keep
+                // the real SDK failures intact while exercising that shape.
+                Ok(NostrPublishOutcome {
+                    message_id: failure.message_id,
+                    accepted: Vec::new(),
+                    failed: failure.endpoint_failures,
+                })
+            }
+            result => result,
+        }
+    }
+}
+
+/// Script wire replies across the anonymous and account-bound SDK sockets.
+async fn publish_auth_reply_sequence(
+    reasons: Vec<&'static str>,
+) -> (
+    TransportEndpoint,
+    Arc<Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+
+    assert!(!reasons.is_empty());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let observed = attempts.clone();
+    let server = tokio::spawn(async move {
+        let mut sockets = tokio::task::JoinSet::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            let observed = observed.clone();
+            let reasons = reasons.clone();
+            sockets.spawn(async move {
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.into_text() else {
+                        continue;
+                    };
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value[0] != "EVENT" {
+                        continue;
+                    }
+                    let id = value[1]["id"].as_str().unwrap().to_owned();
+                    let index = {
+                        let mut observed = observed.lock().await;
+                        let index = observed.len();
+                        observed.push(id.clone());
+                        index
+                    };
+                    let reason = reasons[index.min(reasons.len() - 1)];
+                    let reply = serde_json::json!(["OK", id, reason.is_empty(), reason]);
+                    if socket.send(reply.to_string().into()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (endpoint, attempts, server)
+}
+
+/// Authentication fallback must not replace an earlier uncertain send with
+/// definite rejection; a real later ACK still succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_auth_preserves_uncertainty() {
+    for (earlier_uncertainty, completion, last_reply, category) in [
+        (
+            true,
+            PublishCompletion::Return,
+            "invalid: bad event",
+            Some(TransportEndpointRejectionCategory::Invalid),
+        ),
+        (
+            true,
+            PublishCompletion::FailureReceipt,
+            "invalid: event too large: 999999999",
+            Some(TransportEndpointRejectionCategory::TooLarge),
+        ),
+        (true, PublishCompletion::Return, "", None),
+        (
+            false,
+            PublishCompletion::Return,
+            "invalid: event too large: 999999999",
+            Some(TransportEndpointRejectionCategory::TooLarge),
+        ),
+    ] {
+        let mut replies = Vec::new();
+        if earlier_uncertainty {
+            replies.push("error: publication unavailable");
+        }
+        replies.extend(["auth-required: authenticate", last_reply]);
+        let expected_attempts = replies.len();
+        let (endpoint, attempts, server) = publish_auth_reply_sequence(replies).await;
+        let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+        let fallback = Arc::new(ObservedPublishClient::new(completion).await);
+        let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
+        let signed = EventBuilder::new(Kind::TextNote, "publication certainty")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+        let result = timeout(
+            Duration::from_secs(10),
+            adapter.publish_signed_event(
+                fallback.as_ref(),
+                std::slice::from_ref(&endpoint),
+                &event,
+                1,
+            ),
+        )
+        .await
+        .expect("the wire sequence completes within the ordinary deadline");
+        assert_eq!(
+            *attempts.lock().await,
+            vec![signed.id.to_hex(); expected_attempts],
+            "anonymous attempts and authenticated fallback send the same actual event"
+        );
+        assert_eq!(*fallback.attempts.lock().await, vec![endpoint.clone()]);
+        assert_eq!(*fallback.events.lock().await, vec![event]);
+        if let Some(category) = category {
+            let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+                panic!("the relay never acknowledged the publication")
+            };
+            assert_eq!(failure.endpoint_failures.len(), 1);
+            let failure_endpoint = &failure.endpoint_failures[0];
+            assert_eq!(failure_endpoint.endpoint, endpoint);
+            assert_eq!(failure_endpoint.rejection_category, Some(category));
+            assert_eq!(
+                failure_endpoint.kind,
+                if earlier_uncertainty {
+                    TransportEndpointFailureKind::PossiblyExposed
+                } else {
+                    TransportEndpointFailureKind::TerminalRejected
+                },
+                "authentication fallback cannot erase earlier publication uncertainty"
+            );
+            assert_eq!(
+                failure_endpoint.size_class,
+                (!earlier_uncertainty && category == TransportEndpointRejectionCategory::TooLarge)
+                    .then_some(cgka_traits::EventSizeClass::Under64Kib)
+            );
+            assert_eq!(failure.event_size_class, None);
+        } else {
+            let outcome = result.expect("a real fallback acknowledgement remains successful");
+            assert_eq!(outcome.accepted.len(), 1);
+            assert_eq!(outcome.accepted[0].endpoint, endpoint);
+            assert!(outcome.failed.is_empty());
+        }
+        fallback.inner.shutdown_accounts().await;
+        fallback.inner.client().shutdown().await;
+        plane.shutdown().await;
+        server.abort();
+        let _ = server.await;
     }
 }
 
