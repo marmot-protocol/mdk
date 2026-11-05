@@ -278,10 +278,9 @@ mod tests {
         let words = match kit.begin_recovery_words("alice".into()).await {
             Ok(words) => words,
             Err(MarmotKitError::Runtime { details }) if details.contains("roster_unsupported") => {
-                assert!(
-                    !cfg!(feature = "dev-device-groups"),
-                    "the explicit dev build must exercise active backup forwarding"
-                );
+                if cfg!(feature = "dev-device-groups") {
+                    panic!("the explicit dev build must exercise active backup forwarding");
+                }
                 // A default dependency build cannot enable the experimental
                 // core gate through this wrapper. CI's existing app-policy
                 // feature union takes the active-operation branch below.
