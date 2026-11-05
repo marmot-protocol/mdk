@@ -770,7 +770,7 @@ c_cmd! {
     /// old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
     async fn marmot_group_commit_delivery(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupCommitDelivery) = group_commit_delivery;
 
-    /// Confirmed Adds whose Welcome is still owed, oldest first. Coarse size
+    /// Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
     /// evidence is diagnostic only. A false has_size_class means Unknown,
     /// including old rows or a later coarse legacy retry. The pending notice
     /// remains once per process/Welcome; query for later causes. Free the list

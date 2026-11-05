@@ -18,7 +18,7 @@ use super::common::SelfMembershipFfi;
 use super::media::EncryptedMediaVersionFfi;
 use crate::errors::MarmotKitError;
 
-/// A retained repair handle for an already-confirmed Add. A missing size
+/// A retained repair handle for a canonical create or confirmed Add. A missing size
 /// class means Unknown, including old rows or a later coarse legacy retry.
 /// A present class explains the observed refusal, not non-delivery: legacy
 /// bookkeeping may miss earlier exposure after a crash or record expiry.

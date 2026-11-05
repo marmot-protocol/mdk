@@ -1018,7 +1018,7 @@ impl Marmot {
             }))
     }
 
-    /// Confirmed Adds whose Welcome is still owed, oldest first. The coarse
+    /// Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. The coarse
     /// size class is a best-effort diagnosis, never a terminal verdict. The
     /// pending notice is once per process/Welcome; re-read this query for later
     /// causes. Coarse legacy retries may replace a specific cause with None

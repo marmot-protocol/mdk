@@ -16,7 +16,8 @@ pub struct PendingWelcomeDeliveryRecord {
     pub group_id_hex: String,
     pub recipient_hex: String,
     pub recorded_at: u64,
-    /// Coarse size refusal when proved; absent means Unknown, never delivered.
+    /// Coarse size refusal on the observed attempt; absent means Unknown.
+    /// Neither value proves delivery or non-delivery.
     #[serde(default)]
     pub size_class: Option<cgka_traits::EventSizeClass>,
 }

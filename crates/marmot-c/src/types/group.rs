@@ -46,7 +46,7 @@ impl Default for MarmotEventSizeClass {
 }
 
 c_mirror! {
-    /// A retained Welcome repair handle after an Add has already confirmed.
+    /// A retained Welcome repair handle after a canonical create or confirmed Add.
     /// Unknown includes legacy rows and later coarse retry outcomes; it does
     /// not clear the debt. A class explains the observed refusal, not delivery:
     /// earlier legacy exposure can be unknown. Requires the matching library and header.
