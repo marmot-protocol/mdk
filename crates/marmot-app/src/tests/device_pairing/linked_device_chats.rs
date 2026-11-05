@@ -1928,6 +1928,14 @@ async fn unreadable_history_target_does_not_starve_another_sibling() {
         } else {
             (second, first)
         };
+        if blossom {
+            // Only this real HTTP fixture needs the existing dev dial opt-in;
+            // reopen so both transports are built with that configuration.
+            phone.app.config.allow_loopback_blob_endpoints = true;
+            second.app.config.allow_loopback_blob_endpoints = true;
+            phone = reopen(phone).await;
+            second = reopen(second).await;
+        }
         let chat = chats(&mut phone, 1).await.remove(0);
         let server = blossom.then(local_blossom);
         if let Some(server) = &server {
