@@ -927,8 +927,8 @@ crashed session are swept at startup.
   move the member selection; `a` searches for someone to add; `A` adds by npub/hex (`groups add-members`); `x` removes
   the selected member; `P` promotes them to admin; `R` renames the group; `L` opens Leave confirmation for admins and
   non-admins; `I` opens invites. Leave runs `groups leave`: core demotes an eligible nonlast admin and refuses the last
-  active admin, who must promote another account first. On success the chat leaves the list, though departure can
-  still be settling. `Esc` returns to the main view.
+  active admin, who must promote another account first. On success the TUI returns to the chat list, though departure
+  can still be settling. `Esc` returns to the main view.
 - **Invites** (`I`): pending invites from `groups invites`. `a` or `Enter` accepts and opens the chat, `d` declines,
   `Esc` closes. The picker stays open until no invites remain; with none it shows an info card.
 - **User search** (`s`, or `/users [query]`): a one-shot `users search` over your follow graph (default radius `0..1`).
