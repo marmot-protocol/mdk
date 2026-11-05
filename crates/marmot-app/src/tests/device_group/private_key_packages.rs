@@ -1653,6 +1653,130 @@ async fn carried_sibling_welcome_outcomes_settle_while_the_chat_is_held() {
     assert!(owed(&devices.laptop).is_empty());
 }
 
+/// Settling a real heartbeat must not inspect or retire an unrelated
+/// sibling Welcome. Matching settlement errors still retain their own batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrelated_sibling_welcome_does_not_block_a_heartbeat_projection() {
+    use cgka_traits::storage::MessageStorage as _;
+    use cgka_traits::{MessageState, StoredMessagePayload};
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    add_the_phone_unpublished(&mut devices, &chat).await;
+    let [welcome] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
+    let event = devices
+        .laptop
+        .device_group_event(
+            KIND_SIBLING_WELCOME,
+            base64::engine::general_purpose::STANDARD.encode(&welcome.content),
+        )
+        .unwrap();
+    let carrier = hex::decode(&event.id).unwrap();
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .carry_sibling_welcome(&welcome.id, &carrier)
+            .unwrap()
+    );
+    let storage = group_storage(&devices.laptop);
+    let StoredMessagePayload::OutboundSiblingWelcome {
+        origin: cgka_traits::message::SiblingWelcomeOrigin::ConfirmedCommit(origin),
+        ..
+    } = StoredMessagePayload::decode(&storage.get_message(&welcome.id).unwrap().payload).unwrap()
+    else {
+        panic!("expected the genuine Add's confirmed origin");
+    };
+    storage
+        .update_message_state(&origin, MessageState::EpochInvalidated)
+        .unwrap();
+    let connection = account_database(&devices.laptop_app);
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_unrelated_retirement BEFORE UPDATE ON cgka_messages
+         WHEN OLD.id = X'{}' AND NEW.state <> OLD.state
+         BEGIN SELECT RAISE(ABORT, 'injected unrelated retirement failure'); END;",
+            hex::encode(welcome.id.as_slice())
+        ))
+        .unwrap();
+    assert!(devices.laptop.pending_applied_effects.is_empty());
+    let before = devices.relay.published_events.lock().unwrap().len();
+    let heartbeat = devices
+        .laptop
+        .device_group_event(
+            crate::client::device_group::KIND_DEVICE_HEARTBEAT,
+            "{\"v\":1}".into(),
+        )
+        .unwrap();
+    assert_ne!(heartbeat.id, event.id);
+    let result = devices
+        .laptop
+        .send_device_group_event(&group, heartbeat)
+        .await;
+    let publications = group_messages_since(&devices.relay, before);
+    let retained = devices.laptop.pending_applied_effects.len();
+    let unchanged = storage.get_message(&welcome.id).unwrap();
+    // The full query and a matching selection must still propagate this fault.
+    for error in [
+        devices
+            .laptop
+            .runtime
+            .carried_sibling_welcomes()
+            .unwrap_err(),
+        devices
+            .laptop
+            .runtime
+            .carried_sibling_welcomes_for_carriers(&[carrier.as_slice()])
+            .unwrap_err(),
+    ] {
+        assert!(matches!(error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(cgka_traits::StorageError::Backend(message)))
+            if message.contains("injected unrelated retirement failure")));
+    }
+    // Restore the real database fault before the regression oracle or cleanup.
+    connection
+        .execute_batch("DROP TRIGGER fail_unrelated_retirement")
+        .unwrap();
+    drop(connection);
+    devices.laptop.drain_pending_session_events().await.unwrap();
+    assert_eq!(group_messages_since(&devices.relay, before), publications);
+    assert!(devices.laptop.pending_applied_effects.is_empty());
+    assert_eq!(
+        publications, 1,
+        "the real heartbeat reached the relay before projection"
+    );
+    assert_eq!(unchanged.state, MessageState::Sent);
+    assert!(
+        matches!(StoredMessagePayload::decode(&unchanged.payload).unwrap(),
+        StoredMessagePayload::OutboundSiblingWelcome { carrier: Some(ref value), .. }
+        if value == &carrier)
+    );
+    if let Err(error) = &result {
+        assert!(
+            matches!(error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(cgka_traits::StorageError::Backend(message)))
+            if message.contains("injected unrelated retirement failure")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(retained, 1, "native acceptance must remain replayable");
+    }
+    assert!(
+        matches!(result, Ok(true)),
+        "unrelated retirement blocked the accepted heartbeat: {result:?}"
+    );
+    assert_eq!(retained, 0);
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .carried_sibling_welcomes()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        storage.get_message(&welcome.id).unwrap().state,
+        MessageState::Failed
+    );
+}
+
 /// A failed settlement keeps the accepted fanout replayable. No replacement
 /// carrier is created before the original publication projects successfully;
 /// retry settles that same accepted carrier without another send.

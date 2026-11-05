@@ -89,6 +89,16 @@ where
         Ok(self.session.carried_sibling_welcomes()?)
     }
 
+    /// See [`cgka_engine::Engine::carried_sibling_welcomes_for_carriers`].
+    pub fn carried_sibling_welcomes_for_carriers(
+        &self,
+        carriers: &[&[u8]],
+    ) -> AccountResult<Vec<(MessageId, Vec<u8>)>> {
+        Ok(self
+            .session
+            .carried_sibling_welcomes_for_carriers(carriers)?)
+    }
+
     /// Reserve the actual carrier and its timestamp with the engine association.
     pub fn reserve_sibling_welcome_carrier(
         &self,

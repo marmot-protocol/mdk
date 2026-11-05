@@ -8,6 +8,10 @@
 
 ### Fixed
 
+- Filter sibling-Welcome origin checks to the device-group carriers being settled, so an unrelated retirement
+  failure cannot block a healthy publication. Additive Engine/session/runtime queries preserve the full-query API;
+  group and Sent-row scans and their errors still span storage. No wire or schema change.
+
 - Report an already-present sibling as `SiblingAddRefusal::AlreadyPresent`, so stock selection stops instead of
   trying another private KeyPackage for a membership the selected chat already holds.
 
