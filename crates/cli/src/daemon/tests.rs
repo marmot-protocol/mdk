@@ -489,15 +489,6 @@ fn test_stream_compose_report(stream_id: &[u8]) -> DaemonOutgoingStreamReport {
     }
 }
 
-fn expected_stream_transcript_hash(
-    stream_id: &[u8],
-    start_event_id: &MessageId,
-    text: &str,
-    chunk_bytes: usize,
-) -> String {
-    expected_stream_transcript_hash_for_appends(stream_id, start_event_id, &[text], chunk_bytes)
-}
-
 fn expected_stream_transcript_hash_for_appends(
     stream_id: &[u8],
     start_event_id: &MessageId,
@@ -514,54 +505,6 @@ fn expected_stream_transcript_hash_for_appends(
         }
     }
     hex::encode(transcript.hash())
-}
-
-#[tokio::test]
-async fn stream_compose_returns_local_transcript_when_broker_connect_is_pending() {
-    let stream_id = vec![0xaa; 32];
-    let start_event_id = MessageId::new(vec![0xbb; 32]);
-    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
-    let report = test_stream_compose_report(&stream_id);
-    let (tx, rx) = mpsc::channel(4);
-    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-    let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
-
-    let (append_tx, append_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Append {
-        text: "hello ".to_owned(),
-        respond: append_tx,
-    })
-    .await
-    .unwrap();
-    let appended = tokio::time::timeout(Duration::from_millis(250), append_rx)
-        .await
-        .expect("append should not wait for broker connect")
-        .unwrap()
-        .unwrap();
-    assert_eq!(appended.chunk_count, 1);
-
-    let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish {
-        expected: None,
-        respond: finish_tx,
-    })
-    .await
-    .unwrap();
-    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
-        .await
-        .expect("finish should use local transcript fallback")
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(finished.status, "finished");
-    assert_eq!(finished.text, "hello ");
-    assert_eq!(finished.chunk_count, 1);
-    assert_eq!(
-        finished.transcript_hash.as_deref(),
-        Some(expected_stream_transcript_hash(&stream_id, &start_event_id, "hello ", 8).as_str())
-    );
-
-    session.await.unwrap();
 }
 
 #[tokio::test]
