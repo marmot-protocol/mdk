@@ -521,14 +521,21 @@ impl<S: StorageProvider> Engine<S> {
                     "two KeyPackages name the same sibling",
                 );
             }
-            if let Err(error) = crate::private_key_packages::validate_received_private_key_package(
+            let metadata = match crate::private_key_packages::validate_received_private_key_package(
                 &sibling.key_package,
                 self.identity.self_id(),
                 own.roster(),
                 &sibling.slot,
                 self.wall_clock.now().0,
             ) {
-                return refused(SiblingAddRefusal::KeyPackage, &error.to_string());
+                Ok(metadata) => metadata,
+                Err(error) => return refused(SiblingAddRefusal::KeyPackage, &error.to_string()),
+            };
+            if metadata.ciphersuite != u16::from(mls_group.ciphersuite()) {
+                return refused(
+                    SiblingAddRefusal::KeyPackage,
+                    "the KeyPackage ciphersuite does not match the chat",
+                );
             }
             let tag_key = own
                 .roster()
