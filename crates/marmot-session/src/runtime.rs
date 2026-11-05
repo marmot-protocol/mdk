@@ -7433,6 +7433,94 @@ mod tests {
         assert_eq!(OversizedEvent::of_fanout(&fanout), None);
     }
 
+    #[test]
+    fn legacy_welcome_diagnosis_requires_an_untouched_complete_snapshot() {
+        let mut request = failed_frozen_fanout(TransportEndpointFailureKind::TerminalRejected)
+            .request()
+            .clone();
+        let recipient = MemberId::new(vec![0x66; 32]);
+        let endpoint = request.target.endpoints()[0].clone();
+        request.message.envelope = TransportEnvelope::Welcome {
+            recipient: recipient.clone(),
+        };
+        request.target = TransportPublishTarget::Inbox {
+            recipient,
+            endpoints: vec![endpoint.clone()],
+        };
+        let mut fanout = DurableTransportFanout {
+            id: request.message.id.clone(),
+            group_id: None,
+            evolution_id: None,
+            exact_message: request.message.clone(),
+            target: request.target,
+            targets: vec![TransportFanoutTarget {
+                endpoint: endpoint.clone(),
+                state: TransportFanoutAttemptState::Unattempted,
+                attempt_count: 0,
+                last_attempt_at: None,
+                failure_code: None,
+            }],
+            required_acks: 1,
+            evolution_confirmed: false,
+            possible_exposure: false,
+            created_at: Timestamp(1),
+            bounded_until: None,
+        };
+        let result = Err(TransportAdapterError::PublishEndpoints(
+            cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                "size refusal",
+                vec![TransportEndpointFailure {
+                    endpoint,
+                    reason: "relay rejected event (too-large)".into(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
+                    rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+                    size_class: Some(cgka_traits::EventSizeClass::Under64Kib),
+                }],
+            ),
+        ));
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            Some(OversizedEvent {
+                artifact: OversizedArtifact::Welcome,
+                size_class: cgka_traits::EventSizeClass::Under64Kib
+            })
+        );
+        fanout.targets[0].attempt_count = 1;
+        fanout.targets[0].state = TransportFanoutAttemptState::AttemptedFailed;
+        fanout.targets[0].failure_code = Some("transport_rejected".into());
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            None,
+            "coarse prior evidence cannot be reconstructed as definite"
+        );
+        fanout.targets[0].attempt_count = 0;
+        fanout.targets[0].state = TransportFanoutAttemptState::Unattempted;
+        fanout.targets[0].failure_code = None;
+        fanout.possible_exposure = true;
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            None
+        );
+        fanout.possible_exposure = false;
+        let other = TransportEndpoint("wss://second.example".into());
+        let TransportPublishTarget::Inbox { endpoints, .. } = &mut fanout.target else {
+            unreachable!()
+        };
+        endpoints.push(other.clone());
+        fanout.targets.push(TransportFanoutTarget {
+            endpoint: other,
+            state: TransportFanoutAttemptState::Unattempted,
+            attempt_count: 0,
+            last_attempt_at: None,
+            failure_code: None,
+        });
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            None,
+            "a partial endpoint list cannot prove the original snapshot refused"
+        );
+    }
+
     fn published_message(id: u8) -> PublishedApplicationMessage {
         PublishedApplicationMessage {
             publication_observation: None,

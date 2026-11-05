@@ -50,7 +50,6 @@ c_mirror! {
     /// Unknown includes legacy rows and later coarse retry outcomes; it does
     /// not clear the debt. Requires the matching library and header.
     MarmotPendingWelcomeDelivery from marmot_uniffi::PendingWelcomeDeliveryFfi,
-    free marmot_pending_welcome_delivery_free,
     list(MarmotPendingWelcomeDeliveryList, marmot_pending_welcome_delivery_list_free) {
         str group_id_hex,
         str message_id_hex,
@@ -515,7 +514,6 @@ mod tests {
             assert_eq!(crate::memory::audit::live_allocations(), before);
         }
         unsafe {
-            marmot_pending_welcome_delivery_free(std::ptr::null_mut());
             marmot_pending_welcome_delivery_list_free(std::ptr::null_mut());
         }
     }

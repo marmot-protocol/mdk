@@ -9124,7 +9124,7 @@ mod tests {
         client
             .pending_welcome_delivery_events
             .push(crate::PendingWelcomeDelivery {
-                size_class: None,
+                size_class: Some(crate::EventSizeClass::From512KibTo1Mib),
                 group_id_hex: hex::encode(group_id.as_slice()),
                 message_id_hex: "ab".repeat(32),
                 recipient_hex: "cd".repeat(32),
@@ -9137,13 +9137,21 @@ mod tests {
             if let MarmotAppEvent::WelcomeDeliveryPending {
                 group_id,
                 message_id_hex,
+                size_class,
                 ..
             } = event
             {
-                announced.push((group_id, message_id_hex));
+                announced.push((group_id, message_id_hex, size_class));
             }
         }
-        assert_eq!(announced, [(group_id, "ab".repeat(32))]);
+        assert_eq!(
+            announced,
+            [(
+                group_id,
+                "ab".repeat(32),
+                Some(crate::EventSizeClass::From512KibTo1Mib)
+            )]
+        );
         assert!(client.take_pending_welcome_delivery_events().is_empty());
     }
 
