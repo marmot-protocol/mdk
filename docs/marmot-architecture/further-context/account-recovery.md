@@ -881,14 +881,16 @@ Each step first admits from staging. A group's staged events, across its current
 routes, go to the recovered-ingest path oldest first by `(created_at, id)`, below the group's
 admission frontier: the first second, after the live tail, that its furthest-behind required
 relay still owes. A relay leaves the frontier after an answer without progress or an
-unreachable or refused end, and while it cools down or is broken or retired; what it staged
-ahead of the others then goes in as late input. Once no required relay serves a group (each has
-left, and none is an active unit with nothing left to fetch), the group is stranded: each relay
-that left only because it does not answer (unreachable or cooling down) holds the frontier again,
-so nothing newer goes ahead of history it may still return. A relay that answered without
-progress since its unit last advanced cannot give more now, and a broken unit's debt is parked,
-so neither holds anything; the group's frames go once each holding relay answers, with progress
-or without, or breaks. An admission turn ingests four events, one
+unreachable or refused end, after an answer that stopped on a second it cannot prove (even one
+that advanced first), and while it cools down or is broken or retired; what it staged ahead of
+the others then goes in as late input. Once no required relay serves a group (each has left,
+and none is an active unit with nothing left to fetch), the group is stranded: each unit still
+pursuing its debt holds the frontier again, through unreachable spells, cooldowns and answers
+cut short at their deadline, so nothing newer goes ahead of history its relay may still return.
+Two units hold nothing. A saturated one, whose last answered quantum stopped on a second its
+relay cannot prove (no published cap and no NIP-77 proof; migration 0151), would stop on the
+same second if asked again, and a broken unit's debt is parked. The group's frames go once each
+holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests four events, one
 worker command each, so commands and live input go between them. An event the engine keeps no
 trace of stays staged, and its group waits behind it on the local-failure backoff while other
 groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
@@ -913,7 +915,7 @@ that its relay's non-empty count left unproven. An empty count's range is cold-s
 owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
 group's held frames may go below the first second its fencing relays still owe in their
 capture (`live_fences`), and a relay off the frontier fences nothing unless its group is
-stranded and it does not answer. Each unit keeps every
+stranded and its unit still pursues its debt. Each unit keeps every
 capture range it still owes (migration 0135), up to 8, so the hold survives a restart, which
 forgets the counts. Past 8 the newest are joined into one, which can only fence more.
 Once a capture is covered its fence drops, even while its staged events wait behind another
@@ -940,7 +942,7 @@ queue holds it yet. A fresh activation replaces the adapter's replay coverage, b
 have no other copy, so they move to the new coverage, held from the same point until the
 runner's next plan answers; only a frame whose group the new REQs no longer route, or that the
 buffer has no room for, is lost. A fence holds through an account breaker pause too, and
-while its group is stranded on relays that do not answer: a live frame opened ahead of its
+while its group is stranded on relays that may still return its history: a live frame opened ahead of its
 sender's owed messages moves that
 sender's ratchet, and once it is more than the out-of-order window (100 generations) past them,
 no owner can open them.

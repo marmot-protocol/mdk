@@ -878,6 +878,30 @@ fn the_cursor_is_the_first_second_the_relay_leaves_uncovered() {
 
 /// A fence, slicing, re-check progress, parks, relay health and the budget
 /// survive closing and reopening the database.
+/// Only an answered quantum sets or clears a unit's saturated flag: an
+/// unanswered quantum, a local failure and a re-arm leave it as it was.
+#[test]
+fn only_an_answer_sets_or_clears_saturation() {
+    use RecoveryUnitOutcome as Outcome;
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    let settle = |outcome, saturated| {
+        app.begin_recovery_unit_attempt(&route, RELAY, None, NOW)
+            .unwrap();
+        app.settle_recovery_unit_saturated(&route, RELAY, outcome, saturated, &POLICY, NOW)
+            .unwrap()
+            .saturated
+    };
+    assert!(settle(Outcome::NoProgress, true));
+    assert!(settle(Outcome::Unanswered, false));
+    assert!(settle(Outcome::LocalFailure, false));
+    app.rearm_all_recovery_units().unwrap();
+    assert!(unit(&app, &route, RELAY).saturated);
+    assert!(!settle(Outcome::Advanced, false));
+}
+
 #[test]
 fn state_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -920,8 +944,15 @@ fn state_survives_a_reopen() {
         for _ in 0..POLICY.break_after_no_progress {
             app.begin_recovery_unit_attempt(&route, RELAY, Some(caps), NOW)
                 .unwrap();
-            app.settle_recovery_unit(&route, RELAY, RecoveryUnitOutcome::NoProgress, &POLICY, NOW)
-                .unwrap();
+            app.settle_recovery_unit_saturated(
+                &route,
+                RELAY,
+                RecoveryUnitOutcome::NoProgress,
+                true,
+                &POLICY,
+                NOW,
+            )
+            .unwrap();
         }
         settle(&app, &route, OTHER, RecoveryUnitOutcome::RateLimited, NOW);
         let remainders = app.recovery_coverage_remainders().unwrap();

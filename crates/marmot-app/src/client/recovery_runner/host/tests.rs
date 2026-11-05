@@ -503,14 +503,14 @@ async fn one_shot_sync(dir: &std::path::Path, url: &str) -> crate::SyncSummary {
     summary
 }
 
-/// One-shot syncs, as `wn sync` runs them, show a new message. A fresh
-/// client owes the gap since its last sync, so its group's live REQ is
-/// fenced until its pass answers that gap; the frames the fence then
-/// releases are that sync's to read. The first sync after the send may not
-/// get there (its pass cannot yet prove the second the message was sent in),
-/// but a later one does. A sync that returned before reading what its pass
-/// released lost those frames with its client, and no number of one-shot
-/// syncs showed the message.
+/// A one-shot sync, as `wn sync` runs it, shows a message sent just before
+/// it. A fresh client owes the gap since its last sync, so its group's live
+/// REQ is fenced until its pass answers that gap. This relay publishes no cap
+/// and does not compare, so it cannot prove the second the message was sent
+/// in: the pass's sweep stops there, its unit is saturated, and the group is
+/// let go in the same pass. The frames the fence then releases are that
+/// sync's to read. A sync that returned before reading them lost them with
+/// its client, and no number of one-shot syncs showed the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_syncs_read_what_their_pass_released() {
     let relay = MockRelay::run().await.unwrap();
@@ -539,15 +539,25 @@ async fn one_shot_syncs_read_what_their_pass_released() {
         .await
         .unwrap();
     let joined = one_shot_sync(bob_dir.path(), &url).await;
-    assert_eq!(joined.joined_groups, [group.clone()]);
+    assert_eq!(joined.joined_groups, std::slice::from_ref(&group));
 
     alice.send(&group, b"seed from alice").await.unwrap();
     let mut shown = Vec::new();
     for _ in 0..3 {
         let synced = one_shot_sync(bob_dir.path(), &url).await;
-        shown.extend(synced.messages.into_iter().map(|message| message.plaintext));
+        shown.push(
+            synced
+                .messages
+                .into_iter()
+                .map(|message| message.plaintext)
+                .collect::<Vec<_>>(),
+        );
     }
-    assert_eq!(shown, ["seed from alice"], "a one-shot sync shows it, once");
+    assert_eq!(
+        shown,
+        [vec!["seed from alice".to_owned()], Vec::new(), Vec::new()],
+        "the first sync after the send shows it, and only that one"
+    );
 }
 
 async fn serve_goal_future<T>(

@@ -499,8 +499,18 @@ pub(super) fn settle(
             turn.now,
         )?;
     }
-    turn.app
-        .settle_recovery_unit(&key.route, &key.relay, outcome, &policy.unit, turn.now)?;
+    // A sweep that stopped on a second its relay cannot prove stops there
+    // again next time; a comparison that ran out of budget only paused.
+    let saturated =
+        plan.compare.is_none() && matches!(report.end, SweepEnd::SaturatedSecond { .. });
+    turn.app.settle_recovery_unit_saturated(
+        &key.route,
+        &key.relay,
+        outcome,
+        saturated,
+        &policy.unit,
+        turn.now,
+    )?;
     // The slicing only seeds the next quantum's first request, so a failed
     // write costs one resize and never changes the settled outcome.
     if (report.delta, report.observed_cap) != (plan.delta, plan.observed_cap)

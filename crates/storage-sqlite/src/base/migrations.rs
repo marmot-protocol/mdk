@@ -311,6 +311,8 @@ mod migration_0148_compromise_warning;
 mod migration_0149_history_deliveries;
 #[path = "migrations/0150_epoch_gap_retries.rs"]
 mod migration_0150_epoch_gap_retries;
+#[path = "migrations/0151_recovery_unit_saturated.rs"]
+mod migration_0151_recovery_unit_saturated;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
 #[path = "migrations/0161_small_state.rs"]
@@ -1267,6 +1269,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0150_epoch_gap_retries",
         suspend_foreign_keys: &[],
         apply: migration_0150_epoch_gap_retries::apply,
+    },
+    Migration {
+        version: 151,
+        name: "0151_recovery_unit_saturated",
+        suspend_foreign_keys: &[],
+        apply: migration_0151_recovery_unit_saturated::apply,
     },
     Migration {
         version: 160,

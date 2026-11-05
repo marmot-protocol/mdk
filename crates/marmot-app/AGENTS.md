@@ -738,9 +738,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   fetched staging inside that capture keeps it fenced until admission, even after acquisition coverage completes.
   Staging outside a capture never turns empty-count or restart-gap debt into a fence. The fence is a query
   (`live_fences`) over each unit's durable capture ranges, holding through an account breaker pause and while no
-  required relay serves the group and a relay that does not answer (unreachable or cooling down) still owes it, until
-  it answers, with progress or without, or breaks (a live frame opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for
-  good), and the
+  required relay serves the group and a unit still pursuing its debt owes it: through unreachable spells, cooldowns
+  and deadline-cut answers, until the unit saturates (its answer stopped on a second its relay cannot prove; migration
+  0151) or breaks (a live frame opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for
+  good). A saturated unit leaves the frontier even after advancing, and the
   runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a

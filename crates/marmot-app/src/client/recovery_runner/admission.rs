@@ -10,15 +10,17 @@
 //!   relays that still owe it history. A unit's position is the first second
 //!   it owes after its live tail.
 //! - **Leaving the frontier.** A unit stops holding the frontier once its
-//!   last quantum ended without progress (no progress, unreachable, refused),
-//!   and while its relay cools down or it is broken or retired. What it
-//!   stages later is late input. When no unit serves its group (each has
-//!   left, and none is an active one with nothing left to fetch), the group
-//!   is stranded: each of its units whose relay has not answered holds the
-//!   frontier again, so nothing newer opens ahead of history the relay may
-//!   still return. A relay that answered without progress since its unit
-//!   last advanced cannot give more now, so its unit holds nothing, as does
-//!   a broken one.
+//!   last quantum ended without progress (no progress, unreachable, refused)
+//!   or stopped on a second its relay cannot prove (saturated, even after
+//!   advancing), and while its relay cools down or it is broken or retired.
+//!   What it stages later is late input. When no unit serves its group (each
+//!   has left, and none is an active one with nothing left to fetch), the
+//!   group is stranded: each of its units still pursuing its debt holds the
+//!   frontier again, so nothing newer opens ahead of history its relay may
+//!   still return, through unreachable spells, cooldowns and answers cut
+//!   short. A saturated unit's relay cannot give that history (asking again
+//!   stops on the same second), and a broken unit's debt is parked, so
+//!   neither holds anything.
 //! - **Backpressure.** A relay at a group's staging bound (its events or
 //!   bytes for the group), or any relay while the account is at its own, is
 //!   not eligible while another unit holds the group's frontier, until that
@@ -168,10 +170,9 @@ struct Member {
     /// Whether it serves its group: it has not left, or it is active with
     /// nothing left to fetch, whatever its last answer was.
     serves: bool,
-    /// Whether it left only because its relay does not answer (unreachable
-    /// or cooling down): it is not broken, and has had no answer without
-    /// progress since it last advanced.
-    unanswered: bool,
+    /// Whether its unit still pursues history its relay may return: it is
+    /// neither broken nor saturated.
+    pursued: bool,
     on_frontier: bool,
     /// The capture ranges it keeps durably.
     stored: Vec<RecoveryCoverageRange>,
@@ -513,13 +514,11 @@ impl<'t> Admission<'t> {
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;
                 let unit = turn.app.recovery_unit(&route.route, relay)?;
-                let relay_left = self.relay_left(relay)?;
-                let left = relay_left || unit.as_ref().is_some_and(unit_left);
+                let left = self.relay_left(relay)? || unit.as_ref().is_some_and(unit_left);
                 let state = unit.as_ref().map(|unit| unit.state);
-                let unanswered = relay_left
-                    && unit.as_ref().is_none_or(|unit| {
-                        unit.no_progress == 0 && !matches!(unit.state, RecoveryUnitState::Broken(_))
-                    });
+                let pursued = unit.as_ref().is_none_or(|unit| {
+                    !unit.saturated && !matches!(unit.state, RecoveryUnitState::Broken(_))
+                });
                 let key = UnitKey {
                     route: route.route.clone(),
                     relay: relay.clone(),
@@ -565,7 +564,7 @@ impl<'t> Admission<'t> {
                     serves: !left
                         || (position.is_none()
                             && state.is_none_or(|state| state == RecoveryUnitState::Active)),
-                    unanswered,
+                    pursued,
                     on_frontier: false,
                     stored,
                     fences,
@@ -575,15 +574,14 @@ impl<'t> Admission<'t> {
             }
         }
         // A failed source stops holding up its peers. With no source left to
-        // serve the group, each one whose relay has not answered holds
-        // instead: a frame opened ahead of history the relay may still return
-        // can put that history past the ratchet's out-of-order window. A
-        // relay that answered without progress cannot give more now.
+        // serve the group, each one still pursuing its debt holds instead: a
+        // frame opened ahead of history its relay may still return can put
+        // that history past the ratchet's out-of-order window.
         let stranded = !members.iter().any(|member| member.serves);
         for member in &mut members {
             member.on_frontier = member.position.is_some()
                 && if stranded {
-                    member.unanswered
+                    member.pursued
                 } else {
                     !member.left
                 };
@@ -639,10 +637,10 @@ impl<'t> Admission<'t> {
     }
 }
 
-/// Whether a unit's last quantum ended without progress, or it is broken or
-/// retired.
+/// Whether a unit's last quantum ended without progress or stopped on a
+/// second its relay cannot prove, or it is broken or retired.
 fn unit_left(unit: &RecoveryUnit) -> bool {
-    unit.no_progress > 0 || unit.state != RecoveryUnitState::Active
+    unit.no_progress > 0 || unit.saturated || unit.state != RecoveryUnitState::Active
 }
 
 /// Admission order: `(created_at, id)`.

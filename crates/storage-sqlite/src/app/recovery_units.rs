@@ -159,6 +159,10 @@ pub struct RecoveryUnit {
     pub park: Option<RecoveryUnitPark>,
     pub recheck: RecoveryRecheckPass,
     pub last_served_at_seconds: Option<u64>,
+    /// Its last answered quantum stopped on a second its relay cannot prove
+    /// (no published cap, no negentropy proof): asking again stops there
+    /// too. Set and cleared only by an answered quantum.
+    pub saturated: bool,
 }
 
 /// One relay's health. Not `Debug`: it carries the relay.
@@ -288,7 +292,8 @@ fn caps_columns(caps: Option<RecoveryRelayCaps>) -> (i64, Option<i64>, i64) {
 const UNIT_COLUMNS: &str = "route_kind, route_id, relay, state, broken_reason, probe, no_progress,
     backoff_step, next_attempt_at_seconds, slice_width_seconds, observed_cap, planned_caps_known,
     planned_max_limit, planned_negentropy, park_revision, parked_at_seconds,
-    recheck_position_seconds, recheck_completed_at_seconds, last_served_at_seconds, recheck_revision";
+    recheck_position_seconds, recheck_completed_at_seconds, last_served_at_seconds, recheck_revision,
+    saturated";
 
 fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
     Ok(UnitRow {
@@ -312,6 +317,7 @@ fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
         recheck_completed_at: row.get(17)?,
         last_served_at: row.get(18)?,
         recheck_revision: row.get(19)?,
+        saturated: row.get(20)?,
     })
 }
 
@@ -336,6 +342,7 @@ struct UnitRow {
     recheck_completed_at: Option<i64>,
     last_served_at: Option<i64>,
     recheck_revision: i64,
+    saturated: i64,
 }
 
 impl UnitRow {
@@ -380,6 +387,7 @@ impl UnitRow {
                 revision: i64_to_u64(self.recheck_revision)?,
             },
             last_served_at_seconds: optional(self.last_served_at)?,
+            saturated: self.saturated == 1,
         })
     }
 }
@@ -1361,12 +1369,30 @@ impl SqliteAppStorage {
     }
 
     /// Apply one quantum's outcome to the unit, its relay and the account, in
-    /// one transaction, and return the unit as it now stands.
+    /// one transaction, and return the unit as it now stands. An answered
+    /// quantum settled here did not stop on a second its relay cannot prove.
     pub fn settle_recovery_unit(
         &self,
         route: &TransportReconciliationRoute,
         relay: &str,
         outcome: RecoveryUnitOutcome,
+        policy: &RecoveryUnitPolicy,
+        now_seconds: u64,
+    ) -> StorageResult<RecoveryUnit> {
+        self.settle_recovery_unit_saturated(route, relay, outcome, false, policy, now_seconds)
+    }
+
+    /// As [`Self::settle_recovery_unit`], with `saturated` saying whether the
+    /// quantum stopped on a second its relay cannot prove
+    /// ([`RecoveryUnit::saturated`]). Only an answered outcome (advanced,
+    /// nothing owed or no progress) records it, in the same transaction; any
+    /// other outcome leaves the unit's flag as it was.
+    pub fn settle_recovery_unit_saturated(
+        &self,
+        route: &TransportReconciliationRoute,
+        relay: &str,
+        outcome: RecoveryUnitOutcome,
+        saturated: bool,
         policy: &RecoveryUnitPolicy,
         now_seconds: u64,
     ) -> StorageResult<RecoveryUnit> {
@@ -1396,6 +1422,17 @@ impl SqliteAppStorage {
                 budget_add_tx(&conn, i64_to_u64(minute)?, -1, 0)?;
             }
             let unit = unit_tx(&conn, route, relay)?.ok_or_else(invalid)?;
+            if matches!(
+                outcome,
+                Outcome::Advanced | Outcome::NothingOwed | Outcome::NoProgress
+            ) {
+                conn.execute_cached(
+                    "UPDATE account_recovery_units SET saturated = ?4
+                     WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3",
+                    params![kind, id, relay, i64::from(saturated)],
+                )
+                .storage()?;
+            }
             match outcome {
                 Outcome::Advanced => {
                     rearm_tx(&conn, route, relay)?;

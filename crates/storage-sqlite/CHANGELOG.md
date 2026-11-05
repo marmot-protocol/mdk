@@ -483,6 +483,11 @@
   `begin_recovery_epoch_gap_retry` and `finish_recovery_epoch_gap_retry`, with `RecoveryEpochGapRetry`, and
   `import_recovery_loss_to_ledger`, which turns loss recorded after the one-time conversion into ledger debt.
 
+- Migration 0151 adds `account_recovery_units.saturated`: the unit's last answered quantum stopped on a second its
+  relay cannot prove (mdk#2660 phase 4). `RecoveryUnit` gains `saturated`, and `settle_recovery_unit_saturated`
+  settles an outcome while recording it; `settle_recovery_unit` records an unsaturated answer. Existing units start
+  unsaturated.
+
 - Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
   publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
 
