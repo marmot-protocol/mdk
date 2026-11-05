@@ -6300,7 +6300,7 @@ fn chats_mark_read_clears_unread_and_persists() {
 
     // Alice sends first (establishing her own read marker), then Bob replies so
     // Alice accrues one unread message from Bob.
-    run_json(
+    let seed = run_json(
         home.path(),
         &[
             "--account",
@@ -6313,7 +6313,35 @@ fn chats_mark_read_clears_unread_and_persists() {
         ],
     );
     sync_until_message(home.path(), test_relay_url(), &bob, "seed");
+    let seed_id = seed["message_ids"][0].as_str().expect("seed message id");
+    let seed_read = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert_eq!(seed_read["chats"][0]["last_read_message_id_hex"], seed_id);
+
+    // The unread prerequisite needs a reply after the seed's canonical key.
+    // Observe a real epoch advance instead of relying on process wall clocks.
+    let before_commit = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "show", group_id],
+    );
+    let seed_epoch = before_commit["mls"]["epoch"].as_u64().expect("seed epoch");
     run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "rename",
+            group_id,
+            "general-mark-read",
+        ],
+    );
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let advanced = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "show", group_id],
+    );
+    assert_eq!(advanced["mls"]["epoch"], seed_epoch + 1);
+    let ping = run_json(
         home.path(),
         &[
             "--account",
@@ -6334,6 +6362,10 @@ fn chats_mark_read_clears_unread_and_persists() {
             .expect("unread_count is a number")
             >= 1,
         "alice should have an unread message before mark-read: {before}"
+    );
+    assert_eq!(
+        before["chats"][0]["last_message"]["message_id_hex"],
+        ping["message_ids"][0]
     );
     let newest_id = before["chats"][0]["last_message"]["message_id_hex"]
         .as_str()
@@ -6385,7 +6417,7 @@ fn chats_mark_read_at_older_message_leaves_newer_unread() {
     // Alice seeds (establishing her own marker), then Bob sends two messages
     // Alice syncs one at a time so she can capture each id from the projection's
     // last-message preview.
-    run_json(
+    let seed = run_json(
         home.path(),
         &[
             "--account",
@@ -6398,8 +6430,31 @@ fn chats_mark_read_at_older_message_leaves_newer_unread() {
         ],
     );
     sync_until_message(home.path(), test_relay_url(), &bob, "seed");
+    let seed_id = seed["message_ids"][0].as_str().expect("seed message id");
+    let seed_read = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert_eq!(seed_read["chats"][0]["last_read_message_id_hex"], seed_id);
+    // Separate accepted source epochs establish the two unread positions.
+    // A profile commit does not mark a chat message read.
+    let advance_peer_epoch = |name: &str| {
+        let before = run_json(
+            home.path(),
+            &["--account", &bob, "groups", "show", group_id],
+        );
+        let epoch = before["mls"]["epoch"].as_u64().expect("epoch");
+        run_json(
+            home.path(),
+            &["--account", &alice, "groups", "rename", group_id, name],
+        );
+        run_json(home.path(), &["--account", &bob, "sync"]);
+        let after = run_json(
+            home.path(),
+            &["--account", &bob, "groups", "show", group_id],
+        );
+        assert_eq!(after["mls"]["epoch"], epoch + 1);
+    };
+    advance_peer_epoch("general-older");
 
-    run_json(
+    let older = run_json(
         home.path(),
         &[
             "--account",
@@ -6412,14 +6467,19 @@ fn chats_mark_read_at_older_message_leaves_newer_unread() {
         ],
     );
     sync_until_message(home.path(), test_relay_url(), &alice, "older");
-    let older_id =
-        run_json(home.path(), &["--account", &alice, "chats", "list"])["chats"][0]["last_message"]
-            ["message_id_hex"]
-            .as_str()
-            .expect("older message id")
-            .to_owned();
+    let older_id = older["message_ids"][0]
+        .as_str()
+        .expect("older message id")
+        .to_owned();
+    let after_older = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert_eq!(
+        after_older["chats"][0]["last_message"]["message_id_hex"],
+        older_id
+    );
+    assert_eq!(after_older["chats"][0]["unread_count"], 1);
+    advance_peer_epoch("general-newer");
 
-    run_json(
+    let newer = run_json(
         home.path(),
         &[
             "--account",
@@ -6432,12 +6492,20 @@ fn chats_mark_read_at_older_message_leaves_newer_unread() {
         ],
     );
     sync_until_message(home.path(), test_relay_url(), &alice, "newer");
-    let newer_id =
-        run_json(home.path(), &["--account", &alice, "chats", "list"])["chats"][0]["last_message"]
-            ["message_id_hex"]
-            .as_str()
-            .expect("newer message id")
-            .to_owned();
+    let newer_id = newer["message_ids"][0]
+        .as_str()
+        .expect("newer message id")
+        .to_owned();
+    let before_partial = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert_eq!(
+        before_partial["chats"][0]["last_message"]["message_id_hex"],
+        newer_id
+    );
+    assert_eq!(before_partial["chats"][0]["unread_count"], 2);
+    assert_eq!(
+        before_partial["chats"][0]["last_read_message_id_hex"],
+        seed_id
+    );
     assert_ne!(older_id, newer_id);
 
     // Marking read at the older message advances the forward-only marker only up
