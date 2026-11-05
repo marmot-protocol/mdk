@@ -670,6 +670,91 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
             .unwrap()
             .is_some()
     );
+
+    // A real selected removal of the first linked sibling is different from
+    // branch selection dropping an Add. Its still-published sign-in must not
+    // become a lost-link warning, even with the made approval retained.
+    let departed = link_record(&phone, &group, &tablet_slot_hex);
+    assert_eq!(departed.outcome, DeviceLinkOutcome::Linked);
+    let departed_key = hex::decode(&departed.leaf_signature_key_hex).unwrap();
+    let claims = phone
+        .client
+        .runtime
+        .own_account_leaf_claims(&group, &phone.roster(&group))
+        .unwrap();
+    assert!(claims.iter().any(|(key, claim)| {
+        *key == departed_key
+            && *claim == cgka_traits::app_components::DeviceTagClaim::Device(tablet_slot)
+    }));
+    phone
+        .client
+        .unlink_device_from_group(
+            &group,
+            departed_key.clone(),
+            vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot)],
+        )
+        .await
+        .unwrap();
+    let selected = phone.roster(&group);
+    assert!(!selected.devices.contains_key(&tablet_slot));
+    assert!(!selected.rejected_slots.contains_key(&tablet_slot));
+    assert!(
+        !phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .has_device_removal(&hex::encode(group.as_slice()), &tablet_slot_hex)
+            .unwrap()
+    );
+    assert!(
+        phone
+            .client
+            .runtime
+            .group_record(&group)
+            .unwrap()
+            .device_roster_departures
+            .iter()
+            .any(|fact| fact.slot == tablet_slot
+                && fact.tag_signature_key.as_ref() == Some(&departed_key))
+    );
+    assert_eq!(
+        link_record(&phone, &group, &tablet_slot_hex).outcome,
+        DeviceLinkOutcome::Linked
+    );
+    assert!(phone.client.trusted_device_group().unwrap() == Some(group.clone()));
+    assert!(matches!(
+        phone.client.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        !phone
+            .client
+            .runtime
+            .has_pending_convergence_inputs(&group)
+            .unwrap()
+    );
+    use cgka_traits::storage::RosterTagKeyStorage as _;
+    assert!(
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .roster_tag_keys(&group, 0)
+            .unwrap()
+            .iter()
+            .all(|known| known.slot != tablet_slot
+                || known.tag_signature_key != departed_key
+                || !known.held_as_removed)
+    );
+    phone.client.check_sign_ins().await.unwrap();
+    let rows = phone.client.unrecognized_sign_ins().unwrap();
+    let known_departure = rows
+        .iter()
+        .find(|row| row.slot_id_hex == tablet_slot_hex)
+        .expect("the authentic still-published sibling is listed");
+    assert!(known_departure.signed_in);
+    assert!(!known_departure.previously_linked_here);
 }
 
 /// A later link adds the new device to the device group in one commit, by a
@@ -1720,6 +1805,14 @@ async fn a_link_is_made_across_a_restart_by_the_new_devices_first_commit() {
     let mut phone = reopen(phone).await;
     let record = link_record(&phone, &group, &slot);
     assert_eq!(record.outcome, DeviceLinkOutcome::Pending);
+    assert!(phone.client.trusted_device_group().unwrap() == Some(group.clone()));
+    let reset = phone.client.device_link(DeviceLinkOp::ResetForRepair).await;
+    assert!(matches!(
+        reset,
+        Err(AppError::DeviceGroupRefused("device_group_busy"))
+    ));
+    assert!(phone.client.trusted_device_group().unwrap() == Some(group.clone()));
+    assert_eq!(link_record(&phone, &group, &slot), record);
     let key_package_ref = hex::decode(&record.key_package_ref_hex).unwrap();
     assert_eq!(
         phone
