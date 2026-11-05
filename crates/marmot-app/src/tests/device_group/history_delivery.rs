@@ -913,13 +913,23 @@ async fn a_history_too_long_to_send_inline_goes_through_blossom() {
 
             let longer = devices.phone.create_group("longer", &[]).await.unwrap();
             let longer_hex = hex::encode(longer.as_slice());
-            use_blossom(
-                &mut devices.phone,
-                &longer,
-                BLOSSOM_LOCATOR_KIND_V1,
-                &blossom.url,
-            )
-            .await;
+            devices
+                .phone
+                .replace_encrypted_media_blob_endpoints(
+                    &longer,
+                    vec![
+                        crate::AppBlobEndpoint {
+                            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                            base_url: "http://store.example/".to_owned(),
+                        },
+                        crate::AppBlobEndpoint {
+                            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                            base_url: blossom.url.clone(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
             let mut sent = Vec::new();
             for index in 0..=MAX_INLINE_BUNDLES {
                 sent.push(send_text(&mut devices.phone, &longer, &format!("{index}{long}")).await);
@@ -1396,35 +1406,37 @@ async fn a_long_history_of_a_text_only_chat_is_forgotten() {
     );
 }
 
-/// A history too long for inline deliveries, of a chat with no Blossom
-/// endpoint, is forgotten without sending any of it.
+/// A history too long for inline delivery, of a chat with no usable Blossom
+/// endpoint, is forgotten without sending any of it. Public HTTP remains a
+/// structurally valid endpoint, but the real transport never contacts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_history_of_a_chat_with_no_blossom_endpoint_is_forgotten() {
     let (mut devices, _group, chat, _first) = history_devices().await;
-    use_blossom(
-        &mut devices.phone,
-        &chat,
-        "other-v1",
-        "https://store.example/",
-    )
-    .await;
-    send_text(
-        &mut devices.phone,
-        &chat,
-        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
-    )
-    .await;
-    add_laptop(&mut devices, &chat).await;
-    let before = published_count(&devices.relay);
-    devices.phone.drive_history_deliveries().await;
-    devices.phone.drive_history_blobs().await;
-    assert_eq!(published_count(&devices.relay), before);
-    assert!(
-        storage(&devices.phone_app)
-            .unsent_history_deliveries()
-            .unwrap()
-            .is_empty()
-    );
+    let undialable = devices.phone.create_group("undialable", &[]).await.unwrap();
+    for (chat, locator_kind, server) in [
+        (chat, "other-v1", "https://store.example/"),
+        (undialable, BLOSSOM_LOCATOR_KIND_V1, "http://store.example/"),
+    ] {
+        use_blossom(&mut devices.phone, &chat, locator_kind, server).await;
+        send_text(
+            &mut devices.phone,
+            &chat,
+            &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+        )
+        .await;
+        add_laptop(&mut devices, &chat).await;
+        let before = published_count(&devices.relay);
+        devices.phone.drive_history_deliveries().await;
+        devices.phone.drive_history_blobs().await;
+        assert_eq!(published_count(&devices.relay), before);
+        assert!(
+            storage(&devices.phone_app)
+                .unsent_history_deliveries()
+                .unwrap()
+                .is_empty(),
+            "a chat with no transport-eligible server must not keep unsendable history owed"
+        );
+    }
 }
 
 /// A Blossom delivery naming the device group itself is refused when read,
