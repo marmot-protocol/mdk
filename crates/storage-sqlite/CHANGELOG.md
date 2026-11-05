@@ -4,7 +4,8 @@
 
 - Migration 0177 adds a nullable coarse size diagnosis to existing pending Welcome repair pointers. Old rows remain
   Unknown; unknown future annotations preserve the pointer. Updating a failure diagnosis retains its existing identity
-  and oldest-first position and adds no retry owner.
+  and oldest-first position and adds no retry owner. Rust record literals add `size_class: None` when unknown;
+  older native builds supporting only schema 0176 must upgrade before reopening a migrated account database.
 
 ### Breaking changes
 

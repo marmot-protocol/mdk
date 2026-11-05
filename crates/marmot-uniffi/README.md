@@ -927,7 +927,8 @@ from an unexplained delivery problem without receiving relay details or another 
 
 Regenerate Swift/Kotlin bindings with the matching native library: the event gains a field and the pending
 query returns a new record. The account database adds one nullable annotation to each existing repair row;
-there is no wire change or additional diagnostic network traffic.
+older native builds supporting only schema 0176 cannot reopen the migrated database. There is no wire change or
+additional diagnostic network traffic.
 
 ## Members are accounts
 
