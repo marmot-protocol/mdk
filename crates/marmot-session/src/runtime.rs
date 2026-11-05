@@ -7257,6 +7257,10 @@ fn v5_failed_endpoint_result(
         .filter(|category| {
             !(failure.kind == TransportEndpointFailureKind::NotExposed
                 && *category == TransportEndpointRejectionCategory::TooLarge)
+                // V5 describes the cumulative outcome, not merely the last
+                // refusal after an earlier uncertain attempt.
+                && (failure.kind != TransportEndpointFailureKind::PossiblyExposed
+                    || *category == TransportEndpointRejectionCategory::Error)
         })
         .map(|category| match category {
             TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
