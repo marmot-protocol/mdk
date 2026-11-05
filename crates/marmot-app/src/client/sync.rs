@@ -5813,7 +5813,19 @@ impl AppClient {
                         && !refused
                         && covers_goal
                         && compared.is_some_and(|compared| compared.certified);
-                    certified |= scope_certified;
+                    // Re-certifying a scope is progress only when it can
+                    // qualify: every required relay admitted, as completion
+                    // requires. A certificate over a required relay that is
+                    // not admitted proves the same thing on every pass and
+                    // must not reset the retry backoff (mdk#2923). The scope
+                    // still reports its pass as progressed below, so this
+                    // never feeds a quiet streak or a park.
+                    certified |= scope_certified
+                        && scope
+                            .goal
+                            .required_endpoints
+                            .iter()
+                            .all(|endpoint| scope.goal.admitted_endpoints.contains(endpoint));
                     scopes_certified += u64::from(scope_certified);
                     let scope_progress = if window_searched {
                         storage_sqlite::RecoveryPassProgress::WindowCertified

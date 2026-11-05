@@ -744,6 +744,15 @@
   now marks the chat list stale itself, instead of waiting for a checkpoint
   save that an idle account may skip.
 
+- Idle recovery stops repeating itself (mdk#2923). A native replay
+  synchronization that did not authorize is skipped while nothing it reads has
+  changed: the adapter generation and its replay progress, the routing revision
+  and the durable recovery fence. It still repeats every five minutes. On an
+  offline Pixel 9a this cut full passes from about ten a minute to under one.
+  Skips count as `replay_sync_unchanged`. A comparison that re-certifies a scope
+  with a required relay that is not admitted no longer counts as progress, so
+  that obligation backs off instead of being granted again every 30 seconds.
+
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging
   unusable artwork. Authenticated carried keys and retained canonical source

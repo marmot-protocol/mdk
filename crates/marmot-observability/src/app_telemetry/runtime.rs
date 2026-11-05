@@ -104,6 +104,7 @@ operations! {
     ReplaySyncSourcesChangedPending => "replay_sync_sources_changed_pending",
     ReplaySyncRetry => "replay_sync_retry",
     ReplaySyncRetryPending => "replay_sync_retry_pending",
+    ReplaySyncUnchanged => "replay_sync_unchanged",
     Ingest => "ingest",
     StorageConnectionWait => "storage_connection_wait",
     StorageTransaction => "storage_transaction",

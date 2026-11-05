@@ -363,6 +363,21 @@ impl ReplayAdmissionStatus<'_> {
         self._guard.accounts.contains_key(self.account_id)
     }
 
+    /// Moves on every replay wake: a source change or any same-generation
+    /// progress. Equal values under one generation mean nothing this status
+    /// reports has changed (mdk#2923).
+    pub fn progress(&self) -> u64 {
+        self._guard
+            .account_replay_coverage
+            .get(self.account_id)
+            .map_or(0, |coverage| {
+                coverage
+                    .changes
+                    .progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+    }
+
     /// Wire membership/epoch changes invalidate an owner's cached permission.
     pub fn generation(&self) -> u64 {
         self._guard

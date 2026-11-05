@@ -8425,6 +8425,12 @@ impl AppTransportRouting {
         self.inner.recovery_runner_catching_up.subscribe()
     }
 
+    /// How many times routes or another recovery chokepoint changed: a pass
+    /// that read the routing at one value need not repeat at the same value.
+    fn recovery_revision(&self) -> u64 {
+        *self.inner.recovery_runner_wake.borrow()
+    }
+
     /// Wake the account's recovery runner, if one runs. Coalesces.
     fn wake_recovery_runner(&self) {
         self.inner

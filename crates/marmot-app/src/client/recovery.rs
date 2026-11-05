@@ -417,6 +417,10 @@ pub(crate) struct AccountRecoveryOwner {
     /// not. The adapter bumps its generation only when its replay sources
     /// change; native progress re-sends the same one (mdk#2923 telemetry).
     replay_observed_generation: Option<u64>,
+    /// What the last full synchronization that did not authorize read, and
+    /// when. The same inputs again would repeat its work for the same result,
+    /// so the next pass is skipped until one changes (mdk#2923).
+    replay_unchanged: Option<(NativeReplayPassInputs, Instant)>,
     replay_complete: bool,
     replay_ticket: Option<storage_sqlite::RecoveryDemandTicket>,
     // Routes share immutable tokens: all issued endpoints for actual loss,
@@ -478,6 +482,7 @@ impl AccountRecoveryOwner {
             replay_session: rand::random(),
             replay_generation: None,
             replay_observed_generation: None,
+            replay_unchanged: None,
             replay_complete: false,
             replay_ticket: None,
             replay_sources: Vec::new(),
@@ -870,6 +875,23 @@ impl From<StorageError> for FreezeError {
     }
 }
 
+/// Everything a native replay synchronization reads that can change between
+/// wakes: the adapter's source generation and its progress within it, the
+/// routing revision, and the durable recovery fence (loss, route and
+/// inventory revisions and every pending obligation's revision).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeReplayPassInputs {
+    generation: u64,
+    progress: u64,
+    routing: u64,
+    fence: storage_sqlite::RecoveryRevisionFence,
+}
+
+/// An unchanged pass is still repeated this often. A replay state change
+/// that does not wake the adapter's observers is then picked up within this
+/// bound, not never, while a quiet offline account keeps most of the saving.
+pub(crate) const NATIVE_REPLAY_UNCHANGED_RECHECK: Duration = Duration::from_secs(5 * 60);
+
 impl AppClient {
     /// Copy limited native source facts, then persist without holding the
     /// adapter guard. The cursor seal rechecks the copied generation and current
@@ -886,6 +908,34 @@ impl AppClient {
             .replay_observed_generation
             .replace(generation);
         if self.recovery_owner.native_replay_authorizes(generation) {
+            self.recovery_owner.replay_unchanged = None;
+            return Ok(());
+        }
+        // A pass over the same inputs as the last unauthorized one would only
+        // recompute the same coverage and rewrite the same checkpoint. An
+        // unreadable fence never skips.
+        let inputs = self
+            .app
+            .account_storage(&self.state.label)
+            .ok()
+            .and_then(|storage| storage.app_storage().recovery_revision_fence().ok())
+            .map(|fence| NativeReplayPassInputs {
+                generation,
+                progress: observation.progress(),
+                routing: self.routing.recovery_revision(),
+                fence,
+            });
+        if let (Some(inputs), Some((last, at))) = (&inputs, &self.recovery_owner.replay_unchanged)
+            && inputs == last
+            && at.elapsed() < NATIVE_REPLAY_UNCHANGED_RECHECK
+        {
+            if let Some(telemetry) = self.runtime_telemetry.as_ref() {
+                telemetry.record_runtime(
+                    crate::RuntimePerformanceOperation::ReplaySyncUnchanged,
+                    Duration::ZERO,
+                    marmot_observability::Outcome::Success,
+                );
+            }
             return Ok(());
         }
         // Each full synchronization is timed under its trigger: a changed
@@ -906,15 +956,18 @@ impl AppClient {
             .as_ref()
             .map(|telemetry| telemetry.observe(reason));
         let result = self.synchronize_native_replay_sources(observation).await;
+        // The adapter may have moved on while this ran; the pass succeeded
+        // if the generation it holds now is authorized.
+        let current = self.adapter.replay_admission().await.generation();
+        let authorized = self.recovery_owner.native_replay_authorizes(current);
+        self.recovery_owner.replay_unchanged = match (&result, authorized, inputs) {
+            (Ok(()), false, Some(inputs)) => Some((inputs, Instant::now())),
+            _ => None,
+        };
         if let Some(span) = span {
-            // The adapter may have moved on while this ran; the pass succeeded
-            // if the generation it holds now is authorized.
-            let current = self.adapter.replay_admission().await.generation();
             span.finish(match &result {
                 Err(_) => marmot_observability::Outcome::Failure,
-                Ok(()) if self.recovery_owner.native_replay_authorizes(current) => {
-                    marmot_observability::Outcome::Success
-                }
+                Ok(()) if authorized => marmot_observability::Outcome::Success,
                 Ok(()) => marmot_observability::Outcome::NotReady,
             });
         }
@@ -2665,6 +2718,80 @@ mod tests {
         );
     }
 
+    /// While a relay never answers (offline, or a REQ the relay ignores),
+    /// nothing a replay pass reads changes between wakes. Repeating the full
+    /// pass then only recomputes coverage and rewrites the same checkpoint,
+    /// about nine times a minute on an offline Pixel 9a. An unchanged pass
+    /// is skipped, and the first change runs it again (mdk#2923).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unchanged_unauthorized_replay_pass_is_not_repeated() {
+        use crate::RuntimePerformanceOperation as Op;
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        client.runtime_telemetry = Some(telemetry.clone());
+        let full_passes = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .filter(|snapshot| {
+                    matches!(
+                        snapshot.operation,
+                        Op::ReplaySyncSourcesChanged
+                            | Op::ReplaySyncSourcesChangedPending
+                            | Op::ReplaySyncRetry
+                            | Op::ReplaySyncRetryPending
+                    )
+                })
+                .map(|snapshot| snapshot.completed)
+                .sum::<u64>()
+        };
+        client.prepare_transport().await.unwrap();
+        let generation = client.adapter.replay_admission().await.generation();
+        assert!(
+            !client.recovery_owner.native_replay_authorizes(generation),
+            "no relay has answered"
+        );
+        client.synchronize_native_replay().await.unwrap();
+        let settled = full_passes();
+        for _ in 0..3 {
+            client.synchronize_native_replay().await.unwrap();
+        }
+        assert_eq!(full_passes(), settled, "an unchanged pass is not repeated");
+
+        // Still repeated once the recheck bound has passed.
+        if let Some((_, at)) = client.recovery_owner.replay_unchanged.as_mut() {
+            *at = Instant::now()
+                .checked_sub(super::NATIVE_REPLAY_UNCHANGED_RECHECK)
+                .unwrap();
+        }
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(full_passes(), settled + 1, "the recheck bound repeats it");
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(full_passes(), settled + 1, "and then waits again");
+
+        // A routing change runs it again.
+        client.routing.wake_recovery_runner();
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(full_passes(), settled + 2, "a routing change runs it again");
+        let settled = full_passes();
+
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(
+            full_passes(),
+            settled + 1,
+            "the relays answering runs it again"
+        );
+        let generation = client.adapter.replay_admission().await.generation();
+        assert!(client.recovery_owner.native_replay_authorizes(generation));
+    }
+
     /// A pass records the generation it synchronized, not one the adapter
     /// moved to while it ran: the first full pass for the later generation
     /// still counts as a source change (mdk#2923).
@@ -2879,6 +3006,131 @@ mod tests {
         );
     }
 
+    /// The online loop seen on a Pixel 9a: a replay capture closed on every
+    /// attempt, granted alongside an incremental-history obligation whose
+    /// comparison re-certifies each pass with one required relay not
+    /// admitted. Before mdk#2923 that re-certification reset pacing on every
+    /// pass, so the replay goal's six unserved passes, sized to span pacing
+    /// up to its cap, came about 30 s apart. Now pacing grows across them.
+    /// When the goal parks is unchanged: after six unserved passes, with or
+    /// without the fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_capture_beside_a_re_certified_scope_parks_on_paced_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        let mut app = crate::MarmotApp::with_relays_and_config(
+            dir.path(),
+            vec!["wss://relay.example".into(), "wss://second.example".into()],
+            crate::MarmotAppConfig::white_noise()
+                .with_open_ranking_provider(None, Vec::new())
+                .with_recovery_operated_relays(Vec::new()),
+        )
+        .with_test_relay_client(relay.clone());
+        app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            relay.clone(),
+            app.config.allow_loopback_relay_endpoints,
+        );
+        let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+        client.prepare_transport().await.unwrap();
+        client.create_group("cut capture", &[]).await.unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .app_storage()
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::IncrementalHistory,
+                wall_now_ms().unwrap(),
+            )
+            .unwrap();
+        let mut native = None;
+        let mut ordinals = Vec::new();
+        let mut parked_at = None;
+        for attempt in 1..=8 {
+            // Every capture is closed before its relay answers.
+            let endpoints = relay
+                .accepted_subscriptions()
+                .into_iter()
+                .flat_map(|source| source.endpoints().to_vec())
+                .map(
+                    |endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                        endpoint,
+                        session_generation: None,
+                        events: Vec::new(),
+                        end: transport_nostr_adapter::NostrAcquisitionEnd::RelayClosed,
+                        stats: Default::default(),
+                    },
+                )
+                .collect();
+            *relay.acquisition_result.lock().unwrap() =
+                Some(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+            client.recovery_owner.test_advance_to_retry(&storage);
+            let Some(mut grant) = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            for obligation in &mut grant.plan {
+                match obligation.cause {
+                    storage_sqlite::RecoveryCause::SubscriptionReplay => {
+                        native = Some(obligation.id);
+                    }
+                    storage_sqlite::RecoveryCause::IncrementalHistory => {
+                        for scope in &mut obligation.scopes {
+                            if scope.goal.required_endpoints.len() > 1 {
+                                scope.goal.admitted_endpoints.truncate(1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+            client.run_recovery_grant_for_test(grant).await.unwrap();
+            ordinals.push(
+                storage
+                    .app_storage()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .ordinal,
+            );
+            if parked_at.is_none()
+                && native.is_some_and(|id| {
+                    storage
+                        .app_storage()
+                        .recovery_obligation_status(id)
+                        .unwrap()
+                        .is_some_and(|status| {
+                            status.eligibility
+                                == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+                        })
+                })
+            {
+                parked_at = Some(attempt);
+            }
+        }
+        assert!(native.is_some(), "the capture was granted");
+        assert_eq!(
+            parked_at,
+            Some(6),
+            "six unserved passes park the replay goal, as before"
+        );
+        assert!(
+            ordinals.windows(2).all(|pair| pair[1] >= pair[0])
+                && ordinals.last() > ordinals.first(),
+            "re-certification no longer resets pacing: {ordinals:?}"
+        );
+    }
+
     /// A grant can capture a live source before that source's EOSE arrives
     /// (mdk#2693). The capture then owns the source, so the late EOSE no
     /// longer admits it. A capture the relay refuses leaves the goal owed for
@@ -2951,6 +3203,68 @@ mod tests {
                 .pending_recovery_demands()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A skipped replay pass never holds back authorization: once a
+    /// comparison grant's capture admits the sources, the next pass runs
+    /// and authorizes, though no live EOSE arrived (mdk#2923).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completed_comparison_authorizes_past_a_skipped_replay_pass() {
+        use crate::RuntimePerformanceOperation as Op;
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        client.runtime_telemetry = Some(telemetry.clone());
+        let skipped = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == Op::ReplaySyncUnchanged)
+                .map_or(0, |snapshot| snapshot.completed)
+        };
+        client.prepare_transport().await.unwrap();
+        client.create_group("capture settles", &[]).await.unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        assert!(skipped() >= 1, "nothing changed, so the pass was skipped");
+        assert!(!client.recovery_owner.replay_complete);
+
+        let endpoints = relay
+            .accepted_subscriptions()
+            .into_iter()
+            .flat_map(|source| source.endpoints().to_vec())
+            .map(
+                |endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint,
+                    session_generation: None,
+                    events: Vec::new(),
+                    end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                    stats: Default::default(),
+                },
+            )
+            .collect();
+        *relay.acquisition_result.lock().unwrap() =
+            Some(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+        client.recovery_owner.test_advance_to_retry(&storage);
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .await
+            .unwrap()
+            .expect("the native goal is owed");
+        assert!(!grant.replay_capture.is_empty());
+        client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+
+        client.synchronize_native_replay().await.unwrap();
+        assert!(
+            client.recovery_owner.replay_complete,
+            "the answered capture authorizes on the next pass"
         );
     }
 
@@ -6990,6 +7304,61 @@ mod tests {
             relay.unfloored_account_subscription_count(),
             unfloored,
             "automatic recovery never replays unfloored history"
+        );
+    }
+
+    /// A comparison can certify a route on every pass while the obligation
+    /// never qualifies, because a required relay is not admitted. That
+    /// re-proof is not progress: it must not reset the retry backoff, or the
+    /// same obligation is granted again every 30 s forever, as seen on a
+    /// Pixel 9a. The obligation keeps retrying with a growing delay and never
+    /// parks into a notice (mdk#2923).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_certifying_an_unqualified_scope_backs_off_without_parking() {
+        let (_dir, _relay, app, mut client, _pump) = loss_fixture_with_relays(
+            Some(unix_now_seconds()),
+            vec!["wss://relay.example".into(), "wss://second.example".into()],
+        )
+        .await;
+        let storage = app.account_storage("alice").unwrap();
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            let mut grant = client
+                .authorize_account_recovery(
+                    None,
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap()
+                .expect("an unfinished loss is granted again");
+            // Every required relay is compared, but one is not admitted.
+            for obligation in &mut grant.plan {
+                for scope in &mut obligation.scopes {
+                    assert!(scope.goal.required_endpoints.len() > 1);
+                    scope.goal.admitted_endpoints.truncate(1);
+                }
+            }
+            client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
+            client.run_recovery_grant_for_test(grant).await.unwrap();
+            delays.push(client.recovery_owner.test_retry_remaining(&storage));
+            client.recovery_owner.test_advance_to_retry(&storage);
+            assert_eq!(
+                queue_loss(&storage.app_storage()),
+                Some(storage_sqlite::RecoveryEligibility::Retry),
+                "unqualified, so not complete, and never parked"
+            );
+        }
+        assert!(
+            delays.windows(2).all(|pair| pair[1] > pair[0]),
+            "each re-proof waits longer: {delays:?}"
+        );
+        assert!(
+            storage
+                .app_storage()
+                .parked_recovery_obligations()
+                .unwrap()
+                .is_empty(),
+            "and no notice"
         );
     }
 

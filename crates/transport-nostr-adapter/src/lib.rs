@@ -3830,6 +3830,9 @@ impl Drop for AccountReplayCoverage {
 struct ReplayChanges {
     tx: tokio::sync::watch::Sender<u64>,
     clock: Arc<std::sync::atomic::AtomicU64>,
+    /// Moves on every wake, source change or same-generation progress, so
+    /// an observer can tell an unchanged replay state from a changed one.
+    progress: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ReplayChanges {
@@ -3837,6 +3840,7 @@ impl Default for ReplayChanges {
         Self {
             tx: tokio::sync::watch::channel(0).0,
             clock: Arc::default(),
+            progress: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -4298,6 +4302,9 @@ impl AccountReplayCoverage {
     }
 
     fn wake_replay(&self) {
+        self.changes
+            .progress
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.changes.tx.send_replace(self.wire_generation);
         self.wake.notify_waiters();
     }
