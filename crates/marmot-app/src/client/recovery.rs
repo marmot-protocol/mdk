@@ -413,6 +413,10 @@ pub(crate) struct AccountRecoveryOwner {
     last_unavailable_epoch_observation: Option<[u8; 32]>,
     replay_session: [u8; 16],
     replay_generation: Option<u64>,
+    /// The replay generation the last full synchronization saw, authorized or
+    /// not. The adapter bumps its generation only when its replay sources
+    /// change; native progress re-sends the same one (mdk#2923 telemetry).
+    replay_observed_generation: Option<u64>,
     replay_complete: bool,
     replay_ticket: Option<storage_sqlite::RecoveryDemandTicket>,
     // Routes share immutable tokens: all issued endpoints for actual loss,
@@ -473,6 +477,7 @@ impl AccountRecoveryOwner {
             last_unavailable_epoch_observation: None,
             replay_session: rand::random(),
             replay_generation: None,
+            replay_observed_generation: None,
             replay_complete: false,
             replay_ticket: None,
             replay_sources: Vec::new(),
@@ -870,13 +875,60 @@ impl AppClient {
     /// adapter guard. The cursor seal rechecks the copied generation and current
     /// pending/loss facts; this is never exhaustive history or loss evidence.
     pub(crate) async fn synchronize_native_replay(&mut self) -> Result<(), AppError> {
-        use sha2::{Digest, Sha256};
         let adapter = self.adapter.clone();
         let observation = adapter.replay_admission().await;
         let generation = observation.generation();
+        // The generation this pass synchronizes, recorded from the same
+        // guarded snapshot it classifies and processes: the next full pass for
+        // a later one counts as a source change (mdk#2923 telemetry).
+        let previous = self
+            .recovery_owner
+            .replay_observed_generation
+            .replace(generation);
         if self.recovery_owner.native_replay_authorizes(generation) {
             return Ok(());
         }
+        // Each full synchronization is timed under its trigger: a changed
+        // source set (a new generation) or a retry of one that did not
+        // authorize, each with or without admission still pending. Success
+        // means it authorized the generation (mdk#2923).
+        let reason = match (
+            previous == Some(generation),
+            observation.pending || observation.spill_pending,
+        ) {
+            (false, false) => crate::RuntimePerformanceOperation::ReplaySyncSourcesChanged,
+            (false, true) => crate::RuntimePerformanceOperation::ReplaySyncSourcesChangedPending,
+            (true, false) => crate::RuntimePerformanceOperation::ReplaySyncRetry,
+            (true, true) => crate::RuntimePerformanceOperation::ReplaySyncRetryPending,
+        };
+        let span = self
+            .runtime_telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.observe(reason));
+        let result = self.synchronize_native_replay_sources(observation).await;
+        if let Some(span) = span {
+            // The adapter may have moved on while this ran; the pass succeeded
+            // if the generation it holds now is authorized.
+            let current = self.adapter.replay_admission().await.generation();
+            span.finish(match &result {
+                Err(_) => marmot_observability::Outcome::Failure,
+                Ok(()) if self.recovery_owner.native_replay_authorizes(current) => {
+                    marmot_observability::Outcome::Success
+                }
+                Ok(()) => marmot_observability::Outcome::NotReady,
+            });
+        }
+        result
+    }
+
+    /// One full synchronization of `observation`, a guarded snapshot whose
+    /// generation is not authorized yet.
+    async fn synchronize_native_replay_sources(
+        &mut self,
+        observation: transport_nostr_adapter::ReplayAdmissionStatus<'_>,
+    ) -> Result<(), AppError> {
+        use sha2::{Digest, Sha256};
+        let generation = observation.generation();
         // Every failed write/CAS leaves cached authorization invalid. Copied
         // observations can only authorize their own guarded generation.
         self.recovery_owner.replay_generation = None;
@@ -969,6 +1021,11 @@ impl AppClient {
             }
         }
         drop(observation);
+        #[cfg(test)]
+        if let Some((reached, release)) = self.test_replay_sync_gate.take() {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
@@ -2553,6 +2610,113 @@ mod tests {
         );
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.native_replay_authorizes(generation));
+    }
+
+    /// Each full replay synchronization is timed under its trigger: opening
+    /// the transport syncs a new generation, a sync on a generation that did
+    /// not authorize is a retry, and an authorized generation records nothing
+    /// (mdk#2923).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_replay_synchronization_is_timed_by_trigger() {
+        use crate::RuntimePerformanceOperation as Op;
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        client.runtime_telemetry = Some(telemetry.clone());
+        let spans = |op: Op| {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == op)
+                .map(|snapshot| (snapshot.completed, snapshot.successes))
+                .unwrap()
+        };
+        client.prepare_transport().await.unwrap();
+        assert!(
+            spans(Op::ReplaySyncSourcesChanged).0 >= 1,
+            "opening the transport syncs its first generation"
+        );
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        let generation = client.adapter.replay_admission().await.generation();
+        assert!(client.recovery_owner.native_replay_authorizes(generation));
+
+        let (retries, retry_successes) = spans(Op::ReplaySyncRetry);
+        let changed = spans(Op::ReplaySyncSourcesChanged);
+        client.recovery_owner.replay_generation = Some(generation.wrapping_sub(1));
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(
+            spans(Op::ReplaySyncRetry),
+            (retries + 1, retry_successes + 1),
+            "the same generation again is a retry, and it authorizes"
+        );
+        assert_eq!(spans(Op::ReplaySyncSourcesChanged), changed);
+
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(
+            spans(Op::ReplaySyncRetry),
+            (retries + 1, retry_successes + 1),
+            "an authorized generation records nothing"
+        );
+    }
+
+    /// A pass records the generation it synchronized, not one the adapter
+    /// moved to while it ran: the first full pass for the later generation
+    /// still counts as a source change (mdk#2923).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_generation_change_during_a_pass_counts_as_a_source_change() {
+        use crate::RuntimePerformanceOperation as Op;
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        client.runtime_telemetry = Some(telemetry.clone());
+        let changed = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == Op::ReplaySyncSourcesChanged)
+                .unwrap()
+                .completed
+        };
+        client.prepare_transport().await.unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        let first = client.adapter.replay_admission().await.generation();
+        assert!(client.recovery_owner.native_replay_authorizes(first));
+
+        // A full pass on the first generation, which the adapter leaves for
+        // the second while the pass is paused after its snapshot.
+        client.recovery_owner.replay_generation = Some(first.wrapping_sub(1));
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        client.test_replay_sync_gate = Some((reached_tx, release_rx));
+        let adapter = client.adapter.clone();
+        let (pass, ()) = tokio::join!(client.synchronize_native_replay(), async move {
+            reached.await.unwrap();
+            adapter.change_replay_sources_for_test().await;
+            release.send(()).unwrap();
+        });
+        pass.unwrap();
+        let second = client.adapter.replay_admission().await.generation();
+        assert_ne!(second, first, "the adapter moved on during the pass");
+        assert_eq!(
+            client.recovery_owner.replay_observed_generation,
+            Some(first)
+        );
+
+        let before = changed();
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(changed(), before + 1, "the second generation's first pass");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -537,6 +537,17 @@ mod tests {
         });
         assert!(indefinite.muted);
         assert_eq!(indefinite.muted_until_ms, None);
+
+        let finite = ChatNotificationSettingsFfi::from(ChatNotificationSettings {
+            muted: true,
+            muted_until_ms: Some(1_700_000_000_123),
+            account_ref: "alice".to_owned(),
+            account_id_hex: "aa".to_owned(),
+            group_id_hex: "11".to_owned(),
+            updated_at_ms: 2,
+        });
+        assert!(finite.muted);
+        assert_eq!(finite.muted_until_ms, Some(1_700_000_000_123));
     }
 
     #[test]

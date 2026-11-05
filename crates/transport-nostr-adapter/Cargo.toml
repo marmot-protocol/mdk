@@ -12,6 +12,9 @@ sdk = ["dep:nostr-gossip", "dep:nostr-sdk", "dep:async-wsocket", "dep:tokio-sock
 # Device pairing's Nostr events (#2628). Unreleased until the pairing spec
 # merges: nothing enables it, so no release sends pairing messages.
 unreleased-device-pairing = ["dep:marmot-pairing"]
+# Test hooks for crates that drive the adapter in their own tests. Never
+# enable in app artifacts.
+test-support = []
 
 [dependencies]
 async-trait.workspace = true

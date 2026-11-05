@@ -577,15 +577,37 @@ fn attachment_job_candidate_pages_and_expiry_cleanup_use_bounded_indexes() {
             "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition WHERE expires_at<=?1 ORDER BY expires_at,token LIMIT 64",
             "attachment_acquisition_expiry",
         ),
+        // The idle probes run on every attachment pass (mdk#2923); a scan
+        // here would cost what the probe exists to avoid.
+        (
+            &format!("EXPLAIN QUERY PLAN {EXPIRED_ACQUISITION_PROBE}"),
+            "attachment_acquisition_expiry",
+        ),
+        (
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::partial::EXPIRED_PARTIAL_PROBE
+            ),
+            "attachment_partial_expiry",
+        ),
     ] {
-        let rows = conn
-            .prepare(query)
-            .unwrap()
-            .query_map([12], |r| r.get::<_, String>(3))
+        let mut statement = conn.prepare(query).unwrap();
+        let bound = statement.parameter_count();
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(std::iter::repeat_n(12, bound)),
+                |r| r.get::<_, String>(3),
+            )
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(rows.iter().any(|s| s.contains(index)), "{rows:?}");
+        // A range search on the index, not a scan of it: a covering-index
+        // scan still names the index but reads every row.
+        assert!(
+            rows.iter()
+                .any(|s| s.starts_with("SEARCH") && s.contains(index)),
+            "{rows:?}"
+        );
     }
     drop(conn);
     sql(&store, "UPDATE app_events SET retention_expires_at=12");
@@ -3690,6 +3712,29 @@ fn storage_parked_checkpoints_are_exempt_from_idle_expiry() {
     let far_future = 12 + 48 * 60 * 60;
     assert_eq!(app.prune_attachment_partials(far_future, 64).unwrap(), 1);
     assert_eq!(partial_usage(&store), 3, "only the idle prefix expired");
+    // The pruning probe shares the exemption: a parked prefix still inside
+    // it does not send every attachment pass into the DELETE (mdk#2923).
+    let probe = |now: u64| -> bool {
+        let exempt_after = (now + super::partial::PARTIAL_TTL_SECONDS)
+            .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                super::partial::EXPIRED_PARTIAL_PROBE,
+                rusqlite::named_params! {
+                    ":now": now as i64,
+                    ":exempt_after": exempt_after as i64,
+                },
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(!probe(far_future), "the exempt prefix is not due");
+    assert!(
+        probe(12 + STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS + 48 * 60 * 60),
+        "until its exemption ends"
+    );
     assert_eq!(readmit(&app, far_future, 0, u64::MAX, true), 1);
     let job = app
         .claim_attachment_acquisition(&parked, far_future, far_future + 100)

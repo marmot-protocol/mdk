@@ -17,6 +17,35 @@ pub const ATTACHMENT_CHECKPOINT_BYTES: usize = media_store::CHECKPOINT_APPEND_MA
 /// deadline, so a prefix kept through a long park is still loadable when the
 /// job resumes by any of those paths.
 pub(super) const PARTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// A prunable partial: past its idle expiry, and not a storage-parked
+/// prefix still inside its exemption. The probe and the prune `DELETE` share
+/// this one predicate and its named parameters, so they cannot drift apart
+/// (mdk#2923).
+macro_rules! prunable_partial {
+    () => {
+        "p.expires_at<=:now
+         AND NOT (p.expires_at>:exempt_after AND EXISTS(SELECT 1 FROM attachment_acquisition q
+             WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
+             AND q.storage_blocked_headroom IS NOT NULL))"
+    };
+}
+
+/// Whether any partial is prunable, answered from the
+/// `attachment_partial_expiry` index.
+pub(crate) const EXPIRED_PARTIAL_PROBE: &str = concat!(
+    "SELECT EXISTS(SELECT 1 FROM attachment_partial p WHERE ",
+    prunable_partial!(),
+    ")"
+);
+
+/// Up to `:limit` prunable partials, oldest expiry first.
+const EXPIRED_PARTIAL_PRUNE: &str = concat!(
+    "DELETE FROM attachment_partial WHERE token IN (
+     SELECT p.token FROM attachment_partial p WHERE ",
+    prunable_partial!(),
+    " ORDER BY p.expires_at,p.token LIMIT :limit)"
+);
 /// Longest a storage-parked job keeps its prefix, measured from its latest
 /// park. A parked prefix is exempt from the idle expiry until then, so it
 /// survives while the user frees space, but it cannot hold its disk and its
@@ -477,17 +506,33 @@ impl SqliteAppStorage {
         let exempt_after = now
             .saturating_add(PARTIAL_TTL_SECONDS)
             .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
-        self.lock()?
-            .execute(
-                "DELETE FROM attachment_partial WHERE token IN (
-                 SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
-                 AND NOT (p.expires_at>?3 AND EXISTS(SELECT 1 FROM attachment_acquisition q
-                     WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
-                     AND q.storage_blocked_headroom IS NOT NULL))
-                 ORDER BY p.expires_at,p.token LIMIT ?2)",
-                params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
+        let conn = self.lock()?;
+        // Probe before compiling the DELETE, as for expired acquisitions
+        // (mdk#2923). The probe uses the DELETE's own eligibility, storage-
+        // parked exemption included, so a parked prefix still inside its
+        // exemption does not run the DELETE on every pass.
+        let expired: bool = conn
+            .query_row_cached(
+                EXPIRED_PARTIAL_PROBE,
+                rusqlite::named_params! {
+                    ":now": u64_to_i64(now)?,
+                    ":exempt_after": u64_to_i64(exempt_after)?,
+                },
+                |row| row.get(0),
             )
-            .storage()
+            .storage()?;
+        if !expired {
+            return Ok(0);
+        }
+        conn.execute_cached(
+            EXPIRED_PARTIAL_PRUNE,
+            rusqlite::named_params! {
+                ":now": u64_to_i64(now)?,
+                ":exempt_after": u64_to_i64(exempt_after)?,
+                ":limit": limit as i64,
+            },
+        )
+        .storage()
     }
 
     /// Bytes `reference`'s checkpoint has recorded, if it has one. Unfenced:
