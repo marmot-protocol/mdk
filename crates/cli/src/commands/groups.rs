@@ -2021,6 +2021,161 @@ mod tests {
         assert!(!listed.contains('\u{1b}'));
     }
 
+    #[test]
+    fn rejoin_consent_token_requires_exactly_32_bytes() {
+        assert_eq!(
+            parse_rejoin_token(&format!(" {} ", "Ab".repeat(32))).unwrap(),
+            vec![0xab; 32]
+        );
+        for invalid in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+        ] {
+            assert!(matches!(
+                parse_rejoin_token(&invalid),
+                Err(WnError::InvalidRejoinToken)
+            ));
+        }
+    }
+
+    fn sample_mls(group: &AppGroupRecord) -> AppGroupMlsState {
+        serde_json::from_value(json!({
+            "group_id_hex": group.group_id_hex,
+            "protocol_profile": "current",
+            "lifecycle_state": "stable",
+            "epoch": 3,
+            "member_count": 3,
+            "required_app_components": [],
+            "disbanding_enabled": false,
+        }))
+        .expect("sample MLS state")
+    }
+
+    #[test]
+    fn disband_status_distinguishes_unread_state_and_durable_request_precedence() {
+        let mut group = sample_group("state", None);
+        let mut mls = sample_mls(&group);
+        let unread = disband_status_json(&group, None);
+        assert_eq!(unread["state"], "unknown");
+        assert!(unread["disbanding_enabled"].is_null());
+        assert_eq!(
+            disband_status_json(&group, Some(&mls))["state"],
+            "not_enabled"
+        );
+        mls.disbanding_enabled = true;
+        assert_eq!(disband_status_json(&group, Some(&mls))["state"], "enabled");
+        mls.disbanding = true;
+        assert_eq!(
+            disband_status_json(&group, Some(&mls))["state"],
+            "converging"
+        );
+        mls.disband_request = Some(AppDisbandRequest::Pending {
+            requested_at_ms: 17,
+        });
+        let pending = disband_status_json(&group, Some(&mls));
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(
+            pending["disband_request"],
+            json!({"pending":{"requested_at_ms":17}})
+        );
+        group.disband_request = Some(AppDisbandRequest::Failed {
+            requested_at_ms: 11,
+            reason: marmot_app::AppDisbandFailureReason::NoLongerAdmin,
+        });
+        let failed = disband_status_json(&group, Some(&mls));
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(
+            failed["disband_request"],
+            json!({"failed":{"requested_at_ms":11,"reason":"no_longer_admin"}})
+        );
+        group.disbanded = true;
+        assert_eq!(
+            disband_status_json(&group, Some(&mls))["state"],
+            "disbanded"
+        );
+        group.disbanded = false;
+        mls.lifecycle_state = AppGroupLifecycleState::Disbanded;
+        let terminal = disband_status_json(&group, Some(&mls));
+        assert_eq!(terminal["state"], "disbanded");
+        assert_eq!(terminal["disbanded"], true);
+    }
+
+    #[test]
+    fn management_rows_apply_admin_membership_and_disband_guards() {
+        let me = "11".repeat(32);
+        let peer = "22".repeat(32);
+        let member = "33".repeat(32);
+        let mut group = sample_group("management", None);
+        group.admin_policy.admins = vec![me.clone(), peer.clone()];
+        let members = [&me, &peer, &member]
+            .into_iter()
+            .map(|id| AppGroupMemberRecord {
+                member_id_hex: id.clone(),
+                account: None,
+                local: id == &me,
+                device_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut mls = sample_mls(&group);
+        let state = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(state["is_last_admin"], false);
+        assert_eq!(
+            state["member_actions"],
+            json!([
+                {"member_id":me,"is_self":true,"is_admin":true,"can_remove":false,"can_promote":false,"can_demote":false},
+                {"member_id":peer,"is_self":false,"is_admin":true,"can_remove":true,"can_promote":false,"can_demote":true},
+                {"member_id":member,"is_self":false,"is_admin":false,"can_remove":true,"can_promote":true,"can_demote":false},
+            ])
+        );
+        let peer_view = group_management_json(&member, &group, &members, &mls);
+        assert_eq!(peer_view["can_leave"], true);
+        group.leave_requested_at_ms = Some(19);
+        let pending = group_management_json(&member, &group, &members, &mls);
+        assert_eq!(pending["can_leave"], false);
+        assert_eq!(pending["leave_request_pending"], true);
+        assert_eq!(pending["leave_requested_at_ms"], 19);
+        group.leave_requested_at_ms = None;
+        group.admin_policy.admins = vec![me.clone()];
+        let last = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(last["is_last_admin"], true);
+        assert_eq!(last["can_enable_disbanding"], true);
+        assert_eq!(last["can_disband"], false);
+        mls.disbanding_blockers = vec![peer.clone()];
+        let blocked = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(blocked["can_enable_disbanding"], false);
+        assert_eq!(blocked["disbanding_blockers"], json!([peer]));
+        mls.disbanding_enabled = true;
+        assert_eq!(
+            group_management_json(&me, &group, &members, &mls)["can_disband"],
+            true
+        );
+        for terminal in [false, true] {
+            mls.disbanding = !terminal;
+            mls.lifecycle_state = if terminal {
+                AppGroupLifecycleState::Disbanded
+            } else {
+                AppGroupLifecycleState::Stable
+            };
+            let state = group_management_json(&me, &group, &members, &mls);
+            for flag in [
+                "can_invite",
+                "can_leave",
+                "can_disband",
+                "can_enable_disbanding",
+                "requires_self_demote_before_leave",
+            ] {
+                assert_eq!(state[flag], false, "{flag}");
+            }
+            for row in state["member_actions"].as_array().unwrap() {
+                for flag in ["can_remove", "can_promote", "can_demote"] {
+                    assert_eq!(row[flag], false, "{flag}");
+                }
+            }
+        }
+    }
+
     /// A device whose own leaf was removed gets no member affordances, even
     /// while a sibling device keeps its account (and its admin role) on the roster.
     #[test]

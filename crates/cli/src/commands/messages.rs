@@ -1035,7 +1035,17 @@ mod tests {
     #[test]
     fn parse_event_tag_rejects_malformed_values() {
         for raw in ["not json", "[1,2]", "[]", "{\"a\":1}"] {
-            assert!(parse_event_tag(raw).is_err(), "must reject: {raw}");
+            let error = parse_event_tag(raw).expect_err("malformed tag must be rejected");
+            let WnError::InvalidEventTag(detail) = error else {
+                panic!("wrong tag rejection for {raw}: {error:?}");
+            };
+            let diagnostic = detail
+                .strip_prefix(&format!("{raw}: "))
+                .expect("input context");
+            assert!(
+                !diagnostic.is_empty(),
+                "parser diagnostic must explain {raw}"
+            );
         }
     }
 

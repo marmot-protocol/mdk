@@ -4,7 +4,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle;
@@ -2235,7 +2235,9 @@ impl JsonLineSubscription {
                 }
                 Ok(_) => {}
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("subscription disconnected during absence assertion");
+                }
             }
         }
     }
@@ -2802,6 +2804,9 @@ fn account_create_requires_relay_setup() {
         // Daemon tests drive an in-process `MockRelay` at loopback; production
         // rejects non-public relay hosts unless this dev gate is set.
         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .env_remove("WN_RELAY")
+        .env_remove("WN_SOCKET")
+        .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
         .args(["account", "create"])
         .output()
         .expect("wn command should start");
@@ -2887,14 +2892,14 @@ fn account_create_reports_missing_relay_lists_without_storing_the_nsec() {
 }
 
 #[test]
-fn account_create_rolls_back_when_relay_list_publication_fails() {
+fn account_create_rejects_invalid_relay_before_creating_account() {
     let home = tempfile::tempdir().expect("tempdir");
 
     let error = run_json_error(
         home.path(),
         &["account", "create", "--default-relays", "not-a-relay-url"],
     );
-    assert_ne!(error["code"], "usage");
+    assert_eq!(error["code"], "invalid_relay_url");
 
     let listed = run_json(home.path(), &["account", "list"]);
     assert_eq!(listed["accounts"], serde_json::json!([]));
@@ -3334,7 +3339,7 @@ fn account_import_requires_explicit_repair_before_publishing_missing_relay_lists
 }
 
 #[test]
-fn account_create_rolls_back_when_missing_relay_list_publication_fails() {
+fn account_import_rejects_invalid_relay_before_creating_account() {
     let home = tempfile::tempdir().expect("tempdir");
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
@@ -3349,7 +3354,7 @@ fn account_create_rolls_back_when_missing_relay_list_publication_fails() {
         ],
         &format!("{nsec}\n"),
     );
-    assert_ne!(error["code"], "usage");
+    assert_eq!(error["code"], "invalid_relay_url");
     assert!(!error.to_string().contains(nsec));
 
     let listed = run_json(home.path(), &["account", "list"]);
@@ -5670,6 +5675,57 @@ fn groups_leave_publishes_self_remove() {
         relay.event_count(445) > group_events_before_leave,
         "leave must add a group event to the selected relay"
     );
+    let local = run_json_with_relay(
+        home.path(),
+        relay_url,
+        &["--account", &bob, "chats", "show", group_id],
+    );
+    assert_eq!(local["group"]["self_membership"], "left");
+    assert!(
+        local["group"]["leave_requested_at_ms"]
+            .as_u64()
+            .is_some_and(|at| at > 0)
+    );
+
+    // The peer's SelfRemove timer belongs to a live runtime. Keep that runtime
+    // alive after the cold local-intent read, through normal daemon scheduling.
+    let socket = home.path().join("dev/wnd.sock");
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(relay_url)
+            .arg("--default-account-relays")
+            .arg(relay_url)
+            .args(["--secret-store", "file"])
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let members = run_json_with_relay(
+            home.path(),
+            relay_url,
+            &["--account", &alice, "groups", "members", group_id],
+        );
+        if member_accounts(&members) == sorted_accounts([&alice]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peer did not commit the voluntary departure"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    daemon.stop();
+    let retained = run_json_with_relay(
+        home.path(),
+        relay_url,
+        &["--account", &bob, "chats", "show", group_id],
+    );
+    assert_eq!(retained["group"]["self_membership"], "left");
 }
 
 #[test]
@@ -5980,6 +6036,8 @@ fn chats_mute_suppresses_and_unmute_restores_notifications() {
             "quiet while muted",
         ],
     );
+    // Await this exact message at Bob before checking muted notification output.
+    sync_until_message(home.path(), test_relay_url(), &bob, "quiet while muted");
     subscription.assert_no_line_for(Duration::from_secs(2), |line| {
         line["result"]["trigger"] == "Notification"
             && line["result"]["type"] == "notification"
@@ -6092,26 +6150,6 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
 }
 
 #[test]
-fn chats_list_exposes_visible_groups() {
-    let home = tempfile::tempdir().expect("tempdir");
-
-    let alice = create_account(home.path());
-    let bob = create_account(home.path());
-    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
-
-    let created_group = run_json(
-        home.path(),
-        &["--account", &alice, "group", "create", "general", &bob],
-    );
-    let group_id = created_group["group_id"].as_str().expect("group id");
-    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
-
-    let chats = run_json(home.path(), &["--account", &bob, "chats", "list"]);
-    assert_eq!(chats["chats"][0]["group_id"], group_id);
-    assert_eq!(chats["chats"][0]["profile"]["name"], "general");
-}
-
-#[test]
 fn chats_list_projects_unread_and_last_message() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -6142,7 +6180,7 @@ fn chats_list_projects_unread_and_last_message() {
 
     // Alice sends first: a local send advances the sender's own read marker, so
     // this establishes Alice's read state. Bob receives it.
-    run_json(
+    let seed = run_json(
         home.path(),
         &[
             "--account",
@@ -6157,8 +6195,37 @@ fn chats_list_projects_unread_and_last_message() {
         ],
     );
     sync_until_message(home.path(), test_relay_url(), &bob, "seed from alice");
+    let seed_id = seed["message_ids"][0].as_str().expect("seed message id");
+    let seed_read = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert_eq!(seed_read["chats"][0]["last_read_message_id_hex"], seed_id);
 
-    // Bob replies; Alice syncs and now has an unread message from Bob.
+    // Accepted history sorts by source epoch before timestamp/id. A real
+    // profile commit puts Bob's reply after Alice's read marker regardless of
+    // whether these fast CLI processes publish within the same second.
+    let before = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "show", group_id],
+    );
+    let seed_epoch = before["mls"]["epoch"].as_u64().expect("seed epoch");
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "rename",
+            group_id,
+            "general-updated",
+        ],
+    );
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let advanced = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "show", group_id],
+    );
+    assert_eq!(advanced["mls"]["epoch"], seed_epoch + 1);
+
+    // Bob replies in the new epoch; Alice now has an unread message from Bob.
     run_json(
         home.path(),
         &[
@@ -6926,6 +6993,107 @@ fn daemon_running_does_not_auto_forward_logout() {
     assert_eq!(accounts.len(), 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_execute_failures_preserve_admission_state_and_output_channels() {
+    for json in [false, true] {
+        for failure in ["connect", "busy", "eof"] {
+            let home = tempfile::tempdir().expect("temp home");
+            let socket = home.path().join("dev/wnd.sock");
+            let server = if failure == "connect" {
+                None
+            } else {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(socket.parent().unwrap())
+                    .expect("private socket directory");
+                let listener =
+                    std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+                std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                Some(std::thread::spawn(move || {
+                    let deadline = Instant::now() + POLL_TIMEOUT;
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "CLI never sent a daemon request"
+                                );
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("accept daemon request: {error}"),
+                        }
+                    };
+                    stream.set_read_timeout(Some(POLL_TIMEOUT)).unwrap();
+                    let mut request = Vec::new();
+                    stream
+                        .read_to_end(&mut request)
+                        .expect("read complete execute request");
+                    assert!(!request.is_empty());
+                    if failure == "busy" {
+                        stream.write_all(b"{\"error\":{\"code\":\"server_busy\",\"message\":\"daemon connection capacity is busy\"}}\n").expect("busy frame");
+                    }
+                }))
+            };
+            let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+            command
+                .arg("--home")
+                .arg(home.path())
+                .args(["--secret-store", "file"]);
+            for variable in [
+                "WN_SOCKET",
+                "WN_RELAY",
+                "WN_ACCOUNT",
+                "WN_DEV_SETTLEMENT_QUIESCENCE_MS",
+            ] {
+                command.env_remove(variable);
+            }
+            if json {
+                command.arg("--json");
+            }
+            if failure == "connect" {
+                command.arg("--socket").arg(&socket);
+            }
+            let output = command.args(["account", "list"]).output().expect("run wn");
+            if let Some(server) = server {
+                server.join().expect("daemon fixture");
+            }
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "local account list would succeed, so daemon failure must never replay it"
+            );
+            let expected = match failure {
+                "connect" => ("daemon_unavailable", "daemon not running at"),
+                "busy" => ("server_busy", "daemon connection capacity is busy"),
+                _ => (
+                    "daemon_state_unknown",
+                    "command state is unknown: daemon closed the connection without responding",
+                ),
+            };
+            if json {
+                assert!(output.stderr.is_empty());
+                let value: Value = serde_json::from_slice(&output.stdout).expect("JSON error");
+                assert_eq!(value["ok"], false);
+                assert_eq!(value["error"]["code"], expected.0);
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(expected.1)
+                );
+            } else {
+                assert!(output.stdout.is_empty());
+                let stderr = String::from_utf8(output.stderr).expect("plain error");
+                assert!(stderr.starts_with("error: "));
+                assert!(stderr.contains(expected.1), "{stderr}");
+            }
+        }
+    }
+}
+
 #[test]
 fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -7404,7 +7572,14 @@ fn group_create_fetches_rotated_remote_key_package_via_discovery_relays() {
         &["--account", alice, "groups", "create", "remote", bob],
     );
 
-    assert!(created_group["group_id"].as_str().is_some());
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(bob_home.path(), relay, bob, group_id);
+    let members = run_json_with_relay(
+        bob_home.path(),
+        relay,
+        &["--account", bob, "groups", "members", group_id],
+    );
+    assert_eq!(member_accounts(&members), sorted_accounts([alice, bob]));
 }
 
 #[test]
@@ -7824,35 +7999,22 @@ fn groups_set_avatar_url_round_trips_through_sync_and_show() {
     );
     assert_eq!(empty_err["code"], "invalid_group_avatar_url");
 
-    // Omitting both --url and --clear is a usage error (no silent clear).
-    assert!(
-        !wn(home.path())
-            .args(["--account", &alice, "groups", "set-avatar-url", group_id])
-            .output()
-            .expect("wn command should start")
-            .status
-            .success(),
-        "set-avatar-url without --url/--clear should fail"
-    );
-
-    // --dim without --url is a usage error.
-    assert!(
-        !wn(home.path())
-            .args([
-                "--account",
-                &alice,
-                "groups",
-                "set-avatar-url",
-                group_id,
-                "--dim",
-                "512x512",
-            ])
-            .output()
-            .expect("wn command should start")
-            .status
-            .success(),
-        "set-avatar-url --dim without --url should fail"
-    );
+    for args in [
+        vec!["--account", &alice, "groups", "set-avatar-url", group_id],
+        vec![
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--dim",
+            "512x512",
+        ],
+    ] {
+        let error = run_json_error(home.path(), &args);
+        assert_eq!(error["code"], "usage");
+        assert!(error["message"].as_str().unwrap().contains("--url"));
+    }
 }
 
 #[test]
@@ -9458,7 +9620,8 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
         home.path(),
         &["--account", &alice, "groups", "decline-rejoin", &welcome_id],
     );
-    assert!(declined["code"].is_string());
+    assert_eq!(declined["code"], "engine_error");
+    assert_eq!(declined["message"], "invalid welcome");
 
     // Create/invite already drained their Welcomes, so nothing is pending;
     // re-delivering an unknown Welcome is a typed error, not a silent success.
@@ -9477,7 +9640,8 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
             &welcome_id,
         ],
     );
-    assert!(redeliver["code"].is_string());
+    assert_eq!(redeliver["code"], "engine_error");
+    assert_eq!(redeliver["message"], "record not found");
 
     let alice_management = run_json(
         home.path(),
@@ -9510,25 +9674,35 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
 #[test]
 fn groups_delete_local_removes_the_local_copy_without_leaving() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = TestRelay::new();
+    let relay_url = relay.url();
 
-    let alice = create_account(home.path());
-    let bob = create_account(home.path());
-    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
-    let created = run_json(
+    let alice = create_account_with_real_relay(home.path(), relay_url);
+    let bob = create_account_with_real_relay(home.path(), relay_url);
+    run_json_with_relay(
         home.path(),
+        relay_url,
+        &["--account", &bob, "keys", "publish"],
+    );
+    let created = run_json_with_relay(
+        home.path(),
+        relay_url,
         &["--account", &alice, "groups", "create", "local-only", &bob],
     );
     let group_id = created["group_id"].as_str().expect("group id");
-    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+    sync_until_joined(home.path(), relay_url, &bob, group_id);
 
-    let unconfirmed = run_json_error(
+    let unconfirmed = run_json_error_with_relay(
         home.path(),
+        relay_url,
         &["--account", &bob, "groups", "delete-local", group_id],
     );
     assert_eq!(unconfirmed["code"], "confirmation_required");
 
-    let deleted = run_json(
+    let group_events_before_delete = relay.event_count(445);
+    let deleted = run_json_with_relay(
         home.path(),
+        relay_url,
         &[
             "--account",
             &bob,
@@ -9540,7 +9714,11 @@ fn groups_delete_local_removes_the_local_copy_without_leaving() {
     );
     assert_eq!(deleted["group_id"], group_id);
     assert_eq!(deleted["deleted"], true);
-    let bob_groups = run_json(home.path(), &["--account", &bob, "groups", "list"]);
+    let bob_groups = run_json_with_relay(
+        home.path(),
+        relay_url,
+        &["--account", &bob, "groups", "list"],
+    );
     assert!(
         !bob_groups["groups"]
             .as_array()
@@ -9549,9 +9727,16 @@ fn groups_delete_local_removes_the_local_copy_without_leaving() {
             .any(|group| group["group_id"] == group_id)
     );
 
-    // No MLS leave was sent: Alice still sees Bob in the roster.
-    let members = run_json(
+    assert_eq!(
+        relay.event_count(445),
+        group_events_before_delete,
+        "local deletion must publish no group event, including SelfRemove"
+    );
+    run_json_with_relay(home.path(), relay_url, &["--account", &alice, "sync"]);
+    // Alice has processed the relay before the fresh roster read.
+    let members = run_json_with_relay(
         home.path(),
+        relay_url,
         &["--account", &alice, "groups", "members", group_id],
     );
     assert_eq!(member_accounts(&members), sorted_accounts([&alice, &bob]));
@@ -9906,6 +10091,14 @@ fn groups_add_members_can_assign_initial_admins_in_one_commit() {
     );
     let group_id = created["group_id"].as_str().expect("group id");
 
+    let before = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "show", group_id],
+    );
+    let epoch_before = before["mls"]["epoch"]
+        .as_u64()
+        .expect("epoch before invite");
+
     // An initial admin must be one of the invitees.
     let not_invited = run_json_error(
         home.path(),
@@ -9942,6 +10135,25 @@ fn groups_add_members_can_assign_initial_admins_in_one_commit() {
         &["--account", &alice, "groups", "admins", group_id],
     );
     assert_eq!(admin_accounts(&admins), sorted_accounts([&alice, &carol]));
+    let after = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "show", group_id],
+    );
+    assert_eq!(after["mls"]["epoch"], epoch_before + 1);
+    sync_until_joined(home.path(), test_relay_url(), &carol, group_id);
+    let recipient = run_json(
+        home.path(),
+        &["--account", &carol, "groups", "show", group_id],
+    );
+    assert_eq!(recipient["mls"]["epoch"], epoch_before + 1);
+    let mut recipient_admins = recipient["group"]["admin_policy"]["admins"]
+        .as_array()
+        .expect("recipient admin policy")
+        .iter()
+        .map(|admin| admin.as_str().expect("admin identity").to_owned())
+        .collect::<Vec<_>>();
+    recipient_admins.sort();
+    assert_eq!(recipient_admins, sorted_accounts([&alice, &carol]));
 }
 
 #[cfg(not(feature = "dev-device-groups"))]
