@@ -285,6 +285,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   its reply. The existing 60-second startup budget bounds the probe; an unresponsive socket is preserved and no
   competing daemon is started (mdk#2957).
 
+- The TUI keeps `/login` secret input hidden while a quoted argument is still being edited, including an
+  unfinished extra argument (mdk#2955). Submitting an unfinished quote still reports a parse error.
 - SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
   creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
   `delete_group` inside a transaction and only logged the failure; the group id stayed taken.

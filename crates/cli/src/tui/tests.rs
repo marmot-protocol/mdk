@@ -340,6 +340,25 @@ fn slash_command_parser_handles_account_onboarding_commands() {
         parse_slash_command("/login nsec1secret"),
         Ok(SlashCommand::AccountImportSecret("nsec1secret".to_owned()))
     );
+    for input in ["/login \"nsec1synthetic\"", "/login 'nsec1synthetic'"] {
+        assert_eq!(
+            parse_slash_command(input),
+            Ok(SlashCommand::AccountImportSecret(
+                "nsec1synthetic".to_owned()
+            ))
+        );
+    }
+    for input in [
+        "/login \"nsec1synthetic",
+        "/login 'nsec1synthetic",
+        "/login nsec1synthetic \"",
+        "/login npub1public 'NSEC1synthetic",
+    ] {
+        assert_eq!(
+            parse_slash_command(input),
+            Err("unterminated quoted string".to_owned())
+        );
+    }
     assert!(parse_slash_command("/account create").is_err());
 }
 
@@ -1972,10 +1991,21 @@ fn timeline_subscription_pins_the_initial_page_size() {
 
 #[test]
 fn composer_redacts_nsec_imports_without_hiding_other_input() {
-    assert_eq!(
-        composer_display_text("/login nsec1secret"),
-        "/login <hidden nsec>"
-    );
+    // #2955: masking must work before an opening quote has been closed.
+    // These sentinel values are deliberately not valid credentials.
+    for input in [
+        "/login \"nsec1synthetic",
+        "/login 'nsec1synthetic",
+        " /\tlogin  \"NsEc1synthetic",
+        "/login nsec1synthetic \"",
+        "/login npub1public 'NSEC1synthetic",
+        "/\"login\" 'nsec1synthetic",
+        "/login \"nsec1synthetic\"",
+        "/login 'nsec1synthetic'",
+        "/login nsec1secret",
+    ] {
+        assert_eq!(composer_display_text(input), "/login <hidden nsec>");
+    }
     assert_eq!(
         composer_display_text("/login  nsec1secret"),
         "/login <hidden nsec>"
@@ -2009,6 +2039,20 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
         composer_display_text("/ login npub1bob"),
         "/ login npub1bob"
     );
+    for input in [
+        "ordinary message",
+        "a message mentioning nsec1synthetic",
+        "/login \"npub1public",
+        "/login 'npub1public",
+        "/login npub1public \"",
+        "/login \"npub1public\"",
+        "/login 'npub1public'",
+        "/login \"",
+        "/login '",
+        "/\"login nsec1synthetic",
+    ] {
+        assert_eq!(composer_display_text(input), input);
+    }
 }
 
 #[test]
