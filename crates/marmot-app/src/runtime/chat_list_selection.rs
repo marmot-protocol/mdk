@@ -49,6 +49,12 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let app = self.accounts.app.clone();
         blocking_app_task(move || {
+            // The label may have been reused by another identity since it was
+            // resolved; never read the replacement account's chats.
+            if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
+            {
+                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+            }
             let storage = app.account_storage(&account.label)?.app_storage();
             // Legacy/imported accounts can lack base rows. Repair one bounded
             // batch here, as the window does; the rest is "not ready".
