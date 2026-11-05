@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Erase library-owned recovery-word buffers before freeing them. Host copies still need separate clearing;
+  earlier managed/FFI copies are outside this free's scope. No C layout or function signature changes.
+
 - Add a default-off `dev-device-groups` host capability and explicit experimental constructor. Ordinary constructors
   remain disabled; opt-in native/generated build outputs are isolated. Existing options layouts remain unchanged.
 

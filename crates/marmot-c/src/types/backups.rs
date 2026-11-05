@@ -7,10 +7,11 @@ use marmot_uniffi::conversions::{
 
 c_mirror! {
     /// Shown-once recovery words. Clear host copies and promptly free this
-    /// record; ordinary managed/FFI strings are not secure buffers.
+    /// record. Its returned word buffers are erased before release; host
+    /// copies and earlier managed/FFI copies are not erased by this free.
     MarmotRecoveryWords from RecoveryWordsFfi,
     free marmot_recovery_words_free {
-        str_vec words/words_len,
+        secret_str_vec words/words_len,
         vec confirm_positions/confirm_positions_len: u32,
     }
 }
@@ -73,6 +74,7 @@ mod tests {
                 .collect(),
             confirm_positions: vec![1, 12],
         }));
+        assert_eq!(audit::live_allocations(), before + 15);
         let status = boxed(MarmotBackupRestoreStatus::from(BackupRestoreStatusFfi {
             operation: Some("ab".repeat(16)),
             phase: BackupRestorePhaseFfi::Partial,
@@ -125,6 +127,16 @@ mod tests {
                 std::ffi::CStr::from_ptr(*(*words).words).to_str().unwrap(),
                 "abandon"
             );
+            // Inspect the actual erase owner's LIVE allocation, not freed
+            // memory. Root dispatch/deallocation is covered below and by the
+            // secret_str_vec field; this is not an allocator-time observer.
+            let first_word = std::mem::replace(&mut *(*words).words, std::ptr::null_mut());
+            let erased = crate::memory::take_erased_c_string(first_word)
+                .expect("the first returned word owns an allocation");
+            assert_eq!(erased.as_ptr(), first_word.cast::<u8>().cast_const());
+            assert_eq!(erased.len(), b"abandon\0".len());
+            assert_eq!(erased.as_slice(), &[0; 8]);
+            drop(erased);
             assert_eq!(
                 std::ffi::CStr::from_ptr((*status).operation)
                     .to_str()
@@ -148,6 +160,7 @@ mod tests {
                 "cd".repeat(32)
             );
             marmot_recovery_words_free(words);
+            marmot_recovery_words_free(std::ptr::null_mut());
             marmot_backup_restore_status_free(status);
             marmot_backup_history_availability_list_free(hints);
         }

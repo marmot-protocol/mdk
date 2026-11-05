@@ -34,6 +34,7 @@
 //! - `opt_rec f: M from F` — `Option<record>` → nullable owned `*mut M`.
 //! - `vec f/f_len: M from F` — `Vec<record>` → owned `(ptr, len)` pair.
 //! - `str_vec f/f_len` — `Vec<String>` → owned `(char**, len)` pair.
+//! - `secret_str_vec f/f_len` — same layout, erasing word buffers before free.
 //! - `json_str`, `json_opt_str`, `json_str_vec` — corresponding string forms
 //!   encoded as JSON string literals, preserving embedded NULs losslessly.
 //! - `bytes f/f_len` — `Vec<u8>` → owned `(u8*, len)` pair.
@@ -234,6 +235,19 @@ macro_rules! c_mirror {
                 $value.$f.into_iter().map(<$mir>::from).collect());}
             {$($names)* $f, $fl,}
             {$($fr)* crate::memory::free_vec($this.$f, $this.$fl);}
+            $($rest)*);
+    };
+
+    (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
+        {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
+        $(#[$fm:meta])* secret_str_vec $f:ident/$fl:ident, $($rest:tt)*
+    ) => {
+        c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
+            {$($sf)* $(#[$fm])* pub $f: *mut *mut ::std::ffi::c_char, pub $fl: usize,}
+            {$($lets)* let ($f, $fl) = crate::memory::owned_vec(
+                $value.$f.into_iter().map(crate::memory::owned_c_string).collect::<Vec<_>>());}
+            {$($names)* $f, $fl,}
+            {$($fr)* crate::memory::free_secret_c_strings($this.$f, $this.$fl);}
             $($rest)*);
     };
 
