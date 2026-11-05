@@ -576,7 +576,14 @@ impl TuiApp {
                 {
                     self.timeline_scroll.on_insert(index, self.timeline.len());
                 }
-            } else {
+            } else if self
+                .selected_account_row()
+                .map(|row| row.account_id.as_str())
+                == Some(account.as_str())
+                && self.selected_chat_row().map(|row| row.group_id.as_str()) == Some(group.as_str())
+            {
+                // A no-ID completion must not redirect a pending navigation or
+                // reload a different selected account through refresh_messages.
                 let _ = self.refresh_messages();
             }
         }
@@ -1423,7 +1430,7 @@ impl TuiApp {
             self.status = "type a query, then Enter to search".to_owned();
             return Ok(());
         }
-        self.searching_messages = Some(query.clone());
+        self.searching_messages = Some((account_id.clone(), group.clone(), query.clone()));
         self.status = "searching...".to_owned();
         self.effects.enqueue(Effect::MessageSearch {
             account: account_id,
@@ -1444,8 +1451,17 @@ impl TuiApp {
         query: String,
         result: Result<Vec<Value>, String>,
     ) {
-        if self.searching_messages.as_deref() != Some(query.as_str())
-            || self.messages_account_id.as_deref() != Some(account.as_str())
+        if !self.searching_messages.as_ref().is_some_and(
+            |(pending_account, pending_group, pending_query)| {
+                pending_account == &account && pending_group == &group && pending_query == &query
+            },
+        ) {
+            return;
+        }
+        // Settle this request even if the pane moved while it was running. A
+        // replacement request has a different owner and returned above.
+        self.searching_messages = None;
+        if self.messages_account_id.as_deref() != Some(account.as_str())
             || self.messages_group_id.as_deref() != Some(group.as_str())
             || self
                 .message_search
@@ -1453,9 +1469,11 @@ impl TuiApp {
                 .map(|view| view.group_id.as_str())
                 != Some(group.as_str())
         {
+            if self.status == "searching..." {
+                self.status.clear();
+            }
             return;
         }
-        self.searching_messages = None;
         let values = match result {
             Ok(values) => values,
             Err(err) => {
@@ -2369,9 +2387,10 @@ impl TuiApp {
     ) {
         match single_effect_value(result) {
             Ok(value) => {
-                // The list belongs to the selected account, even if its pane
-                // still shows an earlier account after a failed refresh. A read
-                // of another chat in this same account can still clear its row.
+                // Admit projections only while their account remains selected.
+                // A failed account refresh can leave the previous list visible;
+                // conservatively retain its badge until a successful refresh.
+                // A different chat in the same selected account still updates.
                 if self
                     .selected_account_row()
                     .map(|row| row.account_id.as_str())

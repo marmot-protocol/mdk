@@ -69,9 +69,10 @@ pub(crate) struct TuiApp {
     /// search is outstanding. A `UserSearch` result is folded only while its
     /// query still matches (the same stale guard as `loading_chat`).
     pub(crate) searching_users: Option<String>,
-    /// The query of the most recently requested message search, or `None`. A
-    /// `MessageSearch` result folds only while its query still matches.
-    pub(crate) searching_messages: Option<String>,
+    /// The account, group and query of the outstanding message search. Keeping
+    /// its owner lets a completion settle abandoned work without consuming a
+    /// replacement pane's identical query.
+    pub(crate) searching_messages: Option<(String, String, String)>,
     /// The group id of the group-detail load in flight, or `None`. A
     /// `LoadGroupDetail` result is folded only while it still matches.
     pub(crate) loading_group_detail: Option<String>,
