@@ -159,56 +159,54 @@ mod tests {
             Err(MarmotKitError::InvalidMediaReference { .. })
         ));
         assert!(
-            kit.read_attachment_asset("alice".into(), "bad".into(), 0, 1)
-                .await
-                .is_err()
+            matches!(kit.read_attachment_asset("alice".into(), "bad".into(), 0, 1)
+                .await, Err(MarmotKitError::Runtime { details }) if details.contains("invalid attachment asset reference"))
         );
         for (offset, limit) in [(0, 0), (0, 1_048_577), (u64::MAX, 1)] {
             assert!(
-                kit.read_attachment_asset("alice".into(), absent.clone(), offset, limit)
-                    .await
-                    .is_err()
+                matches!(kit.read_attachment_asset("alice".into(), absent.clone(), offset, limit)
+                    .await, Err(MarmotKitError::InvalidMediaReference { details }) if details == "invalid attachment byte range")
             );
         }
         assert!(
-            kit.attachment_local_assets("alice".into(), "ab".repeat(16), vec![target.clone(); 65])
-                .await
-                .is_err()
+            matches!(kit.attachment_local_assets("alice".into(), "ab".repeat(16), vec![target.clone(); 65])
+                .await, Err(MarmotKitError::InvalidMediaReference { details }) if details == "too many attachment asset lookups")
         );
-        assert!(
+        assert!(matches!(
             kit.attachment_local_assets("alice".into(), String::new(), vec![])
-                .await
-                .is_err()
-        );
+                .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
         assert!(
-            kit.attachment_local_assets("missing".into(), "ab".repeat(16), vec![])
-                .await
-                .is_err()
+            matches!(kit.attachment_local_assets("missing".into(), "ab".repeat(16), vec![])
+                .await, Err(MarmotKitError::UnknownAccount { account_ref }) if account_ref == "missing")
         );
         kit.shutdown_and_close().await.unwrap();
-        assert!(
+        assert!(matches!(
             kit.attachment_local_assets("alice".into(), "ab".repeat(16), vec![target])
-                .await
-                .is_err()
-        );
-        assert!(
+                .await,
+            Err(MarmotKitError::RuntimeStopping)
+        ));
+        assert!(matches!(
             kit.read_attachment_asset("alice".into(), absent, 0, 1)
-                .await
-                .is_err()
-        );
+                .await,
+            Err(MarmotKitError::RuntimeStopping)
+        ));
         assert!(
-            kit.open_attachment_handoff(
-                "alice".into(),
-                "ab".repeat(16),
-                AttachmentLocalTargetFfi {
-                    message_id_hex: "aa".repeat(32),
-                    source_message_id_hex: "bb".repeat(32),
-                    attachment_index: 0,
-                },
-                MediaFileTransferControlFfi::new(),
-            )
-            .await
-            .is_err(),
+            matches!(
+                kit.open_attachment_handoff(
+                    "alice".into(),
+                    "ab".repeat(16),
+                    AttachmentLocalTargetFfi {
+                        message_id_hex: "aa".repeat(32),
+                        source_message_id_hex: "bb".repeat(32),
+                        attachment_index: 0,
+                    },
+                    MediaFileTransferControlFfi::new(),
+                )
+                .await,
+                Err(MarmotKitError::RuntimeStopping)
+            ),
             "a closed runtime refuses new handoffs"
         );
     }

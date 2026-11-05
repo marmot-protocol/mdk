@@ -205,3 +205,237 @@ fn callback_proof_signer_error(error: MarmotKitError) -> String {
 fn signer_error(error: impl ToString) -> MarmotSignerError {
     MarmotSignerError::from(error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    use nostr::prelude::{
+        EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, Timestamp, ToBech32,
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    enum Reply {
+        Json(String),
+        Rejected,
+    }
+
+    struct Callback {
+        method: &'static str,
+        peer: Option<String>,
+        payload: String,
+        thread: ThreadId,
+    }
+
+    struct HostSigner {
+        public_key: Mutex<String>,
+        reply: Mutex<Reply>,
+        calls: Mutex<Vec<Callback>>,
+    }
+
+    impl HostSigner {
+        fn record(&self, method: &'static str, peer: Option<String>, payload: String) {
+            self.calls.lock().unwrap().push(Callback {
+                method,
+                peer,
+                payload,
+                thread: std::thread::current().id(),
+            });
+        }
+
+        fn crypt(
+            &self,
+            method: &'static str,
+            peer: String,
+            payload: String,
+        ) -> Result<String, MarmotKitError> {
+            self.record(method, Some(peer), payload);
+            match &*self.reply.lock().unwrap() {
+                Reply::Rejected => Err(MarmotKitError::ExternalSignerRejected),
+                Reply::Json(_) => Ok(format!("host-{method}-result")),
+            }
+        }
+
+        fn assert_call(
+            &self,
+            method: &str,
+            peer: Option<&str>,
+            payload: &str,
+            asynchronous_caller: Option<ThreadId>,
+        ) {
+            let calls = std::mem::take(&mut *self.calls.lock().unwrap());
+            assert_eq!(calls.len(), 1, "one foreign operation per request");
+            let call = &calls[0];
+            assert_eq!(call.method, method);
+            assert_eq!(call.peer.as_deref(), peer);
+            assert_eq!(call.payload, payload);
+            if let Some(caller) = asynchronous_caller {
+                assert_ne!(
+                    call.thread, caller,
+                    "blocking foreign callback ran on the polling worker"
+                );
+            }
+        }
+    }
+
+    impl ExternalAccountSignerFfi for HostSigner {
+        fn public_key(&self) -> Result<String, MarmotKitError> {
+            self.record("public_key", None, String::new());
+            Ok(self.public_key.lock().unwrap().clone())
+        }
+
+        fn sign_event(&self, unsigned_event_json: String) -> Result<String, MarmotKitError> {
+            self.record("sign_event", None, unsigned_event_json);
+            match self.reply.lock().unwrap().clone() {
+                Reply::Json(json) => Ok(json),
+                Reply::Rejected => Err(MarmotKitError::ExternalSignerRejected),
+            }
+        }
+
+        fn nip04_encrypt(&self, peer: String, content: String) -> Result<String, MarmotKitError> {
+            self.crypt("nip04_encrypt", peer, content)
+        }
+
+        fn nip04_decrypt(&self, peer: String, content: String) -> Result<String, MarmotKitError> {
+            self.crypt("nip04_decrypt", peer, content)
+        }
+
+        fn nip44_encrypt(&self, peer: String, content: String) -> Result<String, MarmotKitError> {
+            self.crypt("nip44_encrypt", peer, content)
+        }
+
+        fn nip44_decrypt(&self, peer: String, content: String) -> Result<String, MarmotKitError> {
+            self.crypt("nip44_decrypt", peer, content)
+        }
+    }
+
+    fn host(keys: &Keys, response: String) -> Arc<HostSigner> {
+        Arc::new(HostSigner {
+            public_key: Mutex::new(keys.public_key().to_bech32().unwrap()),
+            reply: Mutex::new(Reply::Json(response)),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreign_signer_preserves_host_arguments_json_and_interactive_rejection() {
+        let keys = Keys::parse(&"01".repeat(32)).unwrap();
+        let mut unsigned = EventBuilder::new(Kind::TextNote, "binding request")
+            .custom_created_at(Timestamp::from_secs(17))
+            .finalize_unsigned(keys.public_key());
+        unsigned.ensure_id();
+        let signed = unsigned.clone().finalize(&keys).unwrap();
+        let host = host(&keys, signed.as_json());
+        let adapter = ExternalAccountSignerAdapter::new(host.clone());
+        let caller = std::thread::current().id();
+
+        assert_eq!(adapter.get_public_key().await.unwrap(), keys.public_key());
+        host.assert_call("public_key", None, "", Some(caller));
+        *host.public_key.lock().unwrap() = keys.public_key().to_hex();
+        assert_eq!(adapter.get_public_key().await.unwrap(), keys.public_key());
+        host.assert_call("public_key", None, "", Some(caller));
+
+        let returned = adapter.sign_event(unsigned.clone()).await.unwrap();
+        assert_eq!(returned.id, signed.id);
+        assert_eq!(returned.pubkey, keys.public_key());
+        assert_eq!(returned.content, "binding request");
+        host.assert_call("sign_event", None, &unsigned.as_json(), Some(caller));
+
+        let mut no_id = unsigned.clone();
+        no_id.id = None;
+        assert_eq!(
+            adapter.sign_event(no_id).await.unwrap_err().to_string(),
+            "unsigned event id was not set"
+        );
+        assert!(
+            host.calls.lock().unwrap().is_empty(),
+            "invalid requests must not open a host prompt"
+        );
+
+        *host.reply.lock().unwrap() = Reply::Json("{".into());
+        let malformed = adapter.sign_event(unsigned.clone()).await.unwrap_err();
+        assert!(
+            malformed
+                .to_string()
+                .contains("EOF while parsing an object"),
+            "wrong malformed-JSON diagnostic: {malformed}"
+        );
+        host.assert_call("sign_event", None, &unsigned.as_json(), Some(caller));
+
+        *host.reply.lock().unwrap() = Reply::Rejected;
+        assert_eq!(
+            adapter
+                .sign_event(unsigned.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            marmot_app::EXTERNAL_SIGNER_REJECTED
+        );
+        host.assert_call("sign_event", None, &unsigned.as_json(), Some(caller));
+
+        *host.reply.lock().unwrap() = Reply::Json(signed.as_json());
+        let peer = Keys::parse(&"02".repeat(32)).unwrap().public_key();
+        let hex = peer.to_hex();
+        assert_eq!(
+            adapter.nip04_encrypt(&peer, "plain04").await.unwrap(),
+            "host-nip04_encrypt-result"
+        );
+        host.assert_call("nip04_encrypt", Some(&hex), "plain04", Some(caller));
+        assert_eq!(
+            adapter.nip04_decrypt(&peer, "cipher04").await.unwrap(),
+            "host-nip04_decrypt-result"
+        );
+        host.assert_call("nip04_decrypt", Some(&hex), "cipher04", Some(caller));
+        assert_eq!(
+            adapter.nip44_encrypt(&peer, "plain44").await.unwrap(),
+            "host-nip44_encrypt-result"
+        );
+        host.assert_call("nip44_encrypt", Some(&hex), "plain44", Some(caller));
+        assert_eq!(
+            adapter.nip44_decrypt(&peer, "cipher44").await.unwrap(),
+            "host-nip44_decrypt-result"
+        );
+        host.assert_call("nip44_decrypt", Some(&hex), "cipher44", Some(caller));
+        *host.reply.lock().unwrap() = Reply::Rejected;
+        assert_eq!(
+            adapter
+                .nip44_decrypt(&peer, "rejected44")
+                .await
+                .unwrap_err()
+                .to_string(),
+            marmot_app::EXTERNAL_SIGNER_REJECTED
+        );
+        host.assert_call("nip44_decrypt", Some(&hex), "rejected44", Some(caller));
+    }
+
+    #[test]
+    fn foreign_proof_signer_preserves_requested_json_signature_and_rejection() {
+        let keys = Keys::parse(&"03".repeat(32)).unwrap();
+        let request = AccountIdentityProofRequest {
+            account_identity: keys.public_key().to_bytes().to_vec(),
+            mls_signature_public_key: vec![7; 32],
+            ciphersuite: 1,
+            signature_scheme: 0x0807,
+            created_at: 1_700_000_000,
+            protocol_profile: cgka_traits::group::ProtocolProfile::Current,
+        };
+        let unsigned = request.proof_event().unwrap();
+        let signed = unsigned.clone().finalize(&keys).unwrap();
+        let host = host(&keys, signed.as_json());
+        let adapter = ExternalAccountSignerAdapter::new(host.clone());
+        assert_eq!(
+            adapter.sign_account_identity_proof(&request).unwrap(),
+            signed.sig.to_bytes()
+        );
+        host.assert_call("sign_event", None, &unsigned.as_json(), None);
+        *host.reply.lock().unwrap() = Reply::Rejected;
+        assert_eq!(
+            adapter.sign_account_identity_proof(&request).unwrap_err(),
+            marmot_app::EXTERNAL_SIGNER_REJECTED
+        );
+        host.assert_call("sign_event", None, &unsigned.as_json(), None);
+    }
+}

@@ -334,6 +334,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_onboarding_maps_approved_and_ready_attempts_to_signed_out_unit() {
+        // Persisted Approved/Ready checkpoints exercise cancellation, terminal
+        // observation and archiving here; they do not establish a live
+        // signed-in-to-signed-out account transition.
         let relay = MockRelay::run().await.expect("start mock relay");
         let relay_url = relay.url().await.to_string();
         let root = tempfile::tempdir().expect("tempdir");
@@ -428,7 +431,10 @@ mod tests {
             value["version"] = serde_json::json!(999)
         });
         assert!(kit.onboarding_recovery_required(id.clone()).unwrap());
-        assert!(kit.recover_onboarding(id.clone(), false).await.is_err());
+        assert!(matches!(
+            kit.recover_onboarding(id.clone(), false).await,
+            Err(MarmotKitError::OnboardingActionUnavailable)
+        ));
         let epoch = kit.recover_onboarding(id.clone(), true).await.unwrap();
         let fresh = kit
             .begin_onboarding(keys.secret_key().to_bech32().unwrap(), options(relay_url))
@@ -442,16 +448,16 @@ mod tests {
             .propose_onboarding_recommended_relays(id.clone(), OnboardingStepFfi::Relays)
             .await
             .unwrap();
-        assert!(
+        assert!(matches!(
             kit.approve_onboarding_repair(id.clone(), proposal.revision)
-                .await
-                .is_err()
-        );
-        assert!(
+                .await,
+            Err(MarmotKitError::OnboardingActionUnavailable)
+        ));
+        assert!(matches!(
             kit.approve_onboarding_repair_in_epoch(id.clone(), proposal.revision, "stale".into())
-                .await
-                .is_err()
-        );
+                .await,
+            Err(MarmotKitError::OnboardingActionUnavailable)
+        ));
         relay.shutdown();
         drop(relay);
         let approved = kit
