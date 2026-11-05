@@ -4,6 +4,11 @@ MarmotKit releases publish generated Swift/Kotlin APIs with matching native libr
 assets. Apple consumers use a binary-target XCFramework ZIP, generated Swift, and a separate SDK privacy manifest.
 Android consumers unpack the Kotlin and JNI bundle into their app build.
 
+Experimental device-group host test builds are separate from these published release/snapshot assets. Use the
+[explicit build flag and experimental constructor](README.md#experimental-device-group-test-builds), retain matching
+native and generated inputs, and take artifacts only from `output-dev-device-groups/`. Ordinary release
+automation and constructors do not opt in; never add policy-test timing overrides to a host artifact.
+
 ## Apple privacy migration
 
 **Migration required for releases built with this change.** Apple XCFrameworks now contain raw static-library slices,

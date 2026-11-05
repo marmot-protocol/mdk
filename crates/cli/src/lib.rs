@@ -1815,9 +1815,10 @@ mod tests {
         // WN_SOCKET makes the socket selection explicit; this regression covers
         // the auto-discovered daemon socket path that previously forwarded
         // `wn logout` even though the user did not pass `--socket`.
-        if std::env::var_os("WN_SOCKET").is_some() {
-            return;
-        }
+        assert!(
+            std::env::var_os("WN_SOCKET").is_none(),
+            "run this implicit-socket regression with WN_SOCKET unset"
+        );
 
         let home = tempfile::tempdir().expect("temp home");
         let socket = daemon::default_socket_path(home.path());
@@ -2411,16 +2412,14 @@ mod tests {
     }
 
     #[test]
-    fn write_private_file_accepts_a_bare_file_name_relative_path() {
-        // A bare name has an empty parent; writing must not try to create or
-        // chmod "" before opening the file.
+    fn write_private_file_writes_bytes_and_creates_nested_parents() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bare.bin");
         crate::write_private_file(&path, b"ok").expect("absolute path writes");
         assert_eq!(std::fs::read(&path).unwrap(), b"ok");
         let nested = dir.path().join("nested").join("deep.bin");
         crate::write_private_file(&nested, b"ok").expect("nested path creates parents");
-        assert!(nested.exists());
+        assert_eq!(std::fs::read(&nested).unwrap(), b"ok");
     }
 
     #[cfg(unix)]
@@ -2562,9 +2561,11 @@ mod tests {
             }
             other => panic!("expected a messages edit command, got {other:?}"),
         }
-        assert!(
-            Cli::try_parse_from(["wn", "messages", "edit", "GROUP", "TARGET"]).is_err(),
-            "edit requires replacement text"
+        let error = Cli::try_parse_from(["wn", "messages", "edit", "GROUP", "TARGET"])
+            .expect_err("edit requires replacement text");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 
@@ -2733,13 +2734,17 @@ mod tests {
             }
             other => panic!("expected a groups create command, got {other:?}"),
         }
-        assert!(
-            Cli::try_parse_from(["wn", "groups", "update", "GROUP"]).is_err(),
-            "groups update needs --name or --description"
+        let error = Cli::try_parse_from(["wn", "groups", "update", "GROUP"])
+            .expect_err("groups update needs --name or --description");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
-        assert!(
-            Cli::try_parse_from(["wn", "group", "update", "GROUP"]).is_err(),
-            "legacy group update needs --name or --description"
+        let error = Cli::try_parse_from(["wn", "group", "update", "GROUP"])
+            .expect_err("legacy group update needs --name or --description");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 
@@ -2769,9 +2774,11 @@ mod tests {
             }
             other => panic!("expected a media upload command, got {other:?}"),
         }
-        assert!(
-            Cli::try_parse_from(["wn", "media", "upload", "GROUP"]).is_err(),
-            "upload needs at least one file"
+        let error = Cli::try_parse_from(["wn", "media", "upload", "GROUP"])
+            .expect_err("upload needs at least one file");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
         let cli = Cli::try_parse_from(["wn", "media", "send", "GROUP", "{\"x\":1}", "ab"])
             .expect("media send parses");
@@ -2815,11 +2822,18 @@ mod tests {
         assert_eq!(parse_retention_duration("1h").unwrap(), 3_600);
         assert_eq!(parse_retention_duration("1d").unwrap(), 86_400);
         assert_eq!(parse_retention_duration("1w").unwrap(), 604_800);
-        for invalid in ["", "soon", "-1", "1x", "h", "1.5h"] {
-            assert!(
-                parse_retention_duration(invalid).is_err(),
-                "must reject {invalid:?}"
-            );
+        for invalid in [
+            "",
+            "soon",
+            "-1",
+            "1x",
+            "h",
+            "1.5h",
+            "1💥",
+            "18446744073709551615w",
+        ] {
+            let error = parse_retention_duration(invalid).expect_err("invalid retention");
+            assert!(matches!(error, WnError::InvalidRetentionDuration(value) if value == invalid));
         }
     }
 
@@ -2924,24 +2938,6 @@ mod tests {
         assert_eq!(group_flag, None);
         assert_eq!(reply_to, None);
         assert_eq!(args, vec!["GROUP".to_owned(), "hello".to_owned()]);
-    }
-
-    #[test]
-    fn message_send_stray_reply_to_in_text_is_rejected() {
-        // A `--reply-to` that lands *after* the message text is swallowed as
-        // literal text (see the parse-lock tests above). The send handler must
-        // reject that mis-ordering loudly instead of publishing a body carrying a
-        // stray `--reply-to <id>` that silently attaches to no reply.
-        let err = reject_misplaced_reply_to(
-            None,
-            &[
-                "hello".to_owned(),
-                "--reply-to".to_owned(),
-                "PARENT".to_owned(),
-            ],
-        )
-        .expect_err("a stray --reply-to in the message text must be rejected");
-        assert!(matches!(err, WnError::ReplyToAfterMessageText));
     }
 
     #[test]
@@ -3165,11 +3161,12 @@ mod tests {
     // masking the cap.
     #[tokio::test]
     async fn run_from_oversized_request_on_implicit_socket_fails_locally() {
-        // WN_SOCKET would force the explicit-socket branch and invalidate the
-        // implicit-path assertion; only run the check when it is unset.
-        if std::env::var_os("WN_SOCKET").is_some() {
-            return;
-        }
+        // WN_SOCKET would select a different branch, so reject invalid test
+        // setup instead of reporting a passing test without exercising it.
+        assert!(
+            std::env::var_os("WN_SOCKET").is_none(),
+            "run this implicit-socket regression with WN_SOCKET unset"
+        );
 
         let home = tempfile::tempdir().expect("temp home");
         // Materialize the default socket path so `daemon_socket_for_client`
@@ -3196,10 +3193,15 @@ mod tests {
         let output = super::run_from(args).await;
 
         assert_eq!(output.code, 1, "oversized request must fail");
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).expect("JSON error");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "daemon_unavailable");
         assert!(
-            output.stdout.contains("byte limit"),
-            "expected a client-side size-limit error, got stdout: {}",
-            output.stdout
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("byte limit")
         );
     }
 

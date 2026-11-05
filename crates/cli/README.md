@@ -743,8 +743,12 @@ wn daemon stop
   exit 0. If the daemon exits first, the command fails at once with JSON error code `daemon_start_failed`, the log
   path, and the log's last lines. If the daemon is still running but not ready after 60 seconds, the command stops it
   and fails with `daemon_start_timeout`. Ctrl-C stops it too and fails with `daemon_start_interrupted`. A failed start
-  never leaves a daemon running. The 60 seconds cover the runtime's 45-second budget for opening accounts, and macOS
-  can hold the first launch of a newly installed `wnd` for several seconds before it runs.
+  never leaves its newly spawned daemon running. The 60 seconds cover the runtime's 45-second budget for opening
+  accounts, and macOS can hold the first launch of a newly installed `wnd` for several seconds before it runs.
+- Before spawning, `wn daemon start` gives an existing socket up to 60 seconds to answer its readiness probe. If the
+  peer does not complete its reply, the command fails with `daemon_unavailable`, preserves that socket, and starts no
+  competing daemon. Direct `wnd` startup uses the same 60-second budget to check an existing socket and also preserves
+  it on timeout; only a refused connection or a missing socket is treated as stale.
 - `wn daemon stop` prints `daemon stopped` only once the daemon process has exited. The daemon answers the request
   before it shuts down its runtime, which can wait on relays; if it is still running 30 seconds later, the command
   fails with `daemon_stop_timeout` and names its pid, and leaves it to finish shutting down.

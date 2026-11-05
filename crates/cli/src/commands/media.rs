@@ -164,24 +164,7 @@ pub(crate) async fn media_command_with_runtime(
                 },
             )?;
             let media = media_records_json(messages, app.allow_loopback_blob_endpoints());
-            Ok(CommandOutput {
-                plain: if media.is_empty() {
-                    "no media".to_owned()
-                } else {
-                    media
-                        .iter()
-                        .filter_map(|item| item.get("file_name").and_then(Value::as_str))
-                        .map(terminal_safe_text)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                },
-                json: json!({
-                    "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex)?,
-                    "group_id": group_id_hex,
-                    "media": media,
-                }),
-            })
+            media_list_output(&account.account_id_hex, &group_id_hex, media)
         }
         MediaCommand::Send {
             group,
@@ -337,6 +320,31 @@ struct MediaReferenceInput {
 struct MediaLocatorInput {
     kind: String,
     value: String,
+}
+
+fn media_list_output(
+    account_id: &str,
+    group_id: &str,
+    media: Vec<Value>,
+) -> Result<CommandOutput, WnError> {
+    Ok(CommandOutput {
+        plain: if media.is_empty() {
+            "no media".to_owned()
+        } else {
+            media
+                .iter()
+                .filter_map(|item| item.get("file_name").and_then(Value::as_str))
+                .map(terminal_safe_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        json: json!({
+            "account_id": account_id,
+            "npub": npub_for_account_id(account_id)?,
+            "group_id": group_id,
+            "media": media,
+        }),
+    })
 }
 
 fn parse_media_reference_json(raw: &str) -> Result<MediaAttachmentReference, WnError> {
@@ -735,12 +743,19 @@ mod tests {
 
     #[test]
     fn media_list_plain_sanitizes_file_names_and_keeps_row_separators() {
-        let names = ["ok\u{1b}[2J.png".to_owned(), "also\nforged.png".to_owned()];
-        let plain = names
-            .iter()
-            .map(|name| crate::terminal_safe_text(name))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(plain, "ok[2J.png\nalsoforged.png");
+        let message = sample_message(vec![
+            valid_cli_imeta_tag(0x11, "ok\u{1b}[2J.png"),
+            valid_cli_imeta_tag(0x22, "also\nforged\u{202e}.png"),
+        ]);
+        let media = media_records_json(vec![message], false);
+        let output = media_list_output(&"11".repeat(32), &"22".repeat(16), media)
+            .expect("render media list");
+        assert_eq!(output.plain, "ok[2J.png\nalsoforged.png");
+        assert_eq!(output.json["media"].as_array().unwrap().len(), 2);
+        assert_eq!(output.json["media"][0]["file_name"], "ok\u{1b}[2J.png");
+        assert_eq!(
+            output.json["media"][1]["file_name"],
+            "also\nforged\u{202e}.png"
+        );
     }
 }

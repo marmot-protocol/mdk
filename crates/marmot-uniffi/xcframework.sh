@@ -14,11 +14,18 @@
 
 set -euo pipefail
 
+# Explicit opt-in only: keep ordinary release invocations and output untouched.
+DEV_DEVICE_GROUPS=0
+if [[ "${1:-}" == --dev-device-groups ]]; then
+  DEV_DEVICE_GROUPS=1
+  shift
+fi
+
 # Split phases let CI build native slices independently; no arguments retains
 # the complete local build used by downstream synchronization scripts.
 MODE="${1:-all}"
 case "$MODE" in
-  all|generate|assemble) [[ $# -le 1 ]] || { echo "usage: $0 [all|generate|assemble|native <aarch64-apple-ios|aarch64-apple-ios-sim>]" >&2; exit 2; } ;;
+  all|generate|assemble) [[ $# -le 1 ]] || { echo "usage: $0 [--dev-device-groups] [all|generate|assemble|native <aarch64-apple-ios|aarch64-apple-ios-sim>]" >&2; exit 2; } ;;
   native)
     [[ $# -eq 2 ]] || { echo "native requires one iOS target" >&2; exit 2; }
     case "$2" in
@@ -26,7 +33,7 @@ case "$MODE" in
       *) echo "unsupported iOS target: $2" >&2; exit 2 ;;
     esac
     ;;
-  *) echo "usage: $0 [all|generate|assemble|native <aarch64-apple-ios|aarch64-apple-ios-sim>]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--dev-device-groups] [all|generate|assemble|native <aarch64-apple-ios|aarch64-apple-ios-sim>]" >&2; exit 2 ;;
 esac
 
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
@@ -58,6 +65,12 @@ fi
 # cannot take xcframework-macos.sh's build/macos with it.
 BUILD_DIR="$CRATE_DIR/build/ios"
 OUT_DIR="$CRATE_DIR/output"
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  TARGET_DIR="$TARGET_DIR/dev-device-groups"
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  BUILD_DIR="$CRATE_DIR/build/dev-device-groups/ios"
+  OUT_DIR="$CRATE_DIR/output-dev-device-groups"
+fi
 
 # Set public first-party endpoint defaults for values compiled via option_env!.
 # Tokens remain host-app runtime configuration.
@@ -76,6 +89,12 @@ fi
 if [[ "${PRODUCT_ANALYTICS_EXPORT:-0}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
   FEATURE_ARGS+=(--features product-analytics-export)
   BINDGEN_FEATURES="${BINDGEN_FEATURES},product-analytics-export"
+fi
+
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  FEATURE_ARGS+=(--features dev-device-groups)
+  BINDGEN_FEATURES="${BINDGEN_FEATURES},dev-device-groups"
+  echo "==> Experimental device-group capability; ordinary constructors remain disabled"
 fi
 
 

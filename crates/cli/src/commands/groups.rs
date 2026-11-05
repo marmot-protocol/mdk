@@ -1888,6 +1888,85 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, 
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn invite_acceptance_waits_for_the_invite_on_the_same_runtime() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let alice_home = tempfile::tempdir().unwrap();
+        let bob_home = tempfile::tempdir().unwrap();
+        AccountHome::open(alice_home.path())
+            .create_account("alice")
+            .unwrap();
+        let bob_id = AccountHome::open(bob_home.path())
+            .create_account("bob")
+            .unwrap()
+            .account_id_hex;
+        let config =
+            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+        let alice_app =
+            MarmotApp::with_relay_and_config(alice_home.path(), url.clone(), config.clone());
+        let bob_app = MarmotApp::with_relay_and_config(bob_home.path(), url, config);
+        bob_app
+            .client("bob")
+            .await
+            .unwrap()
+            .publish_key_package()
+            .await
+            .unwrap();
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let group = alice
+            .create_group("invite still in flight", &[])
+            .await
+            .unwrap();
+        let bob = bob_app.runtime();
+        bob.start().await.unwrap();
+        // This real worker read drains startup before the acceptance request.
+        bob.key_package_maintenance_status("bob").await.unwrap();
+        assert!(
+            bob_app
+                .group("bob", &hex::encode(group.as_slice()))
+                .unwrap()
+                .is_none()
+        );
+
+        // With an already-ready worker, no other caller, and the current-thread
+        // executor, the worker lookup and empty-channel send cannot wait for
+        // another task. Remove cooperative budget yields too: this first poll
+        // enqueues acceptance before the FIFO read below.
+        let mut acceptance = Box::pin(tokio::task::unconstrained(
+            accept_group_invite_retrying_busy(&bob, "bob", &group),
+        ));
+        poll_fn(|cx| {
+            assert!(acceptance.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        bob.key_package_maintenance_status("bob").await.unwrap();
+        poll_fn(|cx| {
+            assert!(
+                acceptance.as_mut().poll(cx).is_pending(),
+                "a processed unknown invitation must stay retryable"
+            );
+            Poll::Ready(())
+        })
+        .await;
+
+        let sent = alice.invite_members(&group, &[&bob_id]).await.unwrap();
+        assert!(sent.published > 0);
+        let accepted = tokio::time::timeout(Duration::from_secs(15), acceptance).await;
+        bob.shutdown().await;
+        drop(alice);
+        relay.shutdown();
+        let accepted = accepted.expect("the published invite is accepted").unwrap();
+        assert_eq!(accepted.group_id_hex, hex::encode(group.as_slice()));
+        assert_eq!(accepted.profile.name, "invite still in flight");
+        assert!(!accepted.pending_confirmation);
+        assert!(!accepted.archived);
+    }
+
     #[test]
     fn only_welcome_launching_group_commands_require_a_drain() {
         assert!(group_command_requires_welcome_drain(
@@ -2028,6 +2107,161 @@ mod tests {
         );
         assert_eq!(listed.matches('\n').count(), 1);
         assert!(!listed.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn rejoin_consent_token_requires_exactly_32_bytes() {
+        assert_eq!(
+            parse_rejoin_token(&format!(" {} ", "Ab".repeat(32))).unwrap(),
+            vec![0xab; 32]
+        );
+        for invalid in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+        ] {
+            assert!(matches!(
+                parse_rejoin_token(&invalid),
+                Err(WnError::InvalidRejoinToken)
+            ));
+        }
+    }
+
+    fn sample_mls(group: &AppGroupRecord) -> AppGroupMlsState {
+        serde_json::from_value(json!({
+            "group_id_hex": group.group_id_hex,
+            "protocol_profile": "current",
+            "lifecycle_state": "stable",
+            "epoch": 3,
+            "member_count": 3,
+            "required_app_components": [],
+            "disbanding_enabled": false,
+        }))
+        .expect("sample MLS state")
+    }
+
+    #[test]
+    fn disband_status_distinguishes_unread_state_and_durable_request_precedence() {
+        let mut group = sample_group("state", None);
+        let mut mls = sample_mls(&group);
+        let unread = disband_status_json(&group, None);
+        assert_eq!(unread["state"], "unknown");
+        assert!(unread["disbanding_enabled"].is_null());
+        assert_eq!(
+            disband_status_json(&group, Some(&mls))["state"],
+            "not_enabled"
+        );
+        mls.disbanding_enabled = true;
+        assert_eq!(disband_status_json(&group, Some(&mls))["state"], "enabled");
+        mls.disbanding = true;
+        assert_eq!(
+            disband_status_json(&group, Some(&mls))["state"],
+            "converging"
+        );
+        mls.disband_request = Some(AppDisbandRequest::Pending {
+            requested_at_ms: 17,
+        });
+        let pending = disband_status_json(&group, Some(&mls));
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(
+            pending["disband_request"],
+            json!({"pending":{"requested_at_ms":17}})
+        );
+        group.disband_request = Some(AppDisbandRequest::Failed {
+            requested_at_ms: 11,
+            reason: marmot_app::AppDisbandFailureReason::NoLongerAdmin,
+        });
+        let failed = disband_status_json(&group, Some(&mls));
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(
+            failed["disband_request"],
+            json!({"failed":{"requested_at_ms":11,"reason":"no_longer_admin"}})
+        );
+        group.disbanded = true;
+        assert_eq!(
+            disband_status_json(&group, Some(&mls))["state"],
+            "disbanded"
+        );
+        group.disbanded = false;
+        mls.lifecycle_state = AppGroupLifecycleState::Disbanded;
+        let terminal = disband_status_json(&group, Some(&mls));
+        assert_eq!(terminal["state"], "disbanded");
+        assert_eq!(terminal["disbanded"], true);
+    }
+
+    #[test]
+    fn management_rows_apply_admin_membership_and_disband_guards() {
+        let me = "11".repeat(32);
+        let peer = "22".repeat(32);
+        let member = "33".repeat(32);
+        let mut group = sample_group("management", None);
+        group.admin_policy.admins = vec![me.clone(), peer.clone()];
+        let members = [&me, &peer, &member]
+            .into_iter()
+            .map(|id| AppGroupMemberRecord {
+                member_id_hex: id.clone(),
+                account: None,
+                local: id == &me,
+                device_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut mls = sample_mls(&group);
+        let state = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(state["is_last_admin"], false);
+        assert_eq!(
+            state["member_actions"],
+            json!([
+                {"member_id":me,"is_self":true,"is_admin":true,"can_remove":false,"can_promote":false,"can_demote":false},
+                {"member_id":peer,"is_self":false,"is_admin":true,"can_remove":true,"can_promote":false,"can_demote":true},
+                {"member_id":member,"is_self":false,"is_admin":false,"can_remove":true,"can_promote":true,"can_demote":false},
+            ])
+        );
+        let peer_view = group_management_json(&member, &group, &members, &mls);
+        assert_eq!(peer_view["can_leave"], true);
+        group.leave_requested_at_ms = Some(19);
+        let pending = group_management_json(&member, &group, &members, &mls);
+        assert_eq!(pending["can_leave"], false);
+        assert_eq!(pending["leave_request_pending"], true);
+        assert_eq!(pending["leave_requested_at_ms"], 19);
+        group.leave_requested_at_ms = None;
+        group.admin_policy.admins = vec![me.clone()];
+        let last = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(last["is_last_admin"], true);
+        assert_eq!(last["can_enable_disbanding"], true);
+        assert_eq!(last["can_disband"], false);
+        mls.disbanding_blockers = vec![peer.clone()];
+        let blocked = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(blocked["can_enable_disbanding"], false);
+        assert_eq!(blocked["disbanding_blockers"], json!([peer]));
+        mls.disbanding_enabled = true;
+        assert_eq!(
+            group_management_json(&me, &group, &members, &mls)["can_disband"],
+            true
+        );
+        for terminal in [false, true] {
+            mls.disbanding = !terminal;
+            mls.lifecycle_state = if terminal {
+                AppGroupLifecycleState::Disbanded
+            } else {
+                AppGroupLifecycleState::Stable
+            };
+            let state = group_management_json(&me, &group, &members, &mls);
+            for flag in [
+                "can_invite",
+                "can_leave",
+                "can_disband",
+                "can_enable_disbanding",
+                "requires_self_demote_before_leave",
+            ] {
+                assert_eq!(state[flag], false, "{flag}");
+            }
+            for row in state["member_actions"].as_array().unwrap() {
+                for flag in ["can_remove", "can_promote", "can_demote"] {
+                    assert_eq!(row[flag], false, "{flag}");
+                }
+            }
+        }
     }
 
     /// A device whose own leaf was removed gets no member affordances, even

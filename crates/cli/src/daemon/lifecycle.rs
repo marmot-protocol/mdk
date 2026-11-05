@@ -222,9 +222,9 @@ pub(crate) fn blocked_daemon_execute_command(
     }
 }
 
-/// How long `wn daemon start` waits for the `wnd` it spawned to answer while
-/// that daemon is still running. A warm start answers in well under a second,
-/// but the first launch of a freshly linked binary on a loaded macOS machine
+/// Readiness budget for an existing daemon socket and for the `wnd` that
+/// `wn daemon start` spawned while it is still running. A warm start answers
+/// in well under a second, but the first launch of a freshly linked binary on a loaded macOS machine
 /// waited up to 8.5 s before reaching `main` (mdk#2696), and the daemon answers
 /// only after its app runtime starts, which waits up to 45 s for each account
 /// to open (`APP_RUNTIME_ACCOUNT_READY_WAIT` in `marmot-app`). The cap covers
@@ -279,7 +279,22 @@ pub(crate) async fn start_daemon(
             );
         }
     };
-    if let Ok(status) = DaemonClient::new(socket).status().await {
+    let existing = match tokio::time::timeout(start_timeout, DaemonClient::new(socket).status())
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            return daemon_error(
+                cli.json,
+                "daemon_unavailable",
+                format!(
+                    "existing daemon socket at {} did not respond within {start_timeout:?}; the socket was left unchanged and no daemon was started",
+                    socket.display()
+                ),
+            );
+        }
+    };
+    if let Ok(status) = existing {
         return daemon_output(
             cli.json,
             "daemon already running",
@@ -859,7 +874,23 @@ pub(crate) async fn remove_stale_socket(
         return Ok(());
     }
 
-    match send_request(socket, &DaemonRequest::Ping).await {
+    // A connected peer may still be opening its accounts or may never finish
+    // its reply. Neither makes its socket stale or safe to replace.
+    let response = tokio::time::timeout(
+        DAEMON_START_TIMEOUT,
+        send_request(socket, &DaemonRequest::Ping),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "existing daemon socket at {} did not respond within {DAEMON_START_TIMEOUT:?}; the socket was left unchanged",
+                socket.display()
+            ),
+        )
+    })?;
+    match response {
         Ok(_) => Err(std::io::Error::new(
             ErrorKind::AddrInUse,
             format!("daemon already running at {}", socket.display()),
