@@ -5158,7 +5158,9 @@ fn media_images_downscale_with_a_smoothing_filter_not_nearest() {
     // Sparse nearest-neighbor samples alias this high-frequency image to black
     // or white. A smoothing filter preserves its average brightness in the
     // actual halfblock cells the production widget draws.
-    let checker = image::RgbImage::from_fn(80, 80, |x, y| {
+    // Match the halfblock picker's 10x20 font aspect so both half-cells sample
+    // image pixels rather than the background padding of an aspect-fit image.
+    let checker = image::RgbImage::from_fn(80, 160, |x, y| {
         let value = if (x + y) % 2 == 0 { 0 } else { 255 };
         image::Rgb([value; 3])
     });
@@ -5173,8 +5175,14 @@ fn media_images_downscale_with_a_smoothing_filter_not_nearest() {
         &mut protocol,
     );
     let cell = &buffer[(0, 0)];
-    assert_eq!(cell.symbol(), "▀");
-    for color in [cell.fg, cell.bg] {
+    // Equal upper/lower pixels legitimately render as a colored space; its
+    // foreground is invisible, so only the background is part of that sample.
+    let visible_colors = if cell.symbol() == " " {
+        vec![cell.bg]
+    } else {
+        vec![cell.fg, cell.bg]
+    };
+    for color in visible_colors {
         let Color::Rgb(red, green, blue) = color else {
             panic!("expected sampled RGB pixels, got {color:?}");
         };
