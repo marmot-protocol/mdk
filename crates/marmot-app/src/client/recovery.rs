@@ -3056,14 +3056,16 @@ mod tests {
         );
     }
 
-    /// The online loop seen on a Pixel 9a: a replay capture closed on every
-    /// attempt, granted alongside an incremental-history obligation whose
+    /// A replay capture the relay closes on every attempt (`RelayClosed`, an
+    /// unserved pass), granted alongside an incremental-history obligation whose
     /// comparison re-certifies each pass with one required relay not
     /// admitted. Before mdk#2923 that re-certification reset pacing on every
     /// pass, so the replay goal's six unserved passes, sized to span pacing
     /// up to its cap, came about 30 s apart. Now pacing grows across them.
     /// When the goal parks is unchanged: after six unserved passes, with or
-    /// without the fix.
+    /// without the fix. This is not the loop seen online on a Pixel 9a. There
+    /// the pass cutoff cancelled a slow relay's capture, which counts toward
+    /// no streak and parks only at the attempt cap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_closed_capture_beside_a_re_certified_scope_parks_on_paced_passes() {
         let dir = tempfile::tempdir().unwrap();
