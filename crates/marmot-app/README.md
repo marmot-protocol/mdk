@@ -511,6 +511,16 @@ it can't ask them in time, it tries to leave every chat itself, reporting any it
 sets `siblings_not_reached`: tell the user its other devices couldn't be asked, and that they may still list it until
 the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it.
 A device removed while it signs out finishes signing out and is not unlinked.
+Signing out targets this device only; it does not submit an account-wide Leave decision or automatically change the
+account's admin rights. An active-admin account cannot use SelfRemove, even when another admin exists, so an admin
+chat can retain this device's leaf. Changing that account's admin status separately affects all its devices; if it
+is the last active admin, another account must first become an active admin before it can leave.
+
+Sibling assistance applies only to chats that support same-account device removal and have the required tagged
+leaves. `groups_left_to_siblings` records a handoff, not confirmation that removal completed. The call still attempts
+local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
+`local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
+
 An account that cannot run a worker here (signed out, lacking its registered external signer, or excluded by
 onboarding's worker gate) signs out on its own immediately. Unfinished onboarding that runs setup traffic but still
 refuses ordinary commands also signs out on its own immediately. Temporary worker-start failures and unreadable
