@@ -1129,8 +1129,9 @@ pub struct WipeOutcome {
     #[serde(default)]
     pub groups_left_to_siblings: u32,
     /// This device could not ask its siblings to take it out within about
-    /// 30 seconds, so it tried to leave every chat itself; one it could not
-    /// leave is in `group_leave_failures`. Tell the user its other devices
+    /// 30 seconds, or the runtime began shutting down before it could ask.
+    /// It tried to leave every chat itself; one it could not leave is in
+    /// `group_leave_failures`. Tell the user its other devices
     /// could not be asked: they may still list it until the user removes it
     /// from one of them.
     #[serde(default)]
@@ -5059,9 +5060,14 @@ impl MarmotAppRuntime {
             return HashSet::new();
         }
         let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline) => {
+                outcome.siblings_not_reached = true;
+                HashSet::new()
+            }
+            () = wait_for_runtime_shutdown(&mut stopping) => {
                 outcome.siblings_not_reached = true;
                 HashSet::new()
             }
@@ -5073,29 +5079,31 @@ impl MarmotAppRuntime {
     /// `leaving` commit or finds this device signs out on its own; the
     /// caller's deadline ends it otherwise. A step that fails is taken
     /// again, so a passing error does not cost the sibling path. An account
-    /// whose worker cannot take commands at all, signed out without a wipe
-    /// or with no external signer registered, signs out on its own at once.
+    /// that reconciliation excludes from running a worker signs out on its
+    /// own at once, as does unfinished onboarding that permits setup traffic
+    /// but refuses ordinary commands. Other failures to acquire an eligible
+    /// worker retry within the same deadline as a failed step (mdk#2839).
     async fn ask_siblings_to_sign_out(&self, account_ref: &str) -> HashSet<String> {
-        if let Err(err) = self.accounts.worker_commands(account_ref).await {
-            tracing::info!(
-                target: "marmot_app::runtime",
-                method = "ask_siblings_to_sign_out",
-                error_kind = err.privacy_safe_kind(),
-                "no worker to take sign-out steps; signing out on its own"
-            );
-            return HashSet::new();
-        }
         let mut logged = false;
         loop {
-            match self
-                .accounts
-                .sign_out_through_siblings_step(account_ref)
-                .await
+            match async {
+                let account = self.accounts.resolve(account_ref)?;
+                if !self.accounts.account_worker_eligible(&account)? {
+                    return Ok(SiblingSignOut::OnItsOwn);
+                }
+                self.accounts
+                    .sign_out_through_siblings_step(account_ref)
+                    .await
+            }
+            .await
             {
                 Ok(SiblingSignOut::Confirmed { left_to_siblings }) => {
                     return left_to_siblings.into_iter().collect();
                 }
                 Ok(SiblingSignOut::OnItsOwn) => return HashSet::new(),
+                // A setup worker may be admitted while ordinary commands
+                // remain permanently gated on the user's onboarding action.
+                Err(AppError::OnboardingRequired) => return HashSet::new(),
                 Ok(SiblingSignOut::Pending) => {}
                 Err(err) => {
                     if !logged {
@@ -7660,6 +7668,21 @@ impl AccountManager {
         self.reconcile_locked_report_for(None).await
     }
 
+    /// Share worker admission with sibling sign-out, separately from ordinary
+    /// command permission. An eligible account's temporary startup failure
+    /// must not mean it has no worker.
+    fn account_worker_eligible(&self, account: &AccountSummary) -> Result<bool, AppError> {
+        if self.account_is_tearing_down(&account.account_id_hex)
+            || !(account.is_active_local_signing()
+                || (account.external_signing
+                    && !account.signed_out
+                    && self.app.has_external_signer(&account.account_id_hex)))
+        {
+            return Ok(false);
+        }
+        self.onboarding_worker_allowed(&account.label)
+    }
+
     async fn reconcile_locked_report_for(
         &self,
         target_account_id: Option<&str>,
@@ -7674,27 +7697,15 @@ impl AccountManager {
                 .account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| {
-                    !self.account_is_tearing_down(&account.account_id_hex)
-                        && (account.is_active_local_signing()
-                            || (account.external_signing
-                                && !account.signed_out
-                                && self.app.has_external_signer(&account.account_id_hex)))
-                })
-                .collect::<Vec<_>>();
-            let accounts = accounts
-                .into_iter()
-                .filter(
-                    |account| match self.onboarding_worker_allowed(&account.label) {
-                        Ok(allowed) => allowed,
-                        Err(error) => {
-                            tracing::warn!(target: "marmot_app::runtime", method = "reconcile",
+                .filter(|account| match self.account_worker_eligible(account) {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "reconcile",
                                 error_kind = error.privacy_safe_kind(),
                                 "gated one account with an unreadable onboarding checkpoint");
-                            false
-                        }
-                    },
-                )
+                        false
+                    }
+                })
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()

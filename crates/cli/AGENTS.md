@@ -106,6 +106,11 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - Do not fake image messages in the TUI by sending file paths, plaintext placeholders, or raw bytes through
   `message send`. Add an image command only when it uses the real encrypted-media/blob upload path.
 
+For TUI async tests, establish that the child entered and use an explicit release; assert that the UI action
+completed before release. A reload-negative test must make a wrong reload eligible and observable and wait for an
+effect-queue fence. Preserve any empty-chat-list dispatch edge before adding the matching chat row needed to expose
+a wrong reload.
+
 ## Key files
 
 - `src/lib.rs`: crate entrypoint and wiring. Owns `run_from`/`run_cli_local`, the `execute`/`execute_inner` command

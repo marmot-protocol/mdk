@@ -12,6 +12,7 @@
 //! - `(ptr, len)` array fields are owned by their parent struct.
 
 use std::ffi::{CString, c_char};
+use zeroize::Zeroize;
 
 /// Deep-free for a `#[repr(C)]` mirror type: release every owned pointer
 /// reachable from `self` without freeing `self`'s own storage.
@@ -118,6 +119,41 @@ pub(crate) unsafe fn free_c_string(ptr: *mut c_char) {
     }
     note_free();
     drop(unsafe { CString::from_raw(ptr) });
+}
+
+/// Retake an owned secret C string and erase its still-live allocation.
+/// The caller drops the returned byte buffer to release that allocation.
+/// NULL has no allocation to retake.
+///
+/// # Safety
+/// `ptr` must be NULL or an unmodified, unfreed pointer returned by
+/// [`owned_c_string`]. Ownership transfers to the returned buffer.
+pub(crate) unsafe fn take_erased_c_string(ptr: *mut c_char) -> Option<Vec<u8>> {
+    if ptr.is_null() {
+        return None;
+    }
+    // Recover the original allocation length before introducing interior NULs.
+    let mut bytes = unsafe { CString::from_raw(ptr) }.into_bytes_with_nul();
+    bytes.as_mut_slice().zeroize();
+    note_free();
+    Some(bytes)
+}
+
+/// Erase and free owned secret strings, then release their pointer array.
+///
+/// # Safety
+/// `(ptr, len)` must be an unmodified, unfreed pair produced by
+/// [`owned_vec`] from pointers produced by [`owned_c_string`].
+pub(crate) unsafe fn free_secret_c_strings(ptr: *mut *mut c_char, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    for word in unsafe { std::slice::from_raw_parts_mut(ptr, len) } {
+        let owned = std::mem::replace(word, std::ptr::null_mut());
+        drop(unsafe { take_erased_c_string(owned) });
+    }
+    // The consumed NULL slots have nothing left for ordinary string CFree.
+    unsafe { free_vec(ptr, len) };
 }
 
 /// Convert `Option<String>` into a nullable owned C string.

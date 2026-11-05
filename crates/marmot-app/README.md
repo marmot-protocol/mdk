@@ -508,6 +508,10 @@ it can't ask them in time, it tries to leave every chat itself, reporting any it
 sets `siblings_not_reached`: tell the user its other devices couldn't be asked, and that they may still list it until
 the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it.
 A device removed while it signs out finishes signing out and is not unlinked.
+An account that cannot run a worker here (signed out, lacking its registered external signer, or excluded by
+onboarding's worker gate) signs out on its own immediately. Unfinished onboarding that runs setup traffic but still
+refuses ordinary commands also signs out on its own immediately. Temporary worker-start failures and unreadable
+onboarding state retry within the same deadline. Runtime shutdown ends the sibling wait promptly and reports `siblings_not_reached`; any remaining cleanup failure is reported separately.
 
 ### Chat history from another device
 

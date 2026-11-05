@@ -52,3 +52,4 @@ marmot-app = { workspace = true, features = ["test-support"] }
 nostr-relay-builder.workspace = true
 nostr-sdk.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

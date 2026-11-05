@@ -455,7 +455,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `edit_device_roster_entry`, then, once it reads `leaving` on a stable device group with no convergence input left,
   name the chats a sibling takes this device out of (they require 0x800d, the own leaf's tag reads as its slot and
   another leaf's as a listed device that is not `leaving`). One deadline, polled first, bounds all of these steps,
-  the worker's start included: wait on nothing outside it and take no answer after it. Never leave the device group
+  the worker's start included: wait on nothing outside it and take no answer after it. Reconcile and stage 0 share
+  `account_worker_eligible` for admission. Admission is not ordinary command permission: unfinished onboarding may
+  run setup traffic but return typed `OnboardingRequired` to the sibling request. That refusal and excluded accounts
+  sign out on their own immediately; other eligible acquisition errors and unreadable eligibility retry within the
+  deadline. Runtime shutdown interrupts the wait and reports siblings
+  not reached, without waiting for the deadline (mdk#2839). Never leave the device group
   itself: the account is its only admin. A sibling decides a `leaving` device's removal (`decide_leaving_siblings`)
   only on a stable device group with no pending convergence input, after its own random delay of up to 30 seconds,
   and records it as a user's removal would be, so the removal path carries it out. A later link's Welcome into that
