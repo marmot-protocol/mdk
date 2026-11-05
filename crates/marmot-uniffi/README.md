@@ -1166,7 +1166,8 @@ ordinary chats, history, drafts and settings. It abandons old unfinished device 
 repairs no ordinary-chat membership. It is separate from sign-out, account removal and a Move. An already unlinked
 device cannot use it to bypass removal.
 
-The returned link snapshot has no trusted old copy to restore. Start a fresh code-comparison flow and confirm on both
+The returned link snapshot has no trusted old copy to restore. Reset does not publish a new KeyPackage. Use the normal
+`rotate_key_package(account_ref)` publication action, then start a fresh code-comparison flow and confirm on both
 devices; the fresh Welcome can join the same group id under the existing exact sender/group/KeyPackage checks. Reset
 alone does not guarantee admission: the approver may still list the slot or its old leaf, reject it, or be full.
 Existing duplicate, removal, capacity and authentication rules still apply. Cancellation or failure after reset can

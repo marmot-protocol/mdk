@@ -694,12 +694,15 @@ To deliberately discard only this device's local hidden device-group copy before
 
 ```sh
 wn --account "$ACCOUNT" devices link reset --confirm
+wn --account "$ACCOUNT" key-package rotate
+wn --account "$ACCOUNT" devices link start
 ```
 
 This keeps ordinary chats/history/drafts/settings, account credentials and the current slot; it abandons unfinished
 device sync and publishes no removal. It refuses active pairing/Move or unsettled native work (`device_group_busy`),
 possibly indefinitely. No trusted copy returns `no_device_group`. Reset does not guarantee fresh admission: an approver
-that still lists the slot/old leaf, rejects it or is full can refuse. Start ordinary fresh code pairing afterward;
+that still lists the slot/old leaf, rejects it or is full can refuse. Reset itself publishes no KeyPackage; use the
+existing rotation command before fresh code pairing, as above. A failed publication does not restore old trust;
 cancellation/failure can leave needs-link, and no old copy is restored. An already-confirmed fresh Welcome wait retains
 its normal restart behavior. Ordinary chat membership and missing-history repair remain separate. See the
 [shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing).
