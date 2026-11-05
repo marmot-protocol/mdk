@@ -82,6 +82,7 @@ async fn assert_restart_schedule(required_acks: usize) {
         .record_target_failure(
             1,
             TransportEndpointFailure {
+                size_class: None,
                 endpoint: secondary,
                 reason: "acknowledgement unknown".into(),
                 kind: TransportEndpointFailureKind::PossiblyExposed,

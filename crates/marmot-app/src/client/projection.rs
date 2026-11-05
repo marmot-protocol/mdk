@@ -1448,6 +1448,9 @@ fn build_group_system_projection(
 }
 
 fn read_marker_error_code(error: &AppError) -> &'static str {
+    if error.as_oversized_event().is_some() {
+        return "read_marker_failed:event_too_large";
+    }
     // An engine failure gets one code whichever lower-stack layer carried it
     // (mdk#2602).
     if let Some(engine) = error.as_engine_error() {
@@ -1518,6 +1521,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:agent_stream_invalid_candidate"
         }
         AppError::Publish(_) => "read_marker_failed:publish",
+        AppError::EventTooLarge { .. } => "read_marker_failed:event_too_large",
         AppError::MissingDefaultRelays => "read_marker_failed:missing_default_relays",
         AppError::MissingRelayLists(_) => "read_marker_failed:missing_relay_lists",
         AppError::FollowListUnavailable => "read_marker_failed:follow_list_unavailable",

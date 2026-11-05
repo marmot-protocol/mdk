@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::{
-    MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointAckKind,
+    EventSizeClass, MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointAckKind,
     TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
     TransportEndpointRejectionCategory, TransportPublishFailure,
     collapse_publish_failure_summaries,
@@ -4181,6 +4181,7 @@ impl NostrSdkRelayClient {
             // `finish_publish_outcome`), which upper layers may log. The
             // endpoint stays available on the structured failure record.
             Err(timed_out) => Err(TransportEndpointFailure {
+                size_class: None,
                 endpoint: transport_endpoint,
                 reason: if timed_out {
                     "connect relay timed out"
@@ -4201,10 +4202,20 @@ impl NostrSdkRelayClient {
         transport_endpoint: &TransportEndpoint,
     ) -> Result<Option<TransportEndpointAckKind>, TransportEndpointFailure> {
         let local_failure = |reason: &str| TransportEndpointFailure {
+            size_class: None,
             endpoint: transport_endpoint.clone(),
             reason: reason.to_owned(),
             kind: TransportEndpointFailureKind::PossiblyExposed,
             rejection_category: None,
+        };
+        // Only the event-correlated relay rejection path can attach this
+        // coarse measurement. Never parse an SDK socket/error Display here.
+        let relay_failure = |message: &str| {
+            let mut failure = relay_rejection_endpoint_failure(transport_endpoint.clone(), message);
+            if failure.rejection_category == Some(TransportEndpointRejectionCategory::TooLarge) {
+                failure.size_class = Some(EventSizeClass::of_bytes(event.as_json().len()));
+            }
+            failure
         };
         match &self.publication {
             SdkPublication::OpaqueClient => {
@@ -4218,10 +4229,7 @@ impl NostrSdkRelayClient {
                 if relay_endpoint_publish_accepted(output.success.contains_key(endpoint), remote) {
                     Ok(typed_relay_ack_kind(output.success.get(endpoint)))
                 } else if let Some(remote) = remote {
-                    Err(relay_rejection_endpoint_failure(
-                        transport_endpoint.clone(),
-                        remote,
-                    ))
+                    Err(relay_failure(remote))
                 } else {
                     Err(local_failure("relay did not acknowledge event"))
                 }
@@ -4253,10 +4261,7 @@ impl NostrSdkRelayClient {
                         if relay_endpoint_publish_accepted(false, Some(&message)) {
                             Ok(None)
                         } else {
-                            Err(relay_rejection_endpoint_failure(
-                                transport_endpoint.clone(),
-                                &message,
-                            ))
+                            Err(relay_failure(&message))
                         }
                     }
                     // Do not classify local transport errors by their Display,
@@ -4274,11 +4279,13 @@ impl NostrSdkRelayClient {
     ) -> Result<TransportEndpointReceipt, TransportEndpointFailure> {
         let transport_endpoint = TransportEndpoint(endpoint.to_string());
         let mut last_failure = TransportEndpointFailure {
+            size_class: None,
             endpoint: transport_endpoint.clone(),
             reason: "send event failed".to_owned(),
             kind: TransportEndpointFailureKind::PossiblyExposed,
             rejection_category: None,
         };
+        let mut earlier_ambiguous_attempt = false;
         for attempt in 1..=SDK_RELAY_PUBLISH_ATTEMPTS {
             match timeout(
                 SDK_RELAY_PUBLISH_WAIT,
@@ -4296,7 +4303,15 @@ impl NostrSdkRelayClient {
                         ack_kind,
                     });
                 }
-                Ok(Err(failure)) => {
+                Ok(Err(mut failure)) => {
+                    // The last explicit reply cannot prove what an earlier
+                    // unacknowledged attempt did. Withhold the endpoint proof
+                    // too, so durable fanout reconstruction stays conservative.
+                    if earlier_ambiguous_attempt {
+                        failure.size_class = None;
+                    }
+                    earlier_ambiguous_attempt |=
+                        failure.kind == TransportEndpointFailureKind::PossiblyExposed;
                     // An anonymous connection cannot satisfy NIP-42 by waiting
                     // and resending. Return its explicit rejection so the
                     // account owner can perform its authenticated fallback.
@@ -4323,6 +4338,8 @@ impl NostrSdkRelayClient {
                     last_failure = failure;
                 }
                 Err(_) => {
+                    earlier_ambiguous_attempt = true;
+                    last_failure.size_class = None;
                     last_failure.reason = "send event timed out".to_owned();
                     last_failure.kind = TransportEndpointFailureKind::PossiblyExposed;
                     last_failure.rejection_category = None;
@@ -4435,6 +4452,7 @@ impl NostrSdkRelayClient {
             failed,
             request.required_acks,
             timed_out,
+            &attempted_endpoints,
         )
     }
 
@@ -4858,6 +4876,7 @@ impl NostrSdkRelayClient {
                         return Ok(());
                     }
                     return Err(TransportEndpointFailure {
+                        size_class: None,
                         endpoint: transport_endpoint,
                         reason: "configure publish relay failed".to_owned(),
                         kind: TransportEndpointFailureKind::RetryableUnavailable,
@@ -4868,6 +4887,7 @@ impl NostrSdkRelayClient {
             }
             Ok(false) => Ok(()),
             Err(_) => Err(TransportEndpointFailure {
+                size_class: None,
                 endpoint: transport_endpoint,
                 reason: "add publish relay failed".to_owned(),
                 kind: TransportEndpointFailureKind::RetryableUnavailable,
@@ -4975,6 +4995,7 @@ impl NostrSdkRelayClient {
         failed: Vec<TransportEndpointFailure>,
         required_acks: usize,
         timed_out: bool,
+        targets: &[TransportEndpoint],
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         let required_acks = required_acks.max(1);
         if accepted.len() >= required_acks {
@@ -5004,10 +5025,15 @@ impl NostrSdkRelayClient {
         if failed.is_empty() {
             Err(TransportAdapterError::Publish(reason))
         } else {
-            Err(TransportAdapterError::PublishEndpoints(
-                TransportPublishFailure::with_endpoint_failures(reason, failed)
-                    .with_message_id(message_id),
-            ))
+            let size_class = if !timed_out && accepted.is_empty() {
+                EventSizeClass::from_rejected_targets(targets, &failed)
+            } else {
+                None
+            };
+            let mut failure = TransportPublishFailure::with_endpoint_failures(reason, failed)
+                .with_message_id(message_id);
+            failure.event_size_class = size_class;
+            Err(TransportAdapterError::PublishEndpoints(failure))
         }
     }
 }
@@ -5763,6 +5789,7 @@ fn append_missing_publish_failures(
             continue;
         }
         failed.push(TransportEndpointFailure {
+            size_class: None,
             endpoint: endpoint.clone(),
             reason: "publish acknowledgement unknown".into(),
             kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -6056,7 +6083,16 @@ fn relay_rejection_endpoint_failure(
     relay_message: &str,
 ) -> TransportEndpointFailure {
     if let Some(prefix) = nostr::message::MachineReadablePrefix::parse(relay_message) {
-        let category = map_relay_rejection_category(prefix);
+        // Source-verified strfry OK:false grammar, not a generic Invalid
+        // substring heuristic. The count is ignored: measure our own Event.
+        let category = if relay_message
+            .strip_prefix("invalid: event too large: ")
+            .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+        {
+            TransportEndpointRejectionCategory::TooLarge
+        } else {
+            map_relay_rejection_category(prefix)
+        };
         // nostr-sdk also uses the generic `error:` prefix for local SDK/send
         // failures. Without a typed SDK distinction, that prefix is not proof
         // of a relay-level OK:false rejection and must remain conservative.
@@ -6073,7 +6109,8 @@ fn relay_rejection_endpoint_failure(
             | TransportEndpointRejectionCategory::Blocked
             | TransportEndpointRejectionCategory::Invalid
             | TransportEndpointRejectionCategory::Unsupported
-            | TransportEndpointRejectionCategory::Restricted => {
+            | TransportEndpointRejectionCategory::Restricted
+            | TransportEndpointRejectionCategory::TooLarge => {
                 TransportEndpointFailureKind::TerminalRejected
             }
         };
@@ -6083,6 +6120,7 @@ fn relay_rejection_endpoint_failure(
             format!("relay rejected event ({})", category.as_str())
         };
         return TransportEndpointFailure {
+            size_class: None,
             endpoint,
             reason,
             kind,
@@ -6096,6 +6134,7 @@ fn relay_rejection_endpoint_failure(
     // the durable send queued and retry it after connectivity returns. Keep
     // the SDK string out of the reason: it can contain relay URLs.
     TransportEndpointFailure {
+        size_class: None,
         endpoint,
         reason: "publish acknowledgement unknown".to_owned(),
         kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -10391,6 +10430,30 @@ mod tests {
     fn relay_rejection_endpoint_failure_maps_machine_readable_prefix() {
         for (message, category, kind, summary) in [
             (
+                "invalid: event too large: 999999999",
+                TransportEndpointRejectionCategory::TooLarge,
+                TransportEndpointFailureKind::TerminalRejected,
+                "relay rejected event (too-large)",
+            ),
+            (
+                "invalid: payload too large: secret https://evil.example",
+                TransportEndpointRejectionCategory::Invalid,
+                TransportEndpointFailureKind::TerminalRejected,
+                "relay rejected event (invalid)",
+            ),
+            (
+                "invalid: event too large: 42 extra",
+                TransportEndpointRejectionCategory::Invalid,
+                TransportEndpointFailureKind::TerminalRejected,
+                "relay rejected event (invalid)",
+            ),
+            (
+                "invalid: event too large: ",
+                TransportEndpointRejectionCategory::Invalid,
+                TransportEndpointFailureKind::TerminalRejected,
+                "relay rejected event (invalid)",
+            ),
+            (
                 "auth-required: account secret at https://evil.example/auth",
                 TransportEndpointRejectionCategory::AuthRequired,
                 TransportEndpointFailureKind::RetryableUnavailable,
@@ -10443,6 +10506,74 @@ mod tests {
     }
 
     #[test]
+    fn strong_size_failure_requires_every_target_and_no_acceptance() {
+        let a = TransportEndpoint("wss://first.example".into());
+        let b = TransportEndpoint("wss://second.example".into());
+        let targets = vec![a.clone(), b.clone()];
+        let failure = |endpoint: &TransportEndpoint| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "relay rejected event (too-large)".into(),
+            kind: TransportEndpointFailureKind::TerminalRejected,
+            rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+            size_class: Some(EventSizeClass::Under64Kib),
+        };
+        let classify = |accepted, failed, timed_out| {
+            let error = NostrSdkRelayClient::finish_publish_outcome(
+                cgka_traits::MessageId::new(vec![3; 32]),
+                accepted,
+                failed,
+                2,
+                timed_out,
+                &targets,
+            )
+            .expect_err("below the two-target acknowledgement goal");
+            let TransportAdapterError::PublishEndpoints(failure) = error else {
+                panic!("expected endpoint failure")
+            };
+            failure.event_size_class
+        };
+        assert_eq!(
+            classify(vec![], vec![failure(&a), failure(&b)], false),
+            Some(EventSizeClass::Under64Kib)
+        );
+        assert_eq!(
+            classify(vec![], vec![failure(&a)], false),
+            None,
+            "partial report is no proof"
+        );
+        let mut offline = failure(&b);
+        offline.kind = TransportEndpointFailureKind::RetryableUnavailable;
+        offline.rejection_category = None;
+        offline.size_class = None;
+        assert_eq!(classify(vec![], vec![failure(&a), offline], false), None);
+        let mut unknown_size = failure(&b);
+        unknown_size.size_class = None;
+        assert_eq!(
+            classify(vec![], vec![failure(&a), unknown_size], false),
+            None
+        );
+        let mut other_bucket = failure(&b);
+        other_bucket.size_class = Some(EventSizeClass::Over4Mib);
+        assert_eq!(
+            classify(vec![], vec![failure(&a), other_bucket], false),
+            None
+        );
+        assert_eq!(classify(vec![], vec![failure(&a), failure(&b)], true), None);
+        assert_eq!(
+            classify(
+                vec![TransportEndpointReceipt {
+                    endpoint: a,
+                    accepted_at: None,
+                    ack_kind: None
+                }],
+                vec![failure(&b)],
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn finish_publish_outcome_collapses_duplicate_relay_rejection_summaries() {
         let message_id = cgka_traits::MessageId::new(vec![0xD6; 32]);
         let err = NostrSdkRelayClient::finish_publish_outcome(
@@ -10450,12 +10581,14 @@ mod tests {
             Vec::new(),
             vec![
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://first.example".into()),
                     reason: "relay rejected event (blocked)".to_owned(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
                     rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
                 },
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://second.example".into()),
                     reason: "relay rejected event (blocked)".to_owned(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
@@ -10464,6 +10597,7 @@ mod tests {
             ],
             1,
             false,
+            &[],
         )
         .unwrap_err();
 
@@ -10494,6 +10628,7 @@ mod tests {
             ack_kind: None,
         }];
         let failed = vec![TransportEndpointFailure {
+            size_class: None,
             endpoint: TransportEndpoint("wss://bad.example".into()),
             reason: "relay rejected event (auth-required)".to_owned(),
             kind: TransportEndpointFailureKind::TerminalRejected,
@@ -10505,6 +10640,7 @@ mod tests {
             failed.clone(),
             1,
             false,
+            &[],
         )
         .unwrap();
         assert_eq!(outcome.failed, failed);
@@ -10557,6 +10693,7 @@ mod tests {
             cgka_traits::MessageId::new(vec![0xD4; 32]),
             Vec::new(),
             vec![TransportEndpointFailure {
+                size_class: None,
                 endpoint: endpoint.clone(),
                 reason: "connect relay failed".to_owned(),
                 kind: TransportEndpointFailureKind::RetryableUnavailable,
@@ -10564,6 +10701,7 @@ mod tests {
             }],
             1,
             false,
+            &[],
         )
         .unwrap_err();
 
@@ -10581,6 +10719,7 @@ mod tests {
             Vec::new(),
             0,
             false,
+            &[],
         );
         assert!(matches!(
             no_acceptance,
@@ -10598,6 +10737,7 @@ mod tests {
             Vec::new(),
             0,
             false,
+            &[],
         )
         .unwrap();
         assert_eq!(outcome.accepted, accepted);
@@ -12055,6 +12195,10 @@ mod tests {
     async fn terminal_rejection_is_not_retried() {
         for (reason, category) in [
             (
+                "invalid: event too large: 999999999",
+                TransportEndpointRejectionCategory::TooLarge,
+            ),
+            (
                 "blocked: not allowed",
                 TransportEndpointRejectionCategory::Blocked,
             ),
@@ -12090,11 +12234,51 @@ mod tests {
             );
             assert_eq!(failures[0].rejection_category, Some(category));
             assert_eq!(
+                failures[0].size_class,
+                (category == TransportEndpointRejectionCategory::TooLarge)
+                    .then_some(EventSizeClass::Under64Kib),
+                "bucket the locally signed event, never the relay's count"
+            );
+            assert_eq!(
                 attempts.lock().await.len(),
                 1,
                 "{reason} is final; resending only repeats it"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_size_reply_after_an_ambiguous_attempt_keeps_size_proof_unknown() {
+        let (endpoint, _, attempts) = counting_publish_relay_rejection_sequence(
+            Arc::new(AtomicBool::new(true)),
+            vec![
+                "error: publication unavailable",
+                "invalid: event too large: 999999999",
+            ],
+        )
+        .await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let error = sdk
+            .publish_event(
+                std::slice::from_ref(&endpoint),
+                &signed_group_event_dto(),
+                1,
+            )
+            .await
+            .expect_err("both attempts were refused");
+        let TransportAdapterError::PublishEndpoints(failure) = error else {
+            panic!("expected endpoint report")
+        };
+        assert_eq!(attempts.lock().await.len(), 2);
+        assert_eq!(
+            failure.endpoint_failures[0].rejection_category,
+            Some(TransportEndpointRejectionCategory::TooLarge)
+        );
+        assert_eq!(
+            failure.endpoint_failures[0].size_class, None,
+            "the retained endpoint cannot recreate a strong size proof after reopen"
+        );
+        assert_eq!(failure.event_size_class, None);
     }
 
     #[tokio::test]
@@ -13481,6 +13665,19 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<tokio::time::Instant>>>,
     ) {
+        counting_publish_relay_rejection_sequence(limited, vec![reason]).await
+    }
+
+    async fn counting_publish_relay_rejection_sequence(
+        limited: Arc<AtomicBool>,
+        reasons: Vec<&'static str>,
+    ) -> (
+        TransportEndpoint,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<tokio::time::Instant>>>,
+    ) {
+        assert!(!reasons.is_empty());
+        let reasons = Arc::new(reasons);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -13492,6 +13689,7 @@ mod tests {
                 let connections = server_connections.clone();
                 let attempts = server_attempts.clone();
                 let limited = limited.clone();
+                let reasons = reasons.clone();
                 tokio::spawn(async move {
                     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -13507,9 +13705,18 @@ mod tests {
                         if value[0] != "EVENT" {
                             continue;
                         }
-                        attempts.lock().await.push(tokio::time::Instant::now());
+                        let index = {
+                            let mut attempts = attempts.lock().await;
+                            let index = attempts.len();
+                            attempts.push(tokio::time::Instant::now());
+                            index
+                        };
                         let rejected = limited.load(Ordering::Relaxed);
-                        let reason = if rejected { reason } else { "" };
+                        let reason = if rejected {
+                            reasons[index.min(reasons.len() - 1)]
+                        } else {
+                            ""
+                        };
                         let response = serde_json::json!(["OK", value[1]["id"], !rejected, reason]);
                         if socket.send(response.to_string().into()).await.is_err() {
                             return;

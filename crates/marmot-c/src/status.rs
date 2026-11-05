@@ -197,6 +197,9 @@ pub enum MarmotStatus {
     GroupRecoveryUnsettled = 117,
     /// Restart the authenticated recovery challenge; do not retry the grant.
     GroupRecoverySourceMismatch = 118,
+    /// Every current publish target conclusively refused the event for size.
+    /// Detail contains only the artifact kind and coarse locally measured size.
+    EventTooLarge = 119,
 }
 
 thread_local! {
@@ -318,6 +321,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::FollowListTooLarge => MarmotStatus::FollowListTooLarge,
+        MarmotKitError::EventTooLarge { .. } => MarmotStatus::EventTooLarge,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
         MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
@@ -401,6 +405,10 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::EventTooLarge {
+                artifact: marmot_uniffi::OversizedArtifactFfi::Other,
+                size_class: marmot_uniffi::EventSizeClassFfi::Under64Kib,
+            },
             MarmotKitError::AttachmentModeRequired,
             MarmotKitError::AttachmentAccountSignedOut,
             MarmotKitError::ConversationWindowMessageNotRetained,
@@ -633,7 +641,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            109,
+            110,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -715,6 +723,13 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
             80
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::EventTooLarge {
+                artifact: marmot_uniffi::OversizedArtifactFfi::Other,
+                size_class: marmot_uniffi::EventSizeClassFfi::Under64Kib,
+            }) as i32,
+            119
         );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {

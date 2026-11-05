@@ -964,6 +964,9 @@ pub enum TransportEndpointRejectionCategory {
     Unsupported,
     AuthRequired,
     Restricted,
+    /// An explicit, event-correlated refusal because the event is too large.
+    /// This category does not discover an endpoint's configured size limit.
+    TooLarge,
 }
 
 impl TransportEndpointRejectionCategory {
@@ -978,7 +981,101 @@ impl TransportEndpointRejectionCategory {
             Self::Unsupported => "unsupported",
             Self::AuthRequired => "auth-required",
             Self::Restricted => "restricted",
+            Self::TooLarge => "too-large",
         }
+    }
+}
+
+/// Coarse serialized-event sizes for a proven size refusal, never a relay limit.
+/// Exact byte counts must not cross the host diagnostic boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSizeClass {
+    #[serde(rename = "under_64_kib")]
+    Under64Kib,
+    #[serde(rename = "from_64_to_128_kib")]
+    From64To128Kib,
+    #[serde(rename = "from_128_to_256_kib")]
+    From128To256Kib,
+    #[serde(rename = "from_256_to_512_kib")]
+    From256To512Kib,
+    #[serde(rename = "from_512_kib_to_1_mib")]
+    From512KibTo1Mib,
+    #[serde(rename = "from_1_to_2_mib")]
+    From1To2Mib,
+    #[serde(rename = "from_2_to_4_mib")]
+    From2To4Mib,
+    #[serde(rename = "over_4_mib")]
+    Over4Mib,
+}
+
+impl EventSizeClass {
+    /// Serialized event JSON bytes, excluding transport framing. All upper
+    /// bounds are exclusive except 4 MiB, which belongs to `From2To4Mib`.
+    pub fn of_bytes(bytes: usize) -> Self {
+        match bytes {
+            n if n < 64 * 1024 => Self::Under64Kib,
+            n if n < 128 * 1024 => Self::From64To128Kib,
+            n if n < 256 * 1024 => Self::From128To256Kib,
+            n if n < 512 * 1024 => Self::From256To512Kib,
+            n if n < 1024 * 1024 => Self::From512KibTo1Mib,
+            n if n < 2 * 1024 * 1024 => Self::From1To2Mib,
+            n if n <= 4 * 1024 * 1024 => Self::From2To4Mib,
+            _ => Self::Over4Mib,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Under64Kib => "under_64_kib",
+            Self::From64To128Kib => "from_64_to_128_kib",
+            Self::From128To256Kib => "from_128_to_256_kib",
+            Self::From256To512Kib => "from_256_to_512_kib",
+            Self::From512KibTo1Mib => "from_512_kib_to_1_mib",
+            Self::From1To2Mib => "from_1_to_2_mib",
+            Self::From2To4Mib => "from_2_to_4_mib",
+            Self::Over4Mib => "over_4_mib",
+        }
+    }
+
+    /// Classify a complete, distinct target set's explicit size refusals.
+    /// The caller must separately establish zero acceptance and no earlier
+    /// ambiguous exposure; a partial failure list cannot establish this proof.
+    pub fn from_rejected_targets(
+        targets: &[TransportEndpoint],
+        failures: &[TransportEndpointFailure],
+    ) -> Option<Self> {
+        if targets.is_empty() || failures.len() != targets.len() {
+            return None;
+        }
+        let mut class = None;
+        for (index, target) in targets.iter().enumerate() {
+            if targets[..index].contains(target) {
+                return None;
+            }
+            let mut matching = failures
+                .iter()
+                .filter(|failure| &failure.endpoint == target);
+            let failure = matching.next()?;
+            if matching.next().is_some()
+                || failure.kind != TransportEndpointFailureKind::TerminalRejected
+                || failure.rejection_category != Some(TransportEndpointRejectionCategory::TooLarge)
+            {
+                return None;
+            }
+            let next = failure.size_class?;
+            if class.is_some_and(|previous| previous != next) {
+                return None;
+            }
+            class = Some(next);
+        }
+        class
+    }
+}
+
+impl fmt::Display for EventSizeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1015,6 +1112,10 @@ pub struct TransportEndpointFailure {
     pub kind: TransportEndpointFailureKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection_category: Option<TransportEndpointRejectionCategory>,
+    /// Locally measured signed event JSON size, only for a proven size refusal.
+    /// Absent on old persisted failures and when the size cannot be established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_class: Option<EventSizeClass>,
 }
 
 /// Publish failure surfaced by transport adapters.
@@ -1031,6 +1132,11 @@ pub struct TransportPublishFailure {
     pub message_id: Option<MessageId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoint_failures: Vec<TransportEndpointFailure>,
+    /// Strong aggregate proof: every distinct requested endpoint conclusively
+    /// refused this same event for size, with no acceptance or unresolved target.
+    /// Never infer this from a partial endpoint-failure list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_size_class: Option<EventSizeClass>,
 }
 
 impl TransportPublishFailure {
@@ -1042,6 +1148,7 @@ impl TransportPublishFailure {
             summary: summary.into(),
             message_id: None,
             endpoint_failures,
+            event_size_class: None,
         }
     }
 
@@ -1395,6 +1502,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "publish acknowledgement unknown".into(),
                     kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -1437,6 +1545,7 @@ mod tests {
                 .record_target_failure(
                     index,
                     TransportEndpointFailure {
+                        size_class: None,
                         endpoint: fanout.request().target.endpoints()[index].clone(),
                         reason: "scripted failure".into(),
                         kind,
@@ -1481,6 +1590,7 @@ mod tests {
                 .record_target_failure(
                     index,
                     TransportEndpointFailure {
+                        size_class: None,
                         endpoint: fanout.request().target.endpoints()[index].clone(),
                         reason: "scripted failure".into(),
                         kind,
@@ -1525,6 +1635,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "acknowledgement unknown".into(),
                     kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -1537,6 +1648,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "later explicit rejection".into(),
                     kind: TransportEndpointFailureKind::TerminalRejected,
@@ -1567,6 +1679,7 @@ mod tests {
             .record_target_failure(
                 0,
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint("wss://one.example".into()),
                     reason: "connection failed before send".into(),
                     kind: TransportEndpointFailureKind::NotExposed,
@@ -1581,6 +1694,7 @@ mod tests {
                 .record_target_failure(
                     0,
                     TransportEndpointFailure {
+                        size_class: None,
                         endpoint: TransportEndpoint("wss://one.example".into()),
                         reason: "late acknowledgement unknown".into(),
                         kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -1594,6 +1708,31 @@ mod tests {
     }
 
     #[test]
+    fn coarse_event_size_classes_have_fixed_boundaries() {
+        for (bytes, expected) in [
+            (0, EventSizeClass::Under64Kib),
+            (65535, EventSizeClass::Under64Kib),
+            (65536, EventSizeClass::From64To128Kib),
+            (131071, EventSizeClass::From64To128Kib),
+            (131072, EventSizeClass::From128To256Kib),
+            (262144, EventSizeClass::From256To512Kib),
+            (524288, EventSizeClass::From512KibTo1Mib),
+            (1048576, EventSizeClass::From1To2Mib),
+            (2097152, EventSizeClass::From2To4Mib),
+            (4194304, EventSizeClass::From2To4Mib),
+            (4194305, EventSizeClass::Over4Mib),
+        ] {
+            assert_eq!(EventSizeClass::of_bytes(bytes), expected);
+            let encoded = serde_json::to_value(expected).unwrap();
+            assert_eq!(encoded, serde_json::json!(expected.as_str()));
+            assert_eq!(
+                serde_json::from_value::<EventSizeClass>(encoded).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn endpoint_failure_without_kind_deserializes_conservatively() {
         let failure: TransportEndpointFailure = serde_json::from_value(serde_json::json!({
             "endpoint": "wss://relay.example",
@@ -1602,6 +1741,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(failure.kind, TransportEndpointFailureKind::PossiblyExposed);
+        assert_eq!(
+            failure.size_class, None,
+            "old rows have no local size proof"
+        );
     }
 
     #[test]
@@ -1728,6 +1871,7 @@ mod tests {
                 .collect(),
             failed: (0..failed)
                 .map(|i| TransportEndpointFailure {
+                    size_class: None,
                     endpoint: TransportEndpoint(format!("wss://failed-{i}.example")),
                     reason: "unreachable".into(),
                     kind: TransportEndpointFailureKind::RetryableUnavailable,

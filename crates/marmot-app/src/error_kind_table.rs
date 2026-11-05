@@ -275,6 +275,49 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
             read_marker_code: "read_marker_failed:session",
         },
     );
+    let size_refusal = || {
+        let mut failure = cgka_traits::TransportPublishFailure::with_endpoint_failures(
+            "relay rejected event (too-large)",
+            vec![cgka_traits::TransportEndpointFailure {
+                endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+                reason: "relay rejected event (too-large)".into(),
+                kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: Some(cgka_traits::TransportEndpointRejectionCategory::TooLarge),
+                size_class: Some(crate::EventSizeClass::Under64Kib),
+            }],
+        );
+        failure.event_size_class = Some(crate::EventSizeClass::Under64Kib);
+        TransportAdapterError::PublishEndpoints(failure)
+    };
+    let expected = HostAnswers {
+        marmotkit: "EventTooLarge",
+        c_status: "EventTooLarge",
+        cli_code: "event_too_large",
+        sync_class: SyncErrorClass::Protocol,
+        privacy_kind: "event_too_large",
+        wipe_reason: "relay publish failed",
+        read_marker_code: "read_marker_failed:event_too_large",
+    };
+    for (name, error) in [
+        (
+            "size refusal, converted transport",
+            AppError::from(size_refusal()),
+        ),
+        (
+            "size refusal, direct transport wrapper",
+            AppError::Transport(size_refusal()),
+        ),
+        (
+            "size refusal, converted account",
+            AppError::from(AccountError::from(size_refusal())),
+        ),
+        (
+            "size refusal, account transport wrapper",
+            AppError::Account(AccountError::from(size_refusal())),
+        ),
+    ] {
+        rows.push(row(name.into(), error, expected));
+    }
     rows
 }
 

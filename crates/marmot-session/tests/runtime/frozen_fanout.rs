@@ -625,6 +625,17 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 
 #[tokio::test]
 async fn terminal_application_fanout_replays_failure_after_restart_before_delete() {
+    // None is also the real SDK shape after an earlier ambiguous attempt:
+    // reopening must never infer a size proof from the payload or last category.
+    for (category, size_class) in [
+        (TransportEndpointRejectionCategory::Blocked, None),
+        (TransportEndpointRejectionCategory::TooLarge, None),
+        (
+            TransportEndpointRejectionCategory::TooLarge,
+            Some(cgka_traits::EventSizeClass::Under64Kib),
+        ),
+    ] {
+
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot terminal app fanout key").unwrap();
     let database = dir.path().join("alice.sqlite");
@@ -688,10 +699,11 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
         .record_target_failure(
             0,
             TransportEndpointFailure {
+                size_class,
                 endpoint: endpoint.clone(),
                 reason: "relay rejected the event".into(),
                 kind: TransportEndpointFailureKind::TerminalRejected,
-                rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                rejection_category: Some(category),
             },
         )
         .unwrap();
@@ -720,8 +732,12 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
         [marmot_session::PublishFailure {
             message_id: failed_message_id,
             reason,
+            oversized,
         }] if failed_message_id == &message_id
             && reason == "insufficient publish acknowledgements"
+            && *oversized == size_class.map(|size_class| marmot_session::OversizedEvent {
+                artifact: marmot_session::OversizedArtifact::ApplicationMessage, size_class,
+            })
     ));
     assert!(matches!(
         effects.failed_app_messages.as_slice(),
@@ -736,6 +752,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
             && reason == "insufficient publish acknowledgements"
     ));
     assert!(runtime.session().outbound_fanouts().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -945,6 +962,7 @@ async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
         .record_target_failure(
             0,
             TransportEndpointFailure {
+                size_class: None,
                 endpoint: endpoint.clone(),
                 reason: "acknowledgement unknown".into(),
                 kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -1125,6 +1143,7 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         .record_target_failure(
             1,
             TransportEndpointFailure {
+                size_class: None,
                 endpoint: secondary.clone(),
                 reason: "acknowledgement unknown".into(),
                 kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -1149,6 +1168,7 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
             .record_target_failure(
                 1,
                 TransportEndpointFailure {
+                    size_class: None,
                     endpoint: secondary.clone(),
                     reason: "second required acknowledgement unknown".into(),
                     kind: TransportEndpointFailureKind::PossiblyExposed,

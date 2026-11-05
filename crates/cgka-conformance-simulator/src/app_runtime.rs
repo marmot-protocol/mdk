@@ -3016,6 +3016,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
         AppError::InvalidSticker(_) => "invalid_sticker",
         AppError::StickerNotFound => "sticker_not_found",
+        AppError::EventTooLarge { .. } => "event_too_large",
         AppError::StickerRelay(_) => "sticker_relay",
         AppError::StickerImport(_) => "sticker_import",
         AppError::StickerExternalSignerImportUnsupported => {
@@ -3093,6 +3094,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RelayDirectory(_)
         | AppError::DirectoryLookupIncomplete(_)
         | AppError::Publish(_)
+        | AppError::EventTooLarge { .. }
         | AppError::BlobStore(_)
         | AppError::AgentStreamSendFailed(_)
         | AppError::MediaUploadTimedOut
@@ -3496,6 +3498,10 @@ mod tests {
         assert_eq!(denied.code, "not_group_admin");
         assert!(!denied.message.contains(marker));
         for failure in [
+            AppError::EventTooLarge {
+                artifact: marmot_app::OversizedArtifact::Commit,
+                size_class: marmot_app::EventSizeClass::Under64Kib,
+            },
             AppError::RuntimeBusy,
             AppError::FullHistoryRepairIncomplete {
                 reason: marmot_app::FullHistoryRepairIncompleteReason::CoverageUnproven,

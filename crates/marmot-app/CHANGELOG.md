@@ -21,6 +21,9 @@
   in-place recovery pass releases.
   `account_recovery_status` now reports groups catching up, and audit `unproven_history` rows are now produced.
 
+- Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
+  class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
+
 - Skip history-upload endpoints the existing Blossom transport cannot contact, including public HTTP URLs.
   With no eligible endpoint, history follows the existing no-server outcome instead of staying owed until expiry;
   eligible servers retain ordered fallback and retry. Endpoint wire validity and backup selection are unchanged.
@@ -771,6 +774,13 @@
   failed key write remains retryable after restart instead of acknowledging
   unusable artwork. Authenticated carried keys and retained canonical source
   exporters replace stale same-epoch cache entries (mdk#2840).
+
+- Imported-history device names recover after a failed roster read or local
+  label write without opening Devices or waiting for another roster change
+  (mdk#2832). Existing worker seams and pre-import reads retry only until
+  labels are stored; success refreshes timeline rows through the existing linked-device notice,
+  and a changed latest-import answer uses the existing history-import notice.
+  No API, wire or database migration is required.
 
 - A device cleans up after every device its device group's roster stops
   listing, not only one whose `removed` record it still reads (mdk#2761):

@@ -8855,23 +8855,24 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call, after giving storage the roster's
-/// device names again; one `KeyPackageRefreshOverdueChanged` for a
+/// device-group trust since the last call, or a completed deferred device-name
+/// refresh, after giving storage the roster's device names again; one
+/// `KeyPackageRefreshOverdueChanged` for a
 /// maintenance pass that changed the overdue-refresh answer; one
 /// `DeviceLinkChanged` for a change in linking a new device; and one
 /// `ChatHistoryImportsChanged` for a change in chat history from another
 /// device. Both the account-level seam and the applied-summary seam drain
 /// them, so startup, reconnect, maintenance and every command and delivery
 /// announce them.
-fn publish_device_group_changes(
+pub(crate) fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
 ) {
     client.publish_backup_restore_availability();
+    client.refresh_device_labels(client.linked_devices_changed);
     if client.take_linked_devices_changed() {
-        client.refresh_device_labels();
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
