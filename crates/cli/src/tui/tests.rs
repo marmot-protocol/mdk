@@ -348,7 +348,13 @@ fn slash_command_parser_handles_account_onboarding_commands() {
             ))
         );
     }
+    // Display masking may ignore leading whitespace; submission retains it.
+    assert_eq!(
+        parse_slash_command("/login \" nsec1synthetic\""),
+        Ok(SlashCommand::AccountAddPublic(" nsec1synthetic".to_owned()))
+    );
     for input in [
+        "/login \" nsec1synthetic",
         "/login \"nsec1synthetic",
         "/login 'nsec1synthetic",
         "/login nsec1synthetic \"",
@@ -1994,6 +2000,11 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
     // #2955: masking must work before an opening quote has been closed.
     // These sentinel values are deliberately not valid credentials.
     for input in [
+        "/login \" nsec1synthetic",
+        "/login '\tNsEc1synthetic",
+        "/login \" \nNSEC1synthetic",
+        "/login \" nsec1synthetic\"",
+        "/login ' nsec1synthetic '",
         "/login \"nsec1synthetic",
         "/login 'nsec1synthetic",
         " /\tlogin  \"NsEc1synthetic",
@@ -2044,6 +2055,9 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
         "a message mentioning nsec1synthetic",
         "/login \"npub1public",
         "/login 'npub1public",
+        "/login \" npub1public",
+        "/login '\tnpub1public",
+        "/login \" npub1public \"",
         "/login npub1public \"",
         "/login \"npub1public\"",
         "/login 'npub1public'",
