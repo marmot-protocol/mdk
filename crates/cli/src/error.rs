@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::{
-    AccountRelayListStatus, AppError, DirectoryError, MissingKeyPackageReason, MissingRelayListKind,
+    AccountError, AccountRelayListStatus, AppError, DirectoryError, MissingKeyPackageReason,
+    MissingRelayListKind,
 };
 use serde_json::{Value, json};
 
@@ -663,6 +664,12 @@ fn app_error_json(err: &AppError) -> Value {
     }
     match err {
         AppError::AccountHome(err) => account_home_error_json(err),
+        // Keep the existing JSON code while the Rust caller-contract error
+        // stops masquerading as an engine serialization failure.
+        AppError::Account(AccountError::InvalidDeviceRosterEdit) => json!({
+            "code": "engine_error",
+            "message": err.to_string(),
+        }),
         AppError::MissingKeyPackage { account, reason } => json!({
             "code": "missing_key_package",
             "message": err.to_string(),

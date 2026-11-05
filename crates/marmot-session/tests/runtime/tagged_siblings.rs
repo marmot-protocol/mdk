@@ -268,9 +268,8 @@ mod tagged_siblings {
     /// metadata writes on that same id.
     #[tokio::test]
     async fn roster_user_edits_require_fresh_ids_and_non_user_edits_preserve_them() {
-        use cgka_traits::EngineError;
         use cgka_traits::app_components::decode_device_roster_v1;
-        use marmot_session::DeviceRosterEdit;
+        use marmot_session::{AccountError, DeviceRosterEdit};
 
         fn read(device: &Device, group: &GroupId, slot: &DeviceSlotId) -> DeviceEntryV1 {
             let bytes = device
@@ -312,14 +311,7 @@ mod tagged_siblings {
                 })
                 .await
                 .unwrap_err();
-            let expected = if invalid == 2 {
-                "non-user device edit must preserve rename id"
-            } else {
-                "device label or settings edit needs a fresh rename id"
-            };
-            assert!(
-                matches!(error.as_engine_error(), Some(EngineError::Serialize(reason)) if reason == expected)
-            );
+            assert!(matches!(error, AccountError::InvalidDeviceRosterEdit));
             assert_eq!(group_messages(&phone).len(), published);
             assert_eq!(read(&phone, &group, &slot), current);
         }

@@ -9,6 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Keep `code=engine_error` for invalid device-roster marker edits while core reports its corrected caller-error
+  type and fixed diagnostic text. JSON fields and command behavior are unchanged.
+
 - Use core Leave capability hints in group-management output and allow TUI Leave confirmation for admins. Core
   automatically demotes an eligible nonlast admin account and refuses the last active admin before departure effects;
   manual self-demotion remains supported. `can_leave` is false for unaccepted invitations and unrecoverable groups.

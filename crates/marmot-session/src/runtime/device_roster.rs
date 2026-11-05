@@ -117,6 +117,8 @@ where
     /// holding back from commits. A label/settings change must supply a
     /// present fresh rename id; other edits preserve the id. The caller's
     /// supplied id is preserved for its write-ahead recovery record (D86).
+    /// Invalid marker changes return [`AccountError::InvalidDeviceRosterEdit`]
+    /// before staging or publication.
     pub async fn edit_device_roster_entry(
         &mut self,
         group_id: &GroupId,
@@ -141,14 +143,10 @@ where
         if user_values_changed
             && (entry.rename_id.is_none() || entry.rename_id == current.rename_id)
         {
-            return Err(AccountError::Engine(EngineError::Serialize(
-                "device label or settings edit needs a fresh rename id".into(),
-            )));
+            return Err(AccountError::InvalidDeviceRosterEdit);
         }
         if !user_values_changed && entry.rename_id != current.rename_id {
-            return Err(AccountError::Engine(EngineError::Serialize(
-                "non-user device edit must preserve rename id".into(),
-            )));
+            return Err(AccountError::InvalidDeviceRosterEdit);
         }
         if entry == current {
             return Ok(DeviceRosterEdit::Unchanged);

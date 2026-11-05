@@ -30,6 +30,10 @@ pub enum AccountError {
     /// KeyPackage yet, so it may not reach the slot (mdk#2628 3.4).
     #[error("key package is not announced in the device group yet")]
     KeyPackageAnnouncementPending,
+    /// A roster label/settings edit needs a fresh rename id; a non-user edit
+    /// must preserve the existing id. Rejected before staging or publication.
+    #[error("device roster edit violates the user-edit marker contract")]
+    InvalidDeviceRosterEdit,
     #[error("transport delivery was addressed to a different account")]
     WrongAccountDelivery,
 }

@@ -431,6 +431,14 @@ jobs:
       - name: Experimental device-group C host tests
         run: cargo test -p marmot-c --test secret_store_client --features dev-device-groups --locked
 
+      - name: Experimental UniFFI backup forwarding
+        run: |
+          set -euo pipefail
+          test_name='commands::backups::tests::backup_bindings_preserve_the_gate_tokens_and_observer_lifetime'
+          cargo test -p marmot-uniffi --lib --features dev-device-groups --locked "$test_name" -- --exact --list \
+            | grep -Fx "${test_name}: test"
+          cargo test -p marmot-uniffi --lib --features dev-device-groups --locked "$test_name" -- --exact
+
       - name: Compile and run debug C smoke test (gcc)
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
