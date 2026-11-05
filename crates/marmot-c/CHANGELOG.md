@@ -144,8 +144,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
   the roster of the device group this device trusts, this device first
   (mdk#2628 item 3.1). The new `MARMOT_EVENT_LINKED_DEVICES_CHANGED` event says
-  to re-read it. The list is empty in release builds until the roster's spec
-  lands. Use matching regenerated headers and libraries.
+  to re-read it. The list is empty without explicit device-group capability and runtime intent. Use matching regenerated headers and libraries.
 - `MarmotLinkedDevice` adds `has_last_active_at`/`last_active_at`, when a
   heartbeat last showed a sibling running, and `inactive`, this device's own
   judgement 30 days after the later of that and when it first found the
@@ -162,8 +161,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_unrecognized_sign_in_list_free`) (mdk#2628 item 3.2).
   `marmot_answer_sign_in` answers one with a `MarmotSignInResponse`
   discriminant. The new `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED` event says
-  to re-read the list. It is empty in release builds until the roster's spec
-  lands. Use matching regenerated headers and libraries.
+  to re-read the list. It is empty without explicit device-group capability and runtime intent. Use matching regenerated headers and libraries.
 - `marmot_compromise_warning` writes the account's open compromise warning on
   this device as a `MarmotCompromiseWarningItemList` (free with
   `marmot_compromise_warning_item_list_free`) (mdk#2628 item 3.7a), whose

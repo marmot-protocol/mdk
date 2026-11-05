@@ -40,8 +40,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of
   the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in a verified link
   and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
-  the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
-  the pairing spec merges.
+  the `unreleased-device-pairing` feature. Explicit `dev-device-groups` builds enable that capability; ordinary
+  builds keep it off.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
   check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
   many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
@@ -56,9 +56,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   device keyed by its KeyPackage slot, with the key it signs its device tags with, or a rejected slot (a removed
   device's keeps that key). Every member applies the operations to the parent's roster. A roster may
   hold at most 20 devices, no two with one tag signature key. The device that creates a device group draws its tag key
-  at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
-  create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
-  format.
+  at random. The adopted component is advertisable in `dev-device-groups` or policy-test builds. Ordinary builds
+  cannot create or join a device group and treat roster bytes in other groups as unknown data.
 - The engine reads device tags (`marmot.member.device-tag.v1`, 0x800f; mdk#2628 item 3.1d), which say which of an
   account's devices holds a leaf. A tag names the device's roster slot, is signed with that device's tag signature key
   and is sealed under the roster's tag key, so only the account's devices can read it. Read against the roster, a leaf
@@ -108,7 +107,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   whose slot a complete check finds empty stays listed as no longer signed in. A publication that is only stale never
   signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
   with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
-  UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+  UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. The app path requires explicit device-group capability and runtime intent.
 - Hosts can warn the user that someone holding the account's signing key published where the account's devices did
   not (mdk#2628 items 3.7a and 3.7b). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected
   sign-in, from this device or its device group's roster, and each KeyPackage this device found in its own slot that it
@@ -118,7 +117,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   recreated: the roster dropped its rejected KeyPackages (mdk#2628 D74), which changed its encoding. `dismiss_compromise_warning` marks them seen on this device only;
   a rejection branch selection drops and restores stays seen, and rejections already in a device's first roster count
   as seen. `start_fresh` lets the user start a device without the devices its first check found, answering each Not
-  now without rejecting it, and `started_fresh` says whether it did. Only test-policy builds run any of it.
+  now without rejecting it, and `started_fresh` says whether it did. The app path requires explicit device-group capability and runtime intent.
 - Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
   device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
@@ -132,7 +131,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   same-account Add or an Add proposal from the store never adds a device there. A link is never queued: while the
   device group is settling, it is refused with the new `EngineError::LinkDeviceUnsettled`, and the caller retries
   while the new device still waits for its Welcome. The device gets its Welcome as an invited device does. Like the
-  roster, it is reachable only in test-policy builds until the device group's spec is adopted.
+  roster, it requires explicit device-group build capability (`dev-device-groups` or policy tests).
 - New `SendIntent::ReplaceDeviceEntry` replaces one entry of a device group's roster while the roster still holds
   the entry it was computed from (mdk#2628). The engine compares the entry each time it prepares the commit: on the
   send after it settles convergence input, when a queued copy drains, and when it re-issues the edit after a lost
@@ -154,7 +153,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no
   Welcome. It removes the leaf only if the group's tree still has it, and the roster entry either way. Like a link,
   it is never queued: while the device group is settling it is refused with `EngineError::LinkDeviceUnsettled`, and
-  the caller retries. It is reachable only in test-policy builds.
+  the caller retries. It requires explicit device-group build capability (`dev-device-groups` or policy tests).
 - A retained outbound Welcome now keeps the `KeyPackageRef` of the KeyPackage it answers, staged, owed and after
   withdrawal (mdk#2628 item 3.3b). `Engine::sent_welcomes_for_key_package`, forwarded as the runtime's
   `welcomes_for_key_package`, finds a group's Welcomes by it, so a device link that failed can withdraw its Welcome
@@ -174,21 +173,20 @@ versioning through the workspace version in the root `Cargo.toml`.
   and reports an expired Welcome as settled. The runtime's publish check refuses an expired Welcome on every path,
   and a batch checks the deadline again before each relay attempt. With that, a failed link whose Welcome may still be
   deliverable is recorded only after its Welcome is withdrawn, and opening a client no longer withdraws link Welcomes
-  first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable only in
-  test-policy builds.
+  first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable with explicit device-group build capability (`dev-device-groups` or policy tests).
 - A device group is now founded with only its creator in the roster, plus its sign-in rejections, and the founding
   Add sets the linked device's entry as every later link's Commit does (mdk#2628 item 3.3b, D41).
   `create_group_with_chosen_id_and_audit_context` takes that roster update, in the engine, the session and the runtime.
   A device group founded with a member adds exactly one KeyPackage, the update sets that device's entry for a slot the
   founding roster does not list, announcing the KeyPackage, and the founding Add meets the same sender rule as a link.
   Any other device-group founding with a member, and a roster update on any other create, is refused and leaves no
-  group state behind. Reachable only in test-policy builds.
+  group state behind. Reachable with explicit device-group build capability (`dev-device-groups` or policy tests).
 - A new device now joins its device group only through a Welcome that adds it by the KeyPackage the link confirmed
   (mdk#2628 item 3.3b, D41). `DeviceGroupWelcomeExpectation` gains `key_package_ref`, which `marmot-app` fills from
   the confirmed link; an expectation stored without it matches no Welcome. While an expectation is unexpired, the
   engine also refuses, with `EngineError::UnexpectedDeviceGroupWelcome`, a Welcome into any other group, a chat
   included, that adds this device by that KeyPackage, so no other invite uses it up. Storage providers implement the
-  new `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable only in test-policy builds.
+  new `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable with explicit device-group build capability (`dev-device-groups` or policy tests).
 - The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
   IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
@@ -301,7 +299,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   copy, and the engine refused the next link's Welcome into a forgotten group unless the existing device's clock dated
   it after the forget. A Welcome a device link waits for is now held to that link alone: the existing device's leaf key
   and the confirmed `KeyPackageRef`. A new device no longer starts a link by a KeyPackage it already joined by; it
-  waits for the replacement's publication. Only test-policy builds reach device groups.
+  waits for the replacement's publication. The app path requires explicit device-group capability and runtime intent.
 - `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
   device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
   the TUI could mark it "(you)" and refuse to leave as the group's only admin.
