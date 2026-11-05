@@ -22,6 +22,11 @@
   in-place recovery pass releases.
   `account_recovery_status` now reports groups catching up, and audit `unproven_history` rows are now produced.
 
+- Add select all for the native chat-list views (mdk#2983): `MarmotAppRuntime::chat_list_ids(account, view)` returns
+  every chat ID in the view in display order, beyond any open window, and `revalidate_chat_list_ids(account, view,
+  ids)` returns the still-eligible subset in the caller's order, never adding chats. Pending base rows return
+  `ChatPresentationNotReady` instead of a partial list. No schema or wire change.
+
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
   class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
 

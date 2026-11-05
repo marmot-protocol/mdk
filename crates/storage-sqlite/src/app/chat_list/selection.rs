@@ -1,36 +1,13 @@
-//! Complete, compact selection intent, independent of the live display window.
+//! Complete chat-list ID sets, independent of the live display window.
 use super::{ChatListView, pages};
-use crate::base::connection::{CachedSql, ConnectionLifetime};
+use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
 use rusqlite::Connection;
 use std::collections::HashSet;
 
-/// Frozen account/view-local IDs only; no presentation, roster or message bodies.
-/// A snapshot is transient and must be revalidated before each batch action.
-#[derive(Clone)]
-pub struct ChatListSelectionSnapshot {
-    lifetime: ConnectionLifetime,
-    store_epoch: Vec<u8>,
-    view: ChatListView,
-    group_ids: Vec<String>,
-}
-
-impl std::fmt::Debug for ChatListSelectionSnapshot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChatListSelectionSnapshot")
-            .field("view", &self.view)
-            .field("count", &self.group_ids.len())
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ChatListSelectionError {
-    #[error("selection page requires 1 to 200 IDs and an offset within the selection")]
-    InvalidPage,
-    #[error("selection belongs to a different or reopened account store")]
-    StaleSelection,
     #[error("chat-list base projection is not ready")]
     ProjectionNotReady,
     #[error(transparent)]
@@ -38,108 +15,34 @@ pub enum ChatListSelectionError {
 }
 
 impl SqliteAppStorage {
-    /// Capture every eligible ID in one read transaction, using the same indexed
-    /// predicate and order as the native view, before any presentation pagination.
-    /// Work and memory are proportional to eligible IDs, never to profile/history size.
-    pub fn chat_list_selection_snapshot(
+    /// Every ID in a native view, in display order, read in one transaction with
+    /// the view's indexed predicate before any display paging. The count is the
+    /// length. Work and memory grow with the view's chats, never with profile or
+    /// history size. Pending base-row work returns `ProjectionNotReady`, never a
+    /// partial set.
+    pub fn chat_list_ids(&self, view: ChatListView) -> Result<Vec<String>, ChatListSelectionError> {
+        self.connection
+            .with_deferred_read(|conn| eligible_ids(conn, view))
+    }
+
+    /// The subset of `group_ids` still in `view`, in the caller's order with
+    /// duplicates dropped. It only removes: chats that joined the view since the
+    /// caller read it are never added. This read does not authorize a later write;
+    /// each per-chat command still checks its own preconditions.
+    pub fn revalidate_chat_list_ids(
         &self,
         view: ChatListView,
-    ) -> Result<ChatListSelectionSnapshot, ChatListSelectionError> {
-        self.connection.with_deferred_read(|conn| {
-            Ok(ChatListSelectionSnapshot {
-                lifetime: self.connection.lifetime(),
-                store_epoch: store_epoch(conn)?,
-                view,
-                group_ids: eligible_ids(conn, view)?,
-            })
-        })
-    }
-
-    /// The complete frozen count; closing/reopening the store invalidates it.
-    pub fn chat_list_selection_count(
-        &self,
-        selection: &ChatListSelectionSnapshot,
-    ) -> Result<usize, ChatListSelectionError> {
-        self.check_selection_lifetime(selection)?;
-        self.connection.with_deferred_read(|conn| {
-            check_epoch(conn, selection)?;
-            Ok(selection.group_ids.len())
-        })
-    }
-
-    /// Read at most 200 frozen IDs. Activity reorder, window eviction and new
-    /// arrivals do not change the captured order or silently expand the selection.
-    pub fn chat_list_selection_page(
-        &self,
-        selection: &ChatListSelectionSnapshot,
-        offset: usize,
-        limit: usize,
+        group_ids: &[String],
     ) -> Result<Vec<String>, ChatListSelectionError> {
-        if !(1..=200).contains(&limit) || offset > selection.group_ids.len() {
-            return Err(ChatListSelectionError::InvalidPage);
-        }
-        self.check_selection_lifetime(selection)?;
         self.connection.with_deferred_read(|conn| {
-            check_epoch(conn, selection)?;
-            let end = offset.saturating_add(limit).min(selection.group_ids.len());
-            Ok(selection.group_ids[offset..end].to_vec())
+            let mut eligible: HashSet<String> = eligible_ids(conn, view)?.into_iter().collect();
+            Ok(group_ids
+                .iter()
+                .filter(|id| eligible.remove(id.as_str()))
+                .cloned()
+                .collect())
         })
     }
-
-    /// Remove IDs no longer eligible in this native view. Never add late arrivals
-    /// or reconstruct eligibility from client rows. Capture and validation each
-    /// use one consistent transaction; mutations still validate their own preconditions.
-    pub fn revalidate_chat_list_selection(
-        &self,
-        selection: &ChatListSelectionSnapshot,
-    ) -> Result<ChatListSelectionSnapshot, ChatListSelectionError> {
-        self.check_selection_lifetime(selection)?;
-        self.connection.with_deferred_read(|conn| {
-            check_epoch(conn, selection)?;
-            let eligible: HashSet<_> = eligible_ids(conn, selection.view)?.into_iter().collect();
-            Ok(ChatListSelectionSnapshot {
-                lifetime: selection.lifetime.clone(),
-                store_epoch: selection.store_epoch.clone(),
-                view: selection.view,
-                group_ids: selection
-                    .group_ids
-                    .iter()
-                    .filter(|id| eligible.contains(*id))
-                    .cloned()
-                    .collect(),
-            })
-        })
-    }
-
-    fn check_selection_lifetime(
-        &self,
-        selection: &ChatListSelectionSnapshot,
-    ) -> Result<(), ChatListSelectionError> {
-        if !selection.lifetime.matches(&self.connection) {
-            return Err(ChatListSelectionError::StaleSelection);
-        }
-        Ok(())
-    }
-}
-
-fn store_epoch(conn: &Connection) -> Result<Vec<u8>, ChatListSelectionError> {
-    Ok(conn
-        .query_row_cached(
-            "SELECT store_epoch FROM chat_presentation_meta WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .storage()?)
-}
-
-fn check_epoch(
-    conn: &Connection,
-    selection: &ChatListSelectionSnapshot,
-) -> Result<(), ChatListSelectionError> {
-    if store_epoch(conn)? != selection.store_epoch {
-        return Err(ChatListSelectionError::StaleSelection);
-    }
-    Ok(())
 }
 
 fn eligible_ids(

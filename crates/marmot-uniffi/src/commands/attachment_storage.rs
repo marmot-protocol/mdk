@@ -170,20 +170,18 @@ mod tests {
             .unwrap();
         assert!(largest.attachments.is_empty() && largest.next_cursor.is_none());
         assert!(
-            kit.attachment_storage_by_chat("alice".into(), 0, None)
-                .await
-                .is_err()
+            matches!(kit.attachment_storage_by_chat("alice".into(), 0, None)
+                .await, Err(MarmotKitError::Runtime { details }) if details.contains("invalid attachment storage page limit"))
         );
         assert!(
-            kit.largest_retained_attachments("alice".into(), None, 257, None)
-                .await
-                .is_err()
+            matches!(kit.largest_retained_attachments("alice".into(), None, 257, None)
+                .await, Err(MarmotKitError::Runtime { details }) if details.contains("invalid attachment storage page limit"))
         );
-        assert!(
+        assert!(matches!(
             kit.largest_retained_attachments("alice".into(), Some("zz".into()), 8, None)
-                .await
-                .is_err()
-        );
+                .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
         assert_eq!(
             kit.remove_chat_attachments("alice".into(), "ab".repeat(16))
                 .await
@@ -196,11 +194,11 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(
+        assert!(matches!(
             kit.remove_chat_attachments("alice".into(), "not-hex".into())
-                .await
-                .is_err()
-        );
+                .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
         assert_eq!(
             kit.attachment_keep_media("alice".into()).await.unwrap(),
             AttachmentKeepMediaFfi::Forever

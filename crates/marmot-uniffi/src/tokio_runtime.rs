@@ -221,8 +221,13 @@ mod tests {
     #[test]
     fn a_dropped_receive_leaves_its_item_queued() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut receive_polls = 0;
         {
-            let mut call = Box::pin(poll_on_caller(receiver.recv()));
+            let mut receive = Box::pin(receiver.recv());
+            let mut call = Box::pin(poll_on_caller(std::future::poll_fn(|cx| {
+                receive_polls += 1;
+                receive.as_mut().poll(cx)
+            })));
             let waker = futures::task::noop_waker();
             assert!(
                 call.as_mut()
@@ -232,8 +237,8 @@ mod tests {
             sender.send(1).unwrap();
             // Nothing polls the receive between host polls, so the item stays
             // queued when the host drops the call.
-            std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(receive_polls > 0, "the host poll reaches the real receive");
         let next = futures::executor::block_on(poll_on_caller(receiver.recv()));
         assert_eq!(next, Some(1));
     }

@@ -121,11 +121,21 @@ mod tests {
             stream_id_from_hex(&format!(" {} ", "AB".repeat(32))).unwrap(),
             vec![0xAB; 32]
         );
-        for invalid in [String::new(), "ab".repeat(31), "ab".repeat(33)] {
+        for (invalid, bytes) in [
+            (String::new(), 0),
+            ("ab".repeat(31), 31),
+            ("ab".repeat(33), 33),
+        ] {
             assert!(
-                stream_id_from_hex(&invalid).is_err(),
-                "accepted {invalid:?}"
+                matches!(
+                    stream_id_from_hex(&invalid),
+                    Err(MarmotKitError::InvalidHex { details })
+                        if details == format!("expected 32-byte agent stream id, got {bytes} bytes")
+                ),
+                "wrong length guard for {invalid:?}"
             );
         }
+        assert!(matches!(stream_id_from_hex(&"zz".repeat(32)),
+            Err(MarmotKitError::InvalidHex { details }) if details == "Invalid character 'z' at position 0"));
     }
 }
