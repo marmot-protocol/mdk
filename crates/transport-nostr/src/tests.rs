@@ -6665,7 +6665,9 @@ async fn publish_auth_reply_sequence(
                     let Ok(text) = message.into_text() else {
                         continue;
                     };
-                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
                     if value[0] != "EVENT" {
                         continue;
                     }
