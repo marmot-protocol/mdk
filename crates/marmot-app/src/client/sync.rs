@@ -6844,6 +6844,14 @@ impl AppClient {
         #[cfg(not(test))]
         let audit_fail_before_commit = false;
         let mut known_not_committed = audit_fail_before_commit;
+        // Taken before the save: a foreign commit during or after it stays
+        // visible to the next skip, at the cost of one extra rebuild. A read
+        // after the save could already include a commit the chat list
+        // rebuilt before (mdk#2923).
+        let pre_save_commit_version = storage
+            .as_ref()
+            .ok()
+            .and_then(|storage| storage.app_storage().foreign_commit_version().ok());
         let result = (|| {
             #[cfg(test)]
             if audit_fail_before_commit {
@@ -6917,12 +6925,14 @@ impl AppClient {
         if let Some(observation) = observation {
             observation.finish_app(&result);
         }
+        #[cfg(test)]
+        if let Some(hook) = self.test_after_checkpoint_save.take() {
+            hook();
+        }
         if result.is_ok() {
             // This save marked the chat list stale, so it covers every
-            // foreign commit up to here.
-            self.observed_commit_version = storage
-                .ok()
-                .and_then(|storage| storage.app_storage().foreign_commit_version().ok());
+            // foreign commit before it.
+            self.observed_commit_version = pre_save_commit_version;
         }
         if let Some(probe) = &mut self.audit_v5_probe {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);

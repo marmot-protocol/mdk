@@ -12612,6 +12612,26 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         Some(false),
         "and the list picks the change up"
     );
+
+    // A foreign commit right after a real save, before anything reads the
+    // version again, is still seen by the next skip: the save records the
+    // version from before it.
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("bb".repeat(32), 1);
+    let archiver = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let racing_group = group_hex.clone();
+    client.test_after_checkpoint_save = Some(Box::new(move || {
+        archiver
+            .set_group_archived("alice", &racing_group, true)
+            .unwrap();
+    }));
+    assert!(save(&mut client, &probe).1, "a real save");
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "a commit just after a save still invalidates the next skip"
+    );
 }
 
 #[test]

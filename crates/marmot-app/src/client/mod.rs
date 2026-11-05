@@ -770,6 +770,10 @@ pub(super) struct EpochGapWindow {
 }
 
 pub struct AppClient {
+    /// Runs once right after the next projection checkpoint's save, before
+    /// anything else reads storage.
+    #[cfg(test)]
+    pub(crate) test_after_checkpoint_save: Option<Box<dyn FnOnce() + Send + Sync>>,
     /// Pauses the next full native replay pass after its generation snapshot:
     /// signals the first sender, then waits for the second.
     #[cfg(test)]
