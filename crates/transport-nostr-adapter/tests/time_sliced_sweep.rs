@@ -275,20 +275,21 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
 }
 
 /// A NIP-77 relay that answers a busy second inconclusively, by listing its
-/// ids and then withholding one or by sending a NEG-MSG the client cannot
-/// parse, has not shown the second unprovable: the sweep ends on an
-/// inconclusive second, not a saturated one, and asking again under the same
-/// caps proves it.
+/// ids and then withholding one, by sending a NEG-MSG the client cannot
+/// parse, or by repeating each event of an id fetch until a one-id reply
+/// overruns its budget, has not shown the second unprovable: the sweep ends
+/// on an inconclusive second, not a saturated one, and asking again under
+/// the same caps proves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inconclusive_second_is_retried_not_saturated() {
-    for fault in ["withheld id", "malformed NEG-MSG"] {
+    for fault in ["withheld id", "malformed NEG-MSG", "repeated id events"] {
         let fixture = Fixture::new().await;
         let (events, wanted, burst) = backlog();
         fixture.store(&events).await;
-        if fault == "withheld id" {
-            fixture.limit.withhold_id_fetch_events(1);
-        } else {
-            fixture.limit.set_neg_fault(NegFault::MalformedReply);
+        match fault {
+            "withheld id" => fixture.limit.withhold_id_fetch_events(1),
+            "malformed NEG-MSG" => fixture.limit.set_neg_fault(NegFault::MalformedReply),
+            _ => fixture.limit.repeat_id_fetch_events(3),
         }
         let relay = fixture.relay();
         let store = MemoryStore::default();
@@ -303,11 +304,15 @@ async fn an_inconclusive_second_is_retried_not_saturated() {
         .await;
         let stats = fixture.limit.stats();
         assert_eq!(
-            (stats.withheld_id_events, stats.malformed_neg_replies > 0),
-            if fault == "withheld id" {
-                (1, false)
-            } else {
-                (0, true)
+            (
+                stats.withheld_id_events,
+                stats.malformed_neg_replies > 0,
+                stats.repeated_id_events > 0,
+            ),
+            match fault {
+                "withheld id" => (1, false, false),
+                "malformed NEG-MSG" => (0, true, false),
+                _ => (0, false, true),
             },
             "{fault}"
         );
@@ -322,6 +327,7 @@ async fn an_inconclusive_second_is_retried_not_saturated() {
             "{fault}"
         );
         fixture.limit.set_neg_fault(NegFault::None);
+        fixture.limit.repeat_id_fetch_events(1);
         let report = run_sweep(
             request(range()),
             &relay,

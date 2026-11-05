@@ -12,9 +12,10 @@
   return its history. A relay that publishes no limit and no negentropy cannot prove a busy second, and releases the
   group instead of holding it; a relay whose information document cannot be read holds the group until its unit
   gives up, since it may still prove that second, and so does a relay that lists a second's messages and then
-  withholds one or sends a malformed negentropy message. Notification wakes (`CursorPersistence::Frozen`) fetch only the history their newly delivered
-  messages wait on, and nothing older unless the host asks for full-history repair; history older than the 30-day
-  window stops holding live messages. A directly owned client's `sync()` now also reads the live messages its
+  withholds one, sends a malformed negentropy message, or repeats an event until a fetch is cut short. Notification
+  wakes (`CursorPersistence::Frozen`) fetch only the history their newly delivered messages wait on, and nothing
+  older unless the host asks for full-history repair; history older than the 30-day window stops holding live
+  messages. A directly owned client's `sync()` now also reads the live messages its
   in-place recovery pass releases.
   `account_recovery_status` now reports groups catching up, and audit `unproven_history` rows are now produced.
 

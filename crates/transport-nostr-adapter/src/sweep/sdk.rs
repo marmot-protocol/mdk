@@ -271,14 +271,18 @@ impl SweepRelay for SdkSweepRelay {
                 Err(FailedEnd::Closed(reason)) => return SecondReply::Closed(reason),
                 Err(FailedEnd::Unreachable(kind)) => return SecondReply::Unreachable(kind),
                 // Large events can outgrow the byte budget: split the chunk
-                // and ask again. One id that still does not fit stays unproven.
+                // and ask again.
                 Err(FailedEnd::Cut) if chunk.len() > 1 => {
                     let (older, newer) = chunk.split_at(chunk.len() / 2);
                     pending.push(newer.to_vec());
                     pending.push(older.to_vec());
                     continue;
                 }
-                Err(FailedEnd::Cut) => return SecondReply::Unproven,
+                // The budget counts every frame before duplicates are
+                // dropped, so a cut one-id reply is not an event that fits
+                // no reply (64 MiB is far above any relay's event limit): a
+                // later attempt may prove the second.
+                Err(FailedEnd::Cut) => return SecondReply::Inconclusive,
             }
             let asked = chunk.iter().copied().collect::<HashSet<_>>();
             let got = reply

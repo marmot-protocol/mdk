@@ -747,17 +747,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and deadline-cut answers, until the unit saturates (an answered quantum stopped on the first second it owes because
   its relay cannot prove it under the caps the relay published; migration 0151 records that second, and a change in
   the relay's recorded caps clears it; a deadline cut, an inconclusive NIP-77 answer (a listed id the relay then
-  withheld, or a malformed exchange), or unknown caps never saturate) or breaks (a live frame opened ahead of its sender's owed messages can put them past the ratchet's
-  out-of-order window for good). A saturated unit leaves the frontier even after advancing, while that second is
-  still the first it owes. A quantum whose proven slices an un-cover took back mid-fetch settles as unanswered: due
-  again at once, holding its fence. Every debt turn first prunes the ledger to the retention floor (once per hour of
-  floor movement per process), so a capture older than the window fences nothing. A wake-collection
-  (`CursorPersistence::Frozen`) process's runner admits and answers fences but fetches only for every route of a
-  group whose live frames a fence holds (they share its frontier), or for an explicit full-history repair
-  (`fetches_unasked`). The runner reads live counts
-  through its own `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted
-  counts into it with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that
-  ticket after a successful debt turn.
+  withheld, a malformed exchange, or a cut one-id fetch), or unknown caps never saturate) or breaks (a live frame
+  opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for good). A
+  saturated unit leaves the frontier even after advancing, while that second is still the first it owes. A quantum
+  whose proven slices an un-cover took back mid-fetch settles as unanswered: due again at once, holding its fence.
+  Every debt turn first prunes the ledger to the retention floor (once per hour of floor movement per process), so a
+  capture older than the window fences nothing. A wake-collection (`CursorPersistence::Frozen`) process's runner
+  admits and answers fences but fetches only for every route of a group whose live frames a fence holds (they share
+  its frontier), or for an explicit full-history repair (`fetches_unasked`). The runner reads live counts through its
+  own `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
+  with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a
+  successful debt turn.
   Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`
   plus `enable_live_fences` before any native input or REQ. Both native backward-paging entry points are then off
   for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating

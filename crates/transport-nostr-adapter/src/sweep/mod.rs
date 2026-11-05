@@ -246,14 +246,16 @@ pub enum SecondReply {
     /// Every event the relay holds for the second: its NIP-77 id set, all
     /// fetched.
     Complete(Vec<Event>),
-    /// The relay cannot prove the second: it has no NIP-77, its id set for
-    /// the second reaches the per-second limit, or one of its events does
-    /// not fit a reply. Asking again stops on the same second.
+    /// The relay cannot prove the second: it has no NIP-77, or its id set
+    /// for the second reaches the per-second limit. Only the relay's own
+    /// capability or the size of the set it holds says so; asking again
+    /// stops on the same second.
     Unproven,
     /// The relay answered without proving the second this time: it listed
     /// an id and did not return it (an event deleted or expired in between,
-    /// or one it will not serve), or its NIP-77 exchange broke off on a
-    /// malformed message. A later attempt may prove it.
+    /// or one it will not serve), its NIP-77 exchange broke off on a
+    /// malformed message, or a one-id fetch was cut (duplicate frames count
+    /// against the reply budget). A later attempt may prove it.
     Inconclusive,
     Closed(ClosedReason),
     Unreachable(UnreachableKind),

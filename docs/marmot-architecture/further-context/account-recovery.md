@@ -904,12 +904,15 @@ again while those caps stand. It pursues again once it owes an earlier second fi
 relay's recorded caps change. An answer its deadline cut saturates nothing, and nor does a relay
 whose caps were never read: a document that failed to load is not a relay that cannot prove the
 second. Nor does an inconclusive NIP-77 answer: ids the relay listed and then did not all
-return (the event may have gone in between), or an exchange that broke off on a malformed
-message, which is not a relay without NIP-77. The sweep ends on an inconclusive second and asks
+return (the event may have gone in between), an exchange that broke off on a malformed
+message, which is not a relay without NIP-77, or a one-id fetch cut short (the reply budget
+counts duplicate frames). Only the relay's own capability or the size of the set it holds for
+the second proves it cannot prove it. The sweep ends on an inconclusive second and asks
 again on the backoff. A broken unit's debt is parked. The group's frames go once each
-holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests four events, one
-worker command each, so commands and live input go between them. An event the engine keeps no
-trace of stays staged, and its group waits behind it on the local-failure backoff while other
+holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests at most 16 staged
+events in one worker command, stopping at the first event the engine keeps no trace of, so
+commands and live input go between turns. An event the engine keeps no trace of stays staged,
+and its group waits behind it on the local-failure backoff while other
 groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
 once the account holds 64 MiB, is not eligible while another relay holds that group's frontier.
 A debt unit at the frontier is never held back, so the runner never waits on itself; a

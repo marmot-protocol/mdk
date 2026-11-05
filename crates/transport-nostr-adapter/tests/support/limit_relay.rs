@@ -229,6 +229,9 @@ pub struct LimitStats {
     pub stalled_frames: usize,
     /// EVENT frames dropped from exact-id REQs by `withhold_id_fetch_events`.
     pub withheld_id_events: usize,
+    /// EVENT frames of exact-id REQs sent more than once by
+    /// `repeat_id_fetch_events`.
+    pub repeated_id_events: usize,
     /// NEG-OPENs answered by `NegFault::MalformedReply`.
     pub malformed_neg_replies: usize,
 }
@@ -355,6 +358,8 @@ enum RelayVerdict {
     Drop,
     /// Send this frame instead (a hinted EOSE).
     Rewrite(String),
+    /// Send this frame this many times.
+    Repeat(usize),
 }
 
 #[derive(Default)]
@@ -372,6 +377,8 @@ struct Shared {
     stall_after_events: Option<usize>,
     /// Upstream EVENT frames answering exact-id REQs still to drop.
     withhold_id_events: usize,
+    /// Copies of each exact-id REQ's EVENT frames to send; 0 or 1 sends one.
+    id_event_copies: usize,
 }
 
 impl Shared {
@@ -536,6 +543,19 @@ impl LimitRelay {
                                     RelayVerdict::Forward => message,
                                     RelayVerdict::Drop => continue,
                                     RelayVerdict::Rewrite(text) => Message::Text(text.into()),
+                                    RelayVerdict::Repeat(copies) => {
+                                        let mut sent = true;
+                                        for _ in 1..copies {
+                                            if client_write.send(message.clone()).await.is_err() {
+                                                sent = false;
+                                                break;
+                                            }
+                                        }
+                                        if !sent {
+                                            break;
+                                        }
+                                        message
+                                    }
                                 };
                                 if client_write.send(message).await.is_err() {
                                     break;
@@ -597,6 +617,14 @@ impl LimitRelay {
         let mut shared = self.shared.lock().unwrap();
         shared.withhold_id_events = events;
         shared.stats.withheld_id_events = 0;
+    }
+
+    /// Send each EVENT frame of an exact-id REQ `copies` times (1 restores
+    /// single frames), as a relay that repeats itself would.
+    pub fn repeat_id_fetch_events(&self, copies: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.id_event_copies = copies;
+        shared.stats.repeated_id_events = 0;
     }
 
     /// Switch the injected NEG behaviour for every connection.
@@ -1002,6 +1030,10 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
                 shared.withhold_id_events -= 1;
                 shared.stats.withheld_id_events += 1;
                 return RelayVerdict::Drop;
+            }
+            if shared.id_event_copies > 1 && shared.states[connection].id_fetches.contains(id) {
+                shared.stats.repeated_id_events += 1;
+                return RelayVerdict::Repeat(shared.id_event_copies);
             }
             if let Some(req) = shared.states[connection].hinted.get_mut(id) {
                 req.sent += 1;
