@@ -42,6 +42,9 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
   to the release profile, Rust toolchain or measurement methodology must dispatch
   and link completed comparative evidence before merge.
 - Build scripts retain complete no-argument builds and expose generation/native/assembly phases for release CI.
+  The explicit leading `--dev-device-groups` flag selects a default-off capability, isolated target/scratch
+  and `output-dev-device-groups/`; native and generator features must match in every phase. Never pass
+  test-policy timing overrides or make ordinary release invocations opt in.
   Keep `test-build-phases.py` covering phase isolation, required assembly inputs and deployment/strip behavior.
   Shared Swift generation feeds both Apple assemblers; transfer phase inputs only from the same workflow run.
 - Own the host Swift/Kotlin DTO round-trip checks: `chat-projections-smoke.sh`, `options-smoke.sh`,
@@ -169,7 +172,9 @@ Chat-screen DTO changes also use `just uniffi-projections-smoke swift` (requires
 `just uniffi-projections-smoke kotlin` (requires `kotlinc` and `MDK_KOTLIN_CLASSPATH` containing JNA with native
 libraries, Android platform, annotations, and coroutines jars). Options, audit-v4, Details Markdown and
 usage-diagnostics DTO changes use the matching `./crates/marmot-uniffi/<name>-smoke.sh swift|kotlin` with the same
-requirements. These host checks do not replace release-artifact or device validation.
+requirements. `options-smoke.sh swift|kotlin --dev-device-groups` additionally checks the explicit
+constructor in a narrow capable native library; the ordinary invocation checks its unavailable error. These host
+checks do not replace release-artifact or device validation.
 
 Release-artifact checks (after `xcframework.sh`):
 
@@ -188,3 +193,10 @@ macOS release-artifact checks (after `xcframework-macos.sh`, which needs `OTLP_E
 ```
 
 For Android NDK prerequisites and initialization see README.md#kotlin--android.
+
+Experimental host-entry owner: `marmot-c/tests/secret_store_client.rs` runs an authenticated two-device link through a local WebSocket relay
+through exported C calls with `dev-device-groups` and no timing overrides; the same owner proves normal
+constructors stay disabled. Default C and UniFFI constructor owners prove unavailable builds leave roots unopened
+and C callbacks owned by the host. Keep shared option/open paths and the C options layout unchanged.
+`test-build-phases.py` owns explicit experimental feature/output isolation in the packagers; its fake tools do not
+prove native ABI compatibility. Keep normal release invocations off and never forward `test-policy-overrides`.

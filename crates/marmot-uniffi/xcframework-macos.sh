@@ -16,13 +16,20 @@
 
 set -euo pipefail
 
+# Explicit opt-in only: keep ordinary release invocations and output untouched.
+DEV_DEVICE_GROUPS=0
+if [[ "${1:-}" == --dev-device-groups ]]; then
+  DEV_DEVICE_GROUPS=1
+  shift
+fi
+
 # Split phases let CI build native slices independently; no arguments retains
 # the complete local build used by downstream synchronization scripts.
 MODE="${1:-all}"
 case "$MODE" in
-  all|assemble) [[ $# -le 1 ]] || { echo "usage: $0 [all|assemble|native]" >&2; exit 2; } ;;
+  all|assemble) [[ $# -le 1 ]] || { echo "usage: $0 [--dev-device-groups] [all|assemble|native]" >&2; exit 2; } ;;
   native) [[ $# -eq 1 ]] || { echo "native takes no target argument" >&2; exit 2; } ;;
-  *) echo "usage: $0 [all|assemble|native]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--dev-device-groups] [all|assemble|native]" >&2; exit 2 ;;
 esac
 
 # Force rustup's cargo to win over any Homebrew-installed cargo, so that
@@ -55,6 +62,12 @@ if [[ "$TARGET_DIR" != /* ]]; then
 fi
 BUILD_DIR="$CRATE_DIR/build/macos"
 OUT_DIR="$CRATE_DIR/output/macos"
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  TARGET_DIR="$TARGET_DIR/dev-device-groups"
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  BUILD_DIR="$CRATE_DIR/build/dev-device-groups/macos"
+  OUT_DIR="$CRATE_DIR/output-dev-device-groups/macos"
+fi
 
 # Set public first-party endpoint defaults for values compiled via option_env!.
 # Tokens remain host-app runtime configuration.
@@ -74,6 +87,12 @@ fi
 if [[ "${PRODUCT_ANALYTICS_EXPORT:-0}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
   FEATURE_ARGS+=(--features product-analytics-export)
   BINDGEN_FEATURES="${BINDGEN_FEATURES},product-analytics-export"
+fi
+
+if [[ "$DEV_DEVICE_GROUPS" == 1 ]]; then
+  FEATURE_ARGS+=(--features dev-device-groups)
+  BINDGEN_FEATURES="${BINDGEN_FEATURES},dev-device-groups"
+  echo "==> Experimental device-group capability; ordinary constructors remain disabled"
 fi
 
 

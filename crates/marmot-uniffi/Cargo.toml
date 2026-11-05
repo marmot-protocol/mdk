@@ -10,6 +10,8 @@ name = "marmot_uniffi"
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [features]
+# Explicit host test-build capability; never enables convergence timing overrides.
+dev-device-groups = ["marmot-app/dev-device-groups"]
 product-analytics-export = ["marmot-app/product-analytics-export"]
 default = []
 cli = ["uniffi/cli"]

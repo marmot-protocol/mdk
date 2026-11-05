@@ -12,8 +12,7 @@ impl Marmot {
     /// warning is open. An item means someone holding the account's signing
     /// key, or a session with its remote signer, published where the
     /// account's devices did not. The app writes the wording, and never says
-    /// the account's devices stopped them. Always empty in release builds
-    /// until the roster's spec lands. Refresh on `CompromiseWarningChanged`.
+    /// the account's devices stopped them. Always empty without explicit dev capability and runtime intent. Refresh on `CompromiseWarningChanged`.
     pub async fn compromise_warning(
         &self,
         account_ref: String,
