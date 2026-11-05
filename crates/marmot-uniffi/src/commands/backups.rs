@@ -409,6 +409,23 @@ mod tests {
                 .unwrap()
         );
         policy.release.notify_one();
+        // Cancelling a restore drops its waiter, not the shared directory
+        // fetch. Let that released query finish before requiring a new held
+        // query from the next operation, rather than coalescing with the old.
+        let shared = kit.runtime.shared_services();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while shared
+                .relay_plane()
+                .relay_health()
+                .await
+                .directory_inflight_fetches
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the released directory fetch finishes");
         let second = kit
             .begin_backup_restore("alice".into(), phrase)
             .await
