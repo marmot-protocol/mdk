@@ -610,7 +610,7 @@ impl AppClient {
 
     /// Whether `group_id` is settled: stable, with no convergence input left
     /// to process, as a link's outcome is read.
-    fn device_group_settled(&self, group_id: &GroupId) -> bool {
+    pub(super) fn device_group_settled(&self, group_id: &GroupId) -> bool {
         matches!(
             self.runtime.epoch_state(group_id),
             Some(EpochState::Stable { .. })
