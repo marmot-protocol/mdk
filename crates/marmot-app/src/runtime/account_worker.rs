@@ -8930,8 +8930,8 @@ pub(crate) fn publish_app_runtime_group_state_updated(
 }
 
 /// Broadcast a `WelcomeDeliveryPending` event for each Welcome a publish
-/// queued for re-delivery (mdk#352), so subscribers learn a member is
-/// unjoinable without polling the durable queue.
+/// queued for re-delivery (mdk#352), so subscribers learn delivery remains
+/// pending without polling the durable queue. This is not non-delivery evidence.
 fn publish_pending_welcome_delivery_events(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
