@@ -1108,9 +1108,9 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Number of active MLS groups this account successfully left. A chat
-    /// this device is no longer in, its copy removed or disbanded, is
-    /// neither left nor reported as a failure.
+    /// Active MLS groups whose local leave call succeeded, not confirmed removal.
+    /// A chat this device is no longer in, its copy removed or disbanded, is
+    /// neither counted nor reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,

@@ -1207,6 +1207,20 @@ signing out too (mdk#2628):
   that those devices may still list this one until the user removes it from one of them.
 - The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
 
+Signing out is device-only and does not submit an account-wide Leave decision or automatically demote the account.
+An active-admin account cannot self-remove, even with another admin present, so this device's leaf can remain in an
+admin chat. A separate admin-policy change affects the account on all its devices. Before the account can leave the
+chat entirely, another account must be an active admin; an eligible sibling can still remove this device while the
+account remains an admin. This limit also applies without linked devices.
+
+Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
+roster entry already carrying its tag signature key. Removal also needs a chat that supports same-account device
+removal and the required tagged leaves;
+`groups_left_to_siblings` is a handoff, not a completed-removal receipt. `groups_left` counts successful local leave
+calls, not confirmed membership removal. The call still attempts local account deletion after remote leave
+failures. Show the chats in `group_leave_failures` and check `local_cleanup.completed` independently; local cleanup
+completion does not establish that this device left every chat.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, it announces each KeyPackage in its own roster entry before publishing it, so
