@@ -119,6 +119,11 @@ pub struct UnrecognizedSignIn {
     /// read that finds none clears it; the sign-in stays listed.
     pub signed_in: bool,
     pub state: UnrecognizedSignInState,
+    /// This device retains a made approval for this slot, which its current
+    /// selected device roster no longer lists. Informational only: this does
+    /// not authenticate the currently publishing key or prove permanent loss.
+    /// False means no affirmative local context, not that it was never linked.
+    pub previously_linked_here: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,6 +465,7 @@ impl AppClient {
                     before_this_device: record.before_this_device,
                     signed_in: record.signed_in,
                     state,
+                    previously_linked_here: false,
                 })
             })
             .collect())

@@ -448,6 +448,24 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         !queued_intent,
         "the actual split copy must have no queued native work"
     );
+
+    // Actual fresh discovery supplies the existing sign-in row. It can
+    // later help convergence heal; the observation is about this current
+    // missing-link snapshot, never permanent disconnection.
+    published_key_package(&mut laptop.client, &relay).await;
+    phone.client.check_sign_ins().await.unwrap();
+    assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+    let sign_ins = phone.client.unrecognized_sign_ins().unwrap();
+    let missing = sign_ins
+        .iter()
+        .find(|row| row.slot_id_hex == laptop_slot_hex)
+        .unwrap();
+    assert_eq!(missing.state, crate::UnrecognizedSignInState::Prompt);
+    assert!(missing.signed_in);
+    assert!(
+        missing.previously_linked_here,
+        "the actual retained made link must annotate this missing slot"
+    );
 }
 
 /// A later link adds the new device to the device group in one commit, by a
