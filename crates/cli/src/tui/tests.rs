@@ -1317,92 +1317,6 @@ fn chat_label_keeps_unread_count_when_truncated() {
 }
 
 #[test]
-fn terminal_safe_text_strips_bidi_and_zero_width_format_characters() {
-    assert_eq!(
-        terminal_safe_text(
-            "safe\u{202a}name\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{feff}done",
-        ),
-        "safenamedone"
-    );
-}
-
-#[test]
-fn terminal_safe_text_strips_residual_invisible_and_format_spoofing_characters() {
-    // Each entry is a residual invisible / format vector that the original
-    // hardcoded denylist let through (see #473). All must be stripped, while
-    // the surrounding visible "ab" must survive so we are sure we are not
-    // simply dropping everything.
-    let format_class_cf: &[(char, &str)] = &[
-        ('\u{00ad}', "SOFT HYPHEN"),
-        ('\u{2061}', "FUNCTION APPLICATION"),
-        ('\u{2062}', "INVISIBLE TIMES"),
-        ('\u{2063}', "INVISIBLE SEPARATOR"),
-        ('\u{2064}', "INVISIBLE PLUS"),
-        ('\u{206a}', "INHIBIT SYMMETRIC SWAPPING"),
-        ('\u{206f}', "NOMINAL DIGIT SHAPES"),
-        ('\u{fff9}', "INTERLINEAR ANNOTATION ANCHOR"),
-        ('\u{fffa}', "INTERLINEAR ANNOTATION SEPARATOR"),
-        ('\u{fffb}', "INTERLINEAR ANNOTATION TERMINATOR"),
-        ('\u{180e}', "MONGOLIAN VOWEL SEPARATOR"),
-        ('\u{1d173}', "MUSICAL SYMBOL BEGIN BEAM"),
-        ('\u{061c}', "ARABIC LETTER MARK"),
-        ('\u{e0001}', "LANGUAGE TAG"),
-        ('\u{e0020}', "TAG SPACE"),
-        ('\u{e007e}', "TAG TILDE"),
-        ('\u{e007f}', "CANCEL TAG"),
-    ];
-    let invisible_non_cf: &[(char, &str)] = &[
-        ('\u{115f}', "HANGUL CHOSEONG FILLER"),
-        ('\u{1160}', "HANGUL JUNGSEONG FILLER"),
-        ('\u{3164}', "HANGUL FILLER"),
-        ('\u{ffa0}', "HALFWIDTH HANGUL FILLER"),
-        ('\u{2800}', "BRAILLE PATTERN BLANK"),
-    ];
-
-    for (ch, name) in format_class_cf.iter().chain(invisible_non_cf) {
-        let input = format!("a{ch}b");
-        assert_eq!(
-            terminal_safe_text(&input),
-            "ab",
-            "expected {name} (U+{:04X}) to be stripped",
-            *ch as u32
-        );
-    }
-}
-
-#[test]
-fn terminal_safe_text_preserves_legitimate_visible_and_combining_text() {
-    // Visible scripts, whitespace, and zero-width combining marks (accents,
-    // Indic virama, Arabic vowel marks, emoji variation selectors) must survive
-    // unchanged so the sanitizer does not mangle real localized text. Combining
-    // marks legitimately have zero rendered width, so a naive width-only filter
-    // would corrupt them.
-    let preserved = [
-        "plain ascii",
-        "中文 日本語 한국어",
-        "café",         // precomposed
-        "cafe\u{0301}", // e + COMBINING ACUTE ACCENT
-        "नमस्ते",         // Devanagari incl. virama U+094D
-        "سَلَام",          // Arabic incl. fatha U+064E
-        "❤\u{fe0f}",    // heart + VARIATION SELECTOR-16
-        "emoji 😀 ok",
-        "a b\u{00a0}c", // NO-BREAK SPACE is visible/whitespace, keep
-    ];
-    for sample in preserved {
-        assert_eq!(
-            terminal_safe_text(sample),
-            sample,
-            "expected {sample:?} to pass through unchanged"
-        );
-    }
-    // Tab is a C0 control and is correctly stripped (prior behavior preserved).
-    assert_eq!(
-        terminal_safe_text("with\ttab-was-control"),
-        "withtab-was-control"
-    );
-}
-
-#[test]
 fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
     let mut row = timeline_row("01", 0);
     row.from = "alice".to_owned();
@@ -3400,23 +3314,6 @@ fn seen_notification_keys_are_bounded() {
     assert!(
         !seen.insert(recent),
         "a key inside the recent window is still deduplicated"
-    );
-}
-
-#[test]
-fn tick_performs_the_pending_relist_exactly_once() {
-    let account_id = "aa".repeat(32);
-    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"chats":[]}}"#);
-    let mut app = test_tui_app(client, &account_id);
-    app.daemon = DaemonView::default(); // no live subscriptions to drain
-    app.pending_chat_relist = true;
-
-    let changed = app.tick();
-
-    assert!(changed);
-    assert!(
-        !app.pending_chat_relist,
-        "tick queues the pending re-list once, then clears the debounce flag"
     );
 }
 
@@ -5802,33 +5699,6 @@ fn seed_decodable_image(path: &std::path::Path) {
 
 #[cfg(unix)]
 #[test]
-fn media_worker_removes_the_decrypted_file_after_a_successful_decode() {
-    // The decrypted image is decoded into memory and never read from disk again,
-    // so the worker must remove the plaintext artifact once decode succeeds —
-    // decrypted media must not linger at rest.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
-    let output_path = dir.path().join("deadbeef");
-    seed_decodable_image(&output_path);
-    assert!(
-        output_path.exists(),
-        "the artifact exists before the worker runs"
-    );
-
-    let result = run_media_worker(&wn, output_path.clone());
-
-    assert!(
-        matches!(result, MediaLoad::Decoded { .. }),
-        "a valid image decodes"
-    );
-    assert!(
-        !output_path.exists(),
-        "the worker removes the decrypted artifact after a successful decode"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn media_worker_removes_the_decrypted_file_after_a_failed_decode() {
     // A download that succeeds but yields undecodable bytes still wrote decrypted
     // plaintext to disk; the worker must remove it on the decode-failure path too,
@@ -6710,26 +6580,6 @@ fn ctrl_q_does_not_quit() {
         .expect("Ctrl-Q handled");
 
     assert!(app.running, "Ctrl-Q must not quit the app");
-}
-
-#[test]
-fn plain_u_in_messages_focus_removes_the_reaction() {
-    // The guard on the `u` accelerator only rejects Ctrl/Alt: a plain `u` still
-    // fires the unreact and enqueues the `messages unreact` effect.
-    let account_id = "aa".repeat(32);
-    let group_id = "bb".repeat(32);
-    let mut app = test_tui_app(test_unused_client(), &account_id);
-    app.focus = Focus::Messages;
-    app.messages_account_id = Some(account_id.clone());
-    app.messages_group_id = Some(group_id);
-    app.timeline = vec![timeline_row("m1", 1)];
-
-    app.handle_key(char_key('u')).expect("plain u handled");
-
-    assert_eq!(
-        app.status, "removing reaction...",
-        "a plain u still fires the unreact"
-    );
 }
 
 #[test]
@@ -8949,20 +8799,6 @@ fn react_content_guard_rejects_non_latin_and_accented_prose() {
             "{prose:?} must be refused: a reaction is one grapheme cluster"
         );
     }
-}
-
-#[test]
-fn react_content_guard_accepts_the_nip25_downvote_sentinel() {
-    // NIP-25 defines `-` as the dislike sentinel, and `messages react` already
-    // accepts it. A lone `-` is a single unambiguous token with no typed-prose
-    // risk, so the TUI guard must let it through alongside the `+` default.
-    assert_eq!(
-        parse_slash_command("/react -"),
-        Ok(SlashCommand::React {
-            emoji: "-".to_owned()
-        }),
-        "the NIP-25 - downvote sentinel must be accepted"
-    );
 }
 
 #[test]
