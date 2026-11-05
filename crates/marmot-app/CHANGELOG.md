@@ -5,6 +5,9 @@
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
   class. Mixed, ambiguous, legacy and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
 
+- Preserve configured Blossom server base paths for uploads, synthesized downloads and deletion.
+  Existing endpoints need no migration; explicit download locators and network contact policy are unchanged.
+
 - Invalid device-roster marker edits now return the additive Rust `AccountError::InvalidDeviceRosterEdit`,
   rather than an engine serialization error. Lower-level Rust callers matching those errors should adopt the
   new case. The privacy kind is `account_invalid_device_roster_edit`; the Protocol sync class, CLI `engine_error`
@@ -142,6 +145,13 @@
   `key_package_client_name` is set.
 
 ### Added
+
+- Runtime performance snapshots time each phase of a maintenance tick
+  (`worker_maintenance_*`), the passes and blocking batches a tick sets off
+  (`worker_presentation_pass`, `worker_avatar_pass`, `worker_attachment_pass`,
+  `worker_media_sweep`, `worker_upload_promotion`), and each full native replay
+  synchronization by its trigger (`replay_sync_*`), so a profile of an idle
+  account can name where its CPU goes (mdk#2923).
 
 - Add `MarmotAppRuntime::update_linked_device_settings` with optional settings, resolved against the current roster. Rename and settings edits share D37 recovery; an earlier lost edit is recovered before accepting another. History remains limited to future sibling Adds and remaining owed transfers (mdk#2628 D86).
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
@@ -719,6 +729,23 @@
   event keeps its fields, level, message and `method`.
 
 ### Fixed
+
+- An idle account's maintenance tick does less work (mdk#2923). The
+  attachment pass no longer compiles the trigger-heavy expired-acquisition and
+  expired-partial `DELETE`s when nothing has expired; on an idle Pixel 9a that
+  one call was about a third of the app's CPU. A projection checkpoint with
+  nothing to persist is skipped, so a tick no longer commits an empty delta,
+  marks the chat list stale and re-runs the presentation, avatar and attachment
+  passes. A skipped checkpoint still marks the chat list stale when another
+  connection committed since the last checkpoint, so a change another runtime
+  made, such as archiving a chat, still reaches this runtime's list. The
+  chat list's stale mark is now a per-account generation: a refresh records
+  only the generation it started from, so an invalidation made while it runs
+  is kept, which the skipped 15 s save used to restore. Evicting an account's
+  caches now marks its chat list stale instead of clearing the mark. Writing
+  the account's own membership in a chat (leave, decline, removal, rejoin)
+  now marks the chat list stale itself, instead of waiting for a checkpoint
+  save that an idle account may skip.
 
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging

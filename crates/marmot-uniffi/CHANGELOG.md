@@ -161,6 +161,11 @@
 
 ### Added
 
+- `AppPerformanceSnapshotFfi.runtime_operations` reports per-phase
+  maintenance-tick operations (`worker_maintenance_*`, the presentation, avatar
+  and attachment passes and blocking batches a tick sets off) and full native
+  replay synchronizations by trigger (`replay_sync_*`) (mdk#2923).
+
 - Add `update_linked_device_settings` with three optional booleans. Omitted values stay current; refresh on `LinkedDevicesChanged`. Earlier lost user edits recover before the command proceeds (mdk#2628 D86).
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
   earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.

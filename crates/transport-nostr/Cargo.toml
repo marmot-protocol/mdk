@@ -11,7 +11,7 @@ default = []
 # Test hooks and accessors for crates that drive the plane in their own tests
 # (marmot-app enables it through its dev-dependency). Never enable in app
 # artifacts.
-test-support = []
+test-support = ["transport-nostr-adapter/test-support"]
 
 [dependencies]
 async-trait.workspace = true

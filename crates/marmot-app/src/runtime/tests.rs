@@ -3128,6 +3128,72 @@ async fn a_ready_worker_completes_one_span_per_startup_stage() {
     runtime.shutdown().await;
 }
 
+/// The maintenance phases every completed tick passes through, in tick order
+/// (mdk#2923). The key-package catch-up runs only when one is due.
+const MAINTENANCE_TICK_PHASES: [RuntimeOp; 11] = [
+    RuntimeOp::WorkerMaintenanceContentBackfill,
+    RuntimeOp::WorkerMaintenanceLegacyPromotion,
+    RuntimeOp::WorkerMaintenanceCompaction,
+    RuntimeOp::WorkerMaintenancePush,
+    RuntimeOp::WorkerMaintenanceRecovery,
+    RuntimeOp::WorkerMaintenancePostJoin,
+    RuntimeOp::WorkerMaintenanceDue,
+    RuntimeOp::WorkerMaintenanceAppPasses,
+    RuntimeOp::WorkerMaintenanceSession,
+    RuntimeOp::WorkerMaintenanceEffects,
+    RuntimeOp::WorkerMaintenanceHistoryDispatch,
+];
+
+/// A worker's first maintenance tick, which fires on entry, records one span
+/// per phase inside its `worker_maintenance` span, and the passes it sets off
+/// record their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_maintenance_tick_records_one_span_per_phase() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenance).completed == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first maintenance tick completes");
+
+    let ticks = startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenance);
+    for operation in MAINTENANCE_TICK_PHASES {
+        let phase = startup_stage_snapshot(&runtime, operation);
+        assert_eq!(
+            (phase.successes, phase.completed, phase.in_flight),
+            (ticks.successes, ticks.completed, 0),
+            "{}",
+            operation.as_str()
+        );
+    }
+    // The passes the tick sets due run on later loop turns, and its
+    // housekeeping batch on the blocking pool, so wait for each to complete.
+    for operation in [
+        RuntimeOp::WorkerPresentationPass,
+        RuntimeOp::WorkerAvatarPass,
+        RuntimeOp::WorkerAttachmentPass,
+        RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+    ] {
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while startup_stage_snapshot(&runtime, operation).completed == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} completes", operation.as_str()));
+    }
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_worker_open_records_no_startup_stage_spans() {
     let dir = tempfile::tempdir().expect("tempdir");

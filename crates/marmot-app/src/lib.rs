@@ -646,7 +646,7 @@ pub struct MarmotApp {
     signing_out_accounts: Arc<Mutex<HashMap<String, usize>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
-    chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
+    chat_list_projection_stale: Arc<Mutex<ChatListStaleness>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
     product_analytics: marmot_observability::ProductRecorder,
@@ -1760,7 +1760,7 @@ impl MarmotApp {
             signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
-            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::default(),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             audit_recorders: Arc::default(),
             product_analytics,
@@ -1873,7 +1873,7 @@ impl MarmotApp {
             signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
-            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::default(),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             audit_recorders: Arc::default(),
             product_analytics,
@@ -2132,6 +2132,10 @@ impl MarmotApp {
         let audit_v5_enabled = marmot_forensics::ForensicRecorder::records_v5(&audit);
         let mut client = AppClient {
             #[cfg(test)]
+            test_after_checkpoint_save: None,
+            #[cfg(test)]
+            test_replay_sync_gate: None,
+            #[cfg(test)]
             test_recovery_selection_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
@@ -2235,6 +2239,8 @@ impl MarmotApp {
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
+            saved_transport_timestamp: checkpointed_transport_timestamp,
+            observed_commit_version: None,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -4604,7 +4610,10 @@ impl MarmotApp {
             return Ok(());
         }
         storage.set_group_self_membership(group_id_hex, membership)?;
-        self.presentation_signals.wake();
+        // The chat-list row keeps its own copy of the membership. Nothing
+        // else rewrites it, and an idle account may skip the checkpoint save
+        // that used to mark the list stale (mdk#2923).
+        self.invalidate_chat_list_projection(&account.label);
         Ok(())
     }
 
@@ -6456,8 +6465,18 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(state.label.clone());
+            .invalidate(&state.label);
         Ok(())
+    }
+
+    /// Rebuild `label`'s chat list on its next read and wake presentation,
+    /// without writing anything.
+    pub(crate) fn invalidate_chat_list_projection(&self, label: &str) {
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate(label);
+        self.presentation_signals.wake();
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
@@ -6477,7 +6496,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(delta.label.clone());
+            .invalidate(&delta.label);
         self.presentation_signals.wake();
         Ok(())
     }
@@ -6520,7 +6539,7 @@ impl MarmotApp {
             self.chat_list_projection_stale
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(delta.label.clone());
+                .invalidate(&delta.label);
         }
         Ok(row)
     }
@@ -6545,7 +6564,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(label.to_owned());
+            .invalidate(label);
         self.chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6606,11 +6625,19 @@ impl MarmotApp {
     }
 
     fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
-        let stale = self
-            .chat_list_projection_stale
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&account.label);
+        // The generation this rebuild covers. An invalidation while it runs
+        // moves the generation past it, so the list stays stale for the
+        // next read instead of the rebuild clearing a mark it never saw.
+        let (stale, generation) = {
+            let staleness = self
+                .chat_list_projection_stale
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                staleness.is_stale(&account.label),
+                staleness.generation(&account.label),
+            )
+        };
         let warmed = self
             .chat_list_projection_warmed
             .lock()
@@ -6626,6 +6653,12 @@ impl MarmotApp {
         } else {
             storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?;
         }
+        #[cfg(test)]
+        CHAT_LIST_REFRESH_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         self.chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6633,7 +6666,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&account.label);
+            .record_rebuilt(&account.label, generation);
         Ok(())
     }
 
@@ -7851,7 +7884,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(label);
+            .forget(label);
     }
 
     fn shared_storage_path(&self) -> PathBuf {
@@ -8164,6 +8197,58 @@ fn app_feature_registry() -> FeatureRegistry {
         );
     }
     registry
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once inside this thread's next chat-list refresh, after its
+    /// generation snapshot and before it records the rebuild.
+    static CHAT_LIST_REFRESH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Per-account chat-list invalidation, as generations rather than a flag.
+/// Each invalidation advances the account's generation; a rebuild records
+/// the generation it snapshotted before it read anything. The list is stale
+/// while the generation is ahead of the last one rebuilt, so an invalidation
+/// that lands during a rebuild survives it (mdk#2923).
+#[derive(Default)]
+struct ChatListStaleness(HashMap<String, (u64, u64)>);
+
+impl ChatListStaleness {
+    /// Make `label`'s next read rebuild its chat list.
+    fn invalidate(&mut self, label: &str) {
+        let (generation, _) = self.0.entry(label.to_owned()).or_default();
+        *generation += 1;
+    }
+
+    /// Whether an invalidation is newer than `label`'s last rebuild.
+    fn is_stale(&self, label: &str) -> bool {
+        self.0
+            .get(label)
+            .is_some_and(|(generation, rebuilt)| generation > rebuilt)
+    }
+
+    /// The generation a rebuild starting now covers.
+    fn generation(&self, label: &str) -> u64 {
+        self.0.get(label).map_or(0, |(generation, _)| *generation)
+    }
+
+    /// A rebuild that snapshotted `generation` finished. Concurrent rebuilds
+    /// can finish out of order, so the newest snapshot wins.
+    fn record_rebuilt(&mut self, label: &str, generation: u64) {
+        if let Some((_, rebuilt)) = self.0.get_mut(label) {
+            *rebuilt = (*rebuilt).max(generation);
+        }
+    }
+
+    /// `label`'s caches were evicted. Advances the generation like an
+    /// invalidation instead of removing it, so generations never go back:
+    /// a refresh of the evicted incarnation still running holds an older
+    /// snapshot and can never mark a later invalidation rebuilt.
+    fn forget(&mut self, label: &str) {
+        self.invalidate(label);
+    }
 }
 
 #[derive(Clone)]

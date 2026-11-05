@@ -904,6 +904,35 @@ impl MarmotKitError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_keypackage_reason_preserves_typed_cause_and_stable_label() {
+        use super::MissingKeyPackageReasonFfi;
+        use marmot_app::MissingKeyPackageReason;
+        for (source, expected, label) in [
+            (
+                MissingKeyPackageReason::NotFound,
+                MissingKeyPackageReasonFfi::NotFound,
+                "not_found",
+            ),
+            (
+                MissingKeyPackageReason::ObsoleteOnly,
+                MissingKeyPackageReasonFfi::ObsoleteOnly,
+                "obsolete_only",
+            ),
+        ] {
+            let converted = MarmotKitError::from(AppError::MissingKeyPackage {
+                account: "recipient-account".into(),
+                reason: source,
+            });
+            let MarmotKitError::MissingKeyPackage { account, reason } = converted else {
+                panic!("missing KeyPackage lost its typed error");
+            };
+            assert_eq!(account, "recipient-account");
+            assert_eq!(reason, expected, "typed KeyPackage reason");
+            assert_eq!(reason.to_string(), label, "stable KeyPackage reason label");
+        }
+    }
+
     use super::MarmotKitError;
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;
