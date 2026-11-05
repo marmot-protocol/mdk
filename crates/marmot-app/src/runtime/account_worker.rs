@@ -3367,11 +3367,10 @@ async fn run_app_runtime_account_worker(
                     );
                 }
                 let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
-                run_legacy_message_promotion_batch(
+                step.finish(run_legacy_message_promotion_batch(
                     &client,
                     &mut legacy_message_promotion,
-                );
-                step.finish(TelemetryOutcome::Success);
+                ));
                 // Pairing timers, KeyPackage retries and link settlement.
                 client.drive_device_pairing().await;
                 if client.device_unlinked() {
@@ -4115,18 +4114,22 @@ enum StartupHydrationOutcome {
 /// Durable decode failures halt this optional sweep until the next process
 /// start so a malformed legacy row cannot create a hot retry loop. Reads keep
 /// their legacy fallback either way, so this never gates account use.
+/// Returns the batch's outcome for its maintenance span.
 fn run_legacy_message_promotion_batch(
     client: &AppClient,
     schedule: &mut LegacyMessagePromotionSchedule,
-) {
+) -> TelemetryOutcome {
     run_legacy_message_promotion_batch_with(schedule, |limit| {
         client
             .engine_storage
             .promote_legacy_message_rows(limit)
             .map_err(marmot_session::SessionError::from)
-    });
+    })
 }
 
+/// One promotion batch through `promote`: a failed batch is a failure,
+/// whether it retries next tick or halts the sweep, and a sweep that is
+/// complete or halted has nothing to do.
 fn run_legacy_message_promotion_batch_with(
     schedule: &mut LegacyMessagePromotionSchedule,
     promote: impl FnOnce(
@@ -4134,9 +4137,9 @@ fn run_legacy_message_promotion_batch_with(
     ) -> marmot_session::SessionResult<
         storage_sqlite::MessageFormatPromotionProgress,
     >,
-) {
+) -> TelemetryOutcome {
     if schedule.status != LegacyMessagePromotionStatus::Pending {
-        return;
+        return TelemetryOutcome::Success;
     }
     let started = Instant::now();
     match promote(LEGACY_MESSAGE_PROMOTION_BATCH_SIZE) {
@@ -4185,8 +4188,10 @@ fn run_legacy_message_promotion_batch_with(
                 promoted_total = schedule.promoted_total,
                 "legacy-message promotion batch failed"
             );
+            return TelemetryOutcome::Failure;
         }
     }
+    TelemetryOutcome::Success
 }
 
 /// Fully hydrate every group the deferred session open only seeded, in
@@ -10413,7 +10418,7 @@ mod tests {
         let mut schedule = LegacyMessagePromotionSchedule::new();
         let mut calls = 0;
 
-        run_legacy_message_promotion_batch_with(&mut schedule, |limit| {
+        let outcome = run_legacy_message_promotion_batch_with(&mut schedule, |limit| {
             calls += 1;
             assert_eq!(limit, LEGACY_MESSAGE_PROMOTION_BATCH_SIZE);
             Ok(storage_sqlite::MessageFormatPromotionProgress {
@@ -10421,10 +10426,12 @@ mod tests {
                 has_more: false,
             })
         });
-        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+        assert_eq!(outcome, TelemetryOutcome::Success);
+        let outcome = run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             calls += 1;
             unreachable!("completed promotion must not call storage again")
         });
+        assert_eq!(outcome, TelemetryOutcome::Success, "nothing left to do");
 
         assert_eq!(calls, 1);
         assert_eq!(schedule.promoted_total, 7);
@@ -10435,11 +10442,16 @@ mod tests {
     fn legacy_message_promotion_retries_transient_failures() {
         let mut schedule = LegacyMessagePromotionSchedule::new();
 
-        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+        let outcome = run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             Err(marmot_session::SessionError::from(
                 cgka_traits::storage::StorageError::Busy("test contention".into()),
             ))
         });
+        assert_eq!(
+            outcome,
+            TelemetryOutcome::Failure,
+            "a retried batch still failed"
+        );
 
         assert_eq!(schedule.status, LegacyMessagePromotionStatus::Pending);
         assert_eq!(schedule.promoted_total, 0);
@@ -10450,16 +10462,22 @@ mod tests {
         let mut schedule = LegacyMessagePromotionSchedule::new();
         let mut calls = 0;
 
-        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+        let outcome = run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             calls += 1;
             Err(marmot_session::SessionError::from(
                 cgka_traits::storage::StorageError::Serialization("malformed legacy row".into()),
             ))
         });
-        run_legacy_message_promotion_batch_with(&mut schedule, |_| {
+        assert_eq!(outcome, TelemetryOutcome::Failure);
+        let outcome = run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             calls += 1;
             unreachable!("durable failure must halt this process's sweep")
         });
+        assert_eq!(
+            outcome,
+            TelemetryOutcome::Success,
+            "a halted sweep does nothing"
+        );
 
         assert_eq!(calls, 1);
         assert_eq!(schedule.status, LegacyMessagePromotionStatus::Halted);
