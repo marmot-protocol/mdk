@@ -1044,6 +1044,7 @@ impl ScriptedPushRelayClient {
 
     /// Supply the SDK's already-classified endpoint refusal to the real
     /// adapter/session/App owners. Exact-wire parsing remains SDK-owned.
+    #[cfg(feature = "product-analytics-export")]
     pub(crate) fn reject_publishes_of_kind_as_too_large(&self, kind: u64) {
         *self.fail_publish_kind.lock().unwrap() = Some((kind, true));
     }
