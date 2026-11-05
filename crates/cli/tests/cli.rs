@@ -7140,6 +7140,9 @@ fn daemon_execute_failures_preserve_admission_state_and_output_channels() {
                             Err(error) => panic!("accept daemon request: {error}"),
                         }
                     };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking daemon fixture stream");
                     stream.set_read_timeout(Some(POLL_TIMEOUT)).unwrap();
                     let mut request = Vec::new();
                     stream
