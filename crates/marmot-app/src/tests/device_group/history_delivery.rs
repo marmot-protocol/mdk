@@ -1573,7 +1573,8 @@ async fn an_add_to_the_device_group_owes_no_history() {
 /// history state reach hosts the same way. An import names its source even
 /// before any seam, as on a new connection. A chat whose history has not
 /// arrived lists nothing. A renamed device shows its new name, and one no longer on
-/// the roster shows none.
+/// the roster shows none. A failed roster read or TEMP-label write keeps the
+/// previous names and retries at the next seam, without another roster change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_imported_row_names_the_device_it_came_from() {
     let (mut devices, group, chat, first) = history_devices().await;
@@ -1640,9 +1641,67 @@ async fn an_imported_row_names_the_device_it_came_from() {
     );
 
     name_phone(&mut devices, &group, "Old phone").await;
+    let account = devices.laptop_app.account_storage("alice").unwrap();
+    let saved_group = cgka_traits::storage::GroupStorage::get_group(&account, &group).unwrap();
+    // Only the device group's durable record is unreadable; the ordinary
+    // chat and its native history import remain available.
+    storage(&devices.laptop_app)
+        .execute_batch_for_test(&format!(
+            "UPDATE cgka_groups SET record = X'00' WHERE id = X'{}'",
+            hex::encode(group.as_slice())
+        ))
+        .unwrap();
+    assert!(matches!(
+        devices.laptop.trusted_device_roster(),
+        Err(AppError::DeviceGroupRefused("roster_unavailable"))
+    ));
+    assert!(
+        !device_group_seam(&mut devices.laptop),
+        "an unreadable roster cannot change the displayed import names"
+    );
+    assert!(!devices.laptop.take_linked_devices_changed());
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "Phone")), None]
+    );
+
+    let during_failure = send_text(&mut devices.phone, &chat, "import during roster failure").await;
+    let bundle = devices
+        .phone
+        .export_chat_history(&chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let imported = devices
+        .laptop
+        .import_history_bundle(
+            &chat,
+            &slot_of(&devices.phone),
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            &sealed.ciphertext,
+        )
+        .unwrap()
+        .expect("the real chat's new history imports despite the unreadable roster");
+    assert_eq!(
+        imported
+            .timeline_messages
+            .iter()
+            .find(|row| row.message_id_hex == during_failure)
+            .unwrap()
+            .imported_from,
+        Some(phone_named(&devices, "Phone"))
+    );
     assert!(
         device_group_seam(&mut devices.laptop),
-        "the rename is announced"
+        "the new import is announced"
+    );
+    assert!(!device_group_seam(&mut devices.laptop));
+
+    cgka_traits::storage::GroupStorage::put_group(&account, &saved_group).unwrap();
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the recovered names are announced without another roster event"
     );
     assert_eq!(
         sources(&devices),
@@ -1657,6 +1716,35 @@ async fn an_imported_row_names_the_device_it_came_from() {
         &history_state(&devices.laptop, &chat)[..],
         [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(&devices, "Old phone")
     ));
+
+    name_phone(&mut devices, &group, "New phone").await;
+    let labels = storage(&devices.laptop_app);
+    let generation = labels.history_imports_generation().unwrap();
+    labels
+        .execute_batch_for_test(
+            "CREATE TEMP TRIGGER refuse_device_label_write BEFORE INSERT ON device_labels \
+             BEGIN SELECT RAISE(ABORT, 'device label write blocked'); END;",
+        )
+        .unwrap();
+    assert!(devices.laptop.trusted_device_roster().unwrap().is_some());
+    assert!(!device_group_seam(&mut devices.laptop));
+    assert_eq!(labels.history_imports_generation().unwrap(), generation);
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "Old phone")), None]
+    );
+    labels
+        .execute_batch_for_test("DROP TRIGGER temp.refuse_device_label_write")
+        .unwrap();
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the failed atomic label write is retried after storage recovers"
+    );
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "New phone")), None]
+    );
+    assert!(!device_group_seam(&mut devices.laptop));
 
     devices
         .laptop
