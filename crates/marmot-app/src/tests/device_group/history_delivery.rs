@@ -1571,7 +1571,7 @@ async fn an_add_to_the_device_group_owes_no_history() {
 /// history import, then restore the same group without generating a roster event.
 async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, chat: &GroupId) {
     let account = devices.laptop_app.account_storage("alice").unwrap();
-    let saved_group = cgka_traits::storage::GroupStorage::get_group(&account, &group).unwrap();
+    let saved_group = cgka_traits::storage::GroupStorage::get_group(&account, group).unwrap();
     // Only the device group's durable record is unreadable; the ordinary
     // chat and its native history import remain available.
     storage(&devices.laptop_app)
@@ -1594,17 +1594,17 @@ async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, 
         [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(devices, "Phone")
     ));
 
-    let during_failure = send_text(&mut devices.phone, &chat, "import during roster failure").await;
+    let during_failure = send_text(&mut devices.phone, chat, "import during roster failure").await;
     let bundle = devices
         .phone
-        .export_chat_history(&chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .export_chat_history(chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
         .unwrap()
         .unwrap();
     let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
     let imported = devices
         .laptop
         .import_history_bundle(
-            &chat,
+            chat,
             &slot_of(&devices.phone),
             &sealed.key,
             &sealed.ciphertext_sha256,
@@ -1619,7 +1619,7 @@ async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, 
             .find(|row| row.message_id_hex == during_failure)
             .unwrap()
             .imported_from,
-        Some(phone_named(&devices, "Phone"))
+        Some(phone_named(devices, "Phone"))
     );
     assert!(
         device_group_seam(&mut devices.laptop),
