@@ -16,8 +16,8 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
 };
 use nostr::nips::nip19::ToBech32;
+use nostr_relay_builder::LocalRelay;
 use nostr_relay_builder::builder::{PolicyResult, RelayBuilder, WritePolicy};
-use nostr_relay_builder::{LocalRelay, MockRelay};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, QuicBrokerServer};
@@ -27,15 +27,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
-    _relay: TestRelayHandle,
+    _relay: LocalRelay,
     url: String,
 }
 
-#[allow(dead_code)]
-enum TestRelayHandle {
-    Mock(MockRelay),
-    Local(LocalRelay),
-}
+/// The filter limit every test relay enforces and publishes on its
+/// information page, as White Noise's relays do.
+const RELAY_FILTER_LIMIT: usize = 500;
 
 #[derive(Default)]
 struct RecordingKind5State {
@@ -141,46 +139,27 @@ fn kind5_tag_targets<'a>(tags: impl IntoIterator<Item = &'a [String]>) -> Vec<St
 
 impl TestRelay {
     fn new() -> Self {
-        Self::from_mock()
+        Self::from_local_builder(RelayBuilder::default())
     }
 
     fn with_write_policy(policy: impl WritePolicy + 'static) -> Self {
         Self::from_local_builder(RelayBuilder::default().write_policy(policy))
     }
 
-    fn from_mock() -> Self {
-        let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
-        let mut last_error = None;
-        let relay = (0..8)
-            .find_map(|attempt| match runtime.block_on(MockRelay::run()) {
-                Ok(relay) => Some(relay),
-                Err(err) => {
-                    eprintln!("mock relay startup attempt {} failed: {err}", attempt + 1);
-                    last_error = Some(err);
-                    std::thread::sleep(Duration::from_millis(25));
-                    None
-                }
-            })
-            .unwrap_or_else(|| panic!("mock relay should start: {last_error:?}"));
-        let url = runtime.block_on(relay.url()).to_string();
-        Self {
-            _runtime: runtime,
-            _relay: TestRelayHandle::Mock(relay),
-            url,
-        }
-    }
-
     fn from_local_builder(builder: RelayBuilder) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
-        let relay = LocalRelay::new(builder);
+        let relay = LocalRelay::new(builder.max_filter_limit(RELAY_FILTER_LIMIT));
         let mut last_error = None;
         for attempt in 0..8 {
             match runtime.block_on(relay.run()) {
                 Ok(()) => {
-                    let url = runtime.block_on(relay.url()).to_string();
+                    let url = publish_relay_information(
+                        &runtime,
+                        &runtime.block_on(relay.url()).to_string(),
+                    );
                     return Self {
                         _runtime: runtime,
-                        _relay: TestRelayHandle::Local(relay),
+                        _relay: relay,
                         url,
                     };
                 }
@@ -246,6 +225,67 @@ impl TestRelay {
             .flat_map(|event| kind5_event_targets(&event))
             .collect()
     }
+}
+
+/// Serve a relay information page (NIP-11) in front of the relay at
+/// `upstream`, as deployed relays do, and return the front's URL: the page
+/// publishes [`RELAY_FILTER_LIMIT`], which the relay enforces, and claims no
+/// NIPs. The account's recovery runner proves history against the caps a
+/// relay publishes; a relay whose caps it cannot read never lets a group's
+/// held live input past a second it cannot prove.
+fn publish_relay_information(runtime: &tokio::runtime::Runtime, upstream: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = upstream
+        .trim_start_matches("ws://")
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind relay information front");
+    let url = format!(
+        "ws://{}",
+        listener
+            .local_addr()
+            .expect("relay information front address")
+    );
+    runtime.spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut header = Vec::new();
+                while !header.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    match client.read(&mut bytes).await {
+                        Ok(read) if read > 0 && header.len() + read <= 8192 => {
+                            header.extend_from_slice(&bytes[..read]);
+                        }
+                        _ => return,
+                    }
+                }
+                let information = String::from_utf8_lossy(&header).lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("accept")
+                            && value.contains("application/nostr+json")
+                    })
+                });
+                if information {
+                    let body = format!(
+                        r#"{{"supported_nips":[],"limitation":{{"max_limit":{RELAY_FILTER_LIMIT}}}}}"#
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client.write_all(reply.as_bytes()).await;
+                } else if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await
+                    && server.write_all(&header).await.is_ok()
+                {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    url
 }
 
 struct TestBlossom {
@@ -449,7 +489,7 @@ fn wn_plain(home: &std::path::Path) -> Command {
     // CLI tests exercise encrypted media against a loopback Blossom server,
     // which is the dev/test scenario the loopback-HTTP gate is for.
     command.env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
-    // CLI tests connect to an in-process `MockRelay` at loopback, which is the
+    // CLI tests connect to an in-process test relay at loopback, which is the
     // dev/test scenario the loopback-relay gate is for.
     command.env("WN_ALLOW_LOOPBACK_RELAYS", "1");
     // Feature-gated instant settlement for the explicit test build only.
@@ -2443,7 +2483,7 @@ fn account_create_rejects_nsec_argv_and_accepts_stdin_secret() {
 fn whitenoise_identity_commands_create_login_and_show_accounts() {
     // This test exercises the full create-identity + login + KeyPackage publish
     // flow, which is publish-heavy. Use a DEDICATED relay rather than the shared
-    // process-wide `test_relay_url()` MockRelay: under parallel test load, many
+    // process-wide `test_relay_url()` relay: under parallel test load, many
     // subprocesses connecting to one shared relay race, and the login publish
     // intermittently fails with "publish failed: relay not connected". A private
     // relay removes the cross-test connection contention without serializing the
@@ -2841,7 +2881,7 @@ fn account_create_requires_relay_setup() {
         .arg("--json")
         .arg("--secret-store")
         .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // Daemon tests drive an in-process test relay at loopback; production
         // rejects non-public relay hosts unless this dev gate is set.
         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .env_remove("WN_RELAY")
@@ -4495,7 +4535,7 @@ fn daemon_background_stream_watch_records_brokered_preview() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -4631,7 +4671,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -4782,7 +4822,7 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -4933,7 +4973,7 @@ fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manua
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -5866,7 +5906,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -5969,7 +6009,7 @@ fn notifications_subscribe_streams_runtime_notifications_from_daemon() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -6147,7 +6187,7 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // Instant convergence settlement (dev/test) so the daemon surfaces
@@ -6794,7 +6834,7 @@ fn daemon_executes_cli_commands_over_socket() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
             // The forwarded media upload below targets a loopback Blossom server.
@@ -6992,7 +7032,7 @@ fn daemon_socket_path_is_private() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
     });
@@ -7041,7 +7081,7 @@ fn daemon_refuses_reset_over_socket() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
     });
@@ -7080,7 +7120,7 @@ fn daemon_running_does_not_auto_forward_logout() {
             .arg(test_relay_url())
             .arg("--secret-store")
             .arg("file")
-            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // Daemon tests drive an in-process test relay at loopback; production
             // rejects non-public relay hosts unless this dev gate is set.
             .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
     });
@@ -7224,7 +7264,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .arg(&socket)
         .arg("--secret-store")
         .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // Daemon tests drive an in-process test relay at loopback; production
         // rejects non-public relay hosts unless this dev gate is set.
         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .arg("--json")
@@ -7501,7 +7541,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
         .arg(&socket)
         .arg("--secret-store")
         .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // Daemon tests drive an in-process test relay at loopback; production
         // rejects non-public relay hosts unless this dev gate is set.
         .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .arg("--json")

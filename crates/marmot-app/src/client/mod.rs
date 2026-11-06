@@ -1044,6 +1044,16 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// The recovery runner's ownership preparation failed and none has
+    /// succeeded since. While it is owed the worker starts no runner; the
+    /// paced subscription-refresh retry prepares again.
+    pub(crate) runner_preparation_owed: bool,
+    /// The retention floor the recovery runner's debt turns last pruned the
+    /// ledger to in this process, if any did.
+    pub(crate) runner_pruned_floor: Option<u64>,
+    /// One-shot failure of the recovery runner's ownership preparation.
+    #[cfg(test)]
+    pub(crate) fail_next_runner_preparation: bool,
     /// The transport cursor every save persists. `state` holds the ingested
     /// maximum; this moves only through a seal under the router's placement
     /// lock: at a drain checkpoint or settled loss, or with a live ingest's
@@ -1152,6 +1162,7 @@ pub struct AppClient {
     /// The history fetch each live post-join session serves, by subscription
     /// id. Pruned to the live sessions on every post-join pass.
     pub(crate) post_join_history_sessions: HashMap<String, recovery::PostJoinHistorySession>,
+    pub(crate) runner_post_join: HashMap<GroupId, recovery_runner::post_join::Collection>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1882,7 +1893,11 @@ impl AppClient {
                     .remove(&group_id);
             }
             self.retain_live_post_join_history_sessions();
+            self.runner_post_join.clear();
             return Ok(());
+        }
+        if self.app.recovery_runner_owns_debt() {
+            return self.advance_runner_post_join().await;
         }
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();

@@ -186,7 +186,12 @@ impl RunnerHost for AccountRunnerHost {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
+                // The actual local epoch, never a successful sweep, ends a gap.
+                client.drop_settled_epoch_backfill_intents();
                 if let Err(error) = client.settle_recovery_route_changes(&app, now) {
+                    return Some(Err(error));
+                }
+                if let Err(error) = client.prune_runner_retention(&app, now) {
                     return Some(Err(error));
                 }
                 let tails = client.recovery_runner_live_tails(&app, now).await;
@@ -194,15 +199,24 @@ impl RunnerHost for AccountRunnerHost {
                 if inbox.is_none() {
                     routes.retain(|route| route.route != TransportReconciliationRoute::Inbox);
                 }
-                // The live counts and the fences they raise come with PR 5c.
-                Some(turn(&DebtTurn {
+                let live = client.recovery_runner_live_counts().await;
+                let debt = DebtTurn {
                     app: &app,
                     routes: &routes,
                     now,
                     tails: &*tails,
-                    live_counts: &[],
+                    live_counts: &live.counts,
                     inbox: inbox.unwrap_or_default(),
-                }))
+                };
+                let result = turn(&debt);
+                if result.is_ok() {
+                    let fences = match super::admission::live_fences(&debt) {
+                        Ok(fences) => fences,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    client.fence_live_frames(live.ticket, &fences).await;
+                }
+                Some(result)
             })
         })
         .await
@@ -270,10 +284,27 @@ impl RunnerHost for AccountRunnerHost {
 
     async fn admit_staged(
         &self,
-        delivery: TransportDelivery,
-    ) -> Option<Result<Admitted, &'static str>> {
+        deliveries: Vec<TransportDelivery>,
+    ) -> Option<Vec<Result<Admitted, &'static str>>> {
         self.on_client(true, move |client| {
-            Box::pin(async move { Some(admit(client, &delivery).await) })
+            Box::pin(async move {
+                let mut outcomes = Vec::with_capacity(deliveries.len());
+                for delivery in deliveries {
+                    let outcome = admit(client, &delivery).await;
+                    let stopped = !matches!(outcome, Ok(Admitted::Kept));
+                    outcomes.push(outcome);
+                    // Same bounded batch as comparison admission. Publish any
+                    // effects or honor self-removal before another input; a
+                    // failed/untraced prefix never admits anything newer.
+                    if stopped
+                        || client.device_unlinked()
+                        || client.has_pending_effect_projections()
+                    {
+                        break;
+                    }
+                }
+                Some(outcomes)
+            })
         })
         .await
     }
@@ -397,7 +428,10 @@ impl AppClient {
             account_id,
             catching_up: self.routing.recovery_runner_catching_up(),
         };
-        let policy = RecoveryRunnerPolicy::default();
+        let policy = RecoveryRunnerPolicy {
+            fetches_unasked: self.app.cursor_persistence() == crate::CursorPersistence::Advance,
+            ..RecoveryRunnerPolicy::default()
+        };
         let (runner, handle) = RecoveryRunner::waking_on(
             Arc::new(host),
             policy,
@@ -420,8 +454,26 @@ impl AppClient {
 
     /// Spawn the account's runner, for the account worker to serve. Only
     /// with the internal `runner_owns_debt` gate on.
-    pub(crate) async fn spawn_recovery_runner(&self) -> Option<SpawnedRunner> {
+    /// Whether the worker starts a runner it lacks: the gate is on and no
+    /// failed ownership preparation is still owed. A failed one waits for the
+    /// paced subscription-refresh retry to prepare again, so a persistent
+    /// failure never spins the worker, and other work that refresh still owes
+    /// never keeps the runner out.
+    pub(crate) fn recovery_runner_due(&self) -> bool {
+        self.app.recovery_runner_owns_debt() && !self.runner_preparation_owed
+    }
+
+    pub(crate) async fn spawn_recovery_runner(&mut self) -> Option<SpawnedRunner> {
         if !self.app.recovery_runner_owns_debt() {
+            return None;
+        }
+        if let Err(error) = self.prepare_runner_ownership().await {
+            // The worker's existing subscription-refresh retry is paced. A
+            // failed conversion or policy installation never starts a runner.
+            self.pending_runtime_group_subscription_refresh = true;
+            tracing::warn!(target: TARGET, method = "spawn_recovery_runner",
+                error_kind = error.privacy_safe_kind(),
+                "recovery ownership preparation failed; retry remains armed");
             return None;
         }
         let AccountRunner {
@@ -440,10 +492,12 @@ impl AppClient {
 
     /// Give a directly owned client its in-place runner. Only with the
     /// internal `runner_owns_debt` gate on.
-    pub(crate) async fn seat_recovery_runner_in_place(&mut self) {
+    pub(crate) async fn seat_recovery_runner_in_place(&mut self) -> Result<(), crate::AppError> {
         if self.app.recovery_runner_owns_debt() {
+            self.prepare_runner_ownership().await?;
             self.seat_in_place().await;
         }
+        Ok(())
     }
 
     async fn seat_in_place(&mut self) {

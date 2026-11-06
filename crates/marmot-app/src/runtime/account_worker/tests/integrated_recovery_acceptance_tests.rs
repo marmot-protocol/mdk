@@ -231,6 +231,9 @@ async fn group_events(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
+    // This fixture owns the retained comparison owner contract, independently
+    // of the runner-owned production default.
+
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldCommitRequest::default();
     let _release_on_drop = ReleaseOnDrop(gate.clone());
@@ -265,7 +268,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_settlement_quiescence_ms(100)
         .with_dev_epoch_backfill_retry_backoff_ms(100);
-    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone())
+        .with_recovery_runner_ownership_for_test(false);
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
@@ -433,7 +437,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     drop(runtime);
     drop(app);
 
-    let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone())
+        .with_recovery_runner_ownership_for_test(false);
     let reopened = crate::MarmotAppRuntime::new(reopened_app.clone());
     let pool = reopened
         .shared_services()
@@ -958,7 +963,8 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     drop(storage);
     drop(reopened_app);
 
-    let final_app = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    let final_app = MarmotApp::with_relay_and_config(dir.path(), url, config)
+        .with_recovery_runner_ownership_for_test(false);
     let final_runtime = crate::MarmotAppRuntime::new(final_app.clone());
     final_runtime.reconcile_accounts().await.unwrap();
     assert!(
@@ -999,6 +1005,9 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_comparison_waits_for_credit_before_reserving_retry() {
+    // This fixture owns the retained comparison owner contract, independently
+    // of the runner-owned production default.
+
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let relay = LocalRelay::new(RelayBuilder::default());
     relay.run().await.unwrap();
@@ -1011,7 +1020,8 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
         dir.path(),
         url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
         .shared_services()
@@ -1042,6 +1052,9 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_inline_wait_releases_unused_comparison_credit() {
+    // This fixture owns the retained comparison owner contract, independently
+    // of the runner-owned production default.
+
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadQuery::default();
     let _release_on_drop = ReleaseBroadOnDrop(gate.clone());
@@ -1055,7 +1068,8 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
     let config = crate::MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_cursor_persistence(crate::CursorPersistence::Frozen);
-    let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone())
+        .with_recovery_runner_ownership_for_test(false);
     let initial = crate::MarmotAppRuntime::new(initial_app.clone());
     initial.reconcile_accounts().await.unwrap();
     initial
@@ -1077,7 +1091,8 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
     // Frozen policy starts no comparison grant, but its ordinary startup
     // activation still issues a broad relay query and waits inline.
     gate.hold.store(true, Ordering::SeqCst);
-    let app = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url, config)
+        .with_recovery_runner_ownership_for_test(false);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
         .shared_services()
@@ -1130,6 +1145,9 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
+    // This fixture owns the retained comparison owner contract, independently
+    // of the runner-owned production default.
+
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldCommitRequest::default();
     let _release_on_drop = ReleaseOnDrop(gate.clone());
@@ -1154,7 +1172,8 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         .create_account("cancel startup")
         .unwrap();
     let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
-    let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone())
+        .with_recovery_runner_ownership_for_test(false);
     let initial = crate::MarmotAppRuntime::new(initial_app.clone());
     initial.reconcile_accounts().await.unwrap();
     let group = initial
@@ -1212,7 +1231,8 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         retry_not_before_ms.saturating_sub(wall_now_ms),
     ))
     .await;
-    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone())
+        .with_recovery_runner_ownership_for_test(false);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
         .shared_services()
@@ -1375,7 +1395,8 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     drop(runtime);
     drop(app);
     gate.release();
-    let reopened = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    let reopened = MarmotApp::with_relay_and_config(dir.path(), url, config)
+        .with_recovery_runner_ownership_for_test(false);
     let storage = reopened.account_storage(&account.label).unwrap();
     assert_eq!(
         storage

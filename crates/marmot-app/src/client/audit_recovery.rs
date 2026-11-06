@@ -376,6 +376,12 @@ impl AppClient {
         &self,
         storage: &SqliteAppStorage,
     ) -> Result<(), AppError> {
+        if self.app.recovery_runner_owns_debt() {
+            if self.synchronize_runner_loss(storage)? {
+                self.wake_recovery_runner();
+            }
+            return Ok(());
+        }
         let imports = storage.synchronize_account_delivery_loss(&self.state.label)?;
         self.record_recovery_loss_imports(imports);
         Ok(())

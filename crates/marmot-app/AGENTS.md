@@ -641,14 +641,29 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
-  and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. Every account open widens every current route's standing goal, cursor or not; a runner
+  in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
+  fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
+  records its per-cause aggregate `conversion` trace before the first quantum, acknowledges that report and imports
+  ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. A newly armed
+  epoch-gap obligation and invalidation of its group's existing ledger goals commit together through
+  `arm_epoch_gap_recovery`. Invalidate only on a new obligation revision, using the durable goal bounded by retention,
+  never the Welcome hint; duplicate observations preserve replacement coverage. Failed writes remain buffered for
+  the existing retry seam. Wake the runner after the transaction succeeds. The native source's
+  original range is durably owed before its generation may authorize a cursor seal; the seal still checks placement,
+  spill and held input under the existing locks. A failed ledger write never grants that permission. Every account open widens every current route's standing goal, cursor or not; a runner
   settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
   without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
   what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
-  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
+  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. The one
+  exception is `ReplayLiveCount::sent_nothing`: the account pool's wire tap saw no EVENT frame for the REQ before its
+  EOSE, so the empty count proves from the REQ's `since` (`live_boundary_since`). Never derive it from anything but
+  the wire. It keeps a join from owing each quiet route a sliver
+  (`a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins`). It also proves a quiet group's whole history, so a
+  runner fixture that owes history on a quiet group either owes it through a loss (`uncover_recovery_coverage`) after
+  its live REQs went out or opts out with `MarmotApp::with_unvouched_relay_replies_for_test`; tests of the wire
+  proof itself never opt out. Read the
   un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
   loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
   after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a
@@ -683,10 +698,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
-  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
-  `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
-  With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
+  `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Controlled comparison fixtures can select
+  the old owner through the value-only `test-support` builder; this is never a host setting or cargo feature.
+  With the gate off nothing constructs it and the comparison owner keeps every behavior.
+  `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
+  reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
+  A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
+  ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
+  unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled
+  epoch starts a new one. Before each debt turn, actual local epoch advancement clears resolved gaps.
+  A source that failed off the admission frontier cannot block a healthy source's next visit; its range
+  stays uncovered and its own unit backoff/breaker still applies. A visit completes only after at least
+  one required source covered its goal and its own group's releasable staging drained. An all-source outage
+  leaves the current visit in progress; unrelated staging never postpones completion. Partial progress alone ends no visit.
+  Suspended groups receive no visits. Healthy periodic rechecks remain NIP-77-only. `host` is its only seat:
   the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
   admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still
   holds one (`SpawnedRunner::stop`), so a preempted quantum settles there but nothing is ingested on the way out.
@@ -695,7 +721,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
   and after a crash, the charge stays until it ages out of the hour. A
   directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
-  loss branch. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
+  loss branch; `sync()` then reads the live frames the pass released before returning, since no worker will. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
   changes and returns its storage error without running the debt read. The existing admission/survey local-failure
   backoff schedules its retry; never add an immediate self-wake or report a successful zero-debt survey on failure.
   The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
@@ -718,18 +744,50 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
+  Each bounded admission batch checks due epoch-gap visits inside its existing planning turn. Merely pending
+  gap work adds no worker round trip; ready history continues draining within the caller's existing bound.
+  Opening a visit yields to ordinary debt selection so unrelated staging cannot postpone its fetch. Updated
+  frontiers still hold newer staging; nonempty or held staging alone never defers needed network work.
+  Send that bounded admission batch in one worker command, stopping its attempted
+  prefix on the first NoTrace/error, pending effects or self-removal; never charge every input a separate worker handoff.
   Admission releases a group's staged events oldest first below its admission frontier, never past an event the
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
-  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
-  (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
-  `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
-  with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
-  them or `enable_live_fences` before the switch-over. The inbox is a route like a group's, compared only and never
+  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences;
+  fetched staging inside that capture keeps it fenced until admission, even after acquisition coverage completes.
+  Staging outside a capture never turns empty-count or restart-gap debt into a fence. The fence is a query
+  (`live_fences`) over each unit's durable capture ranges, holding through an account breaker pause and while no
+  required relay serves the group and a unit still pursuing its debt owes it: through unreachable spells, cooldowns
+  and deadline-cut answers, until the unit saturates (an answered quantum stopped on the first second it owes because
+  its relay cannot prove it under the caps the relay published; migration 0151 records that second, and a change in
+  the relay's recorded caps clears it; a deadline cut, an inconclusive NIP-77 answer (a listed id the relay then
+  withheld, a malformed exchange, or a cut one-id fetch), or unknown caps never saturate) or breaks (a live frame
+  opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for good). A
+  saturated unit leaves the frontier even after advancing, while that second is still the first it owes. A quantum
+  whose proven slices an un-cover took back mid-fetch settles as unanswered: due again at once, holding its fence.
+  Every debt turn first prunes the ledger to the retention floor (once per hour of floor movement per process), so a
+  capture older than the window fences nothing. A wake-collection (`CursorPersistence::Frozen`) process's runner
+  admits and answers fences but fetches only for every route of a group whose live frames a fence holds (they share
+  its frontier), or for an explicit full-history repair (`fetches_unasked`). The runner reads live counts through its
+  own `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
+  with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a
+  successful debt turn.
+  Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`
+  plus `enable_live_fences` before any native input or REQ. Both native backward-paging entry points are then off
+  for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
+  repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry
+  armed; the worker seats it once a preparation succeeds, even if that refresh then fails (`recovery_runner_due`).
+  Gate-off callers keep the legacy behavior. Imported loss releases the plane cursor fence only at the exact
+  generation/writer barrier; transactional evidence reclamation follows, restoring the guard on failure. This handoff never records recovery success or coverage. The inbox is a route like a group's, compared only and never
   swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
   comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
-  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
-  worker spawns its runner before the startup drain and hands its `SpawnedRunner` through the command context.
+  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight.
+  Explicit repair includes history through its request time inside a healthy live tail: a relay may restore stored
+  events without redelivering them on the open live REQ. Its request-local `PassBound::repair_until` changes debt
+  reads only for that repair, including admission and the verdict; cancellation/drop leaves normal tail authority
+  unchanged. Ordinary passes still subtract healthy live tails. The
+  worker spawns its runner after initial startup catch-up and before replaying deferred commands, and hands its
+  `SpawnedRunner` through the command context. A later successful paced preparation retry seats it at a loop boundary.
   Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
   today (`serve_repair`). Verdicts are today's, never `Ok`, leave a suspended group's routes out, and need something
   judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
@@ -1052,7 +1110,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
   recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
   runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
-  a direct client), `invite_recovery.rs` (durable invitation recovery),
+  a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
+  using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
@@ -1092,6 +1151,9 @@ than replaying those matrices here.
 
 ```sh
 cargo test -p marmot-app
+# Retained comparison-owner cursor and native startup-prefix characterizations:
+# Other partial-summary cases use the production default, including live ingress.
+cargo nextest run -p marmot-app --test since_floor --test partial_sync_summary --features test-support,test-policy-overrides
 # Accelerated recovery/retry scenarios (also enabled by workspace CI):
 cargo test -p marmot-app --features test-policy-overrides
 # Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):

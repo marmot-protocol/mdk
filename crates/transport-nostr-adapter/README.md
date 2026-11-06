@@ -114,6 +114,12 @@ Account, endpoint-safety, and envelope validation stay outside this accounting b
 
 ## Ordered subscription replay
 
+For accounts delegated to the recovery runner, `account_subscription_input` reports whether the current replies
+ended and passed native placement. A full reply can settle a wait or let an unchanged activation reuse its REQs
+while older history remains owed. `account_subscription_eose` keeps the complete-original-query meaning: a
+clamped delegated reply never certifies history or authorizes a cursor. Loss, placement and cursor guards remain
+independent of input readiness.
+
 Initial activation, group-subscription sync, and recovery maintenance stage group deliveries through stored
 replay and any backward pages, then release each group's batch in `(created_at, event id)` order. Live
 arrivals during release queue behind that batch. Each REQ/relay/route owns its historical claims and admission
@@ -388,7 +394,9 @@ a full one-second slice is fetched through NIP-77. Completeness comes from count
 relay's NIP-11 `max_limit` (strfry 500, wok's marmot preset 5,000), or, with no published cap, a reply below the
 largest full reply the relay sent. That count is proof only for kinds everyone may read, as kind 445 is: strfry spends its cap on events it withholds. `rate-limited:` refusals are waited out; unreachable relays and refusals are
 reported apart from "answered, nothing new". Each call reports its covered slices (with their proof) and one
-outcome for the caller's backoff. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
+outcome for the caller's backoff. Fullness uses the raw received count before SDK validation: a raw page of
+500 with one invalid signature still counts as full even though only 499 events survive. The wire sweep regression
+keeps all 1,200 valid historical events exact and oldest first across that boundary. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
 `NostrSdkRelayClient`'s pool. nostr-sdk drops NIP-67 hints, so a client built with `from_builder` reads `more` off
 the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one: `finish` is ignored, since a misread
 `finish` would skip history. A call cut by its deadline or cancellation interrupts the request in flight rather than

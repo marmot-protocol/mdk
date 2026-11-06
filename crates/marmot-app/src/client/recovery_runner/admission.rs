@@ -10,9 +10,20 @@
 //!   relays that still owe it history. A unit's position is the first second
 //!   it owes after its live tail.
 //! - **Leaving the frontier.** A unit stops holding the frontier once its
-//!   last quantum ended without progress (no progress, unreachable, refused),
-//!   and while its relay cools down or it is broken or retired. What it
-//!   stages later is late input.
+//!   last quantum ended without progress (no progress, unreachable, refused)
+//!   or stopped on the first second it owes because its relay cannot prove
+//!   it under the caps the relay published (saturated, even after advancing),
+//!   and while its relay cools down or it is broken or retired. An answer its
+//!   deadline cut, or a relay whose caps were never read, saturates nothing.
+//!   What it stages later is late input. When no unit serves its group (each
+//!   has left, and none is an active one with nothing left to fetch), the
+//!   group is stranded: each of its units still pursuing its debt holds the
+//!   frontier again, so nothing newer opens ahead of history its relay may
+//!   still return, through unreachable spells, cooldowns and answers cut
+//!   short. A saturated unit's relay cannot give that second while its caps
+//!   stand (asking again stops there), and a broken unit's debt is parked, so
+//!   neither holds anything. Saturation names its second: a unit that owes an
+//!   earlier one first, or whose relay publishes other caps, pursues again.
 //! - **Backpressure.** A relay at a group's staging bound (its events or
 //!   bytes for the group), or any relay while the account is at its own, is
 //!   not eligible while another unit holds the group's frontier, until that
@@ -31,13 +42,16 @@
 //!   count left unproven. An empty count's range is cold-start debt, owed but
 //!   never fencing, and so are loss, re-check and epoch-gap debt. A group's
 //!   held frames are released below the first second its fencing units still
-//!   owe in their capture debt. A unit off the frontier fences nothing until
-//!   it is back on it. Each unit keeps every capture range it still owes
+//!   owe in their capture debt or still awaiting admission inside the capture.
+//!   A unit off the frontier does not fence unfetched debt, but an already
+//!   fetched capture prefix still reaches the engine before newer live input.
+//!   A stranded group's units are back on its frontier, so they fence it.
+//!   Each unit keeps every capture range it still owes
 //!   durably, so the hold comes back after a restart, when the counts are
 //!   gone.
 //!
-//! Each admission turn ingests at most a few events, one worker command each,
-//! so the worker serves commands and live input between them. An event the
+//! Each admission turn ingests at most a few events in one worker command,
+//! so the worker serves commands and live input between bounded batches. An event the
 //! engine keeps no trace of (refused for resources) stays staged, and its
 //! group waits behind it on the local-failure backoff, stalled; other groups
 //! go on.
@@ -53,8 +67,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
-    RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnitState, StagedRecoveryEvent,
-    TransportReconciliationRoute,
+    RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnit, RecoveryUnitState,
+    StagedRecoveryEvent, TransportReconciliationRoute,
 };
 
 use super::policy::RecoveryStagingBounds;
@@ -154,6 +168,14 @@ struct Member {
     key: UnitKey,
     /// The first second it owes after its live tail.
     position: Option<u64>,
+    /// Whether it left the frontier as a failed source.
+    left: bool,
+    /// Whether it serves its group: it has not left, or it is active with
+    /// nothing left to fetch, whatever its last answer was.
+    serves: bool,
+    /// Whether its unit still pursues history its relay may return: it is
+    /// neither broken nor saturated.
+    pursued: bool,
     on_frontier: bool,
     /// The capture ranges it keeps durably.
     stored: Vec<RecoveryCoverageRange>,
@@ -161,13 +183,20 @@ struct Member {
     /// in them.
     fences: Vec<RecoveryCoverageRange>,
     first_owed: Option<u64>,
+    /// Fetched but not yet admitted input inside this member's capture.
+    /// Coverage can finish before this prefix reaches the engine.
+    first_staged: Option<u64>,
 }
 
 impl Member {
     /// Below which second it lets its group's live frames go, if it holds
     /// them.
     fn holds_live_frames(&self) -> Option<u64> {
-        self.first_owed.filter(|_| self.on_frontier)
+        self.first_owed
+            .filter(|_| self.on_frontier)
+            .into_iter()
+            .chain(self.first_staged)
+            .min()
     }
 }
 
@@ -290,21 +319,18 @@ impl<'t> Admission<'t> {
         Ok(usage.events >= bounds.group_events || usage.bytes >= bounds.group_bytes)
     }
 
-    /// The routes whose units hold their group's live frames behind a fence:
-    /// the runner serves them first.
+    /// Every route of each group whose live frames a fence holds: the runner
+    /// serves them first. A route owing older history outside any capture
+    /// still holds the group's shared frontier, so the fence waits on it too.
     pub(super) fn fenced_routes(
         &mut self,
     ) -> StorageResult<BTreeSet<TransportReconciliationRoute>> {
         let mut routes = BTreeSet::new();
         for key in self.fence_groups()? {
             let group = self.group(&key)?;
-            routes.extend(
-                group
-                    .members
-                    .iter()
-                    .filter(|member| member.holds_live_frames().is_some())
-                    .map(|member| member.key.route.clone()),
-            );
+            if group.release_before().is_some() {
+                routes.extend(group.routes.iter().cloned());
+            }
         }
         Ok(routes)
     }
@@ -476,6 +502,10 @@ impl<'t> Admission<'t> {
     fn read_group(&mut self, key: &GroupKey) -> StorageResult<Group> {
         let turn = self.turn;
         let routes = self.groups.get(key).cloned().unwrap_or_default();
+        let group_routes = routes
+            .iter()
+            .map(|route| route.route.clone())
+            .collect::<Vec<_>>();
         let mut members = Vec::new();
         for route in routes.iter().copied() {
             for relay in route.required.iter().collect::<BTreeSet<_>>() {
@@ -484,10 +514,19 @@ impl<'t> Admission<'t> {
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;
                 let unit = turn.app.recovery_unit(&route.route, relay)?;
+                let position = debt.first().map(|range| range.since_seconds);
+                // Its relay could not prove the first second it still owes,
+                // under the caps it still publishes.
+                let saturated = unit
+                    .as_ref()
+                    .is_some_and(|unit| saturated_at(unit, position));
                 let left = self.relay_left(relay)?
-                    || unit.as_ref().is_some_and(|unit| {
-                        unit.no_progress > 0 || unit.state != RecoveryUnitState::Active
-                    });
+                    || unit.as_ref().is_some_and(|unit| unit_left(unit, saturated));
+                let state = unit.as_ref().map(|unit| unit.state);
+                let pursued = !saturated
+                    && unit
+                        .as_ref()
+                        .is_none_or(|unit| !matches!(unit.state, RecoveryUnitState::Broken(_)));
                 let key = UnitKey {
                     route: route.route.clone(),
                     relay: relay.clone(),
@@ -504,22 +543,97 @@ impl<'t> Admission<'t> {
                             .copied(),
                     )
                     .collect();
-                let position = debt.first().map(|range| range.since_seconds);
-                let (fences, first_owed) = owed(merge(captures), &debt);
+                let captures = merge(captures);
+                let (mut fences, first_owed) = owed(captures.clone(), &debt);
+                let mut first_staged = None;
+                for capture in captures {
+                    let mut pending = None;
+                    for route in &group_routes {
+                        let items = turn.app.staged_recovery_items(
+                            route,
+                            capture.since_seconds,
+                            capture.until_seconds,
+                        )?;
+                        pending = super::sooner(pending, items.first().map(|item| item.created_at));
+                    }
+                    if let Some(at) = pending {
+                        first_staged = super::sooner(first_staged, Some(at));
+                        if !fences.contains(&capture) {
+                            fences.push(capture);
+                        }
+                    }
+                }
+                fences.sort_by_key(|range| range.since_seconds);
                 members.push(Member {
                     key,
                     position,
-                    on_frontier: position.is_some() && !left,
+                    left,
+                    serves: !left
+                        || (position.is_none()
+                            && state.is_none_or(|state| state == RecoveryUnitState::Active)),
+                    pursued,
+                    on_frontier: false,
                     stored,
                     fences,
                     first_owed,
+                    first_staged,
                 });
             }
+        }
+        // A failed source stops holding up its peers. With no source left to
+        // serve the group, each one still pursuing its debt holds instead: a
+        // frame opened ahead of history its relay may still return can put
+        // that history past the ratchet's out-of-order window.
+        let stranded = !members.iter().any(|member| member.serves);
+        for member in &mut members {
+            member.on_frontier = member.position.is_some()
+                && if stranded {
+                    member.pursued
+                } else {
+                    !member.left
+                };
         }
         Ok(Group {
             routes: routes.iter().map(|route| route.route.clone()).collect(),
             members,
         })
+    }
+
+    /// A failed source stops holding up its peers. Its range stays owed;
+    /// leaving the frontier is never a coverage certificate.
+    pub(super) fn source_left_frontier(
+        &mut self,
+        route: &RunnerRoute,
+        relay: &'t str,
+    ) -> StorageResult<bool> {
+        let turn = self.turn;
+        let unit = turn.app.recovery_unit(&route.route, relay)?;
+        let position = match &unit {
+            Some(unit) if unit.saturated_second.is_some() => turn
+                .app
+                .recovery_unit_debt(&route.route, relay, turn.owed_until(route, relay))?
+                .first()
+                .map(|range| range.since_seconds),
+            _ => None,
+        };
+        Ok(self.relay_left(relay)?
+            || unit
+                .as_ref()
+                .is_some_and(|unit| unit_left(unit, saturated_at(unit, position))))
+    }
+
+    /// Whether this group's already fetched prefix can still be admitted.
+    /// A return visit must hand off that prefix before spending another visit.
+    /// This excludes frontier-held history and leaves unrelated groups alone.
+    pub(super) fn ready_for(&mut self, route: &RunnerRoute) -> StorageResult<bool> {
+        let Some(key) = self.route_groups.get(&route.route).cloned() else {
+            return Ok(false);
+        };
+        let group = self.group(&key)?;
+        let before = group.frontier().unwrap_or(NO_FRONTIER);
+        let routes = group.routes.clone();
+        let read = self.turn.app.staged_recovery_events(&routes, before, 1)?;
+        Ok(!read.events.is_empty() || !read.undecodable.is_empty())
     }
 
     /// Whether the relay's last answer was that it could not be reached, or
@@ -540,6 +654,20 @@ impl<'t> Admission<'t> {
         self.relays_left.insert(relay, left);
         Ok(left)
     }
+}
+
+/// Whether the unit's relay could not prove `position`, the first second it
+/// still owes, under the caps it still publishes.
+fn saturated_at(unit: &RecoveryUnit, position: Option<u64>) -> bool {
+    unit.saturated_second
+        .is_some_and(|second| Some(second) == position)
+}
+
+/// Whether a unit's last quantum ended without progress or stopped on the
+/// second it still owes first because its relay cannot prove it
+/// (`saturated`), or it is broken or retired.
+fn unit_left(unit: &RecoveryUnit, saturated: bool) -> bool {
+    unit.no_progress > 0 || saturated || unit.state != RecoveryUnitState::Active
 }
 
 /// Admission order: `(created_at, id)`.
@@ -602,7 +730,10 @@ fn bounded(mut fences: Vec<RecoveryCoverageRange>, per_unit: usize) -> Vec<Recov
 
 /// Where each fenced group's held live frames may be released up to, as of
 /// `turn`. PR 5's adapter hold reads this in place of owner capture; like the
-/// live tails it is a query, never a value to keep across a wait.
+/// live tails it is a query, never a value to keep across a wait. It holds
+/// while the account breaker pauses the runner: a live frame opened ahead of
+/// its sender's owed messages can put them past the ratchet's out-of-order
+/// window, where no owner can open them.
 pub(crate) fn live_fences(turn: &DebtTurn<'_>) -> StorageResult<Vec<LiveFence>> {
     Admission::new(turn).live_fences()
 }
@@ -621,6 +752,19 @@ fn plan(
     policy: &RecoveryRunnerPolicy,
     held: &BTreeSet<GroupKey>,
 ) -> StorageResult<Batch> {
+    // Retry selection shares this already-required worker turn. A merely
+    // pending gap must not add another scheduling round trip to every batch.
+    // A visit that actually reopens debt yields to its network selection.
+    let stalled = Stalled {
+        all: false,
+        groups: held.clone(),
+    };
+    if super::epoch_gap::advance(turn, policy, &stalled)?.started {
+        return Ok(Batch {
+            events: Vec::new(),
+            discarded: 0,
+        });
+    }
     let mut admission = Admission::new(turn);
     admission.reclaim_unlisted()?;
     admission.record_fences(policy.fences_per_unit)?;
@@ -712,8 +856,10 @@ impl Memory {
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
-    /// Admit what staging may release, one turn after another, until a turn
-    /// finds nothing. Returns how the pass ended, or the step to end with.
+    /// Admit in bounded worker batches. Each batch's plan also checks due gap
+    /// visits, so neither a large backlog nor extra worker scheduling can
+    /// starve recovery. Only opening a visit yields to network selection.
+    /// Returns how the pass ended, or the step to end with.
     /// Holds and waits are armed from the clock as read after the awaits
     /// that led to them, so none is born expired.
     pub(super) async fn admit(&mut self, pass: Option<&PassBound>) -> Result<Drained, Step> {
@@ -732,8 +878,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             let planned = held.clone();
             let policy = self.policy;
             let batch = match self
-                .host
-                .debt_turn(move |turn| plan(turn, &policy, &planned))
+                .debt_turn(pass, move |turn| plan(turn, &policy, &planned))
                 .await
             {
                 None => return Err(Step::Stopped),
@@ -755,14 +900,23 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
             // In order; an event the engine kept no trace of, or a failure,
             // ends the turn, so nothing newer of its group goes ahead of it.
-            let mut tried = Vec::with_capacity(batch.events.len());
+            let (keys, deliveries): (Vec<_>, Vec<_>) = batch
+                .events
+                .into_iter()
+                .map(|(group, event)| {
+                    (
+                        (group, event.delivery.message.id.as_slice().to_vec()),
+                        event.delivery,
+                    )
+                })
+                .unzip();
+            let Some(outcomes) = self.host.admit_staged(deliveries).await else {
+                return Err(Step::Stopped);
+            };
+            let mut tried = Vec::with_capacity(outcomes.len());
             let mut failure = None;
-            for (group, event) in batch.events {
-                let event_id = event.delivery.message.id.as_slice().to_vec();
-                let Some(admitted) = self.host.admit_staged(event.delivery).await else {
-                    return Err(Step::Stopped);
-                };
-                tried.push((group, event_id));
+            for (key, admitted) in keys.into_iter().zip(outcomes) {
+                tried.push(key);
                 match admitted {
                     Ok(Admitted::Kept) => {}
                     Ok(Admitted::NoTrace) => break,

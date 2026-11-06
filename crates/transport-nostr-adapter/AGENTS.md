@@ -27,16 +27,16 @@ for reconnect/backoff and relay status mechanics.
 | `src/key_package.rs` | Marmot kind `30443` KeyPackage event building/publishing (`NostrKeyPackagePublication`, `NostrKeyPackagePublisher`). |
 | `src/pairing.rs` | Device-pairing messages as rumors gift-wrapped to the account's own key. Built only with `unreleased-device-pairing` and in this crate's tests. |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
-| `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Called by `marmot-app`'s recovery runner `quantum.rs`, behind its internal `runner_owns_debt` gate (off by default). |
+| `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it and counts each live REQ's reply frames. Called by `marmot-app`'s recovery runner `quantum.rs`, which owns account history debt by default since PR 5g. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. Called by the same recovery runner's `compare.rs`; its `host.rs` builds `SdkSweepRelay` from the account's existing pool. |
-| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, the one-deadline expiry. Nothing enables it before the switch-over (PR 5g). |
+| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed delegated holds, legacy one-deadline expiry, and buffered live frames, held or waiting for admission, moving to the coverage a fresh activation installs. Enabled by the recovery runner from PR 5g. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
 | `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
-| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp, NIP-77 saturated second, resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
+| `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp including raw500/validated499 with1,200valid events (#2885), NIP-77 saturated second, an inconclusive second (a listed id withheld, a malformed NEG-MSG, or repeated id-fetch events that cut a one-id reply; retried and never saturated), resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
 
 ## Invariants
@@ -95,6 +95,10 @@ for reconnect/backoff and relay status mechanics.
     only then does that relay's EOSE count.
   - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
+  - An account that delegates replay recovery before activation starts neither native paging entry point.
+    A full live reply becomes `Delegated`, not complete-query `Eose`: its received input can be admitted under
+    the owner's bounded fence, while the coverage gate stays incomplete. Raw live counts survive; the ledger
+    owner proves the missing range. Direct adapter callers retain native paging unless they delegate explicitly.
 - Keep each endpoint's `ReplayLiveCount` to its own physical EOSE in one source generation (the endpoint serial), for
   the coverage ledger's live boundary (#2660). Backward paging keeps it. Its `requested_at` must be no later
   than when the relay ran the query: the endpoint's stamp taken before its REQ is issued, raised for a REQ the SDK
@@ -174,13 +178,19 @@ for reconnect/backoff and relay status mechanics.
 - A fence (`src/replay_fence.rs`) holds one group's live frames from its point on, never the account: held frames count
   neither in `admission_pending` nor against request placement or stream admission, and every release path
   (`GroupReplay::release`, native ingress, both `stage_delivery` fast paths) lets out only what lies below the point.
-  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty and not clamped holds the REQ's
+  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty and not being paged natively holds the REQ's
   groups from its `since` until a `fence_replay` plan whose ticket saw that count as admitted answers it. An arming
   belongs to its own count: `ReplayEndpoint::count_id` moves whenever a live count is installed or ends, and only an
   arming whose count is still current can be admitted or kept unanswered, so a count that ends or is replaced (an empty
-  or clamped recount) before admission drops its arming. A fence holds at most one `REPLAY_PAGE_LIMITS.max_duration`;
-  then its frames go out as late input and plans are ignored until a new count arms the group; a plan older than the
-  last applied is ignored, and a fence nothing holds ends at once. A fence holds only what is still in the replay
+  or natively paged recount) before admission drops its arming. Delegated accounts also fence nonempty full replies,
+  without counting them as complete coverage. Only non-delegated fences expire after one `REPLAY_PAGE_LIMITS.max_duration`, releasing late input and
+  ignoring plans until a new count arms the group. Delegated holds have no request deadline: their owner advances or
+  releases them as durable backlog admission permits; no expired timer authorizes newer input. Unanswered armings
+  still retire with their unadmitted count. A plan older than the
+  last applied is ignored, and a fence nothing holds ends at once. A fresh activation (`record_account_replay_start`)
+  moves the buffered live frames native ingress does not own into the new coverage: those fences hold stay held from
+  the same point under the old plan ticket, and those still waiting for admission wait there. Only frames for groups
+  its REQs no longer route, or past the buffer bounds, become replay loss. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin
   until its next hand-off; while a fence holds it there, that pin is exempt (`held_pins`), but a pin on a copy still out
@@ -212,8 +222,12 @@ for reconnect/backoff and relay status mechanics.
   the SDK registry when the queued notification is handled, since a later re-send may have changed it. An unknown
   authenticator keeps `auth-required:` pending. The forwarder test pins the table against the SDK registry. Treat a
   staged group-sync REQ as live. A dropped refusal before EOSE settles that relay's replay coverage but never
-  completes it: `AccountSubscriptionEose::settled` may end a wait, only `complete` may gate live cursor promotion or
-  activation reuse. Ending a drain early on `settled` must leave its checkpoint exactly as the drain's timeout would. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
+  completes it. Keep original-query `AccountSubscriptionEose` separate from `AccountSubscriptionInput`: delegated
+  full replies end current input, so activation reuse, announce readiness and drain waits use the latter. Neither its `complete`
+  nor `settled` qualifies history or promotes a cursor. Native placement and the plane's loss barrier still guard
+  readiness; cursor qualification keeps its independent guarded seal. Repack floor selection still requires
+  original-query completion: current-input readiness must not discard an unresolved original floor. Ending a drain early on settled input must
+  leave its checkpoint exactly as the drain's timeout would. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
   telemetry and the audit queue.
 - Keep the time-sliced sweep (`src/sweep/`) a mechanism: it covers what one call can of one (route, relay, range)
@@ -247,6 +261,16 @@ for reconnect/backoff and relay status mechanics.
   `RelayMessage` parser, which alone decides that a frame ends the REQ. It runs before the SDK's size check, so it
   parses only EOSEs of at most 1 KiB, outside its lock. It never alters, delays or drops a frame, and keeps no event,
   id or payload past the watch.
+- The same tap counts, per REQ, the EVENT frames its relay sends before that REQ's EOSE, valid or not, on the
+  connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
+  `NostrRelayClient::reply_sent_nothing` once as it dispatches each EOSE, and each ask answers only the oldest EOSE
+  for the id not yet asked about, true only if that is also the newest (the SDK may have re-sent the id and had it
+  answered before the dispatch); every EOSE frame is counted, even with no count open. The live count keeps the answer as
+  `ReplayLiveCount::sent_nothing` only when the SDK counted nothing either; `marmot-app` lets only that empty count
+  prove its window. Err toward unknown: a frame the tap cannot tie to one REQ while counts are open (an unreadable EVENT
+  id, an oversized EOSE, a binary frame) spoils every open count on its connection; a REQ re-sent on the same
+  connection while the relay may still answer the earlier one (open, spoiled, or closed by the client) starts unknown;
+  past 1,024 REQs per relay the oldest count goes. Wrappers of a tapped client delegate `reply_sent_nothing`.
 - Keep real relay clients behind `NostrRelayClient`.
 - Both SDK consumers enter through `dispatch_sdk_replay`; `dispatch_sdk_notification` is its private payload handler.
   Observe and admit a raw group copy from one validated/decoded transport message, outside the state write lock.

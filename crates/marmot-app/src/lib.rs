@@ -488,11 +488,9 @@ const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 *
 pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
-/// The internal `runner_owns_debt` gate's default (mdk#2660 phase 4): off
-/// until the switch-over's flip turns it on. While off, no recovery runner
-/// runs and the comparison owner keeps every behavior; proofs turn it on per
-/// app ([`MarmotApp::with_recovery_runner_owning_debt`]).
-const RECOVERY_RUNNER_OWNS_DEBT: bool = false;
+/// Account history belongs to the coverage-ledger recovery runner. The old
+/// owner remains available only for controlled comparisons during retirement.
+const RECOVERY_RUNNER_OWNS_DEBT: bool = true;
 /// Maximum amount the persisted transport cursor may run ahead of local
 /// wall-clock. The cursor is advanced from the inbound message timestamp, which
 /// is the sender-controlled Nostr `created_at` of the outer kind-445 event and
@@ -589,6 +587,9 @@ pub struct MarmotApp {
     /// The internal `runner_owns_debt` gate; see
     /// [`Self::recovery_runner_owns_debt`].
     recovery_runner_owns_debt: bool,
+    /// See [`Self::with_unvouched_relay_replies_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    unvouched_relay_replies: bool,
     config: MarmotAppConfig,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
@@ -1626,13 +1627,45 @@ impl MarmotApp {
     /// Run each account's history recovery runner (mdk#2660 phase 4): the
     /// account worker spawns one per account and a directly owned client runs
     /// one pass in place from `sync()` and `next_event()`. Internal and
-    /// unsupported: the switch-over's proofs turn it on before the default
-    /// flips. Not a host setting. Call it before cloning the app or building
+    /// unsupported: explicitly selects the production default for comparison
+    /// proofs. Not a host setting. Call it before cloning the app or building
     /// a runtime from it.
     #[doc(hidden)]
     pub fn with_recovery_runner_owning_debt(mut self) -> Self {
         self.recovery_runner_owns_debt = true;
         self
+    }
+
+    /// Select the existing internal recovery owner for an upgrade/control
+    /// fixture. Only changes the value the production ownership paths read.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_recovery_runner_ownership_for_test(mut self, owns: bool) -> Self {
+        self.recovery_runner_owns_debt = owns;
+        self
+    }
+
+    /// Treat every live reply this app's accounts read as one the account
+    /// pool's wire tap could not vouch for, as from a relay that sends a
+    /// frame the tap cannot attribute: an empty live count then proves
+    /// nothing (`ReplayLiveCount::sent_nothing`). For runner fixtures that
+    /// seed debt on a quiet group, which the group's own empty live REQ
+    /// would otherwise prove. Call it before cloning the app.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_unvouched_relay_replies_for_test(mut self) -> Self {
+        self.unvouched_relay_replies = true;
+        self
+    }
+
+    /// Whether live counts keep the wire tap's answer: always, outside
+    /// fixtures that opt out.
+    pub(crate) fn vouches_for_relay_replies(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.unvouched_relay_replies {
+            return false;
+        }
+        true
     }
 
     /// The internal `runner_owns_debt` gate: whether the recovery runner runs
@@ -1726,6 +1759,8 @@ impl MarmotApp {
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
             recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
+            #[cfg(any(test, feature = "test-support"))]
+            unvouched_relay_replies: false,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
@@ -1839,6 +1874,8 @@ impl MarmotApp {
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
             recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
+            #[cfg(any(test, feature = "test-support"))]
+            unvouched_relay_replies: false,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
@@ -2008,7 +2045,7 @@ impl MarmotApp {
         // Seated here, where the client is already held: in `client()` the
         // extra await would copy the client through its stack, gate off or
         // not.
-        client.seat_recovery_runner_in_place().await;
+        client.seat_recovery_runner_in_place().await?;
         Ok(client)
     }
 
@@ -2106,6 +2143,7 @@ impl MarmotApp {
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
+            self.recovery_runner_owns_debt(),
         )?;
         // Before the client activates any REQ; a failed read trusts none.
         let live_coverage = client::LiveCoverage::open(
@@ -2116,9 +2154,10 @@ impl MarmotApp {
             &open.adapter,
         )
         .await;
-        let incremental_request = if relay_plane
-            .subscription_rebuild_since(open.state.last_transport_timestamp)
-            .is_none()
+        let incremental_request = if !self.recovery_runner_owns_debt()
+            && relay_plane
+                .subscription_rebuild_since(open.state.last_transport_timestamp)
+                .is_none()
         {
             Some(
                 self.account_storage(&open.state.label)?
@@ -2244,6 +2283,10 @@ impl MarmotApp {
                 .config
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
+            runner_preparation_owed: false,
+            runner_pruned_floor: None,
+            #[cfg(test)]
+            fail_next_runner_preparation: false,
             checkpointed_transport_timestamp,
             saved_transport_timestamp: checkpointed_transport_timestamp,
             observed_commit_version: None,
@@ -2286,6 +2329,7 @@ impl MarmotApp {
             fail_next_convergence_retry_advance: false,
             post_join_maintenance_subscriptions: HashMap::new(),
             post_join_history_sessions: HashMap::new(),
+            runner_post_join: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]
@@ -5028,25 +5072,50 @@ impl MarmotApp {
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
-        recovery_storage
-            .app_storage()
-            .restore_unacknowledged_recovery_loss()?;
-        let recovery_loss_imports = recovery_storage
-            .app_storage()
-            .synchronize_account_delivery_loss(label)?;
-        let delivery_overflow_recovery = recovery_storage
-            .app_storage()
-            .account_delivery_recovery(label)?;
-        let notification_loss = recovery_storage
-            .app_storage()
-            .pending_recovery_demands()?
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
-        let delivery_overflow_recovery_pending =
-            delivery_overflow_recovery.is_some() || notification_loss.is_some();
-        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
-            .map(|recovery| recovery.marker_token)
-            .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
+        let (
+            recovery_loss_imports,
+            delivery_overflow_recovery_pending,
+            delivery_overflow_recovery_marker_token,
+        ) = if self.recovery_runner_owns_debt() {
+            // Retain the local cursor guard until fallible conversion/import
+            // runs with current routing. Reopen never recreates old jobs.
+            let app = recovery_storage.app_storage();
+            let pending = !app
+                .recovery_loss_snapshot(label, storage_sqlite::RecoveryLossCause::Queue)?
+                .is_empty()
+                || !app
+                    .recovery_loss_snapshot(
+                        label,
+                        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                    )?
+                    .is_empty();
+            (Vec::new(), pending, None)
+        } else {
+            recovery_storage
+                .app_storage()
+                .restore_unacknowledged_recovery_loss()?;
+            let recovery_loss_imports = recovery_storage
+                .app_storage()
+                .synchronize_account_delivery_loss(label)?;
+            let delivery_overflow_recovery = recovery_storage
+                .app_storage()
+                .account_delivery_recovery(label)?;
+            let notification_loss = recovery_storage
+                .app_storage()
+                .pending_recovery_demands()?
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
+            let delivery_overflow_recovery_pending =
+                delivery_overflow_recovery.is_some() || notification_loss.is_some();
+            let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
+                .map(|recovery| recovery.marker_token)
+                .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
+            (
+                recovery_loss_imports,
+                delivery_overflow_recovery_pending,
+                delivery_overflow_recovery_marker_token,
+            )
+        };
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();

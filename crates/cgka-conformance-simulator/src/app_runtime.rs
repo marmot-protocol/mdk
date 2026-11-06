@@ -30,8 +30,8 @@ mod process_server;
 #[cfg(test)]
 mod strfry_process_scale;
 pub use crate::relay_fault_proxy::{
-    HistoryRequestV1, PRODUCTION_RELAY_INFORMATION, RelayDeliveryPath, RelayEventDeliveryV1,
-    RelayTrafficV1,
+    ConnectionTrafficV1, HistoryRequestV1, LiveGroupReplyV1, PRODUCTION_RELAY_INFORMATION,
+    RelayDeliveryPath, RelayEventDeliveryV1, RelayTrafficV1,
 };
 pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
@@ -184,8 +184,8 @@ pub struct SupersededGroupChange {
 struct Topology {
     relay_pair: bool,
     in_process: BTreeSet<String>,
-    /// In-process participants whose recovery runner owns history debt.
-    runner_owns_debt: bool,
+    /// Optional owner override; absent means the app production default.
+    runner_owns_debt: Option<bool>,
 }
 
 /// Queued intents a participant's engine refused at drain and retired
@@ -465,7 +465,7 @@ pub struct AppRuntimeHarness {
     // Participants whose runtime lives in this process so probes can overlap.
     in_process: BTreeSet<String>,
     // Whether the in-process participants' recovery runner owns history debt.
-    runner_owns_debt: bool,
+    runner_owns_debt: Option<bool>,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
@@ -535,23 +535,38 @@ impl AppRuntimeHarness {
         let topology = Topology {
             relay_pair: true,
             in_process: in_process.iter().cloned().collect(),
-            runner_owns_debt: false,
+            runner_owns_debt: None,
         };
         Self::new_with_execution(clients, None, None, true, topology).await
     }
 
+    /// Set the existing internal owner for in-process seats from their next
+    /// open, so an upgrade can reopen the same account under the new owner.
+    pub fn set_runner_owns_debt(&mut self, owns: bool) {
+        self.runner_owns_debt = Some(owns);
+    }
+
     /// [`Self::new_with_relay_pair`] with the in-process participants' history
-    /// recovery owned by their account's recovery runner (mdk#2660 phase 4):
-    /// marmot-app's internal gate, turned on per app until the switch-over
-    /// flips its default. Everyone else keeps today's recovery.
+    /// recovery explicitly owned by their account's recovery runner.
+    /// Other participants follow the app production default.
     pub async fn new_with_relay_pair_owning_debt(
         clients: &[String],
         in_process: &[String],
     ) -> Result<Self, SubjectError> {
+        Self::new_with_relay_pair_owner_mode(clients, in_process, true).await
+    }
+
+    /// Pin the internal recovery owner for controlled comparisons; the ordinary
+    /// relay-pair constructor follows the production default.
+    pub async fn new_with_relay_pair_owner_mode(
+        clients: &[String],
+        in_process: &[String],
+        owns: bool,
+    ) -> Result<Self, SubjectError> {
         let topology = Topology {
             relay_pair: true,
             in_process: in_process.iter().cloned().collect(),
-            runner_owns_debt: true,
+            runner_owns_debt: Some(owns),
         };
         Self::new_with_execution(clients, None, None, true, topology).await
     }
@@ -871,6 +886,51 @@ impl AppRuntimeHarness {
             let owned =
                 requests.filter(|request| connections.get(&request.connection).is_some_and(theirs));
             owned.collect::<Vec<_>>()
+        });
+        Ok(owned.collect())
+    }
+
+    /// Each endpoint's wire cost over `client`'s own connections, from
+    /// connection `since[i]` on, summed: those whose `REQ`s named `client`'s
+    /// inbox and no other participant's, as in
+    /// [`Self::client_history_requests`].
+    pub async fn client_traffic(
+        &self,
+        client: &str,
+        since: &[u64],
+    ) -> Result<Vec<ConnectionTrafficV1>, SubjectError> {
+        let own = self.account_identity(client)?;
+        let others = self
+            .participants
+            .iter()
+            .filter(|(label, _)| label.as_str() != client)
+            .map(|(_, participant)| participant.account_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let traffic = self.relay_traffic(since, true).await?;
+        let owned = traffic.into_iter().map(|relay| {
+            let theirs = |inboxes: &BTreeSet<String>| {
+                inboxes.contains(own)
+                    && inboxes.iter().all(|inbox| !others.contains(inbox.as_str()))
+            };
+            let mut total = ConnectionTrafficV1::default();
+            for (connection, traffic) in relay.connection_traffic {
+                if !relay
+                    .connection_inboxes
+                    .get(&connection)
+                    .is_some_and(theirs)
+                {
+                    continue;
+                }
+                total.upstream_bytes += traffic.upstream_bytes;
+                total.downstream_bytes += traffic.downstream_bytes;
+                for (path, frames) in traffic.event_frames {
+                    *total.event_frames.entry(path).or_default() += frames;
+                }
+                for (path, bytes) in traffic.event_bytes {
+                    *total.event_bytes.entry(path).or_default() += bytes;
+                }
+            }
+            total
         });
         Ok(owned.collect())
     }
@@ -2766,7 +2826,7 @@ fn app_for_root(
     relay_urls: &[String],
     settlement_quiescence_ms: Option<u64>,
     maintenance_timing: Option<MaintenanceTiming>,
-    runner_owns_debt: bool,
+    runner_owns_debt: Option<bool>,
 ) -> MarmotApp {
     let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(ms) = settlement_quiescence_ms {
@@ -2776,10 +2836,9 @@ fn app_for_root(
         config = config.with_dev_maintenance_timing(timing);
     }
     let app = MarmotApp::with_relays_and_config(root, relay_urls.to_vec(), config);
-    if runner_owns_debt {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
+    match runner_owns_debt {
+        Some(owns) => app.with_recovery_runner_ownership_for_test(owns),
+        None => app,
     }
 }
 
@@ -3206,11 +3265,11 @@ enum Seat {
     /// Its own process, with today's recovery.
     Process,
     /// This process, so probes can overlap.
-    InProcess { runner_owns_debt: bool },
+    InProcess { runner_owns_debt: Option<bool> },
 }
 
 impl Seat {
-    fn new(in_process: bool, runner_owns_debt: bool) -> Self {
+    fn new(in_process: bool, runner_owns_debt: Option<bool>) -> Self {
         if in_process {
             Self::InProcess { runner_owns_debt }
         } else {

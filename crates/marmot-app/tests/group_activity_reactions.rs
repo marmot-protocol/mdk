@@ -8,7 +8,9 @@ use marmot_app::{
     MarmotApp, MarmotAppConfig, MarmotAppEvent, RuntimeTimelineMessagesSubscription,
     TimelineMessageQuery, TimelinePage,
 };
-use nostr_relay_builder::MockRelay;
+
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
 
 /// Open an isolated account home against the fixture relay without development settlement delays.
 fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
@@ -26,8 +28,9 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
 /// and that a reaction a live timeline showed survives a close made right after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn members_share_real_activity_targets_and_reactions_after_reopen() {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
+    // A relay that publishes its cap, as White Noise's do, so a reopened
+    // member's catch-up is proven rather than held for an unreadable document.
+    let (_relay, url) = limited_relay::mock_relay().await;
     let alice_dir = tempfile::tempdir().unwrap();
     let bob_dir = tempfile::tempdir().unwrap();
     let alice_id = AccountHome::open(alice_dir.path())

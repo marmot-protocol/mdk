@@ -51,11 +51,7 @@ async fn direct_client_on(
         url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
-    let app = if gate {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    };
+    let app = app.with_recovery_runner_ownership_for_test(gate);
     let client = app.client("alice").await.unwrap();
     (dir, app, client)
 }
@@ -189,6 +185,77 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
     surveyed.await.unwrap()
 }
 
+/// One real debt turn on `client`: the fences it answers, as release points.
+async fn debt_turn_fences(client: &mut AppClient) -> Vec<u64> {
+    let AccountRunner {
+        runner, mut turns, ..
+    } = client.build_recovery_runner().await;
+    let host = runner.host.clone();
+    let fenced = tokio::spawn(async move {
+        host.debt_turn(super::super::admission::live_fences)
+            .await
+            .expect("the debt turn was served")
+            .expect("the fences were read")
+    });
+    turns.recv().await.unwrap().serve(client).await;
+    let fences = fenced.await.unwrap();
+    fences
+        .into_iter()
+        .map(|fence| fence.release_before)
+        .collect()
+}
+
+/// The runner's debt turns age the ledger out of the retention window, as
+/// grant settlement did before the runner owned debt: a capture its relay
+/// never answered, older than the window, joins its route's parked remainder
+/// and fences nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        mut client,
+        storage,
+        _dir,
+        _pump,
+        ..
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    let route = group_routes(&client).pop().unwrap();
+    let relay = transport_nostr::canonical_relay("wss://a.example");
+    let now = unix_now_seconds();
+    let aged = storage_sqlite::RecoveryCoverageRange {
+        since_seconds: now - 32 * DAY,
+        until_seconds: now - 31 * DAY,
+    };
+    ledger
+        .widen_recovery_coverage_goals(std::slice::from_ref(&route), aged.since_seconds)
+        .unwrap();
+    ledger
+        .set_recovery_unit_fences(&route, &relay, &[aged])
+        .unwrap();
+
+    assert_eq!(debt_turn_fences(&mut client).await, Vec::<u64>::new());
+    // Another route's goal may slip a second below the floor while the
+    // fixture starts; only this route's parked history is under test.
+    let remainders = ledger
+        .recovery_coverage_remainders()
+        .unwrap()
+        .into_iter()
+        .filter(|remainder| remainder.route == route)
+        .collect::<Vec<_>>();
+    let [remainder] = remainders.as_slice() else {
+        panic!("one parked remainder, not {}", remainders.len());
+    };
+    assert_eq!(remainder.range.since_seconds, aged.since_seconds);
+    assert!(remainder.range.until_seconds >= aged.until_seconds);
+}
+
 /// A cursor-present reopen must owe a group added after cold start on each
 /// relay. A quiet replay cannot erase that gap, and only proving both relays
 /// clears the group's catching-up status (mdk#2862).
@@ -260,7 +327,7 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
 
     // Open on the existing plane, without network maintenance: the goal must
     // exist before transport activation or any epoch-gap demand can supply it.
-    let mut reopened = app
+    let reopened = app
         .local_client_with_relay_plane("alice", &app.relay_plane, None)
         .await
         .unwrap();
@@ -288,7 +355,19 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
     assert!(!off.inbox_catching_up);
     assert!(off.notices.is_empty());
 
-    reopened.app = reopened.app.clone().with_recovery_runner_owning_debt();
+    // A real takeover stops the old account context before installing the
+    // new policy; switching an already active adapter is deliberately refused.
+    let enabled_app = reopened.app.clone().with_recovery_runner_owning_debt();
+    enabled_app
+        .relay_plane
+        .deactivate_account_context(reopened.adapter.account_id())
+        .await
+        .unwrap();
+    drop(reopened);
+    let mut reopened = enabled_app
+        .local_client_with_relay_plane("alice", &enabled_app.relay_plane, None)
+        .await
+        .unwrap();
     reactivate_client(&mut reopened).await;
     let counts = reopened.recovery_runner_live_counts().await.counts;
     let group_counts = counts
@@ -434,10 +513,20 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(groups.len(), 2);
     let storage = app.account_storage("alice").unwrap().app_storage();
     let started = unix_now_seconds();
+    // A loss owes the last hour: the quiet groups' live REQs, which their
+    // relay answered with nothing, already proved it.
     storage
-        .widen_recovery_coverage_goals(&groups, started - HOUR)
+        .uncover_recovery_coverage(&groups, started - HOUR)
         .unwrap();
     let before = storage.recovery_account_usage(started).unwrap().attempts;
+    // Fresh service markers make this pass observable even when setup's
+    // inbox turn happened in the same wall-clock second.
+    fault_connection(&client)
+        .execute(
+            "UPDATE account_recovery_units SET last_served_at_seconds = NULL",
+            [],
+        )
+        .unwrap();
 
     let report = client.run_recovery_runner_pass().await.unwrap();
     let served = storage
@@ -464,6 +553,85 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     );
     assert!(report.advanced >= 2, "each group's empty hour was proved");
     assert_eq!(passes(&client), 2);
+}
+
+/// Bob's app over `dir` on `url`, as one `wn` process opens it.
+fn process_app(dir: &std::path::Path, url: &str) -> crate::MarmotApp {
+    crate::MarmotApp::with_relay_and_config(
+        dir,
+        url,
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_recovery_runner_ownership_for_test(true)
+}
+
+/// One `wn sync` process: a fresh direct client syncs once and exits.
+async fn one_shot_sync(dir: &std::path::Path, url: &str) -> crate::SyncSummary {
+    let app = process_app(dir, url);
+    let mut client = app.client("bob").await.unwrap();
+    assert!(client.has_in_place_recovery_runner());
+    let summary = client.sync().await.unwrap();
+    drop(client);
+    app.relay_plane.shutdown().await;
+    summary
+}
+
+use crate::tests::limited_relay as published_relay;
+
+/// A one-shot sync, as `wn sync` runs it, shows a message sent just before
+/// it. A fresh client owes the gap since its last sync, so its group's live
+/// REQ is fenced until its pass answers that gap. This relay publishes no cap
+/// and does not compare, so it cannot prove the second the message was sent
+/// in: the pass's sweep stops there, its unit is saturated, and the group is
+/// let go in the same pass. The frames the fence then releases are that
+/// sync's to read. A sync that returned before reading them lost them with
+/// its client, and no number of one-shot syncs showed the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_syncs_read_what_their_pass_released() {
+    let (_relay, url) = published_relay::relay_publishing(None).await;
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob = crate::AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let app = process_app(bob_dir.path(), &url);
+    let mut client = app.client("bob").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    client.sync().await.unwrap();
+    drop(client);
+    app.relay_plane.shutdown().await;
+
+    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone(), true).await;
+    let group = alice
+        .create_group_with_options(
+            "one shot",
+            &[bob.account_id_hex.as_str()],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let joined = one_shot_sync(bob_dir.path(), &url).await;
+    assert_eq!(joined.joined_groups, std::slice::from_ref(&group));
+
+    alice.send(&group, b"seed from alice").await.unwrap();
+    let mut shown = Vec::new();
+    for _ in 0..3 {
+        let synced = one_shot_sync(bob_dir.path(), &url).await;
+        shown.push(
+            synced
+                .messages
+                .into_iter()
+                .map(|message| message.plaintext)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        shown,
+        [vec!["seed from alice".to_owned()], Vec::new(), Vec::new()],
+        "the first sync after the send shows it, and only that one"
+    );
 }
 
 async fn serve_goal_future<T>(
@@ -628,6 +796,11 @@ async fn unreadable_welcome_metadata_never_widens_the_goal() {
     .await;
     let ledger = storage.app_storage();
     let route = group_routes(&client).pop().unwrap();
+    // Account-owned native ranges now create goals immediately. This fixture
+    // starts the route-goal preparation contract with no prior goal.
+    fault_connection(&client)
+        .execute("DELETE FROM account_recovery_coverage_goals", [])
+        .unwrap();
     assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
     let welcome_at = unix_now_seconds() - 60 * 60;
     let mut record = storage.get_group(&group).unwrap();
@@ -697,8 +870,10 @@ async fn held_client(
     let (dir, app, mut client) = direct_client_on(relay.url().await.to_string(), true).await;
     client.create_group("held", &[]).await.unwrap();
     let storage = app.account_storage("alice").unwrap().app_storage();
+    // A loss owes the last hour: the quiet group's live REQ, which its relay
+    // answered with nothing, already proved it.
     storage
-        .widen_recovery_coverage_goals(&group_routes(&client), unix_now_seconds() - HOUR)
+        .uncover_recovery_coverage(&group_routes(&client), unix_now_seconds() - HOUR)
         .unwrap();
     cover_inbox(&client, &storage);
     (dir, relay, client, storage)
@@ -757,6 +932,135 @@ fn fault_connection(client: &AppClient) -> rusqlite::Connection {
     )
     .unwrap();
     connection
+}
+
+/// Fresh epoch-gap evidence must create durable work even if the route was
+/// already swept. A failed handoff retries as one transaction, and polling an
+/// unchanged obligation must not erase the replacement proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_epoch_gap_reopens_covered_history_once_and_atomically() {
+    use crate::client::recovery_coverage::scenario_tests::{fixture_on, relay, routes};
+    let fixture = fixture_on(vec![relay()], true, Some(1), None).await;
+    let client = &fixture.client;
+    let app = fixture.storage.app_storage();
+    let routes = routes(client);
+    let group_route = routes
+        .iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap();
+    let now = unix_now_seconds();
+    let since = now - 2 * HOUR;
+    app.widen_recovery_coverage_goals(std::slice::from_ref(group_route), since)
+        .unwrap();
+    let relay = relay();
+    let cover = || {
+        for route in &routes {
+            app.record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route,
+                    relay: &relay,
+                    since_seconds: since,
+                    until_seconds: now,
+                    proof: RecoveryCoverageProof::SweepSlice,
+                }],
+                now,
+            )
+            .unwrap();
+        }
+    };
+    cover();
+    let mut wake = client.routing.recovery_runner_wake().subscribe();
+    let intent = StoredEpochBackfillIntent {
+        group_id_hex: hex::encode(fixture.group.as_slice()),
+        stalled_epoch: 0,
+    };
+    let faults = fault_connection(client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_gap_uncover BEFORE INSERT ON account_recovery_coverage_uncovers
+        BEGIN SELECT RAISE(ABORT, 'injected epoch-gap uncover'); END;",
+        )
+        .unwrap();
+    match client.arm_epoch_gap_recovery(std::slice::from_ref(&intent)) {
+        Err(crate::AppError::Storage(cgka_traits::storage::StorageError::Backend(message))) => {
+            assert!(message.contains("injected epoch-gap uncover"));
+        }
+        other => panic!("expected injected epoch-gap uncover failure, got {other:?}"),
+    }
+    assert!(
+        !app.pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|d| d.cause == RecoveryCause::EpochGap)
+    );
+    assert!(
+        app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    assert!(
+        !woken(&mut wake),
+        "a rolled-back arm does not wake the runner"
+    );
+    faults
+        .execute_batch("DROP TRIGGER fail_gap_uncover")
+        .unwrap();
+    let prior = app.recovery_coverage_mark().unwrap();
+    client
+        .arm_epoch_gap_recovery(std::slice::from_ref(&intent))
+        .unwrap();
+    assert!(woken(&mut wake));
+    assert!(
+        !app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    assert!(
+        app.recovery_coverage_covers(
+            &TransportReconciliationRoute::Inbox,
+            std::slice::from_ref(&relay),
+            since,
+            now
+        )
+        .unwrap()
+    );
+    assert!(app.recovery_coverage_goal(group_route).unwrap().unwrap() <= since);
+    // A quantum already running before the arm cannot certify over it.
+    app.record_recovery_coverage_since(
+        &[RecoveryCoverageSlice {
+            route: group_route,
+            relay: &relay,
+            since_seconds: since,
+            until_seconds: now,
+            proof: RecoveryCoverageProof::SweepSlice,
+        }],
+        now,
+        prior,
+    )
+    .unwrap();
+    assert!(
+        !app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    cover();
+    let mark = app.recovery_coverage_mark().unwrap();
+    client
+        .arm_epoch_gap_recovery(std::slice::from_ref(&intent))
+        .unwrap();
+    assert_eq!(app.recovery_coverage_mark().unwrap(), mark);
+    assert!(!woken(&mut wake));
+    assert!(
+        app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    let newer = StoredEpochBackfillIntent {
+        stalled_epoch: 1,
+        ..intent
+    };
+    client.arm_epoch_gap_recovery(&[newer]).unwrap();
+    assert!(woken(&mut wake));
+    assert!(
+        !app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
 }
 
 /// A settle the stop serves whose write fails leaves its attempt open, so the
@@ -1342,4 +1646,122 @@ async fn a_run_of_turns_never_starves_a_repairs_cancel() {
     .expect("the cancel is seen between turns");
     assert!(served.answered);
     assert!(matches!(served.end, RepairEnd::Cancelled));
+}
+
+/// The app hands loss to durable debt before releasing the plane's cursor
+/// fence. A failure after plane acknowledgment restores that fence and rolls
+/// back both causes' reclamation; retry never certifies the missing history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_loss_handoff_restores_the_guard_after_reclaim_failure() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use storage_sqlite::RecoveryLossCause;
+    let Fixture {
+        mut client,
+        storage,
+        _dir,
+        _pump,
+        relay: _relay,
+        ..
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let app = storage.app_storage();
+    assert!(!app.recovery_conversion_pending().unwrap());
+    let route = group_routes(&client).pop().unwrap();
+    let since = unix_now_seconds() - 100;
+    for (cause, token, count) in [
+        (RecoveryLossCause::Queue, 77, 2),
+        (RecoveryLossCause::NotificationConsumer, 78, 0),
+    ] {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            cause,
+            token,
+            count,
+            unix_now_seconds(),
+            Some(since),
+            Some(&[(route.clone(), since)]),
+        )
+        .unwrap();
+    }
+    client.synchronize_recovery_loss(&app).unwrap();
+    assert_eq!(app.converted_recovery_loss().unwrap().len(), 2);
+    assert!(
+        app.pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| !matches!(
+                demand.cause,
+                RecoveryCause::QueueLoss
+                    | RecoveryCause::NotificationLoss
+                    | RecoveryCause::SubscriptionReplay
+                    | RecoveryCause::IncrementalHistory
+                    | RecoveryCause::ExplicitHistory
+            ))
+    );
+    // Same durable-marker adoption boundary the plane uses on reopen.
+    client.adapter.start_delivery_overflow_recovery(77);
+    assert!(client.adapter.delivery_loss_blocks_cursor());
+    let faults = fault_connection(&client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_runner_loss_reclaim BEFORE DELETE ON
+        account_delivery_loss_evidence WHEN OLD.cause = 1
+        BEGIN SELECT RAISE(ABORT, 'injected runner loss reclaim'); END;",
+        )
+        .unwrap();
+    match client.finish_runner_loss_import() {
+        Err(crate::AppError::Storage(cgka_traits::storage::StorageError::Backend(message))) => {
+            assert!(message.contains("injected runner loss reclaim"))
+        }
+        other => panic!("expected injected runner loss reclaim failure, got {other:?}"),
+    }
+    assert!(
+        client.delivery_loss_blocks_cursor(),
+        "failed reclaim restores the guard"
+    );
+    assert!(
+        client
+            .adapter
+            .pending_delivery_overflow_generation()
+            .is_some()
+    );
+    assert_eq!(
+        app.converted_recovery_loss().unwrap().len(),
+        2,
+        "the earlier cause's reclamation rolls back too"
+    );
+    assert_eq!(
+        app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+            .unwrap()
+            .len(),
+        1
+    );
+    faults
+        .execute_batch("DROP TRIGGER fail_runner_loss_reclaim")
+        .unwrap();
+    assert!(client.finish_runner_loss_import().unwrap());
+    assert!(!client.delivery_loss_blocks_cursor());
+    assert!(app.converted_recovery_loss().unwrap().is_empty());
+    for cause in [
+        RecoveryLossCause::Queue,
+        RecoveryLossCause::NotificationConsumer,
+    ] {
+        assert!(
+            app.recovery_loss_watermarks("alice", cause)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert!(app.recovery_coverage_goal(&route).unwrap().unwrap() <= since);
+    assert!(
+        app.recovery_coverage_ranges(&route, "wss://a.example")
+            .unwrap()
+            .is_empty(),
+        "handoff is debt, never recovered coverage"
+    );
 }

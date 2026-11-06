@@ -166,6 +166,9 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     .await
     .expect("the managed account worker should activate its initial inbox subscription");
     let subscriptions = inbox_subscription_count(&relay);
+    let before_loss = storage.recovery_coverage_mark().unwrap();
+    let retained_since = crate::unix_now_seconds()
+        .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
 
     relay_plane.simulate_notification_lag_for_test(
         &account,
@@ -173,28 +176,20 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
         NostrNotificationLossFloor::Since(1_700_000_000),
     );
     timeout(Duration::from_secs(5), async {
-        while storage
-            .recovery_loss_watermarks(
-                "alice",
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap()
-            .is_empty()
-        {
+        while storage.recovery_coverage_mark().unwrap() == before_loss {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the worker persists the lag");
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor(
-                "alice",
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap(),
-        Some(1_700_000_000)
-    );
+    // The new owner reclaims the raw watermark after durably importing it.
+    // This old floor is outside retention: its owed history must be parked,
+    // rather than silently dropped when that watermark goes away.
+    assert!(storage.recovery_coverage_remainders().unwrap().iter().any(
+        |remainder| remainder.route == storage_sqlite::TransportReconciliationRoute::Inbox
+            && remainder.range.since_seconds <= 1_700_000_000
+            && remainder.range.until_seconds >= retained_since.saturating_sub(1)
+    ));
     for _ in 0..20 {
         assert!(
             !matches!(
@@ -232,6 +227,7 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
         "wss://relay.example",
         crate::MarmotAppConfig::white_noise(),
     )
+    .with_recovery_runner_ownership_for_test(false)
     .with_test_relay_client(relay);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let storage = app.account_storage("alice").unwrap().app_storage();
@@ -456,30 +452,26 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         "after catch-up every live REQ of the account carries a since"
     );
 
+    let before_loss = storage.recovery_coverage_mark().unwrap();
     plane.simulate_notification_lag_for_test(&account, 1, floor);
     timeout(Duration::from_secs(10), async {
-        while storage
-            .recovery_loss_watermarks(
-                &alice.label,
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap()
-            .is_empty()
-        {
+        while storage.recovery_coverage_mark().unwrap() == before_loss {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .expect("the worker persists the lag");
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor(
-                &alice.label,
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap(),
-        floor.since_seconds()
+    // Raw watermarks are reclaimed after import; the durable un-cover fence
+    // and goals now retain the lag even if the runner has already re-proved it.
+    let since = floor.since_seconds().unwrap();
+    let routes = storage.recovery_coverage_goal_routes().unwrap();
+    assert!(
+        routes.len() >= 2,
+        "the inbox and group both retain their goals"
     );
+    for route in routes {
+        assert!(storage.recovery_coverage_goal(&route).unwrap().unwrap() <= since);
+    }
     for _ in 0..20 {
         runtime
             .group_members(&alice.label, &group)
@@ -520,7 +512,8 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
         dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     let storage = app.account_storage(&alice.label).unwrap();
     // Other live REQs have a settled floor newer than the Welcome below.
     let mut state = app.load_state(&alice.label).unwrap();
@@ -711,7 +704,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
 
     // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
     {
-        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
+        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
         let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
         client.publish_key_package().await.unwrap();
         client.sync().await.unwrap();
@@ -721,7 +715,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
 
     // Alice invites Bob, then renames the group before he is back.
     let alice_app =
-        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
+        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
     let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
     let group = alice
         .create_group_with_options(
@@ -748,7 +743,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     while crate::unix_now_seconds() < resume_at + 1 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
+    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config())
+        .with_recovery_runner_ownership_for_test(false);
     bob_app.relay_plane =
         MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
     let mut state = bob_app.load_state("bob").unwrap();
@@ -878,7 +874,8 @@ async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() 
 
     // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
     {
-        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
+        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
         let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
         client.publish_key_package().await.unwrap();
         client.sync().await.unwrap();
@@ -888,7 +885,8 @@ async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() 
 
     // Alice invites Bob, then writes to the group before he is back.
     let alice_app =
-        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
+        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
     let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
     let group = alice
         .create_group_with_options(
@@ -913,7 +911,8 @@ async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() 
     while crate::unix_now_seconds() < resume_at + 1 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
+    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config())
+        .with_recovery_runner_ownership_for_test(false);
     bob_app.relay_plane =
         MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
     let mut state = bob_app.load_state("bob").unwrap();

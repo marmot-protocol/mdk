@@ -86,6 +86,11 @@ pub struct ReplayLiveCount {
     /// the SDK sent it is not reliably known. A provisional tail never starts
     /// earlier.
     pub live_from: u64,
+    /// The relay sent no EVENT frame at all, valid or not, before this EOSE,
+    /// as read off the wire ([`crate::NostrRelayClient::reply_sent_nothing`]).
+    /// nostr-sdk drops some frames without a word, so `events` alone may be
+    /// short: a count with no events proves its window only when this holds.
+    pub sent_nothing: bool,
 }
 
 impl ReplayLiveCount {

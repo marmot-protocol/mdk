@@ -1821,6 +1821,7 @@ async fn welcome_failed_after_convergence_reaches_the_host_once() {
     bob.join(&relay, &group).await;
     // Bob's Commit opens a settlement window on Alice, which holds her invite
     // back for convergence to commit.
+    let _alice_eose = alice.answer_eose(&relay);
     bob.client
         .runtime
         .send(SendIntent::SelfUpdate {

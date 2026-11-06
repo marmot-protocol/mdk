@@ -457,9 +457,12 @@ impl AccountRecoveryOwner {
         wall_now_ms: u64,
         monotonic_now: Instant,
         policy: RecoveryRetryPolicy,
+        runner_owns_debt: bool,
     ) -> StorageResult<Self> {
         policy.delay_ms(0)?;
-        storage.restore_unacknowledged_recovery_loss()?;
+        if !runner_owns_debt {
+            storage.restore_unacknowledged_recovery_loss()?;
+        }
         storage.restore_recovery_waiters()?;
         storage.reclaim_completed_recovery_events()?;
         storage.restore_recovery_retry(wall_now_ms, duration_ms(policy.cap)?)?;
@@ -871,6 +874,74 @@ impl From<StorageError> for FreezeError {
 }
 
 impl AppClient {
+    /// Native ingress remains ordered. Its original windows become durable
+    /// ledger debt, without legacy replay obligations or a coverage claim.
+    /// The actual seal still checks this generation, placement and held frames
+    /// under the plane's existing locks.
+    async fn synchronize_runner_native_replay(
+        &mut self,
+        observation: transport_nostr_adapter::ReplayAdmissionStatus<'_>,
+    ) -> Result<(), AppError> {
+        let generation = observation.generation();
+        let changed_generation = self.recovery_owner.replay_generation != Some(generation);
+        self.recovery_owner.replay_generation = None;
+        self.recovery_owner.replay_complete = false;
+        self.recovery_owner.replay_sources.clear();
+        self.recovery_owner.replay_ticket = None;
+        let active = observation.active();
+        let floor = unix_now_seconds()
+            .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+        let routing = self.routing.snapshot();
+        let mut goals = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for source in observation.sources() {
+            let routes = source
+                .group_routes()
+                .copied()
+                .filter(|route| {
+                    routing
+                        .group_routes
+                        .iter()
+                        .any(|current| current.transport_group_id.as_slice() == route.as_slice())
+                })
+                .map(storage_sqlite::TransportReconciliationRoute::Group)
+                .collect::<Vec<_>>();
+            let routes = if source.group_routes().next().is_none() {
+                vec![storage_sqlite::TransportReconciliationRoute::Inbox]
+            } else {
+                routes
+            };
+            goals
+                .entry(source.since().max(floor))
+                .or_default()
+                .extend(routes);
+        }
+        drop(observation);
+        #[cfg(test)]
+        if let Some((reached, release)) = self.test_replay_sync_gate.take() {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        let app = storage.app_storage();
+        self.synchronize_recovery_loss(&app)?;
+        self.finish_runner_loss_import()?;
+        storage.with_transaction(|_| {
+            for (since, routes) in &goals {
+                app.widen_recovery_coverage_goals(routes, *since)?;
+            }
+            Ok::<_, StorageError>(())
+        })?;
+        if changed_generation {
+            self.wake_recovery_runner();
+        }
+        self.record_native_coverage(&app).await;
+        // Permission means the input is placed or durably owed, never that a
+        // full live EOSE proved complete history. A stale generation cannot seal.
+        self.recovery_owner.replay_generation = active.then_some(generation);
+        self.recovery_owner.replay_complete = active;
+        Ok(())
+    }
+
     /// Copy limited native source facts, then persist without holding the
     /// adapter guard. The cursor seal rechecks the copied generation and current
     /// pending/loss facts; this is never exhaustive history or loss evidence.
@@ -885,7 +956,10 @@ impl AppClient {
             .recovery_owner
             .replay_observed_generation
             .replace(generation);
-        if self.recovery_owner.native_replay_authorizes(generation) {
+        let runner = self.app.recovery_runner_owns_debt();
+        if self.recovery_owner.native_replay_authorizes(generation)
+            && !(runner && self.delivery_loss_blocks_cursor())
+        {
             return Ok(());
         }
         // Each full synchronization is timed under its trigger: a changed
@@ -905,7 +979,11 @@ impl AppClient {
             .runtime_telemetry
             .as_ref()
             .map(|telemetry| telemetry.observe(reason));
-        let result = self.synchronize_native_replay_sources(observation).await;
+        let result = if runner {
+            self.synchronize_runner_native_replay(observation).await
+        } else {
+            self.synchronize_native_replay_sources(observation).await
+        };
         if let Some(span) = span {
             // The adapter may have moved on while this ran; the pass succeeded
             // if the generation it holds now is authorized.
@@ -1696,8 +1774,86 @@ impl AppClient {
         Ok(())
     }
 
+    /// Imported ledger debt replaces the cursor's loss fence. This is a
+    /// durable handoff, not proof of recovery and not a recovery-success metric.
+    pub(crate) fn finish_runner_loss_import(&mut self) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let app = storage.app_storage();
+        let entries = app
+            .converted_recovery_loss()?
+            .into_iter()
+            .filter(|entry| entry.account_label == self.state.label)
+            .collect::<Vec<_>>();
+        let observed = self.adapter.pending_delivery_overflow_generation();
+        if let Some(observed) = observed {
+            self.delivery_overflow_recovery_pending = true;
+            let contains = |cause, token, count| {
+                entries.iter().any(|entry| {
+                    entry.cause == cause
+                        && entry.watermarks.iter().any(|watermark| {
+                            watermark.marker_token == token && watermark.observed_count == count
+                        })
+                })
+            };
+            if (observed.dropped > 0
+                && !contains(
+                    storage_sqlite::RecoveryLossCause::Queue,
+                    observed.marker_token,
+                    observed.dropped,
+                ))
+                || (observed.notification_losses > 0
+                    && !contains(
+                        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                        observed.notification_token,
+                        0,
+                    ))
+            {
+                return Ok(false);
+            }
+            // Exact current counters, durable marker, no marker writer still
+            // running and no queued signal. The plane holds all these checks
+            // under its own lock; a concurrent new omission keeps its guard.
+            if self
+                .adapter
+                .finish_delivery_overflow_recovery(observed)
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        let restore_token = observed.map(|observed| observed.marker_token).or_else(|| {
+            entries
+                .iter()
+                .flat_map(|entry| &entry.watermarks)
+                .next()
+                .map(|mark| mark.marker_token)
+        });
+        let reclaimed = storage.with_transaction(|_| {
+            for entry in &entries {
+                if !app.reclaim_converted_recovery_loss(entry)? {
+                    return Err(StorageError::NotFound);
+                }
+            }
+            Ok::<_, StorageError>(())
+        });
+        if let Err(error) = reclaimed {
+            self.delivery_overflow_recovery_pending = true;
+            if let Some(token) = restore_token {
+                self.adapter.restore_delivery_overflow_guard(token);
+            }
+            return Err(error.into());
+        }
+        let pending = self.adapter.pending_delivery_overflow_generation();
+        self.delivery_overflow_recovery_pending = pending.is_some();
+        self.delivery_overflow_recovery_marker_token = pending.map(|pending| pending.marker_token);
+        Ok(!self.delivery_overflow_recovery_pending)
+    }
+
     pub(super) fn abandon_loss_completion(&mut self) -> Result<(), AppError> {
         self.recovery_owner.pending_loss_acknowledgments.clear();
+        if self.app.recovery_runner_owns_debt() {
+            return Ok(());
+        }
         self.app
             .account_storage(&self.state.label)?
             .app_storage()
@@ -1953,8 +2109,7 @@ impl AppClient {
                 stalled_epoch: *epoch,
             })
             .collect::<Vec<_>>();
-        self.app
-            .arm_epoch_backfill_intents(&self.state.label, &arms)?;
+        self.arm_epoch_gap_recovery(&arms)?;
         self.pending_recovery_arm_writes.clear();
         for (group, epoch) in &self.pending_recovery_capacity_writes {
             storage.app_storage().record_recovery_capacity_pressure(
@@ -1966,6 +2121,9 @@ impl AppClient {
         self.pending_recovery_capacity_writes.clear();
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
+        if self.app.recovery_runner_owns_debt() {
+            return Ok(None);
+        }
         let routing = self.routing.snapshot();
         let readiness = if self.recovery_endpoints_admitted() {
             RecoveryReadiness::Unknown
@@ -2431,7 +2589,10 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        // This fixture owns the legacy native-replay contract through its
+        // retirement, independently of the application default.
         let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
             Some(Duration::from_secs(120)),
@@ -2556,6 +2717,86 @@ mod tests {
             !client.adapter.account_subscription_eose().await.complete(),
             "the quiet peer did not manufacture an EOSE"
         );
+    }
+
+    /// #2793: old inbox scopes must not broaden a newly current group's live
+    /// REQ after conversion. The old-path control keeps the same over-fetch;
+    /// the runner preserves the inbox debt without inheriting its query floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runner_owned_inbox_debt_does_not_lower_a_new_groups_live_req() {
+        use cgka_traits::transport::Timestamp;
+        use transport_nostr_adapter::NostrSubscription;
+        for owns in [false, true] {
+            let (_dir, app, relay, mut old) = native_fixture().await;
+            old.synchronize_native_replay().await.unwrap();
+            let ledger = app.account_storage("alice").unwrap().app_storage();
+            assert!(ledger.pending_recovery_demands().unwrap().iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay));
+            assert!(
+                old.subscription_rebuild_since().unwrap().is_none(),
+                "the production old owner created an unresolved unfloored inbox scope"
+            );
+            // A nightly-shaped durable input: a newer saved cursor beside an
+            // earlier owner's still-unadmitted native scope. No raw scope SQL.
+            let cursor = unix_now_seconds().saturating_sub(60);
+            old.state.last_transport_timestamp = Some(cursor);
+            app.save_state(&old.state).unwrap();
+            app.relay_plane
+                .deactivate_account_context(old.adapter.account_id())
+                .await
+                .unwrap();
+            drop(old);
+            let target = app.clone().with_recovery_runner_ownership_for_test(owns);
+            let mut client = crate::tests::client_on_app_relay_plane(&target, "alice").await;
+            let before = relay.accepted_subscriptions().len();
+            let group = client
+                .create_group("new route while inbox owes", &[])
+                .await
+                .unwrap();
+            let live_since = relay
+                .accepted_subscriptions()
+                .into_iter()
+                .skip(before)
+                .filter_map(|subscription| match subscription {
+                    NostrSubscription::Group {
+                        group_id, since, ..
+                    } if group_id == group => Some(since),
+                    NostrSubscription::GroupBatch { routes, since, .. }
+                        if routes.iter().any(|route| route.group_id == group) =>
+                    {
+                        Some(since)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !live_since.is_empty(),
+                "a real live group REQ must have been issued"
+            );
+            let expected = owns.then_some(Timestamp(cursor.saturating_sub(120)));
+            assert!(
+                live_since.iter().all(|since| *since == expected),
+                "owns={owns}: new group's live REQs {live_since:?}, expected {expected:?}"
+            );
+            if owns {
+                let inbox = storage_sqlite::TransportReconciliationRoute::Inbox;
+                assert!(!ledger.recovery_conversion_pending().unwrap());
+                assert!(
+                    ledger.recovery_coverage_goal(&inbox).unwrap().unwrap() < cursor - 120,
+                    "conversion keeps older inbox debt beyond the new group's live range"
+                );
+                assert!(
+                    ledger
+                        .recovery_coverage_ranges(&inbox, "wss://relay.example")
+                        .unwrap()
+                        .is_empty(),
+                    "the inbox has not answered or proved coverage"
+                );
+                assert!(ledger.pending_recovery_demands().unwrap().iter().all(
+                    |demand| demand.cause != storage_sqlite::RecoveryCause::SubscriptionReplay
+                ));
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3557,7 +3798,7 @@ mod tests {
         app.ensure_account_projection("alice").unwrap();
         app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
         let now = Instant::now();
-        let owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         (storage, owner, now)
     }
 
@@ -3616,7 +3857,7 @@ mod tests {
             )
             .unwrap();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         owner.replay_sources.push(NativeReplaySource {
             plan: RecoveryScopePlan {
                 scope_id: 0,
@@ -3709,7 +3950,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         owner.replay_sources.push(NativeReplaySource {
             plan: RecoveryScopePlan {
                 since_seconds: Some(50),
@@ -3740,6 +3981,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("maintenance", &[]).await.unwrap();
@@ -3755,7 +3997,7 @@ mod tests {
             )
             .unwrap();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         let grant = owner
             .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
             .unwrap()
@@ -4132,13 +4374,14 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("maintenance", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
         let app = storage.app_storage();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         let ticket = app
             .request_recovery(
                 storage_sqlite::RecoveryRequest::MaintenanceBoundary {
@@ -4315,9 +4558,14 @@ mod tests {
                 .unwrap(),
         );
         let reopened_at = now + Duration::from_secs(2);
-        let mut reopened =
-            AccountRecoveryOwner::open(&storage.app_storage(), 900_000, reopened_at, policy())
-                .unwrap();
+        let mut reopened = AccountRecoveryOwner::open(
+            &storage.app_storage(),
+            900_000,
+            reopened_at,
+            policy(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             storage
                 .app_storage()
@@ -4616,6 +4864,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("retirement", &[]).await.unwrap();
@@ -4759,6 +5008,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         app.relay_plane = crate::MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
@@ -4933,7 +5183,12 @@ mod tests {
             .unwrap();
         storage.synchronize_account_delivery_loss("alice").unwrap();
         let debt = storage.recovery_revision_fence().unwrap();
-        let retry = storage.recovery_retry_state().unwrap();
+        let attempts = || {
+            storage
+                .recovery_account_usage(unix_now_seconds())
+                .unwrap()
+                .attempts
+        };
         let mut caller = ExplicitRecoveryPermit::default();
         assert!(
             client
@@ -4946,16 +5201,14 @@ mod tests {
                 .is_none()
         );
         assert!(!caller.spent);
+        // The sync's runner pass admits and fences, but fetches nothing.
         client.sync().await.unwrap();
         assert_eq!(storage.recovery_revision_fence().unwrap(), debt);
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
-        // The distinct supported repair API still authorizes one attempt, but
-        // this backend cannot certify it or release unresolved loss.
+        assert_eq!(attempts(), 0);
+        // The distinct supported repair API still runs, but this backend
+        // cannot certify it or release unresolved loss.
         assert!(client.repair_full_history().await.is_err());
-        assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
-            retry.attempt_serial + 1
-        );
+        assert_eq!(attempts(), 1);
         assert!(
             storage
                 .account_delivery_recovery("alice")
@@ -4991,6 +5244,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5084,6 +5338,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5295,6 +5550,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5438,6 +5694,7 @@ mod tests {
             crate::tests::bounded_epoch_backfill_config()
                 .with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let pump = crate::tests::scripted_eose_pump(
             app.relay_plane.clone(),
@@ -5977,6 +6234,7 @@ mod tests {
                 .unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_recovery_runner_ownership_for_test(false)
                 .with_test_relay_client(relay.clone());
             if owns_debt {
                 app = app.with_recovery_runner_owning_debt();
@@ -6058,6 +6316,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -6145,7 +6404,8 @@ mod tests {
         );
         let now = Instant::now();
         let wall = client.recovery_owner.logical_now_ms(now).unwrap();
-        client.recovery_owner = AccountRecoveryOwner::open(&app, wall, now, policy()).unwrap();
+        client.recovery_owner =
+            AccountRecoveryOwner::open(&app, wall, now, policy(), false).unwrap();
         assert_eq!(app.recovery_retry_state().unwrap(), retry);
         app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
         assert_eq!(
@@ -6210,6 +6470,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
@@ -6309,6 +6570,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap().app_storage();
@@ -6523,6 +6785,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap().app_storage();
@@ -6618,7 +6881,7 @@ mod tests {
         let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let app = storage.app_storage();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         app.join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
             .unwrap();
         let first = owner
@@ -6637,7 +6900,7 @@ mod tests {
         let before = app.recovery_retry_state().unwrap();
         app.join_recovery_comparison(&[2; 16], 1_001_000, &[comparison_goal()])
             .unwrap();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_001_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_001_000, now, policy(), false).unwrap();
         assert!(
             owner
                 .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
@@ -6860,6 +7123,7 @@ mod tests {
             endpoints,
             crate::MarmotAppConfig::white_noise(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         // A checkpointed cursor: the account opens without an unbounded
@@ -7265,6 +7529,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7314,6 +7579,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
             Some(Duration::from_secs(120)),
@@ -7418,6 +7684,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7590,6 +7857,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7715,6 +7983,7 @@ mod tests {
                 .with_open_ranking_provider(None, Vec::new())
                 .with_recovery_operated_relays(vec![OPERATED.into()]),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7834,6 +8103,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7972,6 +8242,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
@@ -8031,6 +8302,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;

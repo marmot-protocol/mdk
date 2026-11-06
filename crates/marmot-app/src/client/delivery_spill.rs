@@ -714,20 +714,24 @@ mod tests {
         );
         // A directly owned client has no worker to select that loss. Its next
         // receive must start recovery without further relay traffic.
-        let attempts = storage
-            .app_storage()
-            .recovery_retry_state()
-            .unwrap()
-            .attempt_serial;
+        assert!(
+            storage
+                .app_storage()
+                .recovery_units()
+                .unwrap()
+                .iter()
+                .all(|unit| unit.last_served_at_seconds.is_none()),
+            "the directly owned client has not attempted recovery yet"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(2), client.next_event()).await;
         assert!(
             storage
                 .app_storage()
-                .recovery_retry_state()
+                .recovery_units()
                 .unwrap()
-                .attempt_serial
-                > attempts,
-            "next_event starts recovery for the new queue loss"
+                .iter()
+                .any(|unit| unit.last_served_at_seconds.is_some()),
+            "next_event starts ledger recovery for the new queue loss"
         );
     }
 }

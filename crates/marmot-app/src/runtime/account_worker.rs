@@ -2116,6 +2116,12 @@ async fn run_app_runtime_account_worker(
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
         }
+        if recovery_runner.is_none() && client.recovery_runner_due() {
+            // A successful paced preparation retry starts the runner here,
+            // even when that refresh failed afterwards. A failure re-arms
+            // that retry rather than spinning in this loop.
+            recovery_runner = client.spawn_recovery_runner().await;
+        }
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
         if replay_changes.is_none() {
@@ -9349,6 +9355,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-policy-overrides")]
     async fn due_convergence_interleaves_with_a_backlog_of_worker_commands() {
+        // This fixture owns the retained comparison owner contract, independently
+        // of the runner-owned production default.
+
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let alice = home.create_account("alice").unwrap();
@@ -9362,6 +9371,7 @@ mod tests {
                 .with_dev_scheduled_convergence_delay_ms(60_000)
                 .with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
@@ -9619,6 +9629,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let group_id = client.create_group("history notices", &[]).await.unwrap();
@@ -10504,6 +10515,7 @@ mod tests {
                 "wss://relay.example".to_owned(),
                 bounded_epoch_backfill_config(),
             )
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
             app.set_audit_log_settings(AuditLogSettings { enabled: true })
                 .unwrap();
@@ -10602,6 +10614,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings { enabled: true })
             .unwrap();
@@ -10734,6 +10747,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client
@@ -10856,6 +10870,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let marker_token = 7;
@@ -10903,6 +10918,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -10965,6 +10981,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         let group_id = client
@@ -11055,6 +11072,7 @@ mod tests {
                 "wss://relay.example".to_owned(),
                 bounded_epoch_backfill_config(),
             )
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group_id = client
@@ -11153,6 +11171,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -11205,6 +11224,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let marker_token = 7;
@@ -11267,6 +11287,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -11321,6 +11342,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client.create_group("demand a", &[]).await.unwrap();
@@ -12113,6 +12135,7 @@ mod tests {
                 "wss://relay.example".to_owned(),
                 bounded_epoch_backfill_config(),
             )
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             // Hold the repair's comparison in flight until its caller stops it.

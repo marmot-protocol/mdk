@@ -727,6 +727,30 @@ async fn public_app_runner_stalled_relay_does_not_loop_bob_current() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
-async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
+async fn public_app_runner_finishes_five_thousand_owed_events() {
     recovery_runner_proofs::owed_history().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "captured 6,000-message admission-order failure; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_orders_six_thousand_backlog_messages_before_live_input() {
+    recovery_runner_proofs::ordered_backlog_regression().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow upgrade-conversion recovery proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_owns_debt_after_the_upgrade_conversion() {
+    recovery_runner_proofs::upgrade().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow per-REQ live fence control; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_fences_nonempty_reqs_but_not_empty_ones() {
+    recovery_runner_proofs::fence_control().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_holds_live_input_while_every_relay_stalls_history() {
+    recovery_runner_proofs::stranded_history().await;
 }

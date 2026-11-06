@@ -474,6 +474,9 @@ pub(super) struct SweepPlan {
     /// The unit's owed ranges, oldest first, each from its ledger cursor to
     /// its end. None reaches past the live tail as this turn read it.
     pub(super) ranges: Vec<SweepRange>,
+    /// The caps the sweep runs on: the relay's NIP-11 caps as just read, else
+    /// as it last published them, else unknown.
+    pub(super) caps: Option<RelayCaps>,
     /// The slice width and observed cap the unit last swept with.
     pub(super) delta: u64,
     pub(super) observed_cap: Option<u32>,
@@ -489,7 +492,9 @@ pub(super) struct SweepPlan {
 /// Plan the quantum on `key` and record the attempt, or `None` when it no
 /// longer owes anything or is no longer eligible. `caps` are the relay's
 /// NIP-11 caps as just read; known ones are recorded first, which re-arms
-/// the relay's units that were planned with other caps. `compares` is
+/// the relay's units that were planned with other caps. An unknown read
+/// plans with the caps the relay last published, so a document that fails
+/// to load does not sweep a relay as if it had none. `compares` is
 /// whether the relay may compare a group's debt; the inbox's always compares.
 pub(super) fn begin(
     turn: &DebtTurn<'_>,
@@ -510,9 +515,8 @@ pub(super) fn begin(
     }) else {
         return Ok(None);
     };
-    let planned: Option<RecoveryRelayCaps> = caps.map(recovery_caps);
-    if planned.is_some() {
-        app.record_recovery_relay_caps(&key.relay, planned, now)?;
+    if let Some(read) = caps {
+        app.record_recovery_relay_caps(&key.relay, Some(recovery_caps(read)), now)?;
     }
     if app
         .recovery_account_paused_until(&policy.unit, now)?
@@ -576,7 +580,19 @@ pub(super) fn begin(
         mark,
         recheck: false,
     });
+    let read = caps;
+    let caps = match read {
+        Some(read) => Some(read),
+        None => app
+            .recovery_relay_health(&key.relay)?
+            .and_then(|health| health.caps)
+            .map(|caps| RelayCaps {
+                max_limit: caps.max_limit,
+                negentropy: caps.negentropy,
+            }),
+    };
     if !best_effort {
+        let planned: Option<RecoveryRelayCaps> = caps.map(recovery_caps);
         app.begin_recovery_unit_attempt(&key.route, &key.relay, planned, now)?;
     }
     Ok(Some(SweepPlan {
@@ -588,6 +604,7 @@ pub(super) fn begin(
             .as_ref()
             .and_then(|unit| unit.slice_width_seconds)
             .unwrap_or(policy.sweep.initial_delta),
+        caps,
         observed_cap: unit.as_ref().and_then(|unit| unit.observed_cap),
         mark,
         compare,

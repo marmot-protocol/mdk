@@ -325,11 +325,19 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
   floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
   shadow mode: no obligation, retry, fence or schedule reads it.
+- **Epoch-gap return visits (`recovery_epoch_gap.rs`, migration 0150).** An unresolved missing epoch has a durable
+  visit count, active-visit marker, exhaustion state and next retry time. Beginning a visit and reopening its
+  retained goals commit together. Restart resumes ledger progress; observations and revised tickets at the same
+  epoch preserve the budget. A higher missing epoch or explicit repair can start a fresh budget. Exhaustion
+  parks the existing EpochGap obligation without claiming coverage or MLS recovery. Storage schedules nothing;
+  the account's recovery runner owns these visits.
 - **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
   `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
   revision and one probe a newer loss can earn) or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
   byte budget, each unit's parked and retired spans and the capture ranges it fences (migration 0135) sit beside it. `settle_recovery_unit` applies one quantum's
-  outcome in one transaction with policy values the caller passes; a unit's debt is the route goal minus that relay's
+  outcome in one transaction with policy values the caller passes; `settle_recovery_unit_saturated` also records
+  the second an answered quantum stopped on because its relay cannot prove it (`saturated_second`, migration 0151),
+  which only an answered quantum sets or clears and a change in the relay's recorded caps clears; a unit's debt is the route goal minus that relay's
   coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
   coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
   write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. A re-check
@@ -360,7 +368,11 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   the changed "history may be incomplete" notices. Converted loss evidence stays, imported and with no obligation;
   `converted_recovery_loss` lists it by account and cause until the worker has finished the relay plane's overflow
   recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
-  (newer or grown loss stays for the import). Nothing calls the conversion yet.
+  (newer or grown loss stays for the import). After conversion, `import_recovery_loss_to_ledger` imports only
+  new or grown evidence into ledger debt, without creating old-owner obligations. It uses the same route and
+  retention inputs, stamps loss revisions, un-covers the generations' reach and keeps below-window debt parked,
+  atomically with the imported counts and exact acknowledgment set. Duplicate observations leave subsequent fetch
+  proof intact. The existing `converted_recovery_loss` and reclaim handoff also own these later generations.
 
 ## Tests and benchmarks
 

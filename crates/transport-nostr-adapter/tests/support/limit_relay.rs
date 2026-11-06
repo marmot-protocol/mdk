@@ -82,6 +82,9 @@ pub enum NegFault {
     /// SDK's first-reply timeout nor its idle timeout ends the sync, so the
     /// caller's overall deadline must do so.
     FingerprintLoop,
+    /// Answer every NEG-OPEN with a NEG-MSG that is not hex: an exchange the
+    /// client cannot parse, from a relay that does speak NIP-77.
+    MalformedReply,
 }
 
 /// How a refused REQ is answered.
@@ -224,6 +227,13 @@ pub struct LimitStats {
     /// and CLOSED frames held back once it stalled.
     pub events_before_stall: usize,
     pub stalled_frames: usize,
+    /// EVENT frames dropped from exact-id REQs by `withhold_id_fetch_events`.
+    pub withheld_id_events: usize,
+    /// EVENT frames of exact-id REQs sent more than once by
+    /// `repeat_id_fetch_events`.
+    pub repeated_id_events: usize,
+    /// NEG-OPENs answered by `NegFault::MalformedReply`.
+    pub malformed_neg_replies: usize,
 }
 
 impl LimitStats {
@@ -331,6 +341,8 @@ struct ConnectionState {
     neg: HashSet<String>,
     /// REQs that get a NIP-67 hint, until their EOSE.
     hinted: HashMap<String, HintedReq>,
+    /// REQs naming exact event ids, until the upstream closes them.
+    id_fetches: HashSet<String>,
 }
 
 /// One hinted REQ: the limit its client sees and the events sent so far.
@@ -346,6 +358,8 @@ enum RelayVerdict {
     Drop,
     /// Send this frame instead (a hinted EOSE).
     Rewrite(String),
+    /// Send this frame this many times.
+    Repeat(usize),
 }
 
 #[derive(Default)]
@@ -361,6 +375,10 @@ struct Shared {
     /// Upstream EVENT frames to forward before every later EVENT, EOSE and
     /// CLOSED is held back.
     stall_after_events: Option<usize>,
+    /// Upstream EVENT frames answering exact-id REQs still to drop.
+    withhold_id_events: usize,
+    /// Copies of each exact-id REQ's EVENT frames to send; 0 or 1 sends one.
+    id_event_copies: usize,
 }
 
 impl Shared {
@@ -525,6 +543,19 @@ impl LimitRelay {
                                     RelayVerdict::Forward => message,
                                     RelayVerdict::Drop => continue,
                                     RelayVerdict::Rewrite(text) => Message::Text(text.into()),
+                                    RelayVerdict::Repeat(copies) => {
+                                        let mut sent = true;
+                                        for _ in 1..copies {
+                                            if client_write.send(message.clone()).await.is_err() {
+                                                sent = false;
+                                                break;
+                                            }
+                                        }
+                                        if !sent {
+                                            break;
+                                        }
+                                        message
+                                    }
                                 };
                                 if client_write.send(message).await.is_err() {
                                     break;
@@ -577,6 +608,23 @@ impl LimitRelay {
         shared.stall_after_events = Some(events);
         shared.stats.events_before_stall = 0;
         shared.stats.stalled_frames = 0;
+    }
+
+    /// Drop the next `events` upstream EVENT frames that answer a REQ naming
+    /// exact ids, across connections, and still forward its EOSE: a relay
+    /// that listed an id over NIP-77 and then withheld it.
+    pub fn withhold_id_fetch_events(&self, events: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.withhold_id_events = events;
+        shared.stats.withheld_id_events = 0;
+    }
+
+    /// Send each EVENT frame of an exact-id REQ `copies` times (1 restores
+    /// single frames), as a relay that repeats itself would.
+    pub fn repeat_id_fetch_events(&self, copies: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.id_event_copies = copies;
+        shared.stats.repeated_id_events = 0;
     }
 
     /// Switch the injected NEG behaviour for every connection.
@@ -767,6 +815,15 @@ fn inspect_client_frame(
                     let mut clamped = false;
                     let hinted = config.eose_hints && frame.len() == 3;
                     shared.states[connection].hinted.remove(&id);
+                    if frame
+                        .iter()
+                        .skip(2)
+                        .any(|filter| filter.get("ids").is_some())
+                    {
+                        shared.states[connection].id_fetches.insert(id.clone());
+                    } else {
+                        shared.states[connection].id_fetches.remove(&id);
+                    }
                     for filter in frame.iter_mut().skip(2) {
                         if let Some(default) = config.req_default_limit
                             && filter.get("limit").is_none()
@@ -883,6 +940,16 @@ fn inspect_client_frame(
                             .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
                     }
                 }
+                // No session opens on the relay, so none is counted.
+                None if fault == NegFault::MalformedReply => {
+                    shared.stats.malformed_neg_replies += 1;
+                    shared.refresh(connection);
+                    Verdict::Refuse {
+                        reply: serde_json::json!(["NEG-MSG", id, "zz"]).to_string(),
+                        upstream: replaced
+                            .then(|| serde_json::json!(["NEG-CLOSE", id]).to_string()),
+                    }
+                }
                 None if fault == NegFault::ErrOnOpen => {
                     *shared
                         .stats
@@ -959,6 +1026,15 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
     }
     match verb {
         "EVENT" => {
+            if shared.withhold_id_events > 0 && shared.states[connection].id_fetches.contains(id) {
+                shared.withhold_id_events -= 1;
+                shared.stats.withheld_id_events += 1;
+                return RelayVerdict::Drop;
+            }
+            if shared.id_event_copies > 1 && shared.states[connection].id_fetches.contains(id) {
+                shared.stats.repeated_id_events += 1;
+                return RelayVerdict::Repeat(shared.id_event_copies);
+            }
             if let Some(req) = shared.states[connection].hinted.get_mut(id) {
                 req.sent += 1;
                 if req.limit.is_some_and(|limit| req.sent > limit) {
@@ -981,6 +1057,7 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
         }
         "CLOSED" => {
             shared.states[connection].hinted.remove(id);
+            shared.states[connection].id_fetches.remove(id);
             if shared.states[connection].active.remove(id) {
                 shared.stats.upstream_closed += 1;
             }

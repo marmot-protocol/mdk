@@ -246,8 +246,17 @@ pub enum SecondReply {
     /// Every event the relay holds for the second: its NIP-77 id set, all
     /// fetched.
     Complete(Vec<Event>),
-    /// The relay has no NIP-77, or the id fetch came back short.
+    /// The relay cannot prove the second: it has no NIP-77, or its id set
+    /// for the second reaches the per-second limit. Only the relay's own
+    /// capability or the size of the set it holds says so; asking again
+    /// stops on the same second.
     Unproven,
+    /// The relay answered without proving the second this time: it listed
+    /// an id and did not return it (an event deleted or expired in between,
+    /// or one it will not serve), its NIP-77 exchange broke off on a
+    /// malformed message, or a one-id fetch was cut (duplicate frames count
+    /// against the reply budget). A later attempt may prove it.
+    Inconclusive,
     Closed(ClosedReason),
     Unreachable(UnreachableKind),
 }
@@ -408,6 +417,12 @@ pub enum SweepEnd {
     SaturatedSecond {
         second: u64,
     },
+    /// A saturated second the relay answered inconclusively
+    /// ([`SecondReply::Inconclusive`]). Not proven, though a later attempt
+    /// may prove it.
+    InconclusiveSecond {
+        second: u64,
+    },
     /// The relay kept refusing with `rate-limited:`.
     RateLimited,
     Refused(ClosedReason),
@@ -423,6 +438,7 @@ impl SweepEnd {
             Self::DeadlineReached => "deadline",
             Self::Cancelled => "cancelled",
             Self::SaturatedSecond { .. } => "saturated_second",
+            Self::InconclusiveSecond { .. } => "inconclusive_second",
             Self::RateLimited => "rate_limited",
             Self::Refused(_) => "refused",
             Self::Unreachable(_) => "unreachable",
@@ -493,9 +509,9 @@ impl SweepReport {
             SweepEnd::Unreachable(_) => SweepOutcomeKind::RelayUnreachable,
             SweepEnd::Refused(_) | SweepEnd::RateLimited => SweepOutcomeKind::Refused,
             SweepEnd::DeadlineReached if self.stats.answers == 0 => SweepOutcomeKind::Unanswered,
-            SweepEnd::DeadlineReached | SweepEnd::SaturatedSecond { .. } => {
-                SweepOutcomeKind::AnsweredNoProgress
-            }
+            SweepEnd::DeadlineReached
+            | SweepEnd::SaturatedSecond { .. }
+            | SweepEnd::InconclusiveSecond { .. } => SweepOutcomeKind::AnsweredNoProgress,
         }
     }
 }
@@ -765,6 +781,10 @@ where
                 SecondReply::Unproven => {
                     self.answered();
                     Some(SweepEnd::SaturatedSecond { second })
+                }
+                SecondReply::Inconclusive => {
+                    self.answered();
+                    Some(SweepEnd::InconclusiveSecond { second })
                 }
                 SecondReply::Closed(reason) => match self.refused(reason).await {
                     Refusal::Retry => continue,

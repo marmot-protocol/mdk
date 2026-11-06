@@ -1201,17 +1201,24 @@ commit. After a cold restart it records latency, traffic and recovery time under
 within 600 seconds, the commit is applied and the later messages decrypt, and that every gap chat message is present
 exactly once. `public_app_large_account_recovery_scorecard_runner_owns_debt` runs it with the recovery runner owning
 history debt.
-`public_app_runner_stalled_relay_does_not_loop` and `public_app_runner_finishes_tens_of_thousands_of_owed_events` are
+`public_app_runner_stalled_relay_does_not_loop` and `public_app_runner_finishes_five_thousand_owed_events` are
 the recovery-runner proofs. In the first, one relay endpoint never answers history while live traffic flows; the
 account must recover from the other endpoint, and attempts on the stalled one must thin out. That entry forces a
 sender's own-leaf maintenance commit while bob is stopped; `public_app_runner_stalled_relay_does_not_loop_bob_current`
 forces all members to agree on the epoch before bob stops. Both preserve the same exact-timeline, live-delivery and
-attempt bounds, and save the case/epochs and whether the epoch-stall arm fired. In the owed-history journey, 20,000
+attempt bounds, and save the case/epochs and whether the epoch-stall arm fired. In the owed-history journey, 5,000
 owed events and a quiet group must finish exactly after a restart, with no history window asked twice during that
-restart recovery. After a reconnect it checks route requests, aggregate runner coverage progress, caught-up status
-and quiet-group delivery; repeated windows are recorded only. Aggregate progress can include inbox comparisons,
-so it does not attribute each group's re-proof to the runner alone. Until the switch-over (mdk#2660 PR 5g) the earlier owner runs beside the runner, so the wire bounds
-count both of bob's owners.
+restart recovery. Reconnect re-proof also rejects repeated windows. Positive runner work and zero native paging
+requests establish runner-only attribution.
+`public_app_runner_orders_six_thousand_backlog_messages_before_live_input` preserves the captured three-sender
+6,000-event failure with competing live traffic and exact history after a full reopen. Busy-group live admission
+waits for older captured history to drain; request deadlines never authorize jumping past it. The upgrade journey additionally requires nonzero conversion before the
+first attempt. The per-REQ fence journey uses two restarts with both groups packed together: counted raw reply then
+empty raw reply, a 12-second history stall and a 30-second low-volume completion bound. Before the empty reply, Alice
+removes Bob from a third group, so his newest group event, which sets the saved cursor, leaves the packed REQ. First
+live visibility requires the complete known backlog; empty counts must not hold live input. These remain explicit
+slow manual proofs.
+
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 

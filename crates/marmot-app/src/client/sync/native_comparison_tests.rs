@@ -32,6 +32,12 @@ struct CryptoFixture {
 }
 
 async fn crypto_fixture() -> CryptoFixture {
+    crypto_fixture_with_owner(None).await
+}
+
+// Mixed comparison/native admission still needs the old comparison executor;
+// ordinary native ingress tests follow the app production default.
+async fn crypto_fixture_with_owner(owner: Option<bool>) -> CryptoFixture {
     let dir = tempfile::tempdir().unwrap();
     let home = crate::AccountHome::open(dir.path());
     home.create_account("sender").unwrap();
@@ -39,6 +45,10 @@ async fn crypto_fixture() -> CryptoFixture {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app =
         crate::MarmotApp::with_relay(dir.path(), ENDPOINT).with_test_relay_client(relay.clone());
+    let app = match owner {
+        Some(owns) => app.with_recovery_runner_ownership_for_test(owns),
+        None => app,
+    };
     remember_test_member_inbox(&app, &recipient.account_id_hex, ENDPOINT);
     let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
@@ -206,7 +216,7 @@ async fn mixed_ingress_case(side: ComparisonSide) {
         cgka_engine::wire_format::DEFAULT_OUT_OF_ORDER_TOLERANCE,
         100
     );
-    let mut fixture = crypto_fixture().await;
+    let mut fixture = crypto_fixture_with_owner(Some(false)).await;
     let (mut native, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
     let expected_transport = native
         .iter()

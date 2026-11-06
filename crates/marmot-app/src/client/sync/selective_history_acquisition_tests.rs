@@ -15,6 +15,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
     let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
     let mut client = client_on_app_relay_plane(&app, "alice").await;

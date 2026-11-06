@@ -1320,8 +1320,9 @@ impl AppClient {
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
-        let rebuild_since = self.subscription_rebuild_since()?;
         self.pending_runtime_group_subscription_refresh = true;
+        self.prepare_runner_ownership().await?;
+        let rebuild_since = self.subscription_rebuild_since()?;
         let result = self.sync_runtime_groups_since(rebuild_since).await;
         if result.is_ok() {
             self.pending_runtime_group_subscription_refresh = false;
@@ -1512,10 +1513,65 @@ impl AppClient {
         }
     }
 
+    fn observe_runner_delivery_overflow(
+        &mut self,
+        overflow: transport_nostr::AccountDeliveryOverflow,
+    ) -> Result<(), AppError> {
+        self.delivery_overflow_recovery_pending = true;
+        self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        if overflow.dropped > 0 {
+            let routes = self.adapter.delivery_loss_routes(&overflow).map(|routes| {
+                routes
+                    .into_iter()
+                    .map(|(route, earliest)| (crate::reconciliation_route(route), earliest))
+                    .collect::<Vec<_>>()
+            });
+            app.record_account_recovery_loss_routed(
+                &self.state.label,
+                storage_sqlite::RecoveryLossCause::Queue,
+                overflow.marker_token,
+                overflow.dropped,
+                unix_now_seconds(),
+                overflow.earliest_dropped,
+                routes.as_deref(),
+            )?;
+        }
+        if overflow.notification_losses > 0 {
+            let routes = self
+                .adapter
+                .notification_loss_routes(&overflow)
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|(route, since)| (crate::reconciliation_route(route), since))
+                        .collect::<Vec<_>>()
+                });
+            app.record_account_recovery_loss_routed(
+                &self.state.label,
+                storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                overflow.notification_token,
+                0,
+                unix_now_seconds(),
+                overflow.notification_floor,
+                routes.as_deref(),
+            )?;
+        }
+        self.synchronize_recovery_loss(&app)?;
+        if overflow.notification_losses > 0 {
+            self.adapter.notification_loss_persisted(overflow);
+        }
+        self.finish_runner_loss_import()?;
+        Ok(())
+    }
+
     fn observe_delivery_overflow(
         &mut self,
         overflow: transport_nostr::AccountDeliveryOverflow,
     ) -> Result<(), AppError> {
+        if self.app.recovery_runner_owns_debt() {
+            return self.observe_runner_delivery_overflow(overflow);
+        }
         // The router's process-local fence already froze cursor advancement at
         // the omission. Re-observe the same token here so the queued signal is
         // also an idempotent storage boundary before recovery starts.
@@ -1822,6 +1878,9 @@ impl AppClient {
     ) -> Result<(), (SyncFailureStage, AppError)> {
         // Failed/cancelled activation must retain a retry intent for scheduled work.
         self.pending_runtime_group_subscription_refresh = true;
+        self.prepare_runner_ownership()
+            .await
+            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
         // Before any subscription goes out: auth-gated relays (NIP-42)
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
@@ -2054,7 +2113,20 @@ impl AppClient {
             self.pending_applied_sync_summary
                 .merge(std::mem::take(&mut summary));
             self.run_recovery_runner_pass().await;
+            // The pass's admission can lift a group's live fence, and the
+            // adapter then hands over the frames it was holding. A directly
+            // owned client has no worker to read them, so this sync does: a
+            // one-shot client would otherwise close with them unread.
+            let drained = self.sync_sdk_relay(None).await;
             self.prepend_pending_applied_summary(&mut summary);
+            match drained {
+                Ok(drained) => summary.merge(drained),
+                Err(mut failure) => {
+                    summary.merge(std::mem::take(&mut failure.partial_summary));
+                    failure.partial_summary = summary;
+                    return Err(failure);
+                }
+            }
             if self.pending_runtime_group_subscription_refresh {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }
@@ -3587,12 +3659,11 @@ impl AppClient {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
                         Ok(result) => return result,
-                        // Settled, not complete: a relay that refused a REQ for
-                        // good will never report EOSE, so waiting longer brings
-                        // nothing. Ending the drain early ends it exactly as a
-                        // timeout would, checkpoint included; live promotion
-                        // and activation reuse still require EOSE.
-                        Err(_) if self.adapter.account_subscription_eose().await.settled() => {
+                        // Current input, not complete-query coverage: a full
+                        // delegated reply has ended too. Refused REQs bring no
+                        // further input. Ending the wait changes no checkpoint
+                        // or cursor-qualification guard.
+                        Err(_) if self.adapter.account_subscription_input().await.settled => {
                             return Ok(None);
                         }
                         Err(_) => {}
@@ -4598,10 +4669,7 @@ impl AppClient {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 stalled_epoch,
             };
-            let result = self.app.arm_epoch_backfill_intents(
-                &self.state.label,
-                std::slice::from_ref(&durable_intent),
-            );
+            let result = self.arm_epoch_gap_recovery(std::slice::from_ref(&durable_intent));
             match result {
                 Ok(()) => {
                     self.pending_recovery_arm_writes.remove(group_id);
@@ -5101,7 +5169,7 @@ impl AppClient {
     /// An epoch gap also completes on its own evidence: once the group's local
     /// epoch moves past the stalled one, that exact gap no longer applies. A
     /// later stall arms a new gap at its own epoch.
-    fn drop_settled_epoch_backfill_intents(&mut self) {
+    pub(in crate::client) fn drop_settled_epoch_backfill_intents(&mut self) {
         let intents = match self
             .app
             .account_storage(&self.state.label)
@@ -6001,6 +6069,17 @@ impl AppClient {
             return self
                 .repair_full_history_through_runner(cancelled, FULL_HISTORY_REPAIR_TIMEOUT, spawned)
                 .await;
+        }
+        if self.app.recovery_runner_owns_debt() {
+            return Err(incomplete_full_history_repair(
+                SyncSummary::default(),
+                if cancelled() {
+                    crate::FullHistoryRepairIncompleteReason::Cancelled
+                } else {
+                    crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+                },
+                self.delivery_loss_blocks_cursor(),
+            ));
         }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
             started: tokio::time::Instant::now(),
@@ -7668,7 +7747,10 @@ fn self_arrival_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupI
 #[cfg(test)]
 mod live_cursor_checkpoint_tests {
     use super::SyncSummary;
-    use crate::tests::{LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test};
+    use crate::tests::{
+        LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test,
+        run_composed_app_runtime_test_on_one_thread,
+    };
 
     /// Queue a newer delivery ahead of an older one, as relays replay stored
     /// history newest-first, and arm the older one's ingest to fail. Returns
@@ -7968,56 +8050,66 @@ mod live_cursor_checkpoint_tests {
     /// would lose it, since the restart re-subscribes above it.
     #[test]
     fn a_delivery_arriving_during_a_drain_checkpoint_save_survives_a_stop() {
-        run_composed_app_runtime_test("drain-checkpoint-arrival-during-save", || async {
-            let mut fixture = LiveCursorFixture::open().await;
-            let cursor_before = fixture.cursor_before;
-            // A drained prefix: admitted without promoting, as a drain's
-            // ingests are until its checkpoint.
-            let drained = fixture
-                .delivery(fixture.probe(cursor_before + 4_000, "drained"))
-                .await;
-            fixture
-                .client
-                .admit_recovered_delivery(&drained, crate::client::sync::InventoryWrite::Immediate)
-                .await
-                .unwrap();
-            assert_eq!(
-                fixture.client.state.last_transport_timestamp,
-                Some(cursor_before + 4_000)
-            );
-            assert_eq!(fixture.persisted(), Some(cursor_before));
-
-            let late_at = cursor_before + 1_000;
-            let late = fixture.probe(late_at, "late");
-            let delivery = fixture.delivery(late.clone()).await;
-            fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
-            fixture
-                .client
-                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
-                .await
-                .unwrap_or_else(|_| panic!("the checkpoint saves"));
-
-            let persisted = fixture.persisted();
-            assert_eq!(persisted, Some(cursor_before + 4_000));
-            assert!(
-                fixture
-                    .app
-                    .relay_plane
-                    .subscription_rebuild_since(persisted)
-                    .is_some_and(|since| since.0 > late_at),
-                "the regression needs a restart floor above the late delivery"
-            );
-            assert!(
+        run_composed_app_runtime_test_on_one_thread(
+            "drain-checkpoint-arrival-during-save",
+            || async {
+                let mut fixture = LiveCursorFixture::open().await;
+                // The seal intentionally defers on lock contention. This case
+                // places one arrival at the successful save's hook; duplicate
+                // scripted EOSE reports must not contend with that one seal.
+                fixture.stop_eose_pump().await;
+                let cursor_before = fixture.cursor_before;
+                // A drained prefix: admitted without promoting, as a drain's
+                // ingests are until its checkpoint.
+                let drained = fixture
+                    .delivery(fixture.probe(cursor_before + 4_000, "drained"))
+                    .await;
                 fixture
                     .client
-                    .adapter
-                    .try_receive_account_delivery()
-                    .is_none(),
-                "the queue never holds a delivery below the checkpoint's floor"
-            );
-            fixture.wait_for_spilled(&late.id).await;
-            fixture.reopen_and_admit_spilled(&late.id).await;
-        });
+                    .admit_recovered_delivery(
+                        &drained,
+                        crate::client::sync::InventoryWrite::Immediate,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.client.state.last_transport_timestamp,
+                    Some(cursor_before + 4_000)
+                );
+                assert_eq!(fixture.persisted(), Some(cursor_before));
+
+                let late_at = cursor_before + 1_000;
+                let late = fixture.probe(late_at, "late");
+                let delivery = fixture.delivery(late.clone()).await;
+                fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
+                fixture
+                    .client
+                    .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
+                    .await
+                    .unwrap_or_else(|_| panic!("the checkpoint saves"));
+
+                let persisted = fixture.persisted();
+                assert_eq!(persisted, Some(cursor_before + 4_000));
+                assert!(
+                    fixture
+                        .app
+                        .relay_plane
+                        .subscription_rebuild_since(persisted)
+                        .is_some_and(|since| since.0 > late_at),
+                    "the regression needs a restart floor above the late delivery"
+                );
+                assert!(
+                    fixture
+                        .client
+                        .adapter
+                        .try_receive_account_delivery()
+                        .is_none(),
+                    "the queue never holds a delivery below the checkpoint's floor"
+                );
+                fixture.wait_for_spilled(&late.id).await;
+                fixture.reopen_and_admit_spilled(&late.id).await;
+            },
+        );
     }
 
     /// Before its first cursor an account's restart relies on its
@@ -8027,8 +8119,12 @@ mod live_cursor_checkpoint_tests {
     /// admits it.
     #[test]
     fn an_older_arrival_during_an_accounts_first_checkpoint_survives_a_stop() {
-        run_composed_app_runtime_test("first-cursor-arrival-during-save", || async {
+        run_composed_app_runtime_test_on_one_thread("first-cursor-arrival-during-save", || async {
             let mut fixture = LiveCursorFixture::open_without_cursor().await;
+            // The seal intentionally defers on lock contention. This case
+            // places one arrival at the successful save's hook; duplicate
+            // scripted EOSE reports must not contend with that one seal.
+            fixture.stop_eose_pump().await;
             let cursor_before = fixture.cursor_before;
             let drained = fixture
                 .delivery(fixture.probe(cursor_before + 4_000, "drained"))
@@ -8666,6 +8762,54 @@ mod runtime_group_subscription_refresh_tests {
         assert!(!client.has_pending_runtime_group_subscription_refresh());
     }
 
+    /// A failed runner preparation keeps the worker's runner out only until a
+    /// preparation succeeds. The paced refresh retry prepares again; a group
+    /// subscription that still fails after it keeps that refresh armed, but
+    /// not the runner out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_runner_preparation_waits_only_for_the_next_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone())
+            .with_recovery_runner_ownership_for_test(true);
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "runner preparation retry",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &PerformanceRecorder::default(),
+            )
+            .await
+            .unwrap();
+        assert!(client.recovery_runner_due());
+
+        client.fail_next_runner_preparation = true;
+        assert!(client.spawn_recovery_runner().await.is_none());
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            !client.recovery_runner_due(),
+            "a failed preparation keeps the runner out"
+        );
+
+        relay.fail_next_subscribe();
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .expect_err("the group subscription still fails after the preparation");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            client.recovery_runner_due(),
+            "the retry prepared ownership, so the worker starts its runner"
+        );
+        assert!(client.spawn_recovery_runner().await.is_some());
+    }
+
     /// Secondary route failures preserve command success and primary publication
     /// errors, including committed activity and buffered subscriber updates.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9243,6 +9387,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("evidence policy", &[]).await.unwrap();
@@ -9581,6 +9726,7 @@ mod tests {
             "wss://backfill.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let first = client.create_group("first demand", &[]).await.unwrap();
@@ -9751,6 +9897,7 @@ mod tests {
                 "wss://backfill.example",
                 bounded_epoch_backfill_config(),
             )
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group = client
@@ -9840,6 +9987,7 @@ mod tests {
             "wss://backfill.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let changed = client
@@ -9928,6 +10076,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let live = client.create_group("still a member", &[]).await.unwrap();
@@ -10043,6 +10192,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let departed = client.create_group("departed", &[]).await.unwrap();
@@ -10194,10 +10344,11 @@ mod tests {
         {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
-            let (app, mut client, route) = crate::tests::undecryptable_probe_route(
+            let (app, mut client, route) = crate::tests::undecryptable_probe_route_with_owner(
                 &dir,
                 &relay,
                 bounded_epoch_backfill_config(),
+                Some(false),
             )
             .await;
             let group = route.group_id.clone();
@@ -10722,6 +10873,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repair_before_the_worker_seats_its_runner_is_coverage_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        // The actual local-open stage precedes the worker's fallible runner
+        // preparation. It has no network or runner yet.
+        let mut client = app
+            .local_client_with_relay_plane("alice", &app.relay_plane, None)
+            .await
+            .unwrap();
+        for cancelled in [false, true] {
+            let error = client
+                .repair_full_history_cancellable(&|| cancelled, None)
+                .await
+                .unwrap_err();
+            let expected = if cancelled {
+                crate::FullHistoryRepairIncompleteReason::Cancelled
+            } else {
+                crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+            };
+            assert!(matches!(
+                error.source,
+                crate::AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: false,
+                } if reason == expected
+            ));
+            assert_eq!(error.partial_summary, SyncSummary::default());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uncertified_full_history_repair_keeps_the_buffered_prefix() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -10787,7 +10972,10 @@ mod retired_loss_observation_tests {
         crate::AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
+        // This case rearms the old obligation's cursor fence; the runner
+        // imports loss as ledger debt and releases that raw handoff instead.
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();

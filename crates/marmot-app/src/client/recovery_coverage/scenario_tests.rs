@@ -41,7 +41,9 @@ pub(in crate::client) struct Fixture {
 }
 
 /// One account with one group and a checkpointed cursor whose live
-/// subscriptions have reached owner admission: the normal caught-up state.
+/// subscriptions have reached native boundary admission: the normal
+/// caught-up input state. Runner-owned cursor permission can precede counts,
+/// so it alone does not settle this fixture.
 pub(in crate::client) async fn fixture() -> Fixture {
     fixture_with_stored(Some(STORED_AT)).await
 }
@@ -75,11 +77,7 @@ pub(in crate::client) async fn fixture_on(
         relay.clone(),
         app.config.allow_loopback_relay_endpoints,
     );
-    let app = if runner_owns_debt {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    };
+    let app = app.with_recovery_runner_ownership_for_test(runner_owns_debt);
     *relay.stored_before_eose.lock().unwrap() = stored;
     let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
@@ -94,6 +92,10 @@ pub(in crate::client) async fn fixture_on(
             if client
                 .recovery_owner
                 .native_replay_authorizes(observation.generation())
+                && (!client.app.recovery_runner_owns_debt()
+                    || observation
+                        .sources()
+                        .all(|source| source.endpoints().all(|endpoint| endpoint.admitted())))
             {
                 break;
             }
@@ -129,6 +131,10 @@ pub(in crate::client) async fn reactivate_client(client: &mut AppClient) {
             if client
                 .recovery_owner
                 .native_replay_authorizes(observation.generation())
+                && (!client.app.recovery_runner_owns_debt()
+                    || observation
+                        .sources()
+                        .all(|source| source.endpoints().all(|endpoint| endpoint.admitted())))
             {
                 break;
             }

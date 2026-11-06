@@ -236,6 +236,17 @@ impl NostrRelayClient for UnlinkedPublishGate {
         self.inner.relay_connection(account, endpoint)
     }
 
+    async fn reply_sent_nothing(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.inner
+            .reply_sent_nothing(account, endpoint, subscription_id)
+            .await
+    }
+
     async fn acquire_history(
         &self,
         request: NostrAcquisitionRequest,

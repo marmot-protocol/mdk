@@ -42,7 +42,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
 use marmot_app::{AuditLogSettings, CursorPersistence, MarmotApp, MarmotAppConfig};
-use nostr_relay_builder::MockRelay;
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
+use limited_relay::{TestRelay, mock_relay};
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
@@ -104,12 +106,6 @@ const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// the one real devices run in, so this file states the window it means instead
 /// of taking whichever one the feature resolution hands it.
 const SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
-
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
-}
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
     open_store_with_config(dir, relay_url, MarmotAppConfig::white_noise())
@@ -240,7 +236,7 @@ fn ingested_message_ids(rows: &[serde_json::Value]) -> Vec<String> {
 /// their own store, plus the handles the tests drive them through.
 struct StalledGroup {
     /// Kept bound so the mock relay outlives the clients.
-    _relay: MockRelay,
+    _relay: TestRelay,
     app_bob: MarmotApp,
     bob: marmot_app::AppClient,
     /// Alice advances the group epoch so bob can stall again at a new one.
@@ -604,7 +600,7 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
         .await;
     }
     let mut frozen_rows = Vec::new();
-    timeout(NEXT_EVENT_DEADLINE, async {
+    let collected = timeout(NEXT_EVENT_DEADLINE, async {
         loop {
             frozen.sync().await.expect("frozen admission succeeds");
             frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
@@ -613,8 +609,23 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
             }
         }
     })
-    .await
-    .expect("the Frozen wake retains the whole burst within the existing deadline");
+    .await;
+    if collected.is_err() {
+        frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
+        let retained = ingested_message_ids(&frozen_rows).len();
+        let kept = dir_bob.keep();
+        std::fs::write(
+            kept.join("frozen-deadline-audit.json"),
+            serde_json::to_vec_pretty(&frozen_rows).unwrap(),
+        )
+        .unwrap();
+        drop(frozen);
+        drop(app_frozen);
+        panic!(
+            "the Frozen wake retains the whole burst within the existing deadline: retained={retained}, evidence={}",
+            kept.display()
+        );
+    }
     assert!(
         rows_of_kind(&frozen_rows, "epoch_stall_backfill_armed").is_empty(),
         "a Frozen wake tracks no stalls: {frozen_rows:?}"

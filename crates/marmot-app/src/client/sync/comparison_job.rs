@@ -717,6 +717,7 @@ impl ComparisonNetworkJob {
             client.test_comparison_delay,
             client.test_comparison_saved_cursor,
         );
+        let runner_owns_debt = client.app.recovery_runner_owns_debt();
         let handle = tokio::spawn(async move {
             #[cfg(test)]
             let _job_active = witness.as_ref().map(|witness| {
@@ -728,7 +729,7 @@ impl ComparisonNetworkJob {
             // Native capture and comparison share the cutoff, not each other's
             // wait. A quiet original REQ must not consume the whole pass first.
             let capture = async {
-                if replay_capture.sources.is_empty() {
+                if runner_owns_debt || replay_capture.sources.is_empty() {
                     return None;
                 }
                 if tokio::time::Instant::now() < deadline {
@@ -2068,7 +2069,9 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // This module retains the legacy grant executor's contract until removal.
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         if audited {
             app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
@@ -2666,7 +2669,8 @@ mod tests {
             fixture._dir.path(),
             url,
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        );
+        )
+        .with_recovery_runner_ownership_for_test(false);
         fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
         fixture.client.test_comparison_results = None;
         fixture.client.request_bounded_comparison().unwrap();
@@ -3046,7 +3050,8 @@ mod tests {
             fixture._dir.path(),
             proxy.url.clone(),
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        );
+        )
+        .with_recovery_runner_ownership_for_test(false);
         fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
         fixture.client.test_comparison_results = None;
         assert!(
@@ -3422,7 +3427,8 @@ mod tests {
             fixture._dir.path(),
             proxy.url.clone(),
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        );
+        )
+        .with_recovery_runner_ownership_for_test(false);
         // Persist the actual inbox before opening Alice: a saved kind-10050
         // declaration takes precedence over the app's constructor default.
         real_app
@@ -4127,9 +4133,36 @@ mod tests {
         );
     }
 
+    // These two comparison-only turn tests require the scripted startup's
+    // empty native prefix to have ended. Pending native input correctly holds
+    // comparison admission, regardless of how many comparison slots remain.
+    async fn wait_for_empty_native_frontier(fixture: &mut Fixture) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                fixture.client.synchronize_native_replay().await.unwrap();
+                match fixture
+                    .client
+                    .take_native_batch(Some(&fixture.group_id))
+                    .await
+                {
+                    super::super::native_ingress::NativeFrontier::Empty => break,
+                    super::super::native_ingress::NativeFrontier::Pending => {
+                        tokio::task::yield_now().await
+                    }
+                    super::super::native_ingress::NativeFrontier::Ready => {
+                        panic!("comparison-only fixture unexpectedly has native frames")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the scripted empty native prefix reaches EOSE");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_admission_runs_in_bounded_turns() {
         let mut fixture = fixture().await;
+        wait_for_empty_native_frontier(&mut fixture).await;
         let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
         let events = (0..MAX_COMPARISON_ADMISSION_PER_TURN + 1)
             .map(|_| candidate_for_route(group_route))
@@ -4169,6 +4202,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn already_held_events_do_not_spend_a_turns_admission_slots() {
         let mut fixture = fixture().await;
+        wait_for_empty_native_frontier(&mut fixture).await;
         let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
         let held = (0..MAX_COMPARISON_ADMISSION_PER_TURN)
             .map(|_| candidate_for_route(group_route))

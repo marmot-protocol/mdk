@@ -1514,3 +1514,255 @@ fn loss_below_the_window_parks_what_old_coverage_proved() {
             .to_vec()
     );
 }
+
+/// Ongoing loss after conversion belongs to the ledger, without recreating
+/// legacy jobs. Duplicate evidence must not erase a later fetch proof; grown
+/// generations reopen debt and cannot be reclaimed through an older snapshot.
+#[test]
+fn post_conversion_loss_stays_in_the_ledger_and_preserves_newer_proof() {
+    let store = at_nightly("INSERT INTO account_state (label, updated_at) VALUES ('alice', 0);");
+    convert(&store).unwrap();
+    let app = store.app_storage();
+    let routes = routes();
+    let prove = |route: &TransportReconciliationRoute| {
+        app.record_recovery_coverage(
+            &[crate::RecoveryCoverageSlice {
+                route,
+                relay: R1,
+                since_seconds: W,
+                until_seconds: NOW,
+                proof: crate::RecoveryCoverageProof::SweepSlice,
+            }],
+            NOW,
+        )
+        .unwrap();
+    };
+    prove(&group(A));
+    prove(&group(B));
+    let mark = app.recovery_coverage_mark().unwrap();
+    let loss = |count| {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            RecoveryLossCause::Queue,
+            30,
+            count,
+            NOW,
+            Some(W + 100),
+            Some(&[(group(A), W + 100)]),
+        )
+        .unwrap()
+    };
+    loss(1);
+    assert!(
+        app.import_recovery_loss_to_ledger("alice", &input(&routes))
+            .unwrap()
+    );
+    assert!(
+        causes(&store).is_empty(),
+        "ledger import must not recreate legacy jobs"
+    );
+    assert_eq!(scope_count(&store), 0);
+    let ranges = |route| {
+        app.recovery_coverage_ranges(&route, R1)
+            .unwrap()
+            .into_iter()
+            .map(|slice| slice.range)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ranges(group(A)), vec![range(W, W + 99)]);
+    assert_eq!(ranges(group(B)), vec![range(W, NOW)]);
+    assert_eq!(
+        app.recovery_coverage_lost_since(mark).unwrap(),
+        Some(vec![group(A)])
+    );
+    // A fetch begun before the loss cannot certify the newly lost range.
+    assert!(
+        app.record_recovery_coverage_since(
+            &[crate::RecoveryCoverageSlice {
+                route: &group(A),
+                relay: R1,
+                since_seconds: W,
+                until_seconds: NOW,
+                proof: crate::RecoveryCoverageProof::SweepSlice,
+            }],
+            NOW,
+            mark
+        )
+        .unwrap()
+    );
+    assert_eq!(ranges(group(A)), vec![range(W, W + 99)]);
+    let first = app.converted_recovery_loss().unwrap().pop().unwrap();
+    assert!(first == converted_loss(RecoveryLossCause::Queue, &[(30, 1)]));
+    prove(&group(A));
+    loss(1);
+    assert!(
+        !app.import_recovery_loss_to_ledger("alice", &input(&routes))
+            .unwrap()
+    );
+    assert_eq!(
+        ranges(group(A)),
+        vec![range(W, NOW)],
+        "duplicate leaves new proof intact"
+    );
+    loss(2);
+    assert!(
+        app.import_recovery_loss_to_ledger("alice", &input(&routes))
+            .unwrap()
+    );
+    assert_eq!(ranges(group(A)), vec![range(W, W + 99)]);
+    assert!(!app.reclaim_converted_recovery_loss(&first).unwrap());
+    let latest = app.converted_recovery_loss().unwrap().pop().unwrap();
+    assert!(latest == converted_loss(RecoveryLossCause::Queue, &[(30, 2)]));
+    assert!(app.reclaim_converted_recovery_loss(&latest).unwrap());
+    assert!(evidence(&store).is_empty());
+    assert!(app.converted_recovery_loss().unwrap().is_empty());
+}
+
+/// Live runner imports preserve debt older than retention. Unknown-age,
+/// zero-count notification loss reaches even a newly current route; routed
+/// queue loss parks only its own route. Neither certifies missing history.
+#[test]
+fn post_conversion_loss_keeps_unknown_and_below_retention_debt() {
+    for routed in [true, false] {
+        let store =
+            at_nightly("INSERT INTO account_state (label, updated_at) VALUES ('alice', 0);");
+        convert(&store).unwrap();
+        let app = store.app_storage();
+        let mut routes = routes();
+        routes.push(RecoveryConversionRoute {
+            route: group(C),
+            required_relays: vec![R1.into()],
+            standing_floor_seconds: W,
+        });
+        let named = [(group(A), W - 10)];
+        app.record_account_recovery_loss_routed(
+            "alice",
+            if routed {
+                RecoveryLossCause::Queue
+            } else {
+                RecoveryLossCause::NotificationConsumer
+            },
+            31,
+            if routed { 2 } else { 0 },
+            NOW,
+            routed.then_some(W - 10),
+            routed.then_some(named.as_slice()),
+        )
+        .unwrap();
+        assert!(
+            app.import_recovery_loss_to_ledger("alice", &input(&routes))
+                .unwrap()
+        );
+        assert!(causes(&store).is_empty());
+        let mut remainders = app
+            .recovery_coverage_remainders()
+            .unwrap()
+            .into_iter()
+            .map(|remainder| (remainder.route, remainder.range))
+            .collect::<Vec<_>>();
+        remainders.sort_by_key(|(route, _)| route.clone());
+        let mut expected = if routed {
+            vec![(group(A), range(W - 10, W - 1))]
+        } else {
+            routes
+                .iter()
+                .map(|current| (current.route.clone(), range(0, W - 1)))
+                .collect()
+        };
+        expected.sort_by_key(|(route, _)| route.clone());
+        assert_eq!(remainders, expected, "routed: {routed}");
+        assert_eq!(goal(&store, &group(C)), if routed { None } else { Some(W) });
+        for current in &routes {
+            for relay in &current.required_relays {
+                assert!(
+                    app.recovery_coverage_ranges(&current.route, relay)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        let watermarks = app.converted_recovery_loss().unwrap();
+        assert_eq!(watermarks.len(), 1);
+        assert_eq!(
+            watermarks[0].watermarks[0].observed_count,
+            if routed { 2 } else { 0 }
+        );
+        assert!(app.recovery_conversion_notices_changed().unwrap());
+    }
+}
+
+/// No ledger import can outrun conversion. A late SQL failure after both
+/// causes were un-covered rolls back revisions, coverage, import watermarks
+/// and acknowledgment entries together, leaving all evidence retryable.
+#[test]
+fn post_conversion_loss_is_atomic_and_requires_completed_conversion() {
+    let store = at_nightly("INSERT INTO account_state (label, updated_at) VALUES ('alice', 0);");
+    let app = store.app_storage();
+    let routes = routes();
+    let before = dump(&store);
+    assert_serialization(
+        app.import_recovery_loss_to_ledger("alice", &input(&routes)),
+        "recovery conversion is pending",
+    );
+    assert_eq!(dump(&store), before);
+    convert(&store).unwrap();
+    app.record_recovery_coverage(
+        &[crate::RecoveryCoverageSlice {
+            route: &group(A),
+            relay: R1,
+            since_seconds: W,
+            until_seconds: NOW,
+            proof: crate::RecoveryCoverageProof::Comparison,
+        }],
+        NOW,
+    )
+    .unwrap();
+    for (cause, token) in [
+        (RecoveryLossCause::Queue, 32),
+        (RecoveryLossCause::NotificationConsumer, 33),
+    ] {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            cause,
+            token,
+            1,
+            NOW,
+            Some(W + 100),
+            Some(&[(group(A), W + 100)]),
+        )
+        .unwrap();
+    }
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_ledger_loss BEFORE INSERT ON account_recovery_conversion_loss
+         WHEN NEW.cause = 1 BEGIN SELECT RAISE(ABORT, 'injected ledger loss commit'); END;",
+        )
+        .unwrap();
+    let before = dump(&store);
+    let revision = app.recovery_revision_fence().unwrap();
+    match app.import_recovery_loss_to_ledger("alice", &input(&routes)) {
+        Err(StorageError::Backend(message)) => {
+            assert!(message.contains("injected ledger loss commit"))
+        }
+        other => panic!("expected injected ledger loss failure, got {other:?}"),
+    }
+    assert_eq!(dump(&store), before);
+    assert_eq!(app.recovery_revision_fence().unwrap(), revision);
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_ledger_loss")
+        .unwrap();
+    assert!(
+        app.import_recovery_loss_to_ledger("alice", &input(&routes))
+            .unwrap()
+    );
+    assert_eq!(app.converted_recovery_loss().unwrap().len(), 2);
+    assert_eq!(
+        app.recovery_revision_fence().unwrap().loss_revision,
+        revision.loss_revision + 1
+    );
+    assert!(causes(&store).is_empty());
+}

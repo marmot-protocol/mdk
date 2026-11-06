@@ -622,6 +622,20 @@ pub struct NostrRelayEvent {
     pub event: NostrTransportEvent,
 }
 
+/// Readiness of the current replies, including clamped input delegated to the
+/// recovery owner. These facts never certify the complete original query.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountSubscriptionInput {
+    /// Every issued endpoint's current reply ended and passed native placement.
+    pub complete: bool,
+    /// Every endpoint answered or was refused; waiting brings no more input.
+    pub settled: bool,
+    /// At least one current reply ended and passed native placement.
+    pub any: bool,
+}
+
 /// End-of-stored-events progress across one account's live inbox and batch REQs,
 /// from [`NostrTransportAdapter::account_subscription_eose`].
 ///
@@ -871,6 +885,25 @@ pub trait NostrRelayClient: Send + Sync {
         _endpoint: &TransportEndpoint,
     ) -> Option<RelayConnection> {
         None
+    }
+
+    /// Whether `endpoint` sent no EVENT frame at all, valid or not, for the
+    /// REQ `subscription_id` before that REQ's EOSE, as read off the wire of
+    /// `account`'s pool. Asked once for each EOSE the client dispatches, in
+    /// the order it dispatches them, and each answer is about that EOSE alone:
+    /// by the time it is dispatched the id may have gone out again and been
+    /// answered anew. A live count that delivered nothing proves its window
+    /// only on this answer, so an implementation must err toward false: when
+    /// it cannot read the wire, cannot tell the REQ from another with its id,
+    /// cannot tie the ask to one EOSE it read, or has no context for the
+    /// account.
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        _subscription_id: &str,
+    ) -> bool {
+        false
     }
 
     /// Optional bounded, request-scoped history operation. Implementations must
@@ -1632,6 +1665,19 @@ impl NostrTransportAdapter {
             .account_subscription_eose(account_id)
     }
 
+    /// Current-reply readiness, separately from complete-query coverage. This
+    /// read neither consumes loss nor grants cursor or history certificates.
+    #[doc(hidden)]
+    pub async fn account_subscription_input(
+        &self,
+        account_id: &MemberId,
+    ) -> AccountSubscriptionInput {
+        self.state
+            .read()
+            .await
+            .account_subscription_input(account_id)
+    }
+
     /// Drain replay loss into the caller's cursor/recovery fence. Import a
     /// returned loss synchronously before awaiting again, then drop the status.
     /// Its read guard keeps replay admission stable through a synchronous seal.
@@ -1874,6 +1920,9 @@ impl NostrTransportAdapter {
         let account = account_id.clone();
         let (mut changes, attempt, wake) = {
             let mut state = self.state.write().await;
+            if state.delegated_recovery.contains(&account) {
+                return Ok(ReplayCaptureOutcome::Stale);
+            }
             let valid = state
                 .account_replay_coverage
                 .get(&account)
@@ -2011,7 +2060,8 @@ impl NostrTransportAdapter {
     /// Fence the account's groups' live frames from now on (mdk#2660): a live
     /// count that leaves part of its REQ's range unproven holds the groups its
     /// REQ routes until the owner's [`Self::fence_replay`] answers it, or one
-    /// replay deadline passes. Call it before activating the account, so its
+    /// replay deadline passes for a non-delegated owner. Delegated holds last until
+    /// their owner releases the backlog. Call it before activating the account, so its
     /// first counts are held too. It lasts the adapter's life.
     pub async fn enable_replay_fencing(&self, account_id: &MemberId) {
         let mut state = self.state.write().await;
@@ -2021,12 +2071,36 @@ impl NostrTransportAdapter {
         }
     }
 
+    /// Delegate this account's history recovery to its ledger-driven owner.
+    /// Install before activation: neither owner-granted capture nor autonomous
+    /// clamp continuation may start for a delegated account. Subscription
+    /// ingress and raw live counts remain available to that owner.
+    #[doc(hidden)]
+    pub async fn delegate_replay_recovery(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), TransportAdapterError> {
+        let mut state = self.state.write().await;
+        if state.delegated_recovery.contains(account_id) {
+            return Ok(());
+        }
+        if state.accounts.contains_key(account_id)
+            || state.account_replay_coverage.contains_key(account_id)
+        {
+            return Err(TransportAdapterError::Subscription(
+                "recovery ownership must be installed before activation".into(),
+            ));
+        }
+        state.delegated_recovery.insert(account_id.clone());
+        Ok(())
+    }
+
     /// Apply the account owner's fences: each group `plan` names releases its
     /// held live frames sent before the plan's point and keeps the rest, the
     /// counts its ticket covers are answered, and a group neither fences nor
-    /// an unanswered count holds goes free. A fence holds at most one replay
-    /// deadline, however often a plan names its group; then its frames go out
-    /// as late input. Enables fencing ([`Self::enable_replay_fencing`]).
+    /// an unanswered count holds goes free. Delegated recovery releases only by
+    /// this plan, independently of network request deadlines. A non-delegated
+    /// fence holds at most one replay deadline, then releases as late input. Enables fencing ([`Self::enable_replay_fencing`]).
     pub async fn fence_replay(&self, account_id: &MemberId, plan: &ReplayFencePlan) {
         let mut state = self.state.write().await;
         state.replay_fencing.insert(account_id.clone());
@@ -2679,11 +2753,26 @@ impl NostrTransportAdapter {
     /// That relay's coverage then waits while older pages are fetched in the
     /// background and delivered like reconciled events.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
+        self.handle_relay_eose_reply(endpoint, subscription_id, false)
+            .await;
+    }
+
+    /// [`Self::handle_relay_eose`], when the wire showed whether the relay
+    /// sent any EVENT frame for the REQ before this EOSE
+    /// ([`NostrRelayClient::reply_sent_nothing`]).
+    pub(crate) async fn handle_relay_eose_reply(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        sent_nothing: bool,
+    ) {
         let now_ms = self.now_ms();
-        self.state
-            .write()
-            .await
-            .record_subscription_eose(&subscription_id, &endpoint, now_ms);
+        self.state.write().await.record_subscription_eose(
+            &subscription_id,
+            &endpoint,
+            now_ms,
+            sent_nothing,
+        );
 
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -3798,6 +3887,9 @@ struct AccountReplayCoverage {
     /// The account owner fences groups' live frames (see `replay_fence`);
     /// until it does, no count arms a fence.
     fencing: bool,
+    /// The account's ledger-driven owner supplies history; native backward
+    /// paging must not run. Kept separate from fence mechanics.
+    recovery_delegated: bool,
     /// The last ticket at which a count that armed a fence became a fact.
     fence_ticket: u64,
     /// The ticket of the last owner plan applied: an older plan is stale.
@@ -3975,9 +4067,11 @@ impl ReplayEndpoint {
         }
     }
 
-    /// What this serial's EOSE counted in `stored`, as a live count.
-    fn eose_count(&self, stored: StoredReplay) -> ReplayLiveCount {
+    /// What this serial's EOSE counted in `stored`, as a live count;
+    /// `sent_nothing` when the wire showed no EVENT frame before it.
+    fn eose_count(&self, stored: StoredReplay, sent_nothing: bool) -> ReplayLiveCount {
         ReplayLiveCount {
+            sent_nothing: sent_nothing && stored.events == 0,
             events: stored.events,
             oldest: stored.oldest,
             requested_at: self.requested_at,
@@ -4241,6 +4335,10 @@ enum RelayReplay {
     /// The relay reported end-of-stored-events. Final: a later `CLOSED` ends
     /// the live REQ but cannot take back history already served.
     Eose,
+    /// A full live reply ended, and the account's ledger-driven owner owes
+    /// the rest. Its received input may be admitted, but this is not complete
+    /// original-query coverage and never upgrades the EOSE coverage gate.
+    Delegated,
     /// The relay ended the REQ with a dropped refusal before EOSE.
     Refused,
     /// The relay sent EOSE after a full page of stored events, so it may have
@@ -4251,6 +4349,14 @@ enum RelayReplay {
     /// Paging ended without proving coverage. Only actually discarded bodies
     /// enter the loss fence; later live input must not remain stuck.
     Incomplete,
+}
+
+impl RelayReplay {
+    /// Physical input ended; unlike complete-query coverage this includes a
+    /// full reply whose missing history is delegated to the account owner.
+    fn input_ended(self) -> bool {
+        matches!(self, Self::Eose | Self::Delegated)
+    }
 }
 
 impl AccountReplayCoverage {
@@ -4314,7 +4420,7 @@ impl AccountReplayCoverage {
                         .subscriptions
                         .get(id)
                         .and_then(|relays| relays.get(relay))
-                        == Some(&RelayReplay::Eose)
+                        .is_some_and(|replay| replay.input_ended())
                     && self.request_admitted(id, Some(*relay))
                 {
                     endpoint.boundary_admitted = true;
@@ -4511,8 +4617,10 @@ impl AccountReplayCoverage {
                     .subscriptions
                     .get(id)
                     .is_some_and(|relays| match relay {
-                        Some(relay) => relays.get(&relay) == Some(&RelayReplay::Eose),
-                        None => relays.values().any(|replay| *replay == RelayReplay::Eose),
+                        Some(relay) => relays
+                            .get(&relay)
+                            .is_some_and(|replay| replay.input_ended()),
+                        None => relays.values().any(|replay| replay.input_ended()),
                     }))
     }
 
@@ -4631,7 +4739,7 @@ impl AccountReplayCoverage {
                         route: *route,
                     };
                     let phase = match replay {
-                        RelayReplay::Eose => ReplayAdmission::Complete,
+                        RelayReplay::Eose | RelayReplay::Delegated => ReplayAdmission::Complete,
                         RelayReplay::Refused | RelayReplay::Incomplete => {
                             ReplayAdmission::Abandoned
                         }
@@ -5347,7 +5455,7 @@ impl AccountReplayCoverage {
                         .subscriptions
                         .get(&request)
                         .and_then(|relays| relays.get(&relay))
-                        == Some(&RelayReplay::Eose);
+                        .is_some_and(|replay| replay.input_ended());
                     let capturing = self
                         .endpoint_deadlines
                         .get(&request)
@@ -5602,6 +5710,19 @@ impl AccountReplayCoverage {
     }
 
     fn snapshot(&self) -> AccountSubscriptionEose {
+        self.snapshot_with(|replay| replay == RelayReplay::Eose)
+    }
+
+    fn input_snapshot(&self) -> AccountSubscriptionInput {
+        let progress = self.snapshot_with(RelayReplay::input_ended);
+        AccountSubscriptionInput {
+            complete: progress.complete(),
+            settled: progress.settled(),
+            any: progress.any(),
+        }
+    }
+
+    fn snapshot_with(&self, ended: impl Fn(RelayReplay) -> bool) -> AccountSubscriptionEose {
         let mut progress = AccountSubscriptionEose {
             subscriptions: self.subscriptions.len() - self.maintenance.len(),
             ..AccountSubscriptionEose::default()
@@ -5613,7 +5734,7 @@ impl AccountReplayCoverage {
             let eose = relays
                 .iter()
                 .filter(|(relay, replay)| {
-                    **replay == RelayReplay::Eose && self.request_admitted(id, Some(**relay))
+                    ended(**replay) && self.request_admitted(id, Some(**relay))
                 })
                 .count();
             let refused = relays
@@ -5661,11 +5782,24 @@ impl AccountReplayCoverage {
         );
     }
 
+    #[cfg(test)]
     fn record_eose(
         &mut self,
         id: &str,
         relay: RelayIndex,
         now_ms: u64,
+    ) -> Option<(ReplayWindow, u64)> {
+        self.record_eose_reply(id, relay, now_ms, false)
+    }
+
+    /// Record `relay`'s EOSE for `id`; `sent_nothing` when the wire showed
+    /// it sent no EVENT frame for the REQ before it.
+    fn record_eose_reply(
+        &mut self,
+        id: &str,
+        relay: RelayIndex,
+        now_ms: u64,
+        sent_nothing: bool,
     ) -> Option<(ReplayWindow, u64)> {
         if !self
             .subscriptions
@@ -5716,7 +5850,7 @@ impl AccountReplayCoverage {
                 .and_then(|relays| relays.get_mut(&relay))
                 && let Some(recount) = endpoint.recount.take()
             {
-                endpoint.install_live_count(endpoint.eose_count(recount));
+                endpoint.install_live_count(endpoint.eose_count(recount, sent_nothing));
                 self.arm_fence(id, relay);
             }
             return None;
@@ -5727,18 +5861,24 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
             .filter(|endpoint| !endpoint.stopped)
         {
-            endpoint.install_live_count(endpoint.eose_count(stored));
+            endpoint.install_live_count(endpoint.eose_count(stored, sent_nothing));
             self.arm_fence(id, relay);
         }
+        let delegated = self.recovery_delegated;
         let replay = self.replay_mut(id, relay)?;
-        if stored.events >= RELAY_REPLAY_PAGE_LIMIT
+        if !delegated
+            && stored.events >= RELAY_REPLAY_PAGE_LIMIT
             && let Some(oldest) = stored.oldest
         {
             return self
                 .own_replay_window(id, relay, now_ms)
                 .map(|window| (window, oldest));
         }
-        *replay = RelayReplay::Eose;
+        *replay = if delegated && stored.events >= RELAY_REPLAY_PAGE_LIMIT {
+            RelayReplay::Delegated
+        } else {
+            RelayReplay::Eose
+        };
         for group in self.groups.values_mut() {
             for (owner, stream) in &mut group.streams {
                 if owner.request.as_ref() != id
@@ -5928,7 +6068,10 @@ impl AccountReplayCoverage {
         let Some(replay) = self.replay_mut(id, relay) else {
             return;
         };
-        if matches!(*replay, RelayReplay::Eose | RelayReplay::Refused) {
+        if matches!(
+            *replay,
+            RelayReplay::Eose | RelayReplay::Delegated | RelayReplay::Refused
+        ) {
             return;
         }
         if disposition == SubscriptionRefusalDisposition::Pending {
@@ -6396,6 +6539,9 @@ struct AdapterState {
     /// Accounts whose owner fences their groups' live frames. Survives
     /// account replacement, so an activation's first counts arm fences.
     replay_fencing: HashSet<MemberId>,
+    /// Account recovery ownership, fixed before activation and retained for
+    /// replacement REQs. Lower-level callers keep native paging by default.
+    delegated_recovery: HashSet<MemberId>,
     source_clock: Arc<std::sync::atomic::AtomicU64>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
@@ -6844,6 +6990,14 @@ impl AdapterState {
         account_id: &MemberId,
         subscriptions: &[NostrSubscription],
     ) {
+        // Buffered live frames have no other copy: they move to the new
+        // coverage, those a fence holds still held, rather than being lost
+        // with the old one.
+        let carried = self
+            .account_replay_coverage
+            .get_mut(account_id)
+            .map(AccountReplayCoverage::take_carried_live)
+            .unwrap_or_default();
         let mut coverage = AccountReplayCoverage::new(
             account_id.clone(),
             self.replay_losses.clone(),
@@ -6853,11 +7007,13 @@ impl AdapterState {
             coverage.attach_ingress(ingress.clone());
         }
         coverage.fencing = self.replay_fencing.contains(account_id);
+        coverage.recovery_delegated = self.delegated_recovery.contains(account_id);
         self.account_replay_coverage
             .insert(account_id.clone(), coverage);
         self.stage_replay_batches(account_id, subscriptions);
         if let Some(coverage) = self.account_replay_coverage.get_mut(account_id) {
             coverage.admit_retained();
+            coverage.restore_carried_live(carried);
         }
     }
 
@@ -6964,6 +7120,13 @@ impl AdapterState {
             .unwrap_or_default()
     }
 
+    fn account_subscription_input(&self, account_id: &MemberId) -> AccountSubscriptionInput {
+        self.account_replay_coverage
+            .get(account_id)
+            .map(AccountReplayCoverage::input_snapshot)
+            .unwrap_or_default()
+    }
+
     fn record_subscription_first_event(
         &mut self,
         subscription_id: &str,
@@ -6980,11 +7143,14 @@ impl AdapterState {
         subscription_id: &str,
         endpoint: &TransportEndpoint,
         now_ms: u64,
+        sent_nothing: bool,
     ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
         for (account_id, coverage) in &mut self.account_replay_coverage {
-            if let Some((window, until)) = coverage.record_eose(subscription_id, relay, now_ms) {
+            if let Some((window, until)) =
+                coverage.record_eose_reply(subscription_id, relay, now_ms, sent_nothing)
+            {
                 let serial = coverage.endpoint_deadlines[subscription_id][&relay].serial;
                 coverage.queue_capture(ReplayPaging {
                     account_id: account_id.clone(),
@@ -7753,6 +7919,113 @@ fn hash_component(hasher: &mut Sha256, component: &[u8]) {
 mod batch_tests {
     use super::*;
 
+    /// Ownership is installed before any REQ and survives activation replacement;
+    /// a delegated source cannot be handed back to credited native capture.
+    #[tokio::test]
+    async fn delegated_recovery_survives_reactivation_and_rejects_native_capture() {
+        let adapter = NostrTransportAdapter::new(Arc::new(ConnectionRelayClient::default()));
+        let account = MemberId::new(vec![0xA1; 32]);
+        adapter.delegate_replay_recovery(&account).await.unwrap();
+        for _ in 0..2 {
+            adapter
+                .activate_account(TransportAccountActivation {
+                    account_id: account.clone(),
+                    inbox_endpoints: vec![TransportEndpoint("wss://a.example".into())],
+                    group_subscriptions: Vec::new(),
+                    since: Some(Timestamp(100)),
+                })
+                .await
+                .unwrap();
+            adapter.delegate_replay_recovery(&account).await.unwrap();
+            let token = {
+                let status = adapter.take_replay_status(&account).await;
+                status
+                    .sources()
+                    .next()
+                    .unwrap()
+                    .endpoints()
+                    .next()
+                    .unwrap()
+                    .capture_token()
+            };
+            let endpoint = TransportEndpoint("wss://a.example".into());
+            for index in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
+                let mut id = [0_u8; 32];
+                id[..8].copy_from_slice(&index.to_be_bytes());
+                adapter
+                    .observe_relay_event(&id, &endpoint, Some(&token.request), 100 + index)
+                    .await;
+            }
+            let input = adapter.account_subscription_input(&account).await;
+            assert!(
+                !input.complete && !input.settled && !input.any,
+                "a full count without physical EOSE is still waiting"
+            );
+            adapter
+                .handle_relay_eose(endpoint, token.request.to_string())
+                .await;
+            {
+                let status = adapter.take_replay_status(&account).await;
+                let source = status.sources().next().unwrap();
+                let endpoint = source.endpoints().next().unwrap();
+                assert!(endpoint.admitted(), "received input needs no native fetch");
+                assert_eq!(
+                    endpoint.live_count().unwrap().events,
+                    RELAY_REPLAY_PAGE_LIMIT
+                );
+            }
+            assert_eq!(
+                adapter
+                    .account_subscription_eose(&account)
+                    .await
+                    .relay_subscription_attempts_with_eose,
+                0,
+                "a full reply never certifies the whole query",
+            );
+            let input = adapter.account_subscription_input(&account).await;
+            assert!(
+                input.complete && input.settled && input.any,
+                "current input ended even though the original query remains unproved"
+            );
+            let credit = Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                adapter
+                    .capture_replay(
+                        &account,
+                        ReplayCapturePlan {
+                            attempt_serial: 1,
+                            sources: vec![token],
+                            credit,
+                        },
+                        NostrAcquisitionCancellation::new(),
+                    )
+                    .await
+                    .unwrap(),
+                ReplayCaptureOutcome::Stale,
+            );
+        }
+        let legacy = MemberId::new(vec![0xB1; 32]);
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: legacy.clone(),
+                inbox_endpoints: vec![TransportEndpoint("wss://a.example".into())],
+                group_subscriptions: Vec::new(),
+                since: Some(Timestamp(100)),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            adapter.delegate_replay_recovery(&legacy).await,
+            Err(TransportAdapterError::Subscription(message))
+                if message == "recovery ownership must be installed before activation"
+        ));
+    }
+
     fn route(index: u8, endpoint: &str, since: Option<u64>) -> NostrSubscription {
         NostrSubscription::Group {
             account_id: MemberId::new(vec![0xA1; 32]),
@@ -8019,6 +8292,7 @@ mod batch_tests {
             oldest: Some(120),
             requested_at,
             live_from: requested_at,
+            sent_nothing: false,
         };
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.boundary_admitted);
@@ -8292,6 +8566,35 @@ mod batch_tests {
         assert!(endpoint.ended_count.is_some());
     }
 
+    /// The wire's word that a relay sent no EVENT frame rides on the live
+    /// count of the EOSE it came with, and only when the SDK counted nothing
+    /// either. A reply the SDK restores after a kept `CLOSED` takes its own
+    /// EOSE's word.
+    #[tokio::test]
+    async fn a_live_count_carries_what_the_wire_showed() {
+        let (mut coverage, id, _) = replay_coverage(2);
+        let sent_nothing = |coverage: &AccountReplayCoverage, relay| {
+            coverage.endpoint_deadlines[&id][&RelayIndex(relay)]
+                .live_count
+                .map(|count| count.sent_nothing)
+        };
+        coverage.record_eose_reply(&id, RelayIndex(1), 0, true);
+        assert_eq!(sent_nothing(&coverage, 1), Some(true));
+        coverage.record_stored_event(&id, RelayIndex(2), 150);
+        coverage.record_eose_reply(&id, RelayIndex(2), 0, true);
+        assert_eq!(
+            sent_nothing(&coverage, 2),
+            Some(false),
+            "the SDK counted an event"
+        );
+
+        for wire in [false, true] {
+            coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
+            coverage.record_eose_reply(&id, RelayIndex(1), 0, wire);
+            assert_eq!(sent_nothing(&coverage, 1), Some(wire), "restored");
+        }
+    }
+
     /// A `CLOSED` the SDK keeps (AUTH, a rate limit) stops the count until the
     /// REQ it sends again reaches EOSE; that reply counts afresh, before or
     /// after the serial's first EOSE, and streams from that EOSE. A dropped
@@ -8404,6 +8707,7 @@ mod batch_tests {
                 oldest: Some(1_000),
                 requested_at: endpoint.requested_at,
                 live_from: endpoint.requested_at,
+                sent_nothing: false,
             })
         );
     }

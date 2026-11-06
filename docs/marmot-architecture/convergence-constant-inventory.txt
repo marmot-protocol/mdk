@@ -91,6 +91,7 @@ A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_U
 A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_ATTEMPTS
 # A19 is the recovery runner's starting values: unit retry, relay cooldown, account caps, quantum, staging and
 # the grace a cut request gets to report what it read.
+# A19 also bounds unresolved epoch-gap visits and admission before retry selection; values unchanged.
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_BASE_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_CAP_SECS
 A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BREAK_AFTER_NO_PROGRESS

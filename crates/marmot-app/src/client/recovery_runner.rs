@@ -53,9 +53,11 @@
 
 mod admission;
 mod compare;
+mod epoch_gap;
 pub(crate) mod host;
 mod open_attempts;
 mod policy;
+pub(crate) mod post_join;
 mod quantum;
 mod recheck;
 mod repair;
@@ -151,7 +153,7 @@ impl RunnerRoute {
 #[derive(Clone, Default)]
 pub(crate) struct PriorityHints {
     /// Groups whose live frames are held behind a fence. Each survey adds
-    /// the routes its own fences hold.
+    /// every route of each group its own fences hold.
     pub(crate) held: BTreeSet<TransportReconciliationRoute>,
     /// Groups with an open conversation window. Each survey adds the routes
     /// whose group has one open.
@@ -177,6 +179,7 @@ pub(crate) struct WorkerTurn<'a> {
 
 /// What a turn that reads debt sees: the account's current routes, and the
 /// live tails and live counts read for this turn alone.
+#[derive(Clone, Copy)]
 pub(crate) struct DebtTurn<'a> {
     pub(crate) app: &'a SqliteAppStorage,
     /// The account's current routes, as of this turn.
@@ -255,13 +258,14 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     /// installed subscriptions lag its routes, so its slice stays owed.
     async fn deliveries(&self, relay: &str, event: Event) -> Option<Vec<TransportDelivery>>;
 
-    /// Hand one staged delivery to the account's recovered-ingest path, as
-    /// one worker command. `None` once the worker is gone; an error is its
-    /// privacy-safe kind.
+    /// Hand one bounded batch to the account's recovered-ingest path in one
+    /// worker command. Return only the attempted prefix, stopping on a hold,
+    /// failure, self-removal or effects needing publication. `None` once the
+    /// worker is gone; an error is its privacy-safe kind.
     async fn admit_staged(
         &self,
-        delivery: TransportDelivery,
-    ) -> Option<Result<Admitted, &'static str>>;
+        deliveries: Vec<TransportDelivery>,
+    ) -> Option<Vec<Result<Admitted, &'static str>>>;
 
     /// Unix seconds.
     fn now_seconds(&self) -> u64;
@@ -378,6 +382,9 @@ impl Connections {
 pub(crate) struct PassBound {
     pub(crate) deadline: Instant,
     pub(crate) stop: CancellationToken,
+    /// An explicit repair checks through its request time even inside a live
+    /// tail. Ordinary passes keep the account's healthy-tail authority.
+    repair_until: Option<u64>,
 }
 
 impl PassBound {
@@ -386,6 +393,7 @@ impl PassBound {
         Self {
             deadline: Instant::now() + budget,
             stop: CancellationToken::new(),
+            repair_until: None,
         }
     }
 
@@ -633,6 +641,30 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         }
     }
 
+    /// Read ordinary debt, except that an explicit repair's bounded request
+    /// also visits the historical part of a healthy live subscription. Its
+    /// authority returns unchanged as soon as that request ends or is dropped.
+    async fn debt_turn<T, F>(&self, pass: Option<&PassBound>, run: F) -> Option<StorageResult<T>>
+    where
+        F: FnOnce(&DebtTurn<'_>) -> StorageResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let until = pass.and_then(|bound| bound.repair_until);
+        self.host
+            .debt_turn(move |turn| {
+                if let Some(until) = until {
+                    let tails = repair::RepairTails(until);
+                    run(&DebtTurn {
+                        tails: &tails,
+                        ..*turn
+                    })
+                } else {
+                    run(turn)
+                }
+            })
+            .await
+    }
+
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
     pub(crate) async fn step(&mut self) -> Step {
         self.step_within(None, true).await
@@ -661,6 +693,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     }
                 }
                 Step::Raced => {}
+                // A bounded admission batch yielded with more immediate work.
+                // Give it another scheduling step within this caller's bound.
+                Step::Idle { next_due: Some(at) } if at <= self.host.now_seconds() => {}
                 Step::Idle { .. } | Step::Stopped => break,
             }
         }
@@ -683,9 +718,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let policy = self.policy;
-        let mut survey = match self
-            .host
-            .debt_turn(move |turn| select::survey(turn, &policy, &stalled))
+        let (mut survey, epoch_gap_due) = match self
+            .debt_turn(pass, move |turn| {
+                let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
+                Ok((select::survey(turn, &policy, &stalled)?, due))
+            })
             .await
         {
             None => return Step::Stopped,
@@ -705,6 +742,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 };
             }
         };
+        let admission_due = sooner(admission_due, epoch_gap_due);
         self.host.surveyed(std::mem::take(&mut survey.catching_up));
         let now = self.host.now_seconds();
         if let Some(step) = self.report_pause(survey.paused_until, now).await {
@@ -713,6 +751,17 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let mut hints = self.hints.borrow().clone();
         hints.held.append(&mut survey.fenced);
         hints.window.append(&mut survey.window);
+        // A wake-collection process fetches only what its live input waits
+        // on: the units of every route of a group whose frames a fence holds.
+        // Other debt waits for an Advance process or an explicit repair.
+        if !self.policy.fetches_unasked && pass.is_none_or(|bound| bound.repair_until.is_none()) {
+            survey
+                .candidates
+                .retain(|candidate| hints.held.contains(&candidate.key.route));
+            survey
+                .rechecks
+                .retain(|candidate| hints.held.contains(&candidate.key.route));
+        }
         let candidate = match select::pick(survey, &mut self.memory, &hints, now, new_round) {
             Pick::Unit(candidate) => candidate,
             Pick::Idle { next_due } => {
@@ -751,8 +800,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let compares = self.memory.compares(&key.relay);
         let open = self.open.clone();
         let plan = match self
-            .host
-            .debt_turn(move |turn| {
+            .debt_turn(pass, move |turn| {
                 let plan = select::begin(turn, &key, best_effort, caps, compares, &policy);
                 // A best-effort relay is charged nothing.
                 if let Ok(Some(plan)) = &plan
@@ -783,6 +831,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let deadline = Instant::now() + policy.quantum;
         let ranges = plan.ranges.len();
+        tracing::debug!(target: TARGET, method = "attempt_started",
+            recheck = false, best_effort, ranges);
+
         // The pass's end preempts the quantum as shutdown does. The sweep's
         // own deadline stays the quantum's, so a cut pass reads as a
         // preemption, never as the relay's verdict.
@@ -797,7 +848,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                         (report, Some(facts))
                     }
                     None => {
-                        let caps = caps.unwrap_or_default();
+                        let caps = plan.caps.unwrap_or_default();
                         let report =
                             quantum::run(host, &plan, caps, deadline, &preempt, &policy).await;
                         (report, None)
@@ -876,8 +927,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let key = candidate.key.clone();
         let open = self.open.clone();
         let plan = match self
-            .host
-            .debt_turn(move |turn| {
+            .debt_turn(pass, move |turn| {
                 let plan = recheck::begin(turn, &key, caps, &policy);
                 if let Ok(Some(plan)) = &plan {
                     open.begun(&plan.compare.key, AttemptKind::Recheck);
@@ -905,6 +955,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let deadline = Instant::now() + policy.quantum;
         let ranges = plan.compare.ranges.len();
+        tracing::debug!(target: TARGET, method = "attempt_started",
+            recheck = true, best_effort = false, ranges);
+
         let preempt = self.cancel.child_token();
         let (report, facts) = {
             let run = compare::run(&*self.host, &plan.compare, deadline, &preempt, &policy);

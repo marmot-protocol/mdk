@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-02
+updated: 2026-11-03
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -523,7 +523,7 @@ in `marmot-app` fills it from facts the owner already has:
 | --- | --- |
 | Every account open, with or without a transport cursor | Every current route's goal widens to its standing floor, directly in the ledger. No extra incremental-history obligation is created for the old owner when a cursor exists |
 | A route becomes current, including a group join or route addition | At the runner's routing-change settlement, before its next debt read, current routes' goals widen to their standing floors. Existing wider goals and durable coverage stay intact |
-| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
+| A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing, unless the wire showed its relay sent no EVENT frame before EOSE, and then it proves from the REQ's `since`. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
 | A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
@@ -531,7 +531,7 @@ in `marmot-app` fills it from facts the owner already has:
 | A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
 | An explicit history request | Every current route's goal widens to the retained window |
 | A pending epoch gap | The group's routes' goals widen to their standing floors |
-| Every settlement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder |
+| Every settlement, and the recovery runner's first debt turn in a process and then each hour of floor movement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder |
 
 **Standing floors.** The Welcome time is a soft signal (`Group::local_copy_welcome_created_at`):
 an application message carries its sender's compose time, so one composed offline before the
@@ -563,8 +563,9 @@ dismissing the notice clears both. Each prune also settles every route below its
 prune parks only from there up, because it no longer holds the coverage below. Widening a goal
 back below that floor, as the shadow report does each time for pending loss, therefore parks
 nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
-to its own. While the ledger is in shadow mode nothing sweeps, so most routes gather a
-remainder; the switch-over drops those.
+to its own. Pre-conversion shadow mode performed no sweeps, so routes could accumulate
+remainders without an acquisition attempt. Ownership conversion discards that shadow evidence
+and rebuilds authoritative debt from retained obligations and current route floors.
 
 A count proves only what its relay had stored when it ran the query, so its live boundary ends
 the second before the count's request stamp. The adapter takes that stamp before it issues the
@@ -580,10 +581,23 @@ counts them (expired, deleted or replaced events, bad signatures, frames it cann
 a count is only a lower bound on what the relay sent and cannot show that a reply was not cut.
 The rule assumes relays cut a reply newest first, as NIP-01 asks of a `limit`: every stored
 event newer than the oldest one counted was then sent. A relay that cuts any other way breaks
-that assumption, and the ledger cannot see it. A count with no event proves nothing, and live
-boundaries read no NIP-11 limit. An API that reported the raw frames each REQ received before
-EOSE could later add back, on top of this rule, a proof from the REQ's `since` for a reply
-under the relay's limit.
+that assumption, and the ledger cannot see it. Live boundaries read no NIP-11 limit, and a count
+with no event proves nothing on its own.
+
+The wire can say more than the count. The account pool's WebSocket tap, the one that reads the
+sweep's hints, also counts the EVENT frames each REQ's relay sends before that REQ's EOSE,
+valid or not, on the connection the REQ went out on. A relay that sent none cut nothing, so a
+count with no event whose tap count is zero proves its whole window, from the REQ's `since`
+through the second before the request. The tap answers only when it can tie every frame to one
+REQ. A frame it cannot attribute while the REQ is open (an EVENT whose id it cannot read, an
+EOSE too long to read, a binary frame), an id re-sent on the connection while the relay may
+still answer the earlier REQ, or a count evicted from its bound leaves the answer unknown, and
+the count proves nothing. The client dispatches an EOSE some time after the tap reads it, and by
+then the id may have gone out again and been answered anew, so the tap answers each dispatched
+EOSE in order and only for the newest one it read. A non-empty count keeps the rule above. Without this, each join, which
+restarts every live REQ, left every quiet route a sliver between the two REQs that only a sweep
+could prove: one attempt per route per relay per join, so a burst of joins spent the account's
+hourly budget (mdk#2660).
 
 Past the request an open REQ vouches only while it lasts, and nothing proves when it stopped
 delivering: a connection can die silently, and a frozen process notices nothing. So each
@@ -709,9 +723,10 @@ Known disagreements, expected until later phases remove their cause:
   connected account that recovered from loss owes the time since that generation's request,
   as unowed debt, until a comparison proves it, or its next generation's EOSE does on a
   route busy enough to count an event older than that time.
-- **Quiet windows.** A live count with no event proves nothing, so where replay admission
-  settles an obligation over a window with no events, the ledger keeps it as unowed debt
-  until a comparison proves it.
+- **Quiet windows.** A live count with no event proves nothing unless the wire showed its
+  relay sent nothing, so where replay admission settles an obligation over a window with no
+  events and the tap could not vouch for the reply, the ledger keeps it as unowed debt until a
+  comparison proves it.
 - **Required relays only.** A certificate is recorded for the route's required relays, and a
   scope is compared on its required relays; a scope with none is not comparable. Live
   boundaries are recorded for every endpoint that admitted one.
@@ -732,6 +747,10 @@ its next attempt time. Each quantum's outcome is one transaction:
 | Rate-limited | — | Cools down | Charged |
 | Refused | Breaks at once and parks its debt | — | Charged |
 | Unanswered, local failure | — | — | Refunded |
+
+A quantum whose every slice was proven but whose coverage an un-cover took back during the
+fetch (a post-join collection or an imported loss) is unanswered too: not its relay's doing, so
+the unit is due again at once and keeps holding its group's frontier.
 
 An attempt is charged when it begins, so a process that dies mid-quantum still counts it.
 A runner stopped mid-quantum while storage is open, by a reconnect or a dropped pass, refunds
@@ -760,15 +779,26 @@ refetches nothing: the events are durable and the ledger-derived cursor is past 
 Staging is not admission; a row leaves once its event is in the seen index, or, if it no
 longer decodes, by un-covering its second so it is fetched again.
 
-### 9. The recovery runner (behind its gate)
+### 9. The recovery runner
 
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
-fetches over the ledger and the retry state above. It runs only behind the internal
-`runner_owns_debt` gate, off until the switch-over turns it on, so the comparison job keeps
-every behavior until then. With the gate on (`recovery_runner/host.rs`), the account worker
+fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
+on; the old owner remains available for controlled comparisons during retirement. Before any
+subscription activates, ownership preparation converts retained obligations and imports loss as
+ledger debt. Both owner-granted native capture and autonomous clamp continuation are disabled
+for app-owned accounts; ordinary native input, count facts and bounded fences remain. Supported
+lower-level adapter/session callers still retain the native pager pending its replacement.
+With runner ownership (`recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
 exit, a quantum in flight included. A directly owned client runs one pass in place from
-`sync()` and from `next_event()` when it meets delivery loss. Sweeps go over the account's own
+`sync()` and from `next_event()` when it meets delivery loss. No worker reads what that pass's
+fence answer releases, so `sync()` reads it before returning. In a wake-collection process
+(`CursorPersistence::Frozen`, a notification extension) the runner admits staged history and
+answers the live fences, but fetches only for the routes of groups whose live frames a fence
+holds (every route of such a group, since they share its frontier), so the messages that woke
+the process can be shown, and otherwise only for an explicit full-history
+repair, the one recovery that posture allows. A loss, a joined group's history and the standing
+window wait for an Advance process. Sweeps go over the account's own
 relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
 widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
 wake only makes it read the ledger again. A unit is one (route,
@@ -839,9 +869,9 @@ relay) on a required relay with NIP-77 has one resumable pass over its covered a
 ranges inside the route's complete reconciliation inventory: the retention window, raised past
 whatever the inventory compacted beyond its 16,384 ids. That is the window inside which
 automatic late-publication repair is guaranteed; below it the held set is incomplete, so
-nothing is re-checked there, and an epoch gap's bound below it is raised to it. Best-effort relays get none, and a relay that can only
-prove by count is never re-checked. A pass falls due 6 h after the last full pass, and at once
-after an epoch gap (that group, from the gap's bound), explicit repair, or a cooldown of its
+nothing is periodically re-checked there. Best-effort relays get none, and a relay that can only
+prove by count receives no periodic re-checks. A pass falls due 6 h after the last full pass, and at once
+after explicit repair or a cooldown of its
 relay longer than an hour. Storage makes them due in the write that ends the cooldown, and each
 such request bumps the pass's revision; a quantum records its pass's progress only under the
 revision it began on, so a request that arrives while one runs is never swallowed. Re-checks run
@@ -852,14 +882,51 @@ pass un-covers nothing and resumes from its position after the unit backoff's do
 re-check charges the account budget and the relay's streak like any quantum, never the unit's
 own retry state. These values are decision A20.
 
+An unresolved durable epoch gap additionally authorizes bounded return visits to that group's retained goals,
+including on relays without NIP-77. This handles a commit published with an old timestamp after an earlier sweep.
+The existing runner reopens those goals and resumes ordinary comparison or sweep quanta under the same credits,
+staging bounds and account budgets. A completed visit that leaves the epoch missing waits 30 seconds before the
+next, doubling the delay under the existing unit policy. A visit ends when each source has covered its range
+or failed off the admission frontier; a failed source's range remains owed and its unit backoff still applies.
+Thus an unavailable relay cannot prevent return visits to healthy relays. After six unsuccessful visits the EpochGap
+obligation parks visibly. Partial sweep progress does not reset this visit budget. Its count, unfinished-visit
+state and next retry time survive restart, and revisions of a ticket at the same missing epoch preserve them.
+A higher stalled epoch or explicit repair starts a fresh budget. Actual local epoch advancement clears the gap;
+reading all history successfully does not. Suspended groups receive no visits. These visits are unfenced and
+do not enable either native backward pager. Healthy routes retain the six-hour NIP-77-only periodic policy.
+
+
+Coverage and retention do not imply decryptability. The ledger can prove a range and retain its events while
+an event remains held as undecryptable protocol input. It must not report that as a visible chat message.
+The runner's end-to-end proofs therefore require exact user-visible timelines in addition to durable coverage
+and retention. Exposing this held-versus-visible distinction in recovery status remains tracked by #2237.
+
 Each step first admits from staging. A group's staged events, across its current and retained
 routes, go to the recovered-ingest path oldest first by `(created_at, id)`, below the group's
 admission frontier: the first second, after the live tail, that its furthest-behind required
 relay still owes. A relay leaves the frontier after an answer without progress or an
-unreachable or refused end, and while it cools down or is broken or retired; what it staged
-ahead of the others then goes in as late input. An admission turn ingests four events, one
-worker command each, so commands and live input go between them. An event the engine keeps no
-trace of stays staged, and its group waits behind it on the local-failure backoff while other
+unreachable or refused end, after an answer that stopped on a second it cannot prove (even one
+that advanced first), and while it cools down or is broken or retired; what it staged ahead of
+the others then goes in as late input. Once no required relay serves a group (each has left,
+and none is an active unit with nothing left to fetch), the group is stranded: each unit still
+pursuing its debt holds the frontier again, through unreachable spells, cooldowns and answers
+cut short at their deadline, so nothing newer goes ahead of history its relay may still return.
+Two units hold nothing. A saturated one, whose last answered quantum stopped on the first
+second it owes because its relay cannot prove it under the caps the relay published (no cap and
+no NIP-77 proof; migration 0151 records that second), would stop on the same second if asked
+again while those caps stand. It pursues again once it owes an earlier second first or the
+relay's recorded caps change. An answer its deadline cut saturates nothing, and nor does a relay
+whose caps were never read: a document that failed to load is not a relay that cannot prove the
+second. Nor does an inconclusive NIP-77 answer: ids the relay listed and then did not all
+return (the event may have gone in between), an exchange that broke off on a malformed
+message, which is not a relay without NIP-77, or a one-id fetch cut short (the reply budget
+counts duplicate frames). Only the relay's own capability or the size of the set it holds for
+the second proves it cannot prove it. The sweep ends on an inconclusive second and asks
+again on the backoff. A broken unit's debt is parked. The group's frames go once each
+holding unit saturates or breaks, or a relay serves the group again. An admission turn ingests at most 16 staged
+events in one worker command, stopping at the first event the engine keeps no trace of, so
+commands and live input go between turns. An event the engine keeps no trace of stays staged,
+and its group waits behind it on the local-failure backoff while other
 groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
 once the account holds 64 MiB, is not eligible while another relay holds that group's frontier.
 A debt unit at the frontier is never held back, so the runner never waits on itself; a
@@ -878,10 +945,12 @@ as admission and survey errors schedules another attempt, without an immediate s
 or a separate retry timer. Existing capture fences stay in force while preparation waits.
 
 Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
-that its relay's non-empty count left unproven. An empty count's range is cold-start debt,
+that its relay's non-empty count left unproven. An empty count's range, unless the wire proved
+it, is cold-start debt,
 owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
 group's held frames may go below the first second its fencing relays still owe in their
-capture (`live_fences`), and a relay off the frontier fences nothing. Each unit keeps every
+capture (`live_fences`), and a relay off the frontier fences nothing unless its group is
+stranded and its unit still pursues its debt. Each unit keeps every
 capture range it still owes (migration 0135), up to 8, so the hold survives a restart, which
 forgets the counts. Past 8 the newest are joined into one, which can only fence more.
 Once a capture is covered its fence drops, even while its staged events wait behind another
@@ -904,7 +973,15 @@ admission nor against other groups' placement, so other groups' boundaries, tail
 on. The recorder writes no live boundary on a held route until its frames are released; its
 tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss, and the
 relay plane's cursor seal stops at the oldest one its restart floor does not cover, since no
-queue holds it yet.
+queue holds it yet. A fresh activation, such as the runner's post-join step, replaces the adapter's replay
+coverage, but buffered live frames have no other copy, so they move to the new coverage: held
+frames stay held from the same point until the runner's next plan answers, and frames still
+waiting for admission go on waiting there. Only a frame whose group the new REQs no longer
+route, or that the buffer has no room for, is lost. A fence holds through an account breaker pause too, and
+while its group is stranded on relays that may still return its history: a live frame opened ahead of its
+sender's owed messages moves that
+sender's ratchet, and once it is more than the out-of-order window (100 generations) past them,
+no owner can open them.
 
 The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
 never swept, admission takes its events as a group of their own and never fences them, and

@@ -780,8 +780,10 @@ async fn cancelling_public_sync_while_waiting_for_recovery_keeps_repaired_activi
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app =
-        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    // This cancellation case waits on the legacy comparison grant's credit.
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_recovery_runner_ownership_for_test(false)
+        .with_test_relay_client(relay);
     let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
     client.recovery_credits = recovery_credits::private_recovery_credit_pool_for_test();
     let group = client.create_group("retry", &[]).await.unwrap();

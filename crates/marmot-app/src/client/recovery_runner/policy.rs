@@ -9,11 +9,13 @@ use storage_sqlite::RecoveryUnitPolicy;
 use transport_nostr_adapter::compare::ComparePolicy;
 use transport_nostr_adapter::sweep::SweepPolicy;
 
-/// The first no-progress backoff of a unit; each further one doubles it.
+/// The first no-progress backoff of a unit or complete unresolved epoch-gap
+/// visit; each further one doubles it.
 pub(crate) const RUNNER_BACKOFF_BASE_SECS: u64 = 30;
 pub(crate) const RUNNER_BACKOFF_CAP_SECS: u64 = 60 * 60;
-/// No-progress answers in a row before a unit breaks. With the backoff above,
-/// six answers take about 15 minutes.
+/// No-progress answers in a row before a unit breaks, also the complete
+/// unsuccessful visit cap for an epoch gap. The first five delays total about
+/// 15 minutes.
 pub(crate) const RUNNER_BREAK_AFTER_NO_PROGRESS: u32 = 6;
 /// How long a unit whose relay was unreachable waits before its next attempt.
 pub(crate) const RUNNER_UNREACHABLE_RETRY_SECS: u64 = 30;
@@ -41,9 +43,9 @@ pub(crate) const RUNNER_STAGED_GROUP_EVENTS: u64 = 2_048;
 pub(crate) const RUNNER_STAGED_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 /// Staged bytes the whole account may hold.
 pub(crate) const RUNNER_STAGED_ACCOUNT_BYTES: u64 = 64 * 1024 * 1024;
-/// Staged events one admission turn ingests before it yields, as the
-/// comparison job's admission does (A13).
-pub(crate) const RUNNER_ADMISSION_PER_TURN: usize = 4;
+/// Staged events one worker admission command ingests, as the comparison job's
+/// admission does (A13). Each batch's existing plan also checks due gap visits.
+pub(crate) const RUNNER_ADMISSION_PER_TURN: usize = 16;
 /// Capture ranges one unit keeps fenced across a restart. Past it the newest
 /// are joined into one, which can only fence more.
 pub(crate) const RUNNER_FENCES_PER_UNIT: usize = 8;
@@ -76,6 +78,15 @@ pub(crate) struct RecoveryRunnerPolicy {
     pub(crate) fences_per_unit: usize,
     pub(crate) sweep: SweepPolicy,
     pub(crate) recheck_interval_seconds: u64,
+    /// Whether every due unit fetches on its own. Off in a wake-collection
+    /// (`CursorPersistence::Frozen`) process, which fetches only for the
+    /// routes of groups whose live frames a fence holds (every route of such
+    /// a group, since they share its frontier), so the messages that woke it
+    /// can be shown, and otherwise only for an explicit full-history repair, as
+    /// `authorize_account_recovery` allows there. Other debt (a loss, a
+    /// joined group's history, the standing window) waits for an Advance
+    /// process.
+    pub(crate) fetches_unasked: bool,
 }
 
 impl Default for RecoveryRunnerPolicy {
@@ -106,6 +117,7 @@ impl Default for RecoveryRunnerPolicy {
             fences_per_unit: RUNNER_FENCES_PER_UNIT,
             sweep: SweepPolicy::default(),
             recheck_interval_seconds: RUNNER_RECHECK_INTERVAL_SECS,
+            fetches_unasked: true,
         }
     }
 }

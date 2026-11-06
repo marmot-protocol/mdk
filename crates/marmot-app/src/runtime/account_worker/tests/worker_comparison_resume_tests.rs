@@ -125,7 +125,8 @@ async fn run_held_comparison(
         dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
@@ -539,7 +540,9 @@ async fn verify_join_routing(path: JoinSummaryPath) {
     let bob = home.create_account("bob").unwrap();
     let endpoint = "wss://relay.example";
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), endpoint).with_test_relay_client(relay.clone());
+    let app = MarmotApp::with_relay(dir.path(), endpoint)
+        .with_recovery_runner_ownership_for_test(false)
+        .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, endpoint);
     let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut receiver = client_on_app_relay_plane(&app, &bob.label).await;
@@ -832,7 +835,8 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
         dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
         .shared_services()
@@ -899,7 +903,8 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);

@@ -1,6 +1,7 @@
 //! Long-lived coverage for the versioned convergence-node protocol.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use cgka_conformance_simulator::node_protocol::{
     MAX_NODE_JSONL_BYTES, NODE_OBSERVATION_SCHEMA_VERSION, NodeCommandV1, NodeRequestV1,
@@ -8,6 +9,9 @@ use cgka_conformance_simulator::node_protocol::{
 };
 use nostr_relay_builder::MockRelay;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// About five seconds of 100 ms observations.
+const OBSERVATIONS_UNTIL_QUIET: u32 = 50;
 
 async fn request(server: &mut NodeServer, id: &str, command: NodeCommandV1) -> NodeResponseBodyV1 {
     server.handle(NodeRequestV1::new(id, command)).await.body
@@ -110,37 +114,38 @@ async fn node_wraps_one_runtime_and_defines_observable_quiescence() {
         NodeResponseBodyV1::Ack { .. }
     ));
 
-    let first = match request(
-        &mut server,
-        "observe-1",
-        NodeCommandV1::Observe {
-            action_id: "step-2:observe".into(),
-        },
-    )
-    .await
-    {
-        NodeResponseBodyV1::Observation { observation, .. } => observation,
-        other => panic!("unexpected observation response: {other:?}"),
-    };
-    let second = match request(
-        &mut server,
-        "observe-2",
-        NodeCommandV1::Observe {
-            action_id: "step-2:observe".into(),
-        },
-    )
-    .await
-    {
-        NodeResponseBodyV1::Observation { observation, .. } => observation,
-        other => panic!("unexpected observation response: {other:?}"),
-    };
+    // The recovery runner publishes its status in the background, so its event
+    // can land after catch-up's Ack, between two observations. Observe until
+    // two consecutive checkpoints match, as the process orchestrator does.
+    let mut previous = None;
+    let mut settled = None;
+    for attempt in 0..OBSERVATIONS_UNTIL_QUIET {
+        let observation = match request(
+            &mut server,
+            &format!("observe-{attempt}"),
+            NodeCommandV1::Observe {
+                action_id: "step-2:observe".into(),
+            },
+        )
+        .await
+        {
+            NodeResponseBodyV1::Observation { observation, .. } => observation,
+            other => panic!("unexpected observation response: {other:?}"),
+        };
+        if observation.progress.observably_quiescent() {
+            settled = Some((previous.expect("quiet needs two observations"), observation));
+            break;
+        }
+        previous = Some(observation);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (first, second) = settled.expect("the node reaches observable quiescence");
     assert_eq!(first.schema_version, NODE_OBSERVATION_SCHEMA_VERSION);
     assert_eq!(
         first.protocol.state_commitment_sha256,
         second.protocol.state_commitment_sha256
     );
-    assert_eq!(second.progress.stable_checkpoint_observations, 2);
-    assert!(second.progress.observably_quiescent());
+    assert!(second.progress.stable_checkpoint_observations >= 2);
     assert_eq!(second.protocol.member_identities, vec!["alice"]);
 
     server.shutdown().await;

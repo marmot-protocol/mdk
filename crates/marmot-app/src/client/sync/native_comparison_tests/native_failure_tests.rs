@@ -166,7 +166,8 @@ async fn held_native_restores_cursor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_check_counts_ingest() {
-    let mut fixture = crypto_fixture().await;
+    // The injected failure targets the legacy owner's scope checkpoint write.
+    let mut fixture = crypto_fixture_with_owner(Some(false)).await;
     let (events, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
     let app = fixture.receiver.app.clone();
     drop(fixture.receiver);
@@ -285,7 +286,7 @@ async fn mixed_network(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_error_keeps_input() {
-    let mut fixture = crypto_fixture().await;
+    let mut fixture = crypto_fixture_with_owner(Some(false)).await;
     let (mut events, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
     events.truncate(2);
     events.sort_by_key(|event| (event.event.created_at, event.event.id.clone()));
@@ -762,7 +763,7 @@ async fn native_error_keeps_fairness() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_receipts_yield() {
-    let mut fixture = crypto_fixture().await;
+    let mut fixture = crypto_fixture_with_owner(Some(false)).await;
     let (mut events, _) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
     events.truncate(4 * MAX_COMPARISON_ADMISSION_PER_TURN + 1);
     events.sort_by_key(|event| (event.event.created_at, event.event.id.clone()));
@@ -849,5 +850,279 @@ async fn mixed_receipts_yield() {
     assert_eq!(
         visible_messages(&fixture.receiver, &fixture.group).len(),
         held + MAX_COMPARISON_ADMISSION_PER_TURN + 1
+    );
+}
+
+/// A real Welcome's post-join history prerequisite must progress under the
+/// new owner once ordinary count/boundary evidence is settled. Cursor and
+/// projection tests do not assert the engine maintenance/history-fetch handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_owned_history_starts_grace_without_fabricating_coverage() {
+    let mut fixture = crypto_fixture().await;
+    fixture
+        .receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    fixture.receiver.sync().await.unwrap();
+    fixture
+        .receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let status = fixture.receiver.maintenance_status(&fixture.group).unwrap();
+    let post_join = status
+        .obligations
+        .iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .expect("real Welcome created the post-join obligation");
+    assert_eq!(
+        post_join.phase,
+        cgka_traits::MaintenancePhase::Grace,
+        "runner-owned history must supply the post-join boundary without an old comparison grant"
+    );
+    let fetch = fixture
+        .receiver
+        .runtime
+        .post_join_history_fetch(&fixture.group)
+        .unwrap()
+        .expect("the joined copy owns its fetch");
+    assert_eq!(
+        fetch.completion.map(|value| value.outcome),
+        None,
+        "a scripted empty EOSE without a sweep backend cannot certify history"
+    );
+    let before = post_join.clone();
+    let app = fixture.receiver.app.clone();
+    drop(fixture.receiver);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let after = receiver
+        .runtime
+        .maintenance_obligations_for_group(&fixture.group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(
+        after.eose_deadline_at, before.eose_deadline_at,
+        "unfinished collection does not move maintenance's EOSE deadline on reopen"
+    );
+    assert_eq!(
+        after.grace_until, before.grace_until,
+        "unfinished collection does not restart grace on reopen"
+    );
+    assert_eq!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap(),
+        Some(fetch),
+        "reopening an unfinished fetch preserves its durable identity and deadline"
+    );
+}
+
+use crate::tests::limited_relay as post_join_relay;
+
+/// Actual SDK acquisition, encrypted history admission, durable completion,
+/// and client replacement at the app handoff. The capped relay supplies wire
+/// evidence, not the asserted maintenance or fetched state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_owned_history_releases_post_join_maintenance() {
+    let (_relay, url) = post_join_relay::mock_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = crate::AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let recipient = home.create_account("receiver").unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config);
+    remember_test_member_inbox(&app, &recipient.account_id_hex, &url);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.publish_key_package().await.unwrap();
+    receiver.prepare_transport().await.unwrap();
+    let mut sender = client_on_app_relay_plane(&app, "sender").await;
+    let group = sender
+        .create_group("runner post-join history", &[&recipient.account_id_hex])
+        .await
+        .unwrap();
+    sender
+        .send(&group, b"history before the join")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            receiver.sync().await.unwrap();
+            receiver
+                .advance_post_join_maintenance_subscriptions()
+                .await
+                .unwrap();
+            if receiver
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .is_some_and(|fetch| fetch.completion.is_some())
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("bounded new-owner collection finishes without a comparison grant");
+    let fetch = receiver
+        .runtime
+        .post_join_history_fetch(&group)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetch.completion.as_ref().map(|value| value.outcome),
+        Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+    );
+    assert!(
+        app.messages("receiver")
+            .unwrap()
+            .iter()
+            .any(|message| message.plaintext == "history before the join"),
+        "fetched means the encrypted input was admitted and persisted"
+    );
+    let before = receiver
+        .runtime
+        .maintenance_obligations_for_group(&group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(before.phase, cgka_traits::MaintenancePhase::Grace);
+    assert!(before.eose_deadline_at.is_some());
+    let account = receiver.adapter.account_id().clone();
+    drop(receiver);
+    app.relay_plane
+        .deactivate_account_context(&account)
+        .await
+        .unwrap();
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver.runtime.post_join_history_fetch(&group).unwrap(),
+        Some(fetch),
+        "reopen retains this copy's completed fetch"
+    );
+    let after = receiver
+        .runtime
+        .maintenance_obligations_for_group(&group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(
+        after.eose_deadline_at, before.eose_deadline_at,
+        "reopen does not move the EOSE deadline"
+    );
+    assert_eq!(
+        after.grace_until, before.grace_until,
+        "reopen does not restart grace"
+    );
+    assert!(
+        receiver.runner_post_join.is_empty(),
+        "a fetched copy in grace does not re-arm history on reopen"
+    );
+}
+
+/// Retained-window coverage is valid evidence, but is not the whole range
+/// requested by an older Welcome. A raw boundary may start grace without
+/// turning that partial range into a fetched-history claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_post_join_retained_coverage_cannot_complete_an_older_welcome() {
+    use cgka_traits::Timestamp;
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    use storage_sqlite::{
+        RecoveryCoverageProof, RecoveryCoverageSlice, TransportReconciliationRoute,
+    };
+    let fixture = crypto_fixture().await;
+    let app = fixture.receiver.app.clone();
+    let storage = app.account_storage("receiver").unwrap();
+    let now = unix_now_seconds();
+    let retained = now.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    let mut record = storage.get_group(&fixture.group).unwrap();
+    record.local_copy_welcome_created_at = Some(Timestamp(retained.saturating_sub(600)));
+    storage.put_group(&record).unwrap();
+    drop(fixture.receiver);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    receiver.sync().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let route = receiver
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| {
+            route.group_id.as_deref() == Some(fixture.group.as_slice())
+                && route.goal_until.is_none()
+        })
+        .unwrap();
+    assert!(matches!(
+        route.route,
+        TransportReconciliationRoute::Group(_)
+    ));
+    // Input to the completion owner: a real ledger certificate for exactly
+    // the retained range, with no certificate for the older requested prefix.
+    storage
+        .app_storage()
+        .record_recovery_coverage(
+            &[RecoveryCoverageSlice {
+                route: &route.route,
+                relay: &route.required[0],
+                since_seconds: retained,
+                until_seconds: unix_now_seconds(),
+                proof: RecoveryCoverageProof::SweepSlice,
+            }],
+            unix_now_seconds(),
+        )
+        .unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap()
+            .unwrap()
+            .completion
+            .is_none(),
+        "a retained-only proof must not certify the older Welcome's whole history"
+    );
+    let mut maintenance = storage.group_maintenance(&fixture.group).unwrap().unwrap();
+    maintenance.post_join_history.as_mut().unwrap().deadline_at =
+        Some(Timestamp(unix_now_seconds().saturating_sub(1)));
+    storage.put_group_maintenance(&maintenance).unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap()
+            .unwrap()
+            .completion
+            .map(|value| value.outcome),
+        Some(cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired),
+        "a raw partial boundary does not disable the unanswered whole-range deadline"
     );
 }

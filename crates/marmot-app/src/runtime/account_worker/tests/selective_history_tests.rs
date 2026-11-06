@@ -23,7 +23,7 @@ struct TextCounts {
     neg_opens: AtomicUsize,
     requests: AtomicUsize,
     event_json: AtomicUsize,
-    window_requests: AtomicUsize,
+    group_history_requests: std::sync::Mutex<Vec<Value>>,
     group_events: std::sync::Mutex<Vec<nostr_sdk::prelude::Event>>,
 }
 
@@ -33,7 +33,10 @@ struct SwitchingRelay {
     counts: Arc<TextCounts>,
 }
 
-async fn switching_relay(backend: String) -> SwitchingRelay {
+/// A WebSocket proxy to `backend` that can refuse NIP-77 and counts what
+/// crosses it. `information` is the NIP-11 page it serves to a request that
+/// asks for one; with `None` such a request fails the WebSocket handshake.
+async fn switching_relay(backend: String, information: Option<&'static str>) -> SwitchingRelay {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let reject_negentropy = Arc::new(AtomicBool::new(true));
@@ -46,6 +49,12 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
             let tally = tally.clone();
             let backend = backend.clone();
             tokio::spawn(async move {
+                if let Some(page) = information
+                    && let Some(header) = asks_for_information(&stream).await
+                {
+                    serve_information(stream, header, page).await;
+                    return;
+                }
                 let Ok(client) = accept_async(stream).await else {
                     return;
                 };
@@ -71,9 +80,9 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
                                 if let Ok(frame) = serde_json::from_str::<Vec<Value>>(text)
                                     && frame
                                         .get(2)
-                                        .and_then(|filter| filter.get("limit"))
-                                        .and_then(Value::as_u64)
-                                        == Some(256)
+                                        .and_then(|filter| filter.get("until"))
+                                        .is_some()
+                                    && frame.get(2).and_then(|filter| filter.get("ids")).is_none()
                                     && frame
                                         .get(2)
                                         .and_then(|filter| filter.get("kinds"))
@@ -87,7 +96,11 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
                                             })
                                         })
                                 {
-                                    tally.window_requests.fetch_add(1, Ordering::SeqCst);
+                                    tally
+                                        .group_history_requests
+                                        .lock()
+                                        .unwrap()
+                                        .push(frame[2].clone());
                                 }
                             }
                             if text.starts_with("[\"EVENT\"")
@@ -148,8 +161,66 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
     }
 }
 
+/// The length of the request header on `stream` when it asks for the NIP-11
+/// page, read without consuming it, so a WebSocket upgrade still sees it.
+async fn asks_for_information(stream: &tokio::net::TcpStream) -> Option<usize> {
+    let mut header = [0; 8192];
+    let length = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = stream.peek(&mut header).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            if let Some(end) = header[..read].windows(4).position(|w| w == b"\r\n\r\n") {
+                return Some(end + 4);
+            }
+            if read == header.len() {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .ok()
+    .flatten()?;
+    String::from_utf8_lossy(&header[..length])
+        .lines()
+        .any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("accept") && value.contains("application/nostr+json")
+            })
+        })
+        .then_some(length)
+}
+
+async fn serve_information(mut stream: tokio::net::TcpStream, header: usize, page: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut request = vec![0; header];
+    if stream.read_exact(&mut request).await.is_err() {
+        return;
+    }
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    let _ = stream.write_all(reply.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_commit_700_recovers() {
+    late_commit_recovery(false).await;
+}
+
+/// Real SDK filters omit a commit published late below their live floor.
+/// Existing coverage must not strand a still-unresolved epoch gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_commit_published_after_gap_coverage_recovers() {
+    late_commit_recovery(true).await;
+}
+
+async fn late_commit_recovery(publish_after_cover: bool) {
+    use cgka_traits::storage::GroupStorage;
     use marmot_account::AccountHome;
     use nostr_relay_builder::prelude::{EventId as RelayEventId, Filter as RelayFilter};
     use nostr_sdk::prelude::Timestamp;
@@ -159,9 +230,21 @@ async fn late_commit_700_recovers() {
         events: true,
         max_events: Some(8_192),
     });
-    let backend = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    // White Noise's relays publish the cap they enforce. On a relay whose
+    // page cannot be read, a group whose events share one second holds its
+    // live input until the unit gives up (unknown caps never saturate),
+    // which this history proof is not about.
+    let backend = LocalRelay::new(
+        RelayBuilder::default()
+            .database(database.clone())
+            .max_filter_limit(500),
+    );
     backend.run().await.unwrap();
-    let proxy = switching_relay(backend.url().await.to_string()).await;
+    let proxy = switching_relay(
+        backend.url().await.to_string(),
+        Some(r#"{"supported_nips":[],"limitation":{"max_limit":500}}"#),
+    )
+    .await;
     let url = proxy.url.clone();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -274,7 +357,14 @@ async fn late_commit_700_recovers() {
     let outer = Keys::generate();
     let protocol_store = app.account_storage(&alice.label).unwrap();
     let storage = protocol_store.app_storage();
+    // A valid backdated Welcome boundary, pinned while Alice is offline:
+    // randomized NIP-59 timestamps must not let this proof omit the held
+    // history and accidentally avoid its >4 MiB admission workload.
+    let mut copy = protocol_store.get_group(&group).unwrap();
+    copy.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(base - 20_000));
+    protocol_store.put_group(&copy).unwrap();
     let mut retained_bytes = 0;
+    let mut retained_ids = Vec::new();
     for index in 0..1_024 {
         let retained = EventBuilder::new(old.kind, old.content.clone())
             .tags(old.tags.iter().cloned())
@@ -296,6 +386,7 @@ async fn late_commit_700_recovers() {
                 },
             )))
             .unwrap();
+        retained_ids.push(retained.id.to_hex());
     }
     assert!(
         retained_bytes > 4 * 1024 * 1024,
@@ -309,10 +400,12 @@ async fn late_commit_700_recovers() {
         .custom_created_at(Timestamp::from_secs(base))
         .finalize(&outer)
         .unwrap();
-    database
-        .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
-        .await
-        .unwrap();
+    if !publish_after_cover {
+        database
+            .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
     database
         .delete(RelayFilter::new().id(RelayEventId::from_byte_array(commit.id.to_bytes())))
         .await
@@ -329,12 +422,58 @@ async fn late_commit_700_recovers() {
             .await
             .unwrap();
     }
+    let mark_before_gap = storage.recovery_coverage_mark().unwrap();
     runtime
         .accounts()
         .sign_in_account(&alice.label)
         .await
         .unwrap();
     runtime.reconcile_accounts().await.unwrap();
+    if publish_after_cover {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                runtime.catch_up_accounts().await.unwrap();
+                let gap = storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(|demand| {
+                        demand.group_id.as_deref() == Some(group.as_ref())
+                            && demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                    });
+                let covered = storage
+                    .recovery_coverage_ranges(
+                        &storage_sqlite::TransportReconciliationRoute::Group(route),
+                        &url,
+                    )
+                    .unwrap()
+                    .iter()
+                    .any(|proof| {
+                        proof.range.since_seconds <= base
+                            && proof.range.until_seconds >= base
+                            && proof.proof == storage_sqlite::RecoveryCoverageProof::SweepSlice
+                    });
+                if gap && storage.recovery_coverage_mark().unwrap() > mark_before_gap && covered {
+                    assert!(
+                        runtime
+                            .group_mls_state(&alice.label, &group)
+                            .await
+                            .unwrap()
+                            .epoch
+                            < epoch
+                    );
+                    database
+                        .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
+                        .await
+                        .unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("fresh gap followed by real sweep coverage before late publication");
+    }
     // Held-only cuts retain production backoff between scan attempts.
     let recovered = tokio::time::timeout(Duration::from_secs(180), async {
         loop {
@@ -357,20 +496,56 @@ async fn late_commit_700_recovers() {
         }
     })
     .await;
+    let seen = storage
+        .load_account_projection_state(&alice.label, 10_000)
+        .unwrap()
+        .seen_events
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained_admitted = retained_ids.iter().filter(|id| seen.contains(*id)).count();
+    let full_goal = storage
+        .recovery_coverage_goal(&storage_sqlite::TransportReconciliationRoute::Group(route))
+        .unwrap()
+        .is_some_and(|floor| floor <= base - 20_000);
+    if recovered.is_err() || retained_admitted != retained_ids.len() || !full_goal {
+        // Preserve a private, closed capsule when a runner-only history proof
+        // fails; generated test keys must never be posted with its log.
+        let local_epoch = runtime
+            .group_mls_state(&alice.label, &group)
+            .await
+            .unwrap()
+            .epoch;
+        let capsule = dir.keep();
+        runtime.shutdown_and_close().await.unwrap();
+        panic!(
+            "late commit recovery failed: local_epoch={local_epoch}, target_epoch={epoch}, retained_admitted={retained_admitted}, full_goal={full_goal}; private capsule at {}",
+            capsule.display()
+        );
+    }
     assert!(
         recovered.is_ok(),
-        "late commit recovery failed: local_epoch={}, target_epoch={epoch}, window_requests={}",
+        "late commit recovery failed: local_epoch={}, target_epoch={epoch}, history_requests={}",
         runtime
             .group_mls_state(&alice.label, &group)
             .await
             .unwrap()
             .epoch,
-        proxy.counts.window_requests.load(Ordering::SeqCst)
+        proxy.counts.group_history_requests.lock().unwrap().len()
     );
     assert!(
-        proxy.counts.window_requests.load(Ordering::SeqCst) > 1,
-        "recovery must pass the newest page after NEG refusal"
+        retained_admitted == retained_ids.len() && full_goal,
+        "recovery must durably admit all 1,024 retained wrappers before the missing commit"
     );
+    {
+        let history = proxy.counts.group_history_requests.lock().unwrap();
+        assert!(history.len() > 1, "recovery must page past the newest page");
+        assert!(
+            history
+                .iter()
+                .all(|filter| filter.get("limit").and_then(Value::as_u64) == Some(500)),
+            "only the runner's bounded sweep may page history; native paging stays disabled"
+        );
+    }
     runtime.shutdown_and_close().await.unwrap();
     backend.shutdown();
 }
@@ -439,8 +614,8 @@ async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() 
         .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
         .await
         .unwrap();
-    let left = switching_relay(left_backend.url().await.to_string()).await;
-    let right = switching_relay(right_backend.url().await.to_string()).await;
+    let left = switching_relay(left_backend.url().await.to_string(), None).await;
+    let right = switching_relay(right_backend.url().await.to_string(), None).await;
     let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
     for url in [&left.url, &right.url] {
         sdk.client().add_relay(url.as_str()).await.unwrap();

@@ -1,4 +1,4 @@
-//! The coverage ledger recorder, in shadow mode (mdk#2660 phase 2).
+//! Coverage recording and the runner-owned debt handoff (mdk#2660).
 //!
 //! Fills storage's coverage ledger from facts the stack already produces:
 //! live REQ boundaries the adapter admitted, comparison certificates at
@@ -7,12 +7,14 @@
 //! and a certificate loses whatever was un-covered after its grant was
 //! selected. Then the recorder
 //! compares the ledger with every pending obligation and reports agreement as
-//! aggregate counts. Nothing here schedules, retries or fences recovery, and
-//! every write is best effort: a failure is logged and the recovery step it
-//! follows goes on. No route, relay, group or obligation identity is logged.
+//! aggregate counts. Legacy observation writes are best effort: a failure is
+//! logged and the recovery step it follows goes on. Runner-owned conversion,
+//! loss import and newly armed epoch gaps are authoritative and fallible.
+//! The runner schedules their debt; this module also wires its bounded live
+//! fences. No route, relay, group or obligation identity is logged.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
+use cgka_traits::storage::{GroupStorage, StorageError, StorageProvider, StorageResult};
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
     RecoveryLossCause, RecoveryLossImport, RecoveryLossReach, RecoveryPredicate,
@@ -138,7 +140,7 @@ impl LiveCoverage {
         mark: Option<RecoveryCoverageMark>,
         adapter: &MarmotRelayPlaneAccountAdapter,
     ) -> Self {
-        let (_, _, inherited) = observe_live_counts(&adapter.replay_admission().await);
+        let (_, _, inherited) = observe_live_counts(&adapter.replay_admission().await, true);
         Self {
             mark,
             broken: inherited.into_keys().collect(),
@@ -265,17 +267,15 @@ struct LiveCountFact {
 #[cfg_attr(not(test), allow(dead_code))]
 impl LiveCountFact {
     /// The count as the runner's fence reads it. Only a non-empty count
-    /// leaves capture debt below its oldest event; one its relay cut at the
-    /// page limit fences nothing, since the adapter pages the rest itself.
+    /// leaves capture debt below its oldest event. Once native paging is
+    /// delegated, a full admitted reply leaves that debt too; admission is
+    /// not proof that the original query was complete.
     fn live_count(&self) -> LiveCount {
         LiveCount {
             routes: self.routes.clone(),
             relay: self.key.1.clone(),
             since: self.since,
-            oldest_seen: self
-                .count
-                .oldest
-                .filter(|_| self.count.events > 0 && !self.count.clamped()),
+            oldest_seen: self.count.oldest.filter(|_| self.count.events > 0),
         }
     }
 }
@@ -315,15 +315,73 @@ fn fence_plan(ticket: ReplayFenceTicket, fences: &[LiveFence]) -> ReplayFencePla
     }
 }
 
-/// The runner's fence seam. Nothing calls it until the switch-over (5g).
+/// Runner-owned debt and live-fence handoffs.
 #[cfg_attr(not(test), allow(dead_code))]
 impl AppClient {
+    /// A newly armed gap contradicts earlier coverage of this group's retained
+    /// history. Commit its legacy diagnostic obligation and runnable ledger
+    /// debt together, once per obligation revision, before waking the owner.
+    pub(crate) fn arm_epoch_gap_recovery(
+        &self,
+        intents: &[storage_sqlite::StoredEpochBackfillIntent],
+    ) -> Result<(), AppError> {
+        if !self.app.recovery_runner_owns_debt() || intents.is_empty() {
+            return self
+                .app
+                .arm_epoch_backfill_intents(&self.state.label, intents);
+        }
+        let storage = self.coverage_storage()?;
+        let current = self.current_coverage_routes();
+        let now = unix_now_seconds();
+        let floor = retention_floor(now);
+        let changed = storage.with_transaction(|storage| -> Result<bool, AppError> {
+            let app = storage.app_storage();
+            let before = app.pending_recovery_demands()?;
+            app.arm_epoch_backfill_intents(intents)?;
+            let mut changed = false;
+            for demand in app.pending_recovery_demands()?.iter().filter(|demand| {
+                demand.cause == RecoveryCause::EpochGap
+                    && !before.iter().any(|prior| prior.ticket == demand.ticket)
+            }) {
+                let routes = current
+                    .iter()
+                    .filter(|route| route.group_id == demand.group_id)
+                    .collect::<Vec<_>>();
+                if routes.is_empty() {
+                    return Err(
+                        StorageError::Backend("epoch gap routes are not installed".into()).into(),
+                    );
+                }
+                let floors = routes
+                    .into_iter()
+                    .map(|route| {
+                        // The Welcome time is only a goal hint, never evidence for
+                        // invalidation. Preserve the actual durable goal, bounded
+                        // by retention; a route with no goal owes the whole window.
+                        let since = app
+                            .recovery_coverage_goal(&route.route)?
+                            .unwrap_or(floor)
+                            .max(floor);
+                        Ok((route.route.clone(), since))
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()?;
+                app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, now)?;
+                changed = true;
+            }
+            Ok(changed)
+        })?;
+        if changed {
+            self.routing.wake_recovery_runner();
+        }
+        Ok(())
+    }
+
     /// The adapter's admitted live counts for the runner's fence, read now
     /// with the fence ticket and the held routes from the same look. The
     /// runner's host reads this with each debt turn's tails (from 5g).
     pub(crate) async fn recovery_runner_live_counts(&self) -> LiveCountRead {
         let observation = self.adapter.replay_admission().await;
-        let (_, facts, _) = observe_live_counts(&observation);
+        let (_, facts, _) = observe_live_counts(&observation, self.app.vouches_for_relay_replies());
         LiveCountRead {
             ticket: observation.fence_ticket(),
             counts: facts.iter().map(LiveCountFact::live_count).collect(),
@@ -335,8 +393,8 @@ impl AppClient {
     }
 
     /// Have the adapter hold each counted group's live frames until the
-    /// runner answers with [`Self::fence_live_frames`], for at most one
-    /// replay deadline. Nothing calls this until the switch-over (5g), so
+    /// runner answers with [`Self::fence_live_frames`]. Delegated backlog holds
+    /// follow durable admission progress, independently of request deadlines. Nothing calls this until the switch-over (5g), so
     /// owner capture keeps every behavior; no call undoes it.
     pub(crate) async fn enable_live_fences(&self) {
         self.adapter.enable_replay_fencing().await;
@@ -356,11 +414,16 @@ impl AppClient {
 /// everything newer than the oldest one it sent reached the client; the
 /// count says nothing about how many it sent, because the SDK drops some
 /// frames (an expired event, one its database deleted) without a word, so
-/// even a short reply may have been cut. An empty count proves nothing.
+/// even a short reply may have been cut. An empty count proves nothing,
+/// unless the wire showed the relay sent no EVENT frame at all
+/// ([`ReplayLiveCount::sent_nothing`]): a relay that sent nothing cut
+/// nothing, so the count proves its whole window from `since`.
 fn live_boundary_since(since: u64, count: &ReplayLiveCount) -> Option<u64> {
+    if count.events == 0 {
+        return count.sent_nothing.then_some(since);
+    }
     count
         .oldest
-        .filter(|_| count.events > 0)
         .map(|oldest| oldest.saturating_add(1).max(since))
 }
 
@@ -369,6 +432,7 @@ fn live_boundary_since(since: u64, count: &ReplayLiveCount) -> Option<u64> {
 /// and every generation it reports with the routes its filter carries.
 fn observe_live_counts(
     observation: &ReplayAdmissionStatus<'_>,
+    vouched: bool,
 ) -> (
     bool,
     Vec<LiveCountFact>,
@@ -394,7 +458,7 @@ fn observe_live_counts(
             .collect::<Vec<_>>();
         for endpoint in source.endpoints() {
             let relay = transport_nostr::canonical_relay(endpoint.endpoint().as_str());
-            let mut fact = |generation, count, ended| {
+            let mut fact = |generation, count: Option<ReplayLiveCount>, ended| {
                 let key = (source.id().to_owned(), relay.clone(), generation);
                 present.insert(key.clone(), routes.clone());
                 if let Some(count) = count {
@@ -402,7 +466,10 @@ fn observe_live_counts(
                         key,
                         routes: routes.clone(),
                         since: source.since(),
-                        count,
+                        count: ReplayLiveCount {
+                            sent_nothing: count.sent_nothing && vouched,
+                            ..count
+                        },
                         ended,
                         placed,
                         held: held.clone(),
@@ -450,6 +517,42 @@ fn relays(endpoints: &[String]) -> Vec<String> {
 
 fn retention_floor(now: u64) -> u64 {
     now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS)
+}
+
+/// How far the retention floor moves before the recovery runner's debt turns
+/// prune the ledger again: history that leaves the window ages out within
+/// about this long, and no turn but the first in this span pays for a prune.
+const RUNNER_RETENTION_PRUNE_STEP_SECS: u64 = 60 * 60;
+
+impl AppClient {
+    /// Age the ledger out of the retention window, as grant settlement's
+    /// shadow report did before the runner owned debt (mdk#2660 5g): what a
+    /// current route still owes below the floor joins its parked remainder,
+    /// coverage, released seconds and capture debt below it go, and goals
+    /// rise to it. A capture the relays never answered then fences nothing
+    /// older than the window. The process's first debt turn prunes, then one
+    /// each time the floor has moved [`RUNNER_RETENTION_PRUNE_STEP_SECS`].
+    pub(crate) fn prune_runner_retention(
+        &mut self,
+        app: &SqliteAppStorage,
+        now: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
+        let floor = retention_floor(now);
+        if self
+            .runner_pruned_floor
+            .is_some_and(|pruned| floor < pruned.saturating_add(RUNNER_RETENTION_PRUNE_STEP_SECS))
+        {
+            return Ok(());
+        }
+        let certifying = self
+            .current_coverage_routes()
+            .into_iter()
+            .map(|current| (current.route, current.required))
+            .collect::<Vec<_>>();
+        app.prune_recovery_coverage(floor, &certifying)?;
+        self.runner_pruned_floor = Some(floor);
+        Ok(())
+    }
 }
 
 fn log_failure(method: &'static str, error: &AppError) {
@@ -531,6 +634,75 @@ fn scope_route(scope: &StoredRecoveryScope) -> Option<TransportReconciliationRou
 }
 
 impl AppClient {
+    /// Convert before any runner work or REQ, then charge later loss directly
+    /// to the ledger. All route floors are validated before the first write.
+    /// The caller is the shared loss-import seam, never the router callback.
+    pub(crate) fn synchronize_runner_loss(&self, app: &SqliteAppStorage) -> Result<bool, AppError> {
+        let now = unix_now_seconds();
+        let routes = self
+            .current_coverage_routes()
+            .iter()
+            .map(|current| {
+                Ok(storage_sqlite::RecoveryConversionRoute {
+                    route: current.route.clone(),
+                    required_relays: current.required.clone(),
+                    standing_floor_seconds: self.standing_floor(current, now)?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let input = storage_sqlite::RecoveryConversionInput {
+            routes: &routes,
+            canonical_relay: &transport_nostr::canonical_relay,
+            retention_floor_seconds: retention_floor(now),
+            now_seconds: now,
+        };
+        app.convert_recovery_obligations(&input)?;
+        if let Some(report) = app.recovery_conversion_report()? {
+            // Aggregate evidence that precedes the first runner quantum.
+            // Conversion never records history coverage or recovery success.
+            tracing::debug!(target: "marmot_app::recovery_runner", method = "conversion",
+                shadow_ranges = report.shadow_ranges,
+                shadow_remainders = report.shadow_remainders,
+                units_broken = report.units_broken,
+                "recovery conversion complete");
+            for (cause, counts) in report.obligations {
+                tracing::debug!(target: "marmot_app::recovery_runner", method = "conversion",
+                    cause = ?cause, pending = counts.pending, parked = counts.parked,
+                    dismissed = counts.dismissed, settled = counts.settled,
+                    "recovery obligations converted");
+            }
+            app.acknowledge_recovery_conversion_report()?;
+        }
+        Ok(app.import_recovery_loss_to_ledger(&self.state.label, &input)?)
+    }
+
+    /// Account-local ownership is installed before even staging native input.
+    /// The adapter rejects a late first switch; repeat setup is idempotent.
+    pub(crate) async fn prepare_runner_ownership(&mut self) -> Result<(), AppError> {
+        if !self.app.recovery_runner_owns_debt() {
+            return Ok(());
+        }
+        let prepared = self.prepare_runner_ownership_once().await;
+        // Owed until a preparation succeeds: only then may the worker start
+        // a runner it lacks, whatever else the refresh still owes.
+        self.runner_preparation_owed = prepared.is_err();
+        prepared
+    }
+
+    async fn prepare_runner_ownership_once(&mut self) -> Result<(), AppError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_runner_preparation) {
+            return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                "injected runner preparation failure".to_owned(),
+            )));
+        }
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        self.synchronize_recovery_loss(&app)?;
+        self.adapter.delegate_replay_recovery().await?;
+        self.enable_live_fences().await;
+        Ok(())
+    }
+
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
@@ -861,7 +1033,7 @@ impl AppClient {
         };
         let (input_placed, facts, present) = {
             let observation = self.adapter.replay_admission().await;
-            observe_live_counts(&observation)
+            observe_live_counts(&observation, self.app.vouches_for_relay_replies())
         };
         live.broken.retain(|key| present.contains_key(key));
         live.settled.retain(|key, _| present.contains_key(key));
@@ -912,7 +1084,7 @@ impl AppClient {
         // count this observation saw.
         let (input_placed, streaming, _) = {
             let observation = self.adapter.replay_admission().await;
-            observe_live_counts(&observation)
+            observe_live_counts(&observation, self.app.vouches_for_relay_replies())
         };
         if !input_placed || self.delivery_loss_blocks_cursor() {
             return;

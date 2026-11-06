@@ -2615,58 +2615,88 @@ async fn relay_telemetry_reflects_activation_through_the_plane() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settled_activation_uses_diff() {
-    let relay = Arc::new(RecordingRelayClient::default());
-    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
-    let account = MemberId::new(vec![0xA1; 32]);
-    let adapter = plane.account_adapter(account.clone(), relay.clone());
-    let endpoint = TransportEndpoint("wss://relay.example".into());
-    let mut activation = TransportAccountActivation {
-        account_id: account,
-        inbox_endpoints: vec![endpoint.clone()],
-        group_subscriptions: Vec::new(),
-        since: Some(Timestamp(100)),
-    };
-    adapter.activate_account(activation.clone()).await.unwrap();
-    let issued = relay.subscriptions.lock().unwrap().clone();
-    for subscription in issued {
-        plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-            .await;
-    }
-    adapter.activate_account(activation.clone()).await.unwrap();
-    assert_eq!(relay.subscriptions.lock().unwrap().len(), 1);
-    assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
-    activation
-        .group_subscriptions
-        .push(TransportGroupSubscription {
-            group_id: GroupId::new(vec![0xC3; 16]),
-            transport_group_id: vec![0xD4; 32],
-            endpoints: vec![endpoint.clone()],
-            retained_since: None,
-        });
-    adapter.activate_account(activation.clone()).await.unwrap();
-    assert_eq!(
-        relay.subscriptions.lock().unwrap().len(),
-        2,
-        "only the added route"
-    );
-    assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
-    activation.since = None;
-    for expected in [4, 6] {
+    for delegated in [false, true] {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let account = MemberId::new(vec![0xA1; 32]);
+        let adapter = plane.account_adapter(account.clone(), relay.clone());
+        if delegated {
+            adapter.delegate_replay_recovery().await.unwrap();
+        }
+        let endpoint = TransportEndpoint("wss://relay.example".into());
+        let mut activation = TransportAccountActivation {
+            account_id: account,
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: Some(Timestamp(100)),
+        };
+        adapter.activate_account(activation.clone()).await.unwrap();
         let issued = relay.subscriptions.lock().unwrap().clone();
         for subscription in issued {
+            if delegated {
+                // A physical full reply ends current input without proving the
+                // original window. Reusing that REQ must not require old paging.
+                for index in 0..500_u64 {
+                    let mut id = [0_u8; 32];
+                    id[..8].copy_from_slice(&index.to_be_bytes());
+                    plane
+                        .inner
+                        .transport
+                        .adapter
+                        .observe_relay_event(
+                            &id,
+                            &endpoint,
+                            Some(&subscription.subscription_id()),
+                            100 + index,
+                        )
+                        .await;
+                }
+            }
             plane
                 .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
                 .await;
         }
+        if delegated {
+            assert!(
+                !adapter.account_subscription_eose().await.complete(),
+                "full current input is not whole-query coverage"
+            );
+        }
+        adapter.activate_account(activation.clone()).await.unwrap();
+        assert_eq!(relay.subscriptions.lock().unwrap().len(), 1);
+        assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
+        activation
+            .group_subscriptions
+            .push(TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            });
         adapter.activate_account(activation.clone()).await.unwrap();
         assert_eq!(
             relay.subscriptions.lock().unwrap().len(),
-            expected,
-            "full replay must reissue"
+            2,
+            "only the added route"
         );
+        assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
+        activation.since = None;
+        for expected in [4, 6] {
+            let issued = relay.subscriptions.lock().unwrap().clone();
+            for subscription in issued {
+                plane
+                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                    .await;
+            }
+            adapter.activate_account(activation.clone()).await.unwrap();
+            assert_eq!(
+                relay.subscriptions.lock().unwrap().len(),
+                expected,
+                "full replay must reissue"
+            );
+        }
+        plane.shutdown().await;
     }
-    plane.shutdown().await;
 }
 
 #[test]

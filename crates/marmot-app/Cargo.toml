@@ -103,6 +103,11 @@ tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
+[[test]]
+name = "since_floor"
+# Characterizes the comparison owner retained for supported lower-level callers.
+required-features = ["test-support"]
+
 [[bench]]
 name = "media_download_backlog"
 harness = false

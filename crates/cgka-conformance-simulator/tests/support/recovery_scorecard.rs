@@ -679,6 +679,7 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         "relays": measured.iter().map(|relay| summarize(relay, workload)).collect::<Vec<_>>(),
         "events_delivered_by_both_relays": both.count(),
         "history_requests": history_requests,
+        "native_paging_requests_per_endpoint": super::recovery_runner_proofs::native_pages(&bobs),
         "account_recovery_status_at_end": account_status.as_ref().map(status_summary).map_err(|error| &error.message),
         "idle_window": {"seconds": IDLE_WINDOW.as_secs(), "relays": idle.collect::<Vec<_>>()},
         "telemetry": {"before": telemetry_before, "after": telemetry_after},
@@ -855,7 +856,7 @@ async fn run_with(runner_owns_debt: bool) {
     let (label, owner) = if runner_owns_debt {
         (
             "scorecard-runner",
-            "recovery runner (with the earlier owner beside it until 5g)",
+            "recovery runner, both native backward pagers disabled",
         )
     } else {
         ("scorecard", "earlier recovery owner")
@@ -865,7 +866,7 @@ async fn run_with(runner_owns_debt: bool) {
     let subject = if runner_owns_debt {
         AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
     } else {
-        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
+        AppRuntimeHarness::new_with_relay_pair_owner_mode(&clients, &clients[1..2], false).await
     };
     let mut subject = subject.expect("scorecard harness setup");
     save(
@@ -935,7 +936,17 @@ async fn run_with(runner_owns_debt: bool) {
         close_errors.is_empty(),
         "runtime close failed: {close_errors:?}"
     );
-    // The only hard assertions: within the deadline the missing commit is
+    if runner_owns_debt {
+        assert!(
+            report["native_paging_requests_per_endpoint"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|count| count.as_u64() == Some(0)),
+            "a native backward pager supplied the runner-only scorecard"
+        );
+    }
+    // Correctness assertions: within the deadline the missing commit is
     // applied and the later messages decrypt, and every gap chat message is
     // present exactly once. Performance targets are only recorded.
     assert_eq!(
