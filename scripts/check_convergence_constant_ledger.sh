@@ -11,8 +11,9 @@ inventory_path="docs/marmot-architecture/convergence-constant-inventory.txt"
 plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
 # A10 includes #1946 qualified local observations; no new numeric policy or ledger id.
 # A15's quiet-period relay repair timer was replaced by the existing account owner.
+# A16's backward epoch-gap paging was deleted with the old owner's comparison job (#2660 phase 4).
 # A19 also owns bounded epoch-gap visits and admission-to-selection fairness; no new numeric policy.
-expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A16 A17 A18 A19 A20 A21)
+expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A17 A18 A19 A20 A21)
 inventory_pairs=("__inventory_sentinel__")
 inventory_ids=()
 fail=0
@@ -132,8 +133,8 @@ discover_constants \
     "crates/marmot-app/src/runtime/account_worker/recovery_credits.rs" \
     "MAX_[A-Z0-9_]+"
 discover_constants \
-    "crates/marmot-app/src/client/sync/comparison_job.rs" \
-    "(MAX_COMPARISON_[A-Z0-9_]+|EPOCH_GAP_WINDOW_[A-Z0-9_]+)"
+    "crates/marmot-app/src/client/sync/native_ingress.rs" \
+    "MAX_NATIVE_[A-Z0-9_]+"
 discover_constants \
     "crates/transport-nostr-adapter/src/sdk_client.rs" \
     "(SDK_RECONCILIATION_(MAX_[A-Z0-9_]+|WAIT|NEGOTIATION_WAIT|WINDOW_PROBES)|SDK_NOTIFICATION_CAPACITY)"

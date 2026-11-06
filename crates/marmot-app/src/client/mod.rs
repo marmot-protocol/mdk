@@ -120,16 +120,11 @@ use push::notification_trigger_for_intent;
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
 pub(crate) use recovery_coverage::LiveCoverage;
 #[cfg(test)]
-pub(crate) use sync::ScriptedComparisons;
-#[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
-    ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, RetainedSendWake,
+    CommittedSyncProgress, ConvergenceScheduleState, EpochBackfillRunOutcome, RetainedSendWake,
     SyncMode,
 };
-#[cfg(test)]
-pub(crate) use sync::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
 
 #[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
@@ -731,44 +726,6 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
-type EpochGapWindowKey = ([u8; 32], String);
-type EpochGapWindows = Arc<std::sync::Mutex<EpochGapWindowCache>>;
-
-#[derive(Default)]
-pub(super) struct EpochGapWindowCache {
-    entries: HashMap<EpochGapWindowKey, EpochGapWindow>,
-    tick: u64,
-}
-
-#[derive(Clone, Copy)]
-struct EpochGapBound {
-    until: u64,
-    /// Skip a held suffix only after its older prefix finishes.
-    resume_since: u64,
-}
-
-impl EpochGapBound {
-    fn new(until: u64) -> Self {
-        Self {
-            until,
-            resume_since: until.saturating_add(1),
-        }
-    }
-}
-
-/// Evictable acquisition hints, never coverage, replay or retry authority.
-#[derive(Clone)]
-pub(super) struct EpochGapWindow {
-    /// Loss, route and retained-inventory revisions for held-span reuse.
-    generation: (u64, u64, u64),
-    goal: storage_sqlite::RecoveryDemandTicket,
-    origin_since: u64,
-    until: u64,
-    since: u64,
-    bounds: Vec<EpochGapBound>,
-    last_used: u64,
-}
-
 pub struct AppClient {
     /// Runs once right after the next projection checkpoint's save, before
     /// anything else reads storage.
@@ -781,32 +738,16 @@ pub struct AppClient {
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
-    #[cfg(test)]
-    pub(crate) test_recovery_selection_witness:
-        Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
     /// This client's own clone of the account-device's audit recorder. App
     /// rows, rotation and the log's end go through it, not the runtime.
     pub(crate) audit: marmot_forensics::SharedRecorder,
-    /// Synthetic endpoint certificates for executor/completion contract tests.
-    /// Never enabled by EOSE or by the production SDK adapter.
-    #[cfg(test)]
-    pub(crate) test_recovery_evidence: Option<recovery::TestRecoveryEvidence>,
-    #[cfg(test)]
-    pub(crate) test_comparison_results: Option<sync::ScriptedComparisons>,
-    #[cfg(test)]
-    pub(crate) test_comparison_delay: Option<std::time::Duration>,
     /// Fail the device-roster read that tells an unlink from a failed link.
     #[cfg(all(test, feature = "unreleased-device-pairing"))]
     pub(crate) test_fail_roster_read: bool,
-    /// A cursor a scripted comparison saves before its delay, as the adapter
-    /// does before each exact-ID fetch.
-    #[cfg(test)]
-    pub(crate) test_comparison_saved_cursor: Option<[u8; 32]>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
-    pub(super) epoch_gap_windows: EpochGapWindows,
     /// The process credits recovery jobs share. A managed worker installs
     /// its runtime's pool; a directly owned client uses the process pool.
     pub(crate) recovery_credits:
@@ -993,17 +934,8 @@ pub struct AppClient {
     /// Native checkpoints already committed; retained across drain cancellation.
     pub(super) pending_native_sync_summary: crate::SyncSummary,
     pub(super) native_sync_deliveries: u64,
-    /// Whether the last settled job certified the retained window of every
-    /// explicit-history scope it compared. Explicit history reaches below
-    /// that window, so this never completes it; it names why it stays open.
-    pub(crate) explicit_history_window_certified: bool,
-    /// Whether the last in-place job's network cutoff skipped or timed out a
-    /// route. A pass that finished early and was admitted late was not cut.
-    pub(crate) recovery_job_network_cut: bool,
     /// The coverage ledger's live-boundary recorder state (mdk#2660).
     pub(crate) live_coverage: tokio::sync::Mutex<recovery_coverage::LiveCoverage>,
-    /// Whether the last in-place job's admission stopped at the whole budget.
-    pub(crate) recovery_job_admission_expired: bool,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
@@ -1184,15 +1116,6 @@ pub struct AppClient {
     /// and linking is rarely in progress.
     #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) device_pairing: Box<device_pairing::DevicePairing>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TestRecoverySelection {
-    pub(crate) seam: marmot_forensics::EpochBackfillExecutionSeam,
-    pub(crate) attempt_serial: u64,
-    pub(crate) comparison_revision: Option<u64>,
-    pub(crate) obligation_count: usize,
 }
 
 /// Whether the Welcomes a create or invite stashed reached the relays. One

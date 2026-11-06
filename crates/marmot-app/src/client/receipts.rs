@@ -3,16 +3,13 @@
 
 use std::collections::HashSet;
 
-use storage_sqlite::{
-    SqliteAccountStorage, TransportReconciliationInventory, TransportReconciliationRoute,
-};
+use storage_sqlite::SqliteAccountStorage;
 
 use super::AppClient;
 use crate::{AppError, remember_seen_event};
 
 pub(crate) struct SynchronizedTransportReceipts<'a> {
     client: &'a mut AppClient,
-    storage: SqliteAccountStorage,
     released: HashSet<String>,
 }
 
@@ -120,7 +117,6 @@ impl AppClient {
         let released = self.synchronize_released_transport_receipts(&storage)?;
         Ok(SynchronizedTransportReceipts {
             client: self,
-            storage,
             released,
         })
     }
@@ -139,17 +135,6 @@ impl<'a> SynchronizedTransportReceipts<'a> {
 
     pub(crate) fn contains(&self, event_id: &str) -> bool {
         self.client.seen_events_index.0.contains(event_id)
-    }
-
-    pub(crate) fn inventory(
-        &self,
-        route: &TransportReconciliationRoute,
-        until: u64,
-    ) -> Result<TransportReconciliationInventory, AppError> {
-        Ok(self
-            .storage
-            .app_storage()
-            .transport_reconciliation_inventory(route, until)?)
     }
 
     pub(crate) fn pending_seen_events(&self) -> Vec<String> {
@@ -171,6 +156,7 @@ mod tests {
     use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
     use marmot_account::AccountHome;
     use std::sync::Arc;
+    use storage_sqlite::TransportReconciliationRoute;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_access_retires_lost_releases_without_caller_reconciliation() {
@@ -264,8 +250,9 @@ mod tests {
                 "duplicate" => assert!(!receipts.contains(&id)),
                 "inventory" => {
                     assert!(
-                        !receipts
-                            .inventory(&route, item.created_at)
+                        !storage
+                            .app_storage()
+                            .transport_reconciliation_inventory(&route, item.created_at)
                             .unwrap()
                             .items
                             .contains(&item)

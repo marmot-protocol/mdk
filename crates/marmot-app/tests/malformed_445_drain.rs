@@ -11,9 +11,9 @@
 //! remains unremembered — re-aborts every subsequent catch-up the relay
 //! replays it into. One garbage event starves every message queued behind it.
 //!
-//! The shape mirrors `since_floor.rs`'s cold-boot harness (see that file's
-//! module docs for why one account per store and why a full shutdown, not
-//! `restart_account`): bob goes fully offline, a malformed kind-445 and a
+//! The shape is the cold-boot harness `cursor_persistence.rs` documents (one
+//! account per store, and a full shutdown rather than `restart_account`): bob
+//! goes fully offline, a malformed kind-445 and a
 //! real message land in his backlog, and a cold boot's first catch-up must
 //! deliver the real message and record zero sync failures.
 
@@ -76,7 +76,7 @@ async fn wait_for_event<F>(
 /// Publish a kind-445 whose content is structurally too short to be a
 /// `base64(nonce || ciphertext)` envelope, with a fresh ephemeral (non-member)
 /// signing key — the peeler classifies it `Malformed` before any decryption
-/// attempt. Contrast `since_floor.rs`'s probe helper, which deliberately
+/// attempt. Contrast `next_event_backfill.rs`'s probe helper, which deliberately
 /// builds an envelope-*shaped* payload so it classifies `DecryptFailed`
 /// instead; this helper pins the other, structurally-invalid classification.
 async fn publish_malformed_group_message_at(
@@ -118,7 +118,7 @@ fn account_sync_failures(runtime: &MarmotAppRuntime) -> u64 {
 async fn malformed_group_message_does_not_starve_messages_behind_it() {
     let (_relay, url) = mock_relay().await;
 
-    // One account per store, exactly as documented in `since_floor.rs`.
+    // One account per store, exactly as documented in `cursor_persistence.rs`.
     let dir_bob = tempfile::tempdir().unwrap();
     let home_bob = AccountHome::open(dir_bob.path());
     home_bob.create_account("bob").unwrap();

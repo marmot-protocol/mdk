@@ -1,16 +1,15 @@
-//! Regression for a catch-up drain that fails after earlier deliveries commit.
+//! Regressions for a sync that fails after earlier deliveries commit.
 //!
 //! The first delivery is durable before the injected second-step failure. The
-//! managed runtime must still broadcast that delivery's `SyncSummary`; otherwise
-//! a live-only subscriber can never learn about the already-projected message.
+//! caller must still learn that delivery's `SyncSummary` exactly once, across
+//! a retry and a restart; otherwise it can never learn about the
+//! already-projected message.
 #![cfg(feature = "test-policy-overrides")]
 
 use std::time::Duration;
 
 use cgka_traits::GroupId;
 use marmot_account::AccountHome;
-#[cfg(feature = "test-support")]
-use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
     AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
 };
@@ -18,12 +17,6 @@ use nostr_relay_builder::MockRelay;
 #[path = "support/limited_relay.rs"]
 mod limited_relay;
 use limited_relay::TestRelay;
-#[cfg(feature = "test-support")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(feature = "test-support")]
-use tokio::net::TcpListener;
-#[cfg(feature = "test-support")]
-use tokio::sync::oneshot;
 
 fn open_store(
     dir: &tempfile::TempDir,
@@ -82,8 +75,6 @@ struct PendingMessageBatch {
     bob_dir: tempfile::TempDir,
     _alice_dir: tempfile::TempDir,
     relay_url: String,
-    #[cfg(feature = "test-support")]
-    bob_id: String,
     group_id: GroupId,
     alice: AppClient,
     pending_messages: Vec<String>,
@@ -173,24 +164,10 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
         bob_dir,
         _alice_dir: alice_dir,
         relay_url,
-        #[cfg(feature = "test-support")]
-        bob_id,
         group_id,
         alice,
         pending_messages: messages,
     }
-}
-
-#[cfg(feature = "test-support")]
-async fn acknowledge_one_http_request(listener: TcpListener, observed: oneshot::Sender<()>) {
-    let (mut stream, _) = listener.accept().await.expect("audit tracker request");
-    let mut request = [0_u8; 4096];
-    let _ = stream.read(&mut request).await;
-    let _ = observed.send(());
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-        .await
-        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -467,123 +444,4 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
         "the persisted welcome event id must suppress route-changing replay",
     );
     assert!(expected_groups.contains(&resumed.joined_groups[0]));
-}
-
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
-    let mut batch = pending_two_message_batch().await;
-    batch.publish_pending_messages().await;
-    // This fault specifically targets the old native startup drain. The new
-    // runner can admit cold history without crossing that checkpoint; default
-    // owner live-ingress and projection-prefix proofs above stay default on.
-    let app_bob_boot2 = MarmotApp::try_with_relays_and_account_home_and_config(
-        batch.bob_dir.path(),
-        vec![batch.relay_url.clone()],
-        AccountHome::open(batch.bob_dir.path()),
-        MarmotAppConfig::white_noise()
-            .with_allow_loopback_relay_endpoints(true)
-            .with_dev_fail_sync_before_delivery(1),
-    )
-    .unwrap()
-    .with_recovery_runner_ownership_for_test(false);
-    let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2);
-    let mut events_bob_boot2 = runtime_bob_boot2.subscribe();
-    let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tracker_addr = tracker_listener.local_addr().unwrap();
-    let (tracker_observed, tracker_request) = oneshot::channel();
-    let tracker_server = tokio::spawn(acknowledge_one_http_request(
-        tracker_listener,
-        tracker_observed,
-    ));
-    runtime_bob_boot2.set_audit_log_batch_window_for_test(Duration::ZERO);
-    runtime_bob_boot2
-        .set_audit_otlp_sender(Some(
-            AuditOtlpSender::for_loopback_dev(
-                "partial-summary-v5",
-                format!("http://{tracker_addr}/v1/logs"),
-                "partial-summary-test-token".to_owned(),
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    runtime_bob_boot2.start().await.unwrap();
-
-    let committed_before_failure = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut message_arrived = None;
-        loop {
-            match events_bob_boot2.recv().await.expect("runtime event stream") {
-                MarmotAppEvent::MessageReceived(message)
-                    if message.account_id_hex == batch.bob_id
-                        && message.message.group_id == batch.group_id
-                        && matches!(
-                            message.message.plaintext.as_str(),
-                            "committed before batch failure" | "still queued after batch failure"
-                        ) =>
-                {
-                    message_arrived = Some(message.message.plaintext);
-                }
-                MarmotAppEvent::AccountError(error)
-                    if error.account_id_hex == batch.bob_id
-                        && error.message.starts_with("runtime startup receive failed:") =>
-                {
-                    break message_arrived;
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("injected catch-up failure event")
-    .expect("the completed delivery's summary must be emitted before the later batch error");
-
-    assert_eq!(
-        runtime_bob_boot2
-            .shared_services()
-            .app_performance_telemetry()
-            .snapshot()
-            .account_sync
-            .failures,
-        1,
-        "the test must exercise the injected mid-batch failure",
-    );
-    tokio::time::timeout(Duration::from_secs(10), tracker_request)
-        .await
-        .expect("partial summary must schedule the audit tracker")
-        .expect("audit tracker observation channel");
-    tracker_server.await.unwrap();
-    runtime_bob_boot2.shutdown().await;
-
-    // The accumulated-prefix checkpoint must persist the seen-id/cursor state
-    // and app-outbox acknowledgement. Bound the third boot with fresh traffic
-    // and prove the delivery announced before the failure is not replayed.
-    let app_bob_boot3 = batch.bob_app(None);
-    let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3);
-    let mut events_bob_boot3 = runtime_bob_boot3.subscribe();
-    runtime_bob_boot3.start().await.unwrap();
-    batch
-        .alice
-        .send(&batch.group_id, b"fresh after failed batch restart")
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let MarmotAppEvent::MessageReceived(message) =
-                events_bob_boot3.recv().await.expect("runtime event stream")
-                && message.account_id_hex == batch.bob_id
-                && message.message.group_id == batch.group_id
-            {
-                assert_ne!(
-                    message.message.plaintext, committed_before_failure,
-                    "the persisted delivery must not replay after restart"
-                );
-                if message.message.plaintext == "fresh after failed batch restart" {
-                    break;
-                }
-            }
-        }
-    })
-    .await
-    .expect("fresh message after restart");
-    runtime_bob_boot3.shutdown().await;
 }

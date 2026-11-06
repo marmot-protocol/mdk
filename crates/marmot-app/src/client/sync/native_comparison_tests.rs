@@ -1,6 +1,6 @@
-//! Real MLS coverage for joining native leases with comparison admission.
+//! Real MLS coverage for native replay ingress: leased native batches, slow
+//! peers, failures and cursor checkpoints.
 
-use super::comparison_job::ComparisonNetworkJob;
 use super::*;
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::tests::{
@@ -10,7 +10,7 @@ use cgka_traits::engine::SendIntent;
 use cgka_traits::{TransportAccountActivation, TransportAdapter};
 use marmot_session::PublishWork;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use transport_nostr_adapter::{NostrRelayEvent, ReplayBatchTake};
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -30,12 +30,6 @@ struct CryptoFixture {
 }
 
 async fn crypto_fixture() -> CryptoFixture {
-    crypto_fixture_with_owner(None).await
-}
-
-// Mixed comparison/native admission still needs the old comparison executor;
-// ordinary native ingress tests follow the app production default.
-async fn crypto_fixture_with_owner(owner: Option<bool>) -> CryptoFixture {
     let dir = tempfile::tempdir().unwrap();
     let home = crate::AccountHome::open(dir.path());
     home.create_account("sender").unwrap();
@@ -43,10 +37,6 @@ async fn crypto_fixture_with_owner(owner: Option<bool>) -> CryptoFixture {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app =
         crate::MarmotApp::with_relay(dir.path(), ENDPOINT).with_test_relay_client(relay.clone());
-    let app = match owner {
-        Some(owns) => app.with_recovery_runner_ownership_for_test(owns),
-        None => app,
-    };
     remember_test_member_inbox(&app, &recipient.account_id_hex, ENDPOINT);
     let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
     receiver.publish_key_package().await.unwrap();
@@ -136,30 +126,6 @@ async fn encrypted_texts(
     (events, expected)
 }
 
-fn script_subset(
-    client: &mut AppClient,
-    route: TransportReconciliationRoute,
-    events: Vec<NostrRelayEvent>,
-) {
-    let events = Mutex::new(Some(events));
-    client.test_comparison_results = Some(ScriptedComparisons::by_route(move |compared| {
-        let events = if *compared == route {
-            events.lock().unwrap().take().unwrap()
-        } else {
-            Vec::new()
-        };
-        Ok(Some((
-            transport_nostr_adapter::NostrReconciliationSummary {
-                relays_succeeded: 1,
-                remote_items: events.len(),
-                received_items: events.len(),
-                ..Default::default()
-            },
-            events,
-        )))
-    }));
-}
-
 async fn lease_native(client: &mut AppClient, group: &GroupId, events: Vec<NostrRelayEvent>) {
     let mut deliveries = Vec::with_capacity(events.len());
     for event in events {
@@ -199,190 +165,6 @@ async fn lease_native(client: &mut AppClient, group: &GroupId, events: Vec<Nostr
     assert!(batch.delivery().is_some());
     client.recovery_owner.native_ingress = Some(ingress);
     client.recovery_owner.native_batch = Some(batch);
-}
-
-#[derive(Clone, Copy)]
-enum ComparisonSide {
-    NewerSubset,
-    OlderPrefix,
-}
-
-async fn mixed_ingress_case(side: ComparisonSide) {
-    assert_eq!(
-        cgka_engine::wire_format::DEFAULT_OUT_OF_ORDER_TOLERANCE,
-        100
-    );
-    let mut fixture = crypto_fixture_with_owner(Some(false)).await;
-    let (mut native, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
-    let expected_transport = native
-        .iter()
-        .map(|event| <[u8; 32]>::try_from(hex::decode(&event.event.id).unwrap()).unwrap())
-        .collect::<BTreeSet<_>>();
-    let compared = match side {
-        // A relay's retained set can be newer than the old native range the
-        // owner already leased. Native4 then comparison4 jumps beyond one
-        // hundred generations and evicts keys for the undrained prefix.
-        ComparisonSide::NewerSubset => native[180..184].to_vec(),
-        // The opposite boundary must not blindly favor native input either:
-        // a known comparison prefix precedes a disjoint newer native lease.
-        ComparisonSide::OlderPrefix => {
-            let newer = native.split_off(112);
-            std::mem::replace(&mut native, newer)
-        }
-    };
-    fixture.receiver.request_bounded_comparison().unwrap();
-    let mut permit = ExplicitRecoveryPermit::default();
-    let grant = fixture
-        .receiver
-        .authorize_account_recovery(
-            Some(&mut permit),
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let route = grant
-        .inventory
-        .iter()
-        .find_map(|item| match item.route {
-            TransportReconciliationRoute::Group(_) => Some(item.route.clone()),
-            TransportReconciliationRoute::Inbox => None,
-        })
-        .expect("the real joined MLS group is selected for comparison");
-    script_subset(&mut fixture.receiver, route.clone(), compared);
-    let execution = fixture
-        .receiver
-        .begin_comparison_grant(&grant)
-        .await
-        .unwrap();
-    let credit = Arc::new(tokio::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .unwrap();
-    let mut network = ComparisonNetworkJob::start(
-        &fixture.receiver,
-        &grant,
-        credit,
-        tokio::time::Instant::now() + Duration::from_secs(30),
-        None,
-    )
-    .unwrap();
-    let (_credit, result) = timeout(Duration::from_secs(30), network.wait())
-        .await
-        .expect("scripted comparison finishes without admitting plaintext")
-        .unwrap();
-    lease_native(&mut fixture.receiver, &fixture.group, native).await;
-    let outcome = fixture
-        .receiver
-        .admit_comparison_inline(None, grant, execution, result)
-        .await
-        .unwrap();
-    let mut summary = match outcome {
-        EpochBackfillRunOutcome::Completed(summary)
-        | EpochBackfillRunOutcome::Incomplete(summary) => summary,
-        EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending => {
-            panic!("the unchanged comparison must be admitted")
-        }
-    };
-    // A short newer subset may finish before the native suffix. Drain it
-    // through the same ordinary bounded owner path, never direct ingestion.
-    for turn in 0..=TEXTS {
-        if !fixture.receiver.admit_native_turn().await.unwrap() {
-            break;
-        }
-        assert!(
-            turn < TEXTS,
-            "native admission must finish in bounded turns"
-        );
-    }
-    summary.merge(fixture.receiver.take_pending_applied_sync_summary());
-    assert_eq!(
-        summary.messages.len(),
-        TEXTS,
-        "every plaintext is surfaced once"
-    );
-    assert_eq!(
-        summary
-            .messages
-            .into_iter()
-            .map(|message| (message.message_id_hex, message.plaintext))
-            .collect::<BTreeMap<_, _>>(),
-        expected,
-        "consumer-visible plaintext must survive the mixed ingress handoff"
-    );
-    let query = crate::AppMessageQuery {
-        group_id_hex: Some(hex::encode(fixture.group.as_slice())),
-        kinds: Some(vec![MARMOT_APP_EVENT_KIND_CHAT]),
-        limit: None,
-    };
-    let visible = fixture
-        .receiver
-        .app
-        .messages_with_query("receiver", query)
-        .unwrap();
-    assert_eq!(visible.len(), TEXTS);
-    assert_eq!(
-        visible
-            .into_iter()
-            .map(|message| (message.message_id_hex, message.plaintext))
-            .collect::<BTreeMap<_, _>>(),
-        expected,
-        "the public persisted message query must expose the exact plaintext set"
-    );
-    let storage = fixture
-        .receiver
-        .app
-        .account_storage("receiver")
-        .unwrap()
-        .app_storage();
-    let persisted = storage
-        .app_messages(storage_sqlite::StoredAppMessageQuery {
-            group_id_hex: Some(hex::encode(fixture.group.as_slice())),
-            kinds: Some(vec![MARMOT_APP_EVENT_KIND_CHAT]),
-            limit: None,
-        })
-        .unwrap();
-    assert_eq!(persisted.len(), TEXTS);
-    assert!(persisted.iter().all(|message| !message.invalidated));
-    assert_eq!(
-        persisted
-            .into_iter()
-            .map(|message| (message.message_id_hex, message.plaintext))
-            .collect::<BTreeMap<_, _>>(),
-        expected,
-        "real MLS plaintext must be committed, not just returned transiently"
-    );
-    let inventory = storage
-        .transport_reconciliation_inventory(&route, unix_now_seconds())
-        .unwrap();
-    assert_eq!(
-        inventory
-            .items
-            .into_iter()
-            .map(|item| item.event_id)
-            .collect::<BTreeSet<_>>(),
-        expected_transport,
-        "every actual encrypted transport event must have durable receipt evidence"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn newer_subset_keeps_plaintext() {
-    timeout(
-        Duration::from_secs(120),
-        mixed_ingress_case(ComparisonSide::NewerSubset),
-    )
-    .await
-    .expect("bounded real MLS mixed ingress regression");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn older_comparison_keeps_text() {
-    timeout(
-        Duration::from_secs(120),
-        mixed_ingress_case(ComparisonSide::OlderPrefix),
-    )
-    .await
-    .expect("bounded real MLS reverse ingress regression");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

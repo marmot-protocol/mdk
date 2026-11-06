@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-03
+updated: 2026-11-06
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -133,6 +133,12 @@ The simulator comes first; Jeff validates on a phone.
 
 ### 0. Native replay belongs to the account owner
 
+> **Superseded in part.** The owner grant, its native capture and the comparison job this section
+> describes are deleted; the recovery runner (section 9) owns every history fetch, and native
+> replay now only records its REQ windows as ledger debt. Ordered native admission, its turn bound
+> and the cursor seal below remain. Row 8 of mdk#2660 deletes the `SubscriptionReplay` remnants
+> and the adapter's pager.
+
 `SubscriptionReplay` records the original live inbox and group query windows. It is not a loss charge.
 Unresolved floors survive cancellation, source replacement and reopen; an unfloored query stays unfloored.
 Completed scopes can be pruned when sources change, so they do not force permanent full-history fetches.
@@ -252,6 +258,10 @@ only startup, a frozen wake or a client with no activation yet installs them, an
 change refreshes them.
 
 ### 3. One execution path for every cause
+
+> **Superseded.** This was the old owner's execution path. Its grant, comparison job, capture
+> and epoch-gap paging are deleted (5c2a846b4 is the last commit with them); the recovery runner
+> (section 9) replaces all of it. Kept as the record of what the runner replaced.
 
 | Cause | Source of work |
 | --- | --- |
@@ -788,10 +798,11 @@ leave staging in one transaction.
 
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
 fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
-on; the old owner remains available for controlled comparisons during retirement. Before any
+on. The old owner's grant, native capture and comparison job are deleted (5c2a846b4 is the last
+commit with them); the gate's off arm remains only in tests until the gate itself goes. Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
-ledger debt. Both owner-granted native capture and autonomous clamp continuation are disabled
-for app-owned accounts; ordinary native input, count facts and bounded fences remain. Supported
+ledger debt. Autonomous clamp continuation is disabled for app-owned accounts; ordinary native
+input, count facts and bounded fences remain. Supported
 lower-level adapter/session callers still retain the native pager pending its replacement.
 With runner ownership (`recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
@@ -842,8 +853,7 @@ nothing. A reconnect that a lag of the pool's notifications skipped still moves 
 generation, and a relay that leaves the pool leaves the feed. An Unrecoverable group's routes are suspended: their debt keeps accruing, but their
 units and re-checks are not scheduled, charged, broken or noticed, since a fetch would only
 fill the frozen copy's deferred input. For the same reason admission gives back what the group
-had staged, owed again, so it holds no staging bound, frontier or fence. With the gate on, the comparison owner also leaves their
-epoch-gap obligations out of its grant, so they stay ready and are never fetched. A retained
+had staged, owed again, so it holds no staging bound, frontier or fence. A retained
 route owes nothing past its switch plus the clock-skew allowance: members that had not applied
 the switch by then still send there, and its live subscription carries that. A relay a route
 replacement drops is retired as gone at the runner's next debt turn, once the routes still do
@@ -1042,8 +1052,23 @@ Deleted when the inline executor retired, after step 2:
 - The inline fallback when no credit is free, the per-cause offload checks, explicit
   catch-up's re-activation, and explicit repair's unfloored replay.
 
+Deleted once the recovery runner owned all debt (#2660 phase 4; 5c2a846b4 is the last commit with
+the old owner):
+
+- The owner grant (`AttemptGrant`, `authorize_account_recovery`), its capture tokens, plan and
+  outcome, and the capture outcome in settlement.
+- `client/sync/comparison_job.rs`: the comparison job, its startup and maintenance passes, the
+  epoch-gap window paging and resume hints (constants A16), and its paced known-event jobs.
+  Ordered native admission moved to `client/sync/native_ingress.rs` with its turn bound (A13).
+- The gate-off native replay source sync that kept `SubscriptionReplay` goals and capture tokens.
+- The epoch-backfill reporting arm, the scripted comparison test seams and the worker's
+  comparison test commands, and the tests that pinned only the deleted path.
+
 Still to delete:
 
+- The old owner's remaining paths: native-replay ownership leftovers, legacy loss import,
+  notices and the post-join maintenance path; then the gate itself and its test fixtures.
+- The adapter's native pager and `SubscriptionReplay` (row 8).
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -1058,10 +1083,10 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Per-account SDK clients (#2009) and directory isolation (#2005).
 - Worker-startup isolation (#1999).
 - Epoch-stall detector facts.
-- Post-join maintenance subscriptions, now floored at the Welcome that installed the copy
-  less a fifteen-minute clock-skew allowance (design section 5), rather than a
-  full-history request. A maintenance grant's job installs them, and they still complete
-  on EOSE, not on comparison.
+- The Welcome floor (design section 5): a joined group's standing goal starts at the
+  Welcome that installed the copy, less a fifteen-minute clock-skew allowance. The
+  runner's post-join collection (`recovery_runner/post_join.rs`) replaces the
+  maintenance subscriptions a grant installed; nothing installs those any more.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed
   row cap, until qualified completion (an explicit deep repair counts only when it achieves

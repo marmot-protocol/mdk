@@ -30,7 +30,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
-  the cursor unit tests; `sync/full_history_tests.rs` covers explicit repair), `projection.rs`
+  the cursor unit tests), `projection.rs`
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
@@ -635,11 +635,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
   durable writes from another boundary. See `tests/audit-v5-welcome-probe.md` for historical subset measurements.
 - Keep the v5-only recovery-owner and transport-cursor audit rows in `src/client/audit_recovery.rs`
-  (`recovery_need_changed`, `recovery_attempt_started`, `recovery_attempt_finished`,
-  `recovery_obligation_reassessed`, `transport_cursor_advanced`). Record at owner seams only: loss import through
-  `synchronize_recovery_loss` (never call the storage import directly from client code), the shared execution
-  bracket (`begin_recovery_execution` / `finish_recovery_execution`, which the comparison job uses), settlement after
-  the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
+  (`recovery_need_changed`, `transport_cursor_advanced`). Record at owner seams only: loss import through
+  `synchronize_recovery_loss` (never call the storage import directly from client code), the notice publication seam
+  and dismissal, and cursor commits after their save succeeds. The attempt and reassessment kinds went with the
+  owner's grant; the recovery runner records its own turns.
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
@@ -647,16 +646,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
-  `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
+  `src/client/audit_recovery/scenario_tests.rs`.
 - Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
   at owner seams only: account open (`record_open_coverage_goals`), the runner's routing-change settlement,
   loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
   routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
-  requests (`record_recovery_request`), native
-  synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
-  un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
-  `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
-  in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
+  requests (`record_recovery_request`) and native
+  synchronization (`synchronize_native_replay`). Its writes are best effort in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
   fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
   records its per-cause aggregate `conversion` trace before the first quantum, acknowledges that report and imports
   ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. A newly armed
@@ -694,29 +690,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
   live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
   newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
-  `recovery_coverage/live_boundary_tests.rs`. `coverage_shadow_report`
-  is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it once
-  loss invalidates by route (its predicate at the current route, inventory and obligation revisions; newer loss voids
-  it only where storage's `recovery_loss_reach_after` says loss imported after the scope's loss revision, retired or
-  not, reached its route inside its window; a scope that would hold but whose newer loss was since acknowledged is not
-  comparable, because acknowledgment deletes where it reached). A loss obligation's scope on a route its own loss
-  (`recovery_loss_reach`) never reached there is not comparable, and loss goals are restored only on reached routes,
-  from their reach. A scope whose floor is unknown or older than the
-  retained window is owed from the retention floor. Before it prunes, it passes the current routes and
-  their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
-  every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
+  `recovery_coverage/live_boundary_tests.rs`. The runner's debt turns age the ledger out of the retention window
+  (`prune_runner_retention`), passing the current routes and their required relays, so what they still owe below the
+  floor is parked as each route's remainder and goals rise to the floor. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
   the window. Read that hint from durable group metadata, not the hydration-gated live accessor: runtime opens defer
   MLS hydration, and an overly early goal cannot narrow later. Propagate metadata read errors instead of treating
   them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
   un-cover or drop debt. It logs aggregate counts only.
-  Known disagreements
-  are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
-  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Controlled comparison fixtures can select
-  the old owner through the value-only `test-support` builder; this is never a host setting or cargo feature.
-  With the gate off nothing constructs it and the comparison owner keeps every behavior.
+  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the gate off through
+  the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed. With it
+  off nothing constructs the runner; the old owner's grant and comparison job no longer exist.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
@@ -815,8 +801,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   nothing with the gate off.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
-  back as an unlisted route's is, and with the gate on the comparison owner drops their
-  epoch-gap obligations from its grant fence (`suspended_epoch_gaps`); gate off, it fetches them as before. A
+  back as an unlisted route's is. A
   retained route's ceiling (`retained_route_goal_until`) caps every debt and re-check read through
   `DebtTurn::owed_until`/`checked_until`; never store it. Route-gone retirement runs only in the runner's debt turn
   (`settle_recovery_route_changes`), from drops `replace_group_routes` records once a runner tracks them; a full
@@ -935,30 +920,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   rejects one; engine types come through `marmot-session`'s re-exports. The crate root re-exports the lower stack's error
   types (`AccountError`, `SessionError`) and identity-proof signer types, so hosts reach them through `marmot_app`
   (mdk#2602).
-- Every recovery cause and caller runs the one comparison job in `src/client/sync/comparison_job.rs`; there is
-  no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
-  they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
-  re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
-  subscriptions. Its epoch-gap window (`fetch_epoch_gap_window`, mdk#2256/#2257) pages backwards from relays that
-  failed without answering comparison, using raw counts/timestamps before SDK filtering and bounded advisory hints.
-  Admit only completed oldest pages; cuts and saturated seconds release no newer suffix. Held-only traversal never
-  resets pacing or durable parking, even after hint eviction or client reconstruction. Keep original comparison
-  stability and SQL fences. Never fetch ahead of older comparison backlog, and admit the route's
-  comparison and window events together oldest first. Window events (`PendingSource::Window`) must not touch the
-  route's certificate, replay cursor or admission verdict. Explicit full-history repair runs the job in place: one comparison pass over every route of its
-  grant inside the repair budget. It never reports complete: history below the retained window is unsearched
-  (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that
-  result closes the request (`close_explicit_history_request`, revision-checked) instead of leaving debt that parks
-  into a notice; an explicit scope whose window certified reports `RecoveryPassProgress::WindowCertified`, never
-  `Quiet`, and the checkpoint that finds every scope certified closes the request from any pass,
-  while `CoverageUnproven`, `Cancelled` and `Deadline` keep it open. Keep
-  the budget split: the network pass ends at `FullHistoryRepairControl::network_deadline` and returns its finished
-  routes for admission; only cancellation aborts the request at the poll; `stopped` ends admission at a turn
-  boundary, keeping the admitted prefix; and
-  preserve generation-checked overflow marker clearing. The account worker can serve committed snapshot reads
-  while repair waits; mutations retain FIFO order, and repair waits while a worker-owned job
-  is in flight. Client continuation tests live in `src/client/sync/full_history_tests.rs`; worker
-  cancellation/read-order tests stay in `src/runtime/account_worker.rs`. See the README for the
+- The recovery runner owns every history fetch (mdk#2660 phase 4); the old owner's grant, comparison job and
+  epoch-gap paging are deleted (5c2a846b4 is the last commit with them). Runtime catch-ups (`SyncMode::Drain`) only
+  drain the live queue. `sync()` drains, flushes recovery observations when debt is pending, and a directly owned
+  client then runs one runner pass in place. Nothing re-subscribes to recover history, and only startup, a frozen
+  wake or an unactivated client installs live subscriptions. Explicit full-history repair is one request the
+  account's runner serves (`recovery_runner/repair.rs`). It never reports complete: history below the retained
+  window is unsearched (`BelowRetentionWindow` when the window is covered), so never certify explicit history from a
+  window. Repair tests live in `src/client/recovery_runner/repair/tests.rs`. See the README for the
   automatic-recovery and send-fairness limits.
 - A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
   besides qualified completion. Record it only through `retire_parked_recovery_obligation` (its own outcome,
@@ -970,20 +939,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `record_account_recovery_loss_routed`), and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
-- AccountRecoveryOwner owns the SubscriptionReplay goal, original unresolved windows, retry and completion.
-  Synchronize borrowed source observations at lifecycle, grant, checkpoint and worker-watch seams. Preserve
-  unresolved floors across cancellation/reopen; an unfloored query must not become a recent tail. Capture only
-  current sources authorized by the frozen selected grant, through the existing credited comparison job.
-  Passive replay_admitted needs current-epoch full-range placement and no pending bytes/nondurable spill;
+- AccountRecoveryOwner keeps ordered native ingress. It synchronizes borrowed source observations at lifecycle,
+  checkpoint and worker-watch seams and records each REQ's original window as ledger debt
+  (`synchronize_native_replay`); it holds no grant and captures nothing. Passive replay_admitted needs current-epoch full-range placement and no pending bytes/nondurable spill;
   it spends no retry credit and never qualifies history, maintenance, known-event or real loss predicates.
   Empty silence is not notification loss. No adapter/relay-plane quiet repair scheduler or alternate owner.
 - Register `ReplayIngress` before activation, seeding durable group spill rows before native source release.
-  Admit complete group batches through the owner's ordinary recovered-ingest path, sharing four actual
-  ingests per turn with comparison input, never through live/spill alternation. Select the oldest known
-  same-group frame across both sources; a pending native range fences that group, not independent groups.
-  Borrow each frame until ACK; cancellation or loan revocation leaves the frame
-  retained. Native batches keep holding the cursor, but acquired ranges spend no new network retry credit
-  while draining. Keep retained spill receipt settlement and independent-group turns.
+  Admit complete group batches through the owner's ordinary recovered-ingest path, examining at most four frames
+  per turn (`MAX_NATIVE_ADMISSION_PER_TURN`, receipt skips included), never through live/spill alternation. A
+  pending native range fences that group, not independent groups. Borrow each frame until ACK; cancellation or
+  loan revocation leaves the frame retained. Native batches keep holding the cursor. Keep retained spill receipt
+  settlement and independent-group turns.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
   `state.last_transport_timestamp`. The seal holds adapter admission stable through the router's placement lock,
   importing any discarded replay into the existing loss fence before deciding. It returns nothing while staged,
@@ -1135,14 +1101,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
-- `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
-  recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
+- `src/client/`: `recovery.rs` (native replay ingress and the recovery seams), `recovery_coverage.rs` (the
+  coverage-ledger recorder, mdk#2660), `recovery_runner.rs` (the per-account recovery
   runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
   a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
   using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
-  `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
-  job).
+  `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
+  admission).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as
   `transport_nostr::`.
 - `src/sqlcipher/open_lock.rs`: in-process same-file open exclusion (the root lease covers cross-process).
@@ -1181,9 +1147,8 @@ than replaying those matrices here.
 
 ```sh
 cargo test -p marmot-app
-# Retained comparison-owner cursor and native startup-prefix characterizations:
-# Other partial-summary cases use the production default, including live ingress.
-cargo nextest run -p marmot-app --test since_floor --test partial_sync_summary --features test-support,test-policy-overrides
+# Partial-summary cases on the production default, including live ingress:
+cargo nextest run -p marmot-app --test partial_sync_summary --features test-support,test-policy-overrides
 # Accelerated recovery/retry scenarios (also enabled by workspace CI):
 cargo test -p marmot-app --features test-policy-overrides
 # Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):

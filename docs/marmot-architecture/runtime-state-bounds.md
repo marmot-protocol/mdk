@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-11-02
+updated: 2026-11-06
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -47,16 +47,6 @@ Tracking issue: marmot-protocol/mdk#381.
 The retry delay starts at one second, doubles after each actual failure, and caps at 60 seconds.
 Suppressed calls do not advance the count or deadline. Expiry permits an attempt on the next
 existing trigger; no timer retains an account or holds the transaction through a cooldown.
-
-### `marmot-app` epoch-gap paging (`src/client/sync/comparison_job.rs`)
-
-| Structure | Bound | Reclamation |
-| --- | --- | --- |
-| Advisory group/peer resume hints | At most 1,024 entries per client; at most 2,048 two-word boundaries per hint (32 KiB of boundary values), plus route/peer identity and ownership metadata | LRU eviction, stale ownership and client drop discard hints. Losing a hint causes a rescan, never a reset of the durable park budget. No event bodies or scan-credit ledger persist in the cache. |
-
-Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event JSON per pass, in 256-event
-pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
-the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
 ### `marmot-observability` runtime performance observations (`src/app_telemetry/runtime.rs`)
 
@@ -307,21 +297,16 @@ Retirement is per occurrence and only on the user's decision; it is not such a c
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| Active grant and admission snapshot | One per account; scopes are input-relative to selected unresolved obligations and their frozen route/endpoint goals. The owner holds a weak admission reference. | Completion, error or future drop releases the snapshot and its inventory; quiescence does not retain an old plan. |
-| Frozen comparison inventory | At most four routes for an automatic or catch-up pass; every route of the account for an explicit full-history repair, which runs one at a time per account. Each route uses the existing 16,384-item retained inventory bound, and the process's two recovery credits cap concurrent passes | Owned by one grant; future drop releases all copied items. Older uncovered ranges remain durable debt, not omitted success. |
-| Pending cross-grant acknowledgment | At most the queue and notification causes; each holds one obligation revision and a fixed-size loss snapshot | Exact live/SQL acknowledgment clears it. Failed execution or reopen restores unreclaimed debt and discards the cache. |
-| Completed known-event rows and scopes | No historical completed-event log | Reclaimed before owner selection with no live grant, and on owner reconstruction. Pending exact-event debt is untouched. |
+| Completed known-event rows and scopes | No historical completed-event log | Reclaimed on owner reconstruction. Pending exact-event debt is untouched. |
 | Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it, and a finished pass whose every route's window certified closes it; cancellation removes urgency only. Reopen performs the same cleanup. |
 | Maintenance boundary metadata and live observations | Input-relative to active post-join domain jobs | Removed with the job/session lifecycle; grace and quiet timers remain domain-owned. |
 | Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
 | Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion, explicit terminal domain retirement, or the user's explicit retirement of a parked occurrence (`state = 2`, "history may be incomplete"). A retired row keeps its unique demand key and its latest scope checkpoints, so it is bounded by the key space; genuinely new demand for that key reopens it. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
 
-Automatic unknown-history investigation runs one bounded comparison pass per
-attempt and parks the obligation once its fixed budget of fruitless passes is spent.
-Timer ticks and duplicate joins do not rearm it. New loss/policy evidence or a
-serialized explicit caller can authorize another bounded investigation, subject
-to the shared owner. Missing epoch/event input uses the capped durable retry policy;
-local convergence eligibility remains independent of that network cooldown.
+The owner holds no grant, frozen inventory or in-memory acknowledgment: the
+recovery runner fetches all history against the coverage ledger (see
+[account history recovery](further-context/account-recovery.md), section 9), and
+conversion turns retained obligations into ledger debt before it starts.
 Each parked obligation is one "history may be incomplete" notice, identified by its
 obligation id and revision and recorded with a `parked_at_ms` time. Dismissing it is
 the user-authorized retirement above; when no loss obligation remains pending it also
@@ -333,7 +318,9 @@ Migration 0095 adds exactly one coalescing operational comparison row per accoun
 sharing the existing recovery retry state. Its frozen descriptor and failed-route
 subset contain at most the existing four-route pass budget; no per-startup or
 per-attempt history accumulates. Receipts remain in the existing 16,384-item,
-30-day per-route inventory, and the active grant owns the bounded in-memory copy.
+30-day per-route inventory. No pass serves the row since the comparison job's
+deletion: conversion settles what it held, and its remaining writers are old-owner
+leftovers (mdk#2660).
 Transiently failed selected routes stay pending; serviced or unattempted routes
 never erase unresolved coverage. Retained inventory may be narrower than older
 coverage debt. This adds no disk-cap claim for the previously approved unresolved

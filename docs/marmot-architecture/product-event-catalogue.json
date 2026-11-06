@@ -1235,7 +1235,7 @@
     },
     {
       "name": "mdk_recovery_summary",
-      "owner": "run_pending_epoch_backfill_reporting_arm and AppClient recovery",
+      "owner": "refresh_recovery_at_seam and AppClient recovery",
       "trigger": "authoritative completion, persisted transition, or window-close state sample",
       "units": [
         "action",

@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-28
+updated: 2026-11-06
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -39,8 +39,8 @@ The request's `account_id` selects the authentication context and inbox recipien
 
 Both time bounds are inclusive, and a window is never issued as an unfiltered time REQ.
 
-The caller keeps its `AttemptGrant`, `RecoveryRevisionFence` and `RecoveryScopeToken` across the await and pairs them
-with the owned result when it hands events to the worker. The transport does not echo or validate durable recovery
+The caller keeps its own recovery identifiers across the await and pairs them with the owned result when it hands
+events to the worker. The transport does not echo or validate durable recovery
 identifiers.
 
 ## Bounds

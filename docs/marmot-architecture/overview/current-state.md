@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-04
+updated: 2026-11-06
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -23,8 +23,8 @@ App account-history recovery uses one coverage-ledger runner (#2660) for startup
 convergence and explicit repair. Before subscriptions activate, it converts retained recovery obligations and
 records loss as durable debt; a worker runs bounded acquisition off its command loop, while a directly owned
 client runs a pass from its event/sync calls. Ordinary native subscription input still enters through the ordered
-admission path, but both owner-granted backward capture and autonomous clamp continuation are disabled for these
-accounts. Nonempty live replies may hold bounded fences; empty replies and restart gaps remain unfenced debt.
+admission path. Owner-granted backward capture and the old owner's comparison job are deleted, and autonomous clamp
+continuation is disabled for these accounts. Nonempty live replies may hold bounded fences; empty replies and restart gaps remain unfenced debt.
 Unresolved epoch gaps authorize paced, bounded return visits to retained group history, including relays without
 NIP-77. Their visit budget survives restart, and exhaustion remains visibly unresolved.
 Coverage, durable retention and visible/decryptable chat history are separate claims. Lower-level adapter/session
