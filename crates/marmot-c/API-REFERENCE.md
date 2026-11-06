@@ -1857,7 +1857,7 @@ Apply a MarmotAttachmentControl discriminant to an opaque reference. # Safety Cl
 MarmotStatus marmot_cancel_device_link(const struct MarmotClient *client, const char *account_ref, struct MarmotDeviceLinkSnapshot **out);
 ```
 
-On the new device, cancel the link and tell the other device. Free the snapshot with `marmot_device_link_snapshot_free`.
+On the new device, request cancellation of the link. This does not guarantee notification of the other device: cancellation while waiting in `Joining` can end locally without sending a cancellation message. Free the snapshot with `marmot_device_link_snapshot_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotcancel_device_link) · [Header contract](include/marmot.h#L8966)
 
