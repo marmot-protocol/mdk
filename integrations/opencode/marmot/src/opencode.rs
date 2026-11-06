@@ -21,6 +21,9 @@ pub(crate) struct OpencodeBackend {
 
 #[async_trait]
 impl Backend for OpencodeBackend {
+    fn supports_steering(&self) -> bool {
+        self.native_enabled
+    }
     fn has_active_turn(&self, group: &str) -> bool {
         self.native_enabled && self.native.active(group)
     }
@@ -64,6 +67,7 @@ impl Backend for OpencodeBackend {
                     invocation,
                     &[],
                     native_environment(self.execution_profile),
+                    self.execution_profile != ExecutionProfile::Inherit,
                     tx,
                 )
                 .await;
@@ -85,6 +89,7 @@ impl Backend for OpencodeBackend {
                     invocation,
                     &attachments,
                     native_environment(self.execution_profile),
+                    self.execution_profile != ExecutionProfile::Inherit,
                     tx,
                 )
                 .await;
@@ -341,8 +346,9 @@ impl OpencodeError {
     }
 }
 
+/// The CLI's permission overlay. Approval replies are passed separately.
 fn native_environment(profile: ExecutionProfile) -> Vec<EnvironmentChange> {
-    let mut environment = config_overlay(profile)
+    config_overlay(profile)
         .map(|(remove, name, value)| {
             vec![
                 EnvironmentChange::Remove(remove),
@@ -352,17 +358,7 @@ fn native_environment(profile: ExecutionProfile) -> Vec<EnvironmentChange> {
                 },
             ]
         })
-        .unwrap_or_default();
-    environment.push(EnvironmentChange::Set {
-        name: "WN_OPENCODE_NATIVE_APPROVALS",
-        value: if profile == ExecutionProfile::Inherit {
-            "inherit"
-        } else {
-            "once"
-        }
-        .into(),
-    });
-    environment
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

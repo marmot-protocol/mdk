@@ -386,51 +386,39 @@ cargo test -p wn-opencode real_opencode_run_file_contract -- --ignored --nocaptu
 
 ## Active-turn steering (opt-in native transport)
 
-The transport is selected once at startup: unset or `cli` keeps the default;
-`native` enables steering. Other values fail configuration validation.
+`WN_OPENCODE_TRANSPORT=native` lets a follow-up join the running turn of its
+group. Unset or `cli` keeps the default `opencode run` transport. Any other
+value fails configuration.
 
-`WN_OPENCODE_TRANSPORT=native` uses a per-turn `opencode serve` process and
-OpenCode's native session API. A follow-up is saved in the same session while
-the current model/tool loop runs; it becomes available at the next step rather
-than waiting in the harness queue. A running tool is not interrupted.
+Each native turn starts its own `opencode serve` in the turn's working
+directory, bound to a free `127.0.0.1` port, with a random password
+created for that turn. The prompt is sent through OpenCode's session API. Once
+OpenCode has stored the prompt, a follow-up from the same group is stored in
+the same session with `noReply`, and the running loop reads it at its next
+step, after any running tool finishes. The server stops when the turn ends.
 
-This uses the shared terminal harness's `Backend::steer` contract, sender checks,
-attachment leases, group routing, session map, process cleanup and uncertain
-outcome handling. The connector continues to own durable message delivery.
-The default remains the existing CLI transport.
+A follow-up is accepted only after OpenCode returns the stored message with
+the same text and attachments. The harness submits each follow-up once. When
+the request fails or its result is unclear, the sender is told delivery is
+uncertain. Follow-ups that arrive after the turn has ended run as the next
+turn. If one is stored just as OpenCode finishes, the reply asks the sender to
+send another message.
 
-Native HTTP responses have a separate bounded budget: the configured aggregate
-attachment limit after base64 expansion, plus 4 MiB for JSON, text and metadata.
-The JSONL control-input limit remains 4 MiB. Initial persistence reads only the
-submitted message; completion uses the original prompt response, so earlier
-attachment batches are never loaded. A response exceeding its budget fails the
-turn. An uncertain follow-up stops the native turn and preserves its session for
-inspection; the follow-up is never queued or replayed automatically.
+The reply is sent when the turn finishes: the completed text of every
+assistant message in the turn, in order. Reasoning and tool output stay
+private. Autonomous and unrestricted profiles answer OpenCode permission
+requests once, so hard denies in OpenCode configuration still apply. With the
+inherited profile, a permission request fails the turn. Questions are
+rejected, so the model asks in its reply.
 
-Native mode currently requires Linux, Python 3 at `/usr/bin/python3`, OpenCode 1.18.32 and a protected
-loopback port range. Set `WN_OPENCODE_NATIVE_PASSWORD_FILE` to a nonempty, private
-0600 file owned by the service user; the same password must reach the spawned
-OpenCode server. Set `WN_OPENCODE_NATIVE_USERNAME` if it differs from `opencode`.
-The default range is 700–799, configurable with
-`WN_OPENCODE_NATIVE_PORT_FIRST` / `WN_OPENCODE_NATIVE_PORT_LAST`. All ports must
-be below the host's unprivileged-port threshold. Grant the service only
-`CAP_NET_BIND_SERVICE` for listening, and run the harness as its ordinary user.
-The API credential is available to tools running as the same service user;
-native mode provides cross-user protection, not a tool sandbox.
-Private per-port locks prevent concurrent rooms from sharing a server. Each
-server inherits only its own invocation's connector route.
+Requirements and limits:
 
-A follow-up is acknowledged only after OpenCode confirms its saved message.
-An ambiguous submission is never queued or automatically retried. If OpenCode
-finishes just as a follow-up is saved and leaves it unanswered, the harness
-reports failure and preserves the session. An older answer or replay cannot
-count as successful steering. Only completed assistant text is published; reasoning,
-tool arguments and transcript history remain private. Autonomous mode grants
-native permission requests once while preserving native hard denies; inherited
-interactive requests fail with the session preserved.
-
-Development also runs:
-
-```sh
-python3 -m unittest discover -s integrations/opencode/marmot/tests -p test_native_bridge.py
-```
+- OpenCode 1.18.32 through 1.19.x. Other versions fail the turn with a
+  configuration error, because the `noReply` behaviour is not a documented
+  contract.
+- The `opencode` executable must not replace `OPENCODE_SERVER_USERNAME` or
+  `OPENCODE_SERVER_PASSWORD`, since the harness authenticates with them.
+- Tools run as the service user and can read the server password, so this
+  protects the server from other local users, not from the model's own tools.
+- A response may be at most 4 MiB plus the configured attachment limit after
+  base64 encoding. A larger response fails the turn.

@@ -47,7 +47,9 @@ impl Config {
     pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, OpencodeBackend) {
         let backend = OpencodeBackend {
             bin: self.0.bin,
-            native: Default::default(),
+            native: std::sync::Arc::new(crate::native::Native::new(
+                self.0.harness.max_attachment_bytes,
+            )),
             native_enabled: self.1,
             execution_profile: self.0.harness.execution_profile,
         };
