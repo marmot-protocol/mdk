@@ -1217,36 +1217,76 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     assert_eq!(laptop.linked_devices().unwrap().len(), 4);
 }
 
-/// With device groups switched off, nothing is listed and no change is
-/// announced, even on a device that trusts a device group.
+/// An ordinary opener of a root that holds a device group, such as a host's
+/// push extension on an experimental test build, is refused before its
+/// session opens (mdk#3012). It hydrates, drains, subscribes and sends
+/// nothing, so a device-group commit the experimental opener left
+/// mid-publication stays staged for the next one. A root without a device
+/// group, and the experimental constructor, still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_groups_off_list_no_devices_and_no_overdue_refresh() {
+async fn an_ordinary_opener_of_a_device_group_root_is_refused() {
     let Devices {
         _dirs,
         relay,
         mut phone,
+        laptop,
         link,
         ..
     } = phone_and_laptop().await;
-    phone.dev_create_device_group(link).await.unwrap();
-    assert_eq!(phone.linked_devices().unwrap().len(), 2);
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    relay.fail_publishes_as_possibly_exposed();
+    phone
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let staged = |client: &AppClient| {
+        (
+            client.runtime.epoch_state(&group),
+            client
+                .runtime
+                .outbound_fanouts_for_group(&group)
+                .unwrap()
+                .iter()
+                .map(|fanout| fanout.message_id().clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let left = staged(&phone);
+    assert!(
+        matches!(left.0, Some(cgka_traits::EpochState::PendingPublish(_))) && left.1.len() == 1,
+        "the phone leaves its commit mid-publication"
+    );
     drop(phone);
+    drop(laptop);
 
-    let phone_app = MarmotApp::with_relay_and_config(
-        _dirs[0].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay);
-    let mut phone = phone_app.client("alice").await.unwrap();
-    assert!(phone.linked_devices().unwrap().is_empty());
-    assert!(phone.linked_devices_changed);
-    assert!(!phone.take_linked_devices_changed());
-    assert!(!phone.key_package_refresh_overdue().unwrap());
-    assert!(phone.key_package_refresh_overdue_changed);
-    assert!(!phone.take_key_package_refresh_overdue_changed());
+    let fresh = Arc::new(ScriptedPushRelayClient::default());
+    let ordinary = |dir: &tempfile::TempDir| {
+        MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig::white_noise()
+                .with_dev_settlement_quiescence_ms(0)
+                .with_dev_scheduled_convergence_delay_ms(0),
+        )
+        .with_test_relay_client(fresh.clone())
+    };
+    assert!(matches!(
+        ordinary(&_dirs[0]).client("alice").await,
+        Err(AppError::ExperimentalDeviceGroupsRequired)
+    ));
+    assert!(fresh.attempted_events().is_empty());
+    assert_eq!(fresh.subscription_count(), 0);
+    // The laptop's root holds no device group yet: it opens as before.
+    ordinary(&_dirs[1]).client("alice").await.unwrap();
+
+    let phone = device_group_app_on(&_dirs[0], fresh.clone(), MarmotDeployment::white_noise())
+        .client("alice")
+        .await
+        .unwrap();
+    assert_eq!(staged(&phone), left, "the commit waits for this opener");
 }
 
 /// Through the runtime, the new device's account worker announces the join it

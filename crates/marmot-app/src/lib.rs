@@ -5067,6 +5067,30 @@ impl MarmotApp {
         Ok(group)
     }
 
+    /// Refuse to open the session of an account that holds a device group
+    /// while device groups are off (mdk#3012): an experimental test build's
+    /// root opened by an ordinary constructor, such as a push extension's.
+    /// That process could only refuse the device group's messages, and
+    /// reading one spends it for every opener of the account. Its drain
+    /// would also settle the device group's staged commits and queued
+    /// intents without the support they need: a staged commit, with no route
+    /// to publish it, is rolled back while its stored fanout still sends it.
+    /// So nothing of the account is hydrated, drained or sent here; the
+    /// experimental constructor opens it. A device group is recorded before
+    /// the engine writes anything of it, so its row is the marker.
+    fn refuse_device_group_without_support(&self, label: &str) -> Result<(), AppError> {
+        if !self.device_groups_enabled()
+            && !self
+                .account_storage(label)?
+                .app_storage()
+                .device_groups()?
+                .is_empty()
+        {
+            return Err(AppError::ExperimentalDeviceGroupsRequired);
+        }
+        Ok(())
+    }
+
     fn open_account(
         &self,
         label: &str,
@@ -5077,6 +5101,7 @@ impl MarmotApp {
         // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
         // by the canonical stored label so aliases cannot open a second engine.
         let label = account.label.as_str();
+        self.refuse_device_group_without_support(label)?;
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;

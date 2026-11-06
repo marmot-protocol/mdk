@@ -78,6 +78,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   founding Add takes the account's own device only through the confirmed `KeyPackageRef` and sets its entry, as a later
   link does (D41). Confirmed links come from device pairing; the `test-policy-overrides` hooks
   (`dev_create_device_group`, `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
+- Never open the session of an account that holds a device group while device groups are off (mdk#3012):
+  `open_account` refuses it first (`refuse_device_group_without_support`, `AppError::ExperimentalDeviceGroupsRequired`),
+  before anything hydrates, drains, subscribes or sends. Such a process could only refuse the group's messages, which
+  spends them for every opener, and its drain would settle the group's staged commits and queued intents with no route.
+  The `device_groups` row is the marker: it is written before the engine writes anything of the group.
 - Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
   it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
   stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the

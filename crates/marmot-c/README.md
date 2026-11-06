@@ -232,7 +232,10 @@ Follow the [shared build and constructor guidance](../marmot-uniffi/README.md#ex
 `marmot_client_new_with_experimental_device_groups` takes the same arguments and unchanged `MarmotClientOptions`
 layout as `marmot_client_new_with_configuration`. Required output validation and clearing happen first. An incapable
 library returns `MARMOT_STATUS_RUNTIME` with `experimental_device_groups_unavailable` before opening the root or
-taking secret-store callback ownership; ownership transfers only on successful construction.
+taking secret-store callback ownership; ownership transfers only on successful construction. A push extension or
+background worker on an experimental root needs this constructor too: under `marmot_client_new_with_configuration`, an
+account that holds a device group does not open, and its calls return `MARMOT_STATUS_RUNTIME` with
+`experimental_device_groups_required`.
 
 Build the C library/header with `./crates/marmot-c/c-bindings.sh --dev-device-groups`. It stages
 `crates/marmot-c/output-dev-device-groups/` using a `dev-device-groups/` child of the selected Cargo target directory.
