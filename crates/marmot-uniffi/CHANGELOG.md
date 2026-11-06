@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `set_housekeeping_mode(account_ref, mode)` and `housekeeping_mode(account_ref)` with `HousekeepingModeFfi`
+  (`Normal`, `Background`) (mdk#2923 PR P). Set `Background` while the app is backgrounded to hold housekeeping
+  without touching messaging, and `Normal` on return. Process-local: set it again after a cold start. Additive;
+  regenerate bindings to use them.
+
 - Emoji set changes (breaking; no host has shipped against the emoji set API).
   `install_emoji_set(account_ref, coordinate, expected_event_id_hex, control)` binds the install to the version the
   user was shown and takes a new `EmojiSetInstallControlFfi` (`cancel()`, `is_cancelled()`, `progress()` returning

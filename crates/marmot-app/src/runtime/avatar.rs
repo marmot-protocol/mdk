@@ -75,6 +75,14 @@ impl IdentityAvatarMaintenance {
         client: &crate::AppClient,
         account: &str,
     ) -> Result<bool, AppError> {
+        // Held in background housekeeping mode (mdk#2923 PR P).
+        if !client
+            .housekeeping_gate()
+            .admit(crate::housekeeping_mode::HousekeepingJob::AvatarIdentities)
+            .runs()
+        {
+            return Ok(false);
+        }
         let storage = client.app.account_storage(&client.state.label)?;
         if self.after.is_empty() {
             let head = client
@@ -147,6 +155,85 @@ mod tests {
     use marmot_account::AccountHome;
     use std::sync::Arc;
     use storage_sqlite::PublicDirectoryUserRecord;
+
+    /// Background housekeeping mode holds identity avatar maintenance at its
+    /// entry: a requested identity whose profile is ready gets no avatar
+    /// reference until the account returns to Normal (mdk#2923 PR P).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_mode_holds_identity_avatar_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = hex::encode(
+            client
+                .create_group("Avatar test", &[])
+                .await
+                .unwrap()
+                .as_slice(),
+        );
+        let member = "bb".repeat(32);
+        app.request_identity_avatar("alice", &group, &member)
+            .unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let owner = storage
+            .app_storage()
+            .requested_avatar_identities_after("")
+            .unwrap()[0]
+            .owner
+            .clone();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&PublicDirectoryUserRecord {
+                account_id_hex: member.clone(),
+                npub: "fixture".into(),
+                profile_json: Some(
+                    serde_json::to_string(&crate::UserProfileMetadata {
+                        picture: Some("https://example.com/avatar.png".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                relay_lists_json: "{}".into(),
+                key_package_json: None,
+                event_id_hex: None,
+                event_kind: None,
+                event_created_at: None,
+                follows: vec![],
+            })
+            .unwrap();
+        let checkpoint = storage
+            .app_storage()
+            .chat_presentation_checkpoint()
+            .unwrap();
+        let mut transition = checkpoint.state.clone();
+        transition.shared_epoch = app
+            .shared_storage()
+            .unwrap()
+            .directory_presentation_version()
+            .unwrap()
+            .store_epoch;
+        storage
+            .app_storage()
+            .commit_chat_presentation_batch(&checkpoint, &transition, &[])
+            .unwrap();
+        let reference = || storage.app_storage().avatar_reference(&owner).unwrap();
+        let mut maintenance = IdentityAvatarMaintenance::default();
+
+        app.set_housekeeping_mode("alice", crate::HousekeepingMode::Background);
+        assert!(!maintenance.run(&client, &account.account_id_hex).unwrap());
+        assert!(reference().is_none(), "held while in Background");
+
+        app.set_housekeeping_mode("alice", crate::HousekeepingMode::Normal);
+        maintenance.run(&client, &account.account_id_hex).unwrap();
+        assert!(
+            reference().is_some(),
+            "Normal resolves the requested identity"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requested_identity_avatar_tracks_later_profile_without_an_open_window() {

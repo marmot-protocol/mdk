@@ -4602,6 +4602,48 @@ impl MarmotAppRuntime {
         self.accounts.pause_maintenance(account_ref).await
     }
 
+    /// Sets the account's background housekeeping mode (mdk#2923). While the
+    /// host app is in the background, `Background` holds housekeeping: the
+    /// prune sweeps, the media-store sweep, the housekeeping batch (keep-media,
+    /// reclaim and WAL truncate, compaction), the avatar pass, the content
+    /// report backfill and legacy message promotion. Held work still runs once
+    /// every [`crate::BACKGROUND_BACKSTOP`] (12 h). Messaging is unaffected:
+    /// receives, sends, downloads, notifications, the KeyPackage lifecycle,
+    /// recovery of prepared publications, the recovery runner and push
+    /// windows keep running, as does what an in-flight send or download
+    /// needs. Returning to `Normal` runs each held job once.
+    ///
+    /// Process-local: it survives the account's worker or client reopening,
+    /// and a cold start is `Normal`, so a host sets it again after start.
+    /// Distinct from `pause_maintenance`, which stops new protocol
+    /// maintenance preparation, and from network suspension (mdk#2600).
+    pub fn set_housekeeping_mode(
+        &self,
+        account_ref: &str,
+        mode: crate::HousekeepingMode,
+    ) -> Result<(), AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .set_housekeeping_mode(&account.label, mode);
+        if mode == crate::HousekeepingMode::Normal {
+            // The owed catch-up runs start without waiting for the tick.
+            self.accounts.app.presentation_signals.wake();
+        }
+        Ok(())
+    }
+
+    /// The account's background housekeeping mode.
+    pub fn housekeeping_mode(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::HousekeepingMode, AppError> {
+        Ok(self
+            .accounts
+            .app
+            .housekeeping_mode(&self.accounts.resolve(account_ref)?.label))
+    }
+
     pub async fn resume_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
         self.accounts.resume_maintenance(account_ref).await
     }

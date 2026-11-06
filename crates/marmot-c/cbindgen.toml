@@ -50,6 +50,7 @@ include = [
     "MarmotSecretStoreStatus",
     "MarmotHostPerformanceOperation",
     "MarmotHostPerformanceOutcome",
+    "MarmotHousekeepingMode",
     "MarmotModerationReportOrigin",
     "MarmotSignInResponse",
     "MarmotCompromiseWarningReason",

@@ -74,6 +74,8 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod close_registry;
+mod housekeeping_mode;
+pub use housekeeping_mode::{BACKGROUND_BACKSTOP, HousekeepingMode};
 mod unlinked_publish_gate;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
@@ -605,6 +607,9 @@ pub struct MarmotApp {
     /// account (mdk#2314 step 6). Dropped with the account's media store.
     legacy_media_migrations:
         Arc<Mutex<HashMap<String, media::legacy_migration::SharedLegacyMigration>>>,
+    /// Per-account background housekeeping mode (mdk#2923 PR P): process-local,
+    /// so it survives a worker or client reopen; a cold start is Normal.
+    housekeeping_modes: housekeeping_mode::HousekeepingModes,
     /// Closers for handles outside the storage caches; `close_storage` runs
     /// them all.
     close_registry: Arc<close_registry::CloseRegistry>,
@@ -1750,6 +1755,7 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
             legacy_media_migrations: Arc::default(),
+            housekeeping_modes: Default::default(),
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -1868,6 +1874,7 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
             legacy_media_migrations: Arc::default(),
+            housekeeping_modes: Default::default(),
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -7030,6 +7037,27 @@ impl MarmotApp {
 
     /// This process's record of the account's legacy attachment migration
     /// (mdk#2314 step 6), shared by the worker's batches and usage reads.
+    /// The account's background housekeeping mode (mdk#2923 PR P).
+    pub fn housekeeping_mode(&self, label: &str) -> HousekeepingMode {
+        self.housekeeping_modes.mode(label)
+    }
+
+    /// Sets the account's background housekeeping mode. The runtime's
+    /// `set_housekeeping_mode` resolves an account reference and wakes the
+    /// worker; this only records it.
+    pub(crate) fn set_housekeeping_mode(&self, label: &str, mode: HousekeepingMode) {
+        self.housekeeping_modes.set(label, mode);
+    }
+
+    /// The entry check held housekeeping jobs make for `label`.
+    pub(crate) fn housekeeping_gate(
+        &self,
+        label: &str,
+        telemetry: Option<marmot_observability::PerformanceRecorder>,
+    ) -> housekeeping_mode::HousekeepingGate {
+        housekeeping_mode::HousekeepingGate::new(self.housekeeping_modes.clone(), label, telemetry)
+    }
+
     pub(crate) fn legacy_media_migration(
         &self,
         label: &str,
@@ -7873,6 +7901,7 @@ impl MarmotApp {
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
+        self.housekeeping_modes.forget(label);
         // Close live bounded windows before a label can bind to another store.
         let _ = self
             .presentation_signals

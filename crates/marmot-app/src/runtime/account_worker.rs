@@ -3205,6 +3205,14 @@ fn run_legacy_message_promotion_batch(
     client: &AppClient,
     schedule: &mut LegacyMessagePromotionSchedule,
 ) -> TelemetryOutcome {
+    // Held in background housekeeping mode (mdk#2923 PR P).
+    if !client
+        .housekeeping_gate()
+        .admit(crate::housekeeping_mode::HousekeepingJob::LegacyPromotion)
+        .runs()
+    {
+        return TelemetryOutcome::Success;
+    }
     run_legacy_message_promotion_batch_with(schedule, |limit| {
         client
             .engine_storage
@@ -3934,6 +3942,15 @@ fn schedule_avatar_acquisition(
     media_http: &MediaHttpContext,
     resumed: &mut bool,
 ) -> Result<bool, AppError> {
+    // Held in background housekeeping mode (mdk#2923 PR P): a new sender's
+    // stored picture waits for the foreground or the backstop.
+    if !client
+        .housekeeping_gate()
+        .admit(crate::housekeeping_mode::HousekeepingJob::AvatarAcquisition)
+        .runs()
+    {
+        return Ok(false);
+    }
     let storage = client.app.account_storage(&client.state.label)?;
     let transport = client.blossom_http_transport.clone();
     // Unset, encrypted group images can't load; profile pictures still do.
@@ -9359,6 +9376,37 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    /// Background housekeeping mode holds legacy message promotion and avatar
+    /// acquisition at their entry, without touching storage; Normal then runs
+    /// each (mdk#2923 PR P).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_mode_holds_legacy_promotion_and_avatar_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = app.client("alice").await.unwrap();
+        let (media_http, _completions) = media_http_context(4);
+        app.set_housekeeping_mode("alice", crate::HousekeepingMode::Background);
+        let mut promotion = LegacyMessagePromotionSchedule::new();
+        let mut avatars_resumed = false;
+        assert_eq!(
+            run_legacy_message_promotion_batch(&client, &mut promotion),
+            TelemetryOutcome::Success
+        );
+        assert_eq!(promotion.status, LegacyMessagePromotionStatus::Pending);
+        assert!(!schedule_avatar_acquisition(&client, &media_http, &mut avatars_resumed).unwrap());
+        assert!(!avatars_resumed, "a held pass never resumes acquisition");
+
+        app.set_housekeeping_mode("alice", crate::HousekeepingMode::Normal);
+        run_legacy_message_promotion_batch(&client, &mut promotion);
+        assert_eq!(promotion.status, LegacyMessagePromotionStatus::Complete);
+        schedule_avatar_acquisition(&client, &media_http, &mut avatars_resumed).unwrap();
+        assert!(avatars_resumed);
     }
 
     #[test]
