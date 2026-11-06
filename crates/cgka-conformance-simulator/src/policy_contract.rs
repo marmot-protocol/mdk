@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 44] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -231,13 +231,6 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 44] = [
     ),
     decision(
         "A14",
-        ConstantInfluence::InputAcquisition,
-        VersioningRule::OperationalNonInterference,
-    ),
-    // The epoch-gap window fetch delivers more input and certifies nothing,
-    // so it changes which history arrives, never what counts as covered.
-    decision(
-        "A16",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

@@ -17,7 +17,6 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
 use futures::FutureExt;
 use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
-use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
@@ -33,12 +32,10 @@ use super::{
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
-use crate::client::recovery::AttemptGrant;
 use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
-    CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
-    CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
-    RetainedSendWake,
+    CommittedSyncProgress, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
+    PreparedGroupImageUploadStart, RetainedSendWake,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -56,88 +53,6 @@ use crate::{
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use marmot_observability::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
-
-enum ComparisonRecoveryOrigin {
-    PeriodicMaintenance,
-    PostConvergence {
-        audit_tracker_update: bool,
-    },
-    Receive {
-        audit_tracker_update: bool,
-        retry_push_registration: bool,
-    },
-}
-
-/// One owned comparison pass: its network wait off the worker, then its
-/// admission a few events per worker turn.
-struct ComparisonRecoveryJob {
-    grant: AttemptGrant,
-    execution: ComparisonExecution,
-    network: Option<ComparisonNetworkJob>,
-    admission: Option<ComparisonAdmission>,
-    /// The process credit the network task released, held through admission
-    /// and checkpoint.
-    credit: Option<Arc<OwnedSemaphorePermit>>,
-    observation: Option<marmot_observability::product_analytics::ProductObservation>,
-    backfill_armed: bool,
-    phase: Option<Observation>,
-    origin: ComparisonRecoveryOrigin,
-    /// Accepting the network result failed; settle as a failed attempt.
-    failure: Option<AppError>,
-    /// The network task ended without a result.
-    abandoned: bool,
-}
-
-impl ComparisonRecoveryJob {
-    fn new(
-        grant: AttemptGrant,
-        execution: ComparisonExecution,
-        network: ComparisonNetworkJob,
-        observation: Option<marmot_observability::product_analytics::ProductObservation>,
-        backfill_armed: bool,
-        phase: Option<Observation>,
-        origin: ComparisonRecoveryOrigin,
-    ) -> Self {
-        Self {
-            grant,
-            execution,
-            network: Some(network),
-            admission: None,
-            credit: None,
-            observation,
-            backfill_armed,
-            phase,
-            origin,
-            failure: None,
-            abandoned: false,
-        }
-    }
-}
-
-/// The initial sync can return the same frozen comparison grant to its worker
-/// while the immutable SDK request runs. The live client stays with the worker
-/// until the bounded result is admitted and the startup summary is finished.
-enum StartupSyncStep {
-    Complete(SyncSummary),
-    Network {
-        grant: Box<AttemptGrant>,
-        execution: ComparisonExecution,
-        network: ComparisonNetworkJob,
-    },
-}
-
-type StartupSyncContinuation<'a> =
-    Pin<Box<dyn Future<Output = Option<Result<SyncSummary, ClassifiedSyncFailure>>> + Send + 'a>>;
-
-enum PendingRecoveryJob {
-    Started {
-        grant: Box<AttemptGrant>,
-        execution: ComparisonExecution,
-        network: ComparisonNetworkJob,
-    },
-    /// Nothing started: no credit, nothing due, or selection failed.
-    Settled(Result<EpochBackfillRunOutcome, AppError>),
-}
 
 pub(crate) struct ManagedAccountWorker {
     pub(super) ready: bool,
@@ -858,22 +773,6 @@ pub(crate) enum AccountWorkerCommand {
     },
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
-    /// Controlled-clock fixture; changes no durable row and grants no I/O.
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    AdvanceRecoveryClock {
-        elapsed: Duration,
-        respond: oneshot::Sender<()>,
-    },
-    /// Arm a current comparison through the same serialized owner used by
-    /// production, so a fixture never writes a stale plan beside the worker.
-    #[cfg(test)]
-    RequestBoundedComparisonForTest {
-        respond: oneshot::Sender<Result<(), AppError>>,
-    },
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    RecoveryRetrySnapshot {
-        respond: oneshot::Sender<(storage_sqlite::RecoveryRetryState, Duration, bool)>,
-    },
     #[cfg(test)]
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
@@ -893,40 +792,6 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
-    /// Full-history repair runs one job in place, so it waits while the
-    /// account's worker-owned job is in flight: there is one job per account.
-    /// A catch-up only drains live input, like a delivery, so it crosses the
-    /// job instead of holding later sends and opens behind it (mdk#2110).
-    fn waits_for_recovery_job(&self) -> bool {
-        matches!(self, Self::RepairFullHistory { .. })
-    }
-
-    /// Reads that can cross a deferred full-history repair without changing the
-    /// recovery grant or the order of later mutations.
-    fn readable_during_comparison_catch_up(&self) -> bool {
-        matches!(
-            self,
-            Self::Members { .. }
-                | Self::MemberIdsPage { .. }
-                | Self::GroupMlsState { .. }
-                | Self::GroupRoster { .. }
-                | Self::QuarantinedGroups { .. }
-                | Self::GroupRecoveryStatus { .. }
-                | Self::HistoryNotices { .. }
-                | Self::AccountRecoveryStatus { .. }
-                | Self::GroupCommitDelivery { .. }
-                | Self::GroupPushDebugInfo { .. }
-                | Self::AccountDevicesActivation { .. }
-                // These read/cancel only ephemeral restore state or catalog
-                // evidence. They change no repair grant/protocol ordering.
-                | Self::CancelBackupRestore { .. }
-                | Self::BackupRestoreStatus { .. }
-                | Self::WatchBackupRestore { .. }
-                | Self::BackupHistoryAvailability { .. }
-                | Self::HistoryImportProvenance { .. }
-        )
-    }
-
     fn needs_media_slot(&self) -> bool {
         match self {
             Self::UploadPreparedGroupImage { .. }
@@ -1220,17 +1085,6 @@ async fn run_app_runtime_account_worker(
     install_storage_telemetry(&client, shared.observer.performance());
     client.runtime_telemetry = Some(shared.observer.performance().clone());
     client.recovery_credits = shared.recovery_credit_pool();
-    #[cfg(test)]
-    {
-        client.test_recovery_selection_witness = shared
-            .recovery_selection_witness
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|target| {
-                (target.account_label == account_label).then(|| target.sink.clone())
-            });
-    }
     let mut scheduled_convergence = ScheduledConvergence::with_test_delay(
         convergence_settlement_delay(&app),
         scheduled_convergence_test_delay(&app),
@@ -1438,7 +1292,7 @@ async fn run_app_runtime_account_worker(
     };
     let startup_sync_result = {
         let mut initial_sync: Pin<
-            Box<dyn Future<Output = Result<StartupSyncStep, ClassifiedSyncFailure>> + Send + '_>,
+            Box<dyn Future<Output = Result<SyncSummary, ClassifiedSyncFailure>> + Send + '_>,
         > = Box::pin(async {
             #[cfg(any(test, feature = "test-policy-overrides"))]
             if let Some(barrier) = shared.take_next_startup_sync_barrier() {
@@ -1458,57 +1312,15 @@ async fn run_app_runtime_account_worker(
             // change found here needs no separate refresh.
             client.refresh_sync_routes().map_err(state_persist)?;
             // The session's first live subscriptions, floored at the cursor,
-            // go out before any recovery grant is selected. A failed attempt
-            // has side effects, so it is startup's failure and spends no
-            // recovery reservation.
+            // go out before recovery observations are flushed. A failed
+            // attempt has side effects, so it is startup's failure.
             client
                 .activate_live_transport(Some(&startup_stage_telemetry))
                 .await?;
-            let credit =
-                recovery_credits::try_acquire_recovery_credit(&shared.recovery_credit_pool());
-            let grant = client
-                .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_some())
+            client
+                .prepare_startup_recovery(Some(&startup_stage_telemetry))
                 .await
                 .map_err(state_persist)?;
-            #[cfg(test)]
-            let activity_witness = shared
-                .comparison_activity_witness
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|(label, witness)| (label == &account_label).then(|| witness.clone()));
-            if let (Some(grant), Some(credit)) = (grant, credit) {
-                let unknown = |error| {
-                    ClassifiedSyncFailure::at_stage(
-                        SyncSummary::default(),
-                        error,
-                        SyncFailureStage::Unknown,
-                    )
-                };
-                let execution = client
-                    .begin_comparison_grant(&grant)
-                    .await
-                    .map_err(unknown)?;
-                let network = match ComparisonNetworkJob::start(
-                    &client,
-                    &grant,
-                    credit,
-                    ComparisonNetworkJob::automatic_deadline(),
-                    #[cfg(test)]
-                    activity_witness,
-                ) {
-                    Ok(network) => network,
-                    Err(error) => {
-                        let _ = client.abandon_comparison_grant(grant, execution);
-                        return Err(unknown(error));
-                    }
-                };
-                return Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Network {
-                    grant: Box::new(grant),
-                    execution,
-                    network,
-                });
-            }
             let summary = client
                 .finish_deferred_comparison_sync(Some(&publish_startup_progress))
                 .await?;
@@ -1516,7 +1328,7 @@ async fn run_app_runtime_account_worker(
                 app.finish_client_open_network_maintenance(&mut client)
                     .await;
             }
-            Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
+            Ok::<_, ClassifiedSyncFailure>(summary)
         });
         loop {
             tokio::select! {
@@ -1551,293 +1363,7 @@ async fn run_app_runtime_account_worker(
         }
         return;
     };
-    // Keep the large command/receive continuation out of the enclosing
-    // worker's async state while the frozen network request is active.
-    let mut startup_sync_result = {
-        let continuation: StartupSyncContinuation<'_> = Box::pin(async {
-            Some(match startup_sync_result {
-                Ok(StartupSyncStep::Complete(summary)) => Ok(summary),
-                Ok(StartupSyncStep::Network {
-                    grant,
-                    execution,
-                    mut network,
-                }) => {
-                    let mut startup_replay_changes = client.adapter.replay_changes().await;
-                    let completed = loop {
-                        let native_progress = match client.admit_native_turn().await {
-                            Ok(progress) => progress,
-                            Err(error) => {
-                                network.abort_and_wait().await;
-                                break Err(ClassifiedSyncFailure::at_stage(
-                                    client.take_pending_applied_sync_summary(),
-                                    error,
-                                    SyncFailureStage::Unknown,
-                                ));
-                            }
-                        };
-                        publish_client_pending_applied_summary(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                        );
-                        scheduled_runtime_group_subscription_refresh.observe_pending(
-                            client.has_pending_runtime_group_subscription_refresh(),
-                            &command_tx,
-                        );
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                        tokio::select! {
-                            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                                network.abort_and_wait().await;
-                                startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
-                                return None;
-                            }
-                            stop = &mut shutdown => {
-                                network.abort_and_wait().await;
-                                startup_explicit_shutdown = stop.is_ok();
-                                return None;
-                            }
-                            result = network.wait() => match result {
-                                Ok(value) => break Ok(value),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        target: "marmot_app::account_worker",
-                                        method = "startup_comparison",
-                                        error_kind = if error.is_panic() { "panic" } else { "cancelled" },
-                                        "comparison task ended before startup admission"
-                                    );
-                                    break Err(ClassifiedSyncFailure::at_stage(
-                                        SyncSummary::default(),
-                                        AppError::BlockingTask("startup comparison task failed".into()),
-                                        SyncFailureStage::Unknown,
-                                    ));
-                                }
-                            },
-                            received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
-                                match received {
-                                    Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
-                                        // Once claimed, finish engine ingest and projection
-                                        // without cancellation by the network completion.
-                                        let delivery_started = Instant::now();
-                                        let receive_observation = shared.observer.performance()
-                                            .observe(RuntimeOp::WorkerReceive);
-                                        let ingested = client.ingest_received_delivery_with_partial(*delivery).await;
-                                        client.drive_device_pairing().await;
-                                        match ingested {
-                                            Ok(summary) => {
-                                                receive_observation.finish(TelemetryOutcome::Success);
-                                                shared.observer.performance().record(
-                                                    AppPerformanceOperation::InboundDeliveryProjection,
-                                                    delivery_started.elapsed(), true,
-                                                );
-                                                publish_app_runtime_summary_with_v5(&client,
-                                                    &events, &account_id_hex, &account_label, &summary,
-                                                );
-                                                publish_client_pending_projection_updates(
-                                                    &mut client, &events, &account_id_hex, &account_label,
-                                                );
-                                                if client.device_unlinked() {
-                                                    // Nothing more goes out: the
-                                                    // comparison ends and the worker
-                                                    // stops (D67).
-                                                    network.abort_and_wait().await;
-                                                    return None;
-                                                }
-                                                start_post_join_history_after_visibility(
-                                                    &mut client, &summary, &events,
-                                                    &account_id_hex, &account_label,
-                                                ).await;
-                                                scheduled_runtime_group_subscription_refresh.observe_pending(
-                                                    client.has_pending_runtime_group_subscription_refresh(),
-                                                    &command_tx,
-                                                );
-                                                schedule_pending_convergence_groups(
-                                                    &mut scheduled_convergence, &mut client,
-                                                );
-                                                finish_receive_after_recovery(
-                                                    &mut client,
-                                                    ReceiveTailContext {
-                                                        events: &events,
-                                                        account_id_hex: &account_id_hex,
-                                                        account_label: &account_label,
-                                                        shared: &shared,
-                                                        scheduled_push_retry: &mut scheduled_push_retry,
-                                                        command_tx: &command_tx,
-                                                    },
-                                                    sync_summary_triggers_audit_tracker_update(&summary),
-                                                    !summary.joined_groups.is_empty(),
-                                                ).await;
-                                            }
-                                            Err(failure) => {
-                                                receive_observation.finish(TelemetryOutcome::Failure);
-                                                shared.observer.performance().record(
-                                                    AppPerformanceOperation::InboundDeliveryProjection,
-                                                    delivery_started.elapsed(), false,
-                                                );
-                                                network.abort_and_wait().await;
-                                                break Err(failure);
-                                            }
-                                        }
-                                    }
-                                    Ok(transport_nostr::AccountDeliveryReceive::Overflow(_)) => {
-                                        // receive_next_delivery persisted the loss marker.
-                                        // This in-flight comparison cannot certify it;
-                                        // the fence check below will retain the debt.
-                                        publish_app_runtime_account_error(
-                                            &events, &account_id_hex, &account_label,
-                                            "account delivery overflow recovery incomplete".to_owned(),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        network.abort_and_wait().await;
-                                        break Err(ClassifiedSyncFailure::at_stage(
-                                            SyncSummary::default(), error, SyncFailureStage::Unknown,
-                                        ));
-                                    }
-                                }
-                            }
-                            command = commands.recv() => {
-                                let Some(command) = command else {
-                                    network.abort_and_wait().await;
-                                    return None;
-                                };
-                                // Preserve the startup snapshot-read and busy-response
-                                // policy during the off-worker request. Mutations still
-                                // obey the deferred FIFO; only its head may use the
-                                // live client while the immutable network request runs.
-                                match command {
-                                    AccountWorkerCommand::GroupRecoveryStatus { group_id, respond }
-                                        if deferred.is_empty() => {
-                                        let _ = respond.send(group_recovery_after_hydration(&mut client, &group_id));
-                                    }
-                                    AccountWorkerCommand::HistoryNotices { respond }
-                                        if deferred.is_empty() => {
-                                        let _ = respond.send(client.history_notices());
-                                    }
-                                    AccountWorkerCommand::AccountRecoveryStatus { respond }
-                                        if deferred.is_empty() => {
-                                        let _ = respond.send(client.account_recovery_status());
-                                    }
-                                    AccountWorkerCommand::SendMessage {
-                                        enqueued_at, queued, group_id, payload, respond,
-                                    } if deferred.is_empty() && !client.device_unlinked() => {
-                                        send_message_on_worker(
-                                            &mut client, enqueued_at, queued, group_id, payload, respond,
-                                            &events, &account_id_hex, &account_label, &shared,
-                                            shared.observer.product().permit(),
-                                        ).await;
-                                        publish_client_pending_applied_summary(
-                                            &mut client, &events, &account_id_hex, &account_label,
-                                        );
-                                    }
-                                    other => handle_startup_sync_command(
-                                        other,
-                                        read_snapshot.as_ref(),
-                                        &mut deferred,
-                                        &mut setup_key_package_result,
-                                        &app,
-                                        &account_label,
-                                    ),
-                                }
-                            }
-                            _ = local_submission_wakeups.changed() => {
-                                local_submission_due = true;
-                            }
-                            changed = wait_for_replay_change(&mut startup_replay_changes) => {
-                                if !changed {
-                                    startup_replay_changes = None;
-                                }
-                            }
-                            () = tokio::task::yield_now(), if native_progress => {}
-                            _ = tokio::time::sleep_until(local_submission_retry_at),
-                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping()
-                                    && !client.device_unlinked() => {
-                                let retry = publish_next_local_submission(
-                                    &mut client, &app, &shared, &events,
-                                    &account_id_hex, &account_label,
-                                ).await;
-                                local_submission_due = retry.is_some();
-                                if let Some(delay) = retry {
-                                    local_submission_retry_at = TokioInstant::now() + delay;
-                                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-                                }
-                            }
-                        }
-                    };
-                    let result = match completed {
-                        Ok((credit, network_result)) => {
-                            let _credit = credit;
-                            // Startup still defers mutations, so its bounded
-                            // batch is admitted here, yielding between turns.
-                            client
-                                .admit_comparison_inline(
-                                    Some(&publish_startup_progress),
-                                    *grant,
-                                    execution,
-                                    network_result,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    ClassifiedSyncFailure::at_stage(
-                                        std::mem::take(&mut client.pending_failed_sync_summary),
-                                        error,
-                                        SyncFailureStage::Unknown,
-                                    )
-                                })
-                        }
-                        Err(failure) => {
-                            let _ = client.abandon_comparison_grant(*grant, execution);
-                            Err(failure)
-                        }
-                    };
-                    if client.device_unlinked() {
-                        return None;
-                    }
-                    // Startup is a sync: whatever the comparison admitted, it
-                    // still drains the live replay its activation started.
-                    let result = match result {
-                        Ok(
-                            EpochBackfillRunOutcome::Completed(mut summary)
-                            | EpochBackfillRunOutcome::Incomplete(mut summary),
-                        ) => client
-                            .finish_deferred_comparison_sync(Some(&publish_startup_progress))
-                            .await
-                            .map(|drained| {
-                                summary.merge(drained);
-                                summary
-                            }),
-                        Ok(
-                            EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending,
-                        ) => {
-                            client
-                                .finish_deferred_comparison_sync(Some(&publish_startup_progress))
-                                .await
-                        }
-                        Err(failure) => Err(failure),
-                    };
-                    if client.device_unlinked() {
-                        return None;
-                    }
-                    app.finish_client_open_network_maintenance(&mut client)
-                        .await;
-                    result
-                }
-                Err(failure) => Err(failure),
-            })
-        });
-        let Some(result) = continuation.await else {
-            if client.device_unlinked() {
-                stop_unlinked_worker(&mut client, unlinked).await;
-            } else if startup_explicit_shutdown {
-                client.finish_audit_recording();
-            }
-            return;
-        };
-        result
-    };
+    let mut startup_sync_result = startup_sync_result;
     // A removal the catch-up applied stops the account before anything
     // else goes out (mdk#2628 D67).
     if client.device_unlinked() {
@@ -1998,7 +1524,7 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http, false) {
+    while let Some(index) = ready_command_index(&pending, &media_http) {
         let command = pending
             .remove(index)
             .expect("selected pending command exists");
@@ -2103,7 +1629,6 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     let mut local_submission_service_owed = false;
-    let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut replay_changes = client.adapter.replay_changes().await;
     let mut admission_retry = ReplayAdmissionRetry::default();
     'worker: loop {
@@ -2131,13 +1656,8 @@ async fn run_app_runtime_account_worker(
                 .await
                 .filter(|changes| changes.has_changed().is_ok());
         }
-        // Once comparison input is known, its turn arbitrates both sources.
-        // Native-only admission is still required while network capture waits.
-        let native_progress = match if comparison_recovery
-            .as_ref()
-            .is_some_and(|job| job.network.is_none())
-            || !admission_retry.ready()
-        {
+        // Native frames admit a few per turn; a failed turn paces its retry.
+        let native_progress = match if !admission_retry.ready() {
             Ok(false)
         } else {
             admission_retry.admit_native_turn(&mut client).await
@@ -2157,162 +1677,17 @@ async fn run_app_runtime_account_worker(
         if client.device_unlinked() {
             continue 'worker;
         }
-        // A pass whose network wait ended admits its owned batch a few events
-        // per turn. The select below then serves commands and live input
-        // before the next turn.
-        if let Some(job) = comparison_recovery.as_mut()
-            && job.network.is_none()
-            && admission_retry.ready()
-        {
-            let turn = match job.admission.as_mut() {
-                Some(admission) => {
-                    client
-                        .admit_comparison_turn(&job.grant, &mut job.execution, admission)
-                        .await
-                }
-                None => Ok(true),
-            };
-            // The turn can apply this device's removal: stop before the
-            // pass settles and runs maintenance.
-            if client.device_unlinked() {
-                continue 'worker;
-            }
-            if turn.is_ok()
-                && let Some(admission) = job.admission.as_mut()
-            {
-                // Each recovered delivery has committed its projection. Do not
-                // withhold this turn's plaintext until the whole batch settles.
-                let summary = admission.take_committed_summary();
-                publish_app_runtime_summary_with_v5(
-                    &client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    &summary,
-                );
-                start_post_join_history_after_visibility(
-                    &mut client,
-                    &summary,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                )
-                .await;
-            }
-            if turn.is_err() {
-                // Mixed admission can fail on a native frame too. Pace its
-                // retained input even after the failed comparison is settled.
-                admission_retry.failed();
-                client.yield_failed_native_turn();
-            } else if job
-                .admission
-                .as_ref()
-                .is_some_and(|admission| admission.progressed)
-            {
-                admission_retry.reset();
-            }
-            if !matches!(turn, Ok(false)) {
-                let mut job = comparison_recovery
-                    .take()
-                    .expect("settling comparison exists");
-                let result = match (turn, job.failure) {
-                    (Err(error), _) | (_, Some(error)) => Err(client.fail_comparison_grant(
-                        job.grant,
-                        job.execution,
-                        job.admission.as_mut(),
-                        error,
-                    )),
-                    _ if job.abandoned => client.abandon_comparison_grant(job.grant, job.execution),
-                    _ => {
-                        client
-                            .finish_comparison_grant(job.grant, job.execution, job.admission)
-                            .await
-                    }
-                };
-                drop(job.credit);
-                let _ = report_pending_epoch_backfill_result(
-                    &mut client,
-                    result,
-                    job.backfill_armed,
-                    job.observation,
-                    EpochBackfillReportContext {
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                    },
-                )
-                .await;
-                // A settled pass is where recovery parks or completes.
-                publish_account_level_changes(
-                    &mut client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                );
-                match job.origin {
-                    ComparisonRecoveryOrigin::PeriodicMaintenance => {
-                        finish_periodic_maintenance_after_recovery(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            &shared,
-                            &product_backlog,
-                            &mut scheduled_convergence,
-                        )
-                        .await;
-                        let step = shared
-                            .observer
-                            .performance()
-                            .observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
-                        dispatch_history_blobs(&mut client, &media_http);
-                        step.finish(TelemetryOutcome::Success);
-                    }
-                    ComparisonRecoveryOrigin::PostConvergence {
-                        audit_tracker_update,
-                    } => {
-                        if audit_tracker_update {
-                            shared.schedule_audit_log_tracker_update("scheduled_convergence");
-                        }
-                    }
-                    ComparisonRecoveryOrigin::Receive {
-                        audit_tracker_update,
-                        retry_push_registration,
-                    } => {
-                        finish_receive_after_recovery(
-                            &mut client,
-                            ReceiveTailContext {
-                                events: &events,
-                                account_id_hex: &account_id_hex,
-                                account_label: &account_label,
-                                shared: &shared,
-                                scheduled_push_retry: &mut scheduled_push_retry,
-                                command_tx: &command_tx,
-                            },
-                            audit_tracker_update,
-                            retry_push_registration,
-                        )
-                        .await;
-                    }
-                }
-                if let Some(phase) = job.phase {
-                    phase.finish(TelemetryOutcome::Success);
-                }
-                continue 'worker;
-            }
-        }
-        // One recovery runner turn per pass of the loop, as comparison
-        // admission gets one above, so ready commands and live input never
-        // starve the runner (or a credit its quantum holds). What it admits
-        // publishes below.
+        // One recovery runner turn per pass of the loop, as native admission
+        // gets one above, so ready commands and live input never starve the
+        // runner (or a credit its quantum holds). What it admits publishes
+        // below.
         if !client.has_pending_effect_projections()
             && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
         {
             turn.serve(&mut client).await;
         }
-        // Unified admission may have advanced native frames as well as the
-        // comparison prefix. Publish their committed effects before live input.
+        // Native and runner admission may have advanced frames. Publish their
+        // committed effects before live input.
         let admitted = client.take_pending_applied_sync_summary();
         let native_received = client.take_native_receive_need();
         publish_app_runtime_summary_with_v5(
@@ -2339,10 +1714,8 @@ async fn run_app_runtime_account_worker(
             .await;
             // Native-owned live group frames have the same recovery follow-up
             // as ordinary receives, including frames with no visible summary.
-            let recovery_started = start_receive_recovery(
+            let _ = refresh_recovery_at_seam(
                 &mut client,
-                &mut comparison_recovery,
-                &admitted,
                 EpochBackfillReportContext {
                     events: &events,
                     account_id_hex: &account_id_hex,
@@ -2351,24 +1724,22 @@ async fn run_app_runtime_account_worker(
                 },
             )
             .await;
-            if !recovery_started {
-                let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&admitted);
-                let retry_push_registration = !admitted.joined_groups.is_empty();
-                finish_receive_after_recovery(
-                    &mut client,
-                    ReceiveTailContext {
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                        scheduled_push_retry: &mut scheduled_push_retry,
-                        command_tx: &command_tx,
-                    },
-                    audit_tracker_update,
-                    retry_push_registration,
-                )
-                .await;
-            }
+            let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&admitted);
+            let retry_push_registration = !admitted.joined_groups.is_empty();
+            finish_receive_after_recovery(
+                &mut client,
+                ReceiveTailContext {
+                    events: &events,
+                    account_id_hex: &account_id_hex,
+                    account_label: &account_label,
+                    shared: &shared,
+                    scheduled_push_retry: &mut scheduled_push_retry,
+                    command_tx: &command_tx,
+                },
+                audit_tracker_update,
+                retry_push_registration,
+            )
+            .await;
         }
         scheduled_runtime_group_subscription_refresh.observe_pending(
             client.has_pending_runtime_group_subscription_refresh(),
@@ -2386,8 +1757,7 @@ async fn run_app_runtime_account_worker(
                 &group_id,
             );
         }
-        let ready_command =
-            ready_command_index(&pending, &media_http, comparison_recovery.is_some());
+        let ready_command = ready_command_index(&pending, &media_http);
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2408,52 +1778,6 @@ async fn run_app_runtime_account_worker(
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
-            }
-            completed = async {
-                comparison_recovery
-                    .as_mut()
-                    .and_then(|job| job.network.as_mut())
-                    .expect("comparison network task exists")
-                    .wait()
-                    .await
-            }, if comparison_recovery.as_ref().is_some_and(|job| job.network.is_some()) => {
-                let job = comparison_recovery.as_mut().expect("completed comparison task exists");
-                job.network = None;
-                match completed {
-                    Ok((credit, network)) => {
-                        #[cfg(test)]
-                        shared
-                            .comparison_test_trace
-                            .lock()
-                            .unwrap()
-                            .extend(network.outcome_kinds_for_test());
-                        // The task owned this permit until its future really
-                        // ended; keep it through owner admission/checkpoint.
-                        job.credit = Some(credit);
-                        match client
-                            .accept_comparison_network(&job.grant, &mut job.execution, network)
-                            .await
-                        {
-                            Ok(admission) => job.admission = admission,
-                            Err(error) => job.failure = Some(error),
-                        }
-                    }
-                    Err(error) => {
-                        #[cfg(test)]
-                        shared
-                            .comparison_test_trace
-                            .lock()
-                            .unwrap()
-                            .push("task_join_error");
-                        tracing::warn!(
-                            target: "marmot_app::account_worker",
-                            method = "comparison_recovery",
-                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
-                            "comparison task ended before worker admission"
-                        );
-                        job.abandoned = true;
-                    }
-                }
             }
             recovered = async {
                 let recovery = welcome_recovery
@@ -2537,27 +1861,15 @@ async fn run_app_runtime_account_worker(
             // nonempty command channel must not starve group convergence.
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
-                    Some(command) => Some((command, true)),
-                    None => commands.recv().await.map(|command| (command, false)),
+                    Some(command) => Some(command),
+                    None => commands.recv().await,
                 }
             }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = true;
                 match command {
-                    Some((command, approved_pending)) => {
+                    Some(command) => {
                         #[cfg(test)]
                         tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
-                        // ready_command_index has already approved pending work
-                        // before the CatchUp barrier. Apply this extra gate only
-                        // to fresh channel arrivals, or the earlier work would
-                        // be requeued behind CatchUp after capacity returns.
-                        if comparison_recovery.is_some() && !approved_pending
-                            && (command.waits_for_recovery_job()
-                                || (pending.iter().any(AccountWorkerCommand::waits_for_recovery_job)
-                                    && !command.readable_during_comparison_catch_up()))
-                        {
-                            pending.push_back(command);
-                            continue;
-                        }
                         let command = match command {
                             AccountWorkerCommand::Drain { respond } => {
                                 if let Some(recovery) = &mut welcome_recovery {
@@ -2683,7 +1995,7 @@ async fn run_app_runtime_account_worker(
                     lifecycle.subscribe_shutdown(),
                 ).boxed().shared();
                 let yield_observation = secondary_retry_yield.clone();
-                let mut phase = Some(shared.observer.performance().observe(RuntimeOp::WorkerConvergence));
+                let phase = shared.observer.performance().observe(RuntimeOp::WorkerConvergence);
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
                 // Mutations retain worker FIFO order; reads use the snapshot.
@@ -2760,46 +2072,8 @@ async fn run_app_runtime_account_worker(
                                             &mut client,
                                         );
                                         let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
-                                        // An existing comparison owns the one
-                                        // account lease. Keep this local pass
-                                        // complete and let that job settle the
-                                        // still-durable recovery debt.
-                                        let backfill_armed = client.has_pending_epoch_backfill();
-                                        let observation = backfill_armed.then(|| shared.observer.product().begin(
-                                            crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
-                                        )).flatten();
-                                        let backfill_result = if comparison_recovery.is_some() {
-                                            Ok(EpochBackfillRunOutcome::Deferred)
-                                        } else {
-                                            match start_pending_recovery_job(
-                                                &mut client,
-                                                &shared,
-                                                EpochBackfillExecutionSeam::Maintenance,
-                                            ).await {
-                                                PendingRecoveryJob::Started {
-                                                    grant, execution, network,
-                                                } => {
-                                                    comparison_recovery = Some(ComparisonRecoveryJob::new(
-                                                        *grant,
-                                                        execution,
-                                                        network,
-                                                        observation,
-                                                        backfill_armed,
-                                                        Some(phase.take().expect("scheduled phase exists")),
-                                                        ComparisonRecoveryOrigin::PostConvergence {
-                                                            audit_tracker_update,
-                                                        },
-                                                    ));
-                                                    return;
-                                                }
-                                                PendingRecoveryJob::Settled(result) => result,
-                                            }
-                                        };
-                                        let _ = report_pending_epoch_backfill_result(
+                                        let _ = refresh_recovery_at_seam(
                                             &mut client,
-                                            backfill_result,
-                                            backfill_armed,
-                                            observation,
                                             EpochBackfillReportContext {
                                                 events: &events,
                                                 account_id_hex: &account_id_hex,
@@ -2859,9 +2133,7 @@ async fn run_app_runtime_account_worker(
                 #[cfg(test)]
                 tests::secondary_retry_scheduler_tests::pass_tail(&account_id_hex).await;
 
-                if let Some(phase) = phase {
-                    phase.finish(TelemetryOutcome::Success);
-                }
+                phase.finish(TelemetryOutcome::Success);
             }
             changed = wait_for_replay_change(&mut replay_changes) => {
                 if !changed {
@@ -2975,19 +2247,15 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                             &mut client,
                         );
-                        if start_receive_recovery(
+                        let _ = refresh_recovery_at_seam(
                             &mut client,
-                            &mut comparison_recovery,
-                            &summary,
                             EpochBackfillReportContext {
                                 events: &events,
                                 account_id_hex: &account_id_hex,
                                 account_label: &account_label,
                                 shared: &shared,
                             },
-                        ).await {
-                            continue 'worker;
-                        }
+                        ).await;
                         let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
                         let retry_push_registration = !summary.joined_groups.is_empty();
                         finish_receive_after_recovery(
@@ -3120,18 +2388,6 @@ async fn run_app_runtime_account_worker(
                                     install_storage_telemetry(&reopened, shared.observer.performance());
                                     reopened.runtime_telemetry = Some(shared.observer.performance().clone());
                                     reopened.recovery_credits = shared.recovery_credit_pool();
-                                    #[cfg(test)]
-                                    {
-                                        reopened.test_recovery_selection_witness = shared
-                                            .recovery_selection_witness
-                                            .lock()
-                                            .unwrap()
-                                            .as_ref()
-                                            .and_then(|target| {
-                                                (target.account_label == account_label)
-                                                    .then(|| target.sink.clone())
-                                            });
-                                    }
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
                                     // eagerly here — the steady-state loop
@@ -3335,11 +2591,11 @@ async fn run_app_runtime_account_worker(
                     }
                 };
             }
-            // A comparison batch still being admitted takes its next turn as
-            // soon as commands and live input have had theirs, instead of
-            // waiting for unrelated input while it holds its recovery credit.
+            // Native input still being admitted takes its next turn as soon as
+            // commands and live input have had theirs, instead of waiting for
+            // unrelated input; a paced retry wakes the loop when it is due.
             () = admission_retry.wait() => { continue 'worker; }
-            _ = tokio::task::yield_now(), if admission_retry.ready() && (native_progress || comparison_recovery.as_ref().is_some_and(|job| job.network.is_none() && job.admission.as_ref().is_some_and(|admission| admission.progressed))) => {
+            _ = tokio::task::yield_now(), if admission_retry.ready() && native_progress => {
                 continue 'worker;
             }
             _ = maintenance_tick.tick() => {
@@ -3353,9 +2609,6 @@ async fn run_app_runtime_account_worker(
                 // shutdown is requested rather than starting work the drain
                 // would then have to wait out.
                 if lifecycle.is_stopping() {
-                    continue 'worker;
-                }
-                if comparison_recovery.is_some() {
                     continue 'worker;
                 }
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
@@ -3497,52 +2750,20 @@ async fn run_app_runtime_account_worker(
                     &command_tx,
                 );
                 let step = telemetry.observe(RuntimeOp::WorkerMaintenanceRecovery);
-                let backfill_armed = client.has_pending_epoch_backfill();
-                let observation = backfill_armed.then(|| shared.observer.product().begin(
-                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
-                )).flatten();
-                let backfill_result = match start_pending_recovery_job(
+                let selection = match refresh_recovery_at_seam(
                     &mut client,
-                    &shared,
-                    EpochBackfillExecutionSeam::Maintenance,
-                )
-                .await
-                {
-                    PendingRecoveryJob::Started {
-                        grant,
-                        execution,
-                        network,
-                    } => {
-                        step.finish(TelemetryOutcome::Success);
-                        comparison_recovery = Some(ComparisonRecoveryJob::new(
-                            *grant,
-                            execution,
-                            network,
-                            observation,
-                            backfill_armed,
-                            Some(phase),
-                            ComparisonRecoveryOrigin::PeriodicMaintenance,
-                        ));
-                        continue 'worker;
-                    }
-                    PendingRecoveryJob::Settled(result) => result,
-                };
-                let selection = if backfill_result.is_ok() {
-                    TelemetryOutcome::Success
-                } else {
-                    TelemetryOutcome::Failure
-                };
-                let _ = report_pending_epoch_backfill_result(
-                    &mut client,
-                    backfill_result, backfill_armed,
-                    observation,
                     EpochBackfillReportContext {
                         events: &events,
                         account_id_hex: &account_id_hex,
                         account_label: &account_label,
                         shared: &shared,
                     },
-                ).await;
+                )
+                .await
+                {
+                    Ok(()) => TelemetryOutcome::Success,
+                    Err(_) => TelemetryOutcome::Failure,
+                };
                 step.finish(selection);
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
@@ -3566,11 +2787,6 @@ async fn run_app_runtime_account_worker(
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
     drop(recovery_runner);
-    // An admission in progress keeps its durable prefix; its debt waits for
-    // the next session.
-    if let Some(network) = comparison_recovery.and_then(|job| job.network) {
-        network.abort_and_wait().await;
-    }
 }
 
 /// Wait for coalesced source changes, including same-generation progress.
@@ -3582,110 +2798,13 @@ async fn wait_for_replay_change(changes: &mut Option<watch::Receiver<u64>>) -> b
     }
 }
 
-/// Select one owner grant and start its job: begin on the worker, then its
-/// immutable SDK request off the worker. Without a process credit nothing is
-/// selected, so the durable demand waits without spending a reservation.
-async fn start_pending_recovery_job(
+/// Flush recovery observations at a worker seam (receive, convergence or
+/// maintenance) and report the outcome. The recovery runner owns every history
+/// fetch (mdk#2660 phase 4), so a seam only records what is owed.
+async fn refresh_recovery_at_seam(
     client: &mut AppClient,
-    shared: &RuntimeSharedServices,
-    seam: EpochBackfillExecutionSeam,
-) -> PendingRecoveryJob {
-    #[cfg(test)]
-    let trace = |kind: &'static str| shared.comparison_test_trace.lock().unwrap().push(kind);
-    let Some(credit) =
-        recovery_credits::try_acquire_recovery_credit(&shared.recovery_credit_pool())
-    else {
-        #[cfg(test)]
-        trace("credit_unavailable");
-        return PendingRecoveryJob::Settled(client.recovery_pending().map(|pending| {
-            if pending {
-                EpochBackfillRunOutcome::Deferred
-            } else {
-                EpochBackfillRunOutcome::NotPending
-            }
-        }));
-    };
-    let grant = match client.select_pending_epoch_backfill(seam).await {
-        Ok(crate::client::PendingRecoverySelection::Grant(grant)) => *grant,
-        Ok(crate::client::PendingRecoverySelection::Deferred) => {
-            #[cfg(test)]
-            trace("selection_deferred");
-            return PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::Deferred));
-        }
-        Ok(crate::client::PendingRecoverySelection::NotPending) => {
-            #[cfg(test)]
-            trace("selection_empty");
-            return PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::NotPending));
-        }
-        Err(error) => {
-            #[cfg(test)]
-            trace(match &error {
-                AppError::Storage(cgka_traits::storage::StorageError::Serialization(message))
-                    if message == "invalid recovery comparison" =>
-                {
-                    "selection_invalid_comparison"
-                }
-                AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => {
-                    "selection_storage_serialization"
-                }
-                AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => {
-                    "selection_storage_busy"
-                }
-                AppError::Storage(_) => "selection_storage_other",
-                AppError::Transport(_) => "selection_transport_error",
-                AppError::Sqlite(_) => "selection_sqlite_error",
-                _ => "selection_other_error",
-            });
-            return PendingRecoveryJob::Settled(Err(error));
-        }
-    };
-    let execution = match client.begin_comparison_grant(&grant).await {
-        Ok(execution) => execution,
-        Err(error) => {
-            #[cfg(test)]
-            trace("begin_error");
-            return PendingRecoveryJob::Settled(Err(error));
-        }
-    };
-    match ComparisonNetworkJob::start(
-        client,
-        &grant,
-        credit,
-        ComparisonNetworkJob::automatic_deadline(),
-        #[cfg(test)]
-        shared
-            .comparison_activity_witness
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|(label, witness)| (label == &client.state.label).then(|| witness.clone())),
-    ) {
-        Ok(network) => {
-            #[cfg(test)]
-            trace("task_started");
-            PendingRecoveryJob::Started {
-                grant: Box::new(grant),
-                execution,
-                network,
-            }
-        }
-        Err(error) => {
-            #[cfg(test)]
-            trace("task_start_error");
-            let _ = client.abandon_comparison_grant(grant, execution);
-            PendingRecoveryJob::Settled(Err(error))
-        }
-    }
-}
-
-/// Dispatch the existing Receive recovery follow-up for either ingress lane.
-/// A running job keeps the one grant; only its settlement resumes its tail.
-async fn start_receive_recovery(
-    client: &mut AppClient,
-    comparison_recovery: &mut Option<ComparisonRecoveryJob>,
-    summary: &SyncSummary,
     context: EpochBackfillReportContext<'_>,
-) -> bool {
+) -> Result<(), AccountCatchUpFailure> {
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
@@ -3696,49 +2815,11 @@ async fn start_receive_recovery(
             )
         })
         .flatten();
-    let result = if comparison_recovery.is_some() {
-        PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::Deferred))
-    } else {
-        start_pending_recovery_job(client, context.shared, EpochBackfillExecutionSeam::Receive)
-            .await
-    };
-    match result {
-        PendingRecoveryJob::Started {
-            grant,
-            execution,
-            network,
-        } => {
-            *comparison_recovery = Some(ComparisonRecoveryJob::new(
-                *grant,
-                execution,
-                network,
-                observation,
-                backfill_armed,
-                None,
-                ComparisonRecoveryOrigin::Receive {
-                    audit_tracker_update: sync_summary_triggers_audit_tracker_update(summary),
-                    retry_push_registration: !summary.joined_groups.is_empty(),
-                },
-            ));
-            true
-        }
-        PendingRecoveryJob::Settled(result) => {
-            let _ = report_pending_epoch_backfill_result(
-                client,
-                result,
-                backfill_armed,
-                observation,
-                context,
-            )
-            .await;
-            false
-        }
-    }
+    let result = client.refresh_pending_recovery().await;
+    report_pending_epoch_backfill_result(result, backfill_armed, observation, context)
 }
 
-/// Keep the domain maintenance continuation after the recovery outcome. A
-/// suspended network comparison resumes this same tail when its worker-owned
-/// admission and checkpoint finish.
+/// Keep the domain maintenance continuation after the recovery outcome.
 async fn finish_periodic_maintenance_after_recovery(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -4554,19 +3635,6 @@ async fn handle_startup_hydration_command(
                     .await;
             }
         }
-        #[cfg(any(test, feature = "test-policy-overrides"))]
-        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => {
-            let storage = client.app.account_storage(&client.state.label).unwrap();
-            let _ = respond.send((
-                storage.app_storage().recovery_retry_state().unwrap(),
-                client.recovery_owner.test_retry_remaining(&storage),
-                storage
-                    .app_storage()
-                    .recovery_comparison()
-                    .unwrap()
-                    .pending(),
-            ));
-        }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
             let count = client.runtime.session().unhydrated_group_ids().len();
@@ -4966,23 +4034,12 @@ fn spawn_media_http<T>(
 fn ready_command_index(
     pending: &VecDeque<AccountWorkerCommand>,
     media_http: &MediaHttpContext,
-    comparison_waiting: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
-    let deferred_catch_up = comparison_waiting
-        .then(|| {
-            pending
-                .iter()
-                .position(AccountWorkerCommand::waits_for_recovery_job)
-        })
-        .flatten();
-    pending.iter().enumerate().position(|(index, command)| {
-        (!comparison_waiting
-            || (deferred_catch_up.is_none_or(|barrier| index < barrier)
-                || command.readable_during_comparison_catch_up()))
-            && (has_capacity || !command.needs_media_slot())
-    })
+    pending
+        .iter()
+        .position(|command| has_capacity || !command.needs_media_slot())
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
@@ -5288,19 +4345,6 @@ async fn complete_media_http(
     drop(permit);
 }
 
-/// Closed command channel for handlers that never serve concurrent commands
-/// (unit tests that call `handle_account_worker_command` directly). Startup
-/// deferred replay uses the live worker queue instead.
-#[cfg(test)]
-fn unused_account_worker_command_io() -> (
-    mpsc::Receiver<AccountWorkerCommand>,
-    VecDeque<AccountWorkerCommand>,
-) {
-    let (tx, rx) = mpsc::channel(1);
-    drop(tx);
-    (rx, VecDeque::new())
-}
-
 fn capture_group_read_snapshot(
     client: &AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -5564,31 +4608,6 @@ fn account_worker_command_future<'a>(
                 move |result| MediaHttpCompletion::GroupImage { result, respond },
             );
             false
-        }),
-        #[cfg(any(test, feature = "test-policy-overrides"))]
-        AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
-            client.recovery_owner.test_advance_clock(elapsed);
-            let _ = respond.send(());
-            true
-        }),
-        #[cfg(test)]
-        AccountWorkerCommand::RequestBoundedComparisonForTest { respond } => Box::pin(async move {
-            let _ = respond.send(client.request_bounded_comparison());
-            true
-        }),
-        #[cfg(any(test, feature = "test-policy-overrides"))]
-        AccountWorkerCommand::RecoveryRetrySnapshot { respond } => Box::pin(async move {
-            let storage = client.app.account_storage(&client.state.label).unwrap();
-            let _ = respond.send((
-                storage.app_storage().recovery_retry_state().unwrap(),
-                client.recovery_owner.test_retry_remaining(&storage),
-                storage
-                    .app_storage()
-                    .recovery_comparison()
-                    .unwrap()
-                    .pending(),
-            ));
-            true
         }),
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => Box::pin(async move {
@@ -8450,41 +7469,6 @@ impl KeyPackageMaintenanceCatchUpOutcome {
     }
 }
 
-#[cfg(test)]
-async fn run_pending_epoch_backfill_reporting_arm(
-    client: &mut AppClient,
-    events: &broadcast::Sender<MarmotAppEvent>,
-    account_id_hex: &str,
-    account_label: &str,
-    shared: &RuntimeSharedServices,
-    seam: EpochBackfillExecutionSeam,
-) -> Result<(), AccountCatchUpFailure> {
-    let backfill_armed = client.has_pending_epoch_backfill();
-    let observation = backfill_armed
-        .then(|| {
-            shared.observer.product().begin(
-                crate::ProductFamily::Recovery,
-                "backfill",
-                crate::ProductUnit::Attempt,
-            )
-        })
-        .flatten();
-    let backfill_result = client.run_pending_epoch_backfill(seam).await;
-    report_pending_epoch_backfill_result(
-        client,
-        backfill_result,
-        backfill_armed,
-        observation,
-        EpochBackfillReportContext {
-            events,
-            account_id_hex,
-            account_label,
-            shared,
-        },
-    )
-    .await
-}
-
 struct EpochBackfillReportContext<'a> {
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -8492,9 +7476,9 @@ struct EpochBackfillReportContext<'a> {
     shared: &'a RuntimeSharedServices,
 }
 
-/// Report the completed comparison without repeating its published turn prefixes.
-async fn report_pending_epoch_backfill_result(
-    client: &mut AppClient,
+/// Report a recovery seam's outcome: product analytics, an account error for a
+/// failure, and the audit tracker when epoch-gap debt was armed.
+fn report_pending_epoch_backfill_result(
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
     observation: Option<marmot_observability::product_analytics::ProductObservation>,
@@ -8508,39 +7492,12 @@ async fn report_pending_epoch_backfill_result(
     } = context;
     if let Some(observation) = observation {
         observation.finish(match &backfill_result {
-            Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
-            Ok(EpochBackfillRunOutcome::Incomplete(_)) => "partial",
             Ok(EpochBackfillRunOutcome::Deferred) => "deferred",
             Ok(EpochBackfillRunOutcome::NotPending) => "no_work_due",
             Err(_) => "failure",
         });
     }
     let result = match backfill_result {
-        // An incomplete replay published the same real summary: it ingested
-        // whatever it reached before the relays failed to confirm they had
-        // served the account's stored history. Its intent stays pending, so the
-        // next seam retries it; nothing here needs to report a worker failure.
-        Ok(
-            EpochBackfillRunOutcome::Completed(summary)
-            | EpochBackfillRunOutcome::Incomplete(summary),
-        ) => {
-            publish_app_runtime_summary_with_v5(
-                client,
-                events,
-                account_id_hex,
-                account_label,
-                &summary,
-            );
-            start_post_join_history_after_visibility(
-                client,
-                &summary,
-                events,
-                account_id_hex,
-                account_label,
-            )
-            .await;
-            Ok(())
-        }
         Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => Ok(()),
         Err(error) => {
             let message = account_error_message("epoch-gap backfill failed", &error);
@@ -8550,9 +7507,9 @@ async fn report_pending_epoch_backfill_result(
                 account_label,
                 message.clone(),
             );
-            // run_pending_epoch_backfill returns only AppError, after several
-            // distinct sync boundaries. Preserve its typed broad cause but do
-            // not derive a stage from that cause.
+            // refresh_pending_recovery returns only AppError, after several
+            // distinct storage and relay boundaries. Preserve its typed broad
+            // cause but do not derive a stage from that cause.
             Err(AccountCatchUpFailure::new(
                 message,
                 SyncFailureClassification::new(SyncFailureStage::Unknown, error.sync_error_class()),
@@ -9047,21 +8004,14 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(feature = "test-policy-overrides")]
-    mod integrated_recovery_acceptance_tests;
-    #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;
     mod publication_progress_tests;
-    #[cfg(feature = "test-policy-overrides")]
-    mod receive_comparison_resume_tests;
     mod recovery_runner_host_tests;
     mod refused_subscription_send_tests;
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
-    mod worker_comparison_resume_tests;
     mod worker_recovery_resume_tests;
-    #[cfg(feature = "test-policy-overrides")]
-    mod worker_wait_attribution_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -9101,12 +8051,9 @@ mod tests {
 
     use marmot_account::AccountHome;
 
+    use crate::MarmotApp;
     use crate::client::epoch_stall::BackfillDecision;
-    use crate::tests::{
-        ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-    };
-    use crate::{AuditLogSettings, MarmotApp};
-    use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
+    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 
     fn setup_state(kind: AccountSetupKind, phase: AccountSetupPhase) -> AccountSetupState {
         AccountSetupState {
@@ -9359,9 +8306,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-policy-overrides")]
     async fn due_convergence_interleaves_with_a_backlog_of_worker_commands() {
-        // This fixture owns the retained comparison owner contract, independently
-        // of the runner-owned production default.
-
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let alice = home.create_account("alice").unwrap();
@@ -9375,7 +8319,6 @@ mod tests {
                 .with_dev_scheduled_convergence_delay_ms(60_000)
                 .with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
-        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
@@ -9437,10 +8380,7 @@ mod tests {
             .unwrap()
             .shutdown()
             .await;
-        // Lost history remains independent of the runnable local passes. The
-        // account already owes the cooldown reserved by catch-up.
-        let retry = app.recovery_retry_state().unwrap();
-        let activations = relay.subscription_count();
+        // Lost history remains independent of the runnable local passes.
         app.record_account_delivery_loss("bob", 771, 1, crate::unix_now_seconds())
             .unwrap();
         let first_pass = Arc::new(tokio::sync::Barrier::new(2));
@@ -9501,22 +8441,6 @@ mod tests {
         })
         .await
         .expect("recovery must not starve the queued commands");
-        assert_eq!(
-            app.recovery_retry_state().unwrap(),
-            retry,
-            "both actual scheduled convergence passes preserve history retry cost"
-        );
-        assert_eq!(
-            relay.subscription_count(),
-            activations,
-            "post-convergence and maintenance cannot bypass the owner cooldown"
-        );
-        assert!(
-            app.pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|d| d.cause == storage_sqlite::RecoveryCause::QueueLoss)
-        );
         runtime.drain_in_flight_work().await.unwrap();
         runtime.shutdown_and_close().await.unwrap();
     }
@@ -10519,894 +9443,6 @@ mod tests {
         assert!(!message.contains("private-relay.example"), "{message}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_epoch_backfill_records_correlated_qualified_and_incomplete_attempts() {
-        for qualified in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            AccountHome::open(dir.path())
-                .create_account("alice")
-                .unwrap();
-            let relay = Arc::new(ScriptedPushRelayClient::default());
-            let app = MarmotApp::with_relay_and_config(
-                dir.path(),
-                "wss://relay.example".to_owned(),
-                bounded_epoch_backfill_config(),
-            )
-            .with_recovery_runner_ownership_for_test(false)
-            .with_test_relay_client(relay.clone());
-            app.set_audit_log_settings(AuditLogSettings { enabled: true })
-                .unwrap();
-            let mut client = client_on_app_relay_plane(&app, "alice").await;
-            let group_id = client
-                .create_group("successful epoch backfill audit", &[])
-                .await
-                .unwrap();
-            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-            client.apply_backfill_decision(
-                &group_id,
-                stalled_epoch,
-                BackfillDecision::Arm,
-                EpochStallBackfillTrigger::UndecryptableThreshold,
-            );
-
-            if qualified {
-                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
-            }
-            let (events, _subscriber) = broadcast::channel(4);
-            let shared = RuntimeSharedServices::default();
-            run_pending_epoch_backfill_reporting_arm(
-                &mut client,
-                &events,
-                "account-id",
-                "alice",
-                &shared,
-                EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .unwrap();
-
-            let rows: Vec<serde_json::Value> = app
-                .audit_log_files()
-                .unwrap()
-                .into_iter()
-                .flat_map(|file| {
-                    std::fs::read_to_string(file.path)
-                        .unwrap()
-                        .lines()
-                        .map(|line| {
-                            marmot_forensics::v5::Record::from_json(line.as_bytes())
-                                .expect("real v5 recovery row");
-                            serde_json::from_str(line).unwrap()
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let attempt_id = rows
-                .iter()
-                .find(|row| row["event"]["type"] == "epoch_stall_backfill_started")
-                .and_then(|row| row["event"]["record_context"]["operation_ref"].as_str())
-                .expect("owner attempt must carry operation_ref");
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
-                    .count(),
-                1
-            );
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_completed")
-                    .count(),
-                usize::from(qualified)
-            );
-            assert!(
-                rows.iter()
-                    .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
-                    .count()
-                    == usize::from(!qualified)
-            );
-            assert!(rows.iter().all(|row| {
-                !matches!(
-                    row["event"]["type"].as_str(),
-                    Some(
-                        "epoch_stall_backfill_started"
-                            | "epoch_stall_backfill_completed"
-                            | "epoch_stall_backfill_failed"
-                    )
-                ) || row["event"]["record_context"]["operation_ref"].as_str() == Some(attempt_id)
-            }));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_epoch_backfill_failure_is_reported_retained_and_coalesced() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(AuditLogSettings { enabled: true })
-            .unwrap();
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("failed epoch backfill audit", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-
-        let (events, mut subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        // The job fails while it takes ownership of its network result.
-        let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
-        let grant = client
-            .authorize_account_recovery(
-                Some(&mut permit),
-                EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .unwrap()
-            .expect("the armed gap is granted");
-        client.released_backfill_reload_pending = true;
-        client.fail_next_released_backfill_reload = true;
-        let result = client.run_recovery_grant_for_test(grant).await;
-        let error = report_pending_epoch_backfill_result(
-            &mut client,
-            result,
-            true,
-            None,
-            EpochBackfillReportContext {
-                events: &events,
-                account_id_hex: "account-id",
-                account_label: "alice",
-                shared: &shared,
-            },
-        )
-        .await
-        .expect_err("a failed job must be returned");
-
-        assert_eq!(error.to_string(), "epoch-gap backfill failed: storage_busy");
-        assert!(client.has_pending_epoch_backfill());
-        let failed_rows: Vec<serde_json::Value> = app
-            .audit_log_files()
-            .unwrap()
-            .into_iter()
-            .flat_map(|file| {
-                std::fs::read_to_string(file.path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| {
-                        marmot_forensics::v5::Record::from_json(line.as_bytes())
-                            .expect("real v5 recovery row");
-                        serde_json::from_str::<serde_json::Value>(line).unwrap()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
-            .collect();
-        assert_eq!(failed_rows.len(), 1);
-        assert_eq!(
-            failed_rows[0]["event"]["error_kind"].as_str(),
-            Some("storage_busy")
-        );
-        assert!(matches!(
-            subscriber.try_recv().unwrap(),
-            MarmotAppEvent::AccountError(RuntimeAccountError { message, .. })
-                if message == "epoch-gap backfill failed: storage_busy"
-        ));
-
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .unwrap();
-        assert!(client.has_pending_epoch_backfill());
-        let subscriptions_after_retry = relay.subscription_count();
-        let retry = app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .recovery_retry_state()
-            .unwrap();
-        assert_eq!(retry.attempt_serial, 2);
-
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::Maintenance,
-        )
-        .await
-        .unwrap();
-        assert_eq!(relay.subscription_count(), subscriptions_after_retry);
-        assert_eq!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap(),
-            retry
-        );
-    }
-
-    /// The Phase-A workload: epoch and overflow join one owner reservation;
-    /// a later receive seam cannot bypass the durable account cooldown.
-    #[cfg(feature = "test-policy-overrides")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recovery_owner_coalesces_overflow_and_epoch_demand_across_seams() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group = client
-            .create_group("ownership baseline", &[])
-            .await
-            .unwrap();
-        let epoch = client.group_mls_state(&group).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group,
-            epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        app.account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .mark_account_delivery_recovery("alice", 7, 1)
-            .unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(7);
-        let (events, _subscriber) = broadcast::channel(16);
-        let shared = RuntimeSharedServices::default();
-        client
-            .sync_with_stage_telemetry(
-                Some(shared.observer.performance()),
-                crate::client::SyncMode::Startup,
-            )
-            .await
-            .unwrap();
-        for (seam, reason) in [
-            (
-                EpochBackfillExecutionSeam::Maintenance,
-                "startup joined compatible epoch, incremental and overflow demand in one attempt",
-            ),
-            (
-                EpochBackfillExecutionSeam::Receive,
-                "receive cannot bypass the account owner cooldown",
-            ),
-        ] {
-            run_pending_epoch_backfill_reporting_arm(
-                &mut client,
-                &events,
-                "account-id",
-                "alice",
-                &shared,
-                seam,
-            )
-            .await
-            .unwrap();
-            let retry = app
-                .account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap();
-            assert_eq!(retry.attempt_serial, 1, "{reason}");
-            assert_eq!(retry.not_before_ms - retry.recorded_at_ms, 300_000);
-        }
-        let retry = app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .recovery_retry_state()
-            .unwrap();
-        client
-            .advance_convergence_after_runtime_sync(&group)
-            .await
-            .unwrap();
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &shared,
-            EpochBackfillExecutionSeam::Maintenance,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap(),
-            retry
-        );
-        client
-            .sync_with_classified_partial_progress()
-            .await
-            .unwrap();
-        assert_eq!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap()
-                .attempt_serial,
-            2
-        );
-        assert!(client.has_pending_epoch_backfill());
-        assert!(client.delivery_overflow_recovery_pending);
-        assert_eq!(
-            app.relay_plane
-                .relay_health()
-                .await
-                .account_delivery_recovery_attempts,
-            2,
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn incomplete_delivery_overflow_recovery_does_not_fail_catch_up() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let marker_token = 7;
-        app.account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .mark_account_delivery_recovery("alice", marker_token, 1)
-            .unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(marker_token);
-
-        let (events, _subscriber) = broadcast::channel(4);
-        run_pending_epoch_backfill_reporting_arm(
-            &mut client,
-            &events,
-            "account-id",
-            "alice",
-            &RuntimeSharedServices::default(),
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .expect("an unproven pass is incomplete recovery, not a catch-up failure");
-
-        assert!(client.delivery_overflow_recovery_pending);
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some(),
-            "incomplete recovery must retain its durable retry marker"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn catch_up_leaves_prearmed_backfill_to_the_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay.clone());
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("explicit catch-up epoch backfill", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-
-        let before = relay.unfloored_account_subscription_count();
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        let (command_tx, mut commands) = mpsc::channel(1);
-        let mut pending = VecDeque::new();
-        let context = AccountWorkerCatchUpContext {
-            app: &app,
-            events: &events,
-            shared: &shared,
-            account_id_hex: "account-id",
-            account_label: "alice",
-        };
-        let (respond, response) = oneshot::channel();
-
-        handle_account_worker_catch_up(&mut client, respond, &mut commands, &mut pending, context)
-            .await;
-
-        response.await.unwrap().unwrap();
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "a draining catch-up leaves the backfill to the owner's paced job",
-        );
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            before,
-            "catch-up never replays unfloored history"
-        );
-        assert_eq!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap()
-                .attempt_serial,
-            0,
-            "catch-up reserves no recovery work (mdk#2110)"
-        );
-        drop(command_tx);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn catch_up_succeeds_with_an_unavailable_backfill_intent() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_recovery_runner_ownership_for_test(false)
-            .with_test_relay_client(relay.clone());
-        let mut client = app.client("alice").await.unwrap();
-        let group_id = client
-            .create_group("deferred explicit catch-up", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let storage = app.account_storage("alice").unwrap();
-        let mut orphan = client.runtime.group_record(&group_id).unwrap();
-        orphan.id = test_group_id(0xde);
-        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
-        storage
-            .app_storage()
-            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(orphan.id.as_slice()),
-                stalled_epoch: 1,
-            }])
-            .unwrap();
-        let subscriptions_before = relay.subscription_count();
-
-        let (events, _subscriber) = broadcast::channel(4);
-        let shared = RuntimeSharedServices::default();
-        let (command_tx, mut commands) = mpsc::channel(1);
-        let mut pending = VecDeque::new();
-        let context = AccountWorkerCatchUpContext {
-            app: &app,
-            events: &events,
-            shared: &shared,
-            account_id_hex: "account-id",
-            account_label: "alice",
-        };
-        let (respond, response) = oneshot::channel();
-
-        handle_account_worker_catch_up(&mut client, respond, &mut commands, &mut pending, context)
-            .await;
-
-        response
-            .await
-            .unwrap()
-            .expect("the completed ordinary catch-up remains successful");
-        assert_eq!(
-            relay.subscription_count(),
-            subscriptions_before,
-            "catch-up reuses the live subscriptions; its job installs none"
-        );
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "the unavailable recovery intent must remain pending"
-        );
-        // The catch-up ran no job, so the owner's first pass runs one and
-        // cannot complete the unavailable intent. Its retry pacing then defers
-        // the next pass, which must stay distinct from no pending work.
-        let first = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect("the owner's pass over an unavailable intent must not fail");
-        assert!(
-            matches!(first, EpochBackfillRunOutcome::Incomplete(_)),
-            "an unavailable intent cannot complete: {first:?}"
-        );
-        let outcome = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect("rechecking a deferred intent must not fail");
-        assert!(
-            matches!(outcome, EpochBackfillRunOutcome::Deferred),
-            "deferred work must remain distinct from no pending work: {outcome:?}"
-        );
-        drop(command_tx);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
-        for qualified in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            AccountHome::open(dir.path())
-                .create_account("alice")
-                .unwrap();
-            let relay = Arc::new(ScriptedPushRelayClient::default());
-            let app = MarmotApp::with_relay_and_config(
-                dir.path(),
-                "wss://relay.example".to_owned(),
-                bounded_epoch_backfill_config(),
-            )
-            .with_recovery_runner_ownership_for_test(false)
-            .with_test_relay_client(relay.clone());
-            let mut client = client_on_app_relay_plane(&app, "alice").await;
-            let group_id = client
-                .create_group("full-history epoch backfill", &[])
-                .await
-                .unwrap();
-            let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-            client.apply_backfill_decision(
-                &group_id,
-                stalled_epoch,
-                BackfillDecision::Arm,
-                EpochStallBackfillTrigger::UndecryptableThreshold,
-            );
-            if qualified {
-                client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
-            }
-            let subscriptions_before_repair = relay.subscription_count();
-
-            let (events, _subscriber) = broadcast::channel(4);
-            let shared = RuntimeSharedServices::default();
-            let (respond, response) = oneshot::channel();
-            let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
-            let (media_http_worker_lifetime, _) = watch::channel(());
-            let media_http = MediaHttpContext {
-                product: Default::default(),
-                tx: media_http_tx,
-                permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
-                history_blobs: HistoryBlobFlights::default(),
-                backup_background_conditions: watch::channel(
-                    crate::runtime::BackupBackgroundConditions::default(),
-                )
-                .0,
-                worker_lifetime: media_http_worker_lifetime,
-            };
-            let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
-            let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
-            handle_account_worker_command(
-                &mut client,
-                AccountWorkerCommand::RepairFullHistory { respond },
-                AccountWorkerCommandContext {
-                    commands: &mut unused_commands,
-                    pending: &mut unused_pending,
-                    app: &app,
-                    events: &events,
-                    account_id_hex: "account-id",
-                    account_label: "alice",
-                    shared: &shared,
-                    media_http: &media_http,
-                    scheduled_convergence: &mut scheduled_convergence,
-                    recovery_runner: None,
-                },
-            )
-            .await;
-
-            let result = response.await.unwrap();
-            if qualified {
-                result.unwrap();
-                assert!(!client.has_pending_epoch_backfill());
-            } else {
-                let failure = result.unwrap_err();
-                assert!(
-                    failure
-                        .to_string()
-                        .contains("full_history_coverage_unproven"),
-                    "{failure}"
-                );
-                assert!(client.has_pending_epoch_backfill());
-            }
-            assert_eq!(
-                app.account_storage("alice")
-                    .unwrap()
-                    .app_storage()
-                    .recovery_retry_state()
-                    .unwrap()
-                    .attempt_serial,
-                1
-            );
-            assert_eq!(
-                relay.subscription_count(),
-                subscriptions_before_repair,
-                "one comparison job serves the coalesced demands and installs no subscription",
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_history_repair_resolves_overflow_after_prearmed_backfill() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("combined full-history repair", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let marker_token = 7;
-        app.account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .mark_account_delivery_recovery("alice", marker_token, 1)
-            .unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(marker_token);
-
-        client
-            .repair_full_history()
-            .await
-            .expect_err("an unproven pass cannot complete either recovery predicate");
-
-        assert!(client.has_pending_epoch_backfill());
-        assert!(client.delivery_overflow_recovery_pending);
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some(),
-            "unproven coverage must preserve the durable overflow marker",
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn explicit_full_history_repair_retains_incomplete_overflow_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let marker_token = 7;
-        app.account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .mark_account_delivery_recovery("alice", marker_token, 1)
-            .unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(marker_token);
-
-        let failure = client
-            .repair_full_history()
-            .await
-            .expect_err("an uncertified pass cannot resolve the durable delivery gap");
-
-        assert_eq!(
-            failure.classification().failure_stage,
-            SyncFailureStage::RelayReceive
-        );
-        assert!(
-            failure.source.privacy_safe_kind() == "account_delivery_queue_overflow",
-            "the public failure must identify the unresolved durable gap",
-        );
-        assert!(
-            matches!(
-                failure.source,
-                AppError::FullHistoryRepairIncomplete {
-                    reason: crate::FullHistoryRepairIncompleteReason::CoverageUnproven,
-                    delivery_loss_pending: true,
-                }
-            ),
-            "the stop reason and independent loss fact must both survive: {:?}",
-            failure.source
-        );
-        assert!(
-            client.delivery_overflow_recovery_pending,
-            "an unconfirmed recovery must remain armed",
-        );
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some(),
-            "an unconfirmed recovery must retain its durable marker",
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_history_repair_falls_back_when_every_pending_intent_defers() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay.clone());
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("deferred full-history repair", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let storage = app.account_storage("alice").unwrap();
-        let mut orphan = client.runtime.group_record(&group_id).unwrap();
-        orphan.id = test_group_id(0xde);
-        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
-        storage
-            .app_storage()
-            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(orphan.id.as_slice()),
-                stalled_epoch: 1,
-            }])
-            .unwrap();
-        let subscriptions_before = relay.subscription_count();
-
-        client
-            .repair_full_history()
-            .await
-            .expect_err("one owner attempt retains unproven and unresolved history");
-
-        assert_eq!(
-            relay.subscription_count(),
-            subscriptions_before,
-            "the fallback repair compares every route and installs no subscription"
-        );
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "the deferred audit intent must remain retryable"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_history_repair_coalesces_new_demand_after_an_inflight_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example",
-            bounded_epoch_backfill_config(),
-        )
-        .with_recovery_runner_ownership_for_test(false)
-        .with_test_relay_client(relay.clone());
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_a = client.create_group("demand a", &[]).await.unwrap();
-        let group_b = client.create_group("demand b", &[]).await.unwrap();
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        client.apply_backfill_decision(
-            &group_a,
-            client.group_mls_state(&group_a).unwrap().epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        let grant = client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap()
-            .unwrap();
-        client.apply_backfill_decision(
-            &group_b,
-            client.group_mls_state(&group_b).unwrap().epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        // The job fails while it takes ownership of its network result.
-        client.released_backfill_reload_pending = true;
-        client.fail_next_released_backfill_reload = true;
-        assert!(client.run_recovery_grant_for_test(grant).await.is_err());
-        let before = relay.unfloored_account_subscription_count();
-        let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
-        assert!(
-            client
-                .repair_full_history()
-                .await
-                .unwrap_err()
-                .source
-                .to_string()
-                .contains("full_history_coverage_unproven")
-        );
-        assert_eq!(relay.unfloored_account_subscription_count(), before);
-        assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
-            attempts + 1
-        );
-        assert_eq!(
-            storage.pending_epoch_backfill_intents().unwrap().len(),
-            2,
-            "both independent gap predicates remain incomplete after the shared uncertified pass"
-        );
-    }
-
     #[test]
     fn a_summary_escalation_reaches_subscribers_as_one_typed_event() {
         // The escalation rides the sync summary that observed it, so every worker
@@ -12135,146 +10171,5 @@ mod tests {
             Some(&(CONVERGENCE_UNSETTLED_MAX_REARMS + 1))
         );
         assert_eq!(scheduled.retry_attempts.get(&group_id), Some(&1));
-    }
-    #[cfg(feature = "test-policy-overrides")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_history_repair_serves_snapshot_reads_and_stops_at_checkpoint() {
-        for caller_cancels in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            AccountHome::open(dir.path())
-                .create_account("alice")
-                .unwrap();
-            AccountHome::open(dir.path()).create_account("bob").unwrap();
-            let relay = Arc::new(ScriptedPushRelayClient::default());
-            let app = MarmotApp::with_relay_and_config(
-                dir.path(),
-                "wss://relay.example".to_owned(),
-                bounded_epoch_backfill_config(),
-            )
-            .with_recovery_runner_ownership_for_test(false)
-            .with_test_relay_client(relay.clone());
-            let mut client = client_on_app_relay_plane(&app, "alice").await;
-            // Hold the repair's comparison in flight until its caller stops it.
-            client.test_comparison_results =
-                Some(crate::client::ScriptedComparisons::by_route(|_| Ok(None)));
-            client.test_comparison_delay = Some(Duration::from_secs(30));
-            let mut bob = client_on_app_relay_plane(&app, "bob").await;
-            let bob_id = cgka_traits::MemberId::new(
-                hex::decode(app.account_home().account("bob").unwrap().account_id_hex).unwrap(),
-            );
-            let bob_before = relay.inbox_subscription_count(&bob_id);
-            let before = relay.subscription_count();
-            let (events, _subscriber) = broadcast::channel(4);
-            let shared = RuntimeSharedServices::default();
-            let (respond, mut response) = oneshot::channel();
-            let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
-            let (worker_lifetime, _) = watch::channel(());
-            let media_http = MediaHttpContext {
-                product: Default::default(),
-                tx: media_http_tx,
-                permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
-                prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
-                history_blobs: HistoryBlobFlights::default(),
-                backup_background_conditions: watch::channel(
-                    crate::runtime::BackupBackgroundConditions::default(),
-                )
-                .0,
-                worker_lifetime,
-            };
-            let (command_tx, mut commands) = mpsc::channel(4);
-            let mut pending = VecDeque::new();
-            let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
-            let handler = handle_account_worker_command(
-                &mut client,
-                AccountWorkerCommand::RepairFullHistory { respond },
-                AccountWorkerCommandContext {
-                    commands: &mut commands,
-                    pending: &mut pending,
-                    app: &app,
-                    events: &events,
-                    account_id_hex: "account-id",
-                    account_label: "alice",
-                    shared: &shared,
-                    media_http: &media_http,
-                    scheduled_convergence: &mut scheduled_convergence,
-                    recovery_runner: None,
-                },
-            );
-            let observer = async {
-                let (respond, read) = oneshot::channel();
-                command_tx
-                    .send(AccountWorkerCommand::QuarantinedGroups { respond })
-                    .await
-                    .unwrap();
-                assert!(
-                    tokio::time::timeout(Duration::from_secs(1), read)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap()
-                        .is_empty()
-                );
-                assert!(matches!(
-                    response.try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-                // Another account uses its own worker catch-up path while
-                // Alice's comparison is still in flight.
-                let (bob_tx, mut bob_commands) = mpsc::channel(1);
-                let mut bob_pending = VecDeque::new();
-                let (bob_respond, bob_response) = oneshot::channel();
-                handle_account_worker_catch_up(
-                    &mut bob,
-                    bob_respond,
-                    &mut bob_commands,
-                    &mut bob_pending,
-                    AccountWorkerCatchUpContext {
-                        app: &app,
-                        events: &events,
-                        account_id_hex: "bob-id",
-                        account_label: "bob",
-                        shared: &shared,
-                    },
-                )
-                .await;
-                bob_response.await.unwrap().unwrap();
-                assert_eq!(
-                    relay.inbox_subscription_count(&bob_id),
-                    bob_before,
-                    "Bob's catch-up reuses his live activation"
-                );
-                drop(bob_tx);
-                if caller_cancels {
-                    drop(response);
-                } else {
-                    shared.lifecycle().begin_shutdown();
-                    let failure = response.await.unwrap().unwrap_err();
-                    assert_eq!(
-                        failure.classification().failure_stage,
-                        crate::SyncFailureStage::RelayReceive
-                    );
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(2), async {
-                tokio::join!(handler, observer);
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                relay.subscription_count(),
-                before,
-                "neither Alice's repair nor Bob's catch-up installs a subscription"
-            );
-            assert_eq!(
-                app.account_storage("bob")
-                    .unwrap()
-                    .app_storage()
-                    .recovery_retry_state()
-                    .unwrap()
-                    .attempt_serial,
-                0,
-                "Bob's catch-up only drains; it reserves no recovery work"
-            );
-        }
     }
 }

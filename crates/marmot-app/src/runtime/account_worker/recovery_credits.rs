@@ -1,6 +1,6 @@
-//! The process-wide pool of recovery credits. Every recovery job reserves one
-//! before it spends a durable attempt, and keeps it through admission and
-//! checkpoint. The worker never waits for one; an explicit caller may.
+//! The process-wide pool of recovery credits. Each recovery runner quantum
+//! waits for one and holds it while it fetches, stages and settles, so at most
+//! two accounts fetch history at once.
 
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -32,13 +32,6 @@ pub(crate) fn private_recovery_credit_pool_for_test() -> Arc<RecoveryCreditPool>
     Arc::new(RecoveryCreditPool::new())
 }
 
-pub(crate) fn try_acquire_recovery_credit(
-    pool: &Arc<RecoveryCreditPool>,
-) -> Option<OwnedSemaphorePermit> {
-    pool.semaphore.clone().try_acquire_owned().ok()
-}
-
-/// An explicit caller waits for its credit instead of deferring.
 pub(crate) async fn acquire_recovery_credit(
     pool: &Arc<RecoveryCreditPool>,
 ) -> OwnedSemaphorePermit {

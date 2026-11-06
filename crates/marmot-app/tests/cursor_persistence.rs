@@ -7,7 +7,7 @@
 //!
 //! # Harness shape
 //!
-//! Mirrors `since_floor.rs`: one account per store (`bob`, the account under
+//! One account per store (`bob`, the account under
 //! test, has his own store; `alice` — who only creates the group and sends
 //! messages — gets a second, independent store pointed at the same relay; two
 //! accounts in one store would share the relay-plane router, a documented

@@ -1,4 +1,5 @@
-//! Cross-account storage isolation and committed-deletion timing boundaries.
+//! The local send submission queue: cross-account storage isolation, committed-deletion timing
+//! boundaries, and durable sends to a group still waiting for hydration.
 
 use super::*;
 use cgka_traits::storage::StorageProvider;
@@ -231,4 +232,175 @@ async fn failed_permanent_removal_preserves_live_row_timing_then_committed_remov
         Err(AccountHomeError::UnknownAccount(_))
     ));
     runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A send to a group still waiting for startup hydration stays queued, reaches
+/// no relay before its safety work, survives a terminal close, and publishes
+/// once after the restored worker hydrates the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() {
+    use nostr_relay_builder::prelude::{
+        EventId, Filter as RelayFilter, Kind as RelayKind, MemoryDatabase, MemoryDatabaseOptions,
+        NostrDatabase,
+    };
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(64),
+    });
+    let relay = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("unhydrated")
+        .unwrap();
+    let normal = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let group = {
+        let fixture = MarmotApp::with_relay_and_config(dir.path(), url.clone(), normal.clone());
+        let mut client = fixture.client(&account.label).await.unwrap();
+        client
+            .create_group("only unhydrated group", &[])
+            .await
+            .unwrap()
+    };
+    let held = normal
+        .clone()
+        .with_dev_startup_hydration_batch_delay_ms(30_000);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), held);
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime
+                .app_performance_snapshot()
+                .runtime_operations
+                .iter()
+                .any(|snapshot| {
+                    snapshot.operation == RuntimeOp::WorkerHydration && snapshot.in_flight == 1
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the sole stored group enters the held unhydrated pipeline");
+    let before = database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<std::collections::HashSet<_>>();
+    let token = "unhydrated-durable-token";
+    let content = "send after hydration is safe";
+    let accepted = runtime
+        .submit_text(&account.label, &group, content.into(), token.into())
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        runtime
+            .local_send_status(&account.label, &group, token)
+            .unwrap(),
+        Some(crate::LocalSendStatus::Queued)
+    ));
+    assert_eq!(
+        app.account_storage(&account.label)
+            .unwrap()
+            .app_storage()
+            .local_submission(&hex::encode(&group), token)
+            .unwrap()
+            .unwrap()
+            .state,
+        0
+    );
+    let after = database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        after, before,
+        "unhydrated sends cannot reach transport before required safety work"
+    );
+    assert_eq!(
+        runtime
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        0
+    );
+    timeout(Duration::from_secs(2), runtime.shutdown_and_close())
+        .await
+        .expect("terminal close interrupts the thirty-second hydration hold")
+        .unwrap();
+    drop(runtime);
+    drop(app);
+    let restored = MarmotApp::with_relay_and_config(dir.path(), url, normal);
+    let restarted = crate::MarmotAppRuntime::new(restored.clone());
+    restarted.reconcile_accounts().await.unwrap();
+    let repeated = restarted
+        .submit_text(&account.label, &group, content.into(), token.into())
+        .await
+        .unwrap();
+    assert_eq!(repeated.message_id_hex, accepted.message_id_hex);
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = restarted
+                .local_send_status(&account.label, &group, token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("one restored send publishes after real group hydration");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
+    assert_eq!(published.message_ids, vec![accepted.message_id_hex.clone()]);
+    let source = restored
+        .account_storage(&account.label)
+        .unwrap()
+        .app_storage()
+        .timeline_message(&hex::encode(&group), &accepted.message_id_hex)
+        .unwrap()
+        .unwrap()
+        .source_message_id_hex
+        .unwrap();
+    assert!(
+        database
+            .event_by_id(&EventId::from_hex(&source).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        restored
+            .messages(&account.label)
+            .unwrap()
+            .iter()
+            .filter(|message| message.plaintext == content)
+            .count(),
+        1
+    );
+    assert_eq!(
+        restarted
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        0
+    );
+    restarted.shutdown_and_close().await.unwrap();
+    relay.shutdown();
 }

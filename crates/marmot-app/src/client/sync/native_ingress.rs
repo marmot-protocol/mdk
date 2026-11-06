@@ -1,16 +1,18 @@
 //! Bounded admission of native replay, owned by the account recovery owner.
 //!
 //! The batch keeps each frame until ordinary ingest finishes. It contributes
-//! neither comparison coverage nor loss acknowledgments; those remain with
-//! the existing recovery grant and checkpoint machinery.
+//! neither coverage nor loss acknowledgments; those remain with the recovery
+//! runner and the checkpoint machinery.
 
 use cgka_traits::{GroupId, TransportEnvelope};
 use transport_nostr_adapter::ReplayBatchTake;
 
-use super::comparison_job::MAX_COMPARISON_ADMISSION_PER_TURN;
 use crate::AppError;
 use crate::client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS;
 use crate::client::{AppClient, AppPerformanceOperation};
+
+/// Native frames one worker turn admits before commands and live input run.
+pub(crate) const MAX_NATIVE_ADMISSION_PER_TURN: usize = 4;
 
 pub(super) enum NativeFrontier {
     Ready,
@@ -81,7 +83,7 @@ impl AppClient {
     pub(crate) async fn admit_native_turn(&mut self) -> Result<bool, AppError> {
         let mut progressed = false;
         let mut inventory = super::InventoryBatch::default();
-        for _ in 0..MAX_COMPARISON_ADMISSION_PER_TURN {
+        for _ in 0..MAX_NATIVE_ADMISSION_PER_TURN {
             // An unlinked account admits nothing more (mdk#2628 D67).
             if self.device_unlinked
                 || !matches!(self.take_native_batch(None).await, NativeFrontier::Ready)

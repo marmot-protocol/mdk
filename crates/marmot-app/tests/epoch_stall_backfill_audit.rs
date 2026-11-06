@@ -361,8 +361,7 @@ impl StalledGroup {
     /// until its quiescence window closes. The account worker drives that second
     /// step; a direct client must call `retry_group_convergence` itself.
     ///
-    /// Awaits bob's observable epoch rather than a fixed wait, the shape
-    /// `wait_for_inbound_delivered` in `since_floor.rs` uses: each pass re-drains,
+    /// Awaits bob's observable epoch rather than a fixed wait: each pass re-drains,
     /// re-drives convergence, and reads the epoch, so the loop returns as soon as
     /// the fold lands instead of one whole `EPOCH_ADVANCE_POLL_INTERVAL` late.
     async fn advance_bobs_epoch(&mut self, name: &str) {

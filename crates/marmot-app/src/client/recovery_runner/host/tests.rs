@@ -23,7 +23,9 @@ use super::{
 use crate::client::AppClient;
 use crate::client::audit_recovery::recorded_v5_rows;
 use crate::client::history_notices::park_recovery_for_test;
-use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture};
+use crate::client::recovery_coverage::scenario_tests::{
+    Fixture, clear_coverage_goals, fault_connection, fixture,
+};
 use crate::unix_now_seconds;
 
 const HOUR: u64 = 60 * 60;
@@ -280,6 +282,7 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
         Some(Duration::from_secs(120)),
     )
     .await;
+    clear_coverage_goals(&client);
     let app = client.app.clone();
     let ledger = storage.app_storage();
     let route = client
@@ -922,11 +925,7 @@ async fn unreadable_welcome_metadata_never_widens_the_goal() {
     .await;
     let ledger = storage.app_storage();
     let route = group_routes(&client).pop().unwrap();
-    // Account-owned native ranges now create goals immediately. This fixture
-    // starts the route-goal preparation contract with no prior goal.
-    fault_connection(&client)
-        .execute("DELETE FROM account_recovery_coverage_goals", [])
-        .unwrap();
+    clear_coverage_goals(&client);
     assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
     let welcome_at = unix_now_seconds() - 60 * 60;
     let mut record = storage.get_group(&group).unwrap();
@@ -1038,26 +1037,6 @@ async fn a_stopped_runner_settles_the_quantum_it_preempted() {
     runner.stop(&mut client).await;
     assert_eq!(charged(&storage), before, "the preempted quantum settled");
     hold.release.notify_waiters();
-}
-
-/// A second connection to the account's database, only to inject write
-/// faults.
-fn fault_connection(client: &AppClient) -> rusqlite::Connection {
-    let app = &client.app;
-    let label = &client.state.label;
-    let path = app.account_storage_path(label);
-    let keys = app.account_home().load_signing_keys(label).unwrap();
-    let key = app
-        .sqlcipher_key(label, &keys, &path, crate::SqlcipherDatabaseKind::Session)
-        .unwrap();
-    let connection = rusqlite::Connection::open(path).unwrap();
-    storage_sqlite::open_hardened_sqlcipher(
-        &connection,
-        &key,
-        storage_sqlite::SqlCipherHardening::cipher_only(),
-    )
-    .unwrap();
-    connection
 }
 
 /// Fresh epoch-gap evidence must create durable work even if the route was

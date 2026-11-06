@@ -2200,23 +2200,12 @@ impl MarmotApp {
             test_after_checkpoint_save: None,
             #[cfg(test)]
             test_replay_sync_gate: None,
-            #[cfg(test)]
-            test_recovery_selection_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
             audit,
-            #[cfg(test)]
-            test_recovery_evidence: None,
-            #[cfg(test)]
-            test_comparison_results: None,
-            #[cfg(test)]
-            test_comparison_delay: None,
             #[cfg(all(test, feature = "unreleased-device-pairing"))]
             test_fail_roster_read: false,
-            #[cfg(test)]
-            test_comparison_saved_cursor: None,
             recovery_owner,
-            epoch_gap_windows: Default::default(),
             // Unit tests run many directly owned clients in one process; each
             // gets its own pool so one test's held job cannot stall another.
             #[cfg(not(test))]
@@ -2287,10 +2276,7 @@ impl MarmotApp {
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
-            explicit_history_window_certified: false,
-            recovery_job_network_cut: false,
             live_coverage: tokio::sync::Mutex::new(live_coverage),
-            recovery_job_admission_expired: false,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             stale_commit_acknowledgements: std::collections::HashMap::new(),

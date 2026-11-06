@@ -346,12 +346,6 @@ pub(crate) struct OrdinaryDeliveryDropTarget {
     pub(crate) event_id: [u8; 32],
 }
 
-#[cfg(test)]
-pub(crate) struct RecoverySelectionWitnessTarget {
-    pub(crate) account_label: String,
-    pub(crate) sink: Arc<StdMutex<Vec<crate::client::TestRecoverySelection>>>,
-}
-
 /// Result of awaiting one existing or newly admitted due background backup pass.
 /// A finished attempt may have failed and does not prove pointer publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,13 +373,6 @@ pub struct RuntimeSharedServices {
     /// Every production runtime points at the same process capacity. The
     /// indirection permits explicit isolation of capacity-sensitive fixtures.
     recovery_credits: Arc<StdMutex<Arc<account_worker::recovery_credits::RecoveryCreditPool>>>,
-    #[cfg(test)]
-    pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
-    #[cfg(test)]
-    pub(crate) comparison_activity_witness:
-        Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
-    #[cfg(test)]
-    pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     /// One exact ordinary SDK delivery may be omitted before worker ingest.
     #[cfg(test)]
     pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
@@ -503,12 +490,6 @@ impl Default for RuntimeSharedServices {
                 account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
-            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
-            #[cfg(test)]
-            comparison_activity_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
@@ -614,12 +595,6 @@ impl RuntimeSharedServices {
             recovery_credits: Arc::new(StdMutex::new(
                 account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
-            #[cfg(test)]
-            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
-            #[cfg(test)]
-            comparison_activity_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_selection_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -1756,33 +1731,6 @@ impl MarmotAppRuntime {
 
     pub fn accounts(&self) -> AccountManager {
         self.accounts.clone()
-    }
-
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    #[doc(hidden)]
-    pub async fn advance_recovery_clock_for_test(&self, account: &str, elapsed: Duration) {
-        let commands = self.accounts.worker_commands(account).await.unwrap();
-        let (respond, response) = oneshot::channel();
-        commands
-            .send(AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond })
-            .await
-            .unwrap();
-        response.await.unwrap();
-    }
-
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    #[doc(hidden)]
-    pub async fn recovery_retry_snapshot_for_test(
-        &self,
-        account: &str,
-    ) -> (storage_sqlite::RecoveryRetryState, Duration, bool) {
-        let commands = self.accounts.worker_commands(account).await.unwrap();
-        let (respond, response) = oneshot::channel();
-        commands
-            .send(AccountWorkerCommand::RecoveryRetrySnapshot { respond })
-            .await
-            .unwrap();
-        response.await.unwrap()
     }
 
     pub fn shared_services(&self) -> RuntimeSharedServices {

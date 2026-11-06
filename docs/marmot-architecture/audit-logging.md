@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-11-02
+updated: 2026-11-06
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -251,7 +251,9 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `epoch_stall_backfill_deferred`, `epoch_stall_backfill_failed`, `epoch_stall_backfill_started`,
 `group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
-`sync_drain`, and `transport_received`. The v5-only recovery kinds are written up under
+`sync_drain`, and `transport_received`. `epoch_stall_backfill_started`, `epoch_stall_backfill_completed` and
+`epoch_stall_backfill_failed` are historical: the backfill bracket that wrote them went with the old recovery
+owner (#2660 phase 4). The v5-only recovery kinds are written up under
 [Account recovery owner rows](#account-recovery-owner-rows-v5-only), the v5-only refusal row under
 [`subscription_refused`](#subscription_refused-v5-only), and the runner's pause row under
 [`recovery_runner_paused`](#recovery_runner_paused-v5-only).
@@ -970,6 +972,11 @@ processing outcomes, and the owner's reassessment. Rows are transitions at the s
 scheduler polls, and recording never blocks or fails a recovery step: an audit-only storage read that fails skips the
 row.
 
+`recovery_attempt_started`, `recovery_attempt_finished` and `recovery_obligation_reassessed` are historical. The old
+owner's grant wrote them; it was deleted in #2660 phase 4, and with the recovery runner on by default since PR 5g no
+production build had written them since. Readers keep decoding them for older logs. A runner pass is not yet
+represented beyond [`recovery_runner_paused`](#recovery_runner_paused-v5-only).
+
 Producers live in [`client/audit_recovery.rs`](../../crates/marmot-app/src/client/audit_recovery.rs); storage reports
 the transitions ([`account_recovery/observe.rs`](../../crates/storage-sqlite/src/account_recovery/observe.rs)).
 
@@ -1026,14 +1033,15 @@ Notes:
 - Unchanged writes record nothing: a duplicate request, or late loss the dismissal already retired.
 - Epoch-gap arms keep their [`epoch_stall_backfill_armed`](#epoch_stall_backfill_armed) row; an epoch gap's goal is
   unbounded because the missing commit's time is unknown. Maintenance boundaries and known events have no request
-  row; their obligations appear on attempt and reassessment rows.
-- Waiting for capacity or capability and parking are owner verdicts on an attempt, recorded by
+  row; in older logs their obligations appear on attempt and reassessment rows.
+- In older logs, waiting for capacity or capability and parking are owner verdicts on an attempt, recorded by
   [`recovery_obligation_reassessed`](#recovery_obligation_reassessed); pacing cooldown is not a transition and writes no
   row.
 
 #### `recovery_attempt_started`
 
-The owner started one reserved attempt with a frozen plan. Account-scoped.
+Historical: no current build writes this row (see above). The owner started one reserved attempt with a frozen plan.
+Account-scoped.
 
 | Field | Meaning |
 | --- | --- |
@@ -1048,12 +1056,14 @@ The owner started one reserved attempt with a frozen plan. Account-scoped.
 | `window_since_secs` / `window_until_secs` | Frozen comparison window over every route. |
 | `route_cap`, `admission_per_turn`, `quantum_ms`, `park_after_quiet_passes` | Budgets in force in this build: routes per pass, events admitted per worker turn, the automatic pass's network quantum, and quiet passes before an obligation parks. |
 
-Recorded at `begin_recovery_execution`, the bracket every comparison-job pass opens, whatever its cause or caller.
+Was recorded at `begin_recovery_execution`, the bracket every comparison-job pass opened, whatever its cause or
+caller.
 
 #### `recovery_attempt_finished`
 
-One finished pass of a started attempt. Account-scoped; recorded on every exit of the bracket
-(`finish_recovery_execution`), before loss and cursor settlement, which have their own rows.
+Historical: no current build writes this row (see above). One finished pass of a started attempt. Account-scoped;
+was recorded on every exit of the bracket (`finish_recovery_execution`), before loss and cursor settlement, which have
+their own rows.
 
 | Field | Meaning |
 | --- | --- |
@@ -1120,9 +1130,9 @@ Notes:
 
 #### `recovery_obligation_reassessed`
 
-The owner's verdict on one obligation after a pass it settled, read back from storage after the checkpoint committed.
-Group-scoped demand carries `group_ref`. At most 16 rows per pass; the finished row's `obligation_count` is exact. A
-pass that stopped before settlement writes none.
+Historical: no current build writes this row (see above). The owner's verdict on one obligation after a pass it
+settled, read back from storage after the checkpoint committed. Group-scoped demand carries `group_ref`. At most 16
+rows per pass; the finished row's `obligation_count` is exact. A pass that stopped before settlement wrote none.
 
 | Field | Meaning |
 | --- | --- |
@@ -1755,10 +1765,10 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Why did a fork/convergence decision happen? | `snapshot_created`, `fork_resolution`, `convergence_decision`, `peeler_outcome`, `auto_commit_decision`, and message-state invalidation rows. |
 | Which app-level state changed outside core membership/profile/admin deltas? | Observed/local `human_action` rows cover message retention, encrypted-media endpoints, avatar URL/image updates, and profile/admin projection deltas. |
 | What recovery debt did this device take on, and how bounded was it? | `recovery_need_changed` rows: cause, `recorded` / `joined` / `resumed`, goal `bound` and `floor_secs`, and the count charged. Epoch gaps keep `epoch_stall_backfill_armed`. |
-| Which obligations did one recovery attempt serve, over which relays, within which budgets? | `recovery_attempt_started`, joined to its other rows by `record_context.operation_ref`. |
-| What did the relays return, and what did processing keep? | `recovery_attempt_finished`: routes compared and certified, events retrieved / duplicate / rejected / retained / refused, relay counts, and the pass `outcome`. Engine application stays on `ingest_outcome`. |
-| Why did history recovery fail on a relay? | `recovery_attempt_finished.relay_outcomes`: per failed relay, the failure class (NEG-ERR and its category, the negentropy-cap NOTICE, a timeout, a relay outside the pool or not usable, a refused fetch) and how many routes it failed. |
-| Why did recovery stop, retry, wait or park, and is another attempt permitted? | `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
+| Which obligations did one recovery attempt serve, over which relays, within which budgets? | Not represented for the recovery runner. Older logs: `recovery_attempt_started`, joined to its other rows by `record_context.operation_ref`. |
+| What did the relays return, and what did processing keep? | Not represented for the recovery runner. Older logs: `recovery_attempt_finished`: routes compared and certified, events retrieved / duplicate / rejected / retained / refused, relay counts, and the pass `outcome`. Engine application stays on `ingest_outcome`. |
+| Why did history recovery fail on a relay? | Not represented for the recovery runner. Older logs: `recovery_attempt_finished.relay_outcomes`: per failed relay, the failure class (NEG-ERR and its category, the negentropy-cap NOTICE, a timeout, a relay outside the pool or not usable, a refused fetch) and how many routes it failed. |
+| Why did recovery stop, retry, wait or park, and is another attempt permitted? | For the recovery runner, `recovery_runner_paused` and the "history may be incomplete" rows below. Older logs: `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
 | When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |

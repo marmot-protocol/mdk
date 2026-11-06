@@ -82,8 +82,8 @@ pub(crate) struct RecoveryRunnerPolicy {
     /// (`CursorPersistence::Frozen`) process, which fetches only for the
     /// routes of groups whose live frames a fence holds (every route of such
     /// a group, since they share its frontier), so the messages that woke it
-    /// can be shown, and otherwise only for an explicit full-history repair, as
-    /// `authorize_account_recovery` allows there. Other debt (a loss, a
+    /// can be shown, and otherwise only for an explicit full-history repair,
+    /// the one recovery that posture allows. Other debt (a loss, a
     /// joined group's history, the standing window) waits for an Advance
     /// process.
     pub(crate) fetches_unasked: bool,

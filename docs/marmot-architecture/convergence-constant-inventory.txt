@@ -65,18 +65,13 @@ A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_BYTE
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_WAIT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_NEGOTIATION_WAIT
-# A13 is the one comparison job; #2068 deleted the online EpochGap slice.
-A13|crates/marmot-app/src/client/sync/comparison_job.rs|MAX_COMPARISON_ADMISSION_PER_TURN
+# A13 bounds ordered native admission per worker turn; the comparison job it once bounded was deleted
+# with the old recovery owner (#2660 phase 4).
+A13|crates/marmot-app/src/client/sync/native_ingress.rs|MAX_NATIVE_ADMISSION_PER_TURN
 # A14 floors the post-join maintenance and retained-route REQs at their anchors.
 A14|crates/marmot-app/src/lib.rs|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE
 # A15's relay-plane quiet repair timer is retired; the account owner paces recovery.
-# A16 bounds backward epoch-gap paging and its advisory resume hints.
-A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_PAGE_EVENTS
-A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_HINTS
-A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_BOUNDARIES
-A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY
-A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_BYTES_PER_RELAY
-A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_DURATION
+# A16's backward epoch-gap paging was deleted with the comparison job; the runner's epoch-gap visits (A19) replace it.
 # A17 bounds ordered subscription replay, its deadlines and native input queue.
 A17|crates/transport-nostr-adapter/src/lib.rs|RELAY_REPLAY_PAGE_LIMIT
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_MAX_PAGES

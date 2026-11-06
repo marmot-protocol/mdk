@@ -5,7 +5,7 @@
 //! arming produces no visible `SyncSummary` content (an undecryptable kind-445
 //! yields `IngestOutcome::TransportDeferred`, no `MarmotAppEvent`). `next_event` must still
 //! RETURN so the worker's post-`next_event`
-//! `run_pending_epoch_backfill` seam (`runtime/account_worker.rs`) runs. If the
+//! recovery seam (`refresh_recovery_at_seam`, `runtime/account_worker.rs`) runs. If the
 //! empty-summary guard does not also check `epoch_backfill_pending`, the call
 //! instead `continue`s and blocks on the next `receive()` — for a permanently
 //! stalled group that next visible event may never arrive, so the armed backfill
@@ -13,9 +13,9 @@
 //!
 //! This drives `AppClient::next_event` directly (the worker's exact call, at
 //! `account_worker.rs`) rather than through the full runtime. The observable is
-//! precisely "did `next_event` return", which the telemetry-based `since_floor`
-//! harness cannot see: it exercises the cold-boot catch-up seam
-//! (`run_pending_epoch_backfill` after the initial `sync()`), not the live
+//! precisely "did `next_event` return", which a runtime-level harness cannot
+//! see: it exercises the cold-boot catch-up seam (the recovery seam after the
+//! initial `sync()`), not the live
 //! `next_event` seam this test pins. Before the guard learned about
 //! `epoch_backfill_pending` this call hangs, and the timeout below is the RED
 //! signal.
@@ -76,7 +76,7 @@ fn test_unix_now_seconds() -> u64 {
 
 /// Publish an envelope-shaped undecryptable kind-445 probe with a fresh
 /// ephemeral key and a caller-chosen `created_at`, h-tagged to
-/// `nostr_group_id_hex`. Copied from `since_floor.rs`: real kind-445 senders are
+/// `nostr_group_id_hex`. Real kind-445 senders are
 /// always a fresh per-event key, and a zero-nonce marker body peels to a clean
 /// `PeelerError::DecryptFailed`, the `IngestOutcome::TransportDeferred` shape
 /// the epoch-stall detector counts.
@@ -110,7 +110,7 @@ async fn publish_garbage_group_message_at(
 
 /// A live delivery that arms the epoch-gap backfill but yields no visible
 /// summary content must still make `next_event` return, so the worker reaches
-/// its `run_pending_epoch_backfill` seam.
+/// its recovery seam (`refresh_recovery_at_seam`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
     let (_relay, url) = mock_relay().await;

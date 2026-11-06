@@ -3,14 +3,13 @@
 //! what ends that.
 use std::time::Duration;
 
-use storage_sqlite::{RecoveryCause, RecoveryCoverageProof, TransportReconciliationRoute};
+use storage_sqlite::{RecoveryCoverageProof, TransportReconciliationRoute};
 use transport_nostr_adapter::{
     RELAY_REPLAY_PAGE_LIMIT, ReplayFenceTicket, ReplayLiveCount, ReplaySourceGeneration,
 };
 
 use super::scenario_tests::{
-    Fixture, STORED_AT, authorize, certified_routes, fixture, fixture_with_stored, owed,
-    reactivate, relay, report, routes,
+    Fixture, STORED_AT, fixture, fixture_with_stored, owed, reactivate, relay, routes,
 };
 use super::{
     LiveCountFact, LiveCoverage, fence_plan, live_boundary_since, observe_live_counts,
@@ -402,9 +401,8 @@ async fn group_request(fixture: &Fixture) -> (String, String) {
 }
 
 /// One healthy generation vouches to now without a new EOSE: an idle,
-/// connected account owes nothing over hours, and the shadow report has
-/// nothing to disagree about. The ledger itself holds only what the EOSE
-/// proved, up to the request.
+/// connected account owes nothing over hours. The ledger itself holds only
+/// what the EOSE proved, up to the request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_connected_account_grows_no_debt_over_hours() {
     let opened = unix_now_seconds();
@@ -420,7 +418,6 @@ async fn an_idle_connected_account_grows_no_debt_over_hours() {
             "{opened} {until} {activated}"
         );
     }
-    assert_eq!(report(&fixture).await.disagreements(), 0);
 }
 
 /// A tail stands only on what the relay client reports when asked: a
@@ -639,8 +636,8 @@ async fn a_reopened_session_trusts_only_generations_it_saw_begin() {
 }
 
 /// Loss during a generation leaves its seconds owed: the generation it may
-/// have reached has no tail again, even once the loss's own obligation is
-/// gone. The next generation's EOSE proves the range again.
+/// have reached has no tail again. The next generation's EOSE proves the
+/// range again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_during_a_generation_leaves_its_seconds_owed() {
     let mut fixture = fixture().await;
@@ -658,25 +655,6 @@ async fn loss_during_a_generation_leaves_its_seconds_owed() {
                 .unwrap(),
             "the loss's seconds stay owed"
         );
-    }
-
-    // A certified pass settles the loss's obligation and covers its window;
-    // the broken generation still vouches for nothing after it.
-    let grant = authorize(&mut fixture.client).await;
-    fixture.client.test_comparison_results = Some(certified_routes(&grant));
-    fixture
-        .client
-        .run_recovery_grant_for_test(grant)
-        .await
-        .unwrap();
-    assert!(
-        app.pending_recovery_demands()
-            .unwrap()
-            .iter()
-            .all(|demand| demand.cause != RecoveryCause::QueueLoss)
-    );
-    for route in routes(&fixture.client) {
-        assert!(owed(&fixture, &route, later).await);
     }
 
     reactivate(&mut fixture).await;
