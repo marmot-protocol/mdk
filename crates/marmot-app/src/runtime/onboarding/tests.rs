@@ -23,6 +23,9 @@ struct Network {
     block_publish: AtomicBool,
     publishing: Notify,
     release_publish: Notify,
+    /// What its relays send the plane: an EOSE for each accepted REQ on each
+    /// relay.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
 }
 #[async_trait]
 impl DirectoryRelayFetcher for Network {
@@ -1200,7 +1203,27 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
 }
 #[async_trait]
 impl NostrRelayClient for Network {
-    async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+    async fn reply_sent_nothing(
+        &self,
+        _: Option<&MemberId>,
+        _: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        let id = subscription.subscription_id();
+        for endpoint in subscription.endpoints() {
+            self.messages.eose(endpoint, &id);
+        }
         Ok(())
     }
     async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
