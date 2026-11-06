@@ -1174,7 +1174,6 @@ async fn the_runtime_fetches_a_blossom_history_and_shows_it_at_once() {
 
     let Devices {
         _dirs,
-        relay,
         laptop_app,
         laptop,
         ..

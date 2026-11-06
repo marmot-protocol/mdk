@@ -1,6 +1,5 @@
 use crate::MarmotApp;
-use crate::tests::{
-    ScriptedPushRelayClient, client_on_app_relay_plane, };
+use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use std::sync::Arc;
 use storage_sqlite::TransportReconciliationRoute;

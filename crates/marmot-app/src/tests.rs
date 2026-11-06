@@ -1013,8 +1013,9 @@ impl ScriptedPushRelayClient {
         *self.hold_replies.lock().unwrap() = hold;
     }
 
-    /// Answer every held REQ that `release` selects now, late.
-    pub(crate) fn release_held_replies(
+    /// Answer every held REQ that `release` selects now, late, and wait
+    /// until every plane on this relay has handled the answers.
+    pub(crate) async fn release_held_replies(
         &self,
         release: impl Fn(&NostrSubscription, &TransportEndpoint) -> bool,
     ) {
@@ -1031,6 +1032,12 @@ impl ScriptedPushRelayClient {
         for (id, _, endpoint) in released {
             self.answer(&endpoint, &id);
         }
+        self.replies_handled().await;
+    }
+
+    /// Answer every held REQ now, late, and wait until the planes handled it.
+    pub(crate) async fn answer_held_replies(&self) {
+        self.release_held_replies(|_, _| true).await;
     }
 
     /// Wait until every plane on this relay has handled every message the
@@ -1039,9 +1046,16 @@ impl ScriptedPushRelayClient {
         self.messages.handled().await;
     }
 
-    /// The relay at `endpoint` closes the REQ `id`, giving `reason`.
-    pub(crate) fn close_subscription(&self, endpoint: &TransportEndpoint, id: &str, reason: &str) {
+    /// The relay at `endpoint` closes the REQ `id`, giving `reason`; waits
+    /// until every plane on this relay has handled the CLOSED.
+    pub(crate) async fn close_subscription(
+        &self,
+        endpoint: &TransportEndpoint,
+        id: &str,
+        reason: &str,
+    ) {
         self.messages.closed(endpoint, id, reason);
+        self.replies_handled().await;
     }
 
     fn script(&self, results: impl IntoIterator<Item = bool>) {
@@ -1786,6 +1800,11 @@ pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> c
 /// asks for it ([`ScriptedPushRelayClient::stored_before_eose`]). Not a group
 /// message, so it counts in the REQ's reply without reaching admission, as a
 /// copy the pool had already seen.
+/// Selects every (REQ, relay) for [`ScriptedPushRelayClient::hold_replies`].
+pub(crate) fn every_reply(_: &NostrSubscription, _: &TransportEndpoint) -> bool {
+    true
+}
+
 fn scripted_stored_event(created_at: u64) -> nostr_sdk::prelude::Event {
     EventBuilder::new(Kind::GiftWrap, "")
         .custom_created_at(NostrTimestamp::from_secs(created_at))
@@ -2014,7 +2033,7 @@ fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
         // This command is deferred behind startup catch-up, so its response is
         // also the steady-state barrier this regression needs.
         runtime.pause_maintenance("alice").await.unwrap();
-        report_scripted_eose(&app.relay_plane, &relay).await;
+        relay.replies_handled().await;
         let sync = app.relay_plane.relay_telemetry().await.sync;
         assert_eq!(sync.tracked_subscriptions, 2);
         assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
@@ -3506,7 +3525,7 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
     run_composed_app_runtime_test("backfill-local-progress-keeps-debt", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) =
+        let (_app, mut client, group) =
             armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
         let epoch = client.group_mls_state(&group).unwrap().epoch;
         let bystander = bystander_stalled_below_threshold(&mut client, epoch);
@@ -14392,7 +14411,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             .len();
         drop(client);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        report_scripted_eose(&app.relay_plane, &relay).await;
+        relay.replies_handled().await;
         for _ in 0..=spilled_before_reopen {
             if !client.admit_native_turn().await.unwrap() {
                 break;
@@ -14663,8 +14682,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
 fn replay_fences_cursor_on_save() {
     run_composed_app_runtime_test("unfinished-replay-checkpoint", || async {
         let mut fixture = LiveCursorFixture::open().await;
-        fixture._eose.0.abort();
-        let _ = (&mut fixture._eose.0).await;
+        // The fresh activation's REQs stay unfinished, so replay is too.
+        fixture.relay.hold_replies(Some(every_reply));
         fixture
             .client
             .runtime
@@ -14736,7 +14755,7 @@ pub(crate) struct LiveCursorFixture {
     account_id: MemberId,
     nostr_group_id_hex: String,
     pub(crate) cursor_before: u64,
-    _eose: _dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
 }
 
 impl LiveCursorFixture {
@@ -14853,23 +14872,8 @@ impl LiveCursorFixture {
             account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
             nostr_group_id_hex,
             cursor_before,
-            _eose: eose,
             _dir: dir,
         }
-    }
-
-    /// Stop the scripted EOSE pump, which [`Self::open`] leaves running after
-    /// every subscription is past end-of-stored-events. A cursor seal reads
-    /// replay admission without waiting and defers its commit while the
-    /// adapter's state lock is taken, and each of the pump's repeat reports
-    /// takes that lock. A REQ issued afterwards never reaches EOSE until a
-    /// simulated reopen starts a fresh pump. Other
-    /// tasks, such as the replay supervisor, still take the lock, so a test
-    /// that asserts what one commit persists also runs on one thread, where
-    /// none of them runs between the commit's readiness read and its seal.
-    pub(crate) async fn stop_eose_pump(&mut self) {
-        self._eose.0.abort();
-        let _ = (&mut self._eose.0).await;
     }
 
     pub(crate) fn persisted(&self) -> Option<u64> {
@@ -14930,12 +14934,9 @@ impl LiveCursorFixture {
             account_id,
             nostr_group_id_hex,
             cursor_before,
-            _eose,
             _dir,
         } = self;
         drop(client);
-        // A reopened connection gets fresh relay replies, even when the old
-        // connection's duplicate EOSE pump was stopped for an atomic seal.
         let client = client_on_app_relay_plane(&app, "alice").await;
         Self {
             app,
@@ -14944,7 +14945,6 @@ impl LiveCursorFixture {
             account_id,
             nostr_group_id_hex,
             cursor_before,
-            _eose,
             _dir,
         }
     }
@@ -15068,6 +15068,9 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // No relay reports end-of-stored-events: the relays may still be
+        // replaying stored history newest-first.
+        relay.hold_replies(Some(every_reply));
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         app.relay_plane =
@@ -15077,8 +15080,6 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
         let mut seeded = app.load_state("alice").unwrap();
         seeded.last_transport_timestamp = Some(cursor_before);
         app.save_state(&seeded).unwrap();
-        // No relay reports end-of-stored-events: the relays may still be
-        // replaying stored history newest-first.
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("live cursor", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -19259,7 +19260,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
@@ -19514,7 +19515,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     // The native group lane waits for the current REQ's stored-history
     // boundary before admitting the real locally published removal commit.
     // It lands in bob's current epoch and buffers for convergence.
-    report_scripted_eose(&plane, &relay).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     // The scheduled-convergence path the account worker drives. This is the
     // field case: the removal was adopted through convergence, not inline.
@@ -19618,7 +19619,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
@@ -19714,7 +19715,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .remove_members(&group_id, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     // The removal lands in the epoch bob still holds, so convergence adopts it
     // rather than the inline commit-apply path.
@@ -22000,7 +22001,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
-    report_scripted_eose(&plane, &relay).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     bob_client.take_pending_projection_updates();
     bob_client.take_pending_applied_sync_summary();
@@ -22065,7 +22066,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .await
             .expect("quiet retry must complete the retained projection");
         assert!(!bob_client.has_pending_effect_projections());
-        report_scripted_eose(&plane, &relay).await;
+        relay.replies_handled().await;
         assert!(bob_client.admit_native_turn().await.unwrap());
         assert_eq!(
             probe_cursor(&bob_client),
@@ -22090,7 +22091,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
                 "projection retry must not release an unaccepted delivery",
             );
         }
-        report_scripted_eose(&plane, &relay).await;
+        relay.replies_handled().await;
         assert!(
             bob_client
                 .admit_native_turn()
@@ -24786,7 +24787,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                         .unwrap();
                 } else {
                     inject_epoch_gap_probe(&app, probe.clone()).await;
-                    report_scripted_eose(&app.relay_plane, &relay).await;
+                    relay.replies_handled().await;
                     if handling == "sdk drain" {
                         client.sync().await.unwrap();
                     } else {
@@ -25516,7 +25517,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     );
     // Bob's leave reaches Alice behind her live REQs' replay; settle it so
     // her next sync ingests the proposal instead of leaving it to a grant.
-    settle_live_replay(&plane, &relay, &mut alice).await;
+    settle_live_replay(&mut alice).await;
     bob_client.leave_group(&group_id).await.unwrap();
     alice.sync().await.unwrap();
     let delay = alice

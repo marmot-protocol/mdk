@@ -511,8 +511,7 @@ async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_hando
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     // The loss handoff may promote a cursor only after the live REQ's replay
     // has finished too. Its EOSE alone cannot acknowledge the loss below.
-    crate::tests::report_scripted_eose(&app.relay_plane, &relay, crate::tests::every_subscription)
-        .await;
+    relay.replies_handled().await;
     let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .mark_account_delivery_recovery("alice", 91, 1)

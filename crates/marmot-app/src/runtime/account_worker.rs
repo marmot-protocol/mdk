@@ -9099,7 +9099,7 @@ mod tests {
     use crate::client::epoch_stall::BackfillDecision;
     use crate::tests::{
         ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-        };
+    };
     use crate::{AuditLogSettings, MarmotApp};
     use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
 

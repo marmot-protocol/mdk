@@ -8054,10 +8054,6 @@ mod live_cursor_checkpoint_tests {
             "drain-checkpoint-arrival-during-save",
             || async {
                 let mut fixture = LiveCursorFixture::open().await;
-                // The seal intentionally defers on lock contention. This case
-                // places one arrival at the successful save's hook; duplicate
-                // scripted EOSE reports must not contend with that one seal.
-                fixture.stop_eose_pump().await;
                 let cursor_before = fixture.cursor_before;
                 // A drained prefix: admitted without promoting, as a drain's
                 // ingests are until its checkpoint.
@@ -8121,10 +8117,6 @@ mod live_cursor_checkpoint_tests {
     fn an_older_arrival_during_an_accounts_first_checkpoint_survives_a_stop() {
         run_composed_app_runtime_test_on_one_thread("first-cursor-arrival-during-save", || async {
             let mut fixture = LiveCursorFixture::open_without_cursor().await;
-            // The seal intentionally defers on lock contention. This case
-            // places one arrival at the successful save's hook; duplicate
-            // scripted EOSE reports must not contend with that one seal.
-            fixture.stop_eose_pump().await;
             let cursor_before = fixture.cursor_before;
             let drained = fixture
                 .delivery(fixture.probe(cursor_before + 4_000, "drained"))
@@ -10741,6 +10733,8 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // The first drain runs before any relay has answered.
+        relay.hold_replies(Some(crate::tests::every_reply));
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -10750,13 +10744,7 @@ mod tests {
         client.sync_sdk_relay(None).await.unwrap();
         assert!(started.elapsed() >= crate::SDK_FIRST_SYNC_WAIT);
         assert!(started.elapsed() <= crate::SDK_FIRST_SYNC_WAIT + Duration::from_millis(1));
-        for subscription in relay.accepted_subscriptions() {
-            for endpoint in subscription.endpoints() {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                    .await;
-            }
-        }
+        relay.answer_held_replies().await;
         assert!(client.adapter.account_subscription_eose().await.complete());
         let started = tokio::time::Instant::now();
         client.sync_sdk_relay(None).await.unwrap();
@@ -10777,6 +10765,8 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // One REQ is refused instead of answered.
+        relay.hold_replies(Some(crate::tests::every_reply));
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -10788,25 +10778,19 @@ mod tests {
             .split_first()
             .expect("the account holds a subscription");
         for endpoint in refused.endpoints() {
-            app.relay_plane
-                .handle_relay_closed_for_test(
-                    endpoint.clone(),
-                    refused.subscription_id(),
-                    transport_nostr_adapter::SubscriptionRefusal {
-                        category: Some(cgka_traits::TransportEndpointRejectionCategory::Restricted),
-                        disposition:
-                            transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
-                    },
+            relay
+                .close_subscription(
+                    endpoint,
+                    &refused.subscription_id(),
+                    "restricted: not served here",
                 )
                 .await;
         }
-        for subscription in served {
-            for endpoint in subscription.endpoints() {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                    .await;
-            }
-        }
+        assert!(!served.is_empty());
+        let refused_id = refused.subscription_id();
+        relay
+            .release_held_replies(|subscription, _| subscription.subscription_id() != refused_id)
+            .await;
         let progress = client.adapter.account_subscription_eose().await;
         assert!(progress.settled());
         assert!(!progress.complete());

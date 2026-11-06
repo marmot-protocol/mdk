@@ -1892,8 +1892,7 @@ impl AppClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{
-        ScriptedPushRelayClient, client_on_app_relay_plane, };
+    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
     use cgka_traits::GroupStorage;
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
     use std::sync::Arc;
@@ -4505,11 +4504,7 @@ mod tests {
     async fn epoch_gap_grant(fixture: &mut Fixture) -> (AttemptGrant, [u8; 32]) {
         // These cases measure comparison fallback, not independent native
         // capture of a startup REQ whose scripted EOSE has not run yet.
-        crate::tests::report_scripted_eose(
-            &fixture.client.relay_plane,
-            &fixture.relay,
-            )
-        .await;
+        fixture.relay.replies_handled().await;
         fixture.client.synchronize_native_replay().await.unwrap();
         let grant = fixture
             .client
@@ -5038,8 +5033,7 @@ mod tests {
         // SubscriptionReplay duty can join every grant (mdk#2693). Then settle
         // the create-group history demand, as the epoch-gap fixture does, so
         // the next grant owns only the comparison slot.
-        let plane = fixture.client.app.relay_plane.clone();
-        crate::tests::settle_live_replay(&plane, &fixture.relay, &mut fixture.client).await;
+        crate::tests::settle_live_replay(&mut fixture.client).await;
         let baseline = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)

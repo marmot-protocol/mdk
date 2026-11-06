@@ -2329,7 +2329,7 @@ async fn each_change_in_linking_is_announced_once() {
 /// a link starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_runtime_announces_linking() {
-    let (relay, [phone]) = alice_devices::<1>().await;
+    let (_relay, [phone]) = alice_devices::<1>().await;
     let Device {
         _dir, app, client, ..
     } = phone;

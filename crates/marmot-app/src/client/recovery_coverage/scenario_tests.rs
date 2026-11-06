@@ -12,8 +12,7 @@ use super::CoverageShadowReport;
 use crate::client::AppClient;
 use crate::client::recovery::AttemptGrant;
 use crate::client::sync::ScriptedComparisons;
-use crate::tests::{
-    ScriptedPushRelayClient, client_on_app_relay_plane, };
+use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use crate::unix_now_seconds;
 
 pub(super) const RELAY: &str = "wss://relay.example";

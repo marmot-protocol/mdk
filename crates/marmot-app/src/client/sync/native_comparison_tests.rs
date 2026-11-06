@@ -4,7 +4,8 @@ use super::comparison_job::ComparisonNetworkJob;
 use super::*;
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::tests::{
-    ScriptedPushRelayClient, client_on_app_relay_plane, remember_test_member_inbox, };
+    ScriptedPushRelayClient, client_on_app_relay_plane, remember_test_member_inbox,
+};
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{TransportAccountActivation, TransportAdapter};
 use marmot_session::PublishWork;

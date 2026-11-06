@@ -341,7 +341,7 @@ impl ScriptedRelayMessages {
                 .collect::<Vec<_>>()
         };
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
+            for spin in 0usize.. {
                 let flushed = self
                     .flushed
                     .lock()
@@ -354,7 +354,13 @@ impl ScriptedRelayMessages {
                     return;
                 }
                 drop(flushed);
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // Yield first: a paused clock must not move while the plane
+                // catches up.
+                if spin < 10_000 {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
             }
         })
         .await

@@ -1388,7 +1388,6 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
 async fn a_restart_that_settles_trust_announces_it() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         mut phone,
         link,
@@ -1432,7 +1431,6 @@ async fn a_restart_that_settles_trust_announces_it() {
 async fn a_reconnect_announces_again() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         mut phone,
         link,

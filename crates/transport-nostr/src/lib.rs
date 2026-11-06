@@ -2412,41 +2412,6 @@ impl MarmotRelayPlane {
             .is_some()
     }
 
-    /// Report end-of-stored-events for one subscription on one endpoint, the
-    /// way [`handle_relay_notification`] does for an SDK-backed plane. An
-    /// injected relay client produces no relay messages of its own, so tests
-    /// that need a subscription's end of stored events drive this seam.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub async fn handle_relay_eose_for_test(
-        &self,
-        endpoint: TransportEndpoint,
-        subscription_id: String,
-    ) {
-        self.inner
-            .transport
-            .adapter
-            .handle_relay_eose(endpoint, subscription_id)
-            .await;
-    }
-
-    /// Report a relay's `CLOSED` for one subscription on one endpoint, the
-    /// way the SDK notification forwarder does.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub async fn handle_relay_closed_for_test(
-        &self,
-        endpoint: TransportEndpoint,
-        subscription_id: String,
-        refusal: transport_nostr_adapter::SubscriptionRefusal,
-    ) {
-        self.inner
-            .transport
-            .adapter
-            .handle_relay_closed(endpoint, subscription_id, refusal)
-            .await;
-    }
-
     /// Drive every managed account worker through its receive-error reconnect
     /// path: an unexpected notification consumer exit closes inbound delivery.
     #[cfg(any(test, feature = "test-support"))]

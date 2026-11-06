@@ -1352,8 +1352,8 @@ async fn lag_recovers_expired_history() {
     let other_subscriptions = relay.subscriptions.lock().unwrap().clone();
     for subscription in other_subscriptions {
         if subscription.account_id() == &other {
-            relay_plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            relay
+                .send_eose(&endpoint, subscription.subscription_id())
                 .await;
         }
     }
@@ -1361,9 +1361,7 @@ async fn lag_recovers_expired_history() {
         &relay,
         |subscription| matches!(subscription, NostrSubscription::AccountInbox { account_id, .. } if account_id == &account),
     );
-    relay_plane
-        .handle_relay_eose_for_test(endpoint.clone(), inbox_id)
-        .await;
+    relay.send_eose(&endpoint, inbox_id).await;
     let subscribed = relay.subscriptions.lock().unwrap().clone();
     let floor = NostrNotificationLossFloor::Since(1_699_999_000);
     let settle = Duration::from_secs(31);
@@ -1512,8 +1510,8 @@ async fn failed_capture_stays_fenced() {
         assert!(adapter.try_receive_account_delivery().is_none());
         assert!(!adapter.account_subscription_eose().await.complete());
     }
-    relay_plane
-        .handle_relay_eose_for_test(endpoint.clone(), subscribed[0].subscription_id())
+    relay
+        .send_eose(&endpoint, subscribed[0].subscription_id())
         .await;
     assert_eq!(
         adapter
@@ -1586,9 +1584,7 @@ async fn lag_parks_missing_relay() {
     let group = issued_id(&relay, |subscription| {
         matches!(subscription, NostrSubscription::GroupBatch { .. })
     });
-    plane
-        .handle_relay_eose_for_test(healthy.clone(), inbox)
-        .await;
+    relay.send_eose(&healthy, inbox).await;
     let subscribed = relay.subscriptions.lock().unwrap().clone();
     plane.simulate_notification_lag_for_test(&account, 1, NostrNotificationLossFloor::Since(since));
     let original = adapter.pending_delivery_overflow().unwrap();
@@ -1637,9 +1633,7 @@ async fn lag_parks_missing_relay() {
         source.subscription_endpoint_eose(&group, &missing).await,
         Some(false)
     );
-    plane
-        .handle_relay_eose_for_test(missing.clone(), group.clone())
-        .await;
+    relay.send_eose(&missing, group.clone()).await;
     assert_eq!(
         source.subscription_endpoint_eose(&group, &missing).await,
         Some(false)
@@ -1752,9 +1746,7 @@ async fn lag_parks_missing_relay() {
     let next_cursor = Some(OPENED_CURSOR + 2_000);
     assert_eq!(adapter.seal_transport_cursor(next_cursor, |_| true), None);
     assert!(adapter.try_receive_account_delivery().is_none());
-    plane
-        .handle_relay_eose_for_test(missing.clone(), group.clone())
-        .await;
+    relay.send_eose(&missing, group.clone()).await;
     let mut recovered = Vec::new();
     for _ in 0..2 {
         let Some(AccountDeliveryReceive::Delivery(delivery)) =
@@ -1820,6 +1812,9 @@ impl DirectoryRelayFetcher for RecordingRelayClient {
 
 #[derive(Default)]
 struct RecordingRelayClient {
+    /// What its relays send the plane. These plane tests place each EOSE and
+    /// CLOSED themselves, so it answers no REQ on its own.
+    messages: Arc<crate::test_support::ScriptedRelayMessages>,
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
@@ -1828,6 +1823,22 @@ struct RecordingRelayClient {
     unavailable_endpoints: StdMutex<HashSet<TransportEndpoint>>,
     hold_acquisitions: AtomicBool,
     acquisition_release: tokio::sync::Notify,
+}
+
+impl RecordingRelayClient {
+    /// `endpoint` ends its stored events for the REQ `id`; returns once the
+    /// plane has handled it.
+    async fn send_eose(&self, endpoint: &TransportEndpoint, id: impl AsRef<str>) {
+        self.messages.eose(endpoint, id.as_ref());
+        self.messages.handled().await;
+    }
+
+    /// `endpoint` closes the REQ `id`, giving `reason`; returns once the
+    /// plane has handled it.
+    async fn send_closed(&self, endpoint: &TransportEndpoint, id: impl AsRef<str>, reason: &str) {
+        self.messages.closed(endpoint, id.as_ref(), reason);
+        self.messages.handled().await;
+    }
 }
 
 struct RetainedHistory {
@@ -2175,6 +2186,21 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
 
 #[async_trait]
 impl NostrRelayClient for RecordingRelayClient {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+
     async fn publish_event_for_account(
         &self,
         _account_id: &MemberId,
@@ -2653,8 +2679,8 @@ async fn settled_activation_uses_diff() {
                         .await;
                 }
             }
-            plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            relay
+                .send_eose(&endpoint, subscription.subscription_id())
                 .await;
         }
         if delegated {
@@ -2685,8 +2711,8 @@ async fn settled_activation_uses_diff() {
         for expected in [4, 6] {
             let issued = relay.subscriptions.lock().unwrap().clone();
             for subscription in issued {
-                plane
-                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                relay
+                    .send_eose(&endpoint, subscription.subscription_id())
                     .await;
             }
             adapter.activate_account(activation.clone()).await.unwrap();
@@ -3255,8 +3281,8 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
     assert!(alice_adapter.try_receive_account_delivery().is_none());
     assert!(bob_adapter.try_receive_account_delivery().is_none());
     for subscription in subscriptions {
-        relay_plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
             .await;
     }
 
@@ -4005,8 +4031,8 @@ async fn owner_authorizes_empty_boundary_without_phantom_loss_after_deadline() {
     let candidate = Some(OPENED_CURSOR + 2_000);
     assert_eq!(adapter.seal_transport_cursor(candidate, |_| false), None);
     tokio::time::advance(Duration::from_secs(30)).await;
-    plane
-        .handle_relay_eose_for_test(available, issued_id(&relay, |_| true))
+    relay
+        .send_eose(&available, issued_id(&relay, |_| true))
         .await;
     let owner_completed = {
         let status = adapter.replay_admission().await;
@@ -4108,21 +4134,12 @@ async fn silent_peer_lease_fences() {
         for subscription in issued {
             let id = subscription.subscription_id();
             if peer == Peer::Refused {
-                plane
-                    .handle_relay_closed_for_test(
-                        unavailable.clone(),
-                        id.clone(),
-                        transport_nostr_adapter::SubscriptionRefusal {
-                            category: None,
-                            disposition:
-                                transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
-                        },
-                    )
+                // An unclassified refusal: the relay drops the REQ for good.
+                relay
+                    .send_closed(&unavailable, &id, "request refused")
                     .await;
             }
-            plane
-                .handle_relay_eose_for_test(available.clone(), id)
-                .await;
+            relay.send_eose(&available, id).await;
         }
         if peer == Peer::Silent {
             tokio::task::yield_now().await;
@@ -4231,8 +4248,8 @@ async fn replay_handoff_fences_cursor() {
         .unwrap();
     let issued = relay.subscriptions.lock().unwrap().clone();
     for subscription in issued {
-        plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
             .await;
     }
     let in_flight = timeout(
@@ -4344,8 +4361,8 @@ async fn fence_held_frame_caps_cursor() {
         .unwrap();
     let issued = relay.subscriptions.lock().unwrap().clone();
     for subscription in issued {
-        plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
             .await;
     }
     for _ in 0..20 {
@@ -4447,8 +4464,8 @@ async fn fence_held_frames_on_both_sides_of_the_floor_cap_at_the_upper() {
     }
     let issued = relay.subscriptions.lock().unwrap().clone();
     for subscription in issued {
-        plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
             .await;
     }
     for _ in 0..20 {
@@ -4514,8 +4531,8 @@ async fn seal_imports_replay_loss() {
     let replacement = relay.subscriptions.lock().unwrap()[first_issued..].to_vec();
     assert!(!replacement.is_empty());
     for subscription in replacement {
-        plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
             .await;
     }
     assert!(
@@ -5282,9 +5299,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
         .collect::<Vec<_>>();
     assert!(!bob_subscription_ids.is_empty());
     for subscription_id in bob_subscription_ids {
-        relay_plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription_id)
-            .await;
+        relay.send_eose(&endpoint, subscription_id).await;
     }
     assert!(
         bob_adapter.account_subscription_eose().await.complete(),
@@ -5301,9 +5316,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
         .collect::<Vec<_>>();
     assert!(!alice_subscription_ids.is_empty());
     for subscription_id in alice_subscription_ids {
-        relay_plane
-            .handle_relay_eose_for_test(endpoint.clone(), subscription_id)
-            .await;
+        relay.send_eose(&endpoint, subscription_id).await;
     }
 
     assert!(

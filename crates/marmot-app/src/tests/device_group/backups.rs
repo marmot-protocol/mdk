@@ -997,7 +997,6 @@ async fn release_builds_refuse_recovery_words() {
 async fn the_runtime_confirms_recovery_words() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         phone,
         ..

@@ -925,7 +925,6 @@ async fn a_rename_needs_a_device_group() {
 async fn the_runtime_renames_a_device_and_announces_it() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         mut phone,
         laptop,

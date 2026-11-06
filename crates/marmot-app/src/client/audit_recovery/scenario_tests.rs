@@ -10,8 +10,7 @@ use storage_sqlite::{RecoveryCause, RecoveryLossCause};
 use super::recorded_v5_rows;
 use crate::client::AppClient;
 use crate::client::recovery::AttemptGrant;
-use crate::tests::{
-    ScriptedPushRelayClient, client_on_app_relay_plane, };
+use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use crate::unix_now_seconds;
 
 struct Fixture {
@@ -470,8 +469,6 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
     // task runs between a commit's readiness read and its seal.
     crate::tests::run_composed_app_runtime_test_on_one_thread("recovery-audit-cursor", || async {
         let mut fixture = crate::tests::LiveCursorFixture::open_audited().await;
-        // Nothing below issues a REQ.
-        fixture.stop_eose_pump().await;
         let cursor_before = fixture.cursor_before;
         // A live promotion within the rebuild lookback writes no row.
         let near = fixture
@@ -625,15 +622,11 @@ async fn a_relay_refusal_is_recorded_at_the_worker_seam() {
         .expect("the account subscribed its inbox");
     for _ in 0..2 {
         fixture
-            .app
-            .relay_plane
-            .handle_relay_closed_for_test(
-                inbox.endpoints()[0].clone(),
-                inbox.subscription_id(),
-                transport_nostr_adapter::SubscriptionRefusal {
-                    category: Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired),
-                    disposition: transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
-                },
+            .relay
+            .close_subscription(
+                &inbox.endpoints()[0],
+                &inbox.subscription_id(),
+                "restricted: members only",
             )
             .await;
     }
@@ -645,7 +638,7 @@ async fn a_relay_refusal_is_recorded_at_the_worker_seam() {
     let refusals = event["refusals"].as_array().unwrap();
     assert_eq!(refusals.len(), 1);
     assert_eq!(refusals[0]["route_kind"], "inbox");
-    assert_eq!(refusals[0]["refusal_category"], "auth_required");
+    assert_eq!(refusals[0]["refusal_category"], "restricted");
     assert_eq!(refusals[0]["disposition"], "dropped");
     assert_eq!(refusals[0]["count"], 2);
     assert_eq!(refusals[0]["endpoint_ref"].as_str().unwrap().len(), 64);
