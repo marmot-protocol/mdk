@@ -3321,7 +3321,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 let result = publisher
                     .publish_event(std::slice::from_ref(endpoint), event, 1)
                     .await;
-                (endpoint, result)
+                (endpoint, false, result)
             });
         }
         while !publishes.is_empty() || !retries.is_empty() {
@@ -3330,17 +3330,40 @@ impl MarmotRelayPlaneAccountAdapter {
                 next = timeout_at(deadline, retries.next()), if !retries.is_empty() => (true, next),
             };
             match next {
-                Ok(Some((endpoint, result))) => {
+                Ok(Some((endpoint, earlier_exposure, result))) => {
                     if is_retry {
                         retrying.remove(endpoint);
                     } else {
                         pending.remove(endpoint);
                     }
+                    let preserve_prior_exposure = |mut failure: TransportEndpointFailure| {
+                        if earlier_exposure && failure.endpoint == *endpoint {
+                            failure.kind = TransportEndpointFailureKind::PossiblyExposed;
+                            failure.size_class = None;
+                        }
+                        failure
+                    };
                     match result {
                         Ok(receipt) => {
+                            let endpoint_accepted = receipt
+                                .accepted
+                                .iter()
+                                .any(|accepted| accepted.endpoint == *endpoint);
                             outcome.message_id = receipt.message_id.or(outcome.message_id);
                             outcome.accepted.extend(receipt.accepted);
-                            outcome.failed.extend(receipt.failed);
+                            outcome.failed.extend(
+                                receipt
+                                    .failed
+                                    .into_iter()
+                                    .filter(|failure| {
+                                        // A matching ACK settles this endpoint even
+                                        // if a supplied receipt retains old failures.
+                                        !(earlier_exposure
+                                            && endpoint_accepted
+                                            && failure.endpoint == *endpoint)
+                                    })
+                                    .map(preserve_prior_exposure),
+                            );
                         }
                         Err(error) => {
                             outcome.message_id =
@@ -3354,10 +3377,17 @@ impl MarmotRelayPlaneAccountAdapter {
                                             )
                                 });
                             if auth_required {
+                                let earlier_exposure =
+                                    error.publish_endpoint_failures().iter().any(|failure| {
+                                        failure.endpoint == *endpoint
+                                            && failure.kind
+                                                == TransportEndpointFailureKind::PossiblyExposed
+                                    });
                                 retrying.insert(endpoint);
                                 retries.push(async move {
                                     (
                                         endpoint,
+                                        earlier_exposure,
                                         fallback
                                             .publish_event_for_account(
                                                 &self.account_id,
@@ -3374,9 +3404,13 @@ impl MarmotRelayPlaneAccountAdapter {
                                 }
                                 outcome.failed.push(unknown(endpoint));
                             } else {
-                                outcome
-                                    .failed
-                                    .extend_from_slice(error.publish_endpoint_failures());
+                                outcome.failed.extend(
+                                    error
+                                        .publish_endpoint_failures()
+                                        .iter()
+                                        .cloned()
+                                        .map(preserve_prior_exposure),
+                                );
                             }
                         }
                     }

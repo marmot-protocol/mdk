@@ -89,14 +89,28 @@ ON, `trusted_schema=OFF`, `temp_store=MEMORY`, and terminal close. See the
 
 ## Chat-list selection
 
-`chat_list_ids(view)` returns every chat ID in one of the four native `ChatListView`s, in display order, from one
-read transaction before any display paging. It uses the view's indexed predicate and ordering and reads no
-presentation, profile, roster or history blobs, so work and memory grow with the view's chats only. Pending
-base-row work returns `ProjectionNotReady` rather than a falsely complete result; the runtime finishes its bounded
-base-row preparation before retrying.
+A `ChatListViewQuery` is one of the four native `ChatListView`s plus an optional `ChatListFilter` (`All`/`Any`/`Not`
+over stored chat facts and group-ID lists). It compiles to SQL appended to the view's condition, with every value
+bound as a parameter, and pages, counts and selects through the view's page index; each leaf is a row column or a
+keyed per-chat lookup, so cost grows with the view's chats, never with history. Queries are bounded (8 levels, 64
+nodes, 500 group IDs) and an over-bound query is a typed `ChatListQueryError` before any read.
+`ChatListFilter::from_nodes` builds the tree from the bindings' flat node list. A `ChatListView` converts into the
+unfiltered query, and page cursors belong to the exact query that produced them.
 
-`revalidate_chat_list_ids(view, ids)` returns the subset of `ids` still in the view, in the caller's order with
-duplicates dropped. It only removes: chats that joined the view since are never added. Both calls are stateless;
+Filtered results are consistent within one read: a window read, `chat_list_ids` and `revalidate_chat_list_ids`. A
+cursor continues only a fixed-view query across reads; `chat_list_page` refuses a cursor with a filter as
+`FilteredCursorUnsupported` before reading. The navigation revision that makes cursors stale covers the fixed views'
+inputs (scope, unread, pin, activity, membership), not every filter leaf's (drafts, manual unread, mentions, delivery
+state, invitations, leave and disband records). Cross-read filtered paging would need revision triggers on each of
+those inputs; add them only if a host needs it.
+
+`chat_list_ids(query)` returns every chat ID the query matches, in display order, from one read transaction before
+any display paging. It reads no presentation, profile, roster or history blobs. Pending base-row work returns
+`ProjectionNotReady` rather than a falsely complete result; the runtime finishes its bounded base-row preparation
+before retrying.
+
+`revalidate_chat_list_ids(query, ids)` returns the subset of `ids` still matching, in the caller's order with
+duplicates dropped. It only removes: chats that matched since are never added. Both calls are stateless;
 hosts keep the selection. A bulk action revalidates first, and each per-chat command still enforces its own
 preconditions: this read is not an atomic authorization for a later write.
 

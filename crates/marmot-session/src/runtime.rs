@@ -5709,6 +5709,7 @@ where
                 && let Some(recipient) = welcome_recipient(&fanout.request().message)
             {
                 output.welcome_failures.push(WelcomeDeliveryFailure {
+                    size_class: OversizedEvent::of_fanout(&fanout).map(|cause| cause.size_class),
                     message_id: fanout.message_id().clone(),
                     recipient,
                     group_id: fanout.group_id().cloned(),
@@ -6177,6 +6178,12 @@ where
                 StorageError::Busy("injected finish-stage failure".into()),
             )));
         }
+        // Diagnostic only: retain legacy publication's conservative exposure,
+        // retry and rollback decisions below. Its coarse durable prior-attempt
+        // records cannot reconstruct a definitive earlier refusal. A crash
+        // before finish bookkeeping or expired records can hide an earlier
+        // exposure: this diagnosis explains the observed attempt, not delivery.
+        let oversized = OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result);
         let report = match result {
             Ok(report) => report,
             Err(error) => {
@@ -6268,7 +6275,7 @@ where
                     },
                 );
                 output.failures.push(PublishFailure {
-                    oversized: None,
+                    oversized,
                     message_id,
                     reason: error.to_string(),
                 });
@@ -6352,7 +6359,7 @@ where
                 },
             );
             output.failures.push(PublishFailure {
-                oversized: None,
+                oversized,
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
             });
@@ -7113,7 +7120,9 @@ pub struct UndeliveredCommit {
 pub struct PublishFailure {
     pub message_id: cgka_traits::MessageId,
     pub reason: String,
-    /// Definitive all-target size refusal; absent for mixed or unknown outcomes.
+    /// All-target size refusal on the observed attempt; absent for mixed or
+    /// unknown outcomes. A legacy Welcome's earlier exposure can be unknown.
+    /// This is not evidence of delivery or non-delivery and never ends retry work.
     pub oversized: Option<OversizedEvent>,
 }
 
@@ -7143,8 +7152,11 @@ impl std::fmt::Display for OversizedArtifact {
     }
 }
 
-/// Privacy-safe explanation of a definitive size refusal, without exact sizes,
-/// identifiers, relay details, or an assertion about an unknown relay limit.
+/// Privacy-safe explanation of an observed all-target size refusal, without
+/// exact sizes, identifiers, relay details, or an inferred relay limit.
+/// Frozen fanouts retain their strong exposure proof. Legacy Welcomes explain
+/// the observed attempt: a crash or expired bookkeeping can hide earlier
+/// exposure, so this does not prove non-delivery or authorize ending retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OversizedEvent {
     pub artifact: OversizedArtifact,
@@ -7152,6 +7164,35 @@ pub struct OversizedEvent {
 }
 
 impl OversizedEvent {
+    fn of_first_legacy_welcome_attempt(
+        fanout: &DurableTransportFanout,
+        result: &Result<TransportPublishReport, TransportAdapterError>,
+    ) -> Option<Self> {
+        if !matches!(
+            fanout.exact_message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) || fanout.possible_exposure
+            || fanout.targets.iter().any(|target| {
+                target.attempt_count != 0 || target.state == TransportFanoutAttemptState::Accepted
+            })
+        {
+            return None;
+        }
+        let failures: &[TransportEndpointFailure] = match result {
+            Ok(report) if report.accepted.is_empty() => &report.failed,
+            Ok(_) => return None,
+            Err(error) => error.publish_endpoint_failures(),
+        };
+        let size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+            fanout.target.endpoints(),
+            failures,
+        )?;
+        Some(Self {
+            artifact: OversizedArtifact::Welcome,
+            size_class,
+        })
+    }
+
     fn of_fanout(fanout: &OutboundFanout) -> Option<Self> {
         if fanout.possible_exposure()
             || fanout.outcome().accepted_targets != 0
@@ -7208,11 +7249,10 @@ pub struct UnresolvedApplicationMessage {
     pub reason: UnresolvedPublishReason,
 }
 
-/// A welcome left undelivered by a confirmed group create/evolution (mdk#352).
+/// A Welcome still owed after a canonical create or confirmed evolution (mdk#352).
 ///
-/// The added member cannot join until the welcome reaches them, and the commit
-/// cannot be rolled back (it is already confirmed and externally visible), so
-/// re-delivery is the only repair. The wrapped welcome stays available in the
+/// Pending does not prove whether the added member received it. Confirmed group
+/// state is not rolled back; ordinary re-delivery remains owed. The wrapped Welcome stays available in the
 /// engine's sent-message store under `message_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WelcomeDeliveryFailure {
@@ -7222,6 +7262,10 @@ pub struct WelcomeDeliveryFailure {
     /// best-effort.
     pub group_id: Option<GroupId>,
     pub reason: String,
+    /// Coarse size refusal on the observed attempt. A legacy Welcome's earlier
+    /// exposure can be unknown after a crash or expired bookkeeping. An absent
+    /// value means Unknown; neither value proves delivery or non-delivery.
+    pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7257,6 +7301,10 @@ fn v5_failed_endpoint_result(
         .filter(|category| {
             !(failure.kind == TransportEndpointFailureKind::NotExposed
                 && *category == TransportEndpointRejectionCategory::TooLarge)
+                // V5 describes the cumulative outcome, not merely the last
+                // refusal after an earlier uncertain attempt.
+                && (failure.kind != TransportEndpointFailureKind::PossiblyExposed
+                    || *category == TransportEndpointRejectionCategory::Error)
         })
         .map(|category| match category {
             TransportEndpointRejectionCategory::Duplicate => audit_v5::RejectionCategory::Duplicate,
@@ -7325,6 +7373,73 @@ fn v5_failed_endpoint_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_failure_projection_keeps_cumulative_uncertainty() {
+        use audit_v5::{EndpointFailureKind as AuditFailure, RejectionCategory as AuditCategory};
+        use cgka_traits::{
+            TransportEndpointFailureKind as Failure, TransportEndpointRejectionCategory as Category,
+        };
+
+        for (kind, category, expected_kind, expected_category) in [
+            (
+                Failure::PossiblyExposed,
+                None,
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::Error),
+                AuditFailure::PossiblyExposed,
+                Some(AuditCategory::Error),
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::Invalid),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::TooLarge),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::RateLimited),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::PossiblyExposed,
+                Some(Category::AuthRequired),
+                AuditFailure::PossiblyExposed,
+                None,
+            ),
+            (
+                Failure::TerminalRejected,
+                Some(Category::Invalid),
+                AuditFailure::TerminalRejected,
+                Some(AuditCategory::Invalid),
+            ),
+        ] {
+            let failure = TransportEndpointFailure {
+                endpoint: TransportEndpoint("wss://relay.example/".into()),
+                reason: "publication refused".into(),
+                kind,
+                rejection_category: category,
+                size_class: None,
+            };
+            let result = v5_failed_endpoint_result(&failure).unwrap_or_else(|| {
+                panic!("the audit must retain the endpoint for {kind:?}/{category:?}")
+            });
+            assert_eq!(result.status, audit_v5::EndpointStatus::Failed);
+            assert_eq!(result.failure_kind, Some(expected_kind));
+            assert_eq!(result.rejection_category, expected_category);
+        }
+    }
 
     fn failed_frozen_fanout(kind: TransportEndpointFailureKind) -> OutboundFanout {
         let group_id = GroupId::new(vec![0x11; 16]);
@@ -7395,6 +7510,94 @@ mod tests {
             .unwrap();
         assert!(fanout.possible_exposure());
         assert_eq!(OversizedEvent::of_fanout(&fanout), None);
+    }
+
+    #[test]
+    fn legacy_welcome_diagnosis_requires_an_untouched_complete_snapshot() {
+        let mut request = failed_frozen_fanout(TransportEndpointFailureKind::TerminalRejected)
+            .request()
+            .clone();
+        let recipient = MemberId::new(vec![0x66; 32]);
+        let endpoint = request.target.endpoints()[0].clone();
+        request.message.envelope = TransportEnvelope::Welcome {
+            recipient: recipient.clone(),
+        };
+        request.target = TransportPublishTarget::Inbox {
+            recipient,
+            endpoints: vec![endpoint.clone()],
+        };
+        let mut fanout = DurableTransportFanout {
+            id: request.message.id.clone(),
+            group_id: None,
+            evolution_id: None,
+            exact_message: request.message.clone(),
+            target: request.target,
+            targets: vec![TransportFanoutTarget {
+                endpoint: endpoint.clone(),
+                state: TransportFanoutAttemptState::Unattempted,
+                attempt_count: 0,
+                last_attempt_at: None,
+                failure_code: None,
+            }],
+            required_acks: 1,
+            evolution_confirmed: false,
+            possible_exposure: false,
+            created_at: Timestamp(1),
+            bounded_until: None,
+        };
+        let result = Err(TransportAdapterError::PublishEndpoints(
+            cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                "size refusal",
+                vec![TransportEndpointFailure {
+                    endpoint,
+                    reason: "relay rejected event (too-large)".into(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
+                    rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+                    size_class: Some(cgka_traits::EventSizeClass::Under64Kib),
+                }],
+            ),
+        ));
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            Some(OversizedEvent {
+                artifact: OversizedArtifact::Welcome,
+                size_class: cgka_traits::EventSizeClass::Under64Kib
+            })
+        );
+        fanout.targets[0].attempt_count = 1;
+        fanout.targets[0].state = TransportFanoutAttemptState::AttemptedFailed;
+        fanout.targets[0].failure_code = Some("transport_rejected".into());
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            None,
+            "coarse prior evidence cannot be reconstructed as definite"
+        );
+        fanout.targets[0].attempt_count = 0;
+        fanout.targets[0].state = TransportFanoutAttemptState::Unattempted;
+        fanout.targets[0].failure_code = None;
+        fanout.possible_exposure = true;
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            None
+        );
+        fanout.possible_exposure = false;
+        let other = TransportEndpoint("wss://second.example".into());
+        let TransportPublishTarget::Inbox { endpoints, .. } = &mut fanout.target else {
+            unreachable!()
+        };
+        endpoints.push(other.clone());
+        fanout.targets.push(TransportFanoutTarget {
+            endpoint: other,
+            state: TransportFanoutAttemptState::Unattempted,
+            attempt_count: 0,
+            last_attempt_at: None,
+            failure_code: None,
+        });
+        assert_eq!(
+            OversizedEvent::of_first_legacy_welcome_attempt(&fanout, &result),
+            None,
+            "a partial endpoint list cannot prove the original snapshot refused"
+        );
     }
 
     fn published_message(id: u8) -> PublishedApplicationMessage {

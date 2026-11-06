@@ -27,6 +27,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [undelivered Welcomes](#undelivered-welcomes),
   [turning on account devices](#turning-on-account-devices),
   [backup recovery and background conditions](#backup-recovery-and-background-conditions),
   [group reporting](#group-reporting),
@@ -152,14 +153,21 @@ or task cancellation, a durable mutation may already be queued; refresh authorit
 before retrying. Do not translate every error into an empty list, restart the entire runtime on
 every subscription update, or delete lock/database files to recover ownership.
 
-`EventTooLarge { artifact, sizeClass }` identifies a conclusive size refusal of one serialized event by every
-requested relay, with no acceptance or unresolved outcome. The artifact is Commit, Welcome, ApplicationMessage or
-Other; size classes are coarse diagnostic buckets from under 64 KiB through over 4 MiB, not relay limits. Do not
-infer this error from generic relay text, a timeout, or one refusal among mixed outcomes. Older retained failures,
-unknown relay formats and KeyPackage publication errors that carry only a message remain generic. Typed causes
-come from frozen native fanout evidence; ordinary legacy Welcome sends and direct signed-publication helpers may
-still report generic failures. A successful Commit is not undone by a later Welcome publication failure; this error
-adds no automatic retirement or retry policy.
+`EventTooLarge { artifact, sizeClass }` reports a size refusal of one serialized event by every requested relay on
+the observed attempt. The artifact is Commit, Welcome, ApplicationMessage or Other; size classes are coarse diagnostic
+buckets from under 64 KiB through over 4 MiB, not relay limits. Do not infer this error from generic relay text, a
+timeout, or one refusal among mixed outcomes. Frozen native fanouts retain their strong proof: no accepted,
+outstanding or ambiguously exposed targets in their retained history, and complete matching typed refusals.
+
+A legacy Welcome's first attempt visible to its coarse bookkeeping can also carry this explanation. A crash before
+finish bookkeeping, or expiry of an older attempt record, can hide earlier exposure. Thus a Welcome `EventTooLarge`
+does **not** prove that the recipient never received it or that delivery is terminal: keep native retries, pending
+work and confirmed state. The error has no frozen-versus-legacy discriminator; hosts must use this limited Welcome
+meaning. Once the retained legacy record shows a prior attempt, its cause stays Unknown/generic rather than being
+reconstructed. Unknown relay formats and KeyPackage errors carrying only a message remain generic; direct signed
+helpers may also remain generic. An explicit retry can return this error; a confirmed create/invite instead exposes
+the later Welcome failure through its pending query/notice without undoing the Add. No retirement or retry policy
+is added.
 
 ### Screen snapshots, paging and ownership
 
@@ -908,6 +916,27 @@ an admin meanwhile, or the change no longer applies), MDK drops it and emits
 for that group. Nothing retries it: tell the user, who may try again. `reason`
 is a stable tag such as `not_group_admin`.
 
+## Undelivered Welcomes
+
+An Add can already be confirmed while its Welcome remains unacknowledged. Subscribe before creating or
+inviting, then use `pending_welcome_deliveries(account_ref)` to read the current repair handles. The
+`WelcomeDeliveryPending` event and each handle carry optional `size_class`: a coarse serialized-event size explaining
+the observed all-target refusal. It does not estimate any relay's configured limit or prove non-delivery; earlier
+legacy exposure can be hidden by a crash or expired bookkeeping. The same [limited Welcome meaning](#runtime-lifecycle-threads-and-errors)
+applies to a typed retry error. `None` means Unknown, including old records, lost diagnostic writes and unrecognized
+future annotations; it is evidence of neither delivery nor non-delivery.
+
+The event remains once per process/Welcome. Later cause changes are obtained from the query, not another event.
+A later coarse legacy retry may replace a specific displayed cause with Unknown while the same debt persists.
+MDK continues its existing retry behavior; this diagnosis neither removes the member nor adds another leaf,
+rolls back the confirmed Add, or declares the obligation terminal. Hosts can distinguish a known size refusal
+from an unexplained delivery problem without receiving relay details or another account's device information.
+
+The event gains a field and the pending query returns a new record. The account database adds one nullable
+annotation to each existing repair row;
+older native builds supporting only schema 0176 cannot reopen the migrated database. There is no wire change or
+additional diagnostic network traffic.
+
 ## Members are accounts
 
 An account can have several devices in one group, each its own MLS leaf. Member
@@ -1158,6 +1187,35 @@ stands or the device leaves the roster, a later branch that removes that rival d
 choice. To apply it again, edit the device once it is listed in the selected roster. Refresh the displayed label and flags on
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
 
+### Explicit local device-group reset before fresh pairing
+
+In an experimental device-group build, offer `reset_device_group_for_repair(account_ref)` only after the user chooses
+to discard this device's local hidden device-group copy. It keeps account credentials, the stable device slot and
+ordinary chats, history, drafts and settings. It abandons old link-bound preparations; retained shared values and
+security decisions can synchronize again under ordinary rules. It sends no removal and repairs no ordinary-chat
+membership. It is separate from sign-out, account removal and a Move. An already unlinked
+device cannot use it to bypass removal.
+
+Reset acts on this device, not the other slot named by a sign-in row. Check both devices before choosing which local
+copy to discard. If the approver still lists this slot, fresh admission can remain refused; removing that slot writes
+removal evidence and is not a universal shortcut back in. If no other device retains the old group, a later first
+link can create a different group: its discarded roster continuity is not restored. Independently retained local
+backup/security records are kept.
+
+The returned link snapshot has no trusted old copy to restore. Reset does not publish a new KeyPackage. Use the normal
+`rotate_key_package(account_ref)` publication action, then start a fresh code-comparison flow and confirm on both
+devices; the fresh Welcome can join the same group id under the existing exact sender/group/KeyPackage checks. Reset
+alone does not guarantee admission: the approver may still list the slot or its old leaf, reject it, or be full.
+Existing duplicate, removal, capacity and authentication rules still apply. Cancellation or failure after reset can
+leave needs-link; a restart before confirmation can require a new exchange. A fresh link already confirmed retains
+its existing durable Welcome-wait/restart rules. Retained chat data guarantees neither current membership nor missing
+history backfill, and admitted work is not recalled.
+
+Active pairing, an unfinished Move or unsettled native device-group work refuses with `device_group_busy`. Ordinary
+settlement may unblock it, but no deadline is promised. No trusted copy returns `no_device_group`; the command never
+creates a link or a new device slot. Rebuild matching native/generated bindings for the additive action and sign-in
+field. Actual app display adoption is separate.
+
 ### Moving this device to another device group
 
 In an experimental device-group build, start the same compared-code linking flow on a device that already trusts a
@@ -1260,6 +1318,13 @@ It is false in ordinary opens without explicit experimental device-group intent.
   `appeared_at`. `client` is display only.
 - `state` is `Prompt`, `NotNow`, or `LinkedElsewhere`/`RejectedElsewhere` when another device answered while the
   prompt waited here. `linked_by_slot_id_hex` names the linking device for `LinkedElsewhere`.
+- `previously_linked_here` adds context only when this device retains a made approval for that slot in its current
+  trusted group but its settled selected roster no longer lists it. Offer “A slot previously linked here is missing
+  from this device's current device list. Open both devices to check the link.” It does not authenticate the current
+  publication or prove permanent loss. Known local removal/rejection or matching retained departure evidence suppresses
+  the context, conservatively including older departures of the same slot/key. Incomplete records, expired evidence,
+  slot reuse and discovery also bound it. False means no affirmative local context, not “never linked.” Keep existing Not now/dismiss behavior; silence/decryption failure is not a reset
+  signal. The user can explicitly choose [local reset](#explicit-local-device-group-reset-before-fresh-pairing).
 - `answer_sign_in(account_ref, slot_id_hex, response)` takes `NotNow`, `Reject` or `Dismiss`. `Reject` drops the sign-in
   from this device's list and records its slot as rejected in the device group's roster; with no device group yet, it
   waits on this device. On another device, a new sign-in whose prompt still waits there turns `RejectedElsewhere` and

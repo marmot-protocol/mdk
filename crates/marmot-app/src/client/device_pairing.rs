@@ -60,7 +60,7 @@ pub enum NewDeviceLinkState {
     },
 }
 
-/// Why a link ended without one device adding the other.
+/// Why a device link attempt ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceLinkEndReason {
     /// This device's user cancelled.
@@ -79,9 +79,9 @@ pub enum DeviceLinkEndReason {
     CannotLink,
     /// The sign-in was rejected on one of this account's devices.
     Rejected,
-    /// Both users confirmed, but adding the device failed, or the new device
-    /// made no change in the device group within an hour of being added, so
-    /// the device that added it removed it again.
+    /// Both users confirmed, but adding or joining failed, or the new device's
+    /// first Commit was not observed on the selected branch in time. Cleanup may
+    /// still be pending; this reason alone does not establish current membership.
     LinkFailed,
 }
 
@@ -217,6 +217,9 @@ pub enum DeviceLinkOp {
     /// Ask another device to link this one. With an existing trusted device
     /// group this begins a move; trust changes only after the new own Commit.
     Start,
+    /// Explicitly discard this device's quiet trusted device-group copy
+    /// before fresh code pairing. Ordinary chat data and identity survive.
+    ResetForRepair,
     /// On the new device: "They match".
     ConfirmMatch,
     /// On the new device: cancel.

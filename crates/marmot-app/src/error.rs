@@ -172,6 +172,10 @@ pub enum AppError {
     DirectConversationIndexNotReady,
     #[error("chat presentation preparation is incomplete; retry after local maintenance")]
     ChatPresentationNotReady,
+    /// A chat-list query broke a size bound or its node list was not one tree.
+    /// Nothing was read.
+    #[error("invalid chat-list query: {0}")]
+    InvalidChatListQuery(storage_sqlite::ChatListQueryError),
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
     #[error("invalid public event reference batch: {0}")]
@@ -232,8 +236,10 @@ pub enum AppError {
     AgentStreamInvalidCandidate(String),
     #[error("publish failed: {0}")]
     Publish(String),
-    /// Every target conclusively refused this artifact for size. Coarse
-    /// metadata only; this is not an assertion about an unknown relay limit.
+    /// Every target refused this artifact for size on the observed attempt.
+    /// A legacy Welcome may have earlier exposure hidden by a crash or expired
+    /// bookkeeping. This proves neither non-delivery nor a terminal outcome;
+    /// keep native retry work and confirmed state. No relay limit is inferred.
     #[error("event too large: {artifact} ({size_class})")]
     EventTooLarge {
         artifact: crate::OversizedArtifact,
@@ -596,7 +602,8 @@ impl AppError {
         )
     }
 
-    /// The same proven size cause through the lower stack's actual wrappers.
+    /// The same observed size cause through the lower stack's actual wrappers.
+    /// For legacy Welcomes it does not rule out earlier exposure.
     /// Direct transport publications have no MLS semantic attribution.
     pub fn as_oversized_event(&self) -> Option<crate::OversizedEvent> {
         match self {
@@ -647,6 +654,7 @@ impl AppError {
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::ChatPresentationNotReady => "chat_presentation_not_ready",
+            Self::InvalidChatListQuery(_) => "invalid_chat_list_query",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
             Self::InvalidPublicEventReferences(_) => "invalid_public_event_references",

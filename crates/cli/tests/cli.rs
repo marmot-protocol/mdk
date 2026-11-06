@@ -10607,6 +10607,38 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
                 .any(|ch| matches!(ch, '\x1b' | '\x07' | '\u{202e}')),
             "unsafe roster controls must not reach the terminal"
         );
+        if expected_settings {
+            let unconfirmed = run_json_error(
+                homes[1].path(),
+                &[
+                    "--socket",
+                    sockets[1].to_str().unwrap(),
+                    "--account",
+                    accounts[1].as_str(),
+                    "devices",
+                    "link",
+                    "reset",
+                ],
+            );
+            assert_eq!(unconfirmed["code"], "confirmation_required");
+            assert_eq!(
+                selected(1, &["list"])["devices"].as_array().unwrap().len(),
+                2
+            );
+            let reset = selected(1, &["link", "reset", "--confirm"]);
+            assert!(reset["new_device"].is_null());
+            assert!(
+                selected(1, &["list"])["devices"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                selected(0, &["list"])["devices"].as_array().unwrap().len(),
+                2,
+                "the thin reset command publishes no remote removal"
+            );
+        }
         for daemon in daemons {
             daemon.stop();
         }

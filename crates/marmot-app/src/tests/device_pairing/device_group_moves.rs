@@ -276,6 +276,19 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             moving.trust(&target),
             Some(DeviceGroupTrust::AwaitingWelcome)
         );
+        let reset = moving
+            .client
+            .device_link(DeviceLinkOp::ResetForRepair)
+            .await;
+        assert!(matches!(
+            reset,
+            Err(AppError::DeviceGroupRefused("device_group_busy"))
+        ));
+        assert!(moving.client.trusted_device_group().unwrap() == Some(old.clone()));
+        assert_eq!(
+            store.app_storage().device_group_move(&target).unwrap(),
+            Some(joined.clone())
+        );
         let issued = moving.client.runtime.issued_private_key_packages().unwrap();
         assert!(!issued.is_empty());
         let fault = linked_device_chats::account_database(&moving.app);

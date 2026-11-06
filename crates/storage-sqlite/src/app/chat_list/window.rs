@@ -1,17 +1,18 @@
 //! Atomic bounded navigation plus selected presentation for runtime-owned windows.
 use super::pages::read_page_tx;
+use super::query::ChatListViewQuery;
 use crate::base::connection::CachedSql;
 use crate::{
-    ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListView,
+    ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
     ChatPresentationVersion, PresentedChatListSnapshot, PresentedChatRow, SqliteAppStorage,
     SqliteResultExt,
 };
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 
 /// Internal foundation for a live runtime window; callers never splice old pages.
 #[derive(Clone)]
 pub struct ChatListWindowQuery {
-    pub view: ChatListView,
+    pub query: ChatListViewQuery,
     /// 1..=200 retained rows.
     pub limit: usize,
     /// Preferred stable anchor, followed by fallback neighbors, at most 200 keys.
@@ -42,6 +43,8 @@ impl SqliteAppStorage {
         {
             return Err(ChatListPageError::InvalidWindowQuery);
         }
+        // A malformed query is a typed error, never a readiness wait.
+        query.query.validate()?;
         self.connection.with_deferred_read(|conn| {
             let missing_base: bool = conn
                 .query_row_cached(
@@ -59,7 +62,7 @@ impl SqliteAppStorage {
                     let mut before = read_page_tx(
                         conn,
                         ChatListPageQuery {
-                            view: query.view,
+                            query: query.query.clone(),
                             limit: query.before_anchor + 1,
                             direction: ChatListPageDirection::Backward,
                             cursor: None,
@@ -71,7 +74,7 @@ impl SqliteAppStorage {
                         let after = read_page_tx(
                             conn,
                             ChatListPageQuery {
-                                view: query.view,
+                                query: query.query.clone(),
                                 limit: remaining,
                                 direction: ChatListPageDirection::Forward,
                                 cursor: before.last.clone(),
@@ -89,7 +92,7 @@ impl SqliteAppStorage {
                 None => read_page_tx(
                     conn,
                     ChatListPageQuery {
-                        view: query.view,
+                        query: query.query.clone(),
                         limit: query.limit,
                         direction: ChatListPageDirection::Forward,
                         cursor: None,
@@ -104,7 +107,7 @@ impl SqliteAppStorage {
                 let mut before = read_page_tx(
                     conn,
                     ChatListPageQuery {
-                        view: query.view,
+                        query: query.query.clone(),
                         limit: query.limit - page.rows.len(),
                         direction: ChatListPageDirection::Backward,
                         cursor: page.first.clone(),
@@ -170,14 +173,25 @@ fn choose_anchor(
     conn: &Connection,
     query: &ChatListWindowQuery,
 ) -> Result<Option<String>, ChatListPageError> {
+    let compiled = query.query.compile()?;
     let mut stmt = conn
         .prepare_cached(&format!(
-            "SELECT group_id_hex FROM chat_list_rows WHERE lower(group_id_hex)=lower(?1) AND {}",
-            query.view.predicate()
+            "SELECT group_id_hex FROM chat_list_rows WHERE {} AND lower(group_id_hex)=lower(?{})",
+            compiled.predicate,
+            compiled.params.len() + 1
         ))
         .storage()?;
     for key in &query.anchors {
-        if let Some(key) = stmt.query_row([key], |r| r.get(0)).optional().storage()? {
+        let params = compiled
+            .params
+            .iter()
+            .cloned()
+            .chain([Value::from(key.clone())]);
+        if let Some(key) = stmt
+            .query_row(params_from_iter(params), |r| r.get(0))
+            .optional()
+            .storage()?
+        {
             return Ok(Some(key));
         }
     }

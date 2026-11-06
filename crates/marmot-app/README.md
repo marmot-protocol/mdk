@@ -331,6 +331,15 @@ departure obligation. Already admitted native work follows its ordinary retry ru
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
 
+For outbound Welcomes, canonical group creation or a confirmed Add can succeed while delivery fails. Subscribe to
+`WelcomeDeliveryPending` and read `pending_welcome_deliveries` for the retained repair handles. Their optional
+`size_class` explains an all-target size refusal on the observed attempt, without relay details or an assumed relay
+limit. A legacy Welcome can have earlier exposure hidden by a crash or expired bookkeeping: neither a present class
+nor Unknown proves delivery or non-delivery. This also applies to a Welcome `EventTooLarge` error; keep native retry
+work and confirmed state. A specific diagnosis may become Unknown after a coarse legacy retry, while the same delivery
+debt and membership remain. Notices remain once per process/Welcome; use the query or an explicit retry's error for
+later causes. Diagnosis storage is best effort and never owns retries, adds another member, or rolls back the Add.
+
 **Members are accounts.** An account with several devices holds one MLS leaf per device in a group. Every member
 projection groups leaves by account: member records, rosters, member-id pages and conversation snapshots list each
 account once with its `device_count`, and `member_count`, admin counts and direct-chat detection count accounts. A chat
@@ -655,6 +664,10 @@ link this device. It is refused before the first check and once this device trus
 says whether it did so and still has no device group, so the app can say that only chats it is invited to from now on
 are here.
 
+`UnrecognizedSignIn::previously_linked_here` is optional local context for a retained link missing from the
+currently trusted, settled roster; false means no affirmative context, and the flag neither authenticates the current
+publication nor proves permanent loss.
+
 ## Compromise warning
 
 `MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
@@ -679,13 +692,16 @@ link (`new_device`) and the prompts for sign-ins this device can link (`prompts`
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from
   `WaitingForAnswer` to `Comparing`, with seven emoji and their English descriptions for screen readers, then
-  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` ends it.
+  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` requests cancellation; see the [cancellation contract](../marmot-uniffi/API-REFERENCE.md#marmotcancel_device_link) for limits.
 - On a device already signed in, a prompt shows the same code once that device checked the new device's KeyPackage.
   `link_device` takes the prompt id, the new device's label and its two settings, both on by default.
   `decline_device_link` is Not now. The prompt stays `Linking` until the new device's first change in the device
   group arrives, which the new device makes as soon as it joins; with none within an hour, this device removes it
   again and both sides show `LinkFailed`. A prompt also says when the sign-in can't be linked, when the account has
   20 devices, when several sign-ins compete, and who added the device on another device.
+- For explicit local repair, `reset_device_group_for_repair` follows the [shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing)
+  before fresh pairing: it preserves ordinary data but discards this copy's device-group continuity, may refuse while
+  busy, and does not guarantee fresh admission.
 - `device_link_snapshot` returns current linking and move progress. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
   also fires once each time the account's worker opens or reconnects. Unconfirmed comparisons end because their
   secrets are memory-only; admitted move bookkeeping resumes from storage.

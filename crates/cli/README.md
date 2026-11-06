@@ -690,6 +690,24 @@ can stay pending indefinitely while ordinary repair applies, keeping old trust a
 Corrupt or unreadable local move records may need manual local recovery or reset. These conditions do not themselves
 unlink this device. See [move behavior and limits](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
 
+To deliberately discard only this device's local hidden device-group copy before fresh code pairing:
+
+```sh
+wn --account "$ACCOUNT" devices link reset --confirm
+wn --account "$ACCOUNT" keys rotate
+wn --account "$ACCOUNT" devices link start
+```
+
+This keeps ordinary chats/history/drafts/settings, account credentials and the current slot; it abandons old link-bound
+preparations, not shared-state/security synchronization, and publishes no removal. It refuses active pairing/Move or
+unsettled native work (`device_group_busy`),
+possibly indefinitely. No trusted copy returns `no_device_group`. Reset does not guarantee fresh admission: an approver
+that still lists the slot/old leaf, rejects it or is full can refuse. Reset itself publishes no KeyPackage; use the
+existing rotation command before fresh code pairing, as above. A failed publication does not restore old trust;
+cancellation/failure can leave needs-link, and no old copy is restored. An already-confirmed fresh Welcome wait retains
+its normal restart behavior. Ordinary chat membership and missing-history repair remain separate. See the
+[shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing).
+
 For this dev-testing build, run **all account commands through a persistent matching daemon**. Select it explicitly
 with `--socket` or exported `WN_SOCKET`, so connection failure is reported instead of falling back to local execution.
 The `devices` commands themselves refuse local execution: without an auto-discovered daemon, their JSON error is
@@ -697,8 +715,8 @@ The `devices` commands themselves refuse local execution: without an auto-discov
 
 Other existing dev account commands can still start one-shot live workers. Such a worker can answer a pending link,
 then exit and lose the unconfirmed comparison session. Comparison sessions and prompt ids are also lost on a
-daemon/worker restart. If an unconfirmed exchange is interrupted, start both daemons, cancel on the new device and
-start a fresh link with a fresh comparison. Already committed links and owed Welcomes retain their existing durable
+daemon/worker restart. If an unconfirmed exchange is interrupted, start both daemons and cancel on the new device only if its exchange
+is still active; then start a fresh link with a fresh comparison. Already committed links and owed Welcomes retain their existing durable
 behavior, so inspect `devices list` before retrying. Restarting does not roll back an approved link.
 
 This dogfood CLI does not expose the existing-device **Not now** action. Do not approve an unwanted request or

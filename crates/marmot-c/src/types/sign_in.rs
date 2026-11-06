@@ -63,6 +63,10 @@ c_mirror! {
         copy signed_in: bool,
         copy state: MarmotUnrecognizedSignInState,
         opt_str linked_by_slot_id_hex,
+        /// Retained local made approval missing from this selected roster;
+        /// not identity authentication or proof of permanent loss. False
+        /// means no affirmative local context, not that it was never linked.
+        copy previously_linked_here: bool,
     }
 }
 
@@ -76,16 +80,17 @@ mod tests {
         let _lock = audit::test_lock();
         let before = audit::live_allocations();
         let list = boxed(MarmotUnrecognizedSignInList::from(vec![
-            UnrecognizedSignInFfi {
+            marmot_app::UnrecognizedSignIn {
                 slot_id_hex: "ab".repeat(32),
                 client: "White Noise".to_owned(),
                 appeared_at: 7,
                 last_seen_at: 9,
                 before_this_device: true,
                 signed_in: true,
-                state: UnrecognizedSignInStateFfi::Prompt,
-                linked_by_slot_id_hex: None,
-            },
+                state: marmot_app::UnrecognizedSignInState::Prompt,
+                previously_linked_here: true,
+            }
+            .into(),
             UnrecognizedSignInFfi {
                 slot_id_hex: "cd".repeat(32),
                 client: String::new(),
@@ -95,6 +100,7 @@ mod tests {
                 signed_in: false,
                 state: UnrecognizedSignInStateFfi::LinkedElsewhere,
                 linked_by_slot_id_hex: Some("ef".repeat(32)),
+                previously_linked_here: false,
             },
         ]));
         unsafe {
@@ -105,11 +111,13 @@ mod tests {
                 "White Noise"
             );
             assert_eq!((first.appeared_at, first.last_seen_at), (7, 9));
-            assert!(first.before_this_device && first.signed_in);
+            assert!(first.before_this_device && first.signed_in && first.previously_linked_here);
             assert_eq!(first.state, MarmotUnrecognizedSignInState::Prompt);
             assert!(first.linked_by_slot_id_hex.is_null());
             let second = &*(*list).items.add(1);
-            assert!(!second.before_this_device && !second.signed_in);
+            assert!(
+                !second.before_this_device && !second.signed_in && !second.previously_linked_here
+            );
             assert_eq!(second.state, MarmotUnrecognizedSignInState::LinkedElsewhere);
             assert_eq!(
                 std::ffi::CStr::from_ptr(second.linked_by_slot_id_hex)
@@ -133,6 +141,13 @@ mod tests {
             MarmotSignInResponse::from_c(2).unwrap().to_ffi(),
             SignInResponseFfi::Dismiss
         );
-        assert!(MarmotSignInResponse::from_c(3).is_err());
+        assert_eq!(
+            MarmotSignInResponse::from_c(1).unwrap().to_ffi(),
+            SignInResponseFfi::Reject
+        );
+        assert_eq!(
+            MarmotSignInResponse::from_c(3),
+            Err(crate::MarmotStatus::InvalidArgument)
+        );
     }
 }

@@ -262,8 +262,10 @@ pub enum MarmotKitError {
     DirectoryLookupIncomplete { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
-    /// All current targets conclusively refused this artifact for size. Only
-    /// coarse locally measured metadata is exposed; no relay limit is inferred.
+    /// All current targets refused this artifact for size on the observed attempt.
+    /// A legacy Welcome can have earlier exposure hidden by a crash or expired
+    /// bookkeeping; this is not proof of non-delivery or a terminal outcome.
+    /// Keep native retries and confirmed state. No relay limit is inferred.
     #[error("event too large: {artifact} ({size_class})")]
     EventTooLarge {
         artifact: OversizedArtifactFfi,
@@ -512,6 +514,12 @@ pub enum MarmotKitError {
     ChatWindowClosed,
     #[error("chat window query failed: {details}")]
     ChatWindowQuery { details: String },
+    /// A chat-list query broke a size bound or its node list was not one tree.
+    /// Nothing was read; fix the query rather than retrying it.
+    #[error("invalid chat-list query: {reason}")]
+    InvalidChatListQuery {
+        reason: crate::conversions::ChatListQueryErrorFfi,
+    },
     #[error("conversation window requests require 1 to 200 rows")]
     ConversationWindowInvalidLimit,
     #[error("selected draft changed; refresh before retrying")]
@@ -655,6 +663,9 @@ impl From<&AppError> for MarmotKitError {
                 max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
             },
             AppError::ChatPresentationNotReady => Self::ChatPresentationNotReady,
+            AppError::InvalidChatListQuery(error) => Self::InvalidChatListQuery {
+                reason: (*error).into(),
+            },
             AppError::DirectConversationIndexNotReady => Self::DirectConversationIndexNotReady,
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
@@ -1580,6 +1591,12 @@ mod tests {
             .next()
             .unwrap_or_default()
             .to_owned()
+    }
+}
+
+impl From<marmot_app::ChatListQueryError> for MarmotKitError {
+    fn from(v: marmot_app::ChatListQueryError) -> Self {
+        Self::InvalidChatListQuery { reason: v.into() }
     }
 }
 

@@ -119,6 +119,11 @@ pub struct UnrecognizedSignIn {
     /// read that finds none clears it; the sign-in stays listed.
     pub signed_in: bool,
     pub state: UnrecognizedSignInState,
+    /// This device retains a made approval for this slot, which its current
+    /// selected device roster no longer lists. Informational only: this does
+    /// not authenticate the currently publishing key or prove permanent loss.
+    /// False means no affirmative local context, not that it was never linked.
+    pub previously_linked_here: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,17 +446,24 @@ impl AppClient {
             return Ok(Vec::new());
         }
         let own_slot = self.own_key_packages()?.slot;
-        let roster = self.trusted_device_roster()?.map(|(_, roster)| roster);
+        let trusted = self.trusted_device_roster()?;
+        let roster = trusted.as_ref().map(|(_, roster)| roster);
         let exceptions = self.old_move_sibling_exceptions()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        Ok(storage
-            .sign_ins()?
+        let records = storage.sign_ins()?;
+        let prior = trusted
+            .as_ref()
+            .map_or_else(BTreeSet::new, |(group, roster)| {
+                self.previously_linked_sign_in_slots(&storage, group, roster, &records)
+            });
+        Ok(records
             .into_iter()
             .filter_map(|record| {
                 if exceptions.contains(&record.slot_id_hex) {
                     return None;
                 }
-                let state = listed_state(&record, roster.as_ref(), own_slot.as_deref())?;
+                let state = listed_state(&record, roster, own_slot.as_deref())?;
+                let previously_linked_here = prior.contains(&record.slot_id_hex);
                 Some(UnrecognizedSignIn {
                     slot_id_hex: record.slot_id_hex,
                     client: record.client,
@@ -460,9 +472,83 @@ impl AppClient {
                     before_this_device: record.before_this_device,
                     signed_in: record.signed_in,
                     state,
+                    previously_linked_here,
                 })
             })
             .collect())
+    }
+
+    /// Local display context only. Missing or unreadable old evidence never
+    /// changes sign-in eligibility, raises a new error, or authorizes repair.
+    fn previously_linked_sign_in_slots(
+        &self,
+        storage: &SqliteAppStorage,
+        group: &cgka_traits::GroupId,
+        roster: &DeviceRosterV1,
+        records: &[SignInRecord],
+    ) -> BTreeSet<String> {
+        let mut prior = BTreeSet::new();
+        if !self.device_group_settled(group) {
+            return prior;
+        }
+        let facts = self.remembered_tag_keys(group).and_then(|keys| {
+            self.stored_group(group)
+                .map(|selected| (keys, selected.map(|group| group.device_roster_departures)))
+        });
+        let (keys, departures) = match facts {
+            Ok((keys, Some(departures))) => (keys, departures),
+            Ok((_, None)) => return prior,
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::client::sign_ins", method = "prior_link_context",
+                    "prior-link display context could not be read");
+                return prior;
+            }
+        };
+        let group_hex = hex::encode(group.as_slice());
+        let mut unreadable = 0usize;
+        for record in records {
+            let Some(slot) = roster_slot(&record.slot_id_hex) else {
+                continue;
+            };
+            if roster.devices.contains_key(&slot) || roster.rejected_slots.contains_key(&slot) {
+                continue;
+            }
+            let context = (|| -> Result<bool, AppError> {
+                let Some(link) = storage
+                    .device_link(&group_hex, &record.slot_id_hex)?
+                    .filter(|link| link.outcome == storage_sqlite::DeviceLinkOutcome::Linked)
+                else {
+                    return Ok(false);
+                };
+                if storage.has_device_removal(&group_hex, &record.slot_id_hex)? {
+                    return Ok(false);
+                }
+                let key = hex::decode(link.leaf_signature_key_hex)?;
+                if key.is_empty() {
+                    return Ok(false);
+                }
+                Ok(!keys.iter().any(|known| {
+                    known.slot == slot && known.held_as_removed && known.tag_signature_key == key
+                }) && !departures.iter().any(|departure| {
+                    // A founding approval and its roster entry can take
+                    // different clock readings. Older same-key evidence
+                    // also withholds this optional display context.
+                    departure.slot == slot && departure.tag_signature_key.as_ref() == Some(&key)
+                }))
+            })();
+            match context {
+                Ok(true) => {
+                    prior.insert(record.slot_id_hex.clone());
+                }
+                Ok(false) => {}
+                Err(_) => unreadable += 1,
+            }
+        }
+        if unreadable > 0 {
+            tracing::warn!(target: "marmot_app::client::sign_ins", method = "prior_link_context",
+                unavailable_count = unreadable, "some prior-link display context could not be read");
+        }
+        prior
     }
 
     /// Answer the unrecognized sign-in in `slot_id_hex`. A rejection is

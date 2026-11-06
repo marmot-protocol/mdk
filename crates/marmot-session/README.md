@@ -14,10 +14,12 @@ The default-off `dev-device-groups` capability permits the adopted device roster
 The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
 See [dev device linking](../cli/README.md#device-linking-dev-builds).
 
-`PublishFailure::oversized` carries a coarse artifact and event-size class only when the complete frozen target set
-conclusively refused the event for size, with no acceptance, unresolved target or prior possible exposure. Old or
-incomplete evidence stays unknown. This diagnostic does not change publication admission, rollback or Welcome debt.
-Custom transport adapters initialize the new optional size fields to `None` unless they can establish that proof;
+`PublishFailure::oversized` carries a coarse artifact and event-size class when the complete frozen target set
+conclusively refused the event for size, with no acceptance, unresolved target or prior possible exposure. A legacy
+Welcome's first observed attempt can also carry it: this explains that attempt only, because a crash or expired
+bookkeeping may hide earlier exposure. Old or incomplete evidence stays unknown; neither Unknown nor a legacy size
+reason proves delivery or non-delivery. This diagnostic does not change publication admission, rollback or Welcome debt.
+Custom transport adapters initialize the optional size fields to `None` unless they have the required size evidence;
 existing retained JSON without them remains readable. Readers predating the new `TooLarge` rejection variant cannot
 be assumed to decode newly written failures. No database migration or transport wire change is involved.
 

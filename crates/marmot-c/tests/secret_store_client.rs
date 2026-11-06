@@ -210,6 +210,47 @@ fn client_name_constructor_validates_arguments_without_taking_store_ownership() 
     };
     assert_eq!(status, MarmotStatus::InvalidArgument);
     assert!(client.is_null());
+
+    unsafe extern "C" fn count_destroy(data: *mut c_void) {
+        unsafe { &*(data as *const std::sync::atomic::AtomicUsize) }.fetch_add(1, Ordering::SeqCst);
+    }
+    let destroyed = std::sync::atomic::AtomicUsize::new(0);
+    let store = MarmotSecretStore {
+        user_data: (&destroyed as *const std::sync::atomic::AtomicUsize)
+            .cast_mut()
+            .cast(),
+        has_secret_for_label: Some(has),
+        has_secret_for_account_id: Some(has),
+        write_secret: Some(write_secret),
+        load_secret: Some(load_secret),
+        remove_secret: Some(remove_secret),
+        free_secret: Some(free_secret),
+        destroy: Some(count_destroy),
+    };
+    client = std::ptr::dangling_mut();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_client_name(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            name.as_ptr(),
+            marmot_c::types::notification::MarmotCursorPersistence::Advance as u32,
+            &store,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
+            &raw mut client,
+        )
+    };
+    assert_eq!(
+        status,
+        MarmotStatus::NullPointer,
+        "valid cursor reaches the later required root guard"
+    );
+    assert!(client.is_null());
+    assert_eq!(
+        destroyed.load(Ordering::SeqCst),
+        0,
+        "accepted vtable remains host-owned after failure"
+    );
 }
 
 #[test]
@@ -683,6 +724,29 @@ mod experimental_host {
                                 .contains("pairing_unsupported")
                         );
                         unsafe { marmot_c::marmot_string_free(detail) };
+                        refused = std::ptr::dangling_mut();
+                        assert_ne!(
+                            unsafe {
+                                marmot_reset_device_group_for_repair(
+                                    clients[0],
+                                    account.as_ref().unwrap().as_ptr(),
+                                    &mut refused,
+                                )
+                            },
+                            MarmotStatus::Ok
+                        );
+                        assert!(
+                            refused.is_null(),
+                            "ordinary opens also refuse explicit reset"
+                        );
+                        let detail = marmot_c::marmot_last_error_message();
+                        assert!(
+                            unsafe { CStr::from_ptr(detail) }
+                                .to_str()
+                                .unwrap()
+                                .contains("pairing_unsupported")
+                        );
+                        unsafe { marmot_c::marmot_string_free(detail) };
                         check(unsafe {
                             marmot_c::commands::marmot_client_shutdown_and_close(clients[0])
                         });
@@ -779,6 +843,13 @@ mod experimental_host {
                     }
                     (existing_linked && new_linked).then_some(())
                 });
+                let mut reset = std::ptr::null_mut();
+                check(unsafe {
+                    marmot_reset_device_group_for_repair(clients[2], account.as_ptr(), &mut reset)
+                });
+                assert!(!reset.is_null());
+                assert!(unsafe { (*reset).new_device.is_null() });
+                unsafe { marmot_device_link_snapshot_free(reset) };
                 for (index, client) in clients.into_iter().enumerate().skip(1) {
                     check(unsafe { marmot_c::commands::marmot_client_shutdown_and_close(client) });
                     unsafe { marmot_client_free(client) };

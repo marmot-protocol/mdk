@@ -282,10 +282,17 @@ enum MarmotStatus
    */
   MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118,
   /**
-   * Every current publish target conclusively refused the event for size.
+   * Every current publish target refused the event for size on the observed
+   * attempt. For legacy Welcomes, earlier exposure can be unknown: this is
+   * not proof of non-delivery or a terminal outcome. Keep native retry work.
    * Detail contains only the artifact kind and coarse locally measured size.
    */
   MARMOT_STATUS_EVENT_TOO_LARGE = 119,
+  /**
+   * A chat-list query broke a size bound or its node list was not one tree.
+   * Detail names the `MarmotChatListQueryError`; nothing was read.
+   */
+  MARMOT_STATUS_INVALID_CHAT_LIST_QUERY = 120,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -575,6 +582,21 @@ typedef enum MarmotSendMaintenanceDisposition {
 } MarmotSendMaintenanceDisposition;
 
 /**
+ * Coarse serialized event size, not an inferred relay limit. Only read
+ * when the corresponding has_size_class flag is true.
+ */
+typedef enum MarmotEventSizeClass {
+  MARMOT_EVENT_SIZE_CLASS_UNDER64_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM64_TO128_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM128_TO256_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM256_TO512_KIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM512_KIB_TO1_MIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM1_TO2_MIB,
+  MARMOT_EVENT_SIZE_CLASS_FROM2_TO4_MIB,
+  MARMOT_EVENT_SIZE_CLASS_OVER4_MIB,
+} MarmotEventSizeClass;
+
+/**
  * Why recovery parked. Current policy parks only the first five;
  * `KnownEvent` and `MaintenanceBoundary` are reserved, and
  * `UnprovenHistory` is not raised until the recovery runner owns
@@ -682,7 +704,7 @@ typedef enum MarmotUnrecognizedSignInState {
 } MarmotUnrecognizedSignInState;
 
 /**
- * Why a link ended without one device adding the other.
+ * Why a device link attempt ended.
  */
 typedef enum MarmotDeviceLinkEndReason {
   /**
@@ -718,9 +740,9 @@ typedef enum MarmotDeviceLinkEndReason {
    */
   MARMOT_DEVICE_LINK_END_REASON_REJECTED,
   /**
-   * Both users confirmed, but adding the device failed, or the new device
-   * made no change in the device group within an hour of being added, so
-   * the device that added it removed it again.
+   * Both users confirmed, but adding or joining failed, or the new device's
+   * first Commit was not observed on the selected branch in time. Cleanup may
+   * still be pending; this reason alone does not establish current membership.
    */
   MARMOT_DEVICE_LINK_END_REASON_LINK_FAILED,
 } MarmotDeviceLinkEndReason;
@@ -2839,6 +2861,32 @@ typedef struct MarmotGroupCommitDelivery {
 } MarmotGroupCommitDelivery;
 
 /**
+ * A retained Welcome repair handle after a canonical create or confirmed Add.
+ * Unknown includes legacy rows and later coarse retry outcomes; it does
+ * not clear the debt. A class explains the observed refusal, not delivery:
+ * earlier legacy exposure can be unknown. Requires the matching library and header.
+ */
+typedef struct MarmotPendingWelcomeDelivery {
+  char *group_id_hex;
+  char *message_id_hex;
+  char *recipient_hex;
+  uint64_t recorded_at;
+  bool has_size_class;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotEventSizeClass size_class;
+} MarmotPendingWelcomeDelivery;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotPendingWelcomeDeliveryList {
+  struct MarmotPendingWelcomeDelivery *items;
+  uintptr_t len;
+} MarmotPendingWelcomeDeliveryList;
+
+/**
  * Embedded replacement offer; show the authenticated inviter before confirmation.
  */
 typedef struct MarmotGroupRejoinInvitation {
@@ -3082,6 +3130,12 @@ typedef struct MarmotUnrecognizedSignIn {
   bool signed_in;
   enum MarmotUnrecognizedSignInState state;
   char *linked_by_slot_id_hex;
+  /**
+   * Retained local made approval missing from this selected roster;
+   * not identity authentication or proof of permanent loss. False
+   * means no affirmative local context, not that it was never linked.
+   */
+  bool previously_linked_here;
 } MarmotUnrecognizedSignIn;
 
 /**
@@ -5764,6 +5818,45 @@ typedef struct MarmotNativeStartupSnapshot {
 } MarmotNativeStartupSnapshot;
 
 /**
+ * One borrowed filter node. Child entries are indices into the query's node
+ * array; fields the kind does not read may hold anything (pointers NULL).
+ */
+typedef struct MarmotChatListFilterNode {
+  /**
+   * A `MarmotChatListFilterNodeKind` discriminant.
+   */
+  uint32_t kind;
+  /**
+   * For CONDITION: a `MarmotChatListCondition` discriminant.
+   */
+  uint32_t condition;
+  /**
+   * For ALL and ANY: the children. For NOT: exactly one child.
+   */
+  const uint32_t *children;
+  uintptr_t children_len;
+  /**
+   * For GROUP_IDS: the listed group IDs.
+   */
+  const char *const *group_ids;
+  uintptr_t group_ids_len;
+} MarmotChatListFilterNode;
+
+/**
+ * Borrowed chat-list query: a view narrowed by an optional filter. A NULL
+ * `filter` with `filter_len` 0 is no filter (the whole view). Node 0 is the
+ * root; every other node is the child of exactly one node listed before it.
+ */
+typedef struct MarmotChatListViewQuery {
+  /**
+   * A `MarmotChatListView` discriminant.
+   */
+  uint32_t view;
+  const struct MarmotChatListFilterNode *filter;
+  uintptr_t filter_len;
+} MarmotChatListViewQuery;
+
+/**
  * Borrowed private input. Its path is local only and is never published.
  */
 typedef struct MarmotMediaFileUploadAttachmentRequest {
@@ -6087,9 +6180,8 @@ typedef enum MarmotEvent_Tag {
   MARMOT_EVENT_ACCOUNT_ERROR,
   MARMOT_EVENT_AGENT_STREAM_ACTIVITY,
   /**
-   * A confirmed create/invite could not deliver a welcome to
-   * `recipient_hex`; that member is unjoinable until the welcome is
-   * re-delivered.
+   * A canonical create or confirmed Add still owes a Welcome to
+   * `recipient_hex`; pending does not prove whether the recipient received it.
    */
   MARMOT_EVENT_WELCOME_DELIVERY_PENDING,
   /**
@@ -6220,6 +6312,16 @@ typedef struct MarmotEvent_WelcomeDeliveryPending_Body {
   char *group_id_hex;
   char *message_id_hex;
   char *recipient_hex;
+  /**
+   * Observed refusal, not delivery evidence; earlier legacy exposure can
+   * be unknown. False means Unknown. Query for later causes;
+   * this notice remains once per process/Welcome.
+   */
+  bool has_size_class;
+  /**
+   * Only meaningful when has_size_class is true.
+   */
+  enum MarmotEventSizeClass size_class;
 } MarmotEvent_WelcomeDeliveryPending_Body;
 
 typedef struct MarmotEvent_EpochStallEscalated_Body {
@@ -8274,6 +8376,23 @@ MarmotStatus marmot_group_commit_delivery(const struct MarmotClient *client,
                                           struct MarmotGroupCommitDelivery **out);
 
 /**
+ * Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
+ * evidence is diagnostic only. A false has_size_class means Unknown,
+ * including old rows or a later coarse legacy retry. The pending notice
+ * remains once per process/Welcome; query for later causes. Free the list
+ * with marmot_pending_welcome_delivery_list_free. Use matching artifacts.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_pending_welcome_deliveries(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               struct MarmotPendingWelcomeDeliveryList **out);
+
+/**
  * Query advisory membership health and pending rejoin offers.
  * Free with `marmot_group_recovery_status_free`.
  *
@@ -8802,6 +8921,23 @@ MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client
 MarmotStatus marmot_start_device_link(const struct MarmotClient *client,
                                       const char *account_ref,
                                       struct MarmotDeviceLinkSnapshot **out);
+
+/**
+ * Explicit local device-group reset before fresh code pairing. Keeps
+ * credentials, slot and ordinary chat data; abandons unfinished device
+ * sync without removing any member. Active pairing/Move or unsettled
+ * native work can refuse indefinitely. Requires experimental gates.
+ * Free with `marmot_device_link_snapshot_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reset_device_group_for_repair(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  struct MarmotDeviceLinkSnapshot **out);
 
 /**
  * On the new device: the user says both screens show the same emoji.
@@ -11981,6 +12117,41 @@ MarmotStatus marmot_revalidate_chat_list_ids(const struct MarmotClient *client,
                                              struct MarmotStringList **out);
 
 /**
+ * Select all for a filtered query: every chat ID `query` matches, in display
+ * order, including chats beyond any open window; the count is the list
+ * length. `query` is borrowed. Returns `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY`
+ * for a query over a size bound or a node array that is not one tree, and
+ * `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY`, never a partial list, while base
+ * rows are still being prepared. Free with `marmot_string_list_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, `query` a valid
+ * `MarmotChatListViewQuery`, and out writable.
+ */
+MarmotStatus marmot_chat_list_query_ids(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const struct MarmotChatListViewQuery *query,
+                                        struct MarmotStringList **out);
+
+/**
+ * The subset of `group_ids` still matching `query`, in the caller's order with
+ * duplicates dropped. Only removes; chats that matched since are never added.
+ * Call it right before a bulk action, then run the existing per-chat commands.
+ * Free with `marmot_string_list_free`.
+ *
+ * # Safety
+ * The client must be live, `query` a valid `MarmotChatListViewQuery`,
+ * `group_ids` must hold `group_ids_len` valid strings (or be NULL with length
+ * 0), and out must be writable.
+ */
+MarmotStatus marmot_revalidate_chat_list_query_ids(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const struct MarmotChatListViewQuery *query,
+                                                   const char *const *group_ids,
+                                                   uintptr_t group_ids_len,
+                                                   struct MarmotStringList **out);
+
+/**
  * White Noise's deployment, the one White Noise's clients pass to every
  * constructor. Free with marmot_deployment_free; a client constructed with
  * it keeps its own copy.
@@ -13361,6 +13532,21 @@ MarmotStatus marmot_open_chat_list_window(const struct MarmotClient *client,
                                           struct MarmotChatListWindowSubscription **out_sub);
 
 /**
+ * Open a live window over every chat a filtered query matches; `query` is
+ * borrowed. The filter runs in SQL before paging. A NULL initial_rows uses 50;
+ * otherwise requires 1–100. Returns `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY` for
+ * a query over a size bound or a node array that is not one tree. Take
+ * snapshot once, then receive replacements.
+ * # Safety
+ * client/string/query must be valid; initial_rows must be NULL or readable, out_sub writable.
+ */
+MarmotStatus marmot_open_chat_list_query_window(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const struct MarmotChatListViewQuery *query,
+                                                const uint32_t *initial_rows,
+                                                struct MarmotChatListWindowSubscription **out_sub);
+
+/**
  * Open independent signed-in account summaries; requires no active chat-list handle.
  * # Safety
  * client must be valid; out_sub writable.
@@ -14029,6 +14215,15 @@ void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList
  * `event` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_event_free(struct MarmotEvent *event);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_pending_welcome_delivery_list_free(struct MarmotPendingWelcomeDeliveryList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

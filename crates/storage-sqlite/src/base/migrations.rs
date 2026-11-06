@@ -365,6 +365,8 @@ mod migration_0173_recipient_confirmed_sends;
 mod migration_0174_heartbeat_welcome_repair;
 #[path = "migrations/0176_device_group_moves.rs"]
 mod migration_0176_device_group_moves;
+#[path = "migrations/0177_welcome_failure_size_class.rs"]
+mod migration_0177_welcome_failure_size_class;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1377,6 +1379,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0176_device_group_moves",
         suspend_foreign_keys: &[],
         apply: migration_0176_device_group_moves::apply,
+    },
+    Migration {
+        version: 177,
+        name: "0177_welcome_failure_size_class",
+        suspend_foreign_keys: &[],
+        apply: migration_0177_welcome_failure_size_class::apply,
     },
 ];
 

@@ -578,7 +578,7 @@ pub(crate) struct ScriptedPushRelayClient {
     /// stale socket does once the device drops offline (mdk#2762).
     fail_publish_possibly_exposed: std::sync::atomic::AtomicBool,
     unavailable_endpoints: std::sync::Mutex<Vec<String>>,
-    fail_publish_kind: std::sync::Mutex<Option<u64>>,
+    fail_publish_kind: std::sync::Mutex<Option<(u64, bool)>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
     /// Every completion read stops before its end of stored events, as a
@@ -1039,7 +1039,14 @@ impl ScriptedPushRelayClient {
     }
 
     pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
-        *self.fail_publish_kind.lock().unwrap() = Some(kind);
+        *self.fail_publish_kind.lock().unwrap() = Some((kind, false));
+    }
+
+    /// Supply the SDK's already-classified endpoint refusal to the real
+    /// adapter/session/App owners. Exact-wire parsing remains SDK-owned.
+    #[cfg(feature = "product-analytics-export")]
+    pub(crate) fn reject_publishes_of_kind_as_too_large(&self, kind: u64) {
+        *self.fail_publish_kind.lock().unwrap() = Some((kind, true));
     }
 
     pub(crate) fn allow_all_publish_kinds(&self) {
@@ -1539,8 +1546,35 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         {
             return Ok(NostrPublishOutcome::default());
         }
-        let fail_matching_kind = *self.fail_publish_kind.lock().unwrap() == Some(event.kind);
-        if fail_matching_kind {
+        let failure = *self.fail_publish_kind.lock().unwrap();
+        if let Some((kind, true)) = failure.filter(|(kind, _)| *kind == event.kind) {
+            assert_eq!(kind, event.kind);
+            event
+                .to_verified_nostr_event()
+                .expect("typed boundary fixture receives a genuine signed event");
+            let class =
+                cgka_traits::EventSizeClass::of_bytes(serde_json::to_vec(event).unwrap().len());
+            return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
+                cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                    "relay rejected event (too-large)",
+                    endpoints
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            endpoint,
+                            reason: "relay rejected event (too-large)".into(),
+                            kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                            rejection_category: Some(
+                                cgka_traits::TransportEndpointRejectionCategory::TooLarge,
+                            ),
+                            size_class: Some(class),
+                        })
+                        .collect(),
+                )
+                .with_message_id(cgka_traits::MessageId::new(hex::decode(&event.id).unwrap())),
+            ));
+        }
+        if failure.is_some_and(|(kind, _)| kind == event.kind) {
             return Err(cgka_traits::TransportAdapterError::Publish(
                 "injected publish failure".to_owned(),
             ));

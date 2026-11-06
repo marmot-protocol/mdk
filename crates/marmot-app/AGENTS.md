@@ -519,9 +519,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
   create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
   `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
-  effects) and from the device-link send; never write a pending Welcome row or queue `WelcomeDeliveryPending` from a
-  drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
-  group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
+  effects), the device-link send, and explicit `redeliver_welcome` (also used by link maintenance). Drives reuse
+  those central seams; never write a pending Welcome row or queue `WelcomeDeliveryPending` directly from a drive.
+  It announces each Welcome once per process (`announced_welcome_failures`). A startup retry can recover its group
+  from the live retained Welcome context and then be noted through the ordinary effects recorder; a failure still
+  without a group is left to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
   (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
   `note_welcome_delivery_failures` and that reconcile are the pending table's only writers; never write a row before a
   commit is exposed, since the engine stages an invite's Welcomes with its commit.

@@ -42,6 +42,18 @@ impl SqliteAppStorage {
         Ok(changed != 0)
     }
 
+    /// Whether this device decided to remove this exact group/slot. This
+    /// keyed existence read does not decode unrelated historical decisions.
+    pub fn has_device_removal(&self, group_id_hex: &str, slot_hex: &str) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM device_removals WHERE group_id_hex = ?1 AND slot_hex = ?2)",
+                params![group_id_hex, slot_hex],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Every removal this device decided, oldest decision first.
     pub fn device_removals(&self) -> StorageResult<Vec<DeviceRemovalRecord>> {
         let conn = self.lock()?;

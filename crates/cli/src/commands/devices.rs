@@ -56,6 +56,7 @@ pub(crate) async fn devices_command_with_runtime(
             })
         }
         DevicesCommand::Link { command } => {
+            let reset = matches!(command, DeviceLinkCommand::Reset { .. });
             let snapshot = match command {
                 DeviceLinkCommand::Start => runtime.start_device_link(&account.label).await?,
                 DeviceLinkCommand::Status => runtime.device_link_snapshot(&account.label).await?,
@@ -63,6 +64,18 @@ pub(crate) async fn devices_command_with_runtime(
                     runtime.confirm_device_link_match(&account.label).await?
                 }
                 DeviceLinkCommand::Cancel => runtime.cancel_device_link(&account.label).await?,
+                DeviceLinkCommand::Reset { confirm } => {
+                    if !confirm {
+                        return Err(WnError::ConfirmationRequired {
+                            command: "devices link reset",
+                            flag: "--confirm",
+                            reason: "discarding local device-group state abandons unfinished device sync; fresh code pairing is required",
+                        });
+                    }
+                    runtime
+                        .reset_device_group_for_repair(&account.label)
+                        .await?
+                }
                 DeviceLinkCommand::Approve {
                     prompt_id,
                     label,
@@ -87,7 +100,11 @@ pub(crate) async fn devices_command_with_runtime(
             object.insert("account_id".to_owned(), json!(account.account_id_hex));
             object.insert("npub".to_owned(), json!(npub));
             Ok(CommandOutput {
-                plain: snapshot_plain(&value),
+                plain: if reset {
+                    "Local device group reset. Ordinary chats and credentials were kept. Start fresh code pairing to link again.".to_owned()
+                } else {
+                    snapshot_plain(&value)
+                },
                 json: value,
             })
         }

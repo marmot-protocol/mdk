@@ -1217,9 +1217,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     assert_eq!(laptop.linked_devices().unwrap().len(), 4);
 }
 
-/// With device groups switched off, as in every release build until the
-/// roster's spec lands, nothing is listed and no change is announced, even on
-/// a device that trusts a device group.
+/// With device groups switched off, nothing is listed and no change is
+/// announced, even on a device that trusts a device group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn device_groups_off_list_no_devices_and_no_overdue_refresh() {
     let Devices {

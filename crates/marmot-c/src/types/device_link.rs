@@ -13,7 +13,7 @@ use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, free_vec, owned_c_string, owned_vec};
 
 c_enum! {
-    /// Why a link ended without one device adding the other.
+    /// Why a device link attempt ended.
     MarmotDeviceLinkEndReason from DeviceLinkEndReasonFfi {
         /// This device's user cancelled.
         Cancelled,
@@ -31,9 +31,9 @@ c_enum! {
         CannotLink,
         /// The sign-in was rejected on one of this account's devices.
         Rejected,
-        /// Both users confirmed, but adding the device failed, or the new device
-        /// made no change in the device group within an hour of being added, so
-        /// the device that added it removed it again.
+        /// Both users confirmed, but adding or joining failed, or the new device's
+        /// first Commit was not observed on the selected branch in time. Cleanup may
+        /// still be pending; this reason alone does not establish current membership.
         LinkFailed,
     }
 }
@@ -291,7 +291,7 @@ mod tests {
                 reason: Reason::LinkFailed,
             },
         ];
-        for new_device in new_device_states {
+        for (expected, new_device) in new_device_states.into_iter().enumerate() {
             let snapshot = boxed(MarmotDeviceLinkSnapshot::from(DeviceLinkSnapshotFfi {
                 new_device: Some(new_device),
                 prompts: Vec::new(),
@@ -300,6 +300,34 @@ mod tests {
             unsafe {
                 assert!(!(*snapshot).new_device.is_null());
                 assert_eq!((*snapshot).prompts_len, 0);
+                match (expected, &*(*snapshot).new_device) {
+                    (0, MarmotNewDeviceLinkState::WaitingForAnswer)
+                    | (2, MarmotNewDeviceLinkState::WaitingForOtherDevice)
+                    | (3, MarmotNewDeviceLinkState::Joining)
+                    | (4, MarmotNewDeviceLinkState::Linked) => {}
+                    (1, MarmotNewDeviceLinkState::Comparing { code, code_len }) => {
+                        assert_eq!(*code_len, 7);
+                        for (index, emoji) in std::slice::from_raw_parts(*code, *code_len)
+                            .iter()
+                            .enumerate()
+                        {
+                            assert_eq!(
+                                std::ffi::CStr::from_ptr(emoji.emoji).to_str().unwrap(),
+                                "🐶"
+                            );
+                            assert_eq!(
+                                std::ffi::CStr::from_ptr(emoji.description)
+                                    .to_str()
+                                    .unwrap(),
+                                format!("Dog {index}")
+                            );
+                        }
+                    }
+                    (5, MarmotNewDeviceLinkState::Ended { reason }) => {
+                        assert_eq!(*reason, MarmotDeviceLinkEndReason::LinkFailed)
+                    }
+                    _ => panic!("new-device tag does not match source row {expected}"),
+                }
                 marmot_device_link_snapshot_free(snapshot);
             }
         }
@@ -339,7 +367,35 @@ mod tests {
             assert!((*snapshot).new_device.is_null());
             assert_eq!((*snapshot).prompts_len, 10);
             assert_eq!((*snapshot).moves_len, 1);
+            for (expected, prompt) in
+                std::slice::from_raw_parts((*snapshot).prompts, (*snapshot).prompts_len)
+                    .iter()
+                    .enumerate()
+            {
+                match (expected, &prompt.state) {
+                    (0, MarmotDeviceLinkPromptState::Preparing)
+                    | (1, MarmotDeviceLinkPromptState::Comparing { .. })
+                    | (2, MarmotDeviceLinkPromptState::CompetingRequests)
+                    | (4, MarmotDeviceLinkPromptState::CannotLink { .. })
+                    | (5, MarmotDeviceLinkPromptState::TooManyDevices)
+                    | (6, MarmotDeviceLinkPromptState::Linking)
+                    | (7, MarmotDeviceLinkPromptState::Linked)
+                    | (8, MarmotDeviceLinkPromptState::AddedElsewhere { .. }) => {}
+                    (3, MarmotDeviceLinkPromptState::RateLimited { retry_at }) => {
+                        assert_eq!(*retry_at, 9)
+                    }
+                    (9, MarmotDeviceLinkPromptState::Ended { reason }) => {
+                        assert_eq!(*reason, MarmotDeviceLinkEndReason::CodesDiffer)
+                    }
+                    _ => panic!("prompt tag does not match source row {expected}"),
+                }
+            }
             let movement = &*(*snapshot).moves;
+            assert_eq!(movement.state, MarmotDeviceGroupMoveState::Made);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(movement.move_id).to_bytes(),
+                b"move"
+            );
             assert_eq!(movement.old_siblings_len, 1);
             assert_eq!(movement.overridden_rejection_slots_len, 1);
             assert!((*movement.old_siblings).question_suppressed);

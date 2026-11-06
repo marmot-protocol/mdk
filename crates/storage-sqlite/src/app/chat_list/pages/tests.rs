@@ -19,7 +19,7 @@ fn seed(
 fn page(store: &SqliteAppStorage, view: ChatListView) -> ChatListPage {
     store
         .chat_list_page(ChatListPageQuery {
-            view,
+            query: view.into(),
             limit: 100,
             direction: ChatListPageDirection::Forward,
             cursor: None,
@@ -49,7 +49,7 @@ fn query(
     cursor: Option<ChatListCursor>,
 ) -> ChatListPageQuery {
     ChatListPageQuery {
-        view,
+        query: view.into(),
         limit,
         direction,
         cursor,
@@ -635,7 +635,12 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                     let relation = cursor.as_ref().map(|_| "<");
                     let sql = format!(
                         "EXPLAIN QUERY PLAN {}",
-                        navigation_sql(view, relation, direction, false)
+                        navigation_sql(
+                            &ChatListViewQuery::from(view).compile().unwrap(),
+                            relation,
+                            direction,
+                            false
+                        )
                     );
                     let mut values = cursor
                         .as_ref()
@@ -989,7 +994,7 @@ fn window_query(
     before_anchor: usize,
 ) -> crate::ChatListWindowQuery {
     crate::ChatListWindowQuery {
-        view: ChatListView::Chats,
+        query: ChatListView::Chats.into(),
         limit,
         anchors: anchors.iter().map(|s| (*s).into()).collect(),
         before_anchor,

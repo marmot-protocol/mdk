@@ -126,8 +126,10 @@ mod presented_chat_list;
 mod reactions;
 pub use chat_list_window::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
-    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
-    ChatListWindowSnapshot, RuntimeChatListWindowSubscription,
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
+    ChatListQueryError, ChatListView, ChatListViewQuery, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS,
+    MAX_CHAT_LIST_FILTER_NODES, RuntimeChatListWindowSubscription,
 };
 pub use onboarding::*;
 pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
@@ -1557,10 +1559,10 @@ pub enum MarmotAppEvent {
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
-    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
-    /// the member is in the group but unjoinable until the welcome is
-    /// re-delivered (mdk#352). Emitted so a UI/CLI/UniFFI subscriber learns a
-    /// member needs repair without polling `pending_welcome_deliveries`. The
+    /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
+    /// this does not prove whether the recipient received it (mdk#352).
+    /// Emitted so a UI/CLI/UniFFI subscriber learns delivery remains pending
+    /// without polling `pending_welcome_deliveries`. The
     /// durable record backs a later `redeliver_welcome(message_id_hex)`.
     WelcomeDeliveryPending {
         account_id_hex: String,
@@ -1568,6 +1570,10 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
         message_id_hex: String,
         recipient_hex: String,
+        /// Coarse size refusal on the observed attempt; earlier legacy exposure
+        /// can be unknown. None means Unknown, not non-delivery. This notice
+        /// stays once per process/Welcome; query pending deliveries for later causes.
+        size_class: Option<cgka_traits::EventSizeClass>,
     },
     /// This device has armed `arms` epoch-gap backfills for `group_id` without
     /// catching up: it is still stalled at `stalled_epoch` while the group has
@@ -2596,8 +2602,8 @@ impl MarmotAppRuntime {
 
     /// This account's own devices, from the roster of the device group this
     /// device trusts: this device first, then by when each was linked. Empty
-    /// until this device trusts a device group, and always empty in release
-    /// builds until the roster's spec lands. Refresh on `LinkedDevicesChanged`.
+    /// until this device trusts a device group, and without explicit dev
+    /// capability and runtime intent. Refresh on `LinkedDevicesChanged`.
     /// An unreadable roster is `DeviceGroupRefused("roster_unavailable")`.
     pub async fn linked_devices(
         &self,
@@ -2627,8 +2633,8 @@ impl MarmotAppRuntime {
     /// inviters stop treating it as fresh, so a host warns the user. True
     /// once its publication is a week old with the refresh still held back;
     /// a routine refresh never shows.
-    /// Always false until this device trusts a device group, and in release
-    /// builds until the device group's spec lands. Refresh on
+    /// Always false until this device trusts a device group, and without
+    /// explicit dev capability and runtime intent. Refresh on
     /// `KeyPackageRefreshOverdueChanged`.
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
         self.accounts.key_package_refresh_overdue(account_ref).await
@@ -2639,8 +2645,8 @@ impl MarmotAppRuntime {
     /// KeyPackage in a slot neither this device nor its device group's roster
     /// knows. One that `before_this_device` was signed in before this device
     /// was; ask whether the user still has it. Any other is new; ask whether
-    /// it was them. Always empty in release builds until the roster's spec
-    /// lands. Refresh on `UnrecognizedSignInsChanged`.
+    /// it was them. Always empty without explicit dev capability and runtime
+    /// intent. Refresh on `UnrecognizedSignInsChanged`.
     pub async fn unrecognized_sign_ins(
         &self,
         account_ref: &str,
@@ -2689,7 +2695,7 @@ impl MarmotAppRuntime {
 
     /// Whether this device started fresh and still has no device group, so
     /// the host can say that only chats it is invited to from now on are
-    /// here. Always false in release builds until the roster's spec lands.
+    /// here. Always false without explicit dev capability and runtime intent.
     /// Refresh on `UnrecognizedSignInsChanged`.
     pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
         self.accounts.started_fresh(account_ref).await
@@ -2702,8 +2708,8 @@ impl MarmotAppRuntime {
     /// a session with its remote signer, published where the account's
     /// devices did not; the host writes the wording and never says the
     /// account's devices stopped them. Rejections already in the first
-    /// roster this device trusts count as seen. Always empty in release
-    /// builds until the roster's spec lands. Refresh on
+    /// roster this device trusts count as seen. Always empty without explicit
+    /// dev capability and runtime intent. Refresh on
     /// `CompromiseWarningChanged`.
     pub async fn compromise_warning(
         &self,
@@ -2724,7 +2730,7 @@ impl MarmotAppRuntime {
     /// `slot_id_hex` from `linked_devices`: one roster commit in the device
     /// group. Any device may rename any device. The label is at most 64
     /// bytes of UTF-8; empty clears it. Refused with
-    /// `DeviceGroupRefused`: `roster_unsupported` (release builds),
+    /// `DeviceGroupRefused`: `roster_unsupported` (device groups are off),
     /// `label_too_long`, `no_device_group`, `unknown_device`,
     /// `roster_unavailable`, or `device_group_busy` while the device group
     /// has an earlier change in flight (retry later). A rename whose commit
@@ -2777,7 +2783,7 @@ impl MarmotAppRuntime {
     /// the device with `removal_pending` until the device group takes it.
     /// Chats that can't take a same-account removal keep the device's leaf;
     /// `removed_device_leftover_chats` counts them. Refused with
-    /// `DeviceGroupRefused`: `roster_unsupported` (release builds),
+    /// `DeviceGroupRefused`: `roster_unsupported` (device groups are off),
     /// `no_device_group`, `unknown_device`, `this_device` (sign out
     /// instead), `device_link_pending` while the device's link may still
     /// fail, or `roster_unavailable`. Refresh on `LinkedDevicesChanged`.
@@ -2795,8 +2801,8 @@ impl MarmotAppRuntime {
     /// longer has, because the chat doesn't take a same-account removal; a
     /// chat admin can remove it. The device is one this account removed, or
     /// one its device group stopped listing, as after a failed link. Zero
-    /// until this device trusts a device group, and always zero in release
-    /// builds until the device group's spec lands. Read it when showing the
+    /// until this device trusts a device group, and without explicit dev
+    /// capability and runtime intent. Read it when showing the
     /// device list; it is not evented.
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
@@ -2815,8 +2821,8 @@ impl MarmotAppRuntime {
     /// KeyPackages don't meet is passed over and not counted, so zero
     /// does not mean the new device reaches every chat. A chat admin can
     /// turn the component on; removing a device frees its leaves.
-    /// Zero until this device trusts a device group, and always zero in
-    /// release builds until the device group's spec lands. Read it when
+    /// Zero until this device trusts a device group, and without explicit
+    /// dev capability and runtime intent. Read it when
     /// showing the device list; it is not evented.
     pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
@@ -2829,7 +2835,7 @@ impl MarmotAppRuntime {
     /// ask for the words at `confirm_positions` and pass them to
     /// `confirm_recovery_words`. MDK keeps the words in memory only, so a
     /// restart starts over with new ones. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds).
+    /// `roster_unsupported` (device groups are off).
     pub async fn begin_recovery_words(&self, account_ref: &str) -> Result<RecoveryWords, AppError> {
         self.accounts.begin_recovery_words(account_ref).await
     }
@@ -2840,7 +2846,7 @@ impl MarmotAppRuntime {
     /// device group's roster, or kept by this device until it has one, and
     /// the words are forgotten once their commit went out. Refused with
     /// `DeviceGroupRefused`, keeping the words for another try:
-    /// `roster_unsupported` (release builds), `recovery_words_not_started`,
+    /// `roster_unsupported` (device groups are off), `recovery_words_not_started`,
     /// `recovery_words_mismatch`, `device_group_busy` (retry later) or
     /// `roster_unavailable`. Any other error keeps them too; trying again
     /// with them commits nothing if the roster already holds their key.
@@ -2865,7 +2871,7 @@ impl MarmotAppRuntime {
     /// already written stay until deleted. Turning them on again takes new
     /// words through `begin_recovery_words`. Off already is not an error.
     /// Refused with `DeviceGroupRefused`, changing nothing:
-    /// `roster_unsupported` (release builds), `device_group_busy` (retry
+    /// `roster_unsupported` (device groups are off), `device_group_busy` (retry
     /// later) or `roster_unavailable`.
     pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
         self.accounts.turn_off_backups(account_ref).await
@@ -2978,7 +2984,7 @@ impl MarmotAppRuntime {
     /// (with no device group, as this device keeps them). A change a fork
     /// dropped and the engine could not re-issue shows here as not made; the
     /// user can make it again. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds) or `roster_unavailable`. Read it
+    /// `roster_unsupported` (device groups are off) or `roster_unavailable`. Read it
     /// when showing backup settings; it is not evented.
     pub async fn backup_settings(&self, account_ref: &str) -> Result<BackupSettings, AppError> {
         self.accounts.backup_settings(account_ref).await
@@ -4447,6 +4453,21 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<crate::DeviceLinkSnapshot, AppError> {
         self.device_link(account_ref, crate::DeviceLinkOp::Start)
+            .await
+    }
+
+    /// Explicitly discard this device's quiet trusted device-group copy
+    /// before fresh code pairing. Preserves this account's credentials, slot
+    /// and ordinary chat data. Old link-bound preparation is abandoned;
+    /// shared state/security can resync. No removal or membership repair.
+    /// Refuses active pairing/Move or unsettled native work with
+    /// `device_group_busy`; settlement may take indefinitely. Cancellation
+    /// after reset does not restore the discarded copy. Requires device groups.
+    pub async fn reset_device_group_for_repair(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::ResetForRepair)
             .await
     }
 

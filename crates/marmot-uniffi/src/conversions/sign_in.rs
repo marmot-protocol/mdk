@@ -42,6 +42,10 @@ pub struct UnrecognizedSignInFfi {
     /// The slot of the device that linked it, when `state` is
     /// `LinkedElsewhere` and the roster names one; `None` otherwise.
     pub linked_by_slot_id_hex: Option<String>,
+    /// A retained made approval for this slot is missing from this device's
+    /// current settled roster. Does not authenticate its current publication
+    /// or prove permanent loss. False means no affirmative local context.
+    pub previously_linked_here: bool,
 }
 
 impl From<UnrecognizedSignIn> for UnrecognizedSignInFfi {
@@ -68,6 +72,7 @@ impl From<UnrecognizedSignIn> for UnrecognizedSignInFfi {
             signed_in: value.signed_in,
             state,
             linked_by_slot_id_hex,
+            previously_linked_here: value.previously_linked_here,
         }
     }
 }

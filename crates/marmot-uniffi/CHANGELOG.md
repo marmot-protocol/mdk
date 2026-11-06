@@ -2,12 +2,26 @@
 
 ## Unreleased
 
+- Add filtered chat-list queries (mdk#2983): `open_chat_list_query_window`, `chat_list_query_ids` and
+  `revalidate_chat_list_query_ids` take a `ChatListViewQueryFfi` whose filter is a flat `ChatListFilterNodeFfi` list
+  (node 0 is the root; children are later indices). Invalid queries fail with the new
+  `MarmotKitError::InvalidChatListQuery { reason: ChatListQueryErrorFfi }`. Fixed-view methods are unchanged.
+  Additive; regenerate bindings to use them.
+
 - Add `chat_list_ids(account_ref, view)` and `revalidate_chat_list_ids(account_ref, view, group_ids)` for select all
   over a whole chat-list view (mdk#2983). Hosts keep checkbox state, revalidate before a bulk action, then call the
   existing per-chat commands. Additive; regenerate bindings to use them.
 
+- Expose qualified prior-linked-slot context and explicit local device-group reset for experimental clients. Regenerate matching Swift/Kotlin bindings; ordinary constructors stay disabled. No schema or wire migration.
+
 - Add typed `EventTooLarge` with coarse artifact and size-class enums. Regenerate Swift/Kotlin bindings with the
   matching library; existing error cases and publication lifecycle remain unchanged. No database or wire migration.
+
+- Expose pending Welcome repair handles and optional coarse size diagnosis in the existing pending event.
+  Regenerate bindings with the matching library. Diagnostics are best effort, old/future unknown annotations remain
+  Unknown, and later coarse legacy retries may replace a specific cause; existing debt and retry behavior remain.
+  Legacy Welcome reasons, including `EventTooLarge`, explain the observed attempt, not earlier non-delivery or a
+  terminal outcome; a crash or expired bookkeeping can hide previous exposure.
 
 - Add a default-off `dev-device-groups` host capability and explicit experimental constructor. Ordinary constructors
   remain disabled; opt-in native/generated build outputs are isolated. Existing options layouts remain unchanged.

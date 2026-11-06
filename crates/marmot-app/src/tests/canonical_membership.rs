@@ -1877,6 +1877,7 @@ async fn welcome_failed_after_convergence_reaches_the_host_once() {
 
     let again = marmot_session::AccountDeviceEffects {
         welcome_failures: vec![marmot_session::WelcomeDeliveryFailure {
+            size_class: None,
             message_id: cgka_traits::MessageId::new(hex::decode(&pending.message_id_hex).unwrap()),
             recipient: MemberId::new(hex::decode(&carol.account_id_hex).unwrap()),
             group_id: Some(group.clone()),
