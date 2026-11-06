@@ -1035,6 +1035,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   progress only, retry transient contention, and halt durable decode failures
   without disabling legacy reads.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
+- A test relay behaves like a relay: `ScriptedPushRelayClient` answers every REQ it accepts with EOSE on each relay,
+  sent through its relay-message channel to the plane's own dispatch. A test that needs a relay still replaying,
+  never finishing, or closing a REQ asks for it (`hold_replies`, `release_held_replies`, `close_subscription`) with
+  a one-line reason. Never call the plane's adapter in place of a relay message.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
 - Keep the relay-telemetry export path in the relay plane (`transport-nostr`, rollup in its `src/telemetry.rs`) and

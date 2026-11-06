@@ -977,12 +977,14 @@ impl ScriptedPushRelayClient {
         Ok(())
     }
 
-    /// Answer an accepted REQ on each of its relays as a relay does: the
-    /// stored event a test scripted, then EOSE. A REQ the test holds stays
-    /// unanswered until [`Self::release_held_replies`].
+    /// Answer an accepted REQ on each of its relays as a relay does, on the
+    /// connection it went out on: the stored event a test scripted, then EOSE.
+    /// A REQ the test holds stays unanswered until
+    /// [`Self::release_held_replies`].
     fn reply(&self, subscription: &NostrSubscription, id: &str) {
         let hold = *self.hold_replies.lock().unwrap();
         for endpoint in subscription.endpoints() {
+            self.messages.connect(endpoint);
             if hold.is_some_and(|hold| hold(subscription, endpoint)) {
                 self.held_replies.lock().unwrap().push((
                     id.to_owned(),

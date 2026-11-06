@@ -271,7 +271,10 @@ for reconnect/backoff and relay status mechanics.
   id, an oversized EOSE, a binary frame) spoils every open count on its connection; a REQ re-sent on the same
   connection while the relay may still answer the earlier one (open, spoiled, or closed by the client) starts unknown;
   past 1,024 REQs per relay the oldest count goes. Wrappers of a tapped client delegate `reply_sent_nothing`.
-- Keep real relay clients behind `NostrRelayClient`.
+- Keep real relay clients behind `NostrRelayClient`. A client that is not the SDK's hands its relays' messages to
+  the plane through `relay_notification_source` (`sdk` feature): one stream of `NostrSdkNotification`s, each
+  event's signature already verified and each relay's frames in order, which the plane dispatches through
+  `dispatch_sdk_replay` like the SDK's. The default, `None`, means its relays send the plane nothing.
 - Both SDK consumers enter through `dispatch_sdk_replay`; `dispatch_sdk_notification` is its private payload handler.
   Observe and admit a raw group copy from one validated/decoded transport message, outside the state write lock.
   The directory-only Client stream stays separate from transport replay generations.

@@ -1078,7 +1078,8 @@ async fn live_predecessor_keeps_its_control_record() {
 /// shared forwarder, whose receiver spans accounts, charges none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_notification_lag_charges_the_source_floor() {
-    let relay = Arc::new(RecordingRelayClient::default());
+    // This test runs the plane's shared notification consumer itself.
+    let relay = Arc::new(RecordingRelayClient::without_relay_messages());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
     let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
@@ -1815,6 +1816,9 @@ struct RecordingRelayClient {
     /// What its relays send the plane. These plane tests place each EOSE and
     /// CLOSED themselves, so it answers no REQ on its own.
     messages: Arc<crate::test_support::ScriptedRelayMessages>,
+    /// The plane gets no relay messages from this client: the test feeds the
+    /// plane's notification consumer itself.
+    no_relay_messages: bool,
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
@@ -1826,6 +1830,13 @@ struct RecordingRelayClient {
 }
 
 impl RecordingRelayClient {
+    fn without_relay_messages() -> Self {
+        Self {
+            no_relay_messages: true,
+            ..Self::default()
+        }
+    }
+
     /// `endpoint` ends its stored events for the REQ `id`; returns once the
     /// plane has handled it.
     async fn send_eose(&self, endpoint: &TransportEndpoint, id: impl AsRef<str>) {
@@ -2035,7 +2046,8 @@ async fn aborted_scoped_supervisors_release_health_across_account_restarts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_supervisor_restarts_after_consumer_panic() {
-    let relay = Arc::new(RecordingRelayClient::default());
+    // This test runs the plane's shared notification consumer itself.
+    let relay = Arc::new(RecordingRelayClient::without_relay_messages());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account_adapter = relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay);
     let source = Arc::new(TestNotificationSource::panic_once());
@@ -2189,6 +2201,9 @@ impl NostrRelayClient for RecordingRelayClient {
     fn relay_notification_source(
         &self,
     ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        if self.no_relay_messages {
+            return None;
+        }
         Some(self.messages.clone())
     }
 
@@ -2214,6 +2229,9 @@ impl NostrRelayClient for RecordingRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        for endpoint in subscription.endpoints() {
+            self.messages.connect(endpoint);
+        }
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
     }
@@ -6184,7 +6202,8 @@ fn sign_group_event(event: &mut NostrTransportEvent) {
 async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
-    let relay = Arc::new(RecordingRelayClient::default());
+    // This test runs the plane's shared notification consumer itself.
+    let relay = Arc::new(RecordingRelayClient::without_relay_messages());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
     let group_id = GroupId::new(vec![0xC3; 32]);

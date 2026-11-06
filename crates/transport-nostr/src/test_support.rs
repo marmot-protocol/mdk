@@ -248,9 +248,11 @@ impl AccountPublishFixture {
 /// A scripted relay pool's own messages, which an injected test client hands
 /// its plane through [`NostrRelayClient::relay_notification_source`], so they
 /// reach the adapter through the dispatch the SDK pool's take. Each relay has
-/// one connection, open from the pool's first message from it. Every receiver
-/// gets every message sent after it subscribed, in order, and none is ever
-/// dropped: a scripted pool never shows its plane a lag.
+/// one connection, which opens before the first REQ the client sends it
+/// ([`Self::connect`]); as the SDK's frontier does, every receiver hears that
+/// connection's boundary before any of its messages. Every receiver gets every
+/// message sent after it subscribed, in order, and none is ever dropped: a
+/// scripted pool never shows its plane a lag.
 ///
 /// One pool shared by several planes reaches all of them, as an SDK pool
 /// would; each adapter heeds only the REQ ids it has live.
@@ -259,17 +261,32 @@ impl AccountPublishFixture {
 /// [`Self::reply_sent_nothing`], which [`Self::handled`] needs.
 #[derive(Default)]
 pub struct ScriptedRelayMessages {
-    receivers: StdMutex<Vec<ScriptedReceiver>>,
+    pool: StdMutex<ScriptedPool>,
     flushes: AtomicUsize,
     /// The flush EOSEs a plane has dispatched.
     flushed: StdMutex<HashSet<String>>,
 }
 
-struct ScriptedReceiver {
-    sender: mpsc::UnboundedSender<NotificationUpdate<NostrSdkNotification>>,
-    /// A relay this receiver has had a message from, whose connection its
-    /// adapter has therefore seen.
-    seen: Option<TransportEndpoint>,
+#[derive(Default)]
+struct ScriptedPool {
+    receivers: Vec<mpsc::UnboundedSender<NotificationUpdate<NostrSdkNotification>>>,
+    /// The relays connected so far, in the order they connected.
+    connected: Vec<TransportEndpoint>,
+}
+
+impl ScriptedPool {
+    /// Send `update` to every receiver still reading.
+    fn broadcast(&mut self, update: NotificationUpdate<NostrSdkNotification>) {
+        self.receivers
+            .retain(|receiver| receiver.send(update.clone()).is_ok());
+    }
+
+    fn connect(&mut self, endpoint: &TransportEndpoint) {
+        if !self.connected.contains(endpoint) {
+            self.connected.push(endpoint.clone());
+            self.broadcast(ScriptedRelayMessages::boundary(endpoint));
+        }
+    }
 }
 
 /// The wire id of a flush's EOSE, which no REQ carries.
@@ -278,6 +295,16 @@ const FLUSH_ID_PREFIX: &str = "scripted-relay-flush-";
 impl ScriptedRelayMessages {
     /// The pool's one reader, and each relay's one connection.
     const EPOCH: [u64; 2] = [1, 1];
+
+    /// The relay at `endpoint` is connected: every plane hears its connection
+    /// open, ahead of the REQs the client is about to send it. A relay
+    /// connects once; later calls change nothing.
+    pub fn connect(&self, endpoint: &TransportEndpoint) {
+        self.pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .connect(endpoint);
+    }
 
     /// `endpoint` ended its stored events for the REQ `subscription_id`.
     pub fn eose(&self, endpoint: &TransportEndpoint, subscription_id: &str) {
@@ -322,23 +349,26 @@ impl ScriptedRelayMessages {
     /// once a plane asks about that one, everything before it is handled.
     pub async fn handled(&self) {
         let pending = {
-            let receivers = self
-                .receivers
+            let pool = self
+                .pool
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            receivers
-                .iter()
-                .filter_map(|receiver| {
-                    let endpoint = receiver.seen.as_ref()?;
-                    let flush = self.flushes.fetch_add(1, Ordering::SeqCst);
-                    let id = format!("{FLUSH_ID_PREFIX}{flush}");
-                    let sent = receiver
-                        .sender
-                        .send(Self::notification(endpoint, Self::eose_message(&id)))
-                        .is_ok();
-                    sent.then(|| (id, receiver.sender.clone()))
-                })
-                .collect::<Vec<_>>()
+            match pool.connected.first() {
+                // No relay has connected, so no plane has anything to handle.
+                None => Vec::new(),
+                Some(endpoint) => pool
+                    .receivers
+                    .iter()
+                    .filter_map(|receiver| {
+                        let flush = self.flushes.fetch_add(1, Ordering::SeqCst);
+                        let id = format!("{FLUSH_ID_PREFIX}{flush}");
+                        let sent = receiver
+                            .send(Self::notification(endpoint, Self::eose_message(&id)))
+                            .is_ok();
+                        sent.then(|| (id, receiver.clone()))
+                    })
+                    .collect::<Vec<_>>(),
+            }
         };
         tokio::time::timeout(Duration::from_secs(10), async {
             for spin in 0usize.. {
@@ -401,25 +431,38 @@ impl ScriptedRelayMessages {
         })
     }
 
+    fn boundary(endpoint: &TransportEndpoint) -> NotificationUpdate<NostrSdkNotification> {
+        NotificationUpdate::Notification(NostrSdkNotification::Replay {
+            endpoint: endpoint.clone(),
+            epoch: Self::EPOCH,
+            reason: transport_nostr_adapter::ReplayRestart::Connection,
+            connected_at: None,
+        })
+    }
+
     fn send(&self, endpoint: &TransportEndpoint, message: RelayMessage<'static>) {
-        let notification = Self::notification(endpoint, message);
-        self.receivers
+        let mut pool = self
+            .pool
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain_mut(|receiver| {
-                receiver.seen.get_or_insert_with(|| endpoint.clone());
-                receiver.sender.send(notification.clone()).is_ok()
-            });
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A relay that answers is connected.
+        pool.connect(endpoint);
+        pool.broadcast(Self::notification(endpoint, message));
     }
 }
 
 impl NostrRelayNotificationSource for ScriptedRelayMessages {
     fn notifications(&self) -> transport_nostr_adapter::NostrSdkNotificationStream {
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.receivers
+        let mut pool = self
+            .pool
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(ScriptedReceiver { sender, seen: None });
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A new reader hears each open connection's boundary first.
+        for endpoint in &pool.connected {
+            let _ = sender.send(Self::boundary(endpoint));
+        }
+        pool.receivers.push(sender);
         Box::pin(futures::stream::unfold(
             receiver,
             |mut receiver| async move { receiver.recv().await.map(|update| (update, receiver)) },
