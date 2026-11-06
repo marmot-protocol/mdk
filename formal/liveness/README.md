@@ -126,6 +126,17 @@ checked refinement theorem. The model does not run Rust. The separately landed g
 property named above covers only the in-memory exchange; app/engine tests own persistence
 and MLS admission. An orderly app reopen is not a mid-write process crash.
 
+`TrustRequiresJoined` and `MadeRequiresFirstCommit` check consistency with
+modeled guards. They do not independently establish freshness across attempts:
+current-attempt join and selection evidence is assumed. The native detector
+and reset behavior remain outside this model.
+
+The model retains a pending cancel across restart as an overapproximation.
+Production's cancel flag is volatile: a crash before withdrawal finishes can
+leave the expectation usable, so its Welcome may still join or the wait may
+expire. Pending-wait progress relies on fair expiry and cleanup, not durable
+replay of cancellation.
+
 Crypto-valid code comparison and matching-session authentication are assumed.
 `ConfirmAdd` abstracts successful ordinary roster admission, not a proof of
 its capacity/duplicate/removal checks. `Reset` means an already-admitted
