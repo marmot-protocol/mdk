@@ -65,5 +65,5 @@ the cancels to send.
 - `tests/attacks.rs`: each attack the code defends against, shown failing.
 - `tests/lifecycle.rs`: expiry, the rate limit, competing requests and cancellation, plus a bounded generated-schedule
   property that interleaves confirmation, replay, cancellation, expiry and unrelated-session traffic through the real
-  roles. It checks confirmation authority and prevents ended sessions from being revived; it does not model durable
-  Welcome delivery or restart.
+  roles. It checks confirmation authority, withdrawal by immediately delivered cancels and ended-session replay.
+  It does not model delayed or lost cancels, durable Welcome delivery or restart.

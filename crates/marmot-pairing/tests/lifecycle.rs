@@ -22,6 +22,8 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 /// replay, Cancel, Expire and traffic for another session. Delivery can repeat
 /// only messages the roles actually emitted. The oracle records user decisions
 /// and emitted confirmations; it does not reimplement either state machine.
+/// Cancel messages returned by cancel/expire are delivered immediately; their
+/// delayed delivery, loss and replay are outside this generated sample.
 ///
 /// These are 192 fixed-seed samples of 32 actions, not exhaustive exploration
 /// or a shrinking generator. Durable Welcome waits and restart belong above
@@ -37,7 +39,12 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
         new_decided_first: Option<bool>,
         existing_confirm_delivered: bool,
         new_link_events: usize,
+        new_link_from_tap: usize,
+        new_link_from_delivery: usize,
         existing_link_events: usize,
+        existing_timeout_cancels: usize,
+        // Valid cancels also establish expected terminal outcomes. The
+        // existing role may already have forgotten its record at expiry.
         new_ended: bool,
         existing_ended: bool,
         now: u64,
@@ -62,9 +69,12 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
             &mut self,
             confirm: PairingConfirm,
             link: marmot_pairing::ConfirmedLink,
+            from_tap: bool,
         ) {
             self.check_link(&link);
             self.new_link_events += 1;
+            self.new_link_from_tap += usize::from(from_tap);
+            self.new_link_from_delivery += usize::from(!from_tap);
             self.new_confirm = Some(confirm);
         }
 
@@ -90,7 +100,7 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                         self.new_decided_first.get_or_insert(true);
                         self.new_approved = true;
                         if let NewDeviceConfirmation::Linked { confirm, link } = result {
-                            self.record_new_link(confirm, link);
+                            self.record_new_link(confirm, link, true);
                         }
                     }
                 }
@@ -102,7 +112,7 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                             .new
                             .receive(&PairingMessage::Confirm(confirm.clone()), self.now)
                         {
-                            self.record_new_link(confirm, link);
+                            self.record_new_link(confirm, link, false);
                         }
                     }
                 }
@@ -139,6 +149,8 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                 }
                 7 => {
                     if let Some(cancel) = self.pair.new.cancel() {
+                        self.new_ended = true;
+                        self.existing_ended = true;
                         self.pair.existing.receive(
                             &PairingMessage::Cancel(cancel),
                             self.now,
@@ -148,6 +160,8 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                 }
                 8 => {
                     if let Some(cancel) = self.pair.existing.cancel(&session) {
+                        self.existing_ended = true;
+                        self.new_ended = true;
                         self.pair
                             .new
                             .receive(&PairingMessage::Cancel(cancel), self.now);
@@ -156,6 +170,8 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                 9 => {
                     self.now = T0 + SESSION_TTL_SECS;
                     if let Some(cancel) = self.pair.new.expire(self.now) {
+                        self.new_ended = true;
+                        self.existing_ended = true;
                         self.pair.existing.receive(
                             &PairingMessage::Cancel(cancel),
                             self.now,
@@ -163,6 +179,11 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                         );
                     }
                     for cancel in self.pair.existing.expire(self.now) {
+                        assert_eq!(cancel.session_id, session);
+                        assert_eq!(cancel.reason, CancelReason::Timeout);
+                        self.existing_timeout_cancels += 1;
+                        self.existing_ended = true;
+                        self.new_ended = true;
                         self.pair
                             .new
                             .receive(&PairingMessage::Cancel(cancel), self.now);
@@ -191,7 +212,7 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                 assert_eq!(
                     self.pair.new.linked(),
                     None,
-                    "replay cannot revive a new role"
+                    "a cancelled or ended new role cannot retain or regain its link"
                 );
                 assert!(!self.pair.new.holds_secrets());
             }
@@ -199,7 +220,7 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
                 assert_eq!(
                     self.pair.existing.linked(&session),
                     None,
-                    "replay cannot revive an existing role"
+                    "a cancelled or ended existing role cannot retain or regain its link"
                 );
                 assert_eq!(self.pair.existing.sessions_holding_secrets(), 0);
             }
@@ -217,6 +238,9 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
     let mut completed = 0;
     let mut new_tapped_first = 0;
     let mut existing_tapped_first = 0;
+    let mut links_from_tap = 0;
+    let mut links_from_delivery = 0;
+    let mut existing_timeout_cancels = 0;
     let mut ended = 0;
     let mut cancelled = 0;
     let mut expired = 0;
@@ -232,7 +256,10 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
             new_decided_first: None,
             existing_confirm_delivered: false,
             new_link_events: 0,
+            new_link_from_tap: 0,
+            new_link_from_delivery: 0,
             existing_link_events: 0,
+            existing_timeout_cancels: 0,
             new_ended: false,
             existing_ended: false,
             now: T0,
@@ -266,6 +293,9 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
             existing_tapped_first += usize::from(probe.new_decided_first == Some(false));
             completed += 1;
         }
+        links_from_tap += probe.new_link_from_tap;
+        links_from_delivery += probe.new_link_from_delivery;
+        existing_timeout_cancels += probe.existing_timeout_cancels;
         ended += usize::from(probe.new_ended || probe.existing_ended);
         cancelled += usize::from(matches!(
             probe.pair.new.end_reason(),
@@ -278,6 +308,8 @@ fn pairing_generated_schedules_preserve_confirmation_authority() {
     }
     assert_eq!(completed, 64);
     assert!(new_tapped_first > 0 && existing_tapped_first > 0);
+    assert!(links_from_tap > 0 && links_from_delivery > 0);
+    assert!(existing_timeout_cancels > 0);
     assert!(ended > 0 && cancelled > 0 && expired > 0 && unrelated_traffic > 0);
 }
 
