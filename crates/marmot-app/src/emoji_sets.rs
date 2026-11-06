@@ -697,10 +697,11 @@ impl MarmotApp {
         search: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<AppEmojiSet>, AppError> {
-        let storage = self.emoji_storage(account_ref)?;
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
         let search = search.map(normalize_search);
         let limit = limit.unwrap_or(50);
         read_blocking(move || {
+            let storage = app.emoji_storage(&account_ref)?;
             let installed = installed_states(&storage)?;
             storage
                 .emoji_sets(installed_only, search.as_deref(), limit)?
@@ -719,8 +720,9 @@ impl MarmotApp {
         input: &str,
     ) -> Result<Option<AppEmojiSet>, AppError> {
         let coordinate = parse_emoji_set_input(input)?;
-        let storage = self.emoji_storage(account_ref)?;
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
         read_blocking(move || {
+            let storage = app.emoji_storage(&account_ref)?;
             let installed = installed_states(&storage)?;
             storage
                 .emoji_set(&coordinate)?
@@ -1047,19 +1049,22 @@ impl MarmotApp {
         };
         let installed_count = kept.len().try_into().unwrap_or(u32::MAX);
         let writer = storage.clone();
-        // The last point a cancellation or shutdown can stop the install.
-        if control.is_cancelled() || self.emoji_install_stop.is_cancelled() {
-            return Err(AppError::EmojiSetInstallCancelled);
-        }
+        let (cancelled, stopped) = (control.cancelled.clone(), self.emoji_install_stop.clone());
         let outcome = write_holding_guard(guard, move || {
-            writer.install_emoji_set(
+            // The write starts here, however long the task waited for the
+            // blocking pool: the last point a cancellation or shutdown can
+            // stop the install.
+            if cancelled.is_cancelled() || stopped.is_cancelled() {
+                return Err(AppError::EmojiSetInstallCancelled);
+            }
+            Ok(writer.install_emoji_set(
                 &snapshot,
                 &kept,
                 EmojiSetInstallLimits {
                     max_sets: MAX_INSTALLED_EMOJI_SETS,
                     max_total_bytes: MAX_INSTALLED_EMOJI_BYTES,
                 },
-            )
+            )?)
         })
         .await??;
         match outcome {
@@ -1105,9 +1110,9 @@ impl MarmotApp {
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppInstalledCustomEmoji>, AppError> {
-        let storage = self.emoji_storage(account_ref)?;
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
         read_blocking(move || {
-            let rows = storage.installed_custom_emoji()?;
+            let rows = app.emoji_storage(&account_ref)?.installed_custom_emoji()?;
             let collisions = colliding_shortcodes(&rows);
             Ok(rows
                 .into_iter()
@@ -1126,9 +1131,10 @@ impl MarmotApp {
         shortcode: &str,
     ) -> Result<AppInstalledCustomEmojiAsset, AppError> {
         let coordinate = parse_emoji_set_input(coordinate)?;
-        let storage = self.emoji_storage(account_ref)?;
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
         let shortcode = shortcode.to_owned();
         read_blocking(move || {
+            let storage = app.emoji_storage(&account_ref)?;
             let (row, bytes) = storage
                 .installed_custom_emoji_bytes(&coordinate, &shortcode)?
                 .ok_or(AppError::EmojiSetNotFound)?;
@@ -1565,8 +1571,9 @@ fn shown_version(
     Ok(set)
 }
 
-/// Run a local read on the blocking pool, so SQLCipher reads (a full picker
-/// list, a 4 MiB emoji and its hash) never hold an async worker.
+/// Run a local read on the blocking pool, so account resolution, a cold
+/// SQLCipher open and the reads themselves (a full picker list, a 4 MiB
+/// emoji and its hash) never hold an async worker.
 async fn read_blocking<T, F>(read: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
