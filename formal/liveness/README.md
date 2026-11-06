@@ -76,14 +76,22 @@ and at most one crash of the new device. Peer confirmations, Adds and emitted
 Welcomes are retained per attempt: local retry does not cancel peer work or
 erase old traffic. Incoming Welcomes explore both refs, groups, signers and
 required-roster flags. Time is abstracted to before/after expiry, not numerical
-clock arithmetic. Histories in `admission`, `durableBeforeSend` and the peer
-sets are specification monitors, not new database fields.
+clock arithmetic. Histories in `admission`, `durableBeforeSend`, `recordedRef`, `retired`
+and the peer sets are specification monitors, not new database fields.
+`recordedRef` independently remembers the current attempt's completed recording;
+`retired` latches withdrawal or expiry. Neither enables an action, and restart
+does not clear them. Only a fresh authenticated attempt resets these monitors;
+old traffic remains indexed by its original ref.
 
 The fair configuration checks confirmation order, recording the durable wait
 before publishing the new confirmation, current-ref/group/signer/roster
 admission, atomic expectation consumption, trust following a recorded join,
 and Made requiring selected first-Commit evidence. A pre-admission history
-monitor checks that no admission happened without a live expectation.
+monitor checks that no admission happened without a live expectation. An
+independent history invariant also forbids admission after this attempt was
+withdrawn or expired and binds it to the ref recorded for this attempt.
+Controls corrupting restart, withdrawal and expectation recording exercise
+that invariant across actions, separately from guard-consistency checks.
 `TypeOK` also checks the peer-confirmation/Add/publication provenance chain.
 
 The temporal property is deliberately narrower than eventual successful
@@ -104,7 +112,7 @@ or a joined group the app has not promoted yet.
 
 | Actions | Production owner | Corresponding Rust checks |
 | --- | --- | --- |
-| `Answer`, `Reveal`, comparison and ordered confirmations | `marmot-pairing` role methods; app `on_new_device_linked` | `pairing_confirmations_go_in_a_fixed_order`; generated pairing schedules |
+| `Answer`, `Reveal`, comparison and ordered confirmations | `marmot-pairing` role methods; app `on_new_device_linked` | `pairing_confirmations_go_in_a_fixed_order`; [`pairing_generated_schedules_preserve_confirmation_authority`](https://github.com/marmot-protocol/mdk/blob/5542e9cbdc761aa4a792746806cf9dd9f7ab65b8/crates/marmot-pairing/tests/lifecycle.rs#L32) (landed separately in #3018) |
 | `RecordAwaiting`, `RecordExpectation`, `PublishNewConfirm` | `AppClient::record_confirmed_device_link`, then `on_new_device_linked` sends | `a_waiting_row_left_without_its_expectation_is_dropped` |
 | Per-attempt `DeliverNewConfirm`, `ConfirmAdd`, `ReleaseWelcome` | app `approve_link`, `link_device_into_group`, `follow_link_publications` | `a_link_commit_that_failed_in_transit_links_once_it_lands`; `a_first_links_undelivered_welcome_is_published_again_until_it_lands` |
 | `TryWelcome` | engine `group_lifecycle.rs` expectation validation and transactional consumption | `the_link_welcome_joins_and_consumes_its_expectation`; wrong-leaf, wrong-KeyPackage, reserved-id and expired/withdrawn-Welcome tests in `account_devices/device_group_welcome.rs` |
@@ -114,8 +122,8 @@ or a joined group the app has not promoted yet.
 | `RequestReset`, `Reset`, `Retry` | app `reset_device_group_for_repair` and fresh pairing | `a_completed_link_can_disappear_from_the_approvers_selected_roster`; `a_device_whose_link_failed_links_again_into_the_same_device_group` |
 
 These are corresponding cases and production-owner checks, not a mechanically
-checked refinement theorem. The model does not run Rust. The generated role
-property covers only the in-memory exchange; app/engine tests own persistence
+checked refinement theorem. The model does not run Rust. The separately landed generated role
+property named above covers only the in-memory exchange; app/engine tests own persistence
 and MLS admission. An orderly app reopen is not a mid-write process crash.
 
 Crypto-valid code comparison and matching-session authentication are assumed.
@@ -129,6 +137,10 @@ reachability witnesses alone are not executable Rust traces. Full Move,
 failed-link undo, later branch loss, ordinary chat admission/data/credentials,
 physical storage, clock rollback and the cryptographic implementation are
 outside this model. The native reset regression owns ordinary-data preservation.
+This model tracks device-group admission only. After a wait ends, an ordinary
+roster-less invitation can take the same id under normal chat admission; the
+model does not guarantee that every later same-id pairing can start or finish.
+The fresh-attempt witness establishes one reachable successful path.
 
 ### Reproduce the linking checks
 
@@ -141,12 +153,15 @@ and then:
 python3 formal/liveness/verify_device_linking.py --out target/device-linking
 ```
 
-It requires the fair result, the unfair temporal counterexample, seven named
+It requires the fair result, the unfair temporal counterexample, eleven named
 model-mutant failures (order, durable-before-send, signer, fresh ref, roster,
-withdrawal, blocked cleanup), and four expected-failure reachability probes (join, fresh
+withdrawal, restart re-arming, restart clearing expiry, withdrawal retaining an
+expectation, stale-ref recording, blocked cleanup), and four expected-failure reachability probes (join, fresh
 same-group join, partial-record crash, old peer work surviving local retry).
 Every run uses a fresh output directory and preserves source/config hashes,
-commands, exit status and logs. A timeout, missing named result or checker
+commands, state counts, exit status and logs, including incomplete runs.
+The per-case ceiling is 300 seconds; changing that budget changes no model
+action, property, fairness premise or input bound. A timeout, missing named result or checker
 exception fails the gate. The reachability probes and mutants are properties
 of the abstract model, not production Rust mutation evidence.
 

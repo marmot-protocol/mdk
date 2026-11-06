@@ -19,7 +19,8 @@ Init == s = [attempt |-> 1, phase |-> "request",
     newConfirmSent |-> FALSE, durableBeforeSend |-> FALSE,
     sentConfirms |-> {}, peerConfirms |-> {}, acceptedConfirms |-> {},
     confirmedAdds |-> {},
-    waiting |-> FALSE, expected |-> FALSE, expired |-> FALSE,
+    waiting |-> FALSE, expected |-> FALSE, expectedRef |-> 0, expired |-> FALSE,
+    recordedRef |-> 0, retired |-> FALSE,
     emitted |-> {}, joined |-> FALSE,
     joinRecorded |-> FALSE, trusted |-> FALSE, firstSelected |-> FALSE,
     made |-> FALSE, cancel |-> FALSE, crashed |-> FALSE,
@@ -50,7 +51,8 @@ RecordAwaiting == /\ Live /\ s.phase = "record" /\ ~s.waiting
                   /\ s' = [s EXCEPT !.waiting = TRUE]
 RecordExpectation == /\ Live /\ s.phase = "record" /\ s.waiting
                      /\ ~s.expected /\ ~s.cancel /\ ~s.expired
-                     /\ s' = [s EXCEPT !.expected = TRUE]
+                     /\ s' = [s EXCEPT !.expected = TRUE, !.expectedRef = s.attempt,
+                                  !.recordedRef = s.attempt]
 PublishNewConfirm == /\ Live /\ s.phase = "record"
                      /\ s.waiting /\ s.expected /\ ~s.cancel /\ ~s.expired
                      /\ s' = [s EXCEPT !.newConfirmSent = TRUE,
@@ -74,7 +76,7 @@ TryWelcome(ref, group, signer, roster) ==
     /\ Live /\ s.waiting /\ ~s.joined
     /\ (signer # 1 \/ group # 1 \/ ref \in s.emitted)
     /\ IF s.expected /\ ~s.expired
-           /\ ref = s.attempt /\ group = 1 /\ signer = 1 /\ roster
+           /\ ref = s.expectedRef /\ group = 1 /\ signer = 1 /\ roster
        THEN s' = [s EXCEPT !.joined = TRUE, !.expected = FALSE,
                            !.admission = <<ref, group, signer, roster,
                                            s.expected /\ ~s.expired>>]
@@ -98,10 +100,12 @@ Cancel == /\ Live /\ ~s.cancel
                !.phase = IF s.joined THEN @ ELSE "ended"]
 Expire == /\ Live /\ ~s.expired /\ ~s.joined
           /\ s' = [s EXCEPT !.expired = TRUE,
+               !.retired = TRUE,
                !.phase = IF s.waiting THEN @ ELSE "ended"]
 WithdrawExpectation == /\ Live /\ (s.cancel \/ s.expired)
                        /\ s.expected /\ ~s.joined
-                       /\ s' = [s EXCEPT !.expected = FALSE]
+                       /\ s' = [s EXCEPT !.expected = FALSE,
+                                      !.retired = TRUE]
 CleanWaitingRow == /\ Live /\ s.waiting /\ ~s.expected /\ ~s.joined
                   /\ (s.cancel \/ s.expired \/ s.phase = "ended")
                   /\ s' = [s EXCEPT !.waiting = FALSE, !.phase = "ended"]
@@ -130,7 +134,8 @@ Retry == /\ Live /\ s.phase = "ended" /\ ~s.waiting /\ ~s.joined
              !.durableBeforeSend = FALSE,
              !.expected = FALSE, !.expired = FALSE,
              !.firstSelected = FALSE, !.made = FALSE, !.cancel = FALSE,
-             !.resetRequested = FALSE, !.admission = <<0, 0, 0, FALSE, FALSE>>]
+             !.resetRequested = FALSE, !.recordedRef = 0, !.retired = FALSE,
+             !.admission = <<0, 0, 0, FALSE, FALSE>>]
 
 Next == Answer \/ Reveal \/ CompareExisting \/ CompareNew \/ ConfirmExisting
         \/ DeliverExistingConfirm \/ ConfirmNew \/ RecordAwaiting
@@ -152,6 +157,8 @@ Fairness == /\ SF_vars(Restart)
 Spec == Init /\ [][Next]_vars /\ (IF FairRun THEN Fairness ELSE TRUE)
 
 TypeOK == /\ s.attempt \in 1..2 /\ s.phase \in Phases
+          /\ s.expectedRef \in 0..2
+          /\ s.recordedRef \in 0..2 /\ s.retired \in BOOLEAN
           /\ s.emitted \subseteq s.confirmedAdds
           /\ s.confirmedAdds \subseteq s.acceptedConfirms
           /\ s.acceptedConfirms \subseteq s.sentConfirms
@@ -173,6 +180,11 @@ MadeRequiresFirstCommit == s.made => s.firstSelected
    an extra implementation field. Cancellation linearizes at withdrawal,
    not at the user's first tap; atomic admission consumes the expectation. *)
 AdmissionRequiresLiveExpectation == s.joined => s.admission[5]
+(* These history monitors are never read by an enabling condition. They retain
+   the current attempt's recording and retirement across restart; only a fresh
+   authenticated attempt resets them. Old peer work remains indexed by ref. *)
+AdmissionRespectsAttemptHistory == s.joined =>
+    /\ s.admission[1] = s.recordedRef /\ ~s.retired
 WaitingEventuallyResolved == s.waiting ~> (~s.waiting \/ s.trusted)
 
 (* These are expected-failure reachability probes, not safety guarantees. *)
