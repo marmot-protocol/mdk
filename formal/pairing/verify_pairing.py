@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check each pairing lemma and require three named model counterexamples."""
+"""Check every pairing lemma and four falsifications from three model mutations."""
 
 import argparse
 import datetime
@@ -31,8 +31,9 @@ def mutations(source):
     early = """rule NewConfirmBeforePeerVerification:
   let reply = mac(kdf(shared,<'mac','new',sid,a,ref,slot,'key_package_ref'>),ref)
   in
-  [ NewApproved(sid,a,event,ref,nx,slot,ekey,shared) ]
-  --[ NewConfirmSent(sid,a,event,ref,slot,'not_yet_known','not_yet_known') ]->
+  [ NewApproved(sid,a,event,ref,nx,slot,ekey,shared),
+    !ExistingIdentity(a,slot,gid,leaf_key) ]
+  --[ NewConfirmSent(sid,a,event,ref,slot,gid,pk(leaf_key)) ]->
   [ Out(<'new_confirm',sid,reply>) ]
 
 """
@@ -49,6 +50,11 @@ def mutations(source):
             "omit-welcome-sender-guard",
             without_welcome_guard,
             "pairing_welcome_sender_matches_confirmation",
+        ),
+        (
+            "omit-welcome-sender-guard-authenticated-link",
+            without_welcome_guard,
+            "pairing_welcome_requires_authenticated_existing_link",
         ),
         (
             "send-new-confirmation-early",
@@ -91,7 +97,11 @@ def check(tamarin, model, folder, name, expected, timeout):
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                try:
+                    status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    termination = "SIGKILL-unreaped"
+                    status = None
     text = log.read_text()
     marker = "summary of summaries:"
     summary = text.split(marker, 1)[1] if marker in text else ""
@@ -199,7 +209,7 @@ def main():
                     args.control_timeout_seconds,
                 ),
             )
-    passed = len(results) == 4 and all(result["passed"] for result in results.values())
+    passed = len(results) == 5 and all(result["passed"] for result in results.values())
     report = {"passed": passed, "model": str(model), "results": results}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"passed": passed, "evidence": str(output)}))

@@ -24,7 +24,10 @@ compromised.
 The theory uses one configured account, unbounded fresh honest role instances
 and Tamarin's built-in DH, hash and signing theories. HKDF and HMAC are public
 uninterpreted function symbols: an attacker may compute them when it knows
-their inputs. Each role independently derives its SAS term from the shared
+their inputs. Multiple honest existing identities may share a device-group
+id with distinct leaf-signing keys. Each identity keeps its group, slot and
+leaf key across sessions; changing those values, including a Move, is outside
+the model. Each role independently derives its SAS term from the shared
 secret, session, account, KeyPackageRef, approver slot and both public keys.
 `CodeCompare` checks equality of those actual derived terms. It does not
 assume equality of the desired confirmed group or Welcome signer; those are
@@ -39,12 +42,13 @@ constant-time code, MLS cryptography or parsing of bytes.
 | Lemma | Contract |
 | --- | --- |
 | `pairing_successful_link_and_welcome` | A complete honest exchange and Welcome admission are reachable. |
+| `pairing_distinct_honest_approvers_share_a_group` | Two distinct honest devices can approve separate links into the same group. |
 | `pairing_same_session_mismatched_codes_reachable` | Substituted network keys can produce different codes for the same session. |
 | `pairing_other_sender_welcome_then_real_one_reachable` | A valid attacker-signed same-id Welcome can be rejected before the real one joins. |
 | `pairing_new_confirmation_follows_existing_confirmation` | A new-device confirmation has a prior matching existing-device confirmation. |
 | `pairing_confirmed_group_and_sender_agree` | The existing confirmation verified by the new device agrees on session, account, publication event, KeyPackageRef, approver slot, group and signer. |
 | `pairing_existing_link_requires_new_confirmation` | An existing device establishes the matching link only after the new device sends its confirmation. |
-| `pairing_welcome_sender_matches_confirmation` | An accepted Welcome's sender equals the sender the link confirmed. |
+| `pairing_welcome_sender_matches_confirmation` | The expected-sender guard holds on accepted Welcomes; the authenticated-link theorem below establishes the origin. |
 | `pairing_welcome_requires_authenticated_existing_link` | Accepted Welcome evidence traces back to an established matching existing-device link. |
 
 The state space is not a bounded Rust execution. The symbolic rules permit
@@ -121,11 +125,13 @@ may change those wall-time budgets, not the theory or proof domain.
 On timeout the runner sends SIGTERM, waits at most two seconds, then escalates
 to SIGKILL with a bounded reap wait. Its separate process-control regression
 uses a synthetic prover that demonstrably ignores SIGTERM; a killed process
-is never counted as proof.
+is never counted as proof. If even the final reap wait expires, the receipt
+records `SIGKILL-unreaped` with no exit status and fails the check; it does not
+claim that an unresponsive process has exited.
 
 The confirmed-group/sender lemma is marked `reuse`; later lemmas can use its
 conclusion. The gate requires that lemma's own proof in the same whole-theory
-run, so it is not an unchecked authentication assumption. The three
+run, so it is not an unchecked authentication assumption. The four
 exists-trace lemmas establish reachability and keep the safety antecedents
 from being the only evidence. Tamarin may exit zero with an incomplete or
 falsified lemma; successful process exit alone is not the gate.
@@ -136,11 +142,21 @@ Sensitivity checks mutate the symbolic model in isolated scratch files:
   both derivation/verification sites. A network rewrite of the advertised
   sender must falsify `pairing_confirmed_group_and_sender_agree`.
 - Remove the expected-sender equality in `AcceptWelcome`. A valid
-  attacker-signed Welcome must falsify
-  `pairing_welcome_sender_matches_confirmation`.
+  attacker-signed Welcome must falsify both the guard-presence lemma
+  `pairing_welcome_sender_matches_confirmation` and the substantive theorem
+  `pairing_welcome_requires_authenticated_existing_link`, in separate selected
+  runs of the same mutant.
 - Allow `NewApproved` to send its confirmation before receiving and verifying
-  the existing device's confirmation. This must falsify
-  `pairing_new_confirmation_follows_existing_confirmation`.
+  the existing device's confirmation, using the matching honest identity's
+  actual group and public signing key. This must falsify
+  `pairing_new_confirmation_follows_existing_confirmation` because of the
+  missing earlier event, rather than invented metadata. This mutant reads the
+  identity fact's public projection and reveals no secret key.
+
+These three mutation types require four named falsifications. The ordering
+and confirmed-binding lemmas deliberately share the same authenticated input
+in the baseline's atomic verification-and-confirmation rule; they are not
+independent cryptographic arguments.
 
 These are model mutations, not mutations of production Rust. The independent
 runtime tests remain necessary. Preserve the exact model hash, tool versions,
