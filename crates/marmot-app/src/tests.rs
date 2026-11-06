@@ -14443,6 +14443,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // The relay is still replaying stored history, newest first, when
+        // the burst overflows the queue, so live ingest promotes no cursor.
+        relay.hold_replies(Some(every_reply));
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(owns)
             .with_test_relay_client(relay.clone());

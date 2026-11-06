@@ -2241,7 +2241,22 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() 
     deliver_all(&mut devices.laptop, &devices.relay).await;
     add_the_phone_unpublished(&mut devices, &chat).await;
     let original = owed(&devices.laptop).remove(0);
-    let earlier = crate::unix_now_seconds() - 601;
+    // The phone's own maintenance sent a heartbeat while the devices were set
+    // up. The lost carrier was accepted just under ten minutes before it, so
+    // only a heartbeat dated after that one shows the phone running since.
+    let last_heartbeat = devices
+        .laptop
+        .app
+        .account_storage(&devices.laptop.state.label)
+        .unwrap()
+        .app_storage()
+        .device_activity()
+        .unwrap()
+        .into_iter()
+        .find(|activity| activity.slot_id_hex == hex::encode(phone_slot))
+        .and_then(|activity| activity.last_active_at)
+        .unwrap_or_else(crate::unix_now_seconds);
+    let earlier = last_heartbeat - 599;
     devices.laptop.runtime = devices.laptop.runtime.with_maintenance_sources(
         Arc::new(EarlierClock(earlier)),
         Arc::new(marmot_session::SystemMonotonicClock::default()),
@@ -2313,6 +2328,10 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() 
         before,
         "ordinary DG activity cannot qualify"
     );
+    // The heartbeat goes out in a later second than the phone's last one.
+    while crate::unix_now_seconds() <= last_heartbeat {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     devices
         .phone
         .send_device_group_message(

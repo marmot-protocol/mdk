@@ -25,6 +25,23 @@ impl transport_nostr::DirectoryRelayFetcher for CrashRelay {
 
 #[async_trait]
 impl NostrRelayClient for CrashRelay {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        self.inner.relay_notification_source()
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.inner
+            .reply_sent_nothing(account, endpoint, subscription_id)
+            .await
+    }
+
     async fn subscribe(
         &self,
         subscription: NostrSubscription,

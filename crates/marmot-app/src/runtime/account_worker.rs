@@ -11600,7 +11600,8 @@ mod tests {
         let mut client = app.client(&account.label).await.unwrap();
         let group = client.create_group("periodic announce", &[]).await.unwrap();
         let group_hex = hex::encode(group.as_slice());
-        // The scripted relay sends no EOSE.
+        // The device can fetch and has settled, so it announces as soon as
+        // it owes one.
         client.test_push_device_can_fetch = Some(true);
         client.push_announce_timing.catch_up_settle = Duration::ZERO;
         client.advance_push_join_windows().await;
