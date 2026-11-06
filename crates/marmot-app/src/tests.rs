@@ -548,8 +548,15 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
-    /// When set, [`report_scripted_eose`] answers each REQ still awaiting
-    /// EOSE with one stored event created at this second before its EOSE.
+    /// What the scripted relays send the plane: each accepted REQ's reply.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
+    /// Which (REQ, endpoint) the relay leaves unanswered; none by default.
+    hold_replies: std::sync::Mutex<Option<fn(&NostrSubscription, &TransportEndpoint) -> bool>>,
+    /// Accepted REQs (wire id, subscription, endpoint) the relay has not
+    /// answered yet.
+    held_replies: std::sync::Mutex<Vec<(String, NostrSubscription, TransportEndpoint)>>,
+    /// When set, each REQ's reply carries one stored event created at this
+    /// second before its EOSE.
     pub(crate) stored_before_eose: std::sync::Mutex<Option<u64>>,
     /// Every relay reads as connected on this attempt, as its own state, so
     /// moving it is a reconnect no notification reports.
@@ -894,6 +901,143 @@ fn registered_release(
 }
 
 impl ScriptedPushRelayClient {
+    /// Record an accepted REQ, or fail or park it as the test scripted.
+    async fn accept_subscription(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscription_attempts
+            .lock()
+            .unwrap()
+            .push(subscription.clone());
+        if subscription.is_group_route() {
+            self.group_subscribe_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self
+            .fail_next_subscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".to_owned(),
+            ));
+        }
+        if subscription.is_group_route()
+            && self
+                .refuse_group_subscribes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "subscribe registered on 0 of 1 relays".to_owned(),
+            ));
+        }
+        let block_for_account = {
+            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
+            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let block_for_account_group = {
+            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
+            if subscription.is_group_route()
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let blocked = block_for_account
+            || block_for_account_group
+            || self
+                .block_next_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if blocked {
+            let released = registered_release(&self.subscribe_release);
+            self.blocked_subscribe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.subscribe_started.notify_one();
+            released.await;
+            if self
+                .fail_blocked_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(cgka_traits::TransportAdapterError::Subscription(
+                    "injected startup activation failure".to_owned(),
+                ));
+            }
+        }
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    /// Answer an accepted REQ on each of its relays as a relay does: the
+    /// stored event a test scripted, then EOSE. A REQ the test holds stays
+    /// unanswered until [`Self::release_held_replies`].
+    fn reply(&self, subscription: &NostrSubscription, id: &str) {
+        let hold = *self.hold_replies.lock().unwrap();
+        for endpoint in subscription.endpoints() {
+            if hold.is_some_and(|hold| hold(subscription, endpoint)) {
+                self.held_replies.lock().unwrap().push((
+                    id.to_owned(),
+                    subscription.clone(),
+                    endpoint.clone(),
+                ));
+                continue;
+            }
+            self.answer(endpoint, id);
+        }
+    }
+
+    fn answer(&self, endpoint: &TransportEndpoint, id: &str) {
+        if let Some(created_at) = *self.stored_before_eose.lock().unwrap() {
+            self.messages
+                .event(endpoint, id, scripted_stored_event(created_at));
+        }
+        self.messages.eose(endpoint, id);
+    }
+
+    /// Leave each (REQ, relay) that `hold` selects unanswered from now on,
+    /// as a relay that has not finished, or never finishes, its stored
+    /// events. `None` answers every later REQ again.
+    pub(crate) fn hold_replies(
+        &self,
+        hold: Option<fn(&NostrSubscription, &TransportEndpoint) -> bool>,
+    ) {
+        *self.hold_replies.lock().unwrap() = hold;
+    }
+
+    /// Answer every held REQ that `release` selects now, late.
+    pub(crate) fn release_held_replies(
+        &self,
+        release: impl Fn(&NostrSubscription, &TransportEndpoint) -> bool,
+    ) {
+        let released = {
+            let mut held = self.held_replies.lock().unwrap();
+            let (released, kept) = std::mem::take(&mut *held)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(_, subscription, endpoint)| {
+                    release(subscription, endpoint)
+                });
+            *held = kept;
+            released
+        };
+        for (id, _, endpoint) in released {
+            self.answer(&endpoint, &id);
+        }
+    }
+
+    /// The relay at `endpoint` closes the REQ `id`, giving `reason`.
+    pub(crate) fn close_subscription(&self, endpoint: &TransportEndpoint, id: &str, reason: &str) {
+        self.messages.closed(endpoint, id, reason);
+    }
+
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -1208,6 +1352,12 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
     fn relay_connection(
         &self,
         _: &MemberId,
@@ -1313,11 +1463,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         subscription: NostrSubscription,
         id: String,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.subscribe(subscription.clone()).await?;
+        self.accept_subscription(subscription.clone()).await?;
         self.scoped_subscriptions
             .lock()
             .unwrap()
-            .push((id, subscription));
+            .push((id.clone(), subscription.clone()));
+        self.reply(&subscription, &id);
         Ok(())
     }
     async fn unsubscribe_scoped(
@@ -1337,74 +1488,8 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.subscription_attempts
-            .lock()
-            .unwrap()
-            .push(subscription.clone());
-        if subscription.is_group_route() {
-            self.group_subscribe_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        if self
-            .fail_next_subscribe
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(cgka_traits::TransportAdapterError::Subscription(
-                "injected subscribe failure".to_owned(),
-            ));
-        }
-        if subscription.is_group_route()
-            && self
-                .refuse_group_subscribes
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(cgka_traits::TransportAdapterError::Subscription(
-                "subscribe registered on 0 of 1 relays".to_owned(),
-            ));
-        }
-        let block_for_account = {
-            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
-            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
-                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
-            {
-                blocked_account.take();
-                true
-            } else {
-                false
-            }
-        };
-        let block_for_account_group = {
-            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
-            if subscription.is_group_route()
-                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
-            {
-                blocked_account.take();
-                true
-            } else {
-                false
-            }
-        };
-        let blocked = block_for_account
-            || block_for_account_group
-            || self
-                .block_next_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
-        if blocked {
-            let released = registered_release(&self.subscribe_release);
-            self.blocked_subscribe_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.subscribe_started.notify_one();
-            released.await;
-            if self
-                .fail_blocked_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(cgka_traits::TransportAdapterError::Subscription(
-                    "injected startup activation failure".to_owned(),
-                ));
-            }
-        }
-        self.subscriptions.lock().unwrap().push(subscription);
+        self.accept_subscription(subscription.clone()).await?;
+        self.reply(&subscription, &subscription.subscription_id());
         Ok(())
     }
 
@@ -1682,94 +1767,28 @@ pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> c
         .expect("client on the app relay plane")
 }
 
-/// Stand-in for the relay pool's end-of-stored-events frames, which an injected
-/// relay client never produces.
-///
-/// A live drain ends on EOSE instead of waiting out its quiet window, and a
-/// post-join maintenance boundary completes only on its own REQ's EOSE, so a
-/// test whose transport is a [`ScriptedPushRelayClient`] has to supply that
-/// signal itself. The pump reports EOSE for every subscription the relay has accepted
-/// and `accept` selects, on every endpoint it was issued to, and keeps doing so
-/// as later subscriptions are registered. Repeat reports are ignored by the
-/// adapter, so this is safe to run for the whole test, but each still takes
-/// the adapter's state lock, which can defer a cursor seal
-/// ([`LiveCursorFixture::stop_eose_pump`]).
-pub(crate) struct ScriptedEosePump(tokio::task::JoinHandle<()>);
-
-impl Drop for ScriptedEosePump {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+/// The one stored event a scripted relay sends before its EOSE when a test
+/// asks for it ([`ScriptedPushRelayClient::stored_before_eose`]). Not a group
+/// message, so it counts in the REQ's reply without reaching admission, as a
+/// copy the pool had already seen.
+fn scripted_stored_event(created_at: u64) -> nostr_sdk::prelude::Event {
+    EventBuilder::new(Kind::GiftWrap, "")
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .finalize(&Keys::generate())
+        .expect("sign scripted stored event")
 }
 
-pub(crate) fn scripted_eose_pump(
-    plane: MarmotRelayPlane,
-    relay: Arc<ScriptedPushRelayClient>,
-    accept: fn(&NostrSubscription) -> bool,
-) -> ScriptedEosePump {
-    ScriptedEosePump(tokio::spawn(async move {
-        loop {
-            report_scripted_eose(&plane, &relay, accept).await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }))
-}
-
-/// One pass of [`scripted_eose_pump`], for a test that needs the EOSE to land
-/// at a moment of its own choosing.
-pub(crate) async fn report_scripted_eose(
-    plane: &MarmotRelayPlane,
-    relay: &ScriptedPushRelayClient,
-    accept: fn(&NostrSubscription) -> bool,
-) {
-    let stored = *relay.stored_before_eose.lock().unwrap();
-    let eose = |endpoint: TransportEndpoint, id: String| async move {
-        // Counts only a REQ still awaiting EOSE on that relay.
-        if let Some(created_at) = stored {
-            plane
-                .count_stored_replay_event_for_test(endpoint.clone(), id.clone(), created_at)
-                .await;
-        }
-        plane.handle_relay_eose_for_test(endpoint, id).await;
-    };
-    let scoped = relay.scoped_subscriptions.lock().unwrap().clone();
-    for (id, subscription) in scoped {
-        if accept(&subscription) {
-            for endpoint in subscription.endpoints() {
-                eose(endpoint.clone(), id.clone()).await;
-            }
-        }
-    }
-    for subscription in relay.accepted_subscriptions() {
-        if !accept(&subscription) {
-            continue;
-        }
-        for endpoint in subscription.endpoints() {
-            eose(endpoint.clone(), subscription.subscription_id()).await;
-        }
-    }
-}
-
-/// Every subscription reaches end-of-stored-events.
-pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
-    true
-}
-
-/// Let end-of-stored-events admit `client`'s live REQs' native replay. Until
-/// then its group messages wait behind the unanswered sources, a sync admits
-/// them only through its recovery job, and that job can return before it does
-/// (mdk#2624). Call this before the client's first grant: a job that starts
-/// before a source's EOSE captures that source; the scripted relay serves no
-/// history, so the capture leaves it incomplete and no later EOSE admits it.
-/// Its `SubscriptionReplay` duty would then join every grant (mdk#2693).
-pub(crate) async fn settle_live_replay(
-    plane: &MarmotRelayPlane,
-    relay: &ScriptedPushRelayClient,
-    client: &mut AppClient,
-) {
+/// Wait until the scripted relay's EOSEs admit `client`'s live REQs' native
+/// replay. Until then its group messages wait behind the unanswered sources,
+/// a sync admits them only through its recovery job, and that job can return
+/// before it does (mdk#2624). Call this before the client's first grant: a job
+/// that starts before a source's EOSE captures that source; the scripted relay
+/// serves no history, so the capture leaves it incomplete and no later EOSE
+/// admits it. Its `SubscriptionReplay` duty would then join every grant
+/// (mdk#2693).
+pub(crate) async fn settle_live_replay(client: &mut AppClient) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        report_scripted_eose(plane, relay, every_subscription).await;
         client.synchronize_native_replay().await.unwrap();
         if client.recovery_owner.test_replay_complete() {
             return;

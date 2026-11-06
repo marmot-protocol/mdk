@@ -223,20 +223,92 @@ impl AccountPublishFixture {
     }
 }
 
-impl MarmotRelayPlane {
-    /// Count one stored event, created at `created_at`, in `endpoint`'s reply
-    /// to a live REQ that has not reached EOSE there, without delivering
-    /// anything: what a scripted relay returned before its EOSE.
-    pub async fn count_stored_replay_event_for_test(
+/// A scripted relay pool's own messages, which an injected test client hands
+/// its plane through [`NostrRelayClient::relay_notification_source`], so they
+/// reach the adapter through the dispatch the SDK pool's take. Each relay has
+/// one connection, open from the pool's first message from it. Every receiver
+/// gets every message sent after it subscribed, in order, and none is ever
+/// dropped: a scripted pool never shows its plane a lag.
+///
+/// One pool shared by several planes reaches all of them, as an SDK pool
+/// would; each adapter heeds only the REQ ids it has live.
+#[derive(Default)]
+pub struct ScriptedRelayMessages {
+    receivers: StdMutex<Vec<mpsc::UnboundedSender<NotificationUpdate<NostrSdkNotification>>>>,
+}
+
+impl ScriptedRelayMessages {
+    /// The pool's one reader, and each relay's one connection.
+    const EPOCH: [u64; 2] = [1, 1];
+
+    /// `endpoint` ended its stored events for the REQ `subscription_id`.
+    pub fn eose(&self, endpoint: &TransportEndpoint, subscription_id: &str) {
+        self.send(
+            endpoint,
+            RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(SubscriptionId::new(
+                subscription_id,
+            ))),
+        );
+    }
+
+    /// `endpoint` closed the REQ `subscription_id`, giving `reason`.
+    pub fn closed(&self, endpoint: &TransportEndpoint, subscription_id: &str, reason: &str) {
+        self.send(
+            endpoint,
+            RelayMessage::Closed {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(subscription_id)),
+                message: std::borrow::Cow::Owned(reason.to_owned()),
+            },
+        );
+    }
+
+    /// `endpoint` sent `event` for the REQ `subscription_id`: the pool's raw
+    /// copy off the wire, which counts in the REQ's reply. A group message
+    /// goes on to admission; anything else is counted and not delivered, as
+    /// an event the pool had already seen.
+    pub fn event(
         &self,
-        endpoint: TransportEndpoint,
-        subscription_id: String,
-        created_at: u64,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+        event: nostr_sdk::prelude::Event,
     ) {
-        self.inner
-            .transport
-            .adapter
-            .observe_unconvertible_relay_event(endpoint, subscription_id, created_at)
-            .await;
+        self.send(
+            endpoint,
+            RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(subscription_id)),
+                event: std::borrow::Cow::Owned(event),
+            },
+        );
+    }
+
+    fn send(&self, endpoint: &TransportEndpoint, message: RelayMessage<'static>) {
+        let relay_url = RelayUrl::parse(endpoint.as_str())
+            .expect("a scripted relay answers only on an endpoint the plane accepted");
+        let notification = NotificationUpdate::Notification(NostrSdkNotification::Payload {
+            notification: ClientNotification::Message {
+                relay_url,
+                message: Box::new(message),
+            },
+            epoch: Self::EPOCH,
+            reason: transport_nostr_adapter::ReplayRestart::Connection,
+        });
+        self.receivers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|receiver| receiver.send(notification.clone()).is_ok());
+    }
+}
+
+impl NostrRelayNotificationSource for ScriptedRelayMessages {
+    fn notifications(&self) -> transport_nostr_adapter::NostrSdkNotificationStream {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.receivers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(sender);
+        Box::pin(futures::stream::unfold(
+            receiver,
+            |mut receiver| async move { receiver.recv().await.map(|update| (update, receiver)) },
+        ))
     }
 }
