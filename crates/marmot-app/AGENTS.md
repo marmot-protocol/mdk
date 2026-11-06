@@ -430,11 +430,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   removal left decides how: a failed link's undo leaves the slot no entry and no rejected slot, so it shows
   `Ended { LinkFailed }`; any other removal, from a group it founded or from a roster it can't read (a failed read
   included), unlinks it (D67). Whether it joined rather than founded the group comes from its trusted record's
-  `Linked` trust. Never decide either from the `device_group_joins` row: one catch-up can apply the first commit and
-  the removal, and the row is gone once that commit lands, before a late undo can arrive (mdk#3011). Every ingest
-  notes the removal as it applies it (`note_device_group_removal` in `retain_effect_projection`): it sets the stop
-  flag and the account's publish stop, then `mark_account_unlinked` writes `unlinked` and `signed_out`, and the copy
-  is forgotten only once that mark lands, so a failed mark is made again at the next open.
+  `Linked` trust; a group it trusts because a move into it was made (the record carries the move's KeyPackage) is left
+  by ordinary unlinking (3.7d). Never decide either from the `device_group_joins` row: one catch-up can apply the
+  first commit and the removal, and the row is gone once that commit lands, before a late undo can arrive (mdk#3011).
+  Every ingest notes the removal as it applies it (`note_device_group_removal` in `retain_effect_projection`): it sets
+  the stop flag and the account's publish stop, then `mark_account_unlinked` writes `unlinked` and `signed_out`, and
+  the copy is forgotten only once that mark lands, so a failed mark is made again at the next open.
   Every publisher `relay_client_for_account_id` hands out refuses to publish once the publish stop is set
   or the record says unlinked, so nothing goes out whichever path a publish comes from; build account publishers only
   through it (`clippy.toml` bans the other ways). The engine stores a removal before the app marks it, so before it
