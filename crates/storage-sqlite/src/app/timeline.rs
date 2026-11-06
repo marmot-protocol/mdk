@@ -8,6 +8,9 @@ mod chat_history;
 mod edits;
 mod opening;
 mod presentation;
+mod removal_validation;
+#[cfg(test)]
+mod removal_validation_tests;
 pub use chat_history::{
     AppEventImport, BackupHistorySource, HistoryExportEvent, HistoryExportRow,
     HistoryImportProvenance, HistoryImportSource, ImportedAppEvent, ImportedFileKey,
@@ -833,6 +836,11 @@ impl SqliteAppStorage {
                         params![event.group_id_hex, event.message_id_hex],
                     ).storage()?;
                 }
+            }
+            if event.kind == MARMOT_APP_EVENT_KIND_REMOVE
+                || existing_event.as_ref().is_some_and(|(kind,_)| *kind == MARMOT_APP_EVENT_KIND_REMOVE)
+            {
+                removal_validation::record(&conn, event)?;
             }
             reports::rescrub_control(&conn, &event.group_id_hex, &event.message_id_hex)?;
             replace_encrypted_media_secret_references_tx(&conn, event)?;
@@ -1727,7 +1735,8 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         .filter(|event| event.kind == MARMOT_APP_EVENT_KIND_CHAT)
         .map(|event| event.message_id_hex.clone())
         .collect();
-    let (mut rows, stream_starts) = project_group_events(events);
+    let removal_targets = removal_validation::targets(tx, group_id_hex, None)?;
+    let (mut rows, stream_starts) = project_group_events(events, &removal_targets);
     let kept_receipts = kept_recipient_receipts_tx(tx, group_id_hex)?;
     for row in &mut rows {
         let receipt_kept = kept_receipts.contains(&row.message_id_hex);
@@ -2434,22 +2443,9 @@ fn apply_message_removals_tx(tx: &Connection, row: &mut TimelineRow) -> StorageR
         ).storage()?;
         if root_is_chat {
             deletes.extend(
-                app_events_targeting_message_tx(
-                    tx,
-                    &row.group_id_hex,
-                    MARMOT_APP_EVENT_KIND_REMOVE,
-                    target,
-                )?
-                .into_iter()
-                .filter(|decision| {
-                    decision.moderation_grant
-                        && cgka_traits::reporting::parse_removal(
-                            &decision.tags,
-                            &decision.plaintext,
-                        )
-                        .as_deref()
-                            == Some(target)
-                }),
+                removal_validation::targeting(tx, &row.group_id_hex, target)?
+                    .into_iter()
+                    .filter(|decision| decision.moderation_grant),
             );
         }
     }
@@ -3224,7 +3220,17 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
             }
         }
         MARMOT_APP_EVENT_KIND_DELETE | MARMOT_APP_EVENT_KIND_REMOVE => {
-            for target in tag_values(tags, EVENT_REF_TAG) {
+            let mut targets = tag_values(tags, EVENT_REF_TAG)
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>();
+            if kind == MARMOT_APP_EVENT_KIND_REMOVE {
+                targets.extend(
+                    removal_validation::targets(tx, group_id_hex, Some(message_id_hex))?
+                        .remove(message_id_hex)
+                        .unwrap_or_default(),
+                );
+            }
+            for target in &targets {
                 ids.insert(target.to_owned());
                 for edit in app_events_targeting_message_tx(
                     tx,
@@ -3960,7 +3966,10 @@ pub(crate) fn canonical_timeline_order_key<'a>(
     (class, primary, phase, intra_epoch_at, message_id_hex)
 }
 
-fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {
+fn project_group_events(
+    events: Vec<RawAppEvent>,
+    removal_targets: &BTreeMap<String, BTreeSet<String>>,
+) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {
     let mut timeline = BTreeMap::<String, TimelineRow>::new();
     let mut stream_starts = Vec::new();
     let mut reactions = Vec::new();
@@ -4094,17 +4103,22 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
         (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex))
     });
     for delete in deletes {
-        for target in tag_values(&delete.tags, EVENT_REF_TAG) {
+        let targets = if delete.kind == MARMOT_APP_EVENT_KIND_REMOVE {
+            removal_targets
+                .get(&delete.message_id_hex)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        } else {
+            tag_values(&delete.tags, EVENT_REF_TAG).collect()
+        };
+        for target in targets {
             let Some(row) = timeline.get_mut(target) else {
                 continue;
             };
             if delete.kind == MARMOT_APP_EVENT_KIND_REMOVE {
-                if row.kind != MARMOT_APP_EVENT_KIND_CHAT
-                    || !delete.moderation_grant
-                    || cgka_traits::reporting::parse_removal(&delete.tags, &delete.plaintext)
-                        .as_deref()
-                        != Some(target)
-                {
+                if row.kind != MARMOT_APP_EVENT_KIND_CHAT || !delete.moderation_grant {
                     continue;
                 }
             } else if row.sender != delete.sender && !delete.moderation_grant {
