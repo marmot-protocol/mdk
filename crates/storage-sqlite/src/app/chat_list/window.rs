@@ -216,19 +216,21 @@ fn choose_anchor(
 
 /// Earliest timed mute after the read's time among chats in the query's view.
 /// The view bounds which chats could ever match; the filter is not applied, so
-/// a spare wake only re-reads an unchanged window. Walks the account's mute
-/// rows, never message history.
+/// a spare wake only re-reads an unchanged window. Walks the view's page index
+/// with one keyed mute lookup per chat, so cost grows with the view's chats,
+/// never with mutes elsewhere in the account or with history.
 fn next_mute_expiry(
     conn: &Connection,
     query: &ChatListWindowQuery,
 ) -> Result<Option<i64>, ChatListPageError> {
-    // Unqualified view columns resolve to the innermost `chat_list_rows`.
+    let view = query.query.view;
     let sql = format!(
-        "SELECT min(mute.muted_until_ms) FROM chat_notification_settings AS mute
-         WHERE mute.muted_until_ms > ?1
-           AND EXISTS(SELECT 1 FROM chat_list_rows
-               WHERE chat_list_rows.group_id_hex = mute.group_id_hex AND {})",
-        query.query.view.predicate()
+        "SELECT min((SELECT mute.muted_until_ms FROM chat_notification_settings AS mute
+                WHERE mute.group_id_hex = chat_list_rows.group_id_hex
+                  AND mute.muted_until_ms > ?1))
+         FROM chat_list_rows INDEXED BY {} WHERE {}",
+        view.index(),
+        view.predicate()
     );
     Ok(conn
         .query_row_cached(&sql, [query.now_ms], |r| r.get(0))

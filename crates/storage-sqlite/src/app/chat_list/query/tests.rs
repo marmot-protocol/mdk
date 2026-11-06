@@ -632,6 +632,47 @@ fn muted_leaf_flips_exactly_at_expiry_and_reports_the_next_expiry_in_the_view() 
     assert_eq!(next(ChatListView::Chats, F::All(Vec::new()), NOW), None);
 }
 
+/// The next-expiry lookup a Muted window read adds walks the view, not the
+/// account's mute settings: muting chats outside the view adds no work.
+#[test]
+fn mute_wake_lookup_cost_grows_with_the_view_not_the_accounts_mutes() {
+    let _serial = crate::base::query_work_test_support::QUERY_MEASUREMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "0000", &["unread"]);
+    mute(&store, "0000", Some(NOW + 10));
+    let mut archived = 0;
+    let mut mute_archived = |count: usize| {
+        for _ in 0..count {
+            archived += 1;
+            let id = format!("{archived:04x}");
+            seed(&store, &id, &["archived", "unread"]);
+            mute(&store, &id, Some(NOW + 1));
+        }
+        ready(&store);
+    };
+    let query = || ChatListViewQuery {
+        view: ChatListView::Unread,
+        filter: Some(cond(C::Muted)),
+    };
+    let steps = || {
+        let (read, steps) =
+            crate::base::query_work_test_support::measure(&store, || rows_at(&app, query(), NOW));
+        assert_eq!(read.next_mute_expiry_ms, Some(NOW + 10));
+        steps
+    };
+    mute_archived(16);
+    let few = steps();
+    mute_archived(2048);
+    let many = steps();
+    assert!(
+        many <= few + few / 10,
+        "mute wake lookup: {few} VM steps with 16 muted chats elsewhere, {many} with 2064"
+    );
+}
+
 #[test]
 fn excluded_ids_win_and_included_ids_never_leave_the_view() {
     let store = SqliteAccountStorage::in_memory().unwrap();
