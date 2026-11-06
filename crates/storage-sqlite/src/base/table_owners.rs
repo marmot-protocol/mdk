@@ -156,6 +156,8 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("chat_presentation_row_work", Side::App),
     ("content_expired_targets", Side::App),
     ("content_pruned_controls", Side::App),
+    ("content_removal_legacy_holds", Side::App),
+    ("content_removal_validation", Side::App),
     ("content_report_backfill", Side::App),
     ("content_reports", Side::App),
     ("conversation_read_state", Side::App),

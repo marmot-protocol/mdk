@@ -119,6 +119,14 @@ preconditions: this read is not an atomic authorization for a later write.
 
 ## Migrations
 
+Migration 0180 records whether a complete removal was valid and its exact target, independently of the sender's
+moderation authority. Tag recovery cannot make an invalid decision valid. Validated removals survive retention and tag
+damage, including decisions with permitted extra tags. The upgrade classifies existing records only where the original
+shape can be proven. For uncertain legacy records, it preserves only target-specific hides already present at upgrade;
+uncertain decisions cannot hide newly seen targets. Those preserved hides remain subject to source withdrawal and
+invalidation. They do not establish original validity; [verified legacy repair](https://github.com/marmot-protocol/mdk/issues/3017)
+is separate, and already-erased content cannot be restored.
+
 Migration0170 adds native local-copy admission metadata and app invitation-decision rows; no existing group is seeded.
 It runs for every account database, including builds with device groups disabled, creating two tables and two partial
 indexes. Native creation/join writes the local admission association transactionally; it adds no per-message writes.

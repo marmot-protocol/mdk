@@ -371,6 +371,8 @@ mod migration_0177_welcome_failure_size_class;
 mod migration_0178_emoji_sets;
 #[path = "migrations/0179_chat_list_kind.rs"]
 mod migration_0179_chat_list_kind;
+#[path = "migrations/0180_removal_validation.rs"]
+mod migration_0180_removal_validation;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1401,6 +1403,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0179_chat_list_kind",
         suspend_foreign_keys: &[],
         apply: migration_0179_chat_list_kind::apply,
+    },
+    Migration {
+        version: 180,
+        name: "0180_removal_validation",
+        suspend_foreign_keys: &[],
+        apply: migration_0180_removal_validation::apply,
     },
 ];
 

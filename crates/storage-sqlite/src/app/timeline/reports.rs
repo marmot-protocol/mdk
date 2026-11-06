@@ -4,7 +4,7 @@ use super::*;
 use crate::SqliteAccountStorage;
 use crate::SqliteAppStorage;
 use cgka_traits::app_event::AppMessageAuthority;
-use cgka_traits::reporting::{ReportReason, parse_dismissal, parse_removal, parse_report};
+use cgka_traits::reporting::{ReportReason, parse_dismissal, parse_report};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentReport {
@@ -353,19 +353,30 @@ pub(super) fn retain_expired_target(
     group: &str,
     target: &str,
 ) -> StorageResult<()> {
-    conn.execute_cached(
-        "INSERT OR IGNORE INTO content_expired_targets (group_id_hex, message_id_hex)
-         SELECT ?1, ?2 WHERE EXISTS (
-            SELECT 1 FROM message_modifier_edges AS edges
-            CROSS JOIN content_pruned_controls AS controls
-              ON controls.group_id_hex = edges.group_id_hex
-             AND controls.message_id_hex = edges.modifier_message_id_hex
-            WHERE edges.group_id_hex = ?1 AND edges.target_message_id_hex = ?2
-              AND edges.kind IN (5, 4891)
-         )",
-        params![group, target],
-    )
-    .storage()?;
+    let mut retained: bool = conn.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM message_modifier_edges edges JOIN content_pruned_controls controls
+          ON controls.group_id_hex=edges.group_id_hex AND controls.message_id_hex=edges.modifier_message_id_hex
+          WHERE edges.group_id_hex=?1 AND edges.target_message_id_hex=?2 AND edges.kind=5)",
+        params![group,target], |row| row.get(0),
+    ).storage()?;
+    if !retained {
+        for control in removal_validation::targeting(conn, group, target)? {
+            if control.moderation_grant && conn.query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM content_pruned_controls WHERE group_id_hex=?1 AND message_id_hex=?2)",
+                params![group,control.message_id_hex], |row| row.get::<_,bool>(0),
+            ).storage()? {
+                retained=true;
+                break;
+            }
+        }
+    }
+    if retained {
+        conn.execute_cached(
+            "INSERT OR IGNORE INTO content_expired_targets VALUES(?1,?2)",
+            params![group, target],
+        )
+        .storage()?;
+    }
     Ok(())
 }
 
@@ -416,13 +427,17 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
     }
     conn.execute_cached(
         "UPDATE app_events SET plaintext = zeroblob(length(plaintext))
-         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind != 4891",
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND (kind != 4891 OR NOT EXISTS (
+           SELECT 1 FROM content_removal_validation v WHERE v.group_id_hex=?1 AND v.message_id_hex=?2 AND v.state=2
+         ))",
         params![group, id],
     )
     .storage()?;
     conn.execute_cached(
         "UPDATE app_events SET
-            plaintext = CASE WHEN kind = 4891 THEN plaintext ELSE '' END,
+            plaintext = CASE WHEN kind = 4891 AND EXISTS (
+              SELECT 1 FROM content_removal_validation v WHERE v.group_id_hex=?1 AND v.message_id_hex=?2 AND v.state=2
+            ) THEN plaintext ELSE '' END,
             retention_seconds = NULL,
             retention_expires_at = NULL
          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND EXISTS (
@@ -435,10 +450,12 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
     .storage()?;
     Ok(())
 }
-/// A control's tags. Once they no longer decode, what survives of them is the
-/// `e` tags its edges recorded: all a retained control keeps, and all a
-/// removal needs to keep hiding its target.
+/// Removal retention uses original validation or a target-specific legacy hold;
+/// reconstructed edges cannot establish the shape of the original decision.
 fn control_tags(conn: &Connection, event: &RawAppEvent) -> StorageResult<Vec<Vec<String>>> {
+    if event.kind == MARMOT_APP_EVENT_KIND_REMOVE {
+        return removal_validation::retained_tags(conn, &event.group_id_hex, &event.message_id_hex);
+    }
     if !app_event_tags_damaged_tx(conn, &event.group_id_hex, &event.message_id_hex)? {
         return Ok(event.tags.clone());
     }
@@ -454,10 +471,7 @@ pub(super) fn retain_pruned_controls(
         let Some(event) = raw(conn, group, id)? else {
             continue;
         };
-        if event.kind == 5
-            || (event.kind == 4891
-                && parse_removal(&control_tags(conn, &event)?, &event.plaintext).is_some())
-        {
+        if event.kind == 5 || (event.kind == 4891 && !control_tags(conn, &event)?.is_empty()) {
             conn.execute_cached(
                 "INSERT OR IGNORE INTO content_pruned_controls VALUES(?1,?2)",
                 params![group, id],
