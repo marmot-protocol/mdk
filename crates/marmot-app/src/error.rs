@@ -152,10 +152,10 @@ pub enum AppError {
     /// (`roster_unavailable`). The reason is a fixed, identity-free code.
     #[error("device group refused: {0}")]
     DeviceGroupRefused(&'static str),
-    /// The account holds a device group and this app has device groups off,
-    /// so its session did not open (mdk#3012). Only the experimental
-    /// device-group constructor opens it.
-    #[error("account holds a device group: open it with experimental device groups")]
+    /// The account holds or is joining a device group and this app has
+    /// device groups off, so its session did not open (mdk#3012). Only the
+    /// experimental device-group constructor opens it.
+    #[error("account holds or is joining a device group: open it with experimental device groups")]
     ExperimentalDeviceGroupsRequired,
     #[error("unknown local group")]
     UnknownGroup(String),

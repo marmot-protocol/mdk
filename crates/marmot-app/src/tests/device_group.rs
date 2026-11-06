@@ -1217,12 +1217,24 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     assert_eq!(laptop.linked_devices().unwrap().len(), 4);
 }
 
+/// An app opened as a release host opens it: device groups off.
+fn ordinary_app_on(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
+    MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay)
+}
+
 /// An ordinary opener of a root that holds a device group, such as a host's
 /// push extension on an experimental test build, is refused before its
 /// session opens (mdk#3012). It hydrates, drains, subscribes and sends
 /// nothing, so a device-group commit the experimental opener left
-/// mid-publication stays staged for the next one. A root without a device
-/// group, and the experimental constructor, still open.
+/// mid-publication stays staged for the next one. A root without device-group
+/// state, and the experimental constructor, still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ordinary_opener_of_a_device_group_root_is_refused() {
     let Devices {
@@ -1263,16 +1275,7 @@ async fn an_ordinary_opener_of_a_device_group_root_is_refused() {
     drop(laptop);
 
     let fresh = Arc::new(ScriptedPushRelayClient::default());
-    let ordinary = |dir: &tempfile::TempDir| {
-        MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example",
-            MarmotAppConfig::white_noise()
-                .with_dev_settlement_quiescence_ms(0)
-                .with_dev_scheduled_convergence_delay_ms(0),
-        )
-        .with_test_relay_client(fresh.clone())
-    };
+    let ordinary = |dir| ordinary_app_on(dir, fresh.clone());
     assert!(matches!(
         ordinary(&_dirs[0]).client("alice").await,
         Err(AppError::ExperimentalDeviceGroupsRequired)
@@ -1287,6 +1290,81 @@ async fn an_ordinary_opener_of_a_device_group_root_is_refused() {
         .await
         .unwrap();
     assert_eq!(staged(&phone), left, "the commit waits for this opener");
+}
+
+/// Only device-group state the engine can still act on refuses an ordinary
+/// opener: a link's Welcome wait it can still accept, as here, or a group it
+/// holds. A row left by a wait that ran out, or by a creation that never
+/// reached the engine, refuses nothing, and the open's reconciliation drops
+/// it, withdrawing the expired wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_device_group_rows_do_not_refuse_an_ordinary_opener() {
+    use cgka_traits::storage::DeviceGroupWelcomeStorage as _;
+    let Devices {
+        _dirs,
+        laptop_app,
+        mut laptop,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    drop((laptop, laptop_app));
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = ordinary_app_on(&_dirs[1], relay);
+    assert!(matches!(
+        app.client("alice").await,
+        Err(AppError::ExperimentalDeviceGroupsRequired)
+    ));
+
+    // The wait runs out with no Welcome.
+    let waited = link.device_group_id.clone();
+    let storage = app.account_storage("alice").unwrap();
+    let mut expected = storage
+        .device_group_welcome_expectation(&waited)
+        .unwrap()
+        .unwrap();
+    expected.expires_at = 1;
+    storage
+        .put_device_group_welcome_expectation(&expected)
+        .unwrap();
+    let rows = storage.app_storage();
+    let row = |id: &GroupId, trust| storage_sqlite::DeviceGroupRecord {
+        group_id_hex: hex::encode(id.as_slice()),
+        trust,
+        key_package_ref_hex: Some(link.key_package_ref_hex.clone()),
+        recorded_at: 1,
+    };
+    assert!(
+        rows.delete_device_group(
+            &hex::encode(waited.as_slice()),
+            DeviceGroupTrust::AwaitingWelcome
+        )
+        .unwrap()
+    );
+    assert!(
+        rows.insert_device_group(&row(&waited, DeviceGroupTrust::AwaitingWelcome))
+            .unwrap()
+    );
+    drop(app.client("alice").await.unwrap());
+    assert_eq!(trust(&app, &waited), None);
+    assert!(
+        storage
+            .device_group_welcome_expectation(&waited)
+            .unwrap()
+            .is_none(),
+        "the expired wait is withdrawn"
+    );
+
+    // A creation ended before the engine wrote anything of the group.
+    let never = GroupId::new(vec![0x7c; 16]);
+    assert!(
+        rows.insert_device_group(&row(&never, DeviceGroupTrust::Creating))
+            .unwrap()
+    );
+    drop(app.client("alice").await.unwrap());
+    assert_eq!(trust(&app, &never), None);
 }
 
 /// Through the runtime, the new device's account worker announces the join it

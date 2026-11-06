@@ -6,7 +6,7 @@
   `Unknown` matches neither kind; a window filtered on `Muted` updates when a mute expires. Regenerate bindings; an
   exhaustive Swift/Kotlin `switch` over the enum needs the new cases.
 
-- An ordinary constructor no longer opens an account that holds a device group: it fails with `Runtime`
+- An ordinary constructor no longer opens an account that holds or is joining a device group: it fails with `Runtime`
   `experimental_device_groups_required` (mdk#3012). Open experimental device-group roots with
   `newWithExperimentalDeviceGroups` in every opener, including notification service extensions.
 

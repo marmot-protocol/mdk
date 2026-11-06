@@ -1054,10 +1054,10 @@ and required deployment as `newWithConfiguration`; relay policy, secret storage,
 client name and platform retain their usual meanings. A library without this feature returns
 `experimental_device_groups_unavailable` before opening the root or acquiring a secret store. Use this constructor in
 **every** foreground/background opener of the experimental root, a notification service extension or background
-worker included. An ordinary constructor does not open an account that holds a device group: its session fails with
-`MarmotKitError.Runtime` `experimental_device_groups_required` (and `start` reports it) before anything of that account
-is read, sent or subscribed, so its device-group messages and unfinished device-group commits wait for an experimental
-opener. Accounts without a device group open as usual. This is an opt-in test build, not a release default.
+worker included. An ordinary constructor does not open an account that holds or is joining a device group: its
+session fails with `MarmotKitError.Runtime` `experimental_device_groups_required` (and `start` reports it) before
+anything of that account is read, sent or subscribed, so its device-group messages and unfinished device-group commits
+wait for an experimental opener. Other accounts open as usual. This is an opt-in test build, not a release default.
 Production settlement, retry and recovery timing remains unchanged; never enable `test-policy-overrides` in a host
 artifact.
 

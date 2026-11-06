@@ -7,7 +7,7 @@ the generic account, session, and engine crates. Read this if you are building a
 
 The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
 The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
-An account that holds a device group opens only with both: otherwise its session fails with
+An account that holds or is joining a device group opens only with both: otherwise its session fails with
 `AppError::ExperimentalDeviceGroupsRequired` before anything of it is read, sent or subscribed (mdk#3012).
 See [dev device linking](../cli/README.md#device-linking-dev-builds).
 

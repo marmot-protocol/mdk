@@ -7,7 +7,7 @@
   chat leaves or enters it at its expiry even when it is off screen. Windows and select-all read mute at the same
   time as each row's `muted`. Additive.
 
-- With device groups off, opening an account that holds a device group now fails with
+- With device groups off, opening an account that holds or is joining a device group now fails with
   `AppError::ExperimentalDeviceGroupsRequired` before its session hydrates, drains, subscribes or sends (mdk#3012).
   An ordinary opener of an experimental root, such as a push extension, used to read that group's messages and lose
   them for every opener; the experimental constructor opens such an account. Accounts without a device group are
