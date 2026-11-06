@@ -688,7 +688,7 @@ link (`new_device`) and the prompts for sign-ins this device can link (`prompts`
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from
   `WaitingForAnswer` to `Comparing`, with seven emoji and their English descriptions for screen readers, then
-  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` ends it.
+  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` requests cancellation; see the [cancellation contract](../marmot-uniffi/API-REFERENCE.md#marmotcancel_device_link) for limits.
 - On a device already signed in, a prompt shows the same code once that device checked the new device's KeyPackage.
   `link_device` takes the prompt id, the new device's label and its two settings, both on by default.
   `decline_device_link` is Not now. The prompt stays `Linking` until the new device's first change in the device
