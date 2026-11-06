@@ -28,6 +28,7 @@ pub mod attachment_history;
 pub mod attachment_storage;
 pub mod commands;
 pub mod deployment;
+pub mod emoji_set_install;
 pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;

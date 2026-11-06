@@ -3028,6 +3028,8 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::EmojiImageTooLarge(_) => "emoji_image_too_large",
         AppError::EmojiImageUnsupported(_) => "emoji_image_unsupported",
         AppError::EmojiSetLimit(_) => "emoji_set_limit",
+        AppError::EmojiSetChanged { .. } => "emoji_set_changed",
+        AppError::EmojiSetInstallCancelled => "emoji_set_install_cancelled",
         _ => "app_runtime_operation",
     }
 }
@@ -3183,6 +3185,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::EmojiSetNotFound
         | AppError::EmojiImageTooLarge(_)
         | AppError::EmojiSetLimit(_)
+        | AppError::EmojiSetChanged { .. }
+        | AppError::EmojiSetInstallCancelled
         | AppError::InvalidReportedPublicKey
         | AppError::CannotReportSelf
         | AppError::ModerationReportRateLimited
@@ -3586,6 +3590,18 @@ mod tests {
             (
                 AppError::EmojiSetLimit(marker.into()),
                 "emoji_set_limit",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::EmojiSetChanged {
+                    current_event_id_hex: marker.into(),
+                },
+                "emoji_set_changed",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::EmojiSetInstallCancelled,
+                "emoji_set_install_cancelled",
                 SubjectFailureCategory::ExpectedRefusal,
             ),
         ] {

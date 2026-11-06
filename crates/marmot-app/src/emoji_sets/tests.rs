@@ -277,16 +277,30 @@ fn image_validation_enforces_limits_and_stated_mime() {
         ("image/png", 64, 32, 1)
     );
     assert_eq!(image.sha256, hex::encode(Sha256::digest(&still)));
-    // No statement, or a generic binary one, leaves magic bytes to decide.
+    // No statement, a generic binary one, or any image type leaves magic
+    // bytes to decide; the format comes from the bytes, never the server.
     assert!(validate_emoji_image(still.clone(), None).is_ok());
     assert!(validate_emoji_image(still.clone(), Some("application/octet-stream")).is_ok());
+    let mislabeled = validate_emoji_image(still.clone(), Some("image/jpeg")).unwrap();
+    assert_eq!(mislabeled.mime, "image/png");
     assert_eq!(
-        validate_emoji_image(still.clone(), Some("image/jpeg")),
-        Err(AppEmojiSkipReason::MimeMismatch)
+        validate_emoji_image(still.clone(), Some("image/gif"))
+            .unwrap()
+            .mime,
+        "image/png"
     );
+    // A stated non-image type is refused even when the bytes parse.
+    for stated in ["text/html", "text/plain", "application/json", "image/"] {
+        assert_eq!(
+            validate_emoji_image(still.clone(), Some(stated)),
+            Err(AppEmojiSkipReason::MimeMismatch),
+            "{stated}"
+        );
+    }
+    // An image type over bytes that are no image is still unsupported.
     assert_eq!(
-        validate_emoji_image(still, Some("image/svg+xml")),
-        Err(AppEmojiSkipReason::MimeMismatch)
+        validate_emoji_image(b"<svg/>".to_vec(), Some("image/svg+xml")),
+        Err(AppEmojiSkipReason::UnsupportedImage)
     );
     assert_eq!(
         validate_emoji_image(png(16, 16, Some(2)), Some("image/png"))
@@ -430,6 +444,8 @@ struct Canned {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     content_length: bool,
+    /// Never answer: hold the connection until the client drops it.
+    stall: bool,
 }
 
 impl Canned {
@@ -439,15 +455,26 @@ impl Canned {
             headers: vec![("Content-Type".to_owned(), content_type.to_owned())],
             body,
             content_length: true,
+            stall: false,
+        }
+    }
+
+    fn stalled() -> Self {
+        Self {
+            stall: true,
+            ..Self::image("image/png", Vec::new())
         }
     }
 }
 
 /// A loopback HTTP/1.1 server that answers each path from a mutable table
-/// and counts every request it receives.
+/// and counts every request it receives, and every stalled request whose
+/// client hung up.
 struct ImageHost {
     base: String,
     requests: Arc<AtomicUsize>,
+    stalled_open: Arc<AtomicUsize>,
+    stalled_dropped: Arc<AtomicUsize>,
     routes: Arc<Mutex<HashMap<String, Canned>>>,
 }
 
@@ -456,8 +483,11 @@ impl ImageHost {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
+        let stalled_open = Arc::new(AtomicUsize::new(0));
+        let stalled_dropped = Arc::new(AtomicUsize::new(0));
         let routes = Arc::new(Mutex::new(HashMap::<String, Canned>::new()));
         let (counter, table) = (requests.clone(), routes.clone());
+        let (open, dropped) = (stalled_open.clone(), stalled_dropped.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -465,6 +495,7 @@ impl ImageHost {
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
                 let table = table.clone();
+                let (open, dropped) = (open.clone(), dropped.clone());
                 tokio::spawn(async move {
                     let mut buffer = vec![0; 8192];
                     let mut read = 0;
@@ -485,7 +516,16 @@ impl ImageHost {
                         headers: Vec::new(),
                         body: Vec::new(),
                         content_length: true,
+                        stall: false,
                     });
+                    if canned.stall {
+                        open.fetch_add(1, Ordering::SeqCst);
+                        // Wait for the client to hang up.
+                        let mut byte = [0; 1];
+                        while !matches!(stream.read(&mut byte).await, Ok(0) | Err(_)) {}
+                        dropped.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
                     let mut head = format!("HTTP/1.1 {}\r\nConnection: close\r\n", canned.status);
                     for (name, value) in &canned.headers {
                         head.push_str(&format!("{name}: {value}\r\n"));
@@ -503,6 +543,8 @@ impl ImageHost {
         Self {
             base,
             requests,
+            stalled_open,
+            stalled_dropped,
             routes,
         }
     }
@@ -523,6 +565,7 @@ impl ImageHost {
 struct Fixture {
     _directory: tempfile::TempDir,
     _relay: nostr_relay_builder::LocalRelay,
+    relay_database: nostr_relay_builder::prelude::MemoryDatabase,
     app: MarmotApp,
     account_id: String,
     host: ImageHost,
@@ -530,6 +573,74 @@ struct Fixture {
     set_created_at: u64,
     set_coordinate: String,
     set_naddr: String,
+}
+
+impl Fixture {
+    fn account(&self) -> &str {
+        &self.account_id
+    }
+
+    /// The event id of the stored version of the fixture set, as a host
+    /// showing it would read it.
+    async fn shown_event_id(&self) -> String {
+        self.app
+            .emoji_set(self.account(), &self.set_coordinate)
+            .await
+            .unwrap()
+            .unwrap()
+            .event_id_hex
+    }
+
+    /// Put an event on the fixture relay, as its author publishing it would.
+    async fn publish(&self, event: &Event) {
+        use nostr_relay_builder::prelude::NostrDatabase;
+        self.relay_database
+            .save_event(&serde_json::from_str(&event.as_json()).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// A newer version of the fixture set with `entries` as its emoji.
+    fn next_version(&self, after: u64, entries: &[(&str, &str)]) -> Event {
+        self.next_version_with(after, entries, [])
+    }
+
+    fn next_version_with(
+        &self,
+        after: u64,
+        entries: &[(&str, &str)],
+        extra: impl IntoIterator<Item = Tag>,
+    ) -> Event {
+        let mut tags = vec![tag(&["d", "blobs"]), tag(&["title", "Blob cats"])];
+        tags.extend(extra);
+        tags.extend(
+            entries
+                .iter()
+                .map(|(shortcode, path)| emoji_tag(shortcode, &self.host.url(path))),
+        );
+        EventBuilder::new(Kind::Custom(EMOJI_SET_KIND), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(after + 1))
+            .finalize(&self.author)
+            .unwrap()
+    }
+
+    async fn assert_nothing_installed(&self) {
+        assert!(
+            self.app
+                .installed_custom_emoji(self.account())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            self.app
+                .emoji_sets(self.account(), true, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 async fn fixture() -> Fixture {
@@ -540,7 +651,8 @@ async fn fixture() -> Fixture {
     let host = ImageHost::start().await;
     let still = png(32, 32, None);
     host.serve("/good.png", Canned::image("image/png", still.clone()));
-    host.serve("/lied.png", Canned::image("image/jpeg", still.clone()));
+    host.serve("/lied.png", Canned::image("text/html", still.clone()));
+    host.serve("/mislabeled.png", Canned::image("image/gif", still.clone()));
     host.serve(
         "/animated.png",
         Canned::image("image/png", png(16, 16, Some(201))),
@@ -564,6 +676,7 @@ async fn fixture() -> Fixture {
             headers: vec![("Location".to_owned(), "http://10.0.0.1/x.png".to_owned())],
             body: Vec::new(),
             content_length: true,
+            stall: false,
         },
     );
     host.serve("/mine.jpg", Canned::image("image/jpeg", jpeg(24, 24)));
@@ -579,6 +692,7 @@ async fn fixture() -> Fixture {
             emoji_tag("good", &host.url("/good.png")),
             emoji_tag("bad shortcode", &host.url("/good.png")),
             emoji_tag("lied", &host.url("/lied.png")),
+            emoji_tag("mislabeled", &host.url("/mislabeled.png")),
             emoji_tag("animated", &host.url("/animated.png")),
             emoji_tag("declared", &host.url("/huge-declared.png")),
             emoji_tag("streamed", &host.url("/huge-streamed.png")),
@@ -616,6 +730,7 @@ async fn fixture() -> Fixture {
             .await
             .unwrap();
     }
+    let relay_database = database.clone();
     let relay = nostr_relay_builder::LocalRelay::new(RelayBuilder::default().database(database));
     relay.run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -641,6 +756,7 @@ async fn fixture() -> Fixture {
     Fixture {
         _directory: directory,
         _relay: relay,
+        relay_database,
         app,
         account_id: account.account_id_hex,
         host,
@@ -664,12 +780,15 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
     let synced = app.sync_emoji_sets(account, None).await.unwrap();
     // The set with no valid emoji is stored, so it can supersede, but hidden.
     assert_eq!((synced.discovered, synced.updated), (1, 2));
-    let listed = app.emoji_sets(account, false, Some("BLOB"), None).unwrap();
+    let listed = app
+        .emoji_sets(account, false, Some("BLOB"), None)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1, "the set with no valid emoji stays hidden");
     let set = &listed[0];
     assert_eq!(set.coordinate, fixture.set_coordinate);
     assert_eq!(set.title.as_deref(), Some("Blob cats"));
-    assert_eq!(set.emoji.len(), 7);
+    assert_eq!(set.emoji.len(), 8);
     assert_eq!(
         set.skipped,
         vec![AppEmojiSkip {
@@ -681,6 +800,7 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
     assert!(set.installed.is_none());
     assert_eq!(
         app.emoji_sets(account, false, Some("streamed"), None)
+            .await
             .unwrap()
             .len(),
         1,
@@ -709,35 +829,48 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
     assert_eq!(host.requests(), 0, "sync and set reads never fetch images");
 
     // An explicit preview fetches exactly one image.
+    let shown = set.event_id_hex.as_str();
     let preview = app
-        .fetch_emoji_set_asset(account, &fixture.set_coordinate, "good")
+        .fetch_emoji_set_asset(account, &fixture.set_coordinate, shown, "good")
         .await
         .unwrap();
     assert_eq!(preview.bytes, png(32, 32, None));
     assert_eq!(host.requests(), 1);
     assert!(matches!(
-        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, "lied")
+        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, shown, "lied")
             .await,
         Err(AppError::EmojiImageUnsupported(_))
     ));
     assert!(matches!(
-        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, "declared")
+        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, shown, "declared")
             .await,
         Err(AppError::EmojiImageTooLarge(_))
     ));
     assert!(matches!(
-        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, "unknown")
+        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, shown, "unknown")
             .await,
         Err(AppError::EmojiSetNotFound)
     ));
+    // The set has no cover: nothing to fetch.
+    let requests = host.requests();
+    assert!(matches!(
+        app.fetch_emoji_set_cover(account, &fixture.set_coordinate, shown)
+            .await,
+        Err(AppError::EmojiSetNotFound)
+    ));
+    assert_eq!(host.requests(), requests);
 
     // Install downloads each entry once and reports every skip.
     let before_install = host.requests();
+    let control = EmojiSetInstallControl::new();
     let installed = app
-        .install_emoji_set(account, &fixture.set_coordinate)
+        .install_emoji_set(account, &fixture.set_coordinate, shown, &control)
         .await
         .unwrap();
-    assert_eq!(installed.installed_count, 1);
+    assert_eq!(
+        installed.installed_count, 2,
+        "a mislabeled image type installs"
+    );
     let skipped = installed
         .skipped
         .iter()
@@ -761,7 +894,10 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
             ),
         ]
     );
-    assert_eq!(host.requests() - before_install, 7);
+    assert_eq!(host.requests() - before_install, 8);
+    let progress = control.progress();
+    assert_eq!((progress.completed_emoji, progress.total_emoji), (8, 8));
+    assert!(progress.transferred_bytes >= 2 * png(32, 32, None).len() as u64);
     let state = installed.set.installed.clone().unwrap();
     assert_eq!(state.event_id_hex, installed.set.event_id_hex);
     assert!(!state.update_available);
@@ -770,14 +906,20 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
     // reach them, and reading them is local.
     host.serve("/good.png", Canned::image("image/png", png(48, 48, None)));
     let requests = host.requests();
-    let picker = app.installed_custom_emoji(account).unwrap();
-    assert_eq!(picker.len(), 1);
-    assert_eq!(picker[0].shortcode, "good");
+    let picker = app.installed_custom_emoji(account).await.unwrap();
+    assert_eq!(
+        picker
+            .iter()
+            .map(|emoji| (emoji.shortcode.as_str(), emoji.mime.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("good", "image/png"), ("mislabeled", "image/png")]
+    );
     assert_eq!(picker[0].set_title.as_deref(), Some("Blob cats"));
     assert_eq!((picker[0].width, picker[0].height), (32, 32));
     assert!(!picker[0].shortcode_collision);
     let read = app
         .read_installed_custom_emoji(account, &fixture.set_coordinate, "good")
+        .await
         .unwrap();
     assert_eq!(read.bytes, png(32, 32, None));
     assert_eq!(read.emoji.sha256, hex::encode(Sha256::digest(&read.bytes)));
@@ -785,22 +927,37 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
 
     // The user's own list installs as a set; the shared shortcode is
     // reported on both, not resolved.
-    app.install_emoji_set(account, &own.coordinate)
-        .await
-        .unwrap();
-    let picker = app.installed_custom_emoji(account).unwrap();
+    app.install_emoji_set(
+        account,
+        &own.coordinate,
+        &own.event_id_hex,
+        &EmojiSetInstallControl::new(),
+    )
+    .await
+    .unwrap();
+    let picker = app.installed_custom_emoji(account).await.unwrap();
     assert_eq!(
         picker
             .iter()
-            .map(|emoji| (emoji.set_coordinate.as_str(), emoji.mime.as_str()))
+            .map(|emoji| (
+                emoji.set_coordinate.as_str(),
+                emoji.shortcode.as_str(),
+                emoji.shortcode_collision
+            ))
             .collect::<Vec<_>>(),
         vec![
-            (fixture.set_coordinate.as_str(), "image/png"),
-            (own.coordinate.as_str(), "image/jpeg"),
+            (fixture.set_coordinate.as_str(), "good", true),
+            (fixture.set_coordinate.as_str(), "mislabeled", false),
+            (own.coordinate.as_str(), "good", true),
         ]
     );
-    assert!(picker.iter().all(|emoji| emoji.shortcode_collision));
-    assert_eq!(app.emoji_sets(account, true, None, None).unwrap().len(), 2);
+    assert_eq!(
+        app.emoji_sets(account, true, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // A newer version with no valid emoji supersedes the installed one: it is
     // hidden from discovery and cannot be fetched or installed, while the
@@ -813,14 +970,20 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
         .custom_created_at(Timestamp::from_secs(fixture.set_created_at + 1))
         .finalize(&fixture.author)
         .unwrap();
-    ingest_discovered_sets(&app.emoji_storage(account).unwrap(), vec![emptied], true).unwrap();
+    ingest_discovered_sets(
+        &app.emoji_storage(account).unwrap(),
+        vec![emptied.clone()],
+        true,
+    )
+    .unwrap();
     assert!(
         app.emoji_sets(account, false, Some("BLOB"), None)
+            .await
             .unwrap()
             .is_empty()
     );
     assert!(
-        app.emoji_sets(account, true, None, None).unwrap()[0]
+        app.emoji_sets(account, true, None, None).await.unwrap()[0]
             .installed
             .as_ref()
             .unwrap()
@@ -832,13 +995,19 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
     ));
     let requests = host.requests();
     assert!(matches!(
-        app.install_emoji_set(account, &fixture.set_coordinate)
-            .await,
+        app.install_emoji_set(
+            account,
+            &fixture.set_coordinate,
+            &emptied.id.to_hex(),
+            &EmojiSetInstallControl::new(),
+        )
+        .await,
         Err(AppError::InvalidEmojiSet(_))
     ));
     assert_eq!(host.requests(), requests);
     assert!(
         app.read_installed_custom_emoji(account, &fixture.set_coordinate, "good")
+            .await
             .is_ok()
     );
 
@@ -849,10 +1018,11 @@ async fn emoji_sets_round_trip_against_a_local_relay_and_image_host() {
             .unwrap()
     );
     assert!(matches!(
-        app.read_installed_custom_emoji(account, &fixture.set_coordinate, "good"),
+        app.read_installed_custom_emoji(account, &fixture.set_coordinate, "good")
+            .await,
         Err(AppError::EmojiSetNotFound)
     ));
-    let picker = app.installed_custom_emoji(account).unwrap();
+    let picker = app.installed_custom_emoji(account).await.unwrap();
     assert_eq!(picker.len(), 1);
     assert!(!picker[0].shortcode_collision);
     assert!(
@@ -869,22 +1039,23 @@ async fn install_with_no_usable_emoji_installs_nothing() {
     let fixture = fixture().await;
     let (app, account) = (&fixture.app, fixture.account_id.as_str());
     app.sync_emoji_sets(account, None).await.unwrap();
+    let shown = fixture.shown_event_id().await;
     fixture.host.routes.lock().unwrap().clear();
 
     let result = app
-        .install_emoji_set(account, &fixture.set_coordinate)
+        .install_emoji_set(
+            account,
+            &fixture.set_coordinate,
+            &shown,
+            &EmojiSetInstallControl::new(),
+        )
         .await;
 
     assert!(
         matches!(result, Err(AppError::EmojiSetNetwork(_))),
         "{result:?}"
     );
-    assert!(app.installed_custom_emoji(account).unwrap().is_empty());
-    assert!(
-        app.emoji_sets(account, true, None, None)
-            .unwrap()
-            .is_empty()
-    );
+    fixture.assert_nothing_installed().await;
 }
 
 /// An image that does not fit the remaining byte budget is skipped on its
@@ -910,7 +1081,10 @@ async fn an_image_over_the_budget_does_not_stop_later_ones() {
         },
     ];
 
-    let (kept, skipped) = fixture.app.download_set(&entries, budget).await;
+    let (kept, skipped) = fixture
+        .app
+        .download_set(&entries, budget, &EmojiSetInstallControl::new())
+        .await;
 
     assert_eq!(
         kept.iter()
@@ -925,6 +1099,29 @@ async fn an_image_over_the_budget_does_not_stop_later_ones() {
             .collect::<Vec<_>>(),
         vec![(Some("big"), AppEmojiSkipReason::OverCap)]
     );
+}
+
+/// No download dials once the install is cancelled, even one the stream
+/// starts before the install's `select!` looks at the control again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_install_starts_no_download() {
+    let fixture = fixture().await;
+    let entries = (0..3)
+        .map(|index| StoredEmojiSetEntry {
+            shortcode: format!("good{index}"),
+            url: fixture.host.url("/good.png"),
+        })
+        .collect::<Vec<_>>();
+    let control = EmojiSetInstallControl::new();
+    control.cancel();
+
+    let (kept, _) = fixture
+        .app
+        .download_set(&entries, MAX_INSTALLED_EMOJI_SET_BYTES, &control)
+        .await;
+
+    assert!(kept.is_empty());
+    assert_eq!(fixture.host.requests(), 0);
 }
 
 /// Bodies rejected after download still count toward the download stop, so
@@ -946,7 +1143,9 @@ async fn rejected_bodies_count_toward_the_download_stop() {
     // Two rejected bodies reach twice this budget.
     let budget = png(32, 32, None).len() as u64;
 
-    let (kept, skipped) = fixture.app.download_set(&entries, budget).await;
+    let control = EmojiSetInstallControl::new();
+    control.start(entries.len());
+    let (kept, skipped) = fixture.app.download_set(&entries, budget, &control).await;
 
     assert!(kept.is_empty());
     assert!(
@@ -960,6 +1159,9 @@ async fn rejected_bodies_count_toward_the_download_stop() {
         (Some("good"), AppEmojiSkipReason::OverCap)
     );
     assert_eq!(skipped.len(), entries.len());
+    // Entries given up on still count, so a progress bar reaches its end.
+    let progress = control.progress();
+    assert_eq!(progress.completed_emoji, progress.total_emoji);
 }
 
 /// Cancelling an install while its storage write runs must not free the
@@ -989,4 +1191,303 @@ async fn a_cancelled_install_write_keeps_the_mutation_lock_until_it_lands() {
     release_tx.send(()).unwrap();
     // Free again once the write has finished.
     drop(lock.lock().await);
+}
+
+/// Wait, bounded, until `ready` holds.
+async fn wait_until(what: &str, ready: impl Fn() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// Install, preview and cover downloads are bound to the version the user
+/// was shown: a sync that stores a newer version between the read and the
+/// tap makes them fail before any image request, and passing the current
+/// version's id installs it. With nothing stored, install does not fetch
+/// the set itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downloads_refuse_a_version_the_user_was_not_shown() {
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    let control = EmojiSetInstallControl::new();
+    assert!(matches!(
+        app.install_emoji_set(account, &fixture.set_coordinate, &"0".repeat(64), &control)
+            .await,
+        Err(AppError::EmojiSetNotFound)
+    ));
+    app.sync_emoji_sets(account, None).await.unwrap();
+    let shown = fixture.shown_event_id().await;
+
+    // The author moves the set to another image host, and a sync lands
+    // before the user taps Install.
+    let newer = fixture.next_version(fixture.set_created_at, &[("good", "/elsewhere.png")]);
+    fixture.publish(&newer).await;
+    app.sync_emoji_sets(account, None).await.unwrap();
+
+    let current = newer.id.to_hex();
+    let changed = |result: Result<_, AppError>| {
+        matches!(
+            result,
+            Err(AppError::EmojiSetChanged { current_event_id_hex }) if current_event_id_hex == current
+        )
+    };
+    assert!(changed(
+        app.install_emoji_set(account, &fixture.set_coordinate, &shown, &control)
+            .await
+            .map(drop)
+    ));
+    assert!(changed(
+        app.fetch_emoji_set_asset(account, &fixture.set_coordinate, &shown, "good")
+            .await
+            .map(drop)
+    ));
+    assert!(changed(
+        app.fetch_emoji_set_cover(account, &fixture.set_coordinate, &shown)
+            .await
+            .map(drop)
+    ));
+    assert_eq!(host.requests(), 0, "no image request for an unseen version");
+    assert_eq!(control.progress(), EmojiSetInstallProgress::default());
+    fixture.assert_nothing_installed().await;
+
+    // Shown again, the current version installs.
+    host.serve(
+        "/elsewhere.png",
+        Canned::image("image/png", png(32, 32, None)),
+    );
+    let installed = app
+        .install_emoji_set(account, &fixture.set_coordinate, &current, &control)
+        .await
+        .unwrap();
+    assert_eq!(installed.installed_count, 1);
+    assert_eq!(installed.set.installed.unwrap().event_id_hex, current);
+    assert_eq!(host.requests(), 1);
+}
+
+/// A set's cover loads only on request, through the same image limits as
+/// its emoji, and is not stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_cover_loads_only_on_request() {
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    let covered = fixture.next_version_with(
+        fixture.set_created_at,
+        &[("good", "/good.png")],
+        [tag(&["image", &host.url("/mislabeled.png")])],
+    );
+    fixture.publish(&covered).await;
+
+    let set = app
+        .fetch_emoji_set(account, &fixture.set_coordinate)
+        .await
+        .unwrap();
+    assert_eq!(set.image_url, Some(host.url("/mislabeled.png")));
+    assert_eq!(host.requests(), 0, "reading a set never loads its cover");
+
+    let cover = app
+        .fetch_emoji_set_cover(account, &fixture.set_coordinate, &set.event_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(
+        (cover.mime.as_str(), cover.width, cover.height),
+        ("image/png", 32, 32)
+    );
+    assert_eq!(cover.sha256, hex::encode(Sha256::digest(&cover.bytes)));
+    assert_eq!(host.requests(), 1);
+
+    host.serve(
+        "/mislabeled.png",
+        Canned::image("text/html", png(32, 32, None)),
+    );
+    assert!(matches!(
+        app.fetch_emoji_set_cover(account, &fixture.set_coordinate, &set.event_id_hex)
+            .await,
+        Err(AppError::EmojiImageUnsupported(_))
+    ));
+    fixture.assert_nothing_installed().await;
+}
+
+/// Cancelling a reinstall mid-download drops the downloads in flight,
+/// starts no more, and leaves the previous snapshot as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_reinstall_keeps_the_previous_snapshot() {
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    app.sync_emoji_sets(account, None).await.unwrap();
+    let first = fixture.shown_event_id().await;
+    app.install_emoji_set(
+        account,
+        &fixture.set_coordinate,
+        &first,
+        &EmojiSetInstallControl::new(),
+    )
+    .await
+    .unwrap();
+
+    // Two quick entries, then four that never answer and fill the
+    // download window, then more that must never be requested.
+    host.serve("/slow.png", Canned::stalled());
+    let mut entries = vec![("a", "/good.png"), ("b", "/mislabeled.png")];
+    entries.extend([("c", "/slow.png"), ("d", "/slow.png"), ("e", "/slow.png")]);
+    entries.extend([("f", "/slow.png"), ("g", "/good.png"), ("h", "/good.png")]);
+    let next = fixture.next_version(fixture.set_created_at, &entries);
+    fixture.publish(&next).await;
+    let shown = app
+        .fetch_emoji_set(account, &fixture.set_coordinate)
+        .await
+        .unwrap();
+    assert_eq!(shown.event_id_hex, next.id.to_hex());
+
+    let before = host.requests();
+    let control = Arc::new(EmojiSetInstallControl::new());
+    let install = tokio::spawn({
+        let (app, account) = (app.clone(), account.to_owned());
+        let (coordinate, control) = (fixture.set_coordinate.clone(), control.clone());
+        async move {
+            app.install_emoji_set(&account, &coordinate, &shown.event_id_hex, &control)
+                .await
+        }
+    });
+    wait_until("the stalled downloads", || {
+        host.stalled_open.load(Ordering::SeqCst) == EMOJI_DOWNLOAD_CONCURRENCY
+    })
+    .await;
+    let progress = control.progress();
+    assert_eq!((progress.completed_emoji, progress.total_emoji), (2, 8));
+    assert_eq!(host.requests() - before, 2 + EMOJI_DOWNLOAD_CONCURRENCY);
+
+    control.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), install)
+        .await
+        .expect("a cancelled install returns promptly")
+        .unwrap();
+    assert!(
+        matches!(result, Err(AppError::EmojiSetInstallCancelled)),
+        "{result:?}"
+    );
+    wait_until("the in-flight downloads to drop", || {
+        host.stalled_dropped.load(Ordering::SeqCst) == EMOJI_DOWNLOAD_CONCURRENCY
+    })
+    .await;
+    // The install has returned and its download stream is gone: every
+    // request it ever made was one of these.
+    assert_eq!(
+        host.requests() - before,
+        2 + EMOJI_DOWNLOAD_CONCURRENCY,
+        "no download starts after cancellation"
+    );
+
+    let installed = app.emoji_sets(account, true, None, None).await.unwrap();
+    let state = installed[0].installed.as_ref().unwrap();
+    assert_eq!(state.event_id_hex, first);
+    assert!(state.update_available);
+    assert_eq!(
+        app.installed_custom_emoji(account)
+            .await
+            .unwrap()
+            .iter()
+            .map(|emoji| emoji.shortcode.as_str())
+            .collect::<Vec<_>>(),
+        vec!["good", "mislabeled"]
+    );
+    assert!(
+        app.read_installed_custom_emoji(account, &fixture.set_coordinate, "good")
+            .await
+            .is_ok()
+    );
+}
+
+/// Start an install whose only stalled download is in flight, run `stop`,
+/// and check the install fails as cancelled, its control reads cancelled
+/// and the download is dropped.
+async fn stop_cancels_a_running_install<F, Fut>(stop: F) -> Fixture
+where
+    F: FnOnce(MarmotApp) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let fixture = fixture().await;
+    let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
+    host.serve("/slow.png", Canned::stalled());
+    let next = fixture.next_version(
+        fixture.set_created_at,
+        &[("a", "/good.png"), ("b", "/slow.png"), ("c", "/good.png")],
+    );
+    fixture.publish(&next).await;
+    let shown = app
+        .fetch_emoji_set(account, &fixture.set_coordinate)
+        .await
+        .unwrap()
+        .event_id_hex;
+    let control = Arc::new(EmojiSetInstallControl::new());
+    let install = tokio::spawn({
+        let (app, account) = (app.clone(), account.to_owned());
+        let (coordinate, control) = (fixture.set_coordinate.clone(), control.clone());
+        async move {
+            app.install_emoji_set(&account, &coordinate, &shown, &control)
+                .await
+        }
+    });
+    wait_until("the stalled download", || {
+        host.stalled_open.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    stop(app.clone()).await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), install)
+        .await
+        .expect("stopping cancels the install promptly")
+        .unwrap();
+    assert!(
+        matches!(result, Err(AppError::EmojiSetInstallCancelled)),
+        "{result:?}"
+    );
+    assert!(control.is_cancelled(), "the host reads the cancellation");
+    wait_until("the in-flight download to drop", || {
+        host.stalled_dropped.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    fixture
+}
+
+/// Runtime shutdown cancels a running install the way its control does,
+/// stores nothing, and refuses later installs before any request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_shutdown_cancels_a_running_install() {
+    let fixture = stop_cancels_a_running_install(|app| async move {
+        crate::MarmotAppRuntime::new(app).shutdown().await;
+    })
+    .await;
+    fixture.assert_nothing_installed().await;
+
+    let shown = fixture.shown_event_id().await;
+    let requests = fixture.host.requests();
+    assert!(matches!(
+        fixture
+            .app
+            .install_emoji_set(
+                fixture.account(),
+                &fixture.set_coordinate,
+                &shown,
+                &EmojiSetInstallControl::new()
+            )
+            .await,
+        Err(AppError::EmojiSetInstallCancelled)
+    ));
+    assert_eq!(fixture.host.requests(), requests);
+}
+
+/// Closing storage, as `shutdown_and_close` does before a host suspends,
+/// cancels a running install too, so nothing keeps downloading or reaches
+/// the closing database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_close_cancels_a_running_install() {
+    stop_cancels_a_running_install(|app| async move {
+        app.close_storage().unwrap();
+    })
+    .await;
 }

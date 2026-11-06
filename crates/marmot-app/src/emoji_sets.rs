@@ -3,9 +3,13 @@
 //!
 //! Egress is explicit. Discovery, `fetch_emoji_set` and `user_emoji_list`
 //! read text events from relays and never fetch an image. Image bytes come
-//! only from `fetch_emoji_set_asset` (one preview) and `install_emoji_set`
-//! (every emoji of a set), each of which tells the image host the user's IP
-//! address, so hosts call them only after an explicit user action.
+//! only from `fetch_emoji_set_asset` (one preview), `fetch_emoji_set_cover`
+//! (the set's cover) and `install_emoji_set` (every emoji of a set), each of
+//! which tells the image host the user's IP address, so hosts call them only
+//! after an explicit user action. Each takes the event id of the version the
+//! user was shown and fails with `EmojiSetChanged`, before any download,
+//! when a later read stored another version: the user never reveals their
+//! address to a host they were not shown.
 //!
 //! Installing snapshots one set version: each emoji is downloaded once,
 //! validated, and stored with its SHA-256 under the account. Reading an
@@ -16,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
@@ -90,7 +95,8 @@ pub enum AppEmojiSkipReason {
     TooLarge,
     /// Not PNG/APNG, GIF, WebP or JPEG, or malformed.
     UnsupportedImage,
-    /// The response's stated MIME type does not match the bytes.
+    /// The response stated a type that is not an image type (such as
+    /// `text/html`) for bytes that decode as an image.
     MimeMismatch,
 }
 
@@ -133,9 +139,9 @@ impl AppEmojiSkipReason {
             Self::UnsupportedImage => {
                 AppError::EmojiImageUnsupported("emoji image format is unsupported".into())
             }
-            Self::MimeMismatch => AppError::EmojiImageUnsupported(
-                "emoji image MIME type does not match its bytes".into(),
-            ),
+            Self::MimeMismatch => {
+                AppError::EmojiImageUnsupported("emoji image was served as a non-image type".into())
+            }
         }
     }
 }
@@ -240,6 +246,80 @@ pub struct AppEmojiSetAsset {
     pub frames: u32,
     pub sha256: String,
     pub bytes: Vec<u8>,
+}
+
+/// A set's validated cover image (its `image` tag) fetched for display. Not
+/// stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppEmojiSetCover {
+    pub set_coordinate: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Progress of one install, read from its [`EmojiSetInstallControl`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmojiSetInstallProgress {
+    /// Entries finished so far: stored, skipped or given up on.
+    pub completed_emoji: u32,
+    /// Entries the install will try: the version's valid emoji. Zero until
+    /// the install has read the stored version.
+    pub total_emoji: u32,
+    /// Response bytes received from image hosts, valid or not, counted as
+    /// each download finishes.
+    pub transferred_bytes: u64,
+}
+
+/// Cancellation and progress for one `install_emoji_set` call. Create one
+/// per install. A cancelled install stops starting downloads, drops the ones
+/// in flight, stores nothing and fails with `EmojiSetInstallCancelled`; a
+/// reinstall leaves the previous snapshot as it was. The final storage write
+/// is atomic and not interruptible: a cancellation that arrives once it has
+/// started is too late, and the install succeeds.
+#[derive(Debug, Default)]
+pub struct EmojiSetInstallControl {
+    cancelled: tokio_util::sync::CancellationToken,
+    completed_emoji: AtomicU32,
+    total_emoji: AtomicU32,
+    transferred_bytes: AtomicU64,
+}
+
+impl EmojiSetInstallControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.is_cancelled()
+    }
+
+    pub fn progress(&self) -> EmojiSetInstallProgress {
+        EmojiSetInstallProgress {
+            completed_emoji: self.completed_emoji.load(Ordering::Acquire),
+            total_emoji: self.total_emoji.load(Ordering::Acquire),
+            transferred_bytes: self.transferred_bytes.load(Ordering::Acquire),
+        }
+    }
+
+    fn start(&self, total: usize) {
+        self.total_emoji
+            .store(total.try_into().unwrap_or(u32::MAX), Ordering::Release);
+    }
+
+    fn finish_entries(&self, count: usize, transferred: u64) {
+        self.transferred_bytes
+            .fetch_add(transferred, Ordering::AcqRel);
+        self.completed_emoji
+            .fetch_add(count.try_into().unwrap_or(u32::MAX), Ordering::AcqRel);
+    }
 }
 
 /// One installed emoji for a picker. Shortcodes may repeat across sets;
@@ -543,7 +623,7 @@ fn stored_set_from_event(
 }
 
 /// A validated image: size, format, dimensions and frames within limits, and
-/// any MIME type the server stated matching the bytes.
+/// served as an image type (or with no type, or a generic binary one).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ValidatedEmojiImage {
     mime: &'static str,
@@ -570,7 +650,7 @@ fn validate_emoji_image(
             AppEmojiSkipReason::UnsupportedImage
         }
     })?;
-    if !stated_mime_matches(stated_mime, inspected.mime) {
+    if !stated_mime_allows_image(stated_mime) {
         return Err(AppEmojiSkipReason::MimeMismatch);
     }
     Ok(ValidatedEmojiImage {
@@ -583,17 +663,19 @@ fn validate_emoji_image(
     })
 }
 
-/// A server that states no type, or only a generic binary one, makes no claim
-/// to check; magic bytes decide. Any other stated type must name the format
-/// the bytes are. APNG is commonly served as `image/png`.
-fn stated_mime_matches(stated: Option<&str>, actual: &str) -> bool {
+/// Whether the response's stated type lets the bytes be used as an image.
+/// The bytes decide the format: `inspect_image` has already parsed their
+/// header, and the stored MIME type comes from it, never from the server.
+/// No type, a generic binary type, or any `image/*` type (servers commonly
+/// label a GIF or WebP `image/png`) defers to them. A stated non-image type
+/// such as `text/html` is refused, so a document that also parses as an
+/// image is not installed.
+fn stated_mime_allows_image(stated: Option<&str>) -> bool {
     match stated {
         None | Some("application/octet-stream" | "binary/octet-stream") => true,
-        Some(stated) => {
-            stated == actual
-                || (actual == "image/apng" && stated == "image/png")
-                || (actual == "image/jpeg" && stated == "image/jpg")
-        }
+        Some(stated) => stated
+            .strip_prefix("image/")
+            .is_some_and(|subtype| !subtype.is_empty()),
     }
 }
 
@@ -607,37 +689,47 @@ struct EmojiAccountContext {
 impl MarmotApp {
     /// Discovered (or, with `installed_only`, installed) sets from local
     /// storage. `search` matches title, description, author (hex or `npub`)
-    /// and shortcodes. No network.
-    pub fn emoji_sets(
+    /// and shortcodes. No network; the read runs on the blocking pool.
+    pub async fn emoji_sets(
         &self,
         account_ref: &str,
         installed_only: bool,
         search: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<AppEmojiSet>, AppError> {
-        let storage = self.emoji_storage(account_ref)?;
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
         let search = search.map(normalize_search);
-        let installed = installed_states(&storage)?;
-        storage
-            .emoji_sets(installed_only, search.as_deref(), limit.unwrap_or(50))?
-            .into_iter()
-            .map(|set| app_set(set, &installed))
-            .collect()
+        let limit = limit.unwrap_or(50);
+        read_blocking(move || {
+            let storage = app.emoji_storage(&account_ref)?;
+            let installed = installed_states(&storage)?;
+            storage
+                .emoji_sets(installed_only, search.as_deref(), limit)?
+                .into_iter()
+                .map(|set| app_set(set, &installed))
+                .collect()
+        })
+        .await
     }
 
-    /// One stored set by coordinate or `naddr`. No network.
-    pub fn emoji_set(
+    /// One stored set by coordinate or `naddr`. No network; the read runs on
+    /// the blocking pool.
+    pub async fn emoji_set(
         &self,
         account_ref: &str,
         input: &str,
     ) -> Result<Option<AppEmojiSet>, AppError> {
         let coordinate = parse_emoji_set_input(input)?;
-        let storage = self.emoji_storage(account_ref)?;
-        let installed = installed_states(&storage)?;
-        storage
-            .emoji_set(&coordinate)?
-            .map(|set| app_set(set, &installed))
-            .transpose()
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
+        read_blocking(move || {
+            let storage = app.emoji_storage(&account_ref)?;
+            let installed = installed_states(&storage)?;
+            storage
+                .emoji_set(&coordinate)?
+                .map(|set| app_set(set, &installed))
+                .transpose()
+        })
+        .await
     }
 
     /// Fetch the newest kind-30030 sets from the account's relays (the ones
@@ -808,22 +900,23 @@ impl MarmotApp {
 
     /// Download one emoji of a stored set for a preview, validated but not
     /// stored. This reveals the user's IP address to the image host the set
-    /// author chose: call it only after the user opens the set.
+    /// author chose: call it only after the user opens the set, passing the
+    /// event id of the version shown. Another stored version fails with
+    /// `EmojiSetChanged` before anything is fetched.
     pub async fn fetch_emoji_set_asset(
         &self,
         account_ref: &str,
         coordinate: &str,
+        expected_event_id_hex: &str,
         shortcode: &str,
     ) -> Result<AppEmojiSetAsset, AppError> {
         let coordinate = parse_emoji_set_input(coordinate)?;
         let storage = self.emoji_storage(account_ref)?;
-        let entry = storage
-            .emoji_set(&coordinate)?
-            .and_then(|set| {
-                set.emoji
-                    .into_iter()
-                    .find(|entry| entry.shortcode == shortcode)
-            })
+        let set = shown_version(&storage, &coordinate, expected_event_id_hex)?;
+        let entry = set
+            .emoji
+            .into_iter()
+            .find(|entry| entry.shortcode == shortcode)
             .ok_or(AppError::EmojiSetNotFound)?;
         let image = self
             .download_emoji(&entry.url)
@@ -842,34 +935,73 @@ impl MarmotApp {
         })
     }
 
-    /// Install the stored version of a set (fetching its text first only
-    /// when none is stored): download every emoji once, validate it and
-    /// store its bytes and SHA-256 under the account, replacing any earlier
-    /// snapshot of the same set. Entries that are invalid, duplicated, fail
-    /// to download or validate, or go over a cap are reported, not fatal.
-    /// This reveals the user's IP address to every image host in the set.
+    /// Download a stored set's cover image (its `image` tag), validated
+    /// under the emoji image limits but not stored. Like
+    /// [`Self::fetch_emoji_set_asset`] it reveals the user's IP address to
+    /// the host the set author chose: call it only after the user opens the
+    /// set, with the event id of the version shown. A set without a cover
+    /// fails with `EmojiSetNotFound`.
+    pub async fn fetch_emoji_set_cover(
+        &self,
+        account_ref: &str,
+        coordinate: &str,
+        expected_event_id_hex: &str,
+    ) -> Result<AppEmojiSetCover, AppError> {
+        let coordinate = parse_emoji_set_input(coordinate)?;
+        let storage = self.emoji_storage(account_ref)?;
+        let url = shown_version(&storage, &coordinate, expected_event_id_hex)?
+            .image_url
+            .ok_or(AppError::EmojiSetNotFound)?;
+        let image = self
+            .download_emoji(&url)
+            .await
+            .0
+            .map_err(AppEmojiSkipReason::into_error)?;
+        Ok(AppEmojiSetCover {
+            set_coordinate: coordinate,
+            mime: image.mime.to_owned(),
+            width: image.width,
+            height: image.height,
+            frames: image.frames,
+            sha256: image.sha256,
+            bytes: image.bytes,
+        })
+    }
+
+    /// Install the stored version of a set: download every emoji once,
+    /// validate it and store its bytes and SHA-256 under the account,
+    /// replacing any earlier snapshot of the same set. Entries that are
+    /// invalid, duplicated, fail to download or validate, or go over a cap
+    /// are reported, not fatal. This reveals the user's IP address to every
+    /// image host in the set.
+    ///
+    /// `expected_event_id_hex` is the version the user was shown. When the
+    /// stored version is another one (a sync or fetch replaced it), the call
+    /// fails with `EmojiSetChanged` before any download; with nothing stored
+    /// it fails with `EmojiSetNotFound` and never fetches the set itself.
+    /// `control` reports progress and cancels; see
+    /// [`EmojiSetInstallControl`]. Runtime shutdown or storage close cancels
+    /// the install the same way.
     pub async fn install_emoji_set(
         &self,
         account_ref: &str,
-        input: &str,
+        coordinate: &str,
+        expected_event_id_hex: &str,
+        control: &EmojiSetInstallControl,
     ) -> Result<AppEmojiSetInstallResult, AppError> {
-        let parsed = parse_input_with_relays(input)?;
-        let coordinate = parsed.address.coordinate();
+        let coordinate = parse_emoji_set_input(coordinate)?;
         let account = self.account_home().account(account_ref)?;
         let storage = self.account_storage(&account.label)?.app_storage();
+        let lock = self.emoji_set_mutation_lock(&account.label);
+        let stop = self.emoji_install_stopped(control);
+        tokio::pin!(stop);
         // Owned so the write below can keep it if this call is cancelled.
-        let guard = self
-            .emoji_set_mutation_lock(&account.label)
-            .lock_owned()
-            .await;
-        if storage.emoji_set(&coordinate)?.is_none() {
-            let context = self.emoji_context(account_ref)?;
-            self.fetch_set_into_storage(&context, &parsed.address, &parsed.relay_hints)
-                .await?;
-        }
-        let set = storage
-            .emoji_set(&coordinate)?
-            .ok_or(AppError::EmojiSetNotFound)?;
+        let guard = tokio::select! {
+            biased;
+            () = &mut stop => return Err(AppError::EmojiSetInstallCancelled),
+            guard = lock.lock_owned() => guard,
+        };
+        let set = shown_version(&storage, &coordinate, expected_event_id_hex)?;
         if set.emoji.is_empty() {
             return Err(no_valid_emoji());
         }
@@ -893,7 +1025,17 @@ impl MarmotApp {
             ));
         }
         let mut skipped = parse_skips(&set.skipped);
-        let (kept, install_skips) = self.download_set(&set.emoji, budget).await;
+        control.start(set.emoji.len());
+        let (kept, install_skips) = tokio::select! {
+            biased;
+            () = &mut stop => return Err(AppError::EmojiSetInstallCancelled),
+            downloaded = self.download_set(&set.emoji, budget, control) => downloaded,
+        };
+        // A cancellation in the poll that finished the downloads still wins
+        // over a failed result.
+        if install_cancelled(&control.cancelled, &self.emoji_install_stop) {
+            return Err(AppError::EmojiSetInstallCancelled);
+        }
         if kept.is_empty() {
             return Err(nothing_installed_error(&install_skips));
         }
@@ -912,15 +1054,22 @@ impl MarmotApp {
         };
         let installed_count = kept.len().try_into().unwrap_or(u32::MAX);
         let writer = storage.clone();
+        let (cancelled, stopped) = (control.cancelled.clone(), self.emoji_install_stop.clone());
         let outcome = write_holding_guard(guard, move || {
-            writer.install_emoji_set(
+            // The write starts here, however long the task waited for the
+            // blocking pool: the last point a cancellation or shutdown can
+            // stop the install.
+            if install_cancelled(&cancelled, &stopped) {
+                return Err(AppError::EmojiSetInstallCancelled);
+            }
+            Ok(writer.install_emoji_set(
                 &snapshot,
                 &kept,
                 EmojiSetInstallLimits {
                     max_sets: MAX_INSTALLED_EMOJI_SETS,
                     max_total_bytes: MAX_INSTALLED_EMOJI_BYTES,
                 },
-            )
+            )?)
         })
         .await??;
         match outcome {
@@ -960,37 +1109,47 @@ impl MarmotApp {
 
     /// Every installed emoji, flattened in set install order then each set's
     /// own order, for a picker. Shortcode collisions between sets are
-    /// reported, not resolved. No network.
-    pub fn installed_custom_emoji(
+    /// reported, not resolved. No network; the read runs on the blocking
+    /// pool.
+    pub async fn installed_custom_emoji(
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppInstalledCustomEmoji>, AppError> {
-        let rows = self.emoji_storage(account_ref)?.installed_custom_emoji()?;
-        let collisions = colliding_shortcodes(&rows);
-        Ok(rows
-            .into_iter()
-            .map(|row| app_installed_emoji(row, &collisions))
-            .collect())
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
+        read_blocking(move || {
+            let rows = app.emoji_storage(&account_ref)?.installed_custom_emoji()?;
+            let collisions = colliding_shortcodes(&rows);
+            Ok(rows
+                .into_iter()
+                .map(|row| app_installed_emoji(row, &collisions))
+                .collect())
+        })
+        .await
     }
 
     /// An installed emoji's stored bytes, checked against their stored
-    /// SHA-256. No network.
-    pub fn read_installed_custom_emoji(
+    /// SHA-256. No network; the read and the hash run on the blocking pool.
+    pub async fn read_installed_custom_emoji(
         &self,
         account_ref: &str,
         coordinate: &str,
         shortcode: &str,
     ) -> Result<AppInstalledCustomEmojiAsset, AppError> {
         let coordinate = parse_emoji_set_input(coordinate)?;
-        let storage = self.emoji_storage(account_ref)?;
-        let (row, bytes) = storage
-            .installed_custom_emoji_bytes(&coordinate, shortcode)?
-            .ok_or(AppError::EmojiSetNotFound)?;
-        let collisions = colliding_shortcodes(&storage.installed_custom_emoji()?);
-        Ok(AppInstalledCustomEmojiAsset {
-            emoji: app_installed_emoji(row, &collisions),
-            bytes,
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
+        let shortcode = shortcode.to_owned();
+        read_blocking(move || {
+            let storage = app.emoji_storage(&account_ref)?;
+            let (row, bytes) = storage
+                .installed_custom_emoji_bytes(&coordinate, &shortcode)?
+                .ok_or(AppError::EmojiSetNotFound)?;
+            let collisions = colliding_shortcodes(&storage.installed_custom_emoji()?);
+            Ok(AppInstalledCustomEmojiAsset {
+                emoji: app_installed_emoji(row, &collisions),
+                bytes,
+            })
         })
+        .await
     }
 
     /// Fetch and validate one emoji image. Also returns the bytes the fetch
@@ -1026,11 +1185,15 @@ impl MarmotApp {
     /// validate and still fit `budget`; one that does not fit is skipped and
     /// later, smaller ones are still tried. Once the bytes transferred,
     /// valid or not, reach twice the budget, the rest are skipped without
-    /// being fetched (beyond the few already in flight).
+    /// being fetched (beyond the few already in flight). Each finished entry
+    /// advances `control`'s progress. No download starts once `control` or
+    /// the app's install stop is cancelled; returning early is the caller's
+    /// `select!`.
     async fn download_set(
         &self,
         entries: &[StoredEmojiSetEntry],
         budget: u64,
+        control: &EmojiSetInstallControl,
     ) -> (Vec<(StoredInstalledEmoji, Vec<u8>)>, Vec<AppEmojiSkip>) {
         let mut kept = Vec::new();
         let mut skipped = Vec::new();
@@ -1043,13 +1206,22 @@ impl MarmotApp {
             .map(|entry| entry.url.clone())
             .enumerate()
             .collect();
+        // Each download checks cancellation before it dials: the stream can
+        // refill and start one within the poll that sees another finish,
+        // before the caller's `select!` looks at the control again.
         let mut downloads = futures::stream::iter(urls)
-            .map(|(index, url)| async move { (index, self.download_emoji(&url).await) })
+            .map(|(index, url)| async move {
+                if install_cancelled(&control.cancelled, &self.emoji_install_stop) {
+                    return (index, (Err(AppEmojiSkipReason::DownloadFailed), 0));
+                }
+                (index, self.download_emoji(&url).await)
+            })
             .buffered(EMOJI_DOWNLOAD_CONCURRENCY);
         let mut done = 0_usize;
         while let Some((index, (result, transferred))) = downloads.next().await {
             done += 1;
             fetched = fetched.saturating_add(transferred);
+            control.finish_entries(1, transferred);
             let entry = &entries[index];
             let skip = |reason| AppEmojiSkip {
                 position: None,
@@ -1084,6 +1256,7 @@ impl MarmotApp {
             }
         }
         drop(downloads);
+        control.finish_entries(entries.len().saturating_sub(done), 0);
         skipped.extend(entries.iter().skip(done).map(|entry| AppEmojiSkip {
             position: None,
             shortcode: Some(entry.shortcode.clone()),
@@ -1216,6 +1389,23 @@ impl MarmotApp {
             }
         }
         Ok(complete)
+    }
+
+    /// Resolves when `control` is cancelled or this app stops installs
+    /// (runtime shutdown or storage close); the latter also cancels
+    /// `control`, so the host reads the same state.
+    async fn emoji_install_stopped(&self, control: &EmojiSetInstallControl) {
+        tokio::select! {
+            () = control.cancelled.cancelled() => {}
+            () = self.emoji_install_stop.cancelled() => control.cancel(),
+        }
+    }
+
+    /// Cancel every running emoji set install and refuse later ones. Called
+    /// when the runtime shuts down and when storage closes, so a backgrounded
+    /// host never keeps downloading or writes after close.
+    pub(crate) fn stop_emoji_set_installs(&self) {
+        self.emoji_install_stop.cancel();
     }
 
     fn emoji_set_mutation_lock(&self, account_label: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1371,6 +1561,55 @@ where
     })
     .await
     .map_err(|_| AppError::BlockingTask("emoji set write task failed".into()))
+}
+
+/// Whether an install is cancelled, by its control or by the app stopping
+/// installs; the latter also cancels the control, so the host reads the
+/// same state.
+fn install_cancelled(
+    control: &tokio_util::sync::CancellationToken,
+    stop: &tokio_util::sync::CancellationToken,
+) -> bool {
+    if stop.is_cancelled() {
+        control.cancel();
+    }
+    control.is_cancelled()
+}
+
+/// The stored version of `coordinate` when it is the one the user was
+/// shown. Nothing stored is `EmojiSetNotFound` (the host fetches with
+/// `fetch_emoji_set`); another version is `EmojiSetChanged`.
+fn shown_version(
+    storage: &SqliteAppStorage,
+    coordinate: &str,
+    expected_event_id_hex: &str,
+) -> Result<StoredEmojiSet, AppError> {
+    let set = storage
+        .emoji_set(coordinate)?
+        .ok_or(AppError::EmojiSetNotFound)?;
+    if !set
+        .version
+        .event_id_hex
+        .eq_ignore_ascii_case(expected_event_id_hex.trim())
+    {
+        return Err(AppError::EmojiSetChanged {
+            current_event_id_hex: set.version.event_id_hex,
+        });
+    }
+    Ok(set)
+}
+
+/// Run a local read on the blocking pool, so account resolution, a cold
+/// SQLCipher open and the reads themselves (a full picker list, a 4 MiB
+/// emoji and its hash) never hold an async worker.
+async fn read_blocking<T, F>(read: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|_| AppError::BlockingTask("emoji set read task failed".into()))?
 }
 
 fn no_valid_emoji() -> AppError {

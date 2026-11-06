@@ -406,6 +406,15 @@ pub enum AppError {
     /// An account-wide emoji cap (installed sets or stored bytes) was reached.
     #[error("emoji set limit reached: {0}")]
     EmojiSetLimit(String),
+    /// The stored version of the set is not the one the user was shown.
+    /// Nothing was downloaded; show the current version (`emoji_set`) and
+    /// ask again with its event id.
+    #[error("emoji set changed; current version {current_event_id_hex}")]
+    EmojiSetChanged { current_event_id_hex: String },
+    /// The install was cancelled through its control, or the runtime is
+    /// shutting down or closing. Nothing was stored.
+    #[error("emoji set install was cancelled")]
+    EmojiSetInstallCancelled,
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
     #[error("invalid push token")]
@@ -751,6 +760,8 @@ impl AppError {
             Self::EmojiImageTooLarge(_) => "emoji_image_too_large",
             Self::EmojiImageUnsupported(_) => "emoji_image_unsupported",
             Self::EmojiSetLimit(_) => "emoji_set_limit",
+            Self::EmojiSetChanged { .. } => "emoji_set_changed",
+            Self::EmojiSetInstallCancelled => "emoji_set_install_cancelled",
             Self::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             Self::InvalidPushToken(_) => "invalid_push_token",
             Self::InvalidPushServer(_) => "invalid_push_server",

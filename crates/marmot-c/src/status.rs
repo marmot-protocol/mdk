@@ -219,6 +219,13 @@ pub enum MarmotStatus {
     EmojiImageUnsupported = 125,
     /// The installed-set or stored-byte cap is reached.
     EmojiSetLimit = 126,
+    /// The stored emoji set version is not the one the user was shown;
+    /// nothing was downloaded. Detail names the current event id: read the
+    /// set again, show it, and retry with that id.
+    EmojiSetChanged = 127,
+    /// The emoji set install was cancelled through its control, or the
+    /// runtime is shutting down or closing. Nothing was stored.
+    EmojiSetInstallCancelled = 128,
 }
 
 thread_local! {
@@ -323,6 +330,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::EmojiImageTooLarge { .. } => MarmotStatus::EmojiImageTooLarge,
         MarmotKitError::EmojiImageUnsupported { .. } => MarmotStatus::EmojiImageUnsupported,
         MarmotKitError::EmojiSetLimit { .. } => MarmotStatus::EmojiSetLimit,
+        MarmotKitError::EmojiSetChanged { .. } => MarmotStatus::EmojiSetChanged,
+        MarmotKitError::EmojiSetInstallCancelled => MarmotStatus::EmojiSetInstallCancelled,
         MarmotKitError::AccountUnlinked { .. } => MarmotStatus::AccountUnlinked,
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
@@ -669,6 +678,10 @@ mod tests {
             MarmotKitError::EmojiSetLimit {
                 details: "d".into(),
             },
+            MarmotKitError::EmojiSetChanged {
+                current_event_id_hex: "d".into(),
+            },
+            MarmotKitError::EmojiSetInstallCancelled,
             MarmotKitError::AccountUnlinked {
                 account_ref: "a".into(),
             },
@@ -686,7 +699,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            117,
+            119,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(MarmotStatus::GroupInviteNotPending as i32, 61);
@@ -799,6 +812,10 @@ mod tests {
                 details: "d".into()
             }) as i32,
             126
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::EmojiSetInstallCancelled) as i32,
+            128
         );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {

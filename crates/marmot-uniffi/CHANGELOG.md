@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Emoji set changes (breaking; no host has shipped against the emoji set API).
+  `install_emoji_set(account_ref, coordinate, expected_event_id_hex, control)` binds the install to the version the
+  user was shown and takes a new `EmojiSetInstallControlFfi` (`cancel()`, `is_cancelled()`, `progress()` returning
+  `EmojiSetInstallProgressFfi`). `fetch_emoji_set_asset` gains `expected_event_id_hex` before `shortcode`. New
+  `fetch_emoji_set_cover` returns `EmojiSetCoverFfi`. New `MarmotKitError` cases `EmojiSetChanged {
+  current_event_id_hex }` and `EmojiSetInstallCancelled`; exhaustive error switches need them. `emoji_sets`,
+  `emoji_set`, `installed_custom_emoji` and `read_installed_custom_emoji` are now async. `MimeMismatch` now means a
+  non-image response type; any `image/*` type is accepted. Regenerate bindings.
+
 - Add `Direct`, `Group` and `Muted` to `ChatListConditionFfi` (mdk#2983). A chat whose conversation kind is still
   `Unknown` matches neither kind; a window filtered on `Muted` updates when a mute expires. Regenerate bindings; an
   exhaustive Swift/Kotlin `switch` over the enum needs the new cases.

@@ -154,12 +154,13 @@ pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
 pub use emoji_sets::{
-    AppEmojiSet, AppEmojiSetAsset, AppEmojiSetEmoji, AppEmojiSetInstallResult,
+    AppEmojiSet, AppEmojiSetAsset, AppEmojiSetCover, AppEmojiSetEmoji, AppEmojiSetInstallResult,
     AppEmojiSetSyncResult, AppEmojiSkip, AppEmojiSkipReason, AppInstalledCustomEmoji,
     AppInstalledCustomEmojiAsset, AppInstalledEmojiSetState, AppUserEmojiList, EMOJI_SET_KIND,
-    MAX_CUSTOM_EMOJI_SHORTCODE_BYTES, MAX_DISCOVERY_EMOJI_SETS, MAX_EMOJI_IMAGE_BYTES,
-    MAX_EMOJI_PER_SET, MAX_INSTALLED_EMOJI_BYTES, MAX_INSTALLED_EMOJI_SET_BYTES,
-    MAX_INSTALLED_EMOJI_SETS, USER_EMOJI_LIST_KIND, parse_emoji_set_input,
+    EmojiSetInstallControl, EmojiSetInstallProgress, MAX_CUSTOM_EMOJI_SHORTCODE_BYTES,
+    MAX_DISCOVERY_EMOJI_SETS, MAX_EMOJI_IMAGE_BYTES, MAX_EMOJI_PER_SET, MAX_INSTALLED_EMOJI_BYTES,
+    MAX_INSTALLED_EMOJI_SET_BYTES, MAX_INSTALLED_EMOJI_SETS, USER_EMOJI_LIST_KIND,
+    parse_emoji_set_input,
 };
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
@@ -678,6 +679,9 @@ pub struct MarmotApp {
     /// remain in the account SQLCipher database.
     sticker_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     emoji_set_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Cancelled for good when the runtime shuts down or storage closes:
+    /// every running emoji set install stops and later ones are refused.
+    emoji_install_stop: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1827,6 +1831,7 @@ impl MarmotApp {
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
             emoji_set_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_install_stop: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -1945,6 +1950,7 @@ impl MarmotApp {
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
             emoji_set_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_install_stop: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -6985,6 +6991,7 @@ impl MarmotApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
         let _ = self.abort_all_public_indexer_copies();
+        self.stop_emoji_set_installs();
         self.presentation_signals.catalog_changed();
 
         // Empty the lookup caches so nothing reaches a closed handle through

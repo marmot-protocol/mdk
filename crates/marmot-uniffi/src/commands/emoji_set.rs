@@ -1,10 +1,13 @@
 //! NIP-51 emoji sets: text-only discovery, the account's own emoji list
 //! (read only), explicit image fetches, and installed snapshots read locally.
 
+use std::sync::Arc;
+
 use crate::Marmot;
 use crate::conversions::{
-    EmojiSetAssetFfi, EmojiSetFfi, EmojiSetInstallResultFfi, EmojiSetSyncResultFfi,
-    InstalledCustomEmojiAssetFfi, InstalledCustomEmojiFfi, UserEmojiListFfi,
+    EmojiSetAssetFfi, EmojiSetCoverFfi, EmojiSetFfi, EmojiSetInstallControlFfi,
+    EmojiSetInstallResultFfi, EmojiSetSyncResultFfi, InstalledCustomEmojiAssetFfi,
+    InstalledCustomEmojiFfi, UserEmojiListFfi,
 };
 use crate::errors::MarmotKitError;
 
@@ -13,8 +16,8 @@ use crate::errors::MarmotKitError;
 impl Marmot {
     /// Read stored emoji sets, or only installed ones in install order.
     /// `search` matches title, description, author (hex or `npub`) and
-    /// shortcodes. Local only; call off the UI thread.
-    pub fn emoji_sets(
+    /// shortcodes. Local only; the read runs off the caller's thread.
+    pub async fn emoji_sets(
         &self,
         account_ref: String,
         installed_only: bool,
@@ -28,18 +31,21 @@ impl Marmot {
                 search.as_deref(),
                 limit.map(|value| value as usize),
             )
+            .await
             .map(|sets| sets.into_iter().map(Into::into).collect())
             .map_err(Into::into)
     }
 
-    /// Read one stored set by coordinate or `naddr`. Local only.
-    pub fn emoji_set(
+    /// Read one stored set by coordinate or `naddr`. Local only; the read
+    /// runs off the caller's thread.
+    pub async fn emoji_set(
         &self,
         account_ref: String,
         coordinate: String,
     ) -> Result<Option<EmojiSetFfi>, MarmotKitError> {
         self.app
             .emoji_set(&account_ref, &coordinate)
+            .await
             .map(|set| set.map(Into::into))
             .map_err(Into::into)
     }
@@ -89,14 +95,27 @@ impl Marmot {
     /// Download every emoji of the stored set version once, validate it and
     /// store its bytes and SHA-256 under the account. Reveals the user's IP
     /// address to each image host in the set: call only after the user taps
-    /// Install.
+    /// Install. `expected_event_id_hex` is the `event_id_hex` of the version
+    /// the user was shown (also when reinstalling for `update_available`):
+    /// if another version is stored the call fails with `EmojiSetChanged`
+    /// before any download, and with nothing stored it fails with
+    /// `EmojiSetNotFound` (fetch with `fetch_emoji_set` first). `control`
+    /// reports progress and cancels; a cancelled install fails with
+    /// `EmojiSetInstallCancelled` and stores nothing.
     pub async fn install_emoji_set(
         &self,
         account_ref: String,
         coordinate: String,
+        expected_event_id_hex: String,
+        control: Arc<EmojiSetInstallControlFfi>,
     ) -> Result<EmojiSetInstallResultFfi, MarmotKitError> {
         self.app
-            .install_emoji_set(&account_ref, &coordinate)
+            .install_emoji_set(
+                &account_ref,
+                &coordinate,
+                &expected_event_id_hex,
+                &control.inner,
+            )
             .await
             .map(Into::into)
             .map_err(Into::into)
@@ -117,15 +136,42 @@ impl Marmot {
 
     /// Download one emoji of a stored set for a preview. Reveals the user's
     /// IP address to the image host the set author chose: call only after
-    /// the user opens the set. Nothing is stored.
+    /// the user opens the set. `expected_event_id_hex` is the version shown;
+    /// another stored version fails with `EmojiSetChanged` before any
+    /// download. Nothing is stored.
     pub async fn fetch_emoji_set_asset(
         &self,
         account_ref: String,
         coordinate: String,
+        expected_event_id_hex: String,
         shortcode: String,
     ) -> Result<EmojiSetAssetFfi, MarmotKitError> {
         self.app
-            .fetch_emoji_set_asset(&account_ref, &coordinate, &shortcode)
+            .fetch_emoji_set_asset(
+                &account_ref,
+                &coordinate,
+                &expected_event_id_hex,
+                &shortcode,
+            )
+            .await
+            .map(Into::into)
+            .map_err(Into::into)
+    }
+
+    /// Download a stored set's cover image (`image_url`) under the emoji
+    /// image limits. Reveals the user's IP address to the host the set
+    /// author chose: call only after the user opens the set, with the shown
+    /// version's `event_id_hex` (`EmojiSetChanged` otherwise, before any
+    /// download). A set without a cover fails with `EmojiSetNotFound`.
+    /// Nothing is stored.
+    pub async fn fetch_emoji_set_cover(
+        &self,
+        account_ref: String,
+        coordinate: String,
+        expected_event_id_hex: String,
+    ) -> Result<EmojiSetCoverFfi, MarmotKitError> {
+        self.app
+            .fetch_emoji_set_cover(&account_ref, &coordinate, &expected_event_id_hex)
             .await
             .map(Into::into)
             .map_err(Into::into)
@@ -133,20 +179,22 @@ impl Marmot {
 
     /// Every installed emoji, in set install order then set order, for a
     /// picker. Shortcode collisions between sets are flagged, not resolved.
-    /// Local only.
-    pub fn installed_custom_emoji(
+    /// Local only; the read runs off the caller's thread.
+    pub async fn installed_custom_emoji(
         &self,
         account_ref: String,
     ) -> Result<Vec<InstalledCustomEmojiFfi>, MarmotKitError> {
         self.app
             .installed_custom_emoji(&account_ref)
+            .await
             .map(|emoji| emoji.into_iter().map(Into::into).collect())
             .map_err(Into::into)
     }
 
     /// An installed emoji's stored bytes, checked against their SHA-256.
-    /// Local only: never touches the network.
-    pub fn read_installed_custom_emoji(
+    /// Local only: never touches the network. The read and the hash run off
+    /// the caller's thread.
+    pub async fn read_installed_custom_emoji(
         &self,
         account_ref: String,
         coordinate: String,
@@ -154,6 +202,7 @@ impl Marmot {
     ) -> Result<InstalledCustomEmojiAssetFfi, MarmotKitError> {
         self.app
             .read_installed_custom_emoji(&account_ref, &coordinate, &shortcode)
+            .await
             .map(Into::into)
             .map_err(Into::into)
     }

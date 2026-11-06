@@ -6687,6 +6687,7 @@ impl MarmotAppRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.accounts.app.stop_emoji_set_installs();
         for task in self.accounts.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
@@ -9441,6 +9442,7 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.app.stop_emoji_set_installs();
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
