@@ -310,7 +310,11 @@ fn active_trusted_device_group_forget(
     let Some(record) = record else {
         return Ok(false);
     };
-    let group: cgka_traits::Group = crate::deserialize(&record)?;
+    // An unreadable record cannot authorize extra reset cleanup. Ordinary
+    // forget must still be able to discard that unusable local copy.
+    let Ok(group) = crate::deserialize::<cgka_traits::Group>(&record) else {
+        return Ok(false);
+    };
     if group.is_terminal() {
         return Ok(false);
     }

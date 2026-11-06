@@ -5310,6 +5310,66 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap()
     );
     assert_eq!(app.device_renames().unwrap().len(), 1);
+
+    // The generic forget still discards an unreadable trusted copy. That
+    // record cannot authorize the extra active-reset retirement above.
+    let unreadable_id = cgka_traits::GroupId::new(vec![0xee]);
+    store
+        .put_group(&crate::base::test_support::sample_group(
+            unreadable_id.clone(),
+            2,
+            1,
+        ))
+        .unwrap();
+    assert!(
+        app.insert_device_group(&crate::DeviceGroupRecord {
+            group_id_hex: "ee".into(),
+            trust: crate::DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some("unreadable".into()),
+            recorded_at: 1,
+        })
+        .unwrap()
+    );
+    app.trust_device_group(
+        "ee",
+        crate::DeviceGroupTrust::Creating,
+        crate::DeviceGroupTrust::Created,
+        None,
+        1,
+        &crate::FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let kept_preparations = app.device_renames().unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE cgka_groups SET record = x'ff' WHERE id = x'ee'", [])
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        store.get_group(&unreadable_id),
+        Err(cgka_traits::storage::StorageError::Serialization(_))
+    ));
+    assert!(
+        store
+            .forget_group_local(&unreadable_id, cgka_traits::Timestamp(102))
+            .expect("generic forget must discard an unreadable trusted copy")
+    );
+    assert!(store.is_group_forgotten(&unreadable_id).unwrap());
+    assert_eq!(
+        store.group_local_reset_cutoff(&unreadable_id).unwrap(),
+        Some(cgka_traits::Timestamp(102))
+    );
+    assert!(!store.list_groups().unwrap().contains(&unreadable_id));
+    assert!(app.device_group("ee").unwrap().is_none());
+    assert_eq!(app.device_renames().unwrap(), kept_preparations);
 }
 
 #[test]
