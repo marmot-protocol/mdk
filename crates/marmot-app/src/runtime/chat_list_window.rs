@@ -188,10 +188,10 @@ struct Reader {
     /// Re-read on a draft change to any chat, not only visible ones, because
     /// the filter's matches depend on drafts.
     drafts_anywhere: bool,
-    // A `Text` filter needs no flag: search text changes only when the
-    // presentation worker re-prepares a row (after a profile, name or
-    // description change anywhere in the account), and that bumps the
-    // presentation revision every window already re-reads on.
+    /// Re-read on a profile change to anyone, because a `Text` filter's
+    /// matches depend on peer names. The read itself catches search text up
+    /// (`prepare_search_batch`), so this holds without an account worker.
+    profiles_anywhere: bool,
 }
 
 impl MarmotAppRuntime {
@@ -237,6 +237,7 @@ impl MarmotAppRuntime {
             account_id: account.account_id_hex,
             store_epoch: Vec::new(),
             drafts_anywhere: query.references(ChatListCondition::HasDraft),
+            profiles_anywhere: query.references_text(),
             query,
         };
         let position = Position {
@@ -367,7 +368,7 @@ impl Reader {
                 crate::chat_presentation::maintenance::prepare_search_batch(
                     &app,
                     &label,
-                    &storage.app_storage(),
+                    &storage,
                     &account_id,
                     query.query.view,
                 )?;
@@ -523,7 +524,7 @@ impl Sources {
                 },
                 event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 profile = self.profiles.recv() => match profile {
-                    Ok(profile) if rows.iter().any(|r| {
+                    Ok(profile) if reader.profiles_anywhere || rows.iter().any(|r| {
                         r.row.last_message.as_ref().is_some_and(|m| {
                             m.sender.eq_ignore_ascii_case(&profile)
                                 || m.group_system.as_ref().is_some_and(|e| {

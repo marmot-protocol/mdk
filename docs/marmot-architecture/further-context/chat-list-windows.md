@@ -170,9 +170,11 @@ by a name, description, avatar or membership change), a query with a text leaf
 is not ready, never a partial set: `chat_list_ids` and `revalidate_chat_list_ids`
 return `ChatPresentationNotReady`; opening a window waits, as it does for base
 rows; and an open window publishes `ChatPresentationNotReady` and retries. Before
-each such read the runtime prepares one bounded batch of the
-view's pending rows and wakes the account's presentation worker for the rest.
-Queries without a text leaf never wait on presentation outside their window.
+each such read the runtime runs a few bounded steps of the account's profile
+catch-up and prepares one batch of the view's pending rows, so a text read does
+not depend on a running account worker; catch-up still owed after those steps
+is reported as not ready too. Queries without a text leaf never wait on
+presentation outside their window.
 Every eligible direct-chat peer is a presentation dependency, even under a group
 name, so a peer's profile change re-prepares the chat's search text.
 
@@ -187,11 +189,11 @@ a draft change wakes a window only when the chat is visible, unless the window's
 filter tests drafts, in which case any draft change in the account re-reads it.
 Mute expiry is not a change anything writes, so a window whose filter tests mute
 also wakes at the next mute expiry among the chats in its view, visible or not:
-a chat leaves or enters a muted window at its expiry. A text window needs no
-extra wake-up: search text changes only when the presentation worker stores a
-row, and every stored change, including one that alters only the search text,
-advances the presentation revision every window re-reads on, so a profile or
-description change makes an off-screen chat enter or leave it.
+a chat leaves or enters a muted window at its expiry. A text window also re-reads
+on a profile change to anyone, and its read catches the search text up; every
+stored presentation change, including one that alters only the search text,
+advances the presentation revision every window re-reads on. So a profile or
+description change makes an off-screen chat enter or leave a text window.
 
 ## Select all
 

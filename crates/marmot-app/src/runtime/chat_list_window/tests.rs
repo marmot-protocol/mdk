@@ -1016,6 +1016,7 @@ async fn invalid_window_query_is_distinct_from_readiness() {
         store_epoch: vec![],
         query: ChatListView::Chats.into(),
         drafts_anywhere: false,
+        profiles_anywhere: false,
     };
     let result = reader
         .read(
@@ -1713,9 +1714,10 @@ async fn a_draft_filtered_window_rereads_on_an_off_screen_draft_change() {
 }
 
 /// A text window opens once the view's search text is ready, and when a peer
-/// renames, the chats that match only after the presentation worker re-prepares
-/// them enter the window, though none was on screen before. A named direct
-/// chat, titled by its group name, matches by its peer's profile name.
+/// renames, the chats that now match enter the window, though none was on
+/// screen before. No account worker runs here: the text read catches search
+/// text up itself, for a live window and for a one-shot ID read. A named
+/// direct chat, titled by its group name, matches by its peer's profile name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
     // Every third chat is a direct chat with the same peer and no group name.
@@ -1728,37 +1730,44 @@ async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
         .await
         .unwrap();
     assert!(window.snapshot.rows.is_empty());
-    let peer = "bb".repeat(32);
-    f.app
-        .directory()
-        .save_directory_entry_for_test(&UserDirectoryRecord {
-            account_id_hex: peer.clone(),
-            npub: "fixture".into(),
-            local_account: None,
-            profile: Some(UserProfileMetadata {
-                name: Some("Zebra Crossing".into()),
-                created_at: 200,
-                ..Default::default()
-            }),
-            follows: vec![],
-            follow_source_relays: vec![],
-            relay_lists: AccountRelayListStatus::empty(),
-            key_package: None,
-        })
-        .unwrap();
-    // The account worker's catch-up, then its notification.
-    let shared = f.app.shared_storage().unwrap();
-    while crate::chat_presentation::maintenance::maintain(&f.store, &shared, &f.account_id).unwrap()
-    {
-    }
-    f.signal();
+    let rename = |name: &str, created_at| {
+        f.app
+            .directory()
+            .save_directory_entry_for_test(&UserDirectoryRecord {
+                account_id_hex: "bb".repeat(32),
+                npub: "fixture".into(),
+                local_account: None,
+                profile: Some(UserProfileMetadata {
+                    name: Some(name.into()),
+                    created_at,
+                    ..Default::default()
+                }),
+                follows: vec![],
+                follow_source_relays: vec![],
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap()
+    };
+    rename("Zebra Crossing", 200);
     let direct = ["0001", "0004", "0007", "000a"];
     let updated = next_where(&mut window, |w| !w.rows.is_empty()).await;
-    let all = f.runtime.chat_list_ids("alice", query).await.unwrap();
+    let all = f
+        .runtime
+        .chat_list_ids("alice", query.clone())
+        .await
+        .unwrap();
     let mut sorted = all.clone();
     sorted.sort();
     assert_eq!(sorted, direct);
     assert_eq!(ids(&updated), all[..3]);
+    // An ID read straight after a rename sees it, whether or not the window
+    // has caught up yet.
+    rename("Yak", 300);
+    assert_eq!(
+        f.runtime.chat_list_ids("alice", query).await.unwrap(),
+        Vec::<String>::new()
+    );
     f.runtime.shutdown_and_close().await.unwrap();
 }
 

@@ -19,8 +19,8 @@
 - Chat-list queries can search chat text with `ChatListFilter::Text` (mdk#2983): title, group name, description and a
   direct chat's peer profile names, trimmed and lowercased like user directory search, as a literal substring.
   Localized fallback titles are not searchable. While any chat in the query's view has pending presentation, a text
-  query is not ready (`ChatPresentationNotReady`, never a partial set); each read first prepares one bounded batch of
-  those chats. Presentation preparation now passes the peer's profile names to storage, and an upgraded account
+  query is not ready (`ChatPresentationNotReady`, never a partial set); each read first runs a few bounded steps of the
+  profile catch-up and prepares one batch of those chats, and a text window re-reads on any profile change. Presentation preparation now passes the peer's profile names to storage, and an upgraded account
   re-prepares every chat's presentation once in the background. Additive.
 
 - Chat-list queries can filter by conversation kind (`ChatListCondition::Direct`, `Group`) and mute (`Muted`)

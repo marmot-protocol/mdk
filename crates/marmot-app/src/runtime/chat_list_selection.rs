@@ -86,7 +86,8 @@ impl MarmotAppRuntime {
             {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
-            let storage = app.account_storage(&account.label)?.app_storage();
+            let account_storage = app.account_storage(&account.label)?;
+            let storage = account_storage.app_storage();
             // Legacy/imported accounts can lack base rows. Repair one bounded
             // batch here, as the window does; the rest is "not ready".
             crate::chat_presentation::maintenance::prepare_base_rows(
@@ -97,7 +98,7 @@ impl MarmotAppRuntime {
                 crate::chat_presentation::maintenance::prepare_search_batch(
                     &app,
                     &account.label,
-                    &storage,
+                    &account_storage,
                     &account.account_id_hex,
                     view,
                 )?;

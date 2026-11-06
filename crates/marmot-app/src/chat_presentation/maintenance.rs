@@ -212,30 +212,53 @@ pub(crate) fn prepare_window(
     Ok(())
 }
 
-/// Prepare one bounded batch of the rows a text query over `view` waits for
-/// (pending presentation anywhere in the view), then notify windows and wake
-/// the account worker for the rest. Cost is one batch, whatever the view size.
+/// Catch-up steps a text read runs before reporting "not ready".
+const SEARCH_CATCH_UP_STEPS: usize = 4;
+
+/// Bring the search text a query over `view` matches up to date, in bounded
+/// work, so a text read never needs a running account worker: a few steps of
+/// the account-wide profile catch-up (`maintain`), then one batch of the rows
+/// pending in the view. The storage read reports pending rows as not ready;
+/// catch-up still owed after these steps is reported here as
+/// `ChatPresentationNotReady`, and the caller's retry continues it.
 pub(crate) fn prepare_search_batch(
     app: &crate::MarmotApp,
     label: &str,
-    account: &SqliteAppStorage,
+    account: &SqliteAccountStorage,
     local: &str,
     view: storage_sqlite::ChatListView,
 ) -> Result<(), AppError> {
-    let pending = account.chat_list_pending_search_text(view, CHAT_PRESENTATION_BATCH_LIMIT)?;
-    if pending.is_empty() {
-        return Ok(());
+    let shared = app.shared_storage()?;
+    let app_storage = account.app_storage();
+    let before = app_storage.chat_presentation_version()?;
+    let mut owed = false;
+    for _ in 0..SEARCH_CATCH_UP_STEPS {
+        owed = maintain(account, &shared, local)?;
+        if !owed {
+            break;
+        }
     }
-    let prepared = prepare_window(account, &app.shared_storage()?, local, &pending);
-    app.presentation_signals.wake();
-    let _ = app
-        .presentation_signals
-        .updates
-        .send(super::signals::PresentationInvalidation {
-            account_label: label.to_owned(),
-            version: account.chat_presentation_version()?,
-        });
-    prepared
+    let pending = app_storage.chat_list_pending_search_text(view, CHAT_PRESENTATION_BATCH_LIMIT)?;
+    let prepared = prepare_window(&app_storage, &shared, local, &pending);
+    if owed || !pending.is_empty() {
+        app.presentation_signals.wake();
+    }
+    let after = app_storage.chat_presentation_version()?;
+    if after != before {
+        // Other windows re-read rows this step rewrote.
+        let _ = app
+            .presentation_signals
+            .updates
+            .send(super::signals::PresentationInvalidation {
+                account_label: label.to_owned(),
+                version: after,
+            });
+    }
+    prepared?;
+    if owed {
+        return Err(AppError::ChatPresentationNotReady);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
