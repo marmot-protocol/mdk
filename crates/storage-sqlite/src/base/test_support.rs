@@ -74,3 +74,18 @@ pub(crate) fn sample_queued_intent(id: MessageId, group_id: GroupId) -> QueuedOu
         reissue_attempts: 0,
     }
 }
+
+/// The first `limit` rows of a chat-list query, read the way a live window reads them.
+pub(crate) fn chat_list_window_page(
+    app: &crate::SqliteAppStorage,
+    query: impl Into<crate::ChatListViewQuery>,
+    limit: usize,
+) -> Result<crate::ChatListPage, crate::ChatListPageError> {
+    app.read_chat_list_window(crate::ChatListWindowQuery {
+        query: query.into(),
+        limit,
+        anchors: Vec::new(),
+        before_anchor: 0,
+    })
+    .map(|read| read.page)
+}

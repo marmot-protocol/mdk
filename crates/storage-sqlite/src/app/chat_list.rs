@@ -23,10 +23,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-pub use pages::{
-    ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
-    ChatListView,
-};
+pub use pages::{ChatListPage, ChatListPageDirection, ChatListPageError, ChatListView};
 pub use query::{
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListQueryError, ChatListViewQuery,
     MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,

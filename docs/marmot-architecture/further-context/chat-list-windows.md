@@ -1,7 +1,7 @@
 ---
 title: "Bounded live chat-list windows"
 created: 2026-09-14
-updated: 2026-11-05
+updated: 2026-11-06
 status: implementation
 ---
 
@@ -38,7 +38,7 @@ while `recv()` waits. Once queued, a command outlives cancellation of its caller
 its completion remains available in the update stream. Dropping the subscription
 closes its actor even when command handles survive. Runtime shutdown or account
 cache eviction (including sign-out, wipe and setup reset) closes existing handles.
-Reopen returns a new generation. Cursors are ephemeral boundaries, not restart tokens.
+Reopen returns a new generation.
 
 ## Window policy
 
@@ -90,7 +90,7 @@ selected-presentation work, which does not block an otherwise ready window.
 Invalidations are coalesced before a read. Those arriving during the read remain
 queued for the next refresh. Lag refreshes the current window. Local read/preparation
 failures surface explicitly and retain a one-second retry obligation without
-requiring a new event. Internal query/cursor validation errors are terminal and retain
+requiring a new event. Internal query validation errors are terminal and retain
 their error classification. Losing a teardown signal closes the window conservatively:
 account cache eviction can preserve both account ID and durable store epoch, so a
 refresh alone cannot establish that its lifetime survived. Timed mute expiry
@@ -137,17 +137,13 @@ The filter compiles to SQL appended to the view's condition, ahead of keyset
 paging, with every value bound as a parameter. Reads still walk the view's page
 index in display order; each leaf is a `chat_list_rows` column or one keyed
 lookup per chat (account groups, engine leave and disband records, and the draft
-tables). Cost grows with the chats in the view, never with history. Cursors
-belong to the exact query that produced them.
+tables). Cost grows with the chats in the view, never with history.
 
-Filtered results are consistent within one read: each window read, `chat_list_ids`
-and `revalidate_chat_list_ids`. Only fixed-view cursors continue across reads;
-storage refuses a cursor with a filter (`FilteredCursorUnsupported`) up front,
-because the navigation revision that makes cursors stale covers the views'
-inputs, not drafts, manual unread, mentions, delivery state, invitations or
-leave and disband records. Cross-read filtered paging would need revision
-triggers on each of those inputs, a follow-up only if a host needs it. Windows
-never page with stored cursors, so they are unaffected.
+Every read is self-contained: each window read, `chat_list_ids` and
+`revalidate_chat_list_ids` runs in one read transaction, so filtered and fixed
+views behave alike. Storage keeps no cursor between reads. A window keeps its
+place by re-reading around a stable anchor chat ID, and paging grows the window
+instead of continuing a stored page.
 
 Windows re-read on almost every account change already. Drafts are the exception:
 a draft change wakes a window only when the chat is visible, unless the window's

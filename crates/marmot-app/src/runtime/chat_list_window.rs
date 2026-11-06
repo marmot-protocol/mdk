@@ -10,7 +10,7 @@ pub use storage_sqlite::{
     ChatListQueryError, ChatListView, ChatListViewQuery, MAX_CHAT_LIST_FILTER_DEPTH,
     MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,
 };
-use storage_sqlite::{ChatListCursor, ChatListWindowQuery, ChatListWindowRead};
+use storage_sqlite::{ChatListWindowQuery, ChatListWindowRead};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub const CHAT_LIST_WINDOW_INITIAL_ROWS: usize = 50;
@@ -68,8 +68,6 @@ pub struct ChatListWindowSnapshot {
     /// The query's base view.
     pub view: ChatListView,
     pub rows: Vec<PresentedChatRow>,
-    pub first: Option<ChatListCursor>,
-    pub last: Option<ChatListCursor>,
     pub has_more_before: bool,
     pub has_more_after: bool,
     pub anchor: ChatListAnchorOutcome,
@@ -454,8 +452,6 @@ fn snapshot(
         sequence,
         view,
         rows,
-        first: read.page.first,
-        last: read.page.last,
         has_more_before: read.page.has_more_before,
         has_more_after: read.page.has_more_after,
         anchor,
@@ -671,9 +667,8 @@ async fn run(
                     current.sequence,
                     reader.query.view,
                 );
-                // Storage revisions also change for activity outside this window.
-                // Do not invalidate client commands or redraw unchanged visible content
-                // solely because opaque boundary tokens acquired a newer revision.
+                // Activity outside this window also triggers re-reads. Do not invalidate
+                // client commands or redraw when the visible content is unchanged.
                 let changed = replacement.rows != current.rows
                     || replacement.has_more_before != current.has_more_before
                     || replacement.has_more_after != current.has_more_after
