@@ -558,6 +558,8 @@ tla-liveness: _tla-tools
         -metadir target/tla/states \
         -config ConvergenceLifecycle.fair.cfg \
         formal/liveness/ConvergenceLifecycle.tla
+    python3 formal/liveness/verify_device_linking.py --jar "$jar" \
+        --out "${CARGO_TARGET_DIR:-target}/device-linking"
 
 tla-liveness-counterexample: _tla-tools
     #!/usr/bin/env bash
