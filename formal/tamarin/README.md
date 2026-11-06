@@ -6,6 +6,10 @@ application-output handoffs follow the engine's rules. Read it to learn what is 
 how each lemma maps to Rust tests. Temporal and liveness claims live in the TLA+ model under
 [`../liveness`](../liveness/).
 
+Pairing authentication and the confirmed Welcome sender are modeled separately
+under [`../pairing`](../pairing/). Those proofs start before the admitted-input
+boundary of this convergence model.
+
 ## Contents
 
 - [Scope](#scope)
@@ -52,9 +56,13 @@ read that file.
 
 ## Targets
 
-- `just tamarin` runs Tamarin on the model with `--quit-on-warning` and an explicit 60-second derivation-check timeout,
-  and requires `tamarin-prover` on `PATH`. Successful runs print only Tamarin's `summary of summaries`; prover errors,
-  warnings, derivation-check timeouts, or a missing summary print the full output and fail the target.
+- `just tamarin` runs this convergence model, then the pairing model and its
+  negative controls. Both require `tamarin-prover` on `PATH` and use
+  `--quit-on-warning` with an explicit 60-second derivation-check timeout.
+  This model's successful run prints Tamarin's `summary of summaries`; prover
+  errors, warnings, derivation-check timeouts, or a missing summary print the
+  full output and fail the target. The pairing gate additionally requires each
+  named property result and preserves its complete logs and control artifacts.
 - `just tamarin-interactive` opens the model in Tamarin's interactive UI and requires `tamarin-prover` on `PATH`.
 - `just policy-casegen` emits Tamarin seed rules and executable lemmas from `policy_cases.json`.
 

@@ -134,7 +134,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | The engine's canonicalization contract | [Canonicalization contract](docs/marmot-architecture/cgka-engine-canonicalization-contract.md) |
 | How it is tested: scenarios, vectors, generated chaos, property tests | [Conformance simulator](crates/cgka-conformance-simulator/README.md) |
 | Multi-process and container campaigns | [Campaign runner](crates/convergence-campaign-runner/README.md) |
-| Formal proofs and how they map to Rust tests | [Tamarin models](formal/tamarin/README.md) |
+| Formal proofs and how they map to Rust tests | [Convergence model](formal/tamarin/README.md), [pairing authentication](formal/pairing/README.md) |
 | What the engine owns and leaves out | [`cgka-engine`](crates/cgka-engine/README.md) |
 
 ## Crate map
@@ -171,6 +171,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`convergence-campaign-runner`](crates/convergence-campaign-runner/README.md) | Distributed container/VM campaigns |
 | | [`incident-replay`](crates/incident-replay/README.md) | Triages forensic exports of real incidents into verdicts and simulator vectors |
 | | [`formal/tamarin`](formal/tamarin/README.md) | Tamarin models for convergence and lifecycle |
+| | [`formal/pairing`](formal/pairing/README.md) | Symbolic pairing authentication and Welcome binding |
 
 ## Development
 
