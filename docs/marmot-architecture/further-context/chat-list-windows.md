@@ -173,8 +173,14 @@ rows; and an open window publishes `ChatPresentationNotReady` and retries. Befor
 each such read the runtime runs a few bounded steps of the account's profile
 catch-up and prepares one batch of the view's pending rows, so a text read does
 not depend on a running account worker; catch-up still owed after those steps
-is reported as not ready too. Queries without a text leaf never wait on
-presentation outside their window.
+is reported as not ready too. Readiness is durable state, not the result of a
+step: no chat in the view has pending presentation, and the account's committed
+catch-up checkpoint has reached the shared directory's head. That holds because
+every stored presentation is written under a compare-and-set: on the chat's
+source revision for group fields and membership, and on the catch-up checkpoint
+for peer profiles, so a value prepared from a profile read before a catch-up
+step passed a change is refused and its chat stays pending. Queries without a
+text leaf never wait on presentation outside their window.
 Every eligible direct-chat peer is a presentation dependency, even under a group
 name, so a peer's profile change re-prepares the chat's search text.
 

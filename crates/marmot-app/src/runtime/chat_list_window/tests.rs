@@ -1821,6 +1821,56 @@ fn search_catch_up_is_owed_until_a_selected_peer_is_fanned_out() {
     assert!(!search_catch_up_owed(&app, &shared).unwrap());
 }
 
+/// A window's preparation stores nothing once the catch-up checkpoint has
+/// moved since it read profiles: the step that moved it may have passed a
+/// change to a peer the pending chat did not depend on yet. The chat stays
+/// pending and a fresh read stores it.
+#[test]
+fn a_window_batch_read_before_a_catch_up_step_is_read_again() {
+    use crate::chat_presentation::maintenance::{commit_window_batch, maintain, read_window_batch};
+    let f = Fixture::new(6);
+    let shared = f.app.shared_storage().unwrap();
+    let app = f.store.app_storage();
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    f.mutate("0001", |group| group.profile_name = "Pals".into());
+    let pending = || {
+        app.chat_list_pending_search_text(ChatListView::Chats, 100)
+            .unwrap()
+    };
+    assert_eq!(pending(), ["0001"]);
+    let batch = read_window_batch(&app, &shared, &f.account_id, &["0001".into()]).unwrap();
+    // Meanwhile another caller's catch-up step passes a directory change.
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: "cc".repeat(32),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    let checkpoint = app.chat_presentation_checkpoint().unwrap();
+    let mut next = checkpoint.state.clone();
+    next.revision = shared.directory_presentation_version().unwrap().revision;
+    assert!(
+        app.commit_chat_presentation_batch(&checkpoint, &next, &[])
+            .unwrap()
+    );
+    assert!(!commit_window_batch(&app, &batch).unwrap(), "read again");
+    assert_eq!(pending(), ["0001"]);
+    let batch = read_window_batch(&app, &shared, &f.account_id, &["0001".into()]).unwrap();
+    assert!(commit_window_batch(&app, &batch).unwrap());
+    assert!(pending().is_empty());
+}
+
 /// Chats enter and leave a filtered window as the filtered fact changes, the
 /// window always equals the head of the same query's complete ID set, and no
 /// row appears twice.
