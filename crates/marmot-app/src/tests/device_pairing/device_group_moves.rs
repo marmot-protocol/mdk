@@ -670,6 +670,77 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
     });
 }
 
+/// The mover makes the move, then the destination's deadline undo of the
+/// link supersedes its first destination commit. A destination removal after
+/// Made is ordinary unlinking, even one whose roster reads as a failed link's
+/// undo: the moved device is unlinked rather than told linking failed
+/// (mdk#3011).
+#[test]
+fn a_destination_undo_after_made_unlinks_the_moved_device() {
+    run_composed_app_runtime_test("device-group-move-undo-after-made", || async {
+        let (relay, [mut original, mut moving, mut destination]) = alice_devices::<3>().await;
+        let old = link(&relay, &mut original, &mut moving, "Moving").await;
+        published_key_package(&mut moving.client, &relay).await;
+        let slot = choose_link(&relay, &mut destination, &mut moving).await;
+        moving.op(DeviceLinkOp::ConfirmMatch).await;
+        moving.step(&relay).await;
+        destination.step(&relay).await;
+        let target = destination.client.trusted_device_group().unwrap().unwrap();
+        assert_ne!(target, old);
+        deliver_new(&mut moving.client, &relay, &mut moving.cursor).await;
+        moving
+            .client
+            .drive_device_group_moves(unix_now_seconds())
+            .await
+            .unwrap();
+        assert_eq!(
+            moving.client.trusted_device_group().unwrap(),
+            Some(target.clone()),
+            "the move is made on the mover's first destination commit"
+        );
+
+        // The destination reads none of that, commits once more and undoes
+        // the link at its deadline: its deeper branch supersedes the mover's
+        // first commit, and the roster it leaves has no entry for the slot.
+        let effects = destination
+            .client
+            .runtime
+            .send(SendIntent::SelfUpdate {
+                group_id: target.clone(),
+            })
+            .await
+            .unwrap();
+        destination
+            .client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        destination
+            .client
+            .drive_device_pairing_at(unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+            .await;
+        assert_eq!(
+            link_record(&destination, &target, &slot).outcome,
+            DeviceLinkOutcome::Failed
+        );
+        crate::tests::device_group::converge_device_group(
+            &mut moving.client,
+            &relay,
+            &mut moving.cursor,
+            &target,
+            2,
+        )
+        .await;
+        assert!(moving.client.runtime.group_record(&target).unwrap().removed);
+        let slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+        let left = moving.roster(&target);
+        assert!(!left.devices.contains_key(&slot) && !left.rejected_slots.contains_key(&slot));
+        assert!(moving.client.device_unlinked());
+        let account = moving.app.account_home().account("alice").unwrap();
+        assert!(account.unlinked && account.signed_out);
+    });
+}
+
 /// A real approver deadline undo can arrive with the authentic Welcome.
 /// That admitted-but-not-Made destination alone is forgotten; old trust is
 /// neither reconstructed nor passed through another trust transition.

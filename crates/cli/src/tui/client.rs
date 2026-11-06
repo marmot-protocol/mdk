@@ -2443,9 +2443,9 @@ impl TuiApp {
     /// notification for a non-selected chat). Refreshes each row's projection
     /// (unread + last-message) and re-orders by activity while preserving the
     /// messages pane, its subscriptions, and the highlighted chat by group id.
-    /// Unlike `refresh_chats` this never reloads the timeline or resets
-    /// subscriptions, and it is silent on success (ambient) so it never clobbers
-    /// the status line.
+    /// Unlike `refresh_chats` this never reloads the timeline. Account-wide chat
+    /// and notification feeds follow the accepted list's account; matching feeds
+    /// stay in place. Success is silent so an ambient update keeps the status line.
     fn fold_relist(&mut self, account: String, result: Result<Vec<Value>, String>) {
         // Anchor to the enqueuing account: if the selection changed while the
         // re-list was in flight, its rows belong to a different account — dropping
@@ -2453,6 +2453,7 @@ impl TuiApp {
         // with a stale account's list.
         if self
             .selected_account_row()
+            .filter(|account| account.local_signing)
             .map(|account| account.account_id.as_str())
             != Some(account.as_str())
         {
@@ -2480,10 +2481,16 @@ impl TuiApp {
             .unwrap_or_default();
         // A complete accepted snapshot can legitimately replace a retained
         // other-account list after a failed foreground refresh.
-        self.chats_account_id = Some(account);
+        self.chats_account_id = Some(account.clone());
         sort_chats_by_activity(&mut self.chats);
         self.selected_chat = selected_chat_index(&self.chats, previous_group_id.as_deref())
             .unwrap_or_else(|| self.selected_chat.min(self.chats.len().saturating_sub(1)));
+        if let Err(err) = self.ensure_chat_subscription(&account) {
+            self.set_drain_status(format!("chat subscription failed: {err}"));
+        }
+        if let Err(err) = self.ensure_notification_subscription(&account) {
+            self.set_drain_status(format!("notification subscription failed: {err}"));
+        }
     }
 
     /// Fetch and prepend the previous history page. Runs synchronously like every

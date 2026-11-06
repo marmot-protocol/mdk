@@ -1926,19 +1926,32 @@ impl AppClient {
     /// its roster shows that device's first commit, and leaves a `removed`
     /// record for its slot; a failed link's undo drops the slot's entry and
     /// leaves none. So the roster the removal left decides, even when this
-    /// device applied its first commit and the removal in one catch-up. Only
-    /// a device that joined the group can have a failed link; a missing or
+    /// device applied its first commit and the removal in one catch-up, or
+    /// had selected its first commit on a branch the removal superseded.
+    /// Only a device that joined the group through a link, rather than
+    /// created it, can have a failed link. Its trust record says which for
+    /// as long as it trusts the group; the join it holds is forgotten once
+    /// its first commit lands, before a late removal can reach it
+    /// (mdk#3011). A group this device trusts because a move into it was
+    /// made is left by ordinary unlinking whatever the roster says, a
+    /// failed link's undo included (3.7d): its trust record carries the
+    /// KeyPackage of a move that reached Made. A move that ended before
+    /// Made trusted nothing, so it does not count. A missing or
     /// undecodable roster counts as an unlink, and the caller counts an
     /// error as one too.
     fn removal_undid_failed_link(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
-        let joined = self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .device_group_joins()?
-            .iter()
-            .any(|(group_id_hex, _)| *group_id_hex == hex::encode(group_id.as_slice()));
-        if !joined {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let Some(record) = storage.device_group(&hex::encode(group_id.as_slice()))? else {
+            return Ok(false);
+        };
+        let moved_in = storage
+            .device_group_move(group_id)?
+            .is_some_and(|movement| {
+                movement.rejected_slots.is_some()
+                    && record.key_package_ref_hex.as_deref()
+                        == Some(hex::encode(&movement.expectation.key_package_ref).as_str())
+            });
+        if record.trust != DeviceGroupTrust::Linked || moved_in {
             return Ok(false);
         }
         #[cfg(test)]

@@ -1,7 +1,7 @@
 ---
 title: "Native chat-list and account-attention handoff"
 created: 2026-09-14
-updated: 2026-11-05
+updated: 2026-11-06
 status: implementation
 ---
 
@@ -56,10 +56,8 @@ same query for select all, so a folder's list, count and selection agree. C uses
 `marmot_open_chat_list_query_window`, `marmot_chat_list_query_ids` and
 `marmot_revalidate_chat_list_query_ids` with a borrowed `MarmotChatListViewQuery`.
 
-The native snapshot deliberately does not serialize the Rust storage `first` and
-`last` cursors. They are internal boundaries owned by the window actor; no native
-command consumes them. `hasMoreBefore/After`, rows and generation/sequence are the
-complete native navigation contract. Do not persist sequences as restart tokens.
+Storage keeps no cursor between reads. `hasMoreBefore/After`, rows and
+generation/sequence are the complete native navigation contract. Do not persist sequences as restart tokens.
 
 ## Errors, cancellation and ownership
 

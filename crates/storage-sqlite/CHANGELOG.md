@@ -11,13 +11,17 @@
 
 ### Breaking changes
 
+- Remove cross-read chat-list paging (mdk#2983): `chat_list_page`, `chat_list_page_from_anchor`, `ChatListPageQuery`,
+  `ChatListCursor`, the `first`/`last` cursors on `ChatListPage`, and the `InvalidLimit`, `CursorMismatch`,
+  `StaleCursor` and `FilteredCursorUnsupported` errors. Nothing outside storage tests called them: the runtime window
+  composes its seeks inside one read snapshot and keeps its place by anchor chat ID. Block-list rebuilds no longer
+  bump the chat-list navigation revision, which nothing reads now; migration 0072's revision triggers stay until a
+  later migration drops them. No schema change.
+
 - Add `ChatListViewQuery` (a `ChatListView` plus an optional `ChatListFilter`) compiled to SQL on the view's page
-  index, with bound parameters, before keyset paging (mdk#2983). `ChatListPageQuery` and `ChatListWindowQuery` replace
-  their `view` field with `query`; `chat_list_page_from_anchor`, `chat_list_ids` and `revalidate_chat_list_ids` take
-  `impl Into<ChatListViewQuery>`, so a `ChatListView` still works. Cursors belong to their exact query, and only
-  fixed-view cursors continue across reads: `chat_list_page` refuses a cursor with a filter as the new
-  `ChatListPageError::FilteredCursorUnsupported`, since filtered results are consistent within one read. New typed
-  `ChatListQueryError` (also as `ChatListPageError::InvalidQuery` and `ChatListSelectionError::InvalidQuery`) and
+  index, with bound parameters, before keyset paging (mdk#2983). `ChatListWindowQuery` replaces its `view` field with
+  `query`; `chat_list_ids` and `revalidate_chat_list_ids` take `impl Into<ChatListViewQuery>`, so a `ChatListView`
+  still works. New typed `ChatListQueryError` (also as `ChatListPageError::InvalidQuery` and `ChatListSelectionError::InvalidQuery`) and
   `ChatListFilter::from_nodes` for the bindings' flat node list. No schema change.
 
 - Replace the unused stateful chat-list selection snapshot with stateless `chat_list_ids(view)` and

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    ChatListMessageDeliveryState, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
-    ChatListSelectionError, SqliteAccountStorage, SqliteAppStorage, StoredAppEvent,
+    ChatListMessageDeliveryState, ChatListPageError, ChatListSelectionError, SqliteAccountStorage,
+    SqliteAppStorage, StoredAppEvent, base::test_support::chat_list_window_page,
 };
 use ChatListCondition as C;
 use ChatListFilter as F;
@@ -138,15 +138,8 @@ fn ids(app: &SqliteAppStorage, view: ChatListView, filter: ChatListFilter) -> Ve
         filter: Some(filter),
     };
     let ids = app.chat_list_ids(query.clone()).unwrap();
-    // The page path compiles the same query; list and select-all must agree.
-    let page = app
-        .chat_list_page(ChatListPageQuery {
-            query,
-            limit: 100,
-            direction: ChatListPageDirection::Forward,
-            cursor: None,
-        })
-        .unwrap();
+    // The window path compiles the same query; list and select-all must agree.
+    let page = chat_list_window_page(app, query, 100).unwrap();
     assert_eq!(
         page.rows
             .iter()
@@ -304,13 +297,7 @@ fn every_condition_matches_exactly_the_chats_with_that_fact() {
             _ => unreachable!(),
         };
         if matches!(condition, C::PendingSend | C::FailedSend) {
-            let rows = app
-                .chat_list_page(ChatListPageQuery {
-                    query: ChatListView::Chats.into(),
-                    limit: 100,
-                    direction: ChatListPageDirection::Forward,
-                    cursor: None,
-                })
+            let rows = chat_list_window_page(&app, ChatListView::Chats, 100)
                 .unwrap()
                 .rows;
             let showing: Vec<_> = rows
@@ -471,12 +458,7 @@ fn bounds_and_node_lists_fail_with_typed_errors_and_no_partial_result() {
             ))
         ));
         assert!(matches!(
-            app.chat_list_page(ChatListPageQuery {
-                query: too_many_ids.clone(),
-                limit: 10,
-                direction: ChatListPageDirection::Forward,
-                cursor: None,
-            }),
+            chat_list_window_page(&app, too_many_ids.clone(), 10),
             Err(ChatListPageError::InvalidQuery(
                 ChatListQueryError::TooManyGroupIds
             ))
@@ -690,70 +672,4 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
         .map(|row| row.group_id_hex.clone())
         .collect();
     assert_eq!(tiled, all);
-}
-
-/// A cursor continues only a fixed view. With a filter it is refused up front
-/// with a distinct error (restarting would hit it again), because the cursor
-/// revision does not cover every filter input.
-#[test]
-fn cursors_continue_fixed_views_and_are_refused_with_a_filter() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    for n in 0..7 {
-        seed(
-            &store,
-            &format!("{n:02x}"),
-            if n % 2 == 0 { &["unread"] } else { &[] },
-        );
-    }
-    ready(&store);
-    let page = |query: ChatListViewQuery, cursor| {
-        app.chat_list_page(ChatListPageQuery {
-            query,
-            limit: 2,
-            direction: ChatListPageDirection::Forward,
-            cursor,
-        })
-    };
-    // A fixed view pages to its end across reads.
-    for view in [ChatListView::Chats, ChatListView::Unread] {
-        let mut paged = Vec::new();
-        let mut cursor = None;
-        loop {
-            let next = page(view.into(), cursor.take()).unwrap();
-            paged.extend(next.rows.iter().map(|row| row.group_id_hex.clone()));
-            if !next.has_more_after {
-                break;
-            }
-            cursor = next.last;
-        }
-        assert_eq!(paged, app.chat_list_ids(view).unwrap(), "{view:?}");
-    }
-    // A filtered first page reads; its cursor never continues a filtered query,
-    // even one whose filter matches everything.
-    let unread = ChatListViewQuery {
-        view: ChatListView::Chats,
-        filter: Some(cond(C::Unread)),
-    };
-    let first = page(unread.clone(), None).unwrap();
-    assert_eq!(first.rows.len(), 2);
-    let everything = ChatListViewQuery {
-        view: ChatListView::Chats,
-        filter: Some(F::All(Vec::new())),
-    };
-    let fixed = page(ChatListView::Chats.into(), None).unwrap();
-    for (query, cursor) in [
-        (unread, first.last.clone()),
-        (everything, fixed.last.clone()),
-    ] {
-        assert!(matches!(
-            page(query, cursor),
-            Err(ChatListPageError::FilteredCursorUnsupported)
-        ));
-    }
-    // A filtered query's cursor still belongs to that query alone.
-    assert!(matches!(
-        page(ChatListView::Chats.into(), first.last),
-        Err(ChatListPageError::CursorMismatch)
-    ));
 }

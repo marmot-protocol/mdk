@@ -3765,6 +3765,14 @@ fn mark_read_completion_does_not_cross_a_successful_then_failed_account_switch()
 // A failed return to A changes the highlight without changing B's real data.
 #[cfg(unix)]
 fn chat_list_b_after_failed_return_to_a(pane_is_b: bool) -> (tempfile::TempDir, TuiApp) {
+    chat_list_b_after_failed_return_to_a_with_daemon(pane_is_b, false)
+}
+
+#[cfg(unix)]
+fn chat_list_b_after_failed_return_to_a_with_daemon(
+    pane_is_b: bool,
+    daemon_running: bool,
+) -> (tempfile::TempDir, TuiApp) {
     let a = "aa".repeat(32);
     let b = "bb".repeat(32);
     let group = "cc".repeat(32);
@@ -3777,10 +3785,15 @@ fn chat_list_b_after_failed_return_to_a(pane_is_b: bool) -> (tempfile::TempDir, 
          *' --account {b} chats list '*)\ncat <<'JSON'\n{response}\nJSON\n;;\n\
          *' --account {a} chats list '*)\n\
          printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"A refresh failed\"}}}}'\n;;\n\
+         *' --account {a} chats subscribe '*)\n\
+         printf '%s\\n' '{{\"ok\":true,\"result\":{{\"type\":\"chat\",\"chat\":{{\"group_id\":\"{group}\",\"profile\":{{\"name\":\"A live update\"}},\"unread_count\":9,\"has_unread\":true}}}}}}'\n\
+         exec sleep 60\n;;\n\
+         *' subscribe '*|*' subscribe-archived '*|*' subscribe-state '*)\n\
+         exec sleep 60\n;;\n\
          *)\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{\"messages\":[],\"has_more_before\":false}}}}'\n;;\nesac\n"
     ));
     let mut app = test_tui_app(client, &a);
-    app.daemon.running = false;
+    app.daemon.running = daemon_running;
     app.accounts.push(AccountRow {
         account_id: b.clone(),
         npub: "npub1bob".to_owned(),
@@ -3815,6 +3828,275 @@ fn chat_list_b_after_failed_return_to_a(pane_is_b: bool) -> (tempfile::TempDir, 
         Some(if pane_is_b { b.as_str() } else { a.as_str() })
     );
     (dir, app)
+}
+
+#[cfg(unix)]
+#[test]
+fn relist_recovery_realigns_the_live_account_feeds() {
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    let group = "cc".repeat(32);
+    let (_dir, mut app) = chat_list_b_after_failed_return_to_a_with_daemon(true, true);
+    assert_eq!(app.chat_subscription.as_ref().unwrap().account_id, b);
+    assert_eq!(
+        app.notification_subscription.as_ref().unwrap().account_id,
+        b
+    );
+    app.timeline = vec![
+        timeline_row("B's previous message", 1),
+        timeline_row("B's retained message", 2),
+    ];
+    app.timeline_scroll.offset = 1;
+    app.timeline_scroll.selection = Some(0);
+    let timeline = app.timeline.clone();
+    let scroll = app.timeline_scroll.clone();
+    let timeline_child = app.timeline_subscription.as_ref().unwrap().child.id();
+    let message_child = app.message_subscription.as_ref().unwrap().child.id();
+    let group_child = app.group_state_subscription.as_ref().unwrap().child.id();
+    app.status = "draft saved".to_owned();
+
+    app.apply_effect_done(EffectDone {
+        effect: Effect::Relist {
+            account: a.clone(),
+            include_archived: false,
+        },
+        result: Ok(vec![serde_json::json!({"chats":[{
+            "group_id":group,"profile":{"name":"A recovered list"},"unread_count":5
+        }]})]),
+    });
+
+    assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
+    assert_eq!(app.chats[0].name, "A recovered list");
+    assert_eq!(
+        (
+            app.chat_subscription
+                .as_ref()
+                .map(|feed| feed.account_id.as_str()),
+            app.notification_subscription
+                .as_ref()
+                .map(|feed| feed.account_id.as_str()),
+        ),
+        (Some(a.as_str()), Some(a.as_str())),
+        "an accepted complete list must recover both account-wide feeds"
+    );
+    // The relist itself must preserve the pane and all of its live children.
+    // Draining a later chat event has its own existing subscription policy.
+    assert_eq!(app.messages_account_id.as_deref(), Some(b.as_str()));
+    assert_eq!(app.messages_group_id.as_deref(), Some(group.as_str()));
+    assert_eq!(app.timeline, timeline);
+    assert_eq!(app.timeline_scroll, scroll);
+    assert_eq!(
+        app.timeline_subscription.as_ref().unwrap().child.id(),
+        timeline_child
+    );
+    assert_eq!(
+        app.message_subscription.as_ref().unwrap().child.id(),
+        message_child
+    );
+    assert_eq!(
+        app.group_state_subscription.as_ref().unwrap().child.id(),
+        group_child
+    );
+    assert_eq!(
+        app.status, "draft saved",
+        "successful ambient repair stays quiet"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.chats[0].name != "A live update" {
+        assert!(
+            Instant::now() < deadline,
+            "A's new chat feed must deliver its update"
+        );
+        app.drain_chat_subscription();
+        thread::yield_now();
+    }
+    assert_eq!(app.chats[0].projection.unread_count, 9);
+    assert!(
+        app.chat_subscription
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app.notification_subscription
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    let chat_child = app.chat_subscription.as_ref().unwrap().child.id();
+    let notification_child = app.notification_subscription.as_ref().unwrap().child.id();
+    let current_message_child = app.message_subscription.as_ref().unwrap().child.id();
+    let current_group_child = app.group_state_subscription.as_ref().unwrap().child.id();
+    app.status = "draft saved".to_owned();
+    app.apply_effect_done(EffectDone {
+        effect: Effect::Relist {
+            account: a,
+            include_archived: false,
+        },
+        result: Ok(vec![serde_json::json!({"chats":[{
+            "group_id":group,"profile":{"name":"A same-account snapshot"},"unread_count":4
+        }]})]),
+    });
+    assert_eq!(app.chats[0].name, "A same-account snapshot");
+    assert_eq!(
+        app.chat_subscription.as_ref().unwrap().child.id(),
+        chat_child
+    );
+    assert_eq!(
+        app.notification_subscription.as_ref().unwrap().child.id(),
+        notification_child
+    );
+    assert_eq!(app.messages_account_id.as_deref(), Some(b.as_str()));
+    assert_eq!(app.messages_group_id.as_deref(), Some(group.as_str()));
+    assert_eq!(app.timeline, timeline);
+    assert_eq!(app.timeline_scroll, scroll);
+    assert_eq!(
+        app.timeline_subscription.as_ref().unwrap().child.id(),
+        timeline_child
+    );
+    assert_eq!(
+        app.message_subscription.as_ref().unwrap().child.id(),
+        current_message_child
+    );
+    assert_eq!(
+        app.group_state_subscription.as_ref().unwrap().child.id(),
+        current_group_child
+    );
+    assert_eq!(
+        app.status, "draft saved",
+        "successful ambient repair stays quiet"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
+    let a = "aa".repeat(32);
+    let group = "cc".repeat(32);
+    for fail_chat in [false, true] {
+        for login in [false, true] {
+            let (dir, mut app) = chat_list_b_after_failed_return_to_a_with_daemon(true, true);
+            let survivor = if fail_chat {
+                app.ensure_notification_subscription(&a)
+                    .expect("matching notification feed");
+                app.notification_subscription.as_ref().unwrap().child.id()
+            } else {
+                app.ensure_chat_subscription(&a)
+                    .expect("matching chat feed");
+                app.chat_subscription.as_ref().unwrap().child.id()
+            };
+            let client = app.client.clone();
+            app.client.exe = dir.path().join("missing-wn");
+            if login {
+                app.screen = Screen::Login(LoginMode::NsecEntry);
+            }
+            app.status = "current prompt".to_owned();
+            app.apply_effect_done(EffectDone {
+                effect: Effect::Relist {
+                    account: a.clone(),
+                    include_archived: false,
+                },
+                result: Ok(vec![serde_json::json!({"chats":[{"group_id":group}]})]),
+            });
+            assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
+            let status_prefix = if fail_chat {
+                assert!(
+                    app.chat_subscription.is_none(),
+                    "a failed spawn drops the stale feed"
+                );
+                assert_eq!(
+                    app.notification_subscription.as_ref().unwrap().child.id(),
+                    survivor
+                );
+                "chat subscription failed: "
+            } else {
+                assert!(
+                    app.notification_subscription.is_none(),
+                    "a failed spawn drops the stale filter"
+                );
+                assert_eq!(app.chat_subscription.as_ref().unwrap().child.id(), survivor);
+                "notification subscription failed: "
+            };
+            if login {
+                assert_eq!(
+                    app.status, "current prompt",
+                    "background failure preserves login guidance"
+                );
+            } else {
+                assert!(
+                    app.status.starts_with(status_prefix),
+                    "actual subscription failure: {}",
+                    app.status
+                );
+            }
+            app.client = client;
+            app.apply_effect_done(EffectDone {
+                effect: Effect::Relist {
+                    account: a.clone(),
+                    include_archived: false,
+                },
+                result: Ok(vec![serde_json::json!({"chats":[{"group_id":group}]})]),
+            });
+            assert_eq!(app.chat_subscription.as_ref().unwrap().account_id, a);
+            assert_eq!(
+                app.notification_subscription.as_ref().unwrap().account_id,
+                a
+            );
+            let retained = if fail_chat {
+                app.notification_subscription.as_ref().unwrap().child.id()
+            } else {
+                app.chat_subscription.as_ref().unwrap().child.id()
+            };
+            assert_eq!(
+                retained, survivor,
+                "retry leaves the already matching feed in place"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn relist_feed_recovery_respects_daemon_and_local_signing_lifecycle() {
+    let a = "aa".repeat(32);
+    let group = "cc".repeat(32);
+    for public_only in [false, true] {
+        let (_dir, mut app) = chat_list_b_after_failed_return_to_a_with_daemon(true, true);
+        if public_only {
+            app.accounts[0].local_signing = false;
+            app.refresh_chats()
+                .expect("public-only refresh clears stale state");
+        } else {
+            app.stop_daemon()
+                .expect("stop the daemon through its command owner");
+        }
+        let status = app.status.clone();
+        app.apply_effect_done(EffectDone {
+            effect: Effect::Relist {
+                account: a.clone(),
+                include_archived: false,
+            },
+            result: Ok(vec![serde_json::json!({"chats":[{"group_id":group}]})]),
+        });
+        assert!(app.chat_subscription.is_none());
+        assert!(app.notification_subscription.is_none());
+        assert_eq!(app.status, status);
+        if public_only {
+            assert!(
+                app.chats.is_empty(),
+                "a late local result cannot repopulate public-only state"
+            );
+            assert!(app.chats_account_id.is_none());
+        } else {
+            assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
+        }
+    }
 }
 
 #[cfg(unix)]
