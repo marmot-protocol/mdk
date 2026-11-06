@@ -1,5 +1,5 @@
 use super::*;
-use crate::SqliteAccountStorage;
+use crate::{SqliteAccountStorage, SqliteAppStorage};
 use cgka_traits::storage::{DisbandFailureReason, DisbandRequestStorage, LeaveRequestStorage};
 use cgka_traits::types::GroupId;
 use rusqlite::params;
@@ -16,15 +16,29 @@ fn seed(
     conn.execute("INSERT INTO account_groups(group_id_hex, endpoint, updated_at, archived, self_membership, pending_confirmation) VALUES (?1, '', 0, ?2, ?3, ?4)", params![id, archived, membership, pending]).unwrap();
     conn.execute("INSERT INTO chat_list_rows(group_id_hex, updated_at, archived, self_membership, unread_count, pending_confirmation) VALUES (?1, 0, ?2, ?3, ?4, ?5)", params![id, archived, membership, unread, pending]).unwrap();
 }
-fn page(store: &SqliteAppStorage, view: ChatListView) -> ChatListPage {
+/// One keyset seek in its own read snapshot, as the window composes them.
+fn read(store: &SqliteAppStorage, query: PageQuery) -> Result<ChatListPage, ChatListPageError> {
     store
-        .chat_list_page(ChatListPageQuery {
-            query: view.into(),
-            limit: 100,
-            direction: ChatListPageDirection::Forward,
-            cursor: None,
-        })
-        .unwrap()
+        .connection
+        .with_deferred_read(|conn| read_page_tx(conn, query, None))
+}
+fn read_from_anchor(
+    store: &SqliteAppStorage,
+    view: ChatListView,
+    anchor: &str,
+    limit: usize,
+    direction: ChatListPageDirection,
+) -> Result<ChatListPage, ChatListPageError> {
+    store.connection.with_deferred_read(|conn| {
+        read_page_tx(conn, query(view, limit, direction, None), Some(anchor))
+    })
+}
+fn page(store: &SqliteAppStorage, view: ChatListView) -> ChatListPage {
+    read(
+        store,
+        query(view, 100, ChatListPageDirection::Forward, None),
+    )
+    .unwrap()
 }
 fn ids(page: &ChatListPage) -> Vec<&str> {
     page.rows.iter().map(|r| r.group_id_hex.as_str()).collect()
@@ -46,13 +60,13 @@ fn query(
     view: ChatListView,
     limit: usize,
     direction: ChatListPageDirection,
-    cursor: Option<ChatListCursor>,
-) -> ChatListPageQuery {
-    ChatListPageQuery {
+    boundary: Option<SortKey>,
+) -> PageQuery {
+    PageQuery {
         query: view.into(),
         limit,
         direction,
-        cursor,
+        boundary,
     }
 }
 
@@ -79,16 +93,14 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
             ChatListPageDirection::Forward,
             ChatListPageDirection::Backward,
         ] {
-            let anchored = app
-                .chat_list_page_from_anchor(ChatListView::Chats, "abcd", 10, direction)
-                .unwrap();
+            let anchored =
+                read_from_anchor(&app, ChatListView::Chats, "abcd", 10, direction).unwrap();
             assert_eq!(ids(&anchored), [id]);
             assert!(matches!(
-                app.chat_list_page_from_anchor(ChatListView::Archived, "abcd", 10, direction),
+                read_from_anchor(&app, ChatListView::Archived, "abcd", 10, direction),
                 Err(ChatListPageError::AnchorUnavailable)
             ));
         }
-        let cursor = page(&app, ChatListView::Chats).last;
         store
             .put_leave_request(&LeaveRequest {
                 group_id: group.clone(),
@@ -100,16 +112,6 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
         let left = page(&app, ChatListView::Left);
         assert_eq!(left.rows[0].leave_requested_at_ms, Some(123));
         assert_eq!(left.rows[0].self_membership, crate::SelfMembership::Member);
-        // The engine write moved the navigation revision.
-        assert!(matches!(
-            app.chat_list_page(query(
-                ChatListView::Chats,
-                1,
-                ChatListPageDirection::Forward,
-                cursor
-            )),
-            Err(ChatListPageError::StaleCursor)
-        ));
         // A queued leave keeps an archived row in Left, not Archived.
         set_archived(&store, id, true);
         assert!(page(&app, ChatListView::Archived).rows.is_empty());
@@ -266,52 +268,57 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
     let all = page(&app, ChatListView::Chats);
     assert_eq!(ids(&all), ["04", "01", "03", "05"]);
     assert_eq!(all.rows[2].pinned_position, Some(2));
-    let first = app
-        .chat_list_page(query(
-            ChatListView::Chats,
-            2,
-            ChatListPageDirection::Forward,
-            None,
-        ))
-        .unwrap();
+    let first = read(
+        &app,
+        query(ChatListView::Chats, 2, ChatListPageDirection::Forward, None),
+    )
+    .unwrap();
     assert_eq!(ids(&first), ["04", "01"]);
     assert!(!first.has_more_before && first.has_more_after);
-    let second = app
-        .chat_list_page(query(
+    let second = read(
+        &app,
+        query(
             ChatListView::Chats,
             2,
             ChatListPageDirection::Forward,
             first.last.clone(),
-        ))
-        .unwrap();
+        ),
+    )
+    .unwrap();
     assert_eq!(ids(&second), ["03", "05"]);
     assert!(second.has_more_before && !second.has_more_after);
-    let back = app
-        .chat_list_page(query(
+    let back = read(
+        &app,
+        query(
             ChatListView::Chats,
             2,
             ChatListPageDirection::Backward,
             second.first,
-        ))
-        .unwrap();
+        ),
+    )
+    .unwrap();
     assert_eq!(ids(&back), ids(&first));
-    let tail = app
-        .chat_list_page(query(
+    let tail = read(
+        &app,
+        query(
             ChatListView::Chats,
             2,
             ChatListPageDirection::Backward,
             None,
-        ))
-        .unwrap();
+        ),
+    )
+    .unwrap();
     assert_eq!(ids(&tail), ["03", "05"]);
-    let empty = app
-        .chat_list_page(query(
+    let empty = read(
+        &app,
+        query(
             ChatListView::Chats,
             2,
             ChatListPageDirection::Forward,
             tail.last,
-        ))
-        .unwrap();
+        ),
+    )
+    .unwrap();
     assert!(empty.rows.is_empty() && empty.has_more_before && !empty.has_more_after);
 }
 
@@ -355,169 +362,10 @@ fn manual_unread_invite_acceptance_and_source_membership_change_are_immediate() 
 }
 
 #[test]
-fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
-    use cgka_traits::storage::StorageProvider;
-    for commit in [false, true] {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        for id in ["01", "02", "03"] {
-            seed(&store, id, false, "member", 0, false);
-        }
-        let before = page(&store.app_storage(), ChatListView::Chats).first;
-        let result =
-            StorageProvider::with_transaction(&store, |store| -> Result<(), ChatListPageError> {
-                store
-                    .lock()?
-                    .execute(
-                        "UPDATE chat_list_rows SET activity_sort_at = 99 WHERE group_id_hex = '03'",
-                        [],
-                    )
-                    .storage()?;
-                let first = store.app_storage().chat_list_page(query(
-                    ChatListView::Chats,
-                    1,
-                    ChatListPageDirection::Forward,
-                    None,
-                ))?;
-                assert_eq!(ids(&first), ["03"]);
-                let next = store.app_storage().chat_list_page(query(
-                    ChatListView::Chats,
-                    1,
-                    ChatListPageDirection::Forward,
-                    first.last,
-                ))?;
-                assert_eq!(ids(&next), ["01"]);
-                let anchored = store.app_storage().chat_list_page_from_anchor(
-                    ChatListView::Chats,
-                    "02",
-                    2,
-                    ChatListPageDirection::Backward,
-                )?;
-                assert_eq!(ids(&anchored), ["01", "02"]);
-                assert!(matches!(
-                    store.app_storage().chat_list_page_from_anchor(
-                        ChatListView::Chats,
-                        "missing",
-                        2,
-                        ChatListPageDirection::Forward,
-                    ),
-                    Err(ChatListPageError::AnchorUnavailable)
-                ));
-                assert!(!store.lock()?.is_autocommit());
-                if commit {
-                    Ok(())
-                } else {
-                    Err(ChatListPageError::InvalidLimit)
-                }
-            });
-        assert_eq!(result.is_ok(), commit);
-        if !commit {
-            assert!(matches!(result, Err(ChatListPageError::InvalidLimit)));
-        }
-        assert!(store.lock().unwrap().is_autocommit());
-        assert_eq!(
-            ids(&page(&store.app_storage(), ChatListView::Chats)),
-            if commit {
-                vec!["03", "01", "02"]
-            } else {
-                vec!["01", "02", "03"]
-            }
-        );
-        let resumed = store.app_storage().chat_list_page(query(
-            ChatListView::Chats,
-            1,
-            ChatListPageDirection::Forward,
-            before,
-        ));
-        if commit {
-            assert!(matches!(resumed, Err(ChatListPageError::StaleCursor)));
-        } else {
-            assert_eq!(ids(&resumed.unwrap()), ["02"]);
-        }
-    }
-}
-
-#[test]
-fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change() {
+fn list_membership_rolls_back_with_failed_source_write() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     seed(&store, "01", false, "member", 1, false);
-    seed(&store, "02", false, "member", 1, false);
-    let cursor = page(&app, ChatListView::Chats).first;
-    for limit in [0, 101, usize::MAX] {
-        assert!(matches!(
-            app.chat_list_page(query(
-                ChatListView::Chats,
-                limit,
-                ChatListPageDirection::Forward,
-                None
-            )),
-            Err(ChatListPageError::InvalidLimit)
-        ));
-    }
-    let other = SqliteAccountStorage::in_memory().unwrap();
-    assert!(matches!(
-        other.app_storage().chat_list_page(query(
-            ChatListView::Chats,
-            1,
-            ChatListPageDirection::Forward,
-            cursor.clone()
-        )),
-        Err(ChatListPageError::CursorMismatch)
-    ));
-    assert!(matches!(
-        app.chat_list_page(query(
-            ChatListView::Unread,
-            1,
-            ChatListPageDirection::Forward,
-            cursor.clone()
-        )),
-        Err(ChatListPageError::CursorMismatch)
-    ));
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE chat_list_rows SET title = 'changed' WHERE group_id_hex = '02'",
-            [],
-        )
-        .unwrap();
-    assert_eq!(
-        app.chat_list_page(query(
-            ChatListView::Chats,
-            1,
-            ChatListPageDirection::Forward,
-            cursor.clone()
-        ))
-        .unwrap()
-        .rows[0]
-            .title,
-        "changed"
-    );
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE chat_list_rows SET activity_sort_at = 90 WHERE group_id_hex = '02'",
-            [],
-        )
-        .unwrap();
-    assert!(matches!(
-        app.chat_list_page(query(
-            ChatListView::Chats,
-            1,
-            ChatListPageDirection::Forward,
-            cursor
-        )),
-        Err(ChatListPageError::StaleCursor)
-    ));
-}
-
-#[test]
-fn navigation_and_cursor_revision_roll_back_with_failed_source_write() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    seed(&store, "01", false, "member", 1, false);
-    let cursor = page(&app, ChatListView::Chats).last;
     {
         let conn = store.lock().unwrap();
         let tx = conn.unchecked_transaction().unwrap();
@@ -532,15 +380,6 @@ fn navigation_and_cursor_revision_roll_back_with_failed_source_write() {
         // Dropping without commit simulates an aborted source mutation.
     }
     assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01"]);
-    assert!(
-        app.chat_list_page(query(
-            ChatListView::Chats,
-            1,
-            ChatListPageDirection::Forward,
-            cursor
-        ))
-        .is_ok()
-    );
 }
 
 #[test]
@@ -599,11 +438,10 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
             ChatListView::Archived,
             ChatListView::Left,
         ] {
-            let tail = app
-                .chat_list_page(query(view, 10, ChatListPageDirection::Backward, None))
-                .unwrap();
+            let tail = read(&app, query(view, 10, ChatListPageDirection::Backward, None)).unwrap();
             let (_, anchor_steps) = measure(&store, || {
-                app.chat_list_page_from_anchor(
+                read_from_anchor(
+                    &app,
                     view,
                     &tail.rows.last().unwrap().group_id_hex,
                     10,
@@ -621,8 +459,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                     (ChatListPageDirection::Backward, tail.first.clone()),
                 ] {
                     let (result, steps) = measure(&store, || {
-                        app.chat_list_page(query(view, limit, direction, cursor.clone()))
-                            .unwrap()
+                        read(&app, query(view, limit, direction, cursor.clone())).unwrap()
                     });
                     assert!(
                         steps < if limit == 10 { 2200 } else { 19000 },
@@ -642,10 +479,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                             false
                         )
                     );
-                    let mut values = cursor
-                        .as_ref()
-                        .map(|c| key_params(&c.key))
-                        .unwrap_or_default();
+                    let mut values = cursor.as_ref().map(key_params).unwrap_or_default();
                     values.push((limit as i64).into());
                     let conn = store.lock().unwrap();
                     let mut stmt = conn.prepare(&sql).unwrap();
@@ -802,29 +636,30 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
                 [tick],
             )
             .unwrap();
-        let anchored = app
-            .chat_list_page_from_anchor(
-                ChatListView::Chats,
-                "00c8",
-                50,
-                ChatListPageDirection::Forward,
-            )
-            .unwrap();
+        let anchored = read_from_anchor(
+            &app,
+            ChatListView::Chats,
+            "00c8",
+            50,
+            ChatListPageDirection::Forward,
+        )
+        .unwrap();
         assert_eq!(anchored.rows.first().unwrap().group_id_hex, "00c8");
         assert_eq!(anchored.rows.len(), 50);
         assert!(anchored.has_more_before && anchored.has_more_after);
-        let preceding = app
-            .chat_list_page_from_anchor(
-                ChatListView::Chats,
-                "00c8",
-                50,
-                ChatListPageDirection::Backward,
-            )
-            .unwrap();
+        let preceding = read_from_anchor(
+            &app,
+            ChatListView::Chats,
+            "00c8",
+            50,
+            ChatListPageDirection::Backward,
+        )
+        .unwrap();
         assert_eq!(preceding.rows.last().unwrap().group_id_hex, "00c8");
     }
     assert!(matches!(
-        app.chat_list_page_from_anchor(
+        read_from_anchor(
+            &app,
             ChatListView::Archived,
             "00c8",
             50,
@@ -838,7 +673,8 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
         .execute("DELETE FROM chat_list_rows WHERE group_id_hex = '00c8'", [])
         .unwrap();
     assert!(matches!(
-        app.chat_list_page_from_anchor(
+        read_from_anchor(
+            &app,
             ChatListView::Chats,
             "00c8",
             50,
@@ -909,7 +745,6 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
             .collect::<Vec<_>>(),
         [Some(0), Some(2), None]
     );
-    let boundary = current.last;
     store
         .lock()
         .unwrap()
@@ -944,17 +779,6 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
         Ok(())
     })
     .unwrap();
-    assert!(
-        store
-            .app_storage()
-            .chat_list_page(query(
-                ChatListView::Chats,
-                1,
-                ChatListPageDirection::Backward,
-                boundary
-            ))
-            .is_ok()
-    );
     store
         .lock()
         .unwrap()

@@ -1,6 +1,7 @@
 use super::*;
 use crate::ChatListView;
 use crate::SqliteAccountStorage;
+use crate::base::test_support::chat_list_window_page;
 use rusqlite::params;
 
 fn seed(
@@ -34,14 +35,7 @@ fn ids_cover_the_whole_view_past_the_display_limit() {
         for n in 0..count {
             seed(&store, &format!("{n:032x}"), false, "member", 0, false);
         }
-        let display = app
-            .chat_list_page(crate::ChatListPageQuery {
-                query: ChatListView::Chats.into(),
-                limit: 50,
-                direction: crate::ChatListPageDirection::Forward,
-                cursor: None,
-            })
-            .unwrap();
+        let display = chat_list_window_page(&app, ChatListView::Chats, 50).unwrap();
         assert_eq!(display.rows.len(), count.min(50));
         assert_eq!(
             app.chat_list_ids(ChatListView::Chats).unwrap(),
@@ -71,14 +65,7 @@ fn ids_match_each_native_view_and_its_display_page() {
         (ChatListView::Left, vec!["04", "05"]),
     ] {
         assert_eq!(app.chat_list_ids(view).unwrap(), expected, "{view:?}");
-        let page = app
-            .chat_list_page(crate::ChatListPageQuery {
-                query: view.into(),
-                limit: 100,
-                direction: crate::ChatListPageDirection::Forward,
-                cursor: None,
-            })
-            .unwrap();
+        let page = chat_list_window_page(&app, view, 100).unwrap();
         assert_eq!(
             page.rows
                 .iter()

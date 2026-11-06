@@ -171,14 +171,9 @@ fn assert_preview_retention(
     let mut rows = app.chat_list_rows(ChatListQuery::default()).unwrap();
     rows.push(app.chat_list_row(GROUP).unwrap().unwrap());
     rows.extend(
-        app.chat_list_page(crate::ChatListPageQuery {
-            query: crate::ChatListView::Chats.into(),
-            limit: 10,
-            direction: crate::ChatListPageDirection::Forward,
-            cursor: None,
-        })
-        .unwrap()
-        .rows,
+        crate::base::test_support::chat_list_window_page(&app, crate::ChatListView::Chats, 10)
+            .unwrap()
+            .rows,
     );
     let direct = app.direct_conversation_candidate_rows(REMOTE).unwrap();
     assert_eq!(direct.len(), 1);
@@ -5066,10 +5061,9 @@ fn retention_scan_lets_imported_rows_expire_on_time() {
     }
 }
 
-/// Debug output never carries avatar key material or a page cursor's position,
-/// which names a group.
+/// Debug output never carries avatar key material.
 #[test]
-fn debug_output_hides_avatar_keys_and_cursor_positions() {
+fn debug_output_hides_avatar_keys() {
     let avatar = ChatListAvatar {
         image_hash_hex: "a1".repeat(32),
         image_key_hex: "b2".repeat(32),
@@ -5081,26 +5075,6 @@ fn debug_output_hides_avatar_keys_and_cursor_positions() {
     assert!(shown.contains(&avatar.image_hash_hex), "{shown}");
     assert!(!shown.contains(&avatar.image_key_hex), "{shown}");
     assert!(!shown.contains(&avatar.image_upload_key_hex), "{shown}");
-
-    let group_id = hex_id(0xab, 16);
-    let store = setup_store_with_group(StoredAccountGroup {
-        group_id_hex: group_id.clone(),
-        ..group()
-    })
-    .app_storage();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let cursor = store
-        .chat_list_page(ChatListPageQuery {
-            query: ChatListView::Chats.into(),
-            limit: 10,
-            direction: ChatListPageDirection::Forward,
-            cursor: None,
-        })
-        .unwrap()
-        .last
-        .expect("cursor");
-    let shown = format!("{cursor:?}");
-    assert!(!shown.contains(&group_id), "{shown}");
 }
 
 /// mdk#1291: a peer's reaction delivers a failed send in the chat list, and

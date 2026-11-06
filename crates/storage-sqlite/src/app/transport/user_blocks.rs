@@ -149,11 +149,6 @@ impl SqliteAppStorage {
             local_account_id,
             mention_classifier,
         )?;
-        tx.execute(
-            "UPDATE chat_list_navigation_meta SET revision=revision+1",
-            [],
-        )
-        .storage()?;
         tx.commit().storage()?;
         Ok(true)
     }

@@ -95,14 +95,12 @@ bound as a parameter, and pages, counts and selects through the view's page inde
 keyed per-chat lookup, so cost grows with the view's chats, never with history. Queries are bounded (8 levels, 64
 nodes, 500 group IDs) and an over-bound query is a typed `ChatListQueryError` before any read.
 `ChatListFilter::from_nodes` builds the tree from the bindings' flat node list. A `ChatListView` converts into the
-unfiltered query, and page cursors belong to the exact query that produced them.
+unfiltered query.
 
-Filtered results are consistent within one read: a window read, `chat_list_ids` and `revalidate_chat_list_ids`. A
-cursor continues only a fixed-view query across reads; `chat_list_page` refuses a cursor with a filter as
-`FilteredCursorUnsupported` before reading. The navigation revision that makes cursors stale covers the fixed views'
-inputs (scope, unread, pin, activity, membership), not every filter leaf's (drafts, manual unread, mentions, delivery
-state, invitations, leave and disband records). Cross-read filtered paging would need revision triggers on each of
-those inputs; add them only if a host needs it.
+Every read is self-contained. `read_chat_list_window`, `chat_list_ids` and `revalidate_chat_list_ids` each run in one
+read transaction, and no cursor carries a position into a later read, so filtered and fixed queries behave alike. A
+live window keeps its place by re-reading around a stable anchor chat ID; paging grows the window rather than
+continuing a stored page.
 
 `chat_list_ids(query)` returns every chat ID the query matches, in display order, from one read transaction before
 any display paging. It reads no presentation, profile, roster or history blobs. Pending base-row work returns

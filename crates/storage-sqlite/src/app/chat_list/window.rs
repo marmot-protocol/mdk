@@ -1,11 +1,10 @@
 //! Atomic bounded navigation plus selected presentation for runtime-owned windows.
-use super::pages::read_page_tx;
+use super::pages::{PageQuery, read_page_tx};
 use super::query::ChatListViewQuery;
 use crate::base::connection::CachedSql;
 use crate::{
-    ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
-    ChatPresentationVersion, PresentedChatListSnapshot, PresentedChatRow, SqliteAppStorage,
-    SqliteResultExt,
+    ChatListPage, ChatListPageDirection, ChatListPageError, ChatPresentationVersion,
+    PresentedChatListSnapshot, PresentedChatRow, SqliteAppStorage, SqliteResultExt,
 };
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 
@@ -61,11 +60,11 @@ impl SqliteAppStorage {
                 Some(anchor) => {
                     let mut before = read_page_tx(
                         conn,
-                        ChatListPageQuery {
+                        PageQuery {
                             query: query.query.clone(),
                             limit: query.before_anchor + 1,
                             direction: ChatListPageDirection::Backward,
-                            cursor: None,
+                            boundary: None,
                         },
                         Some(anchor),
                     )?;
@@ -73,11 +72,11 @@ impl SqliteAppStorage {
                     if remaining > 0 {
                         let after = read_page_tx(
                             conn,
-                            ChatListPageQuery {
+                            PageQuery {
                                 query: query.query.clone(),
                                 limit: remaining,
                                 direction: ChatListPageDirection::Forward,
-                                cursor: before.last.clone(),
+                                boundary: before.last.clone(),
                             },
                             None,
                         )?;
@@ -91,26 +90,26 @@ impl SqliteAppStorage {
                 }
                 None => read_page_tx(
                     conn,
-                    ChatListPageQuery {
+                    PageQuery {
                         query: query.query.clone(),
                         limit: query.limit,
                         direction: ChatListPageDirection::Forward,
-                        cursor: None,
+                        boundary: None,
                     },
                     None,
                 )?,
             };
             // Near the end fill unused capacity from before the window, retaining the anchor.
-            // has_more_before excludes empty pages: a cursorless backward read would
+            // has_more_before excludes empty pages: a boundaryless backward read would
             // otherwise restart from the wrong end of the list.
             if page.rows.len() < query.limit && page.has_more_before {
                 let mut before = read_page_tx(
                     conn,
-                    ChatListPageQuery {
+                    PageQuery {
                         query: query.query.clone(),
                         limit: query.limit - page.rows.len(),
                         direction: ChatListPageDirection::Backward,
-                        cursor: page.first.clone(),
+                        boundary: page.first.clone(),
                     },
                     None,
                 )?;

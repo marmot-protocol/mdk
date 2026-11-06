@@ -79,6 +79,9 @@
 
 ### Breaking changes
 
+- Remove the `first`/`last` storage cursor fields from `ChatListWindowSnapshot` (mdk#2983). No binding exposed them and
+  no command consumed them; a window keeps its place by anchor chat ID.
+
 - `AppCreateGroupOptions` adds `initial_admins` for founding co-admin selection.
   Add the field to exhaustive struct literals, or use `..Default::default()`
   to retain creator-only admin defaults.
