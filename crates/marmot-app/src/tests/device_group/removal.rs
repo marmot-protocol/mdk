@@ -567,7 +567,7 @@ async fn a_device_its_device_group_removes_is_unlinked_from_the_account() {
         .await;
     assert!(
         laptop_storage.device_group_joins().unwrap().is_empty(),
-        "the laptop's link is settled, so its removal is not a failed link"
+        "the laptop's link is settled: only the roster tells its removal from a failed link's undo"
     );
 
     phone
@@ -625,6 +625,45 @@ async fn a_device_its_device_group_removes_is_unlinked_from_the_account() {
         .await
         .unwrap_err();
     assert_eq!(relay.attempted_events().len(), attempted);
+}
+
+/// The laptop removes the phone, which created the device group, with
+/// `remove_device` alone, as a failed link's undo would. Only a device that
+/// joined the group can have a failed link, so the phone is unlinked all the
+/// same (D40, D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_creators_removal_unlinks_it_without_a_removed_record() {
+    let (devices, group) = tagging_devices().await;
+    let mut phone_cursor = published_count(&devices.relay);
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        mut laptop,
+        ..
+    } = devices;
+    assert_eq!(trust(&phone_app, &group), Some(DeviceGroupTrust::Created));
+    let phone_slot = slot_of(&phone);
+    laptop
+        .unlink_device_from_group(
+            &group,
+            device_group_leaf(&laptop, &group, phone_slot),
+            vec![DeviceRosterOperationV1::RemoveDevice(phone_slot)],
+        )
+        .await
+        .unwrap();
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    assert!(phone.runtime.group_record(&group).unwrap().removed);
+    let left = roster(&phone, &group);
+    assert!(
+        !left.devices.contains_key(&phone_slot) && !left.rejected_slots.contains_key(&phone_slot),
+        "the roster reads as a failed link's undo would leave it"
+    );
+    assert!(phone.device_unlinked());
+    let account = phone_app.account_home().account("alice").unwrap();
+    assert!(account.unlinked && account.signed_out);
 }
 
 /// The laptop sends its first commit in the device group and is closed

@@ -1926,8 +1926,12 @@ impl AppClient {
     /// its roster shows that device's first commit, and leaves a `removed`
     /// record for its slot; a failed link's undo drops the slot's entry and
     /// leaves none. So the roster the removal left decides, even when this
-    /// device applied its first commit and the removal in one catch-up. Only
-    /// a device that joined the group can have a failed link; a missing or
+    /// device applied its first commit and the removal in one catch-up, or
+    /// had selected its first commit on a branch the removal superseded.
+    /// Only a device that joined the group, rather than created it, can have
+    /// a failed link. Its trust record says which for as long as it trusts
+    /// the group; the join it holds is forgotten once its first commit
+    /// lands, before a late removal can reach it (mdk#3011). A missing or
     /// undecodable roster counts as an unlink, and the caller counts an
     /// error as one too.
     fn removal_undid_failed_link(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
@@ -1935,9 +1939,8 @@ impl AppClient {
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .device_group_joins()?
-            .iter()
-            .any(|(group_id_hex, _)| *group_id_hex == hex::encode(group_id.as_slice()));
+            .device_group(&hex::encode(group_id.as_slice()))?
+            .is_some_and(|record| record.trust == DeviceGroupTrust::Linked);
         if !joined {
             return Ok(false);
         }
