@@ -28,6 +28,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const FOLLOW_UP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
 const METADATA_BYTES: usize = 4 * 1024 * 1024;
 const USERNAME: &str = "opencode";
 const UNANSWERED_NOTICE: &str = "A follow-up reached OpenCode as this turn finished, so it has no answer yet. Send another message to continue.";
@@ -210,41 +211,49 @@ impl Native {
 
         let prompt = parts(&invocation.prompt, &files)?;
         let message_path = ["session", session.as_str(), "message"];
-        let first = server.call_without_timeout(
+        let first = server.request(
             Method::POST,
             &message_path,
+            &[],
             Some(json!({ "parts": prompt })),
+            None,
         );
         tokio::pin!(first);
         // Follow-ups must not be stored ahead of the prompt, so steering opens
-        // only after the prompt is visible in the session.
+        // only after the prompt is visible in the session. A turn that finishes
+        // first keeps its answer and is never steered.
         let mut completed = None;
         let confirm_deadline = Instant::now() + STARTUP_TIMEOUT;
-        let first_id = loop {
-            let messages = server.messages(&session, 8).await?;
+        let mut first_id = None;
+        while first_id.is_none() && !matches!(completed, Some(Ok(_))) {
+            let messages = server.messages_since(&session, baseline.as_deref()).await?;
             if let Some(message) = first_user_after(&messages, baseline.as_deref()) {
                 match stored(message, &invocation.prompt, &prompt) {
-                    Stored::Complete => break message_id(Some(message)).unwrap(),
+                    Stored::Complete => first_id = message_id(Some(message)),
                     Stored::ReadFailed => return Err(HarnessError::AttachmentNotProcessed),
                     Stored::Pending => {}
                 }
             }
-            if matches!(completed, Some(Err(_))) || Instant::now() > confirm_deadline {
+            if first_id.is_some() {
+                break;
+            }
+            if let Some(Err(error)) = completed.take() {
+                return Err(error);
+            }
+            if Instant::now() > confirm_deadline {
                 return Err(HarnessError::BackendStream);
             }
-            if completed.is_none() {
-                tokio::select! {
-                    result = &mut first => completed = Some(result),
-                    () = sleep(Duration::from_millis(50)) => {}
-                }
-            } else {
-                sleep(Duration::from_millis(50)).await;
+            tokio::select! {
+                result = &mut first => completed = Some(result),
+                () = sleep(CONFIRM_INTERVAL) => {}
             }
-        };
+        }
 
         let (sender, receiver) = mpsc::channel(4);
         let mut follow_ups = FollowUps(receiver);
-        let registration = self.register(current_group_id(), sender);
+        let registration = first_id
+            .is_some()
+            .then(|| self.register(current_group_id(), sender));
         // Staged follow-up files must outlive the turn that reads them.
         let mut leases = Vec::new();
         let mut answered = HashSet::new();
@@ -262,7 +271,7 @@ impl Native {
                     let _ = reply.send(server.follow_up(&session, &text, &files).await);
                 }
                 _ = poll.tick() => {
-                    server.answer_requests(&session, approve_once, &mut answered).await?;
+                    server.answer_requests(approve_once, &mut answered).await?;
                 }
             }
         };
@@ -270,9 +279,13 @@ impl Native {
         drop(registration);
         let answer = answer?;
 
-        let (texts, unanswered) = match server.turn_messages(&session, &first_id).await {
-            Ok(messages) => turn_text(&messages),
-            Err(_) => (completed_text(&answer), false),
+        let history = match &first_id {
+            Some(first_id) => server.turn_messages(&session, first_id).await.ok(),
+            None => None,
+        };
+        let (texts, unanswered) = match history {
+            Some(messages) => turn_text(&messages),
+            None => (completed_text(&answer), false),
         };
         for text in texts
             .into_iter()
@@ -384,15 +397,6 @@ impl Server {
             .await
     }
 
-    async fn call_without_timeout(
-        &self,
-        method: Method,
-        path: &[&str],
-        body: Option<Value>,
-    ) -> Result<Value, HarnessError> {
-        self.request(method, path, &[], body, None).await
-    }
-
     /// One attempt, never retried: a lost response may still have committed.
     async fn request(
         &self,
@@ -463,6 +467,28 @@ impl Server {
         }
     }
 
+    /// Messages newer than `baseline`, read in small pages. Until steering
+    /// opens these are the prompt and its replies, so reads stay narrow.
+    async fn messages_since(
+        &self,
+        session: &str,
+        baseline: Option<&str>,
+    ) -> Result<Vec<Value>, HarnessError> {
+        let mut limit = 2;
+        loop {
+            let messages = self.messages(session, limit).await?;
+            let has_baseline = baseline.is_none_or(|baseline| {
+                messages
+                    .iter()
+                    .any(|message| message_id(Some(message)).as_deref() == Some(baseline))
+            });
+            if has_baseline || messages.len() < limit || limit >= 64 {
+                return Ok(messages);
+            }
+            limit *= 2;
+        }
+    }
+
     /// Messages from the turn's prompt onward, paging back until it is found.
     async fn turn_messages(&self, session: &str, first: &str) -> Result<Vec<Value>, HarnessError> {
         let mut limit = 16;
@@ -507,7 +533,6 @@ impl Server {
     /// Answers this session's permission and question requests once each.
     async fn answer_requests(
         &self,
-        session: &str,
         approve_once: bool,
         answered: &mut HashSet<String>,
     ) -> Result<(), HarnessError> {
@@ -521,7 +546,9 @@ impl Server {
                 let Some(id) = request["id"].as_str() else {
                     continue;
                 };
-                if request["sessionID"] != session || !answered.insert(format!("{kind}:{id}")) {
+                // The server is private to this turn, so every request is
+                // ours, including those from subagent sessions.
+                if !answered.insert(format!("{kind}:{id}")) {
                     continue;
                 }
                 if kind == "permission" && !approve_once {
