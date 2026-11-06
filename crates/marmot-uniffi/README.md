@@ -1406,7 +1406,8 @@ runtime starts closed. An admitted pass settles after false, while later passes 
 the same runtime-wide facts and never starts its worker. Manual restore is independent.
 
 An OS background task can await `runDueBackupPass(accountRef)`: it joins the current pass or tries ordinary due
-admission once. `NotStarted` admits nothing; `FinishedAttempt` means the pass's serialized settlement attempt and
+admission once, waiting through startup catch-up before admission if necessary. `NotStarted` admits nothing;
+`FinishedAttempt` means the pass's serialized settlement attempt and
 credit release ended. It is not a publication-success receipt, forced backup, future-due wait or whole-runtime idle
 barrier. Cancelling this caller detaches its wait; worker stop/replacement returns `TransportClosed`. The host
 bounds its OS execution opportunity and supplies fresh facts to each new runtime. Disabled device-group support returns

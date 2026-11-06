@@ -162,7 +162,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   workers read the runtime-wide latest facts; only a new runtime defaults closed. Report through the retained shared
   watch before workers exist. Only enabled workers subscribe to changes. The finite due-pass wait joins one admitted
   flight or tries existing admission once, waits outside the serialized command lane, and signals after finish, permit
-  return and flight clear. The completion sender stays worker-owned, never in detached HTTP work; stop closes
+  return and flight clear. Its admission reply waits through startup catch-up without the local-command response
+  timeout; the host owns its wait budget. The completion sender stays worker-owned, never in detached HTTP work; stop closes
   pending waits. Caller cancellation detaches without cancelling a pass. FinishedAttempt is not publication success.
   This gate does not apply to manual restore or redefine lower-level AppClient APIs.
 - Manual backup restore (`src/client/backup_restore.rs`, mdk#2628 4.4c, D93) owns one ephemeral account-worker job.
@@ -1159,6 +1160,8 @@ closed/default admission, held real PUT proves current-pass settlement after fal
 facts. A new runtime remains closed. The same held-PUT owner covers joining completion, detached caller cancellation,
 serialized settlement after false, and worker-stop completion closure. The bounded host token codec owner lives in `client/backup_restore.rs`; wrappers own stale-token, watch-close,
 DTO cache and C deep-free tests rather than duplicating history/crypto owners.
+`a_due_backup_request_waits_through_startup` holds the real worker's startup FIFO and advances only its command-response
+clock past the local admission bound; real held HTTP and settlement prove the caller remains attached afterward.
 
 Manual restore owners are in `src/tests/device_group/backup_restore.rs` (the backup-writer test module's child):
 current own-leaf admission before GET and serialized apply, cold indexed-chat hydration without loading unrelated chats,

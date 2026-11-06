@@ -588,7 +588,8 @@ signable, fully onboarded account before updating the same runtime-wide facts, w
 External-signing accounts may report before the host registers its signer; signed worker work still requires that signer.
 
 An OS background task can await `run_due_backup_pass(account_ref)`. It joins a pass already running, or tries existing
-due/writer/backoff/media-credit admission once. `NotStarted` means none was admitted; `FinishedAttempt` means the
+due/writer/backoff/media-credit admission once, waiting through startup catch-up before admission if necessary.
+`NotStarted` means none was admitted; `FinishedAttempt` means the
 pass and serialized settlement attempt ended, including credit release. It does not prove successful pointer publication,
 force a backup, wait for future due work or establish global idle state. Cancelling that caller detaches its wait;
 worker stop/replacement returns `TransportClosed`. The host bounds its OS execution opportunity. Manual restore and

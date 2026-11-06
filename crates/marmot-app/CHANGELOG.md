@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A due-backup caller waits through account startup catch-up instead of timing out at the local command-response
+  bound (mdk#3013). Its existing completion, cancellation and worker-stop outcomes are unchanged; the host still
+  bounds its OS execution opportunity.
+
 - Chat-list queries can filter by conversation kind (`ChatListCondition::Direct`, `Group`) and mute (`Muted`)
   (mdk#2983). A window whose filter tests mute re-reads at the next mute expiry among the chats in its view, so a
   chat leaves or enters it at its expiry even when it is off screen. Windows and select-all read mute at the same
