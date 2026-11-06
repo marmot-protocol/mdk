@@ -1259,7 +1259,7 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
 /// failed, is not unlinked, and links again (mdk#3011).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link() {
-    undo_after_the_first_commit_fails_the_link(true).await;
+    undo_after_the_first_commit_fails_the_link(true, false).await;
 }
 
 /// [`an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link`],
@@ -1267,10 +1267,19 @@ async fn an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link() {
 /// and the phone undoes the link again after the laptop's first commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_undo_after_the_new_devices_first_commit_fails_the_link() {
-    undo_after_the_first_commit_fails_the_link(false).await;
+    undo_after_the_first_commit_fails_the_link(false, false).await;
 }
 
-async fn undo_after_the_first_commit_fails_the_link(supersedes: bool) {
+/// [`an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link`],
+/// where the laptop also keeps a move into the same group with the same
+/// KeyPackage that ended before Made, as one whose Welcome never came leaves
+/// it. Only a made move makes a removal an unlink, so the link still fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_after_a_move_that_ended_before_made_fails_the_link() {
+    undo_after_the_first_commit_fails_the_link(true, true).await;
+}
+
+async fn undo_after_the_first_commit_fails_the_link(supersedes: bool, ended_move: bool) {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     let slot = choose_link(&relay, &mut phone, &mut laptop).await;
     laptop.op(DeviceLinkOp::ConfirmMatch).await;
@@ -1294,6 +1303,33 @@ async fn undo_after_the_first_commit_fails_the_link(supersedes: bool) {
             .tag_signature_key
             .is_some()
     );
+    if ended_move {
+        // The store writes such a row when a move ends before Made: phase 3,
+        // with no captured rejected slots.
+        let key_package_ref = laptop_storage
+            .device_group(&hex::encode(group.as_slice()))
+            .unwrap()
+            .unwrap()
+            .key_package_ref_hex
+            .unwrap();
+        linked_device_chats::account_database(&laptop.app)
+            .execute(
+                "INSERT INTO device_group_moves (destination_id, original_id, original_trust,
+                 original_key_package_ref_hex, original_recorded_at, sender_signature_key,
+                 key_package_ref, expires_at, own_slot, siblings, phase)
+                 VALUES (?1, ?2, 'linked', '00', 0, X'01', ?3, 0, ?4, CAST('[]' AS BLOB), 3)",
+                rusqlite::params![
+                    group.as_slice(),
+                    [9u8; 16].as_slice(),
+                    hex::decode(key_package_ref).unwrap(),
+                    laptop_slot.as_slice(),
+                ],
+            )
+            .unwrap();
+        let ended = laptop_storage.device_group_move(&group).unwrap().unwrap();
+        assert_eq!(ended.phase, storage_sqlite::DeviceGroupMovePhase::Finished);
+        assert!(ended.rejected_slots.is_none());
+    }
 
     // One more commit from the epoch both fork at makes that side's branch
     // the deeper one. The phone reads nothing from the laptop meanwhile.

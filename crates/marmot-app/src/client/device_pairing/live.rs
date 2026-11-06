@@ -1935,8 +1935,10 @@ impl AppClient {
     /// (mdk#3011). A group this device trusts because a move into it was
     /// made is left by ordinary unlinking whatever the roster says, a
     /// failed link's undo included (3.7d): its trust record carries the
-    /// move's KeyPackage. A missing or undecodable roster counts as an
-    /// unlink, and the caller counts an error as one too.
+    /// KeyPackage of a move that reached Made. A move that ended before
+    /// Made trusted nothing, so it does not count. A missing or
+    /// undecodable roster counts as an unlink, and the caller counts an
+    /// error as one too.
     fn removal_undid_failed_link(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let Some(record) = storage.device_group(&hex::encode(group_id.as_slice()))? else {
@@ -1945,8 +1947,9 @@ impl AppClient {
         let moved_in = storage
             .device_group_move(group_id)?
             .is_some_and(|movement| {
-                record.key_package_ref_hex.as_deref()
-                    == Some(hex::encode(&movement.expectation.key_package_ref).as_str())
+                movement.rejected_slots.is_some()
+                    && record.key_package_ref_hex.as_deref()
+                        == Some(hex::encode(&movement.expectation.key_package_ref).as_str())
             });
         if record.trust != DeviceGroupTrust::Linked || moved_in {
             return Ok(false);
