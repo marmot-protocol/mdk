@@ -178,9 +178,12 @@ fn spawn_media_sweep(
     // A failed read counts as a change.
     let cleanup = storage.media_cleanup_epoch().ok();
     let foreign = storage.foreign_commit_version().ok();
+    // A failed unlink, truncate or abandon may have left its file behind the
+    // cursor of a pass in progress, so it owes a pass from the start.
+    let store_owed = media.take_sweep_owed();
     let owed = until_complete
         | rescan_now
-        | media.take_sweep_owed()
+        | store_owed
         | latches.sweep_unfinished.load(Ordering::Acquire)
         | latches.sweep_cleanup_seen.is_none()
         | (cleanup.is_none() || cleanup != latches.sweep_cleanup_seen)
@@ -190,10 +193,10 @@ fn spawn_media_sweep(
     }
     latches.sweep_cleanup_seen = cleanup;
     latches.sweep_foreign_seen = foreign;
-    // Either is a full pass from the start, which is what was owed. The
+    // Each is a full pass from the start, which is what was owed. The
     // cursor restart takes the store's sweep lock, which an earlier batch
     // may still hold, so it runs on the blocking pool with the sweep.
-    let restart = rescan_now || until_complete;
+    let restart = rescan_now || until_complete || store_owed;
     if restart {
         latches.sweep_rescan.store(false, Ordering::Release);
         latches.sweep_rescan_due = None;
