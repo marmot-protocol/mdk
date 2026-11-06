@@ -5067,6 +5067,49 @@ impl MarmotApp {
         Ok(group)
     }
 
+    /// Refuse to open the session of an account that holds or is joining a
+    /// device group while device groups are off (mdk#3012): an experimental test build's
+    /// root opened by an ordinary constructor, such as a push extension's.
+    /// That process could only refuse the device group's messages, and
+    /// reading one spends it for every opener of the account. Its drain
+    /// would also settle the device group's staged commits and queued
+    /// intents without the support they need: a staged commit, with no route
+    /// to publish it, is rolled back while its stored fanout still sends it.
+    /// So nothing of the account is hydrated, drained or sent here; the
+    /// experimental constructor opens it.
+    ///
+    /// The account is refused while the engine holds a group a device-group
+    /// row names, or waits on a link's Welcome it can still accept. Every
+    /// device group's row is written before the engine writes anything of it.
+    /// A row left by a creation that never reached the engine, or by a wait
+    /// that ran out, names nothing the engine can still hold or join, so it
+    /// refuses nothing, and this open's reconciliation drops it.
+    fn refuse_device_group_without_support(&self, label: &str) -> Result<(), AppError> {
+        use cgka_traits::storage::{DeviceGroupWelcomeStorage as _, GroupStorage as _};
+        if self.device_groups_enabled() {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        let now = unix_now_seconds();
+        // The engine accepts a link's Welcome only before its wait ends.
+        let waiting = storage
+            .device_group_welcome_expectations()?
+            .iter()
+            .any(|expected| now < expected.expires_at);
+        if waiting {
+            return Err(AppError::ExperimentalDeviceGroupsRequired);
+        }
+        for record in storage.app_storage().device_groups()? {
+            let group_id = GroupId::new(hex::decode(&record.group_id_hex)?);
+            match storage.get_group(&group_id) {
+                Ok(_) => return Err(AppError::ExperimentalDeviceGroupsRequired),
+                Err(cgka_traits::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn open_account(
         &self,
         label: &str,
@@ -5077,6 +5120,7 @@ impl MarmotApp {
         // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
         // by the canonical stored label so aliases cannot open a second engine.
         let label = account.label.as_str();
+        self.refuse_device_group_without_support(label)?;
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;

@@ -10,6 +10,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Append `Direct` (13), `Group` (14) and `Muted` (15) to the `MarmotChatListCondition` discriminants a filter node
   carries (mdk#2983). Existing values are unchanged. Use the matching library.
 
+- Under `marmot_client_new_with_configuration`, an account that holds or is joining a device group no longer
+  opens: its calls return `MARMOT_STATUS_RUNTIME` with `experimental_device_groups_required` (mdk#3012). Open
+  experimental device-group roots with `marmot_client_new_with_experimental_device_groups` in every opener.
+
 - Add filtered chat-list queries (mdk#2983): `marmot_open_chat_list_query_window`, `marmot_chat_list_query_ids` and
   `marmot_revalidate_chat_list_query_ids` take a borrowed `MarmotChatListViewQuery` whose filter is an array of
   `MarmotChatListFilterNode` (kind and condition are `uint32_t` discriminants). Append

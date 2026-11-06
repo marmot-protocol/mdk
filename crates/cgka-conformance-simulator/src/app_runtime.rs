@@ -3144,6 +3144,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupCreateAdminNotMember
         | AppError::GroupInviteIncludesInviter
         | AppError::DeviceGroupRefused(_)
+        | AppError::ExperimentalDeviceGroupsRequired
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)

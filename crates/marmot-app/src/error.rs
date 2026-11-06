@@ -152,6 +152,11 @@ pub enum AppError {
     /// (`roster_unavailable`). The reason is a fixed, identity-free code.
     #[error("device group refused: {0}")]
     DeviceGroupRefused(&'static str),
+    /// The account holds or is joining a device group and this app has
+    /// device groups off, so its session did not open (mdk#3012). Only the
+    /// experimental device-group constructor opens it.
+    #[error("account holds or is joining a device group: open it with experimental device groups")]
+    ExperimentalDeviceGroupsRequired,
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -649,6 +654,7 @@ impl AppError {
             Self::GroupCreateAdminNotMember => "group_create_admin_not_member",
             Self::GroupInviteIncludesInviter => "group_invite_includes_inviter",
             Self::DeviceGroupRefused(_) => "device_group_refused",
+            Self::ExperimentalDeviceGroupsRequired => "experimental_device_groups_required",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",

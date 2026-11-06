@@ -881,7 +881,6 @@ async fn a_rename_needs_a_device_group() {
         relay,
         mut phone,
         laptop,
-        link,
         ..
     } = phone_and_laptop().await;
     let laptop_slot = own_slot(&laptop);
@@ -894,7 +893,8 @@ async fn a_rename_needs_a_device_group() {
         ),
         "no_device_group"
     );
-    phone.dev_create_device_group(link).await.unwrap();
+    // An app with device groups off opens only an account without a device
+    // group (mdk#3012), so the phone is reopened before it makes one.
     drop(phone);
 
     let phone_app = MarmotApp::with_relay_and_config(

@@ -886,8 +886,8 @@ async fn a_client_kept_after_its_unlink_publishes_nothing() {
 }
 
 /// The laptop's engine applies its removal but the app never notes it, as
-/// after a crash between the two (here, device groups are off when it is
-/// applied). A caller then opens its client directly, without the runtime or
+/// after a crash between the two (here, its mark fails as it is applied
+/// and the process ends). A caller then opens its client directly, without the runtime or
 /// a pairing drive. The open notes the removal, so the client is stopped
 /// before the caller can send in the chat it is still in (D67).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -907,20 +907,16 @@ async fn a_client_opened_after_an_unnoted_removal_is_stopped() {
         .drive_device_pairing_at(crate::unix_now_seconds())
         .await;
     commit_removal_decided_elsewhere(&mut phone, &group, slot_of(&laptop)).await;
-    drop((laptop, laptop_app, phone));
-    let off = MarmotApp::with_relay_and_config(
-        _dirs[1].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay.clone());
-    let mut laptop = off.client("alice").await.unwrap();
+    drop(phone);
+    // Its mark fails as it applies the removal, and the process ends: the
+    // engine holds the removal and nothing durable notes it.
+    laptop_app
+        .test_fail_unlink_mark
+        .store(true, Ordering::Relaxed);
     deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
     assert!(laptop.runtime.group_record(&group).unwrap().removed);
-    assert!(!laptop.device_unlinked());
-    drop((laptop, off));
+    assert!(!laptop_app.account_home().account("alice").unwrap().unlinked);
+    drop((laptop, laptop_app));
 
     let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
     let attempted = relay.attempted_events().len();
@@ -968,19 +964,16 @@ async fn an_app_publish_after_an_unnoted_removal_is_refused() {
         .drive_device_pairing_at(crate::unix_now_seconds())
         .await;
     commit_removal_decided_elsewhere(&mut phone, &group, slot_of(&laptop)).await;
-    drop((laptop, laptop_app, phone));
-    let off = MarmotApp::with_relay_and_config(
-        _dirs[1].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay.clone());
-    let mut laptop = off.client("alice").await.unwrap();
+    drop(phone);
+    // Its mark fails as it applies the removal, and the process ends: the
+    // engine holds the removal and nothing durable notes it.
+    laptop_app
+        .test_fail_unlink_mark
+        .store(true, Ordering::Relaxed);
     deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
     assert!(laptop.runtime.group_record(&group).unwrap().removed);
-    drop((laptop, off));
+    assert!(!laptop_app.account_home().account("alice").unwrap().unlinked);
+    drop((laptop, laptop_app));
 
     let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
     let attempted = relay.attempted_events().len();
@@ -1036,8 +1029,8 @@ async fn the_stored_removal_is_looked_for_once_per_process() {
 }
 
 /// The laptop's engine applies its removal but the app never notes it, as
-/// after a crash between the two (here, device groups are off when it is
-/// applied). Started again under the runtime, its worker follows the removal
+/// after a crash between the two (here, its mark fails as it is applied
+/// and the process ends). Started again under the runtime, its worker follows the removal
 /// before its catch-up: the account is unlinked and deactivated, and nothing
 /// goes out from it (D67).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1059,21 +1052,17 @@ async fn a_removal_applied_before_a_restart_unlinks_before_catch_up() {
         .remove_linked_device(&own_slot(&laptop))
         .await
         .unwrap();
-    drop((laptop, laptop_app, phone));
-    let off = MarmotApp::with_relay_and_config(
-        _dirs[1].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay.clone());
-    let mut laptop = off.client("alice").await.unwrap();
+    drop(phone);
+    // Its mark fails as it applies the removal, and the process ends: the
+    // engine holds the removal and nothing durable notes it.
+    laptop_app
+        .test_fail_unlink_mark
+        .store(true, Ordering::Relaxed);
     deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
     laptop.sync().await.unwrap();
     assert!(laptop.runtime.group_record(&group).unwrap().removed);
-    assert!(!laptop.device_unlinked());
-    drop((laptop, off));
+    assert!(!laptop_app.account_home().account("alice").unwrap().unlinked);
+    drop((laptop, laptop_app));
     let laptop_app = device_group_app_at(&_dirs[1], relay.clone());
     let account_id_hex = laptop_app
         .account_home()
@@ -1434,58 +1423,6 @@ async fn a_removal_waits_while_the_device_group_copy_is_terminal() {
             .devices
             .contains_key(&laptop_slot_bytes),
         "the removal is committed once the copy is readable"
-    );
-}
-
-/// Switching device groups off and on again keeps a decision: while they are
-/// off nothing is carried out, and once they are on the removal commits.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_removal_survives_device_groups_switched_off_and_on() {
-    let (
-        Devices {
-            _dirs,
-            relay,
-            phone_app,
-            phone,
-            laptop,
-            ..
-        },
-        group,
-    ) = tagging_devices().await;
-    let laptop_slot_bytes = slot_of(&laptop);
-    phone_app
-        .account_storage("alice")
-        .unwrap()
-        .app_storage()
-        .record_device_removal(
-            &hex::encode(group.as_slice()),
-            &own_slot(&laptop),
-            crate::unix_now_seconds() - 60,
-        )
-        .unwrap();
-    drop((phone, phone_app));
-
-    let off = MarmotApp::with_relay_and_config(
-        _dirs[0].path(),
-        "wss://relay.example",
-        MarmotAppConfig::white_noise()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
-    )
-    .with_test_relay_client(relay.clone());
-    let mut phone = off.client("alice").await.unwrap();
-    phone.run_due_maintenance().await.unwrap();
-    assert_eq!(pending_removals(&off), 1, "the decision is kept");
-    drop((phone, off));
-
-    let phone_app = device_group_app_at(&_dirs[0], relay);
-    let mut phone = phone_app.client("alice").await.unwrap();
-    phone.run_due_maintenance().await.unwrap();
-    assert!(
-        !roster(&phone, &group)
-            .devices
-            .contains_key(&laptop_slot_bytes),
-        "the removal commits once device groups are on"
     );
 }
 

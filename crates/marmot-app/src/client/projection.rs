@@ -1479,6 +1479,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::GroupCreateAdminNotMember => "read_marker_failed:group_create_admin_not_member",
         AppError::GroupInviteIncludesInviter => "read_marker_failed:group_invite_includes_inviter",
         AppError::DeviceGroupRefused(_) => "read_marker_failed:device_group_refused",
+        AppError::ExperimentalDeviceGroupsRequired => {
+            "read_marker_failed:experimental_device_groups_required"
+        }
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {

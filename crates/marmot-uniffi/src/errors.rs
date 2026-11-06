@@ -615,6 +615,11 @@ impl From<&AppError> for MarmotKitError {
                     account_ref: account_ref.clone(),
                 }
             }
+            // Beside `experimental_device_groups_unavailable`: the same
+            // test-build constructor contract, so the same shape.
+            AppError::ExperimentalDeviceGroupsRequired => Self::Runtime {
+                details: "experimental_device_groups_required".to_owned(),
+            },
             // #543: reveal_nsec must surface its required failure modes as typed
             // FFI errors, not the untyped `Runtime` bucket, so a key-backup
             // surface can distinguish "no exportable key" / "keystore locked" /
@@ -1250,6 +1255,16 @@ mod tests {
             matches!(ffi, MarmotKitError::Runtime { .. }),
             "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
         );
+    }
+
+    /// mdk#3012: an ordinary constructor's refusal of a device-group root
+    /// reaches hosts as the code the README documents, beside
+    /// `experimental_device_groups_unavailable`.
+    #[test]
+    fn a_device_group_root_refusal_crosses_ffi_as_its_documented_code() {
+        let ffi: MarmotKitError = (&AppError::ExperimentalDeviceGroupsRequired).into();
+        assert!(matches!(ffi, MarmotKitError::Runtime { details }
+            if details == "experimental_device_groups_required"));
     }
 
     /// mdk#2158: an attachment whose epoch the group left, or whose group is

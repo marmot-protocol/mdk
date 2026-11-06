@@ -1967,83 +1967,71 @@ fn set_welcome_deadline(device: &Device, welcome: &cgka_traits::MessageId, deliv
 /// The account worker publishes owed Welcomes at startup before the link gate
 /// runs: in its recovery pass, and in any maintenance pass a host queued
 /// while initial sync ran, which replays first. A link's Welcome whose new
-/// device stopped waiting still never reaches a relay, even when the next
-/// launch turns device groups off: the Welcome's own deadline holds it on
-/// every publish path, whatever ran first.
+/// device stopped waiting still never reaches a relay: the Welcome's own
+/// deadline holds it on every publish path, whatever ran first. (A launch with
+/// device groups off opens nothing of the account; mdk#3012.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_never_publishes_an_expired_links_welcome() {
-    for groups_on in [true, false] {
-        let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
-        let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
-        let owed = phone
-            .client
-            .runtime
-            .outstanding_welcome_deliveries()
-            .unwrap();
-        let [(_, welcome)] = owed.as_slice() else {
-            panic!("the first link owes one Welcome")
-        };
-        let welcome_id = hex::encode(welcome.id.as_slice());
-        // The restart comes after the new device stopped waiting, with the
-        // link still pending.
-        set_welcome_deadline(&phone, &welcome.id, crate::unix_now_seconds() - 1);
-        assert_eq!(
-            link_record(&phone, &group, &slot).outcome,
-            DeviceLinkOutcome::Pending
-        );
-        // The device stayed off longer than the Welcome's fanout is kept, so
-        // no attempt record holds it and maintenance would publish it as owed.
-        phone
-            .client
-            .runtime
-            .session()
-            .delete_transport_fanout(&welcome.id)
-            .unwrap();
-        let Device {
-            _dir, app, client, ..
-        } = phone;
-        drop(client);
-        let app = if groups_on {
-            app
-        } else {
-            MarmotApp::with_relay_and_config(
-                _dir.path(),
-                "wss://relay.example",
-                MarmotAppConfig::white_noise().with_dev_scheduled_convergence_delay_ms(0),
-            )
-            .with_test_relay_client(relay.clone())
-        };
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let (group, slot) = create_device_group_unpublished(&relay, &mut phone, &mut laptop).await;
+    let owed = phone
+        .client
+        .runtime
+        .outstanding_welcome_deliveries()
+        .unwrap();
+    let [(_, welcome)] = owed.as_slice() else {
+        panic!("the first link owes one Welcome")
+    };
+    let welcome_id = hex::encode(welcome.id.as_slice());
+    // The restart comes after the new device stopped waiting, with the
+    // link still pending.
+    set_welcome_deadline(&phone, &welcome.id, crate::unix_now_seconds() - 1);
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending
+    );
+    // The device stayed off longer than the Welcome's fanout is kept, so
+    // no attempt record holds it and maintenance would publish it as owed.
+    phone
+        .client
+        .runtime
+        .session()
+        .delete_transport_fanout(&welcome.id)
+        .unwrap();
+    let Device {
+        _dir, app, client, ..
+    } = phone;
+    drop(client);
 
-        relay.allow_publishes();
-        let runtime = crate::MarmotAppRuntime::new(app.clone());
-        let startup = Arc::new(tokio::sync::Barrier::new(2));
-        runtime
-            .shared_services()
-            .set_next_startup_sync_barrier(startup.clone());
-        runtime.reconcile_accounts().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), startup.wait())
+    relay.allow_publishes();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let startup = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), startup.wait())
+        .await
+        .expect("the worker reaches initial sync");
+    let maintenance = runtime.run_due_maintenance("alice");
+    tokio::pin!(maintenance);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut maintenance)
             .await
-            .expect("the worker reaches initial sync");
-        let maintenance = runtime.run_due_maintenance("alice");
-        tokio::pin!(maintenance);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(150), &mut maintenance)
-                .await
-                .is_err(),
-            "a maintenance pass waits for initial sync"
-        );
-        // Answered during startup, behind the queued pass, so that pass is
-        // deferred before initial sync is released.
-        runtime.quarantined_groups("alice").await.unwrap();
-        startup.wait().await;
-        maintenance.await.unwrap();
-        runtime.drain_in_flight_work().await.unwrap();
-        runtime.shutdown().await;
-        assert!(
-            !relay.published_event_ids().contains(&welcome_id),
-            "startup published an expired link's Welcome, device groups on: {groups_on}"
-        );
-    }
+            .is_err(),
+        "a maintenance pass waits for initial sync"
+    );
+    // Answered during startup, behind the queued pass, so that pass is
+    // deferred before initial sync is released.
+    runtime.quarantined_groups("alice").await.unwrap();
+    startup.wait().await;
+    maintenance.await.unwrap();
+    runtime.drain_in_flight_work().await.unwrap();
+    runtime.shutdown().await;
+    assert!(
+        !relay.published_event_ids().contains(&welcome_id),
+        "startup published an expired link's Welcome"
+    );
 }
 
 /// A restart drops a first link's prompt while no relay has taken its
