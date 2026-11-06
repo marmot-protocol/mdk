@@ -1252,6 +1252,162 @@ async fn a_device_with_no_first_commit_by_the_deadline_is_removed_and_told() {
     );
 }
 
+/// The laptop selects its first commit in the device group, but the phone
+/// reads none of it by the link's deadline and undoes the link on a deeper
+/// branch, which supersedes that commit. The roster the undo left has no
+/// entry for the laptop's slot, so the laptop tells its user that linking
+/// failed, is not unlinked, and links again (mdk#3011).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link() {
+    undo_after_the_first_commit_fails_the_link(true, false).await;
+}
+
+/// [`an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link`],
+/// with the laptop's branch the deeper one: it drops the phone's first undo,
+/// and the phone undoes the link again after the laptop's first commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_after_the_new_devices_first_commit_fails_the_link() {
+    undo_after_the_first_commit_fails_the_link(false, false).await;
+}
+
+/// [`an_undo_that_supersedes_the_new_devices_first_commit_fails_the_link`],
+/// where the laptop also keeps a move into the same group with the same
+/// KeyPackage that ended before Made, as one whose Welcome never came leaves
+/// it. Only a made move makes a removal an unlink, so the link still fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_after_a_move_that_ended_before_made_fails_the_link() {
+    undo_after_the_first_commit_fails_the_link(true, true).await;
+}
+
+async fn undo_after_the_first_commit_fails_the_link(supersedes: bool, ended_move: bool) {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let slot = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the group
+    let group = phone.client.trusted_device_group().unwrap().unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    let joined = laptop.step(&relay).await; // the Welcome, and its first commit
+    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+    laptop
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    let laptop_storage = laptop.app.account_storage("alice").unwrap().app_storage();
+    assert!(
+        laptop_storage.device_group_joins().unwrap().is_empty(),
+        "the laptop's first commit is selected, so it forgot its join"
+    );
+    assert!(
+        laptop.roster(&group).devices[&laptop_slot]
+            .tag_signature_key
+            .is_some()
+    );
+    if ended_move {
+        // The store writes such a row when a move ends before Made: phase 3,
+        // with no captured rejected slots.
+        let key_package_ref = laptop_storage
+            .device_group(&hex::encode(group.as_slice()))
+            .unwrap()
+            .unwrap()
+            .key_package_ref_hex
+            .unwrap();
+        linked_device_chats::account_database(&laptop.app)
+            .execute(
+                "INSERT INTO device_group_moves (destination_id, original_id, original_trust,
+                 original_key_package_ref_hex, original_recorded_at, sender_signature_key,
+                 key_package_ref, expires_at, own_slot, siblings, phase)
+                 VALUES (?1, ?2, 'linked', '00', 0, X'01', ?3, 0, ?4, CAST('[]' AS BLOB), 3)",
+                rusqlite::params![
+                    group.as_slice(),
+                    [9u8; 16].as_slice(),
+                    hex::decode(key_package_ref).unwrap(),
+                    laptop_slot.as_slice(),
+                ],
+            )
+            .unwrap();
+        let ended = laptop_storage.device_group_move(&group).unwrap().unwrap();
+        assert_eq!(ended.phase, storage_sqlite::DeviceGroupMovePhase::Finished);
+        assert!(ended.rejected_slots.is_none());
+    }
+
+    // One more commit from the epoch both fork at makes that side's branch
+    // the deeper one. The phone reads nothing from the laptop meanwhile.
+    let deeper = if supersedes { &mut phone } else { &mut laptop };
+    let effects = deeper
+        .client
+        .runtime
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    deeper
+        .client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    let deadline = crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1;
+    phone.client.drive_device_pairing_at(deadline).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
+    assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+    let undone_at = phone.client.runtime.group_record(&group).unwrap().epoch;
+    super::device_group::converge_device_group(
+        &mut phone.client,
+        &relay,
+        &mut phone.cursor,
+        &group,
+        2,
+    )
+    .await;
+    if supersedes {
+        assert_eq!(
+            phone.client.runtime.group_record(&group).unwrap().epoch,
+            undone_at,
+            "the phone keeps its undo over the laptop's first commit"
+        );
+    } else {
+        // The phone adopts the laptop's branch, which lists the laptop with
+        // its key, and undoes the link again on top of it.
+        assert!(phone.roster(&group).devices.contains_key(&laptop_slot));
+        phone.client.drive_device_pairing_at(deadline + 1).await;
+        assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+        assert_eq!(
+            link_record(&phone, &group, &slot).outcome,
+            DeviceLinkOutcome::Failed
+        );
+    }
+
+    super::device_group::converge_device_group(
+        &mut laptop.client,
+        &relay,
+        &mut laptop.cursor,
+        &group,
+        2,
+    )
+    .await;
+    assert!(laptop.client.runtime.group_record(&group).unwrap().removed);
+    let ended = laptop.step(&relay).await;
+    assert_eq!(
+        ended.new_device,
+        Some(NewDeviceLinkState::Ended {
+            reason: DeviceLinkEndReason::LinkFailed
+        })
+    );
+    assert!(!laptop.client.device_unlinked());
+    let account = laptop.app.account_home().account("alice").unwrap();
+    assert!(!account.unlinked && !account.signed_out);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert_eq!(laptop.trust(&group), None);
+
+    published_key_package(&mut laptop.client, &relay).await;
+    assert_eq!(link(&relay, &mut phone, &mut laptop, "Laptop").await, group);
+    assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
+}
+
 /// A device whose link failed discarded its copy of the device group, so a
 /// later link's Welcome into that same group is a first join, and the link
 /// is made.
