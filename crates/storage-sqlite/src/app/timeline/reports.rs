@@ -489,6 +489,19 @@ pub(super) fn retain_pruned_controls(
 }
 
 impl SqliteAppStorage {
+    /// Whether the content-report backfill has nothing left: its cursor has
+    /// reached the prefix migration 0079 froze, which nothing raises again.
+    /// A read, no writer (mdk#2923).
+    pub fn content_reports_backfill_complete(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT after_order >= through_order FROM content_report_backfill WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Repair only indexed deletion, edit and moderation events in the captured
     /// pre-migration prefix. Ordinary history is neither scanned nor reprojected.
     pub fn backfill_content_reports(

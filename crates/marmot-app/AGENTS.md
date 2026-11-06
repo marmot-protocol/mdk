@@ -583,14 +583,23 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
   memory, and its final write-back cannot be interrupted, so the cap bounds how long a close can wait for it; an
   account over the cap with no legacy bodies left is logged once per process, as a power-of-two MiB bucket), at most once per worker ownership (a rolled-back one is retried, at most three times), never while a
-  migration batch runs. The maintenance task (never awaited) checks the gates every tick and only flags a due
-  compaction; the account worker awaits it from its maintenance tick only when flagged, so a tick with nothing due
+  migration batch runs. The maintenance task (never awaited) checks the gates and only flags a due compaction: on
+  the first batch of each opened database, then hourly, never again once the database is incremental (mdk#2923
+  §4); the account worker awaits it from its maintenance tick only when flagged, so a tick with nothing due
   costs the worker nothing and none of its synchronous storage calls park an async thread on the held connection, and
-  `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs after every
-  migration batch and bulk removal, settling any WAL truncate the storage records as owed; the first pass of each
+  `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs with every
+  housekeeping batch, settling any WAL truncate the storage records as owed; the first pass of each
   worker ownership truncates once on an incremental database, since a truncate owed when a process ended is recorded
   nowhere. `close_storage` calls `begin_close` on every database before closing media stores:
   a sweep blocked behind a compacting connection holds its store's sweep lock until the VACUUM, which polls the close latch, stops.
+- Idle housekeeping (mdk#2923 §4, `runtime/account_worker/attachments.rs` `HousekeepingLatches`): the housekeeping
+  batch spawns only while a part is owed, and finished one-time work latches from the opened database's data (no
+  legacy bodies or legacy uploads, no database-held avatars, the startup truncate, an incremental database), keyed to
+  `connection_serial` so another opened database derives it again. Deferred outcomes never latch; they are rechecked
+  hourly or after a media-row deletion (`media_cleanup_epoch`). The media sweep runs to completion at ownership, then
+  only after a deletion on this connection, another connection's commit (`foreign_commit_version`), a failed
+  best-effort unlink (`MediaStore::take_sweep_owed`) or an unfinished batch. Keep new idle paths read-only until
+  they find work.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,

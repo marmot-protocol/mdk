@@ -159,6 +159,9 @@ struct Inner<C> {
     /// Keys of checkpoints an operation holds; see [`CheckpointLock`].
     checkpoints: Mutex<Vec<Vec<u8>>>,
     checkpoint_released: Condvar,
+    /// A best-effort unlink or wire truncate failed, so a file may be left
+    /// that only [`MediaStore::sweep`] removes (mdk#2923).
+    sweep_owed: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     full_disk_for_test: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -281,6 +284,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                 readers: Mutex::new(Vec::new()),
                 checkpoints: Mutex::new(Vec::new()),
                 checkpoint_released: Condvar::new(),
+                sweep_owed: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
                 full_disk_for_test: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
@@ -395,7 +399,7 @@ impl<C: MediaCatalog> MediaStore<C> {
             Ok(ReadyOutcome::Ready) => Ok(PublishOutcome::Published(id)),
             Ok(ReadyOutcome::Existing(twin)) => {
                 // The target deleted this row; only the file remains.
-                let _ = remove_if_present(&self.path(&id));
+                self.unlink_best_effort(&self.path(&id));
                 Ok(PublishOutcome::Existing(twin))
             }
             Ok(ReadyOutcome::Superseded) => {
@@ -493,14 +497,14 @@ impl<C: MediaCatalog> MediaStore<C> {
             PromotedOutcome::Existing(twin) => {
                 // The target deleted the staged row; only its file remains.
                 self.forget_reader(&id);
-                let _ = remove_if_present(&self.path(&id));
+                self.unlink_best_effort(&self.path(&id));
                 Ok(PromoteOutcome::Existing(twin))
             }
             PromotedOutcome::Superseded => Ok(PromoteOutcome::Superseded),
             PromotedOutcome::Released => {
                 // The target deleted the staged row with its owner.
                 self.forget_reader(&id);
-                let _ = remove_if_present(&self.path(&id));
+                self.unlink_best_effort(&self.path(&id));
                 Ok(PromoteOutcome::Released)
             }
         }
@@ -515,7 +519,7 @@ impl<C: MediaCatalog> MediaStore<C> {
             return Ok(false);
         }
         self.forget_reader(&id);
-        let _ = remove_if_present(&self.path(&id));
+        self.unlink_best_effort(&self.path(&id));
         Ok(true)
     }
 
@@ -658,7 +662,10 @@ impl<C: MediaCatalog> MediaStore<C> {
             return;
         }
         if self.inner.catalog.abandon_pending(*id).is_ok() {
-            let _ = remove_if_present(&self.path(id));
+            self.unlink_best_effort(&self.path(id));
+        } else {
+            // The pending row and its file stay for the sweep.
+            self.inner.sweep_owed.store(true, Ordering::Release);
         }
     }
 
@@ -831,18 +838,24 @@ impl<C: MediaCatalog> MediaStore<C> {
             }
         };
         if let Err(error) = wire.append(bytes) {
-            let _ = wire.truncate(offset);
+            if wire.truncate(offset).is_err() {
+                self.inner.sweep_owed.store(true, Ordering::Release);
+            }
             return Err(error);
         }
         let received = offset.saturating_add(bytes.len() as u64);
         match target.record(id, received) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                let _ = wire.truncate(offset);
+                if wire.truncate(offset).is_err() {
+                    self.inner.sweep_owed.store(true, Ordering::Release);
+                }
                 Ok(false)
             }
             Err(error) => {
-                let _ = wire.truncate(offset);
+                if wire.truncate(offset).is_err() {
+                    self.inner.sweep_owed.store(true, Ordering::Release);
+                }
                 Err(error.into())
             }
         }
@@ -988,7 +1001,7 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// Unlinks a wire file whose checkpoint row is already gone. Best
     /// effort: the sweep removes anything left.
     fn remove_wire(&self, id: &FileId) {
-        let _ = remove_if_present(&self.wire_path(id));
+        self.unlink_best_effort(&self.wire_path(id));
     }
 
     /// Unlinks the files of `ids` whose rows are gone. Callers pass the ids a
@@ -997,14 +1010,28 @@ impl<C: MediaCatalog> MediaStore<C> {
         for id in ids {
             self.forget_reader(id);
             if matches!(self.inner.catalog.file_state(*id), Ok(None)) {
-                let _ = remove_if_present(&self.path(id));
+                self.unlink_best_effort(&self.path(id));
             }
         }
     }
 
+    /// Unlinks `path` if present. Best effort: a failure leaves the file for
+    /// the sweep, and [`Self::take_sweep_owed`] reports it.
+    fn unlink_best_effort(&self, path: &Path) {
+        if remove_if_present(path).is_err() {
+            self.inner.sweep_owed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether a best-effort unlink, wire truncate or abandon failed since
+    /// the last call, leaving work only [`Self::sweep`] does. Clears it.
+    pub fn take_sweep_owed(&self) -> bool {
+        self.inner.sweep_owed.swap(false, Ordering::AcqRel)
+    }
+
     /// One bounded sweep batch: up to `limit` rows, then up to `limit` of
     /// this store's file names. Run batches at startup until `complete`, then
-    /// on a maintenance tick.
+    /// whenever something may have left work for it.
     pub fn sweep(&self, limit: usize) -> MediaResult<SweepReport> {
         self.inner.ensure_open()?;
         let limit = limit.max(1);

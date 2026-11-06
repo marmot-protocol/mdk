@@ -6015,3 +6015,93 @@ fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
             .is_empty()
     );
 }
+
+/// The media cleanup count moves once per `media_files` or
+/// `attachment_partial` row this connection deletes, and for nothing else:
+/// that is what tells the media sweep a file may have lost its row
+/// (mdk#2923).
+#[test]
+fn media_cleanup_epoch_counts_this_connections_media_row_deletions() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    assert_eq!(app.media_cleanup_epoch().unwrap(), 0);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO media_files (id,file_key,state,category,byte_len,plaintext_digest,created_at,last_used_at)
+             VALUES (zeroblob(16),zeroblob(32),1,1,0,zeroblob(32),0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE media_files SET last_used_at=1", [])
+            .unwrap();
+    }
+    assert_eq!(
+        app.media_cleanup_epoch().unwrap(),
+        0,
+        "inserts and updates do not count"
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM media_files", [])
+        .unwrap();
+    assert_eq!(app.media_cleanup_epoch().unwrap(), 1);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute(
+            "INSERT INTO attachment_partial (token,ciphertext_digest,locator_digest,etag,total,received,expires_at)
+             VALUES (x'01',zeroblob(32),zeroblob(32),'\"e\"',1,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM attachment_partial", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    }
+    assert_eq!(app.media_cleanup_epoch().unwrap(), 2);
+}
+
+/// Every opened database has its own serial, shared by its clones, so state
+/// derived from one database never carries to another (mdk#2923 §4).
+#[test]
+fn each_opened_database_has_its_own_connection_serial() {
+    let first = SqliteAccountStorage::in_memory().unwrap();
+    let second = SqliteAccountStorage::in_memory().unwrap();
+    assert_eq!(
+        first.app_storage().connection_serial(),
+        first.clone().app_storage().connection_serial()
+    );
+    assert_ne!(
+        first.app_storage().connection_serial(),
+        second.app_storage().connection_serial()
+    );
+}
+
+/// What an idle maintenance tick asks of an account with nothing to do is
+/// answered without a writer transaction (mdk#2923 §4).
+#[test]
+fn idle_maintenance_checks_take_no_writer() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let writers = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let counted = writers.clone();
+    store.set_timing_observer(Some(std::sync::Arc::new(
+        move |operation, _duration, _success| {
+            if operation == crate::SqliteTimingOperation::WriteBegin {
+                *counted.lock().unwrap() += 1;
+            }
+        },
+    )));
+    assert_eq!(app.prune_attachment_uploads(100, 64).unwrap(), 0);
+    assert_eq!(app.recover_attachment_uploads(100, 32, 0).unwrap(), 0);
+    app.retain_recovery_maintenance_jobs(&[]).unwrap();
+    assert_eq!(app.count_push_join_window_time(1_000).unwrap(), 0);
+    assert!(app.pending_chat_presentation_inputs().unwrap().is_empty());
+    assert!(app.content_reports_backfill_complete().unwrap());
+    assert!(!app.has_legacy_attachment_work().unwrap());
+    assert!(!app.has_database_held_avatars().unwrap());
+    assert!(!app.has_file_backed_uploads().unwrap());
+    assert_eq!(store.promote_legacy_message_rows(64).unwrap().promoted, 0);
+    assert_eq!(*writers.lock().unwrap(), 0);
+}

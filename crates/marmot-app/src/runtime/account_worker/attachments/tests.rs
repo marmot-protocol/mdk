@@ -2043,3 +2043,193 @@ async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
             .load(std::sync::atomic::Ordering::Acquire)
     );
 }
+
+/// Starts nothing new until the media sweep task this admission holds, if
+/// any, has finished.
+async fn finish_media_sweep(admission: &mut Admission) {
+    if let Some(task) = admission.media_sweep.take() {
+        task.await.unwrap();
+    }
+}
+
+/// The media sweep runs to completion when a worker takes ownership, then
+/// again only once something may have left work for it: here, a deleted
+/// media row. With nothing changed it starts no batch at all (mdk#2923 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_media_sweep_runs_again_only_once_a_media_row_was_deleted() {
+    use media_store::MediaCatalog;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweeps = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMediaSweep)
+            .unwrap()
+            .completed
+    };
+    spawn_media_sweep(
+        &mut admission,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    finish_media_sweep(&mut admission).await;
+    assert_eq!(sweeps(), 1, "the ownership sweep runs");
+    for _ in 0..3 {
+        spawn_media_sweep(
+            &mut admission,
+            &app_storage,
+            media.clone(),
+            false,
+            &telemetry,
+        );
+        finish_media_sweep(&mut admission).await;
+    }
+    assert_eq!(sweeps(), 1, "nothing changed, so no batch starts");
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let id = media_store::FileId([7; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [2; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    // The deletion owes batches until one reaches the end of the store.
+    let mut batches = 0;
+    loop {
+        let before = sweeps();
+        spawn_media_sweep(
+            &mut admission,
+            &app_storage,
+            media.clone(),
+            false,
+            &telemetry,
+        );
+        finish_media_sweep(&mut admission).await;
+        if sweeps() == before {
+            break;
+        }
+        batches += 1;
+        assert!(batches < 1000, "the sweep settles");
+    }
+    assert!(batches >= 1, "a deleted media row owes a sweep");
+}
+
+/// What housekeeping derived from one opened database is dropped when the
+/// account's database is another one: a reopened, reset or replaced
+/// database starts unlatched (mdk#2923 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_latches_reset_for_another_opened_database() {
+    use std::sync::atomic::Ordering;
+    let (_dir, client, stale, _) = offline_fixture().await;
+    let app = &client.app;
+    let mut latches = HousekeepingLatches::default();
+    latches.bind(&stale.app_storage());
+    latches.legacy_bodies_done.store(true, Ordering::Release);
+    latches.database_avatars_done.store(true, Ordering::Release);
+    latches.compaction_settled.store(true, Ordering::Release);
+    latches.sweep_cleanup_seen = Some(0);
+    latches.bind(&stale.app_storage());
+    assert!(
+        latches.legacy_bodies_done.load(Ordering::Acquire),
+        "same database keeps them"
+    );
+
+    app.drop_account_caches("alice");
+    let reopened = app.account_storage("alice").unwrap();
+    latches.bind(&reopened.app_storage());
+    assert!(!latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(!latches.database_avatars_done.load(Ordering::Acquire));
+    assert!(!latches.compaction_settled.load(Ordering::Acquire));
+    assert_eq!(latches.sweep_cleanup_seen, None, "a sweep is owed again");
+}
+
+/// The housekeeping batch spawns while any part of it is owed and not
+/// otherwise (mdk#2923 §4). Finished one-time work (no legacy bodies or
+/// database-held avatars on a fresh account, an incremental database, the
+/// startup truncate) latches; a deferred outcome never does: keep-media
+/// `more`, the hourly recheck and a deletion each owe another batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
+    use media_store::MediaCatalog;
+    use std::sync::atomic::Ordering;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let runtime = crate::MarmotAppRuntime::new(client.app.clone());
+    let shared = runtime.shared_services();
+    let mut admission = Admission::default();
+    let batches = || {
+        shared
+            .observer
+            .performance()
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMaintenanceHousekeepingBatch)
+            .unwrap()
+            .completed
+    };
+    let run = async |admission: &mut Admission| {
+        spawn_legacy_migration(&client, &shared, admission);
+        if let Some(task) = admission.legacy_migration.take() {
+            task.await.unwrap();
+        }
+    };
+    run(&mut admission).await;
+    assert_eq!(batches(), 1, "the first batch derives everything");
+    assert!(admission.latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(
+        admission
+            .latches
+            .database_avatars_done
+            .load(Ordering::Acquire)
+    );
+    assert!(admission.latches.compaction_settled.load(Ordering::Acquire));
+    for _ in 0..3 {
+        run(&mut admission).await;
+    }
+    assert_eq!(batches(), 1, "nothing owed, so no batch");
+
+    admission.keep_media_more.store(true, Ordering::Release);
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(batches(), 2, "keep-media more owes one batch");
+
+    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(batches(), 3, "the deferred recheck owes one batch");
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(storage.app_storage());
+    let id = media_store::FileId([9; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [3; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(
+        batches(),
+        4,
+        "a deletion frees pages, so reclaim checks once"
+    );
+    runtime.shutdown().await;
+}
