@@ -13,7 +13,7 @@ use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, free_vec, owned_c_string, owned_vec};
 
 c_enum! {
-    /// Why a link ended without one device adding the other.
+    /// Why a device link attempt ended.
     MarmotDeviceLinkEndReason from DeviceLinkEndReasonFfi {
         /// This device's user cancelled.
         Cancelled,
@@ -31,9 +31,9 @@ c_enum! {
         CannotLink,
         /// The sign-in was rejected on one of this account's devices.
         Rejected,
-        /// Both users confirmed, but adding the device failed, or the new device
-        /// made no change in the device group within an hour of being added, so
-        /// the device that added it removed it again.
+        /// Both users confirmed, but adding or joining failed, or the new device's
+        /// first Commit was not observed on the selected branch in time. Cleanup may
+        /// still be pending; this reason alone does not establish current membership.
         LinkFailed,
     }
 }
