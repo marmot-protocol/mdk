@@ -30,25 +30,49 @@ async fn report_backfill_retries_entire_batch_after_projection_failure() {
     let author = keys.public_key().to_hex();
     let target = hex::encode([11; 32]);
     let report = hex::encode([12; 32]);
-    let removal = hex::encode([13; 32]);
     let tags = serde_json::json!([["e", target, "spam"], ["p", author]]).to_string();
-    // Model a pre-migration prefix whose raw events have not been projected.
+    // Admit the complete removal before its target exists, preserving original
+    // validation and source authority without pre-projecting the raw prefix.
+    let now = unix_now_seconds();
+    let removal = cgka_traits::app_event::MarmotAppEvent::new(
+        &author,
+        now,
+        4891,
+        vec![vec!["e".to_owned(), target.clone()]],
+        r#"{"v":1,"action":"remove"}"#,
+    );
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_app_event_with_source(
+            &storage_sqlite::StoredAppEvent {
+                group_id_hex: groups[1].clone(),
+                message_id_hex: removal.id,
+                source_message_id_hex: None,
+                source_epoch: None,
+                direction: "received".into(),
+                sender: removal.pubkey,
+                plaintext: removal.content,
+                kind: removal.kind,
+                tags: removal.tags,
+                recorded_at: removal.created_at,
+                received_at: now,
+                origin_commit_id: None,
+                moderation_grant: true,
+            },
+            None,
+            Some(cgka_traits::app_event::AppMessageAuthority {
+                source_context: [0; 32],
+                moderation_grant: true,
+            }),
+        )
+        .unwrap();
+    // Model a raw historical prefix whose targets/reports are not projected.
     for group in &groups {
         for (id, kind, tags, content, grant, authority) in [
             (&target, 9, "[]".to_owned(), "retained target", 0, 0),
             (&report, 1984, tags.clone(), "report explanation", 0, 0),
-        ]
-        .into_iter()
-        .chain((group == &groups[1]).then(|| {
-            (
-                &removal,
-                4891,
-                serde_json::json!([["e", target]]).to_string(),
-                r#"{"v":1,"action":"remove"}"#,
-                1,
-                2,
-            )
-        })) {
+        ] {
             connection
                 .execute(
                     "INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,
