@@ -2835,7 +2835,7 @@ impl MarmotAppRuntime {
     /// ask for the words at `confirm_positions` and pass them to
     /// `confirm_recovery_words`. MDK keeps the words in memory only, so a
     /// restart starts over with new ones. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds).
+    /// `roster_unsupported` (device groups are off).
     pub async fn begin_recovery_words(&self, account_ref: &str) -> Result<RecoveryWords, AppError> {
         self.accounts.begin_recovery_words(account_ref).await
     }
@@ -2846,7 +2846,7 @@ impl MarmotAppRuntime {
     /// device group's roster, or kept by this device until it has one, and
     /// the words are forgotten once their commit went out. Refused with
     /// `DeviceGroupRefused`, keeping the words for another try:
-    /// `roster_unsupported` (release builds), `recovery_words_not_started`,
+    /// `roster_unsupported` (device groups are off), `recovery_words_not_started`,
     /// `recovery_words_mismatch`, `device_group_busy` (retry later) or
     /// `roster_unavailable`. Any other error keeps them too; trying again
     /// with them commits nothing if the roster already holds their key.
@@ -2871,7 +2871,7 @@ impl MarmotAppRuntime {
     /// already written stay until deleted. Turning them on again takes new
     /// words through `begin_recovery_words`. Off already is not an error.
     /// Refused with `DeviceGroupRefused`, changing nothing:
-    /// `roster_unsupported` (release builds), `device_group_busy` (retry
+    /// `roster_unsupported` (device groups are off), `device_group_busy` (retry
     /// later) or `roster_unavailable`.
     pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
         self.accounts.turn_off_backups(account_ref).await
@@ -2984,7 +2984,7 @@ impl MarmotAppRuntime {
     /// (with no device group, as this device keeps them). A change a fork
     /// dropped and the engine could not re-issue shows here as not made; the
     /// user can make it again. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds) or `roster_unavailable`. Read it
+    /// `roster_unsupported` (device groups are off) or `roster_unavailable`. Read it
     /// when showing backup settings; it is not evented.
     pub async fn backup_settings(&self, account_ref: &str) -> Result<BackupSettings, AppError> {
         self.accounts.backup_settings(account_ref).await
