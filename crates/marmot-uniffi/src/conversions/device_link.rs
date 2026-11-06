@@ -24,7 +24,7 @@ impl From<DeviceLinkEmoji> for DeviceLinkEmojiFfi {
     }
 }
 
-/// Why a link ended without one device adding the other.
+/// Why a device link attempt ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum DeviceLinkEndReasonFfi {
     /// This device's user cancelled.
@@ -43,9 +43,9 @@ pub enum DeviceLinkEndReasonFfi {
     CannotLink,
     /// The sign-in was rejected on one of this account's devices.
     Rejected,
-    /// Both users confirmed, but adding the device failed, or the new device
-    /// made no change in the device group within an hour of being added, so
-    /// the device that added it removed it again.
+    /// Both users confirmed, but adding or joining failed, or the new device's
+    /// first Commit was not observed on the selected branch in time. Cleanup may
+    /// still be pending; this reason alone does not establish current membership.
     LinkFailed,
 }
 
