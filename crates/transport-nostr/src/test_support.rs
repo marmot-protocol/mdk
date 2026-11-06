@@ -2,6 +2,8 @@
 //! scripted relay client. The plane's publish-accounting tests and the app's
 //! relay-telemetry export tests both use it; once the plane is its own crate
 //! it sits behind that crate's `test-support` feature (relay-plane brief, PR 3).
+//! [`ScriptedRelayMessages`] carries an injected test client's relay messages
+//! to its plane.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -34,6 +36,8 @@ pub enum PublishScript {
 pub struct CountingClient {
     pub calls: AtomicUsize,
     pub accounts: StdMutex<Vec<MemberId>>,
+    /// What its relays send: an EOSE for each accepted REQ on each relay.
+    pub messages: Arc<ScriptedRelayMessages>,
     script: StdMutex<PublishScript>,
     entered: StdMutex<Option<oneshot::Sender<()>>>,
     release: StdMutex<Option<oneshot::Receiver<()>>>,
@@ -44,6 +48,7 @@ impl CountingClient {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             accounts: StdMutex::new(Vec::new()),
+            messages: Arc::default(),
             script: StdMutex::new(script),
             entered: StdMutex::new(None),
             release: StdMutex::new(None),
@@ -66,10 +71,27 @@ impl CountingClient {
 
 #[async_trait]
 impl NostrRelayClient for CountingClient {
+    fn relay_notification_source(&self) -> Option<Arc<dyn NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+
     async fn subscribe(
         &self,
-        _subscription: transport_nostr_adapter::NostrSubscription,
+        subscription: transport_nostr_adapter::NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let id = subscription.subscription_id();
+        for endpoint in subscription.endpoints() {
+            self.messages.eose(endpoint, &id);
+        }
         Ok(())
     }
 
@@ -223,20 +245,232 @@ impl AccountPublishFixture {
     }
 }
 
-impl MarmotRelayPlane {
-    /// Count one stored event, created at `created_at`, in `endpoint`'s reply
-    /// to a live REQ that has not reached EOSE there, without delivering
-    /// anything: what a scripted relay returned before its EOSE.
-    pub async fn count_stored_replay_event_for_test(
+/// A scripted relay pool's own messages, which an injected test client hands
+/// its plane through [`NostrRelayClient::relay_notification_source`], so they
+/// reach the adapter through the dispatch the SDK pool's take. Each relay has
+/// one connection, which opens when a test connects it or at the latest when
+/// the client sends it its first REQ ([`Self::connect`]); as the SDK's
+/// frontier does, every receiver hears that connection's boundary before any
+/// of its messages. Every receiver gets every
+/// message sent after it subscribed, in order, and none is ever dropped: a
+/// scripted pool never shows its plane a lag.
+///
+/// One pool shared by several planes reaches all of them, as an SDK pool
+/// would; each adapter heeds only the REQ ids it has live.
+///
+/// A client using it delegates [`NostrRelayClient::reply_sent_nothing`] to
+/// [`Self::reply_sent_nothing`], which [`Self::handled`] needs.
+#[derive(Default)]
+pub struct ScriptedRelayMessages {
+    pool: StdMutex<ScriptedPool>,
+    flushes: AtomicUsize,
+    /// The flush EOSEs a plane has dispatched.
+    flushed: StdMutex<HashSet<String>>,
+}
+
+#[derive(Default)]
+struct ScriptedPool {
+    receivers: Vec<mpsc::UnboundedSender<NotificationUpdate<NostrSdkNotification>>>,
+    /// The relays connected so far, in the order they connected.
+    connected: Vec<TransportEndpoint>,
+}
+
+impl ScriptedPool {
+    /// Send `update` to every receiver still reading.
+    fn broadcast(&mut self, update: NotificationUpdate<NostrSdkNotification>) {
+        self.receivers
+            .retain(|receiver| receiver.send(update.clone()).is_ok());
+    }
+
+    fn connect(&mut self, endpoint: &TransportEndpoint) {
+        if !self.connected.contains(endpoint) {
+            self.connected.push(endpoint.clone());
+            self.broadcast(ScriptedRelayMessages::boundary(endpoint));
+        }
+    }
+}
+
+/// The wire id of a flush's EOSE, which no REQ carries.
+const FLUSH_ID_PREFIX: &str = "scripted-relay-flush-";
+
+impl ScriptedRelayMessages {
+    /// The pool's one reader, and each relay's one connection.
+    const EPOCH: [u64; 2] = [1, 1];
+
+    /// The relay at `endpoint` is connected: every plane hears its connection
+    /// open, ahead of any message from it. A relay connects once; later calls
+    /// change nothing. A plane that hears it only after issuing a REQ there
+    /// restarts that REQ as on a reconnect, and counts the REQ only from its
+    /// EOSE. To have a REQ count from its issue, connect the relay and wait
+    /// for [`Self::handled`] before the plane issues it.
+    pub fn connect(&self, endpoint: &TransportEndpoint) {
+        self.pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .connect(endpoint);
+    }
+
+    /// `endpoint` ended its stored events for the REQ `subscription_id`.
+    pub fn eose(&self, endpoint: &TransportEndpoint, subscription_id: &str) {
+        self.send(endpoint, Self::eose_message(subscription_id));
+    }
+
+    /// `endpoint` closed the REQ `subscription_id`, giving `reason`.
+    pub fn closed(&self, endpoint: &TransportEndpoint, subscription_id: &str, reason: &str) {
+        self.send(
+            endpoint,
+            RelayMessage::Closed {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(subscription_id)),
+                message: std::borrow::Cow::Owned(reason.to_owned()),
+            },
+        );
+    }
+
+    /// `endpoint` sent `event` for the REQ `subscription_id`: the pool's raw
+    /// copy off the wire, which counts in the REQ's reply. A group message
+    /// goes on to admission; anything else is counted and not delivered, as
+    /// an event the pool had already seen.
+    pub fn event(
         &self,
-        endpoint: TransportEndpoint,
-        subscription_id: String,
-        created_at: u64,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+        event: nostr_sdk::prelude::Event,
     ) {
-        self.inner
-            .transport
-            .adapter
-            .observe_unconvertible_relay_event(endpoint, subscription_id, created_at)
-            .await;
+        self.send(
+            endpoint,
+            RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(subscription_id)),
+                event: std::borrow::Cow::Owned(event),
+            },
+        );
+    }
+
+    /// Wait until every plane reading this pool has handled every message
+    /// sent before the call, as a test that once called the adapter itself
+    /// had. Each receiver gets one more EOSE, for an id no REQ carries, on a
+    /// relay it has heard from; the dispatcher asks
+    /// [`NostrRelayClient::reply_sent_nothing`] about each EOSE in order, so
+    /// once a plane asks about that one, everything before it is handled.
+    pub async fn handled(&self) {
+        let pending = {
+            let pool = self
+                .pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match pool.connected.first() {
+                // No relay has connected, so no plane has anything to handle.
+                None => Vec::new(),
+                Some(endpoint) => pool
+                    .receivers
+                    .iter()
+                    .filter_map(|receiver| {
+                        let flush = self.flushes.fetch_add(1, Ordering::SeqCst);
+                        let id = format!("{FLUSH_ID_PREFIX}{flush}");
+                        let sent = receiver
+                            .send(Self::notification(endpoint, Self::eose_message(&id)))
+                            .is_ok();
+                        sent.then(|| (id, receiver.clone()))
+                    })
+                    .collect::<Vec<_>>(),
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for spin in 0usize.. {
+                let done = {
+                    let flushed = self
+                        .flushed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // A plane that shut down meanwhile handles nothing more.
+                    pending
+                        .iter()
+                        .all(|(id, sender)| flushed.contains(id) || sender.is_closed())
+                };
+                if done {
+                    return;
+                }
+                // Yield first: a paused clock must not move while the plane
+                // catches up.
+                if spin < 10_000 {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        })
+        .await
+        .expect("every plane handles the scripted relay messages");
+    }
+
+    /// The answer a scripted relay gives: it does not read its own wire, so
+    /// it never vouches that a relay sent nothing. Notes a flush's EOSE.
+    pub fn reply_sent_nothing(&self, subscription_id: &str) -> bool {
+        if subscription_id.starts_with(FLUSH_ID_PREFIX) {
+            self.flushed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(subscription_id.to_owned());
+        }
+        false
+    }
+
+    fn eose_message(subscription_id: &str) -> RelayMessage<'static> {
+        RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(SubscriptionId::new(
+            subscription_id,
+        )))
+    }
+
+    fn notification(
+        endpoint: &TransportEndpoint,
+        message: RelayMessage<'static>,
+    ) -> NotificationUpdate<NostrSdkNotification> {
+        let relay_url = RelayUrl::parse(endpoint.as_str())
+            .expect("a scripted relay answers only on an endpoint the plane accepted");
+        NotificationUpdate::Notification(NostrSdkNotification::Payload {
+            notification: ClientNotification::Message {
+                relay_url,
+                message: Box::new(message),
+            },
+            epoch: Self::EPOCH,
+            reason: transport_nostr_adapter::ReplayRestart::Connection,
+        })
+    }
+
+    fn boundary(endpoint: &TransportEndpoint) -> NotificationUpdate<NostrSdkNotification> {
+        NotificationUpdate::Notification(NostrSdkNotification::Replay {
+            endpoint: endpoint.clone(),
+            epoch: Self::EPOCH,
+            reason: transport_nostr_adapter::ReplayRestart::Connection,
+            connected_at: None,
+        })
+    }
+
+    fn send(&self, endpoint: &TransportEndpoint, message: RelayMessage<'static>) {
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A relay that answers is connected.
+        pool.connect(endpoint);
+        pool.broadcast(Self::notification(endpoint, message));
+    }
+}
+
+impl NostrRelayNotificationSource for ScriptedRelayMessages {
+    fn notifications(&self) -> transport_nostr_adapter::NostrSdkNotificationStream {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A new reader hears each open connection's boundary first.
+        for endpoint in &pool.connected {
+            let _ = sender.send(Self::boundary(endpoint));
+        }
+        pool.receivers.push(sender);
+        Box::pin(futures::stream::unfold(
+            receiver,
+            |mut receiver| async move { receiver.recv().await.map(|update| (update, receiver)) },
+        ))
     }
 }

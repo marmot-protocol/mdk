@@ -997,13 +997,11 @@ async fn release_builds_refuse_recovery_words() {
 async fn the_runtime_confirms_recovery_words() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         phone,
         ..
     } = phone_and_laptop().await;
     drop(phone);
-    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     runtime.reconcile_accounts().await.unwrap();
 

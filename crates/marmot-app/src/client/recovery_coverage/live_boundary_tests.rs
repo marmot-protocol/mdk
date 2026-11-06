@@ -6,7 +6,6 @@ use std::time::Duration;
 use storage_sqlite::{RecoveryCause, RecoveryCoverageProof, TransportReconciliationRoute};
 use transport_nostr_adapter::{
     RELAY_REPLAY_PAGE_LIMIT, ReplayFenceTicket, ReplayLiveCount, ReplaySourceGeneration,
-    SubscriptionRefusal, SubscriptionRefusalDisposition,
 };
 
 use super::scenario_tests::{
@@ -560,16 +559,13 @@ async fn a_closed_req_ends_its_tail_and_the_next_eose_proves_the_gap() {
         owe_retained_window(&fixture);
         let group = group_route(&fixture);
         let (id, endpoint) = group_request(&fixture).await;
+        // An unclassified refusal: the relay drops the REQ for good.
         fixture
-            .client
-            .relay_plane
-            .handle_relay_closed_for_test(
-                cgka_traits::TransportEndpoint(endpoint),
-                id,
-                SubscriptionRefusal {
-                    category: None,
-                    disposition: SubscriptionRefusalDisposition::Dropped,
-                },
+            .relay
+            .close_subscription(
+                &cgka_traits::TransportEndpoint(endpoint),
+                &id,
+                "request refused",
             )
             .await;
         let later = unix_now_seconds() + HOUR;
@@ -601,7 +597,6 @@ async fn a_closed_req_ends_its_tail_and_the_next_eose_proves_the_gap() {
 async fn a_reopened_session_trusts_only_generations_it_saw_begin() {
     let Fixture {
         _dir,
-        _pump,
         client,
         storage,
         group,
@@ -621,7 +616,6 @@ async fn a_reopened_session_trusts_only_generations_it_saw_begin() {
         .unwrap();
     let mut fixture = Fixture {
         _dir,
-        _pump,
         client,
         storage,
         group,

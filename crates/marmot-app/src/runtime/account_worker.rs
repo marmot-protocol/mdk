@@ -9104,7 +9104,6 @@ mod tests {
     use crate::client::epoch_stall::BackfillDecision;
     use crate::tests::{
         ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-        every_subscription, scripted_eose_pump,
     };
     use crate::{AuditLogSettings, MarmotApp};
     use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
@@ -10537,8 +10536,6 @@ mod tests {
             .with_test_relay_client(relay.clone());
             app.set_audit_log_settings(AuditLogSettings { enabled: true })
                 .unwrap();
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group_id = client
                 .create_group("successful epoch backfill audit", &[])
@@ -11621,7 +11618,8 @@ mod tests {
         let mut client = app.client(&account.label).await.unwrap();
         let group = client.create_group("periodic announce", &[]).await.unwrap();
         let group_hex = hex::encode(group.as_slice());
-        // The scripted relay sends no EOSE.
+        // The device can fetch and has settled, so it announces as soon as
+        // it owes one.
         client.test_push_device_can_fetch = Some(true);
         client.push_announce_timing.catch_up_settle = Duration::ZERO;
         client.advance_push_join_windows().await;

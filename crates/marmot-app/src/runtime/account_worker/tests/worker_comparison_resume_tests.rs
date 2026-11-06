@@ -528,8 +528,7 @@ async fn verify_join_routing(path: JoinSummaryPath) {
         CommittedSyncProgress, EpochBackfillRunOutcome, MAX_COMPARISON_ADMISSION_PER_TURN,
     };
     use crate::tests::{
-        ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-        remember_test_member_inbox, report_scripted_eose, scripted_eose_pump,
+        ScriptedPushRelayClient, client_on_app_relay_plane, remember_test_member_inbox,
     };
     use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
 
@@ -544,7 +543,6 @@ async fn verify_join_routing(path: JoinSummaryPath) {
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, endpoint);
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut receiver = client_on_app_relay_plane(&app, &bob.label).await;
     // Startup's real KeyPackage lane does not activate Bob's inbox. His first
     // Welcome therefore cannot arrive through ordinary local publication.
@@ -577,7 +575,7 @@ async fn verify_join_routing(path: JoinSummaryPath) {
             .all(|group_hex| app.group(&bob.label, group_hex).unwrap().is_none())
     );
     receiver.prepare_transport().await.unwrap();
-    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     receiver.synchronize_native_replay().await.unwrap();
     receiver.request_bounded_comparison().unwrap();
     receiver
@@ -747,7 +745,7 @@ async fn verify_join_routing(path: JoinSummaryPath) {
     )));
     // The visible join requests history; only the recovery owner may install
     // that temporary subscription under its next grant.
-    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     receiver
         .recovery_owner
         .test_advance_to_retry(&app.account_storage(&bob.label).unwrap());
@@ -780,7 +778,7 @@ async fn verify_join_routing(path: JoinSummaryPath) {
                 NostrSubscription::GroupMaintenance { since: Some(_), .. }
             )
     }));
-    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     let summary = receiver.sync().await.unwrap();
     publish_app_runtime_summary_with_v5(
         &receiver,

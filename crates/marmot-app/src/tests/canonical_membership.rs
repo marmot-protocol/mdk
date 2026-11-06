@@ -1691,7 +1691,6 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     )
     .unwrap();
     drop(alice);
-    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let runtime = app.runtime();
     let mut notifications = runtime.subscribe();
     let mut timeline = runtime
@@ -1821,7 +1820,6 @@ async fn welcome_failed_after_convergence_reaches_the_host_once() {
     bob.join(&relay, &group).await;
     // Bob's Commit opens a settlement window on Alice, which holds her invite
     // back for convergence to commit.
-    let _alice_eose = alice.answer_eose(&relay);
     bob.client
         .runtime
         .send(SendIntent::SelfUpdate {

@@ -28,7 +28,7 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 | `src/directory.rs`, `src/directory_wire.rs` | Directory fetches and subscriptions, and their relay wire handling. |
 | `src/safety.rs` | `RelaySafetyPolicy`: the host-safety chokepoint every relay endpoint passes before a connect. |
 | `src/telemetry.rs` | Relay telemetry snapshots and the export rollup. |
-| `src/test_support.rs` | Publish-accounting fixtures shared with `marmot-app`'s tests (`test-support` feature). |
+| `src/test_support.rs` | Publish-accounting fixtures and `ScriptedRelayMessages`, the relay messages a fake relay client sends the plane, shared with `marmot-app`'s tests (`test-support` feature). |
 
 ## Rules
 
@@ -40,6 +40,9 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 - Transport consumers enter `transport_nostr_adapter::dispatch_sdk_replay` with the SDK's ordered reader/connection
   metadata. Handle payload variants in its private `dispatch_sdk_notification`; do not add a second dispatcher here.
   Keep metadata through worker queueing and fence receiver loss before resuming. Directory Client input stays separate.
+  An injected client's `relay_notification_source` runs under the same supervisor and dispatch as the SDK's stream,
+  so a fake relay's EOSE, CLOSED and EVENT reach the plane as a relay's do; give a fake relay client one instead of a
+  hook into the adapter.
 - Recovery debt, retry selection and native input qualification belong to the app's AccountRecoveryOwner.
   Bridge frozen capture plans, the owner's fence plans and borrowed source guards; never schedule quiet-period
   repair here. Import actual loss before cursor authorization and retain placement/spill locking through the owner's

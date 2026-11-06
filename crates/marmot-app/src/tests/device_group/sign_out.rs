@@ -448,11 +448,6 @@ async fn sign_out_and_wipe_leaves_a_shared_chat_to_the_sibling() {
     } = devices;
     let laptop_slot = slot_of(&laptop);
     let mut phone_cursor = published_count(&relay);
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     assert!(matches!(
         runtime.reconcile_accounts().await,
@@ -509,11 +504,6 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
         ..
     } = devices;
     drop(laptop);
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -556,11 +546,6 @@ async fn a_confirmation_after_the_deadline_counts_as_not_reached() {
     );
     assert_eq!(status_of(&laptop, &group, &laptop), DeviceStatusV1::Leaving);
     drop(laptop);
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -610,7 +595,6 @@ async fn a_worker_still_opening_at_the_deadline_counts_as_not_reached() {
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = device_group_app_at(&dir, relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(app.clone());
     // Longer than the worker's first answer once open, so only the
     // deadline over its start ends the wait.
@@ -664,7 +648,6 @@ async fn shutting_down_ends_a_wipes_worker_retry_without_waiting_for_its_deadlin
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = device_group_app_at(&dir, relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
     let held_client = app.client("alice").await.unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     assert!(matches!(
@@ -756,11 +739,6 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let laptop_key = laptop.runtime.own_signature_key();
     drop(laptop);
     let mut phone_cursor = published_count(&relay);
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -870,11 +848,6 @@ async fn a_cancelled_sign_out_leaves_the_account_not_signing_out() {
         ..
     } = devices;
     drop(laptop);
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -962,7 +935,6 @@ async fn accounts_without_sibling_signout_commands_are_wiped_immediately() {
         }
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = device_group_app_at(&dir, relay.clone());
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let runtime = MarmotAppRuntime::new(app.clone());
         if matches!(case, Case::OnboardingWorkerCommandGated) {
             use crate::{OnboardingOptions, OnboardingStatus, OnboardingStep};

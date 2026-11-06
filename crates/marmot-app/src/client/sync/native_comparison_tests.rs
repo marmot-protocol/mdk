@@ -4,8 +4,7 @@ use super::comparison_job::ComparisonNetworkJob;
 use super::*;
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::tests::{
-    ScriptedEosePump, ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-    remember_test_member_inbox, scripted_eose_pump,
+    ScriptedPushRelayClient, client_on_app_relay_plane, remember_test_member_inbox,
 };
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{TransportAccountActivation, TransportAdapter};
@@ -24,7 +23,6 @@ mod native_failure_tests;
 
 struct CryptoFixture {
     _dir: tempfile::TempDir,
-    _pump: ScriptedEosePump,
     relay: Arc<ScriptedPushRelayClient>,
     sender: AppClient,
     receiver: AppClient,
@@ -50,7 +48,6 @@ async fn crypto_fixture_with_owner(owner: Option<bool>) -> CryptoFixture {
         None => app,
     };
     remember_test_member_inbox(&app, &recipient.account_id_hex, ENDPOINT);
-    let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
     receiver.publish_key_package().await.unwrap();
     receiver.prepare_transport().await.unwrap();
@@ -75,7 +72,6 @@ async fn crypto_fixture_with_owner(owner: Option<bool>) -> CryptoFixture {
     receiver.take_pending_projection_updates();
     CryptoFixture {
         _dir: dir,
-        _pump: pump,
         relay,
         sender,
         receiver,

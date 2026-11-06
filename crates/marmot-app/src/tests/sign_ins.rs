@@ -1843,11 +1843,6 @@ async fn the_host_lists_checks_and_answers_sign_ins() {
     let account = Account::new(2, true);
     drop(account.open(0).await);
     let phone_app = &account.apps[0];
-    let _eose = scripted_eose_pump(
-        phone_app.relay_plane.clone(),
-        account.relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
@@ -1935,11 +1930,6 @@ async fn the_host_sees_no_sign_ins_without_device_groups() {
     drop(account.open(0).await);
     drop(account.open(1).await);
     let phone_app = &account.apps[0];
-    let _eose = scripted_eose_pump(
-        phone_app.relay_plane.clone(),
-        account.relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();

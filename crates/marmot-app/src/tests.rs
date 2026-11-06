@@ -531,6 +531,9 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
     });
 }
 
+/// Which (REQ, relay) a [`ScriptedPushRelayClient`] leaves unanswered.
+pub(crate) type HeldReply = fn(&NostrSubscription, &TransportEndpoint) -> bool;
+
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
     pub(crate) acquisition_result:
@@ -548,8 +551,15 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
-    /// When set, [`report_scripted_eose`] answers each REQ still awaiting
-    /// EOSE with one stored event created at this second before its EOSE.
+    /// What the scripted relays send the plane: each accepted REQ's reply.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
+    /// Which (REQ, endpoint) the relay leaves unanswered; none by default.
+    hold_replies: std::sync::Mutex<Option<HeldReply>>,
+    /// Accepted REQs (wire id, subscription, endpoint) the relay has not
+    /// answered yet.
+    held_replies: std::sync::Mutex<Vec<(String, NostrSubscription, TransportEndpoint)>>,
+    /// When set, each REQ's reply carries one stored event created at this
+    /// second before its EOSE.
     pub(crate) stored_before_eose: std::sync::Mutex<Option<u64>>,
     /// Every relay reads as connected on this attempt, as its own state, so
     /// moving it is a reconnect no notification reports.
@@ -894,6 +904,178 @@ fn registered_release(
 }
 
 impl ScriptedPushRelayClient {
+    /// Record an accepted REQ, or fail or park it as the test scripted.
+    async fn accept_subscription(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscription_attempts
+            .lock()
+            .unwrap()
+            .push(subscription.clone());
+        if subscription.is_group_route() {
+            self.group_subscribe_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self
+            .fail_next_subscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".to_owned(),
+            ));
+        }
+        if subscription.is_group_route()
+            && self
+                .refuse_group_subscribes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "subscribe registered on 0 of 1 relays".to_owned(),
+            ));
+        }
+        let block_for_account = {
+            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
+            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let block_for_account_group = {
+            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
+            if subscription.is_group_route()
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let blocked = block_for_account
+            || block_for_account_group
+            || self
+                .block_next_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if blocked {
+            let released = registered_release(&self.subscribe_release);
+            self.blocked_subscribe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.subscribe_started.notify_one();
+            released.await;
+            if self
+                .fail_blocked_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(cgka_traits::TransportAdapterError::Subscription(
+                    "injected startup activation failure".to_owned(),
+                ));
+            }
+        }
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    /// Answer an accepted REQ on each of its relays as a relay does, on the
+    /// connection it went out on: the stored event a test scripted, then EOSE.
+    /// A REQ the test holds stays unanswered until
+    /// [`Self::release_held_replies`]. A relay not yet connected connects
+    /// here, after the plane issued the REQ, so the plane restarts the REQ as
+    /// on a reconnect and counts it only from its EOSE; see
+    /// [`Self::connect_relays`].
+    fn reply(&self, subscription: &NostrSubscription, id: &str) {
+        let hold = *self.hold_replies.lock().unwrap();
+        for endpoint in subscription.endpoints() {
+            self.messages.connect(endpoint);
+            if hold.is_some_and(|hold| hold(subscription, endpoint)) {
+                self.held_replies.lock().unwrap().push((
+                    id.to_owned(),
+                    subscription.clone(),
+                    endpoint.clone(),
+                ));
+                continue;
+            }
+            self.answer(endpoint, id);
+        }
+    }
+
+    fn answer(&self, endpoint: &TransportEndpoint, id: &str) {
+        if let Some(created_at) = *self.stored_before_eose.lock().unwrap() {
+            self.messages
+                .event(endpoint, id, scripted_stored_event(created_at));
+        }
+        self.messages.eose(endpoint, id);
+    }
+
+    /// Leave each (REQ, relay) that `hold` selects unanswered from now on,
+    /// as a relay that has not finished, or never finishes, its stored
+    /// events. `None` answers every later REQ again.
+    pub(crate) fn hold_replies(&self, hold: Option<HeldReply>) {
+        *self.hold_replies.lock().unwrap() = hold;
+    }
+
+    /// Answer every held REQ that `release` selects now, late, and wait
+    /// until every plane on this relay has handled the answers.
+    pub(crate) async fn release_held_replies(
+        &self,
+        release: impl Fn(&NostrSubscription, &TransportEndpoint) -> bool,
+    ) {
+        let released = {
+            let mut held = self.held_replies.lock().unwrap();
+            let (released, kept) = std::mem::take(&mut *held)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(_, subscription, endpoint)| {
+                    release(subscription, endpoint)
+                });
+            *held = kept;
+            released
+        };
+        for (id, _, endpoint) in released {
+            self.answer(&endpoint, &id);
+        }
+        self.replies_handled().await;
+    }
+
+    /// Answer every held REQ now, late, and wait until the planes handled it.
+    pub(crate) async fn answer_held_replies(&self) {
+        self.release_held_replies(|_, _| true).await;
+    }
+
+    /// These relays are connected, as a running app's relays are before its
+    /// account subscribes: wait until every plane on this relay has heard
+    /// each connection, so the REQs it issues there later count from their
+    /// own issue rather than from their EOSE. Call it once the plane exists
+    /// and before the account's first REQ.
+    pub(crate) async fn connect_relays(&self, endpoints: &[&str]) {
+        for endpoint in endpoints {
+            self.messages
+                .connect(&TransportEndpoint((*endpoint).to_owned()));
+        }
+        self.replies_handled().await;
+    }
+
+    /// Wait until every plane on this relay has handled every message the
+    /// relay sent so far.
+    pub(crate) async fn replies_handled(&self) {
+        self.messages.handled().await;
+    }
+
+    /// The relay at `endpoint` closes the REQ `id`, giving `reason`; waits
+    /// until every plane on this relay has handled the CLOSED.
+    pub(crate) async fn close_subscription(
+        &self,
+        endpoint: &TransportEndpoint,
+        id: &str,
+        reason: &str,
+    ) {
+        self.messages.closed(endpoint, id, reason);
+        self.replies_handled().await;
+    }
+
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -1208,6 +1390,21 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+
     fn relay_connection(
         &self,
         _: &MemberId,
@@ -1313,11 +1510,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         subscription: NostrSubscription,
         id: String,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.subscribe(subscription.clone()).await?;
+        self.accept_subscription(subscription.clone()).await?;
         self.scoped_subscriptions
             .lock()
             .unwrap()
-            .push((id, subscription));
+            .push((id.clone(), subscription.clone()));
+        self.reply(&subscription, &id);
         Ok(())
     }
     async fn unsubscribe_scoped(
@@ -1337,74 +1535,8 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.subscription_attempts
-            .lock()
-            .unwrap()
-            .push(subscription.clone());
-        if subscription.is_group_route() {
-            self.group_subscribe_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        if self
-            .fail_next_subscribe
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(cgka_traits::TransportAdapterError::Subscription(
-                "injected subscribe failure".to_owned(),
-            ));
-        }
-        if subscription.is_group_route()
-            && self
-                .refuse_group_subscribes
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(cgka_traits::TransportAdapterError::Subscription(
-                "subscribe registered on 0 of 1 relays".to_owned(),
-            ));
-        }
-        let block_for_account = {
-            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
-            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
-                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
-            {
-                blocked_account.take();
-                true
-            } else {
-                false
-            }
-        };
-        let block_for_account_group = {
-            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
-            if subscription.is_group_route()
-                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
-            {
-                blocked_account.take();
-                true
-            } else {
-                false
-            }
-        };
-        let blocked = block_for_account
-            || block_for_account_group
-            || self
-                .block_next_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
-        if blocked {
-            let released = registered_release(&self.subscribe_release);
-            self.blocked_subscribe_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.subscribe_started.notify_one();
-            released.await;
-            if self
-                .fail_blocked_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(cgka_traits::TransportAdapterError::Subscription(
-                    "injected startup activation failure".to_owned(),
-                ));
-            }
-        }
-        self.subscriptions.lock().unwrap().push(subscription);
+        self.accept_subscription(subscription.clone()).await?;
+        self.reply(&subscription, &subscription.subscription_id());
         Ok(())
     }
 
@@ -1682,94 +1814,33 @@ pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> c
         .expect("client on the app relay plane")
 }
 
-/// Stand-in for the relay pool's end-of-stored-events frames, which an injected
-/// relay client never produces.
-///
-/// A live drain ends on EOSE instead of waiting out its quiet window, and a
-/// post-join maintenance boundary completes only on its own REQ's EOSE, so a
-/// test whose transport is a [`ScriptedPushRelayClient`] has to supply that
-/// signal itself. The pump reports EOSE for every subscription the relay has accepted
-/// and `accept` selects, on every endpoint it was issued to, and keeps doing so
-/// as later subscriptions are registered. Repeat reports are ignored by the
-/// adapter, so this is safe to run for the whole test, but each still takes
-/// the adapter's state lock, which can defer a cursor seal
-/// ([`LiveCursorFixture::stop_eose_pump`]).
-pub(crate) struct ScriptedEosePump(tokio::task::JoinHandle<()>);
-
-impl Drop for ScriptedEosePump {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-pub(crate) fn scripted_eose_pump(
-    plane: MarmotRelayPlane,
-    relay: Arc<ScriptedPushRelayClient>,
-    accept: fn(&NostrSubscription) -> bool,
-) -> ScriptedEosePump {
-    ScriptedEosePump(tokio::spawn(async move {
-        loop {
-            report_scripted_eose(&plane, &relay, accept).await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }))
-}
-
-/// One pass of [`scripted_eose_pump`], for a test that needs the EOSE to land
-/// at a moment of its own choosing.
-pub(crate) async fn report_scripted_eose(
-    plane: &MarmotRelayPlane,
-    relay: &ScriptedPushRelayClient,
-    accept: fn(&NostrSubscription) -> bool,
-) {
-    let stored = *relay.stored_before_eose.lock().unwrap();
-    let eose = |endpoint: TransportEndpoint, id: String| async move {
-        // Counts only a REQ still awaiting EOSE on that relay.
-        if let Some(created_at) = stored {
-            plane
-                .count_stored_replay_event_for_test(endpoint.clone(), id.clone(), created_at)
-                .await;
-        }
-        plane.handle_relay_eose_for_test(endpoint, id).await;
-    };
-    let scoped = relay.scoped_subscriptions.lock().unwrap().clone();
-    for (id, subscription) in scoped {
-        if accept(&subscription) {
-            for endpoint in subscription.endpoints() {
-                eose(endpoint.clone(), id.clone()).await;
-            }
-        }
-    }
-    for subscription in relay.accepted_subscriptions() {
-        if !accept(&subscription) {
-            continue;
-        }
-        for endpoint in subscription.endpoints() {
-            eose(endpoint.clone(), subscription.subscription_id()).await;
-        }
-    }
-}
-
-/// Every subscription reaches end-of-stored-events.
-pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
+/// The one stored event a scripted relay sends before its EOSE when a test
+/// asks for it ([`ScriptedPushRelayClient::stored_before_eose`]). Not a group
+/// message, so it counts in the REQ's reply without reaching admission, as a
+/// copy the pool had already seen.
+/// Selects every (REQ, relay) for [`ScriptedPushRelayClient::hold_replies`].
+pub(crate) fn every_reply(_: &NostrSubscription, _: &TransportEndpoint) -> bool {
     true
 }
 
-/// Let end-of-stored-events admit `client`'s live REQs' native replay. Until
-/// then its group messages wait behind the unanswered sources, a sync admits
-/// them only through its recovery job, and that job can return before it does
-/// (mdk#2624). Call this before the client's first grant: a job that starts
-/// before a source's EOSE captures that source; the scripted relay serves no
-/// history, so the capture leaves it incomplete and no later EOSE admits it.
-/// Its `SubscriptionReplay` duty would then join every grant (mdk#2693).
-pub(crate) async fn settle_live_replay(
-    plane: &MarmotRelayPlane,
-    relay: &ScriptedPushRelayClient,
-    client: &mut AppClient,
-) {
+fn scripted_stored_event(created_at: u64) -> nostr_sdk::prelude::Event {
+    EventBuilder::new(Kind::GiftWrap, "")
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .finalize(&Keys::generate())
+        .expect("sign scripted stored event")
+}
+
+/// Wait until the scripted relay's EOSEs admit `client`'s live REQs' native
+/// replay. Until then its group messages wait behind the unanswered sources,
+/// a sync admits them only through its recovery job, and that job can return
+/// before it does (mdk#2624). Call this before the client's first grant: a job
+/// that starts before a source's EOSE captures that source; the scripted relay
+/// serves no history, so the capture leaves it incomplete and no later EOSE
+/// admits it. Its `SubscriptionReplay` duty would then join every grant
+/// (mdk#2693).
+pub(crate) async fn settle_live_replay(client: &mut AppClient) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        report_scripted_eose(plane, relay, every_subscription).await;
         client.synchronize_native_replay().await.unwrap();
         if client.recovery_owner.test_replay_complete() {
             return;
@@ -1812,9 +1883,7 @@ fn cancelled_sync_keeps_profile() {
             .create_group("before", &[bob_account.account_id_hex.as_str()])
             .await
             .unwrap();
-        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         bob.sync().await.unwrap();
-        drop(eose);
         let storage = app.account_storage("bob").unwrap();
         let epoch = storage.get_group(&group_id).unwrap().epoch;
         alice
@@ -1977,13 +2046,12 @@ fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .unwrap()
             .expect("local group projection");
 
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.start().await.unwrap();
         // This command is deferred behind startup catch-up, so its response is
         // also the steady-state barrier this regression needs.
         runtime.pause_maintenance("alice").await.unwrap();
-        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         let sync = app.relay_plane.relay_telemetry().await.sync;
         assert_eq!(sync.tracked_subscriptions, 2);
         assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
@@ -2176,7 +2244,6 @@ fn failed_epoch_backfill_attempt_retains_one_correlated_retry() {
             relay.clone(),
             true,
         );
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -3331,7 +3398,6 @@ async fn verify_qualified_local_escalation(reopen: bool, qualified: bool) {
         // conversion. The locally admitted undecryptable prefix is real.
         client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
     }
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     client
         .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
         .await
@@ -3408,7 +3474,6 @@ fn recovery_reopen_preserves_pending_debt_and_the_retry_deadline() {
             .with_dev_epoch_stall_wedge_rearm_interval_ms(10 * 60 * 1_000);
         let (app, mut client, route) =
             undecryptable_probe_route_with_owner(&dir, &relay, config, Some(false)).await;
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let probe_base = crate::unix_now_seconds() - 1_000;
 
         for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
@@ -3478,7 +3543,7 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
     run_composed_app_runtime_test("backfill-local-progress-keeps-debt", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) =
+        let (_app, mut client, group) =
             armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
         let epoch = client.group_mls_state(&group).unwrap().epoch;
         let bystander = bystander_stalled_below_threshold(&mut client, epoch);
@@ -3500,7 +3565,6 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
             .await
             .unwrap();
         assert!(client.group_mls_state(&group).unwrap().epoch > epoch);
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         client.run_recovery_grant_for_test(grant).await.unwrap();
         assert!(
             client.has_pending_epoch_backfill(),
@@ -3997,7 +4061,6 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
                     .iter()
                     .all(|scope| scope.goal.route_kind == 2)
         }));
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
         client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_eq!(
@@ -6460,7 +6523,6 @@ async fn failed_leave_push_compensation_body() {
         .with_test_relay_client(relay.clone());
     let alice = app.account_home().account("alice").unwrap().account_id_hex;
     let plane = MarmotRelayPlane::new(None, relay.clone());
-    let eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
     let mut alice_client = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -6502,7 +6564,6 @@ async fn failed_leave_push_compensation_body() {
             .any(|key| hex::encode(key) == alice)
     );
     drop(alice_client);
-    drop(eose);
     drop(plane);
     use cgka_traits::storage::GroupStorage as _;
     let store = app.account_storage("alice").unwrap();
@@ -12813,7 +12874,6 @@ async fn a_self_membership_write_reaches_the_warmed_chat_list() {
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
-    let _eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -14218,11 +14278,6 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
         let omitted_id = omitted.id.clone();
         inject_epoch_gap_probe(&reopened, omitted).await;
 
-        let _eose = scripted_eose_pump(
-            reopened.relay_plane.clone(),
-            relay.clone(),
-            every_subscription,
-        );
         client
             .sync()
             .await
@@ -14374,7 +14429,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             .len();
         drop(client);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         for _ in 0..=spilled_before_reopen {
             if !client.admit_native_turn().await.unwrap() {
                 break;
@@ -14404,6 +14459,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // The relay is still replaying stored history, newest first, when
+        // the burst overflows the queue, so live ingest promotes no cursor.
+        relay.hold_replies(Some(every_reply));
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(owns)
             .with_test_relay_client(relay.clone());
@@ -14645,8 +14703,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
 fn replay_fences_cursor_on_save() {
     run_composed_app_runtime_test("unfinished-replay-checkpoint", || async {
         let mut fixture = LiveCursorFixture::open().await;
-        fixture._eose.0.abort();
-        let _ = (&mut fixture._eose.0).await;
+        // The fresh activation's REQs stay unfinished, so replay is too.
+        fixture.relay.hold_replies(Some(every_reply));
         fixture
             .client
             .runtime
@@ -14718,7 +14776,6 @@ pub(crate) struct LiveCursorFixture {
     account_id: MemberId,
     nostr_group_id_hex: String,
     pub(crate) cursor_before: u64,
-    _eose: ScriptedEosePump,
     _dir: tempfile::TempDir,
 }
 
@@ -14813,7 +14870,6 @@ impl LiveCursorFixture {
             seeded.last_transport_timestamp = Some(cursor_before);
             app.save_state(&seeded).unwrap();
         }
-        let eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("live cursor", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -14837,23 +14893,8 @@ impl LiveCursorFixture {
             account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
             nostr_group_id_hex,
             cursor_before,
-            _eose: eose,
             _dir: dir,
         }
-    }
-
-    /// Stop the scripted EOSE pump, which [`Self::open`] leaves running after
-    /// every subscription is past end-of-stored-events. A cursor seal reads
-    /// replay admission without waiting and defers its commit while the
-    /// adapter's state lock is taken, and each of the pump's repeat reports
-    /// takes that lock. A REQ issued afterwards never reaches EOSE until a
-    /// simulated reopen starts a fresh pump. Other
-    /// tasks, such as the replay supervisor, still take the lock, so a test
-    /// that asserts what one commit persists also runs on one thread, where
-    /// none of them runs between the commit's readiness read and its seal.
-    pub(crate) async fn stop_eose_pump(&mut self) {
-        self._eose.0.abort();
-        let _ = (&mut self._eose.0).await;
     }
 
     pub(crate) fn persisted(&self) -> Option<u64> {
@@ -14914,14 +14955,9 @@ impl LiveCursorFixture {
             account_id,
             nostr_group_id_hex,
             cursor_before,
-            _eose,
             _dir,
         } = self;
         drop(client);
-        // A reopened connection gets fresh relay replies, even when the old
-        // connection's duplicate EOSE pump was stopped for an atomic seal.
-        drop(_eose);
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let client = client_on_app_relay_plane(&app, "alice").await;
         Self {
             app,
@@ -14930,7 +14966,6 @@ impl LiveCursorFixture {
             account_id,
             nostr_group_id_hex,
             cursor_before,
-            _eose,
             _dir,
         }
     }
@@ -15054,6 +15089,9 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // No relay reports end-of-stored-events: the relays may still be
+        // replaying stored history newest-first.
+        relay.hold_replies(Some(every_reply));
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         app.relay_plane =
@@ -15063,8 +15101,6 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
         let mut seeded = app.load_state("alice").unwrap();
         seeded.last_transport_timestamp = Some(cursor_before);
         app.save_state(&seeded).unwrap();
-        // No relay reports end-of-stored-events: the relays may still be
-        // replaying stored history newest-first.
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("live cursor", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -15671,11 +15707,6 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
         // All preceding live reopens ran with EOSE withheld. Only the
         // coalesced catch-up below receives a boundary; it still cannot
         // certify or clear independent loss debt.
-        let _eose_pump = scripted_eose_pump(
-            runtime.shared_services().relay_plane().clone(),
-            relay.clone(),
-            every_subscription,
-        );
         relay.release_subscribe();
 
         recovery_a.await.unwrap().unwrap();
@@ -19250,7 +19281,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
@@ -19313,7 +19344,6 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
-    let _eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
 
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
@@ -19506,7 +19536,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     // The native group lane waits for the current REQ's stored-history
     // boundary before admitting the real locally published removal commit.
     // It lands in bob's current epoch and buffers for convergence.
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     // The scheduled-convergence path the account worker drives. This is the
     // field case: the removal was adopted through convergence, not inline.
@@ -19610,7 +19640,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
@@ -19706,7 +19736,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .remove_members(&group_id, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     // The removal lands in the epoch bob still holds, so convergence adopts it
     // rather than the inline commit-apply path.
@@ -21992,7 +22022,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     bob_client.take_pending_projection_updates();
     bob_client.take_pending_applied_sync_summary();
@@ -22057,7 +22087,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .await
             .expect("quiet retry must complete the retained projection");
         assert!(!bob_client.has_pending_effect_projections());
-        report_scripted_eose(&plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         assert!(bob_client.admit_native_turn().await.unwrap());
         assert_eq!(
             probe_cursor(&bob_client),
@@ -22082,7 +22112,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
                 "projection retry must not release an unaccepted delivery",
             );
         }
-        report_scripted_eose(&plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         assert!(
             bob_client
                 .admit_native_turn()
@@ -22597,8 +22627,6 @@ fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
         )
         .await;
         {
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client
                 .sync()
                 .await
@@ -22639,8 +22667,6 @@ fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
                     .unwrap(),
                 1,
             );
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client
                 .sync()
                 .await
@@ -24782,12 +24808,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                         .unwrap();
                 } else {
                     inject_epoch_gap_probe(&app, probe.clone()).await;
-                    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
-                    let _eose = scripted_eose_pump(
-                        app.relay_plane.clone(),
-                        relay.clone(),
-                        every_subscription,
-                    );
+                    relay.replies_handled().await;
                     if handling == "sdk drain" {
                         client.sync().await.unwrap();
                     } else {
@@ -24859,8 +24880,6 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                     .any(|item| hex::encode(item.event_id) == probe.id)
             );
             inject_epoch_gap_probe(&app, probe.clone()).await;
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client.sync().await.unwrap();
             assert_eq!(
                 recorded_ingest_outcomes(&app, &probe.id).len(),
@@ -25110,7 +25129,6 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
     // The scripted relay has no socket forwarder to finish native stored input.
-    let _pump = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -25520,7 +25538,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     );
     // Bob's leave reaches Alice behind her live REQs' replay; settle it so
     // her next sync ingests the proposal instead of leaving it to a grant.
-    settle_live_replay(&plane, &relay, &mut alice).await;
+    settle_live_replay(&mut alice).await;
     bob_client.leave_group(&group_id).await.unwrap();
     alice.sync().await.unwrap();
     let delay = alice
@@ -25609,7 +25627,6 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
         runtime.catch_up_accounts().await.unwrap();
@@ -26296,7 +26313,6 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let plane = MarmotRelayPlane::new(None, relay.clone());
         // The scripted relay has no socket forwarder to finish native stored input.
-        let _pump = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
         let mut alice = app
             .client_with_relay_plane("alice", &plane, None)
             .await
@@ -26791,7 +26807,6 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let (app, mut client, route) =
         undecryptable_probe_route(&dir, &relay, bounded_epoch_backfill_config()).await;
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
     // Model a welcome-installed copy: the route's group is created locally, and
     // a copy this device created has no Welcome time to compare against.

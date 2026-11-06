@@ -82,7 +82,7 @@ fn gossip_state(device: &Device, group_hex: &str) -> storage_sqlite::AccountGrou
 
 /// `device`'s post-join history fetch in `group` has fetched and processed
 /// the group's messages from its join epoch on. Returns when it ended. The
-/// scripted relay sends no EOSE, so the test ends it.
+/// test ends it itself.
 pub(super) fn finish_post_join_fetch(device: &Device, group: &GroupId) -> i64 {
     let runtime = &device.client.runtime;
     let fetch = runtime

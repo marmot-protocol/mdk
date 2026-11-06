@@ -2492,10 +2492,16 @@ mod otlp {
                     true,
                 );
             }
+            // The fixture's relay answered its activation's REQs.
+            fixture.client.messages.handled().await;
+            let answered = fixture.plane.telemetry_rollup(None).await.relays[0]
+                .eose_latency
+                .sample_count();
             let mut relay_baseline = None;
             for expected in [0_u64, 1, 2] {
                 // Full-history activation reissues an ordinary inbox REQ with
-                // a new attempt. Its real EOSE tracking computes the timing.
+                // a new attempt, which the relay answers. Its real EOSE
+                // tracking computes the timing.
                 fixture
                     .adapter
                     .activate_account(cgka_traits::TransportAccountActivation {
@@ -2506,21 +2512,7 @@ mod otlp {
                     })
                     .await
                     .unwrap();
-                let subscription = transport_nostr_adapter::NostrSubscription::AccountInbox {
-                    account_id: fixture.account_id.clone(),
-                    endpoints: inbox_endpoints.clone(),
-                    since: None,
-                    attempt: fixture
-                        .adapter
-                        .account_subscription_attempt()
-                        .await
-                        .unwrap(),
-                }
-                .subscription_id();
-                fixture
-                    .plane
-                    .handle_relay_eose_for_test(inbox_endpoints[0].clone(), subscription)
-                    .await;
+                fixture.client.messages.handled().await;
                 let rollup = fixture.plane.telemetry_rollup(None).await;
                 assert_eq!(
                     rollup.relays.len(),
@@ -2528,7 +2520,7 @@ mod otlp {
                     "the wire fixture must have real relay telemetry"
                 );
                 let source = &rollup.relays[0].eose_latency;
-                assert_eq!(source.sample_count(), expected + 1);
+                assert_eq!(source.sample_count(), answered + expected + 1);
                 let baseline = relay_baseline.get_or_insert_with(|| source.clone());
                 if expected != 0 {
                     performance.record(

@@ -872,11 +872,6 @@ async fn the_runtime_writes_a_due_backup() {
     let old_run = [0xe1; 16];
     ledger.begin_backup_run(&old_run, &[0xf2; 32], 1).unwrap();
     let before = ledger.backup_runs().unwrap();
-    let _eose = scripted_eose_pump(
-        phone_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let closed = MarmotAppRuntime::new(phone_app.clone());
     closed.reconcile_accounts().await.unwrap();
     // Durable cleanup happens synchronously during preparation, so this

@@ -657,11 +657,6 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
     drop(laptop);
     let root = laptop_app.account_home().root().to_path_buf();
     let reader = storage(&laptop_app);
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     runtime.reconcile_accounts().await.unwrap();
     let mut watch = runtime.watch_backup_restore("alice").await.unwrap();

@@ -425,11 +425,6 @@ async fn the_host_reads_and_dismisses_the_warning() {
     let account = Account::new(2, true);
     drop(account.open(0).await);
     let phone_app = &account.apps[0];
-    let _eose = scripted_eose_pump(
-        phone_app.relay_plane.clone(),
-        account.relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();

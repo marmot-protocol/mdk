@@ -870,9 +870,40 @@ impl NostrSubscribeReport {
     }
 }
 
+/// One receiver of a relay client's [`NostrSdkNotification`]s.
+#[cfg(feature = "sdk")]
+pub type NostrSdkNotificationStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = nostr_sdk::NotificationUpdate<NostrSdkNotification>> + Send>,
+>;
+
+/// The messages an injected [`NostrRelayClient`]'s relays send it: EVENT,
+/// EOSE and `CLOSED` frames with their connection boundaries, which a relay
+/// plane dispatches through [`dispatch_sdk_replay`] as it does the SDK pool's.
+///
+/// That dispatch trusts its payloads as the SDK pool's: a source yields only
+/// events whose signatures it verified, and each relay's frames in the order
+/// that relay sent them.
+#[cfg(feature = "sdk")]
+pub trait NostrRelayNotificationSource: Send + Sync {
+    /// A new receiver of every notification from now on. A relay plane asks
+    /// again for a consumer that replaces a failed one, so a receiver ends
+    /// only when the client is gone or yields `Shutdown`: an ended stream is
+    /// the consumer's unexpected exit.
+    fn notifications(&self) -> NostrSdkNotificationStream;
+}
+
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
+    /// Where the messages this client's relays send come from, for a relay
+    /// plane built on this client to dispatch. None for a client whose relay
+    /// messages reach the adapter another way: the plane reads the SDK
+    /// client's own notifications.
+    #[cfg(feature = "sdk")]
+    fn relay_notification_source(&self) -> Option<Arc<dyn NostrRelayNotificationSource>> {
+        None
+    }
+
     /// The connection `account`'s REQs to `endpoint` are open on now, read
     /// from the client's own state, not its notifications: none when the
     /// relay is not connected, the account has no context here, or the client

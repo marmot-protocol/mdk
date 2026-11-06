@@ -1083,11 +1083,6 @@ async fn a_removal_applied_before_a_restart_unlinks_before_catch_up() {
 
     let attempted = relay.attempted_events().len();
     let subscriptions = relay.subscription_count();
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
@@ -1165,11 +1160,6 @@ async fn removal_arriving_live(fail_unlink_mark: bool) {
         .test_fail_unlink_mark
         .store(fail_unlink_mark, Ordering::Relaxed);
 
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();

@@ -2589,6 +2589,9 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        // These tests answer each REQ themselves, to see the owner before
+        // and after its EOSE.
+        relay.hold_replies(Some(crate::tests::every_reply));
         // This fixture owns the legacy native-replay contract through its
         // retirement, independently of the application default.
         let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
@@ -2600,6 +2603,7 @@ mod tests {
             relay.clone(),
             app.config.allow_loopback_relay_endpoints,
         );
+        relay.connect_relays(&["wss://relay.example"]).await;
         let client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         (dir, app, relay, client)
     }
@@ -2634,12 +2638,7 @@ mod tests {
                     .is_empty()
             );
         }
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.replay_complete);
         assert_eq!(
@@ -2668,7 +2667,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_ready_peer_is_enough() {
-        let (_dir, app, relay, mut client) = native_fixture().await;
+        let (_dir, _app, relay, mut client) = native_fixture().await;
         let mut routing = client.routing.snapshot();
         routing
             .local_inbox_endpoints
@@ -2681,17 +2680,9 @@ mod tests {
                 .iter()
                 .any(|source| source.endpoints().len() >= 2)
         );
-        for source in subscriptions {
-            for endpoint in source
-                .endpoints()
-                .iter()
-                .filter(|endpoint| endpoint.as_str() != "wss://quiet.example")
-            {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), source.subscription_id())
-                    .await;
-            }
-        }
+        relay
+            .release_held_replies(|_, endpoint| endpoint.as_str() != "wss://quiet.example")
+            .await;
         client.synchronize_native_replay().await.unwrap();
         assert!(
             client.recovery_owner.replay_complete,
@@ -2814,12 +2805,7 @@ mod tests {
             reopened.subscription_rebuild_since().unwrap().is_none(),
             "cancellation and a new session cannot narrow unresolved original input"
         );
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         reopened.synchronize_native_replay().await.unwrap();
         assert!(reopened.recovery_owner.replay_complete);
         assert!(
@@ -2830,14 +2816,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_stale_seal_is_deferred() {
-        let (_dir, app, relay, mut client) = native_fixture().await;
+        let (_dir, _app, relay, mut client) = native_fixture().await;
         client.prepare_transport().await.unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         let generation = client.adapter.replay_admission().await.generation();
         assert!(client.recovery_owner.native_replay_authorizes(generation));
@@ -2860,7 +2841,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_replay_synchronization_is_timed_by_trigger() {
         use crate::RuntimePerformanceOperation as Op;
-        let (_dir, app, relay, mut client) = native_fixture().await;
+        let (_dir, _app, relay, mut client) = native_fixture().await;
         let telemetry = marmot_observability::PerformanceRecorder::default();
         client.runtime_telemetry = Some(telemetry.clone());
         let spans = |op: Op| {
@@ -2877,12 +2858,7 @@ mod tests {
             spans(Op::ReplaySyncSourcesChanged).0 >= 1,
             "opening the transport syncs its first generation"
         );
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         let generation = client.adapter.replay_admission().await.generation();
         assert!(client.recovery_owner.native_replay_authorizes(generation));
@@ -2912,7 +2888,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_generation_change_during_a_pass_counts_as_a_source_change() {
         use crate::RuntimePerformanceOperation as Op;
-        let (_dir, app, relay, mut client) = native_fixture().await;
+        let (_dir, _app, relay, mut client) = native_fixture().await;
         let telemetry = marmot_observability::PerformanceRecorder::default();
         client.runtime_telemetry = Some(telemetry.clone());
         let changed = || {
@@ -2925,12 +2901,7 @@ mod tests {
                 .completed
         };
         client.prepare_transport().await.unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         let first = client.adapter.replay_admission().await.generation();
         assert!(client.recovery_owner.native_replay_authorizes(first));
@@ -3177,12 +3148,7 @@ mod tests {
             client.test_comparison_results = Some(scripted_routes(&grant, |_| false));
             client.run_recovery_grant_for_test(grant).await.unwrap();
             // The live REQs' own EOSE arrives only after the capture.
-            crate::tests::report_scripted_eose(
-                &app.relay_plane,
-                &relay,
-                crate::tests::every_subscription,
-            )
-            .await;
+            relay.answer_held_replies().await;
             client.synchronize_native_replay().await.unwrap();
             assert_eq!(client.recovery_owner.replay_complete, admitted, "{end:?}");
         }
@@ -3253,12 +3219,7 @@ mod tests {
                 .iter()
                 .any(|scope| { scope.plan.since_seconds.is_none() && !scope.replay_admitted })
         );
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.replay_complete);
         assert!(client.subscription_rebuild_since().unwrap().is_some());
@@ -3268,12 +3229,7 @@ mod tests {
     async fn native_generation_rearms() {
         let (_dir, app, relay, mut client) = native_fixture().await;
         client.prepare_transport().await.unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         let old_generation = client.recovery_owner.replay_generation.unwrap();
         let old_ticket = client.recovery_owner.replay_ticket.unwrap();
@@ -3333,17 +3289,9 @@ mod tests {
         }
         client.routing.replace(routing);
         client.sync_runtime_groups().await.unwrap();
-        for request in relay.accepted_subscriptions() {
-            for endpoint in request
-                .endpoints()
-                .iter()
-                .filter(|endpoint| endpoint.as_str() != "wss://quiet.example")
-            {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), request.subscription_id())
-                    .await;
-            }
-        }
+        relay
+            .release_held_replies(|_, endpoint| endpoint.as_str() != "wss://quiet.example")
+            .await;
         client.synchronize_native_replay().await.unwrap();
         let storage = app.account_storage("alice").unwrap().app_storage();
         let ticket = client.recovery_owner.replay_ticket.unwrap();
@@ -3382,17 +3330,9 @@ mod tests {
             .activate_transport(Some(cgka_traits::Timestamp(unix_now_seconds())))
             .await
             .unwrap();
-        for request in relay.accepted_subscriptions() {
-            for endpoint in request
-                .endpoints()
-                .iter()
-                .filter(|endpoint| endpoint.as_str() != "wss://quiet.example")
-            {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), request.subscription_id())
-                    .await;
-            }
-        }
+        relay
+            .release_held_replies(|_, endpoint| endpoint.as_str() != "wss://quiet.example")
+            .await;
         client.synchronize_native_replay().await.unwrap();
         let scopes = storage.recovery_scope_snapshots(ticket.id).unwrap();
         assert!(
@@ -3427,15 +3367,12 @@ mod tests {
         for request in requests {
             if request.carries_group(&group) {
                 assert_eq!(request.endpoints().len(), 1);
-                app.relay_plane
-                    .handle_relay_closed_for_test(
-                        request.endpoints()[0].clone(),
-                        request.subscription_id(),
-                        transport_nostr_adapter::SubscriptionRefusal {
-                            category: None,
-                            disposition:
-                                transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
-                        },
+                // An unclassified refusal: the relay drops the REQ for good.
+                relay
+                    .close_subscription(
+                        &request.endpoints()[0],
+                        &request.subscription_id(),
+                        "request refused",
                     )
                     .await;
                 refused = true;
@@ -3544,11 +3481,6 @@ mod tests {
             &recipient.account_id_hex,
             "wss://relay.example",
         );
-        let pump = crate::tests::scripted_eose_pump(
-            app.relay_plane.clone(),
-            relay.clone(),
-            crate::tests::every_subscription,
-        );
         let mut receiver = crate::tests::client_on_app_relay_plane(&app, "bob").await;
         receiver.publish_key_package().await.unwrap();
         receiver.prepare_transport().await.unwrap();
@@ -3564,14 +3496,8 @@ mod tests {
                 .joined_groups
                 .contains(&group)
         );
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         sender.synchronize_native_replay().await.unwrap();
-        drop(pump);
         // The terminal commit joins an unresolved native range. It cannot
         // bypass that range through local publication's ordinary queue.
         receiver.runtime.activate_transport(None).await.unwrap();
@@ -3604,12 +3530,7 @@ mod tests {
                 if matches!(termination, NativeTermination::Disband) {
                     sender.retry_group_convergence(&group).await.unwrap();
                 }
-                crate::tests::report_scripted_eose(
-                    &app.relay_plane,
-                    &relay,
-                    crate::tests::every_subscription,
-                )
-                .await;
+                relay.answer_held_replies().await;
                 receiver.admit_native_turn().await.unwrap();
                 receiver
                     .advance_convergence_after_runtime_sync(&group)
@@ -3624,12 +3545,7 @@ mod tests {
         .await
         .expect("the real terminal backlog commit settles");
         receiver.sync_runtime_groups().await.unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         receiver.synchronize_native_replay().await.unwrap();
         assert!(
             storage
@@ -3695,12 +3611,7 @@ mod tests {
             .activate_transport(Some(cgka_traits::Timestamp(unix_now_seconds())))
             .await
             .unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         let ticket = client.recovery_owner.replay_ticket.unwrap();
         assert!(ticket.revision > old_ticket.revision);
@@ -3732,12 +3643,7 @@ mod tests {
         // A genuine new source covering the old window resumes, without
         // weakening that window or treating a terminal refusal as capturable.
         client.runtime.activate_transport(None).await.unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.replay_complete);
         assert!(storage.parked_recovery_obligations().unwrap().is_empty());
@@ -3774,12 +3680,7 @@ mod tests {
         }
         client.routing.replace(routing);
         client.sync_runtime_groups().await.unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client.synchronize_native_replay().await.unwrap();
         assert!(!client.runtime.group_record(&group).unwrap().is_terminal());
         let stored = storage.recovery_scope_snapshots(ticket.id).unwrap();
@@ -4995,7 +4896,6 @@ mod tests {
     async fn verify_maintenance_boundary_request(incremental: bool) {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
         };
         use cgka_traits::storage::MaintenanceStorage;
         let directory = tempfile::tempdir().unwrap();
@@ -5015,13 +4915,12 @@ mod tests {
             relay.clone(),
             true,
         );
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client
             .create_group("maintenance predicate", &[])
             .await
             .unwrap();
-        crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
+        crate::tests::settle_live_replay(&mut client).await;
         let storage = app.account_storage("alice").unwrap();
         let job = cgka_traits::MaintenanceObligation {
             id: cgka_traits::MessageId::new(vec![55; 32]),
@@ -5119,12 +5018,8 @@ mod tests {
             maintenance,
             "recovery never touches live subscriptions"
         );
-        let (subscription, route) = &client.post_join_maintenance_subscriptions[&group];
-        for endpoint in &route.endpoints {
-            app.relay_plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.clone())
-                .await;
-        }
+        // The relay answered the boundary's REQ when it arrived.
+        relay.replies_handled().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -5154,10 +5049,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frozen_wake_preserves_recovery_debt_and_cost_until_explicit_full_repair() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let directory = tempfile::tempdir().unwrap();
         crate::AccountHome::open(directory.path())
             .create_account("alice")
@@ -5170,12 +5062,11 @@ mod tests {
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         // Startup source facts are passive native duty, not frozen-wake L1
         // recovery. Settle that lifecycle before capturing the full debt fence
         // whose preservation this test checks.
-        crate::tests::report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         client.synchronize_native_replay().await.unwrap();
         let storage = app.account_storage("alice").unwrap().app_storage();
         storage
@@ -5231,7 +5122,6 @@ mod tests {
     async fn post_join_maintenance_req_is_floored_at_its_welcome_not_the_join() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
         };
         use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
         let directory = tempfile::tempdir().unwrap();
@@ -5246,7 +5136,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let joined = client.create_group("offline member", &[]).await.unwrap();
         let created_here = client.create_group("created here", &[]).await.unwrap();
@@ -5325,7 +5214,6 @@ mod tests {
     async fn verify_post_join_boundary_and_grace() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
         };
         use cgka_traits::storage::MaintenanceStorage;
         let directory = tempfile::tempdir().unwrap();
@@ -5340,7 +5228,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client
             .create_group("maintenance predicate", &[])
@@ -5394,7 +5281,7 @@ mod tests {
         client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_eq!(client.post_join_maintenance_subscriptions.len(), 1);
         // The boundary is the installed REQ's own end of stored events.
-        crate::tests::report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -5537,7 +5424,6 @@ mod tests {
     async fn paused_post_join_sweep_requests_nothing_and_drops_its_session() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
         };
         use cgka_traits::storage::MaintenanceStorage;
         let directory = tempfile::tempdir().unwrap();
@@ -5552,7 +5438,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("paused post-join", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
@@ -5627,12 +5512,13 @@ mod tests {
         );
     }
 
-    /// Every subscription but a post-join maintenance REQ, whose end of stored
-    /// events the test reports itself.
-    fn not_post_join_maintenance(
+    /// A post-join maintenance REQ, whose end of stored events the test
+    /// places itself.
+    fn post_join_maintenance(
         subscription: &transport_nostr_adapter::NostrSubscription,
+        _: &cgka_traits::TransportEndpoint,
     ) -> bool {
-        !matches!(
+        matches!(
             subscription,
             transport_nostr_adapter::NostrSubscription::GroupMaintenance { .. }
         )
@@ -5679,7 +5565,6 @@ mod tests {
         tempfile::TempDir,
         crate::MarmotApp,
         Arc<crate::tests::ScriptedPushRelayClient>,
-        crate::tests::ScriptedEosePump,
         AppClient,
         cgka_traits::GroupId,
     ) {
@@ -5696,15 +5581,12 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let pump = crate::tests::scripted_eose_pump(
-            app.relay_plane.clone(),
-            relay.clone(),
-            not_post_join_maintenance,
-        );
+        // These tests see the post-join session before and after its EOSE.
+        relay.hold_replies(Some(post_join_maintenance));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         client.prepare_transport().await.unwrap();
         let group = client.create_group(name, &[]).await.unwrap();
-        (directory, app, relay, pump, client, group)
+        (directory, app, relay, client, group)
     }
 
     /// Request the group's post-join session and run the recovery job that
@@ -5743,7 +5625,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_commit_during_post_join_catch_up_keeps_the_history_req_until_its_eose() {
         use cgka_traits::storage::MaintenanceStorage;
-        let (_directory, app, relay, _pump, mut client, group) =
+        let (_directory, app, relay, mut client, group) =
             post_join_fetch_fixture("commit during catch-up").await;
         let storage = app.account_storage("alice").unwrap();
         let fetch = owe_post_join_history_fetch(&storage, &group, 61);
@@ -5775,12 +5657,7 @@ mod tests {
             None
         );
 
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -5809,7 +5686,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unanswered_post_join_history_fetch_ends_at_its_deadline() {
         use cgka_traits::storage::MaintenanceStorage;
-        let (_directory, app, _relay, _pump, mut client, group) =
+        let (_directory, app, _relay, mut client, group) =
             post_join_fetch_fixture("unanswered fetch").await;
         let storage = app.account_storage("alice").unwrap();
         let fetch = owe_post_join_history_fetch(&storage, &group, 62);
@@ -5865,7 +5742,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_qualified_post_join_boundary_waits_past_the_deadline_for_processing() {
         use cgka_traits::storage::MaintenanceStorage;
-        let (_directory, app, relay, _pump, mut client, group) =
+        let (_directory, app, relay, mut client, group) =
             post_join_fetch_fixture("processing past deadline").await;
         let storage = app.account_storage("alice").unwrap();
         let fetch = owe_post_join_history_fetch(&storage, &group, 67);
@@ -5878,12 +5755,7 @@ mod tests {
         let ingress = client.recovery_owner.native_ingress.take();
         assert!(ingress.is_some());
 
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -5936,7 +5808,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rearmed_self_update_keeps_the_fetch_session_checkpointable() {
         use cgka_traits::storage::MaintenanceStorage;
-        let (_directory, app, relay, _pump, mut client, group) =
+        let (_directory, app, relay, mut client, group) =
             post_join_fetch_fixture("re-armed self-update").await;
         let storage = app.account_storage("alice").unwrap();
         let fetch = owe_post_join_history_fetch(&storage, &group, 68);
@@ -5960,12 +5832,7 @@ mod tests {
         );
         assert!(maintenance_boundary_requested(&storage));
 
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -5987,7 +5854,7 @@ mod tests {
     /// no boundary is requested for it again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_left_copy_drops_its_owed_post_join_history_fetch() {
-        let (_directory, app, _relay, _pump, mut client, group) =
+        let (_directory, app, _relay, mut client, group) =
             post_join_fetch_fixture("left mid-fetch").await;
         let storage = app.account_storage("alice").unwrap();
         owe_post_join_history_fetch(&storage, &group, 66);
@@ -6011,7 +5878,7 @@ mod tests {
     /// left the self-update obligation nothing to wait for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_restarted_client_resumes_an_unfinished_post_join_history_fetch() {
-        let (_directory, app, relay, _pump, mut client, group) =
+        let (_directory, app, relay, mut client, group) =
             post_join_fetch_fixture("restart mid-fetch").await;
         let storage = app.account_storage("alice").unwrap();
         let fetch = owe_post_join_history_fetch(&storage, &group, 63);
@@ -6030,12 +5897,7 @@ mod tests {
             client.post_join_history_sessions[&subscription].fetch,
             fetch
         );
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -6060,7 +5922,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replacement_welcome_starts_a_new_post_join_history_fetch() {
         use cgka_traits::storage::MaintenanceStorage;
-        let (_directory, app, relay, _pump, mut client, group) =
+        let (_directory, app, relay, mut client, group) =
             post_join_fetch_fixture("re-invite").await;
         let storage = app.account_storage("alice").unwrap();
         let first = owe_post_join_history_fetch(&storage, &group, 64);
@@ -6071,12 +5933,7 @@ mod tests {
         // own obligation. The earlier copy's stays live until maintenance sees
         // that its leaf has rotated.
         let second = owe_post_join_history_fetch(&storage, &group, 65);
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -6112,12 +5969,7 @@ mod tests {
             .advance_post_join_maintenance_subscriptions()
             .await
             .unwrap();
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -6140,7 +5992,7 @@ mod tests {
     /// fetch's own demand, whose EOSE ends the fetch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_session_granted_before_a_replacement_welcome_is_requested_again() {
-        let (_directory, app, relay, _pump, mut client, group) =
+        let (_directory, app, relay, mut client, group) =
             post_join_fetch_fixture("stale grant").await;
         let storage = app.account_storage("alice").unwrap();
         owe_post_join_history_fetch(&storage, &group, 66);
@@ -6170,12 +6022,7 @@ mod tests {
             client.post_join_maintenance_subscriptions[&group].0,
             stale_session
         );
-        crate::tests::report_scripted_eose(
-            &app.relay_plane,
-            &relay,
-            crate::tests::every_subscription,
-        )
-        .await;
+        relay.answer_held_replies().await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -6221,10 +6068,7 @@ mod tests {
     /// old owner still selects it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unrecoverable_groups_epoch_gap_is_suspended_once_the_runner_owns_debt() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         use cgka_traits::storage::GroupStorage;
         use storage_sqlite::{RecoveryCause, RecoveryEligibility};
         for owns_debt in [false, true] {
@@ -6239,8 +6083,6 @@ mod tests {
             if owns_debt {
                 app = app.with_recovery_runner_owning_debt();
             }
-            let _pump =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group = client.create_group("suspended", &[]).await.unwrap();
             let storage = app.account_storage("alice").unwrap();
@@ -6305,10 +6147,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_history_is_bounded_while_epoch_input_remains_retryable() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         use storage_sqlite::{RecoveryCause, RecoveryEligibility};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
@@ -6318,7 +6157,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("retry policy", &[]).await.unwrap();
         let epoch = client.group_mls_state(&group).unwrap().epoch;
@@ -7080,7 +6918,6 @@ mod tests {
         Arc<crate::tests::ScriptedPushRelayClient>,
         crate::MarmotApp,
         AppClient,
-        crate::tests::ScriptedEosePump,
     ) {
         loss_fixture(Some(unix_now_seconds())).await
     }
@@ -7094,7 +6931,6 @@ mod tests {
         Arc<crate::tests::ScriptedPushRelayClient>,
         crate::MarmotApp,
         AppClient,
-        crate::tests::ScriptedEosePump,
     ) {
         loss_fixture_with_relays(bound, vec!["wss://relay.example".into()]).await
     }
@@ -7107,12 +6943,8 @@ mod tests {
         Arc<crate::tests::ScriptedPushRelayClient>,
         crate::MarmotApp,
         AppClient,
-        crate::tests::ScriptedEosePump,
     ) {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7125,7 +6957,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         // A checkpointed cursor: the account opens without an unbounded
         // no-cursor investigation, so the loss is the only debt.
         let mut state = app.load_state("alice").unwrap();
@@ -7133,7 +6964,7 @@ mod tests {
         app.save_state(&state).unwrap();
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("certified loss", &[]).await.unwrap();
-        crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
+        crate::tests::settle_live_replay(&mut client).await;
         let storage = app.account_storage("alice").unwrap().app_storage();
         // The lost deliveries are inside every route's retained window, which
         // starts when the account first retained that route.
@@ -7143,7 +6974,7 @@ mod tests {
         storage.synchronize_account_delivery_loss("alice").unwrap();
         client.delivery_overflow_recovery_pending = true;
         client.delivery_overflow_recovery_marker_token = Some(41);
-        (dir, relay, app, client, pump)
+        (dir, relay, app, client)
     }
 
     fn scripted_routes(
@@ -7218,7 +7049,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_loss_completes_on_certified_comparisons_without_unfloored_replay() {
-        let (_dir, relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let (_dir, relay, app, mut client) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
         let unfloored = relay.unfloored_account_subscription_count();
         let grant = client
@@ -7259,7 +7090,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn later_passes_keep_certificates_from_earlier_passes() {
-        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let (_dir, _relay, app, mut client) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
         let group = |route: &storage_sqlite::TransportReconciliationRoute| {
             matches!(
@@ -7305,7 +7136,7 @@ mod tests {
     /// certificates, and only uncertified routes are compared again (mdk#2110).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_new_route_keeps_certificates_of_unchanged_routes() {
-        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let (_dir, _relay, app, mut client) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
         let inbox = |route: &storage_sqlite::TransportReconciliationRoute| {
             matches!(route, storage_sqlite::TransportReconciliationRoute::Inbox)
@@ -7364,7 +7195,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn served_passes_that_certify_nothing_park_the_obligation() {
         // No known start: every served comparison finishes, none can certify.
-        let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
+        let (_dir, _relay, app, mut client) = loss_fixture(None).await;
         let storage = app.account_storage("alice").unwrap();
         for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
             let grant = client
@@ -7398,7 +7229,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_required_relay_outages_keep_retrying_without_spending_budget() {
-        let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
+        let (_dir, _relay, app, mut client) = loss_fixture(None).await;
         let storage = app.account_storage("alice").unwrap();
         for pass in 1..=8 {
             let grant = client
@@ -7422,7 +7253,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_required_relay_failures_park_after_exactly_six_passes() {
-        let (_dir, _relay, app, mut client, _pump) = loss_fixture_with_relays(
+        let (_dir, _relay, app, mut client) = loss_fixture_with_relays(
             None,
             vec!["wss://relay.example".into(), "wss://second.example".into()],
         )
@@ -7489,7 +7320,7 @@ mod tests {
     async fn a_permanently_unfetchable_id_parks_after_quiet_passes() {
         // The relays finish every comparison, but one ID they claim can never
         // be fetched: over the single-event ceiling, or always withheld.
-        let (_dir, _relay, app, mut client, _pump) = loss_fixture(Some(unix_now_seconds())).await;
+        let (_dir, _relay, app, mut client) = loss_fixture(Some(unix_now_seconds())).await;
         let storage = app.account_storage("alice").unwrap();
         for pass in 1..=RECOVERY_PARK_AFTER_ATTEMPTS {
             assert_ne!(
@@ -7519,10 +7350,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_parked_history_debt_leaves_no_comparison_slot_retrying() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7531,10 +7359,9 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("withheld history", &[]).await.unwrap();
-        crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
+        crate::tests::settle_live_replay(&mut client).await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap();
         let history = || {
@@ -7569,10 +7396,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_compares_routes_added_after_its_join_through_their_debt() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7587,7 +7411,6 @@ mod tests {
             relay.clone(),
             app.config.allow_loopback_relay_endpoints,
         );
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
         let app = storage.app_storage();
@@ -7674,10 +7497,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_executes_against_the_rebuilt_endpoint_set_without_false_coverage() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7686,7 +7506,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap();
@@ -7773,7 +7592,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_history_completion_releases_comparison_and_other_recovery() {
-        let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
+        let (_dir, _relay, app, mut client) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
         let app = storage.app_storage();
         client.request_bounded_comparison().unwrap();
@@ -7847,10 +7666,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incremental_recovery_follows_replaced_inbox_relays_without_a_comparison_request() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7859,7 +7675,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
         storage
@@ -7924,7 +7739,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quiet_slices_park_only_after_every_route_was_compared() {
-        let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
+        let (_dir, _relay, app, mut client) = loss_fixture(None).await;
         for index in 0..4 {
             client
                 .create_group(&format!("slice {index}"), &[])
@@ -7963,10 +7778,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn best_effort_relay_failure_completes_on_the_operated_relay() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         use storage_sqlite::RecoveryComparisonOutcome as Outcome;
         const OPERATED: &str = "wss://operated.example";
         const BEST_EFFORT: &str = "wss://best-effort.example";
@@ -7985,7 +7797,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client
             .create_group_with_options(
@@ -8093,10 +7904,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_runtime_retries_failed_route_without_reissuing_successful_sibling() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -8105,7 +7913,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("comparison routes", &[]).await.unwrap();
         client.request_bounded_comparison().unwrap();
@@ -8203,7 +8010,7 @@ mod tests {
              retry together complete the cold-start debt"
         );
         client.prepare_transport().await.unwrap();
-        crate::tests::report_scripted_eose(&client.relay_plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         client.synchronize_native_replay().await.unwrap();
         let revision = app.recovery_comparison().unwrap().revision;
         let cost = app.recovery_retry_state().unwrap();
@@ -8216,8 +8023,7 @@ mod tests {
                 .await
                 .unwrap();
             client.prepare_transport().await.unwrap();
-            crate::tests::report_scripted_eose(&client.relay_plane, &relay, every_subscription)
-                .await;
+            relay.replies_handled().await;
             client
                 .run_pending_epoch_backfill(
                     marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
@@ -8292,10 +8098,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn absent_comparison_backend_stays_parked_across_new_startup_requests() {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+        use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -8304,7 +8107,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap().app_storage();

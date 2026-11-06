@@ -25,6 +25,23 @@ impl transport_nostr::DirectoryRelayFetcher for CrashRelay {
 
 #[async_trait]
 impl NostrRelayClient for CrashRelay {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        self.inner.relay_notification_source()
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.inner
+            .reply_sent_nothing(account, endpoint, subscription_id)
+            .await
+    }
+
     async fn subscribe(
         &self,
         subscription: NostrSubscription,
@@ -244,11 +261,6 @@ async fn message_journey_queue_cancel() {
     let group = client.create_group("journey", &[]).await.unwrap();
     drop(client);
     let runtime = app.runtime();
-    let _eose = scripted_eose_pump(
-        runtime.shared_services().relay_plane().clone(),
-        relay.clone(),
-        every_subscription,
-    );
     runtime.reconcile_accounts().await.unwrap();
     relay.block_next_publish();
     let sender = runtime.clone();

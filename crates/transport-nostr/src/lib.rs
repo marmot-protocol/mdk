@@ -29,9 +29,10 @@ use transport_nostr_adapter::{
     AccountSubscriptionEose, AccountSubscriptionInput, NostrAcquisitionCancellation,
     NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrNotificationLossBounds, NostrNotificationLossFloor, NostrPublishOutcome,
-    NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient, NostrSdkNotification,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter,
-    RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome, SubscriptionAttempt,
+    NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient,
+    NostrRelayNotificationSource, NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth,
+    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
+    RelayRegistrationOutcome, SubscriptionAttempt,
 };
 
 pub use transport_nostr_adapter::{
@@ -141,6 +142,10 @@ struct MarmotRelayPlaneInner {
 struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
+    /// An injected relay client's own relay messages
+    /// ([`NostrRelayClient::relay_notification_source`]), read by the same
+    /// supervised consumer as a single SDK client's.
+    injected_notifications: Option<Arc<dyn NostrRelayNotificationSource>>,
     directory_client: Option<NostrSdkClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
@@ -1356,11 +1361,13 @@ impl MarmotRelayPlane {
         relay_client: Arc<dyn NostrRelayClient>,
         allow_loopback: bool,
     ) -> Self {
+        let notifications = relay_client.relay_notification_source();
         let adapter = NostrTransportAdapter::new(relay_client);
         Self::from_adapter(
             subscription_rebuild_lookback,
             adapter,
             None,
+            notifications,
             None,
             Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
             allow_loopback,
@@ -1375,10 +1382,12 @@ impl MarmotRelayPlane {
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
         allow_loopback: bool,
     ) -> Self {
+        let notifications = relay_client.relay_notification_source();
         Self::from_adapter(
             subscription_rebuild_lookback,
             NostrTransportAdapter::new(relay_client),
             None,
+            notifications,
             None,
             directory_fetcher,
             allow_loopback,
@@ -1393,6 +1402,7 @@ impl MarmotRelayPlane {
             subscription_rebuild_lookback,
             adapter,
             Some(relay_client),
+            None,
             Some(directory_client.clone()),
             Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
             allow_loopback,
@@ -1403,6 +1413,7 @@ impl MarmotRelayPlane {
         subscription_rebuild_lookback: Option<Duration>,
         adapter: NostrTransportAdapter,
         sdk_relay_client: Option<NostrSdkRelayClient>,
+        injected_notifications: Option<Arc<dyn NostrRelayNotificationSource>>,
         directory_client: Option<NostrSdkClient>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
         allow_loopback: bool,
@@ -1410,6 +1421,7 @@ impl MarmotRelayPlane {
         let transport = Arc::new(RelayPlaneTransport {
             adapter,
             sdk_relay_client,
+            injected_notifications,
             directory_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
@@ -2281,6 +2293,26 @@ impl MarmotRelayPlane {
                         self.inner.transport.clone(),
                     ));
                 }
+            } else if needs_forwarder
+                && let Some(source) = &self.inner.transport.injected_notifications
+            {
+                if notification_forwarder.take().is_some() {
+                    recover_relay_notification_forwarder(
+                        &self.inner.transport,
+                        RelayNotificationConsumerExit::Closed,
+                    );
+                }
+                let source: Arc<dyn RelayNotificationSource> =
+                    Arc::new(InjectedRelayNotificationSource(source.clone()));
+                // Read from now on: a fake relay answers a REQ as it is sent,
+                // which can be before the consumer task first runs.
+                let receiver = source.notifications();
+                *notification_forwarder = Some(spawn_relay_notification_supervisor_reading(
+                    source,
+                    self.inner.transport.clone(),
+                    None,
+                    Some(receiver),
+                ));
             }
         }
         if let Ok(mut forwarder) = self
@@ -2384,41 +2416,6 @@ impl MarmotRelayPlane {
             .get_mut(account_id)
             .map(|route| route.spill = None)
             .is_some()
-    }
-
-    /// Report end-of-stored-events for one subscription on one endpoint, the
-    /// way [`handle_relay_notification`] does for an SDK-backed plane. An
-    /// injected relay client produces no relay messages of its own, so tests
-    /// that need a subscription's end of stored events drive this seam.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub async fn handle_relay_eose_for_test(
-        &self,
-        endpoint: TransportEndpoint,
-        subscription_id: String,
-    ) {
-        self.inner
-            .transport
-            .adapter
-            .handle_relay_eose(endpoint, subscription_id)
-            .await;
-    }
-
-    /// Report a relay's `CLOSED` for one subscription on one endpoint, the
-    /// way the SDK notification forwarder does.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub async fn handle_relay_closed_for_test(
-        &self,
-        endpoint: TransportEndpoint,
-        subscription_id: String,
-        refusal: transport_nostr_adapter::SubscriptionRefusal,
-    ) {
-        self.inner
-            .transport
-            .adapter
-            .handle_relay_closed(endpoint, subscription_id, refusal)
-            .await;
     }
 
     /// Drive every managed account worker through its receive-error reconnect
@@ -2762,6 +2759,22 @@ impl RelayNotificationSource for SdkRelayNotificationSource {
     }
 }
 
+/// An injected relay client's messages. It has no SDK registry or REQ floors
+/// to consult: a `CLOSED` keeps `auth-required:` pending, and a lag is loss
+/// from no known floor.
+struct InjectedRelayNotificationSource(Arc<dyn NostrRelayNotificationSource>);
+
+impl RelayNotificationSource for InjectedRelayNotificationSource {
+    fn notifications(&self) -> RelayNotificationStream {
+        self.0.notifications()
+    }
+
+    /// The stream itself reports a shutdown.
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+}
+
 fn spawn_relay_notification_forwarder(
     sdk_relay_client: NostrSdkRelayClient,
     transport: Arc<RelayPlaneTransport>,
@@ -2873,9 +2886,20 @@ fn spawn_relay_notification_supervisor_scoped(
     transport: Arc<RelayPlaneTransport>,
     account_id: Option<MemberId>,
 ) -> JoinHandle<()> {
+    spawn_relay_notification_supervisor_reading(source, transport, account_id, None)
+}
+
+/// [`spawn_relay_notification_supervisor_scoped`], whose first consumer reads
+/// `receiver` when one is given instead of asking the source for one.
+fn spawn_relay_notification_supervisor_reading(
+    source: Arc<dyn RelayNotificationSource>,
+    transport: Arc<RelayPlaneTransport>,
+    account_id: Option<MemberId>,
+    receiver: Option<RelayNotificationStream>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _running = RunningSupervisorGuard::new(transport.notification_forwarder_health.clone());
-        let mut receiver = None;
+        let mut receiver = receiver;
         let mut restart_backoff = RelayNotificationRestartBackoff::default();
         loop {
             let adapter = transport.adapter.clone();

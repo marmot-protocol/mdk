@@ -1271,11 +1271,6 @@ async fn the_runtime_announces_a_device_group_join_and_lists_its_devices() {
         .account("alice")
         .unwrap()
         .account_id_hex;
-    let _eose = scripted_eose_pump(
-        laptop_app.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
@@ -1393,7 +1388,6 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
 async fn a_restart_that_settles_trust_announces_it() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         mut phone,
         link,
@@ -1420,7 +1414,6 @@ async fn a_restart_that_settles_trust_announces_it() {
         .account("alice")
         .unwrap()
         .account_id_hex;
-    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
@@ -1438,7 +1431,6 @@ async fn a_restart_that_settles_trust_announces_it() {
 async fn a_reconnect_announces_again() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         mut phone,
         link,
@@ -1451,7 +1443,6 @@ async fn a_reconnect_announces_again() {
         .account("alice")
         .unwrap()
         .account_id_hex;
-    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();

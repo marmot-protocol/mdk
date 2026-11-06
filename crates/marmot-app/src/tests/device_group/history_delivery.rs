@@ -1174,7 +1174,6 @@ async fn the_runtime_fetches_a_blossom_history_and_shows_it_at_once() {
 
     let Devices {
         _dirs,
-        relay,
         laptop_app,
         laptop,
         ..
@@ -1185,7 +1184,6 @@ async fn the_runtime_fetches_a_blossom_history_and_shows_it_at_once() {
         .account("alice")
         .unwrap()
         .account_id_hex;
-    let _eose = scripted_eose_pump(laptop_app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();

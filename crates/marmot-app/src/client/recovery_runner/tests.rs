@@ -1434,7 +1434,6 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_real_ta
         .as_secs();
     let Fixture {
         _dir,
-        _pump,
         relay: scripted,
         client,
         storage,
@@ -1483,7 +1482,6 @@ async fn recovery_runner_explicit_repair_revisits_a_healthy_live_tail() {
     use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture, relay, routes};
     let Fixture {
         _dir,
-        _pump,
         client,
         storage,
         ..

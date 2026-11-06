@@ -43,27 +43,13 @@ impl Device {
         }
     }
 
-    /// Answer this device's REQs with end-of-stored-events, as a relay does,
-    /// for as long as the pump lives. The scripted relay sends none on its
-    /// own. A Commit opens a settlement window on this device only once its
-    /// live REQs have their EOSE; without one, the device merges the Commit
-    /// with its own next change and sends that at once.
-    pub(super) fn answer_eose(&self, relay: &Arc<ScriptedPushRelayClient>) -> ScriptedEosePump {
-        scripted_eose_pump(
-            self.client.relay_plane.clone(),
-            relay.clone(),
-            every_subscription,
-        )
-    }
-
     pub(super) async fn receive(&mut self, relay: &ScriptedPushRelayClient) {
         deliver_new(&mut self.client, relay, &mut self.cursor).await;
         self.client.sync().await.unwrap();
     }
 
     /// This device can fetch from now on and has settled, so it announces as
-    /// soon as it owes one. The scripted relay sends no EOSE, so its own
-    /// catch-up never shows as run.
+    /// soon as it owes one.
     pub(super) async fn can_fetch(&mut self) {
         self.client.test_push_device_can_fetch = Some(true);
         self.client.push_announce_timing.catch_up_settle = std::time::Duration::ZERO;

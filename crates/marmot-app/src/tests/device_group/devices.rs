@@ -925,7 +925,6 @@ async fn a_rename_needs_a_device_group() {
 async fn the_runtime_renames_a_device_and_announces_it() {
     let Devices {
         _dirs,
-        relay,
         phone_app,
         mut phone,
         laptop,
@@ -940,7 +939,6 @@ async fn the_runtime_renames_a_device_and_announces_it() {
         .account("alice")
         .unwrap()
         .account_id_hex;
-    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
