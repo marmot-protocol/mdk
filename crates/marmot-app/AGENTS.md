@@ -1108,7 +1108,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   correlation; no relay I/O),
   `user_blocks.rs` (block policy and NIP-51 sync), `emoji_sets.rs` (NIP-51 emoji sets: text-only discovery,
   the account's kind-10030 list read only, installed snapshots pinned by event id and SHA-256; tests in
-  `emoji_sets/tests.rs`; image bytes only from `install_emoji_set` and `fetch_emoji_set_asset`, never from sync, and
+  `emoji_sets/tests.rs`; image bytes only from `install_emoji_set`, `fetch_emoji_set_asset` and `fetch_emoji_set_cover`,
+  each bound to the shown version's event id, never from sync, and
   never write kind 10030 or put a set URL or address in a message), `image_inspect.rs` (PNG/APNG, GIF, WebP and JPEG
   header inspection and dimension/frame caps shared by stickers and emoji sets; stickers still refuse JPEG),
   `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports

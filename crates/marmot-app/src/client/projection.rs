@@ -1573,6 +1573,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::EmojiImageTooLarge(_) => "read_marker_failed:emoji_image_too_large",
         AppError::EmojiImageUnsupported(_) => "read_marker_failed:emoji_image_unsupported",
         AppError::EmojiSetLimit(_) => "read_marker_failed:emoji_set_limit",
+        AppError::EmojiSetChanged { .. } => "read_marker_failed:emoji_set_changed",
+        AppError::EmojiSetInstallCancelled => "read_marker_failed:emoji_set_install_cancelled",
         AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
         AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",

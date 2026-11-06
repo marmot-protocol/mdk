@@ -501,6 +501,16 @@ pub enum MarmotKitError {
     /// Installed-set or stored-byte cap reached.
     #[error("emoji set limit reached: {details}")]
     EmojiSetLimit { details: String },
+    // Plain comments here: this enum's UniFFI metadata, docstrings
+    // included, is near the 16 KiB buffer limit. The stored set version is
+    // not the one the user was shown; nothing was downloaded. Show the set
+    // again (`emoji_set`) and retry with `current_event_id_hex`.
+    #[error("emoji set changed; current version {current_event_id_hex}")]
+    EmojiSetChanged { current_event_id_hex: String },
+    // Cancelled through its control, or by runtime shutdown or close.
+    // Nothing was stored.
+    #[error("emoji set install was cancelled")]
+    EmojiSetInstallCancelled,
     /// This device was unlinked from the account by its other devices. The
     /// account stays signed out here: wipe it, then link the device again
     /// (mdk#2628 D67).
@@ -853,6 +863,12 @@ impl From<&AppError> for MarmotKitError {
             AppError::EmojiSetLimit(details) => Self::EmojiSetLimit {
                 details: details.clone(),
             },
+            AppError::EmojiSetChanged {
+                current_event_id_hex,
+            } => Self::EmojiSetChanged {
+                current_event_id_hex: current_event_id_hex.clone(),
+            },
+            AppError::EmojiSetInstallCancelled => Self::EmojiSetInstallCancelled,
             other => Self::Runtime {
                 details: other.to_string(),
             },
@@ -1546,6 +1562,15 @@ mod tests {
                 AppError::EmojiSetLimit("50 sets".into()),
                 |e| matches!(e, MarmotKitError::EmojiSetLimit { details } if details == "50 sets"),
             ),
+            (
+                AppError::EmojiSetChanged {
+                    current_event_id_hex: "ab".into(),
+                },
+                |e| matches!(e, MarmotKitError::EmojiSetChanged { current_event_id_hex } if current_event_id_hex == "ab"),
+            ),
+            (AppError::EmojiSetInstallCancelled, |e| {
+                matches!(e, MarmotKitError::EmojiSetInstallCancelled)
+            }),
         ];
         for (app_err, expected) in cases {
             let label = format!("{app_err:?}");

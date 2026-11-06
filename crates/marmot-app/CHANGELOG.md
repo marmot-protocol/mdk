@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Emoji set image downloads are bound to the version the user was shown (breaking; the emoji set API has not
+  shipped). `install_emoji_set` takes `expected_event_id_hex` and an `&EmojiSetInstallControl`;
+  `fetch_emoji_set_asset` takes `expected_event_id_hex`. Another stored version fails with the new
+  `AppError::EmojiSetChanged { current_event_id_hex }` before any download, and install no longer fetches a set
+  that is not stored (`EmojiSetNotFound`). The control reports progress and cancels; a cancelled install, or one
+  stopped by runtime shutdown or storage close, fails with the new `AppError::EmojiSetInstallCancelled` and stores
+  nothing. Add `fetch_emoji_set_cover` for a set's cover image. Any `image/*` response type is now accepted and the
+  bytes decide the format; only non-image types (`MimeMismatch`) are refused. `emoji_sets`, `emoji_set`,
+  `installed_custom_emoji` and `read_installed_custom_emoji` are now async and read on the blocking pool.
+
 - Chat-list queries can filter by conversation kind (`ChatListCondition::Direct`, `Group`) and mute (`Muted`)
   (mdk#2983). A window whose filter tests mute re-reads at the next mute expiry among the chats in its view, so a
   chat leaves or enters it at its expiry even when it is off screen. Windows and select-all read mute at the same

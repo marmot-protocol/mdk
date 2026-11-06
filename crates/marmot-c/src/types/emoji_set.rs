@@ -1,9 +1,10 @@
 //! C mirrors of the NIP-51 emoji set conversions.
 
 use marmot_uniffi::conversions::{
-    EmojiSetAssetFfi, EmojiSetEmojiFfi, EmojiSetFfi, EmojiSetInstallResultFfi,
-    EmojiSetSyncResultFfi, EmojiSkipFfi, EmojiSkipReasonFfi, InstalledCustomEmojiAssetFfi,
-    InstalledCustomEmojiFfi, InstalledEmojiSetStateFfi, UserEmojiListFfi,
+    EmojiSetAssetFfi, EmojiSetCoverFfi, EmojiSetEmojiFfi, EmojiSetFfi, EmojiSetInstallProgressFfi,
+    EmojiSetInstallResultFfi, EmojiSetSyncResultFfi, EmojiSkipFfi, EmojiSkipReasonFfi,
+    InstalledCustomEmojiAssetFfi, InstalledCustomEmojiFfi, InstalledEmojiSetStateFfi,
+    UserEmojiListFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -120,6 +121,31 @@ c_mirror! {
         copy frames: u32,
         str sha256,
         bytes bytes/bytes_len,
+    }
+}
+
+c_mirror! {
+    /// A set's validated cover image. Not stored.
+    MarmotEmojiSetCover from EmojiSetCoverFfi,
+    free marmot_emoji_set_cover_free {
+        str set_coordinate,
+        str mime,
+        copy width: u32,
+        copy height: u32,
+        copy frames: u32,
+        str sha256,
+        bytes bytes/bytes_len,
+    }
+}
+
+c_mirror! {
+    /// Progress of one install, read with
+    /// `marmot_emoji_set_install_control_progress`. Plain values; nothing to
+    /// free.
+    MarmotEmojiSetInstallProgress from EmojiSetInstallProgressFfi {
+        copy completed_emoji: u32,
+        copy total_emoji: u32,
+        copy transferred_bytes: u64,
     }
 }
 

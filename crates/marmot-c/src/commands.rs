@@ -54,7 +54,7 @@ use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
 use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::emoji_set::{
-    MarmotEmojiSet, MarmotEmojiSetAsset, MarmotEmojiSetInstallResult, MarmotEmojiSetList,
+    MarmotEmojiSet, MarmotEmojiSetAsset, MarmotEmojiSetCover, MarmotEmojiSetList,
     MarmotEmojiSetSyncResult, MarmotInstalledCustomEmojiAsset, MarmotInstalledCustomEmojiList,
     MarmotUserEmojiList,
 };
@@ -3760,7 +3760,8 @@ c_cmd! {
 /// Read stored emoji sets, or only installed ones in install order. `search`
 /// may be NULL; it matches title, description, author (hex or `npub`) and
 /// shortcodes. `installed_only` is a uint8_t flag. `has_limit` 0 leaves the
-/// limit unset. Local only. Free with `marmot_emoji_set_list_free`.
+/// limit unset. Local only; blocks while the read runs off the embedded
+/// runtime's workers. Free with `marmot_emoji_set_list_free`.
 ///
 /// # Safety
 /// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
@@ -3783,12 +3784,12 @@ pub unsafe extern "C" fn marmot_emoji_sets(
         let limit = crate::memory::c_bool(has_limit).then_some(limit);
         unsafe {
             deliver(
-                client.marmot.emoji_sets(
+                client.block_on(client.marmot.emoji_sets(
                     account_ref,
                     crate::memory::c_bool(installed_only),
                     search,
                     limit,
-                ),
+                )),
                 out,
             )
         }
@@ -3798,7 +3799,7 @@ pub unsafe extern "C" fn marmot_emoji_sets(
 c_cmd! {
     /// Read one stored emoji set by coordinate or `naddr`. NULL when absent.
     /// Local only. Free with `marmot_emoji_set_free`.
-    sync fn marmot_emoji_set(
+    async fn marmot_emoji_set(
         account_ref: str, coordinate: str,
     ) -> opt_rec(MarmotEmojiSet) = emoji_set;
 
@@ -3823,14 +3824,6 @@ c_cmd! {
         account_ref: str,
     ) -> rec(MarmotUserEmojiList) = user_emoji_list;
 
-    /// Download each emoji of the stored set version once, validate it and
-    /// store its bytes and SHA-256. Reveals the user's IP address to the
-    /// set's image hosts: call only after the user taps Install. Free with
-    /// `marmot_emoji_set_install_result_free`.
-    async fn marmot_install_emoji_set(
-        account_ref: str, coordinate: str,
-    ) -> rec(MarmotEmojiSetInstallResult) = install_emoji_set;
-
     /// Remove an installed set and its stored bytes. Writes whether it was
     /// installed. Local only.
     async fn marmot_uninstall_emoji_set(
@@ -3839,21 +3832,33 @@ c_cmd! {
 
     /// Download one emoji of a stored set for a preview. Reveals the user's
     /// IP address to the image host: call only after the user opens the
-    /// set. Nothing is stored. Free with `marmot_emoji_set_asset_free`.
+    /// set. `expected_event_id_hex` is the version shown; another stored
+    /// version fails with `MARMOT_STATUS_EMOJI_SET_CHANGED` before any
+    /// download. Nothing is stored. Free with `marmot_emoji_set_asset_free`.
     async fn marmot_fetch_emoji_set_asset(
-        account_ref: str, coordinate: str, shortcode: str,
+        account_ref: str, coordinate: str, expected_event_id_hex: str, shortcode: str,
     ) -> rec(MarmotEmojiSetAsset) = fetch_emoji_set_asset;
+
+    /// Download a stored set's cover image under the emoji image limits.
+    /// Reveals the user's IP address to its host: call only after the user
+    /// opens the set, with the shown version's event id
+    /// (`MARMOT_STATUS_EMOJI_SET_CHANGED` otherwise). No cover is
+    /// `MARMOT_STATUS_EMOJI_SET_NOT_FOUND`. Nothing is stored. Free with
+    /// `marmot_emoji_set_cover_free`.
+    async fn marmot_fetch_emoji_set_cover(
+        account_ref: str, coordinate: str, expected_event_id_hex: str,
+    ) -> rec(MarmotEmojiSetCover) = fetch_emoji_set_cover;
 
     /// Every installed emoji for a picker, in set install order then set
     /// order. Local only. Free with `marmot_installed_custom_emoji_list_free`.
-    sync fn marmot_installed_custom_emoji(
+    async fn marmot_installed_custom_emoji(
         account_ref: str,
     ) -> rec(MarmotInstalledCustomEmojiList) = installed_custom_emoji;
 
     /// An installed emoji's stored bytes, checked against their SHA-256.
     /// Local only: never touches the network. Free with
     /// `marmot_installed_custom_emoji_asset_free`.
-    sync fn marmot_read_installed_custom_emoji(
+    async fn marmot_read_installed_custom_emoji(
         account_ref: str, coordinate: str, shortcode: str,
     ) -> rec(MarmotInstalledCustomEmojiAsset) = read_installed_custom_emoji;
 }

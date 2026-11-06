@@ -1,10 +1,13 @@
 //! NIP-51 emoji set DTOs. Discovery DTOs carry URLs for disclosure only;
 //! installed-emoji DTOs carry no URL at all.
 
+use std::sync::Arc;
+
 use marmot_app::{
-    AppEmojiSet, AppEmojiSetAsset, AppEmojiSetEmoji, AppEmojiSetInstallResult,
+    AppEmojiSet, AppEmojiSetAsset, AppEmojiSetCover, AppEmojiSetEmoji, AppEmojiSetInstallResult,
     AppEmojiSetSyncResult, AppEmojiSkip, AppEmojiSkipReason, AppInstalledCustomEmoji,
     AppInstalledCustomEmojiAsset, AppInstalledEmojiSetState, AppUserEmojiList,
+    EmojiSetInstallControl, EmojiSetInstallProgress,
 };
 
 /// Why an emoji entry was not offered or not installed.
@@ -24,7 +27,8 @@ pub enum EmojiSkipReasonFfi {
     TooLarge,
     /// Not PNG/APNG, GIF, WebP or JPEG, or malformed.
     UnsupportedImage,
-    /// The stated MIME type does not match the bytes.
+    /// Served as a non-image type (such as `text/html`). Any `image/*` type,
+    /// right or wrong, defers to the bytes.
     MimeMismatch,
 }
 
@@ -118,6 +122,8 @@ pub struct EmojiSetFfi {
     pub created_at: u64,
     pub title: Option<String>,
     pub description: Option<String>,
+    /// The cover's URL, for disclosure; load it only through
+    /// `fetch_emoji_set_cover`.
     pub image_url: Option<String>,
     pub emoji: Vec<EmojiSetEmojiFfi>,
     /// At most 64 entries; `skipped_count` counts every skipped entry.
@@ -233,6 +239,88 @@ impl From<AppEmojiSetAsset> for EmojiSetAssetFfi {
             sha256: value.sha256,
             bytes: value.bytes,
         }
+    }
+}
+
+/// A set's validated cover image (its `image` tag). Not stored.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct EmojiSetCoverFfi {
+    pub set_coordinate: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+impl From<AppEmojiSetCover> for EmojiSetCoverFfi {
+    fn from(value: AppEmojiSetCover) -> Self {
+        Self {
+            set_coordinate: value.set_coordinate,
+            mime: value.mime,
+            width: value.width,
+            height: value.height,
+            frames: value.frames,
+            sha256: value.sha256,
+            bytes: value.bytes,
+        }
+    }
+}
+
+/// Progress of one install. `completed_emoji` reaches `total_emoji` when
+/// every entry has been stored, skipped or given up on; `total_emoji` is 0
+/// until the install has read the stored version. `transferred_bytes`
+/// counts response bytes from image hosts as each download finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct EmojiSetInstallProgressFfi {
+    pub completed_emoji: u32,
+    pub total_emoji: u32,
+    pub transferred_bytes: u64,
+}
+
+impl From<EmojiSetInstallProgress> for EmojiSetInstallProgressFfi {
+    fn from(value: EmojiSetInstallProgress) -> Self {
+        Self {
+            completed_emoji: value.completed_emoji,
+            total_emoji: value.total_emoji,
+            transferred_bytes: value.transferred_bytes,
+        }
+    }
+}
+
+/// Cancellation and progress for one `install_emoji_set` call. Create one
+/// per install and poll `progress()` for a determinate bar. `cancel()`
+/// stops new downloads, drops those in flight, stores nothing and makes the
+/// install fail with `EmojiSetInstallCancelled`; a cancelled reinstall
+/// leaves the previous snapshot untouched. Shutting down or closing the
+/// runtime cancels it the same way. The final atomic write is not
+/// interruptible: a cancellation that arrives once it has started is too
+/// late and the install succeeds.
+#[derive(uniffi::Object)]
+pub struct EmojiSetInstallControlFfi {
+    pub(crate) inner: Arc<EmojiSetInstallControl>,
+}
+
+#[uniffi::export]
+impl EmojiSetInstallControlFfi {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::default(),
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    pub fn progress(&self) -> EmojiSetInstallProgressFfi {
+        self.inner.progress().into()
     }
 }
 

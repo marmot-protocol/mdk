@@ -4160,6 +4160,59 @@ Compare current with an older version, including after the last page. RestartReq
 </details>
 
 <details>
+<summary>conversions/emoji_set.rs</summary>
+
+### `EmojiSetInstallControlFfi::new`
+
+**Current constructor.** **C:** `marmot_emoji_set_install_control_new`.
+
+```rust
+pub fn new() -> Arc<Self>
+```
+
+Create one control per `install_emoji_set` call and pass it in; it is never reused across installs. A control that is already cancelled makes the install fail with `EmojiSetInstallCancelled` before any download.
+
+[Source](src/conversions/emoji_set.rs#L306)
+
+### `EmojiSetInstallControlFfi::cancel`
+
+**Current.** **C:** `marmot_emoji_set_install_control_cancel`.
+
+```rust
+pub fn cancel(&self)
+```
+
+Request cancellation from any thread. The install starts no new download, drops those in flight, stores nothing and fails promptly with `EmojiSetInstallCancelled`; a cancelled reinstall leaves the previous snapshot readable. Install is all-or-nothing: the final atomic write is not interruptible, so a cancellation that arrives once it has started is too late and the install succeeds. Needed because cancelling the host's task does not reach the Rust future under UniFFI 0.29.
+
+[Source](src/conversions/emoji_set.rs#L312)
+
+### `EmojiSetInstallControlFfi::is_cancelled`
+
+**Current.** **C:** `marmot_emoji_set_install_control_is_cancelled`.
+
+```rust
+pub fn is_cancelled(&self) -> bool
+```
+
+Whether cancellation was requested, by `cancel()` or by the runtime: `shutdown` and `shutdown_and_close` cancel every running install the same way, so a backgrounded app never keeps downloading or writes after close.
+
+[Source](src/conversions/emoji_set.rs#L316)
+
+### `EmojiSetInstallControlFfi::progress`
+
+**Current.** **C:** `marmot_emoji_set_install_control_progress`.
+
+```rust
+pub fn progress(&self) -> EmojiSetInstallProgressFfi
+```
+
+Poll for a determinate progress bar: `completed_emoji` of `total_emoji` entries finished (stored, skipped or given up on), and `transferred_bytes` received from image hosts. `total_emoji` is the stored version's valid emoji count and stays 0 until the install has read it; `completed_emoji` reaches it when an install succeeds. Bytes are counted as each download finishes, not while it streams.
+
+[Source](src/conversions/emoji_set.rs#L320)
+
+</details>
+
+<details>
 <summary>conversions/media.rs</summary>
 
 ### `MediaFileTransferControlFfi::new`
@@ -5470,22 +5523,22 @@ Observe one initial snapshot and later progress/availability revisions. Closing 
 ### `Marmot::emoji_set`
 
 ```rust
-pub fn emoji_set( &self, account_ref: String, coordinate: String, ) -> Result<Option<EmojiSetFfi>, MarmotKitError>
+pub async fn emoji_set( &self, account_ref: String, coordinate: String, ) -> Result<Option<EmojiSetFfi>, MarmotKitError>
 ```
 
-Reads one stored set by coordinate (`30030:<pubkey>:<d>`) or `naddr` without network I/O. Returns none when it is not stored; use `fetch_emoji_set` for an explicit network fetch.
+Reads one stored set by coordinate (`30030:<pubkey>:<d>`) or `naddr` without network I/O, on the blocking pool. Returns none when it is not stored; use `fetch_emoji_set` for an explicit network fetch.
 
-[Source](src/commands/emoji_set.rs#L36)
+[Source](src/commands/emoji_set.rs#L41)
 
 ### `Marmot::emoji_sets`
 
 ```rust
-pub fn emoji_sets( &self, account_ref: String, installed_only: bool, search: Option<String>, limit: Option<u32>, ) -> Result<Vec<EmojiSetFfi>, MarmotKitError>
+pub async fn emoji_sets( &self, account_ref: String, installed_only: bool, search: Option<String>, limit: Option<u32>, ) -> Result<Vec<EmojiSetFfi>, MarmotKitError>
 ```
 
-Reads the encrypted emoji set projection off the UI thread. `installed_only` returns installed snapshots in install order; otherwise the newest discovered sets first. `search` matches title, description, author (hex or `npub`) and shortcodes. No network I/O.
+Reads the encrypted emoji set projection on the blocking pool, off the caller's thread. `installed_only` returns installed snapshots in install order; otherwise the newest discovered sets first. `search` matches title, description, author (hex or `npub`) and shortcodes. No network I/O.
 
-[Source](src/commands/emoji_set.rs#L17)
+[Source](src/commands/emoji_set.rs#L20)
 
 ### `Marmot::fetch_emoji_set`
 
@@ -5495,47 +5548,57 @@ pub async fn fetch_emoji_set( &self, account_ref: String, input: String, ) -> Re
 
 Fetches one set from a pasted coordinate or `naddr`, trying up to 8 of the `naddr`'s relay hints and then the account relays, and stores it. Text only. Refused with `InvalidEmojiSet` for malformed input or a set with no valid emoji, `EmojiSetNotFound` when no relay has it.
 
-[Source](src/commands/emoji_set.rs#L64)
+[Source](src/commands/emoji_set.rs#L70)
 
 ### `Marmot::fetch_emoji_set_asset`
 
 ```rust
-pub async fn fetch_emoji_set_asset( &self, account_ref: String, coordinate: String, shortcode: String, ) -> Result<EmojiSetAssetFfi, MarmotKitError>
+pub async fn fetch_emoji_set_asset( &self, account_ref: String, coordinate: String, expected_event_id_hex: String, shortcode: String, ) -> Result<EmojiSetAssetFfi, MarmotKitError>
 ```
 
-Downloads and validates one emoji of a stored set for a preview, with the same limits as install. Nothing is stored. Kept as its own call so the host can disclose it: it reveals the user's IP address to the image host the set's author chose, so call it only after the user opens the set.
+Downloads and validates one emoji of a stored set for a preview, with the same limits as install. Nothing is stored. Kept as its own call so the host can disclose it: it reveals the user's IP address to the image host the set's author chose, so call it only after the user opens the set. `expected_event_id_hex` is the `event_id_hex` of the version shown: when a sync or fetch has stored another version since, the call fails with `EmojiSetChanged` before any download.
 
-[Source](src/commands/emoji_set.rs#L121)
+[Source](src/commands/emoji_set.rs#L142)
+
+### `Marmot::fetch_emoji_set_cover`
+
+```rust
+pub async fn fetch_emoji_set_cover( &self, account_ref: String, coordinate: String, expected_event_id_hex: String, ) -> Result<EmojiSetCoverFfi, MarmotKitError>
+```
+
+Downloads and validates a stored set's cover image (`image_url`, its `image` tag) under the emoji image limits, through the same hardened public fetch as `fetch_emoji_set_asset`. Nothing is stored. It reveals the user's IP address to the host the set's author chose, so call it only after the user opens the set, never from a list; MDK loads it so the host never fetches set images itself. `expected_event_id_hex` is the version shown: another stored version fails with `EmojiSetChanged` before any download. A set without a cover fails with `EmojiSetNotFound`.
+
+[Source](src/commands/emoji_set.rs#L167)
 
 ### `Marmot::install_emoji_set`
 
 ```rust
-pub async fn install_emoji_set( &self, account_ref: String, coordinate: String, ) -> Result<EmojiSetInstallResultFfi, MarmotKitError>
+pub async fn install_emoji_set( &self, account_ref: String, coordinate: String, expected_event_id_hex: String, control: Arc<EmojiSetInstallControlFfi>, ) -> Result<EmojiSetInstallResultFfi, MarmotKitError>
 ```
 
-Snapshots the stored set version (its event id), downloads each emoji once over hardened HTTPS (public hosts only, redirects re-checked), validates it (4 MiB, 4096 px per side, 200 frames, PNG/APNG, GIF, WebP or JPEG, stated MIME matching the bytes) and stores the bytes and SHA-256 under the account. Invalid, duplicate, failed and over-cap entries are reported in `skipped`, not fatal. A later change to the set's URLs or images never reaches the stored bytes until the user reinstalls. Caps: 50 installed sets, 500 emoji and 32 MiB per set, 128 MiB in all (`EmojiSetLimit`). Reveals the user's IP address to every image host in the set: call only after the user taps Install.
+Snapshots the stored set version (its event id), downloads each emoji once over hardened HTTPS (public hosts only, redirects re-checked), validates it (4 MiB, 4096 px per side, 200 frames, PNG/APNG, GIF, WebP or JPEG decided by the bytes; a response typed as a non-image such as `text/html` is refused, any `image/*` type is accepted) and stores the bytes and SHA-256 under the account. `expected_event_id_hex` binds the install to the version the user was shown, including a reinstall for `update_available`: another stored version fails with `EmojiSetChanged` (carrying `current_event_id_hex`) before any download, and nothing stored fails with `EmojiSetNotFound`; install never fetches the set itself. `control` (`EmojiSetInstallControlFfi`) reports progress and cancels; a cancelled install, or one stopped by runtime shutdown or close, fails with `EmojiSetInstallCancelled` and stores nothing, leaving any previous snapshot as it was. Invalid, duplicate, failed and over-cap entries are reported in `skipped`, not fatal. A later change to the set's URLs or images never reaches the stored bytes until the user reinstalls. Caps: 50 installed sets, 500 emoji and 32 MiB per set, 128 MiB in all (`EmojiSetLimit`). Reveals the user's IP address to every image host in the set: call only after the user taps Install.
 
-[Source](src/commands/emoji_set.rs#L93)
+[Source](src/commands/emoji_set.rs#L105)
 
 ### `Marmot::installed_custom_emoji`
 
 ```rust
-pub fn installed_custom_emoji( &self, account_ref: String, ) -> Result<Vec<InstalledCustomEmojiFfi>, MarmotKitError>
+pub async fn installed_custom_emoji( &self, account_ref: String, ) -> Result<Vec<InstalledCustomEmojiFfi>, MarmotKitError>
 ```
 
-Every installed emoji, flattened in set install order then set order, for a picker: set coordinate and title, author, shortcode, MIME, dimensions, frames, SHA-256 and size. No URL. Shortcode collisions between installed sets are flagged with `shortcode_collision`, not resolved; host built-ins such as `marmot` and `wn` win in the host. No network I/O.
+Every installed emoji, flattened in set install order then set order, for a picker: set coordinate and title, author, shortcode, MIME, dimensions, frames, SHA-256 and size. No URL. Shortcode collisions between installed sets are flagged with `shortcode_collision`, not resolved; host built-ins such as `marmot` and `wn` win in the host. No network I/O; the read runs on the blocking pool.
 
-[Source](src/commands/emoji_set.rs#L137)
+[Source](src/commands/emoji_set.rs#L183)
 
 ### `Marmot::read_installed_custom_emoji`
 
 ```rust
-pub fn read_installed_custom_emoji( &self, account_ref: String, coordinate: String, shortcode: String, ) -> Result<InstalledCustomEmojiAssetFfi, MarmotKitError>
+pub async fn read_installed_custom_emoji( &self, account_ref: String, coordinate: String, shortcode: String, ) -> Result<InstalledCustomEmojiAssetFfi, MarmotKitError>
 ```
 
-Reads an installed emoji's stored bytes, checked against the SHA-256 recorded at install; a mismatch is an error, never other bytes. No network I/O. To use an emoji in a chat, upload these bytes as an encrypted attachment (`send_tagged_media`); never put the set's image URL or address in a message.
+Reads an installed emoji's stored bytes (up to 4 MiB), checked against the SHA-256 recorded at install; a mismatch is an error, never other bytes. No network I/O; the read and hash run on the blocking pool. To use an emoji in a chat, upload these bytes as an encrypted attachment (`send_tagged_media`); never put the set's image URL or address in a message.
 
-[Source](src/commands/emoji_set.rs#L149)
+[Source](src/commands/emoji_set.rs#L197)
 
 ### `Marmot::sync_emoji_sets`
 
@@ -5545,7 +5608,7 @@ pub async fn sync_emoji_sets( &self, account_ref: String, search: Option<String>
 
 Fetches up to 60 of the newest kind-30030 sets from the account's relays (the sticker discovery relays), keeping only the newest version of each address and at most 16 versions per fetch. Sets with no valid emoji are hidden. A `search` that is an `npub` or hex public key narrows the fetch to that author. Text only: never fetches an image.
 
-[Source](src/commands/emoji_set.rs#L50)
+[Source](src/commands/emoji_set.rs#L56)
 
 ### `Marmot::uninstall_emoji_set`
 
@@ -5555,7 +5618,7 @@ pub async fn uninstall_emoji_set( &self, account_ref: String, coordinate: String
 
 Removes an installed snapshot and its stored bytes. Returns whether the set was installed. The discovered set stays in the projection. No network I/O.
 
-[Source](src/commands/emoji_set.rs#L107)
+[Source](src/commands/emoji_set.rs#L126)
 
 ### `Marmot::user_emoji_list`
 
@@ -5565,6 +5628,6 @@ pub async fn user_emoji_list( &self, account_ref: String, ) -> Result<UserEmojiL
 
 Reads the account's own kind-10030 emoji list and the kind-30030 sets its `a` tags point to (at most 64), for suggestions. Its loose `emoji` tags come back as `own_emoji`, installable as the pseudo-set `10030:<pubkey>:`. Text only. MDK never publishes or edits kind 10030; it is a public list shared with other clients.
 
-[Source](src/commands/emoji_set.rs#L78)
+[Source](src/commands/emoji_set.rs#L84)
 
 </details>

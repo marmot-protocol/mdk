@@ -399,16 +399,23 @@ separate call the host makes after a user action:
 | Call | Network | What it reaches |
 | --- | --- | --- |
 | `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | The sticker discovery relays (account relays), plus up to 8 relay hints from a pasted `naddr` |
-| `fetch_emoji_set_asset` | One image host | The host the set's author chose; nothing is stored |
+| `fetch_emoji_set_asset`, `fetch_emoji_set_cover` | One image host | The host the set's author chose for that emoji or the cover; nothing is stored |
 | `install_emoji_set` | Every image host in the set | Downloads each emoji once and stores the bytes |
-| `emoji_sets`, `emoji_set`, `installed_custom_emoji`, `read_installed_custom_emoji`, `uninstall_emoji_set` | None | Local storage only |
+| `emoji_sets`, `emoji_set`, `installed_custom_emoji`, `read_installed_custom_emoji`, `uninstall_emoji_set` | None | Local storage only, read on the blocking pool |
 
 Sync never fetches an image. Image fetches reveal the user's IP address to the image host, so hosts disclose them
-before calling. They use the hardened Blossom fetch: HTTPS on public hosts only, with loopback, private, link-local,
+before calling. Each image fetch takes the `event_id_hex` of the set version the user was shown and fails with
+`EmojiSetChanged`, before any request, when a sync or fetch has stored another version since: a newer version can
+name other hosts, and the user must see those before revealing their address to them. Install does not fetch the set
+text either; with nothing stored it fails with `EmojiSetNotFound`. They use the hardened Blossom fetch: HTTPS on public hosts only, with loopback, private, link-local,
 unspecified and IPv4-mapped addresses refused before connecting and again after every redirect.
 
 Installing pins one set version (its event id) and stores each emoji's bytes and SHA-256 in the account database. A
 later change to the set's URLs or images reaches nothing until the user reinstalls; reads check the stored hash.
+Install is all-or-nothing. An `EmojiSetInstallControl` passed with it reports progress (entries finished of entries to
+try, bytes received) and cancels: no new download starts, those in flight are dropped and nothing is stored, so a
+cancelled reinstall keeps the previous snapshot. Runtime shutdown and storage close cancel running installs the same
+way. The final write is atomic and not interruptible.
 `user_emoji_list` reads the account's kind-10030 list for suggestions; MDK never publishes or edits it. Installed
 emoji carry no URL: to use one in a chat, upload its bytes as an encrypted attachment, so the set's image URL and
 address never reach a group.
@@ -420,7 +427,7 @@ Limits:
 | Sets per discovery sync | 60 newest, at most 16 versions of one address per fetch |
 | Emoji per set | 500 (later entries skipped as over the cap) |
 | Shortcode | 1–64 bytes of ASCII letters, digits, `-` and `_` (the chat custom-emoji rule) |
-| Image | 4 MiB, 4096 px per side, 200 frames; PNG/APNG, GIF, WebP or JPEG whose bytes match the stated MIME type |
+| Image | 4 MiB, 4096 px per side, 200 frames; PNG/APNG, GIF, WebP or JPEG, decided by the bytes. A response typed as a non-image (such as `text/html`) is refused; any `image/*` type, right or wrong, is not checked against them |
 | Installed sets | 50 |
 | Stored bytes | 32 MiB per set, 128 MiB in all |
 
