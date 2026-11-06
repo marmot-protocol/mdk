@@ -112,7 +112,9 @@ The gate runs the whole theory, requires a verified result for every declared
 lemma, then requires the named falsification for each control below. It keeps
 the original source untouched and writes synthetic mutant theories, prover
 logs, command/timing/hash receipts and a report in a fresh timestamped output
-directory. A timeout, tool error, missing summary, omitted lemma, incomplete
+directory. Compact named outcomes and hashes are also printed in the job log;
+formal CI uploads the complete synthetic evidence even when a check fails.
+A timeout, tool error, missing summary, omitted lemma, incomplete
 proof or unexpected control result fails the gate. Default budgets are 600
 seconds for the whole theory and 180 seconds per control; command-line options
 may change those wall-time budgets, not the theory or proof domain.

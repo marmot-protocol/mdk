@@ -148,29 +148,56 @@ def main():
     (output / "tool-version.txt").write_text(version.stdout + version.stderr)
     baseline = output / "baseline"
     baseline.mkdir()
-    results = {
-        "baseline": check(
+    results = {}
+
+    def record(label, result):
+        results[label] = result
+        print(
+            json.dumps(
+                {
+                    "check": label,
+                    "exit": result["exit"],
+                    "timed_out": result["timed_out"],
+                    "elapsed_seconds": result["elapsed_seconds"],
+                    "model_sha256": result["model_sha256"],
+                    "log_sha256": result["log_sha256"],
+                    "outcomes": {
+                        name: result["outcomes"].get(name, "missing")
+                        for name in result["expected"]
+                    },
+                    "passed": result["passed"],
+                }
+            ),
+            flush=True,
+        )
+
+    record(
+        "baseline",
+        check(
             args.tamarin,
             model,
             baseline,
             None,
             dict.fromkeys(names, "verified"),
             args.timeout_seconds,
-        )
-    }
+        ),
+    )
     if results["baseline"]["passed"]:
         for label, mutant, lemma in mutations(source):
             folder = output / label
             folder.mkdir()
             variant = folder / "device_pairing_v1.spthy"
             variant.write_text(mutant)
-            results[label] = check(
-                args.tamarin,
-                variant,
-                folder,
-                lemma,
-                {lemma: "falsified"},
-                args.control_timeout_seconds,
+            record(
+                label,
+                check(
+                    args.tamarin,
+                    variant,
+                    folder,
+                    lemma,
+                    {lemma: "falsified"},
+                    args.control_timeout_seconds,
+                ),
             )
     passed = len(results) == 4 and all(result["passed"] for result in results.values())
     report = {"passed": passed, "model": str(model), "results": results}

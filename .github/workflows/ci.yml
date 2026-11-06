@@ -1432,6 +1432,15 @@ jobs:
       - name: Verify pairing authentication and model controls
         run: python3 formal/pairing/verify_pairing.py --out target/formal-pairing
 
+      - name: Preserve pairing proof and control evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pairing-symbolic-proof-${{ github.run_attempt }}
+          path: target/formal-pairing
+          retention-days: 7
+          if-no-files-found: ignore
+
   hermes-installer-auth:
     name: Hermes installer auth
     needs: changes
