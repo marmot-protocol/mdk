@@ -14,6 +14,272 @@ use marmot_pairing::{
     PairingCancel, PairingConfirm, PairingError, PairingMessage, REQUEST_MAX_FUTURE_SECS,
     REQUEST_TTL_SECS, SESSION_TTL_SECS, SessionId,
 };
+use rand::{Rng, SeedableRng, rngs::StdRng};
+
+/// A bounded generated-schedule property over the real pairing roles. Each
+/// schedule starts after Request, Answer and Reveal; the actions below are
+/// ConfirmExisting, ConfirmNew, DeliverExistingConfirm, DeliverNewConfirm,
+/// replay, Cancel, Expire and traffic for another session. Delivery can repeat
+/// only messages the roles actually emitted. The oracle records user decisions
+/// and emitted confirmations; it does not reimplement either state machine.
+///
+/// These are 192 fixed-seed samples of 32 actions, not exhaustive exploration
+/// or a shrinking generator. Durable Welcome waits and restart belong above
+/// these in-memory roles and are not claimed here.
+#[test]
+fn pairing_generated_schedules_preserve_confirmation_authority() {
+    struct Probe {
+        pair: Comparison,
+        existing_confirm: Option<PairingConfirm>,
+        new_confirm: Option<PairingConfirm>,
+        existing_approved: bool,
+        new_approved: bool,
+        new_decided_first: Option<bool>,
+        existing_confirm_delivered: bool,
+        new_link_events: usize,
+        existing_link_events: usize,
+        new_ended: bool,
+        existing_ended: bool,
+        now: u64,
+    }
+
+    impl Probe {
+        fn check_link(&self, link: &marmot_pairing::ConfirmedLink) {
+            assert!(self.existing_approved && self.new_approved);
+            assert!(self.existing_confirm_delivered);
+            assert_eq!(link.session_id, self.pair.request.session_id);
+            assert_eq!(
+                link.key_package_event_id,
+                self.pair.request.key_package_event_id
+            );
+            assert_eq!(link.key_package_ref, self.pair.request.key_package_ref);
+            assert_eq!(link.existing_device_slot, slot(1));
+            assert_eq!(link.device_group_id, device_group());
+            assert_eq!(link.welcome_sender_key, welcome_signer());
+        }
+
+        fn record_new_link(
+            &mut self,
+            confirm: PairingConfirm,
+            link: marmot_pairing::ConfirmedLink,
+        ) {
+            self.check_link(&link);
+            self.new_link_events += 1;
+            self.new_confirm = Some(confirm);
+        }
+
+        fn action(&mut self, action: u8) {
+            let session = self.pair.session_id();
+            match action {
+                0 => {
+                    if let Ok(confirm) = self.pair.existing.confirm_link(
+                        &session,
+                        device_group(),
+                        welcome_signer(),
+                        self.now,
+                    ) {
+                        assert!(!self.existing_approved, "one existing-device decision");
+                        self.new_decided_first.get_or_insert(false);
+                        self.existing_approved = true;
+                        self.existing_confirm = Some(confirm);
+                    }
+                }
+                1 => {
+                    if let Ok(result) = self.pair.new.confirm_match(self.now) {
+                        assert!(!self.new_approved, "one new-device decision");
+                        self.new_decided_first.get_or_insert(true);
+                        self.new_approved = true;
+                        if let NewDeviceConfirmation::Linked { confirm, link } = result {
+                            self.record_new_link(confirm, link);
+                        }
+                    }
+                }
+                2 => {
+                    if let Some(confirm) = &self.existing_confirm {
+                        self.existing_confirm_delivered = true;
+                        if let NewDeviceEvent::Linked { confirm, link } = self
+                            .pair
+                            .new
+                            .receive(&PairingMessage::Confirm(confirm.clone()), self.now)
+                        {
+                            self.record_new_link(confirm, link);
+                        }
+                    }
+                }
+                3 => {
+                    if let Some(confirm) = &self.new_confirm
+                        && let ExistingDeviceEvent::Linked(link) = self.pair.existing.receive(
+                            &PairingMessage::Confirm(confirm.clone()),
+                            self.now,
+                            self.now,
+                        )
+                    {
+                        self.check_link(&link);
+                        self.existing_link_events += 1;
+                    }
+                }
+                4 => {
+                    self.pair.existing.receive(
+                        &PairingMessage::Request(self.pair.request.clone()),
+                        T0,
+                        self.now,
+                    );
+                }
+                5 => {
+                    self.pair
+                        .new
+                        .receive(&PairingMessage::Answer(self.pair.answer.clone()), self.now);
+                }
+                6 => {
+                    self.pair.existing.receive(
+                        &PairingMessage::Reveal(self.pair.reveal.clone()),
+                        self.now,
+                        self.now,
+                    );
+                }
+                7 => {
+                    if let Some(cancel) = self.pair.new.cancel() {
+                        self.pair.existing.receive(
+                            &PairingMessage::Cancel(cancel),
+                            self.now,
+                            self.now,
+                        );
+                    }
+                }
+                8 => {
+                    if let Some(cancel) = self.pair.existing.cancel(&session) {
+                        self.pair
+                            .new
+                            .receive(&PairingMessage::Cancel(cancel), self.now);
+                    }
+                }
+                9 => {
+                    self.now = T0 + SESSION_TTL_SECS;
+                    if let Some(cancel) = self.pair.new.expire(self.now) {
+                        self.pair.existing.receive(
+                            &PairingMessage::Cancel(cancel),
+                            self.now,
+                            self.now,
+                        );
+                    }
+                    for cancel in self.pair.existing.expire(self.now) {
+                        self.pair
+                            .new
+                            .receive(&PairingMessage::Cancel(cancel), self.now);
+                    }
+                }
+                10 => {
+                    let unrelated = PairingMessage::Cancel(PairingCancel {
+                        session_id: SessionId::new([9; 32]),
+                        reason: CancelReason::User,
+                    });
+                    assert_eq!(
+                        self.pair.new.receive(&unrelated, self.now),
+                        NewDeviceEvent::Ignored(IgnoreReason::OtherSession)
+                    );
+                    assert_eq!(
+                        self.pair.existing.receive(&unrelated, self.now, self.now),
+                        ExistingDeviceEvent::Ignored(IgnoreReason::OtherSession)
+                    );
+                }
+                _ => unreachable!("the bounded generator chooses a known action"),
+            }
+
+            self.new_ended |= self.pair.new.end_reason().is_some();
+            self.existing_ended |= self.pair.existing.end_reason(&session).is_some();
+            if self.new_ended {
+                assert_eq!(
+                    self.pair.new.linked(),
+                    None,
+                    "replay cannot revive a new role"
+                );
+                assert!(!self.pair.new.holds_secrets());
+            }
+            if self.existing_ended {
+                assert_eq!(
+                    self.pair.existing.linked(&session),
+                    None,
+                    "replay cannot revive an existing role"
+                );
+                assert_eq!(self.pair.existing.sessions_holding_secrets(), 0);
+            }
+            if let Some(link) = self.pair.new.linked() {
+                self.check_link(link);
+            }
+            if let Some(link) = self.pair.existing.linked(&session) {
+                self.check_link(link);
+                assert_eq!(self.new_link_events, 1);
+            }
+            assert!(self.new_link_events <= 1 && self.existing_link_events <= 1);
+        }
+    }
+
+    let mut completed = 0;
+    let mut new_tapped_first = 0;
+    let mut existing_tapped_first = 0;
+    let mut ended = 0;
+    let mut cancelled = 0;
+    let mut expired = 0;
+    let mut unrelated_traffic = 0;
+    for case in 0..192 {
+        let mut rng = StdRng::seed_from_u64(0x2628_0026_1106 ^ case);
+        let mut probe = Probe {
+            pair: to_comparison(T0),
+            existing_confirm: None,
+            new_confirm: None,
+            existing_approved: false,
+            new_approved: false,
+            new_decided_first: None,
+            existing_confirm_delivered: false,
+            new_link_events: 0,
+            existing_link_events: 0,
+            new_ended: false,
+            existing_ended: false,
+            now: T0,
+        };
+        for step in 0..32 {
+            let mode = case % 3;
+            let action = if mode == 2 && step == 4 {
+                9
+            } else if mode == 1 {
+                rng.gen_range(0..=10)
+            } else {
+                // No cancellation or expiry in the completion samples;
+                // replay and unrelated traffic still interleave with taps.
+                match rng.gen_range(0..=7) {
+                    7 => 10,
+                    action => action,
+                }
+            };
+            unrelated_traffic += usize::from(action == 10);
+            probe.action(action);
+        }
+        if case % 3 == 0 {
+            // Deliver the finite suffix fairly: a safe implementation cannot
+            // satisfy this property merely by rejecting every action.
+            for action in [0, 1, 2, 3] {
+                probe.action(action);
+            }
+            assert_eq!(probe.new_link_events, 1);
+            assert_eq!(probe.existing_link_events, 1);
+            new_tapped_first += usize::from(probe.new_decided_first == Some(true));
+            existing_tapped_first += usize::from(probe.new_decided_first == Some(false));
+            completed += 1;
+        }
+        ended += usize::from(probe.new_ended || probe.existing_ended);
+        cancelled += usize::from(matches!(
+            probe.pair.new.end_reason(),
+            Some(EndReason::UserCancelled | EndReason::Cancelled(CancelReason::User))
+        ));
+        expired += usize::from(matches!(
+            probe.pair.new.end_reason(),
+            Some(EndReason::Timeout | EndReason::Cancelled(CancelReason::Timeout))
+        ));
+    }
+    assert_eq!(completed, 64);
+    assert!(new_tapped_first > 0 && existing_tapped_first > 0);
+    assert!(ended > 0 && cancelled > 0 && expired > 0 && unrelated_traffic > 0);
+}
 
 #[test]
 fn pairing_new_device_shows_no_code_before_an_answer() {

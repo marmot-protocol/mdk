@@ -63,4 +63,7 @@ the cancels to send.
 - `tests/vectors.rs`: known answers from `testdata/pairing_vectors.py`, an independent Python implementation, through
   both state machines, plus the emoji table's digest.
 - `tests/attacks.rs`: each attack the code defends against, shown failing.
-- `tests/lifecycle.rs`: expiry, the rate limit, competing requests and cancellation.
+- `tests/lifecycle.rs`: expiry, the rate limit, competing requests and cancellation, plus a bounded generated-schedule
+  property that interleaves confirmation, replay, cancellation, expiry and unrelated-session traffic through the real
+  roles. It checks confirmation authority and prevents ended sessions from being revived; it does not model durable
+  Welcome delivery or restart.
