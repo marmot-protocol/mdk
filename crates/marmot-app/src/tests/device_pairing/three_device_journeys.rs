@@ -6,16 +6,30 @@
 use super::*;
 use crate::tests::device_group::history_delivery::send_text;
 
+/// Passes of [`settle`] one phase may take. Settlement is bounded by work,
+/// not elapsed time: each phase settled within three passes in 64 local runs
+/// with up to 48 copies of this test in parallel, while one pass, nearly all
+/// of it maintenance, grew from about 0.4 s to over 2 s under that load.
+const SETTLE_PASSES: u32 = 8;
+
+/// Catches a pass that never returns. It is no settlement bound: the slowest
+/// loaded local phase took 6.5 s.
+const SETTLE_HANG_BACKSTOP: Duration = Duration::from_secs(120);
+
 /// Drive normal inbound, convergence and maintenance until the three
-/// independently stored copies agree. No wall-clock sleep supplies settlement.
+/// independently stored copies agree and each satisfies `done`. No
+/// wall-clock sleep supplies settlement, and a phase that needs more than
+/// [`SETTLE_PASSES`] passes fails however fast or slow the machine is.
 async fn settle(
     relay: &ScriptedPushRelayClient,
     devices: &mut [&mut Device],
     group: &GroupId,
     phase: &str,
+    done: impl Fn(&Device) -> bool,
 ) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    let started = std::time::Instant::now();
+    tokio::time::timeout(SETTLE_HANG_BACKSTOP, async {
+        for _ in 0..SETTLE_PASSES {
             for device in devices.iter_mut() {
                 device.step(relay).await;
                 let effects = device
@@ -48,15 +62,21 @@ async fn settle(
                         .runtime
                         .has_pending_convergence_inputs(group)
                         .unwrap()
+                    && done(device)
             }) {
-                break;
+                return;
             }
             tokio::task::yield_now().await;
         }
+        panic!(
+            "{phase}: all linked copies settle through their ordinary app paths \
+             within {SETTLE_PASSES} passes ({:?})",
+            started.elapsed()
+        );
     })
     .await
-    .unwrap_or_else(|error| {
-        panic!("{phase}: all linked copies settle through their ordinary app paths: {error:?}")
+    .unwrap_or_else(|_| {
+        panic!("{phase}: a settle pass did not return within {SETTLE_HANG_BACKSTOP:?}")
     });
 }
 
@@ -104,6 +124,7 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
             &mut [&mut phone, &mut tablet, &mut laptop],
             &group,
             "after linking all three devices",
+            |_| true,
         )
         .await;
         assert_eq!(phone.roster(&group).devices.len(), 3);
@@ -149,28 +170,20 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
             "one external invitation admitted all three independent leaves"
         );
         tablet.client.accept_group_invite(&chat).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                settle(
-                    &relay,
-                    &mut [&mut phone, &mut tablet, &mut laptop],
-                    &group,
-                    "sharing Accept",
-                )
-                .await;
-                if [&phone, &tablet, &laptop].iter().all(|device| {
-                    !device
-                        .client
-                        .state_group_record(&chat)
-                        .unwrap()
-                        .pending_confirmation
-                }) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("one Accept reaches both linked siblings");
+        settle(
+            &relay,
+            &mut [&mut phone, &mut tablet, &mut laptop],
+            &group,
+            "sharing Accept: one Accept reaches both linked siblings",
+            |device| {
+                !device
+                    .client
+                    .state_group_record(&chat)
+                    .unwrap()
+                    .pending_confirmation
+            },
+        )
+        .await;
         let before = send_text(&mut bob, &chat, "before Laptop closes").await;
         for device in [&mut phone, &mut tablet, &mut laptop] {
             device.step(&relay).await;
@@ -185,6 +198,7 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
             &mut [&mut phone, &mut tablet, &mut laptop],
             &group,
             "before closing Laptop",
+            |_| true,
         )
         .await;
 
@@ -270,6 +284,7 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
             &mut [&mut phone, &mut tablet, &mut laptop],
             &group,
             "after reopening Laptop",
+            |_| true,
         )
         .await;
         for device in [&phone, &tablet, &laptop] {
