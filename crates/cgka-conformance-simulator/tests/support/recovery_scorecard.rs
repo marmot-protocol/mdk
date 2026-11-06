@@ -454,7 +454,7 @@ pub(super) fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
 }
 
 /// One probe call: its index, start offset (s), latency (ms) and failure.
-struct Sample {
+pub(super) struct Sample {
     index: u64,
     at: f64,
     ms: f64,
@@ -462,7 +462,7 @@ struct Sample {
 }
 
 /// Call `probe` every `every` until `stop`, recording each call.
-fn periodic<F, Fut>(
+pub(super) fn periodic<F, Fut>(
     stop: &Arc<AtomicBool>,
     every: Duration,
     t0: Instant,
@@ -498,7 +498,7 @@ where
 
 /// Latency percentiles of successful calls, plus failures by kind and the
 /// first failure's offset. Failed calls return early, so they are excluded.
-fn latencies(samples: &[Sample]) -> Value {
+pub(super) fn latencies(samples: &[Sample]) -> Value {
     let ok = samples.iter().filter(|sample| sample.error.is_none());
     let mut summary = percentiles(ok.map(|sample| sample.ms));
     let mut errors = BTreeMap::<&str, u64>::new();

@@ -957,8 +957,10 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             // stays staged, and its group waits behind it.
             let mut kept_back = BTreeSet::new();
             let mut moved = BTreeSet::new();
+            let mut events = 0usize;
             for ((group, _), removed) in tried.into_iter().zip(removed) {
                 if removed {
+                    events += 1;
                     moved.insert(group);
                 } else {
                     kept_back.insert(group);
@@ -967,6 +969,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             tracing::debug!(
                 target: TARGET,
                 method = "admit",
+                events = events,
                 groups_admitted = moved.len(),
                 groups_held = kept_back.len(),
             );
