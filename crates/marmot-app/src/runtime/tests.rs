@@ -4574,3 +4574,65 @@ fn generated_setup_profile_adopts_a_selected_profile_only_before_local_readiness
         assert!(store, "{phase:?}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_invite_decline_does_not_leave_the_group() {
+    use crate::tests::{every_subscription, scripted_eose_pump};
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = transport_nostr::MarmotRelayPlane::new(None, relay.clone());
+    let _pump = scripted_eose_pump(plane.clone(), relay, every_subscription);
+    let group = {
+        let mut alice = app
+            .client_with_relay_plane("alice", &plane, None)
+            .await
+            .unwrap();
+        let mut bob_client = app
+            .client_with_relay_plane("bob", &plane, None)
+            .await
+            .unwrap();
+        bob_client.sync().await.unwrap();
+        let group = alice
+            .create_group("Invite", &[&bob.account_id_hex])
+            .await
+            .unwrap();
+        assert!(
+            bob_client
+                .sync()
+                .await
+                .unwrap()
+                .joined_groups
+                .contains(&group)
+        );
+        group
+    };
+    let id = hex::encode(group.as_slice());
+    assert!(app.group("bob", &id).unwrap().unwrap().pending_confirmation);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+    let (respond, response) = oneshot::channel();
+    drop(response);
+    commands
+        .send(AccountWorkerCommand::DeclineGroupInvite {
+            group_id: group.clone(),
+            respond,
+        })
+        .await
+        .unwrap();
+
+    // The abandoned decline is skipped, so the invite is still pending for
+    // the decline the account actually waits for.
+    let declined = runtime
+        .decline_group_invite("bob", &group)
+        .await
+        .expect("an abandoned decline must not consume the pending invite");
+    assert_eq!(declined.summary.published, 1);
+    runtime.shutdown_and_close().await.unwrap();
+}

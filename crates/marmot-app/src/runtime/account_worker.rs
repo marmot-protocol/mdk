@@ -6741,6 +6741,14 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => Box::pin(async move {
+            // Declining leaves the group, which cannot be undone. A requester
+            // that stopped waiting (for example after the worker response
+            // deadline) reports the outcome as unknown and may have decided to
+            // accept since; running its queued decline now would leave a group
+            // the account meant to keep.
+            if respond.is_closed() {
+                return true;
+            }
             let result = client.decline_group_invite(&group_id).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
