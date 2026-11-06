@@ -1771,6 +1771,56 @@ async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Search readiness follows the committed catch-up checkpoint, not a step's
+/// result: once a step has selected a renamed peer for fan-out, its chats are
+/// neither refreshed nor marked pending, and only the checkpoint shows the
+/// catch-up is still owed. A text read that lost that step to another caller
+/// must see the same.
+#[test]
+fn search_catch_up_is_owed_until_a_selected_peer_is_fanned_out() {
+    use crate::chat_presentation::maintenance::{maintain, search_catch_up_owed};
+    let f = Fixture::new(6);
+    let shared = f.app.shared_storage().unwrap();
+    let app = f.store.app_storage();
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    assert!(!search_catch_up_owed(&app, &shared).unwrap());
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: "bb".repeat(32),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    assert!(search_catch_up_owed(&app, &shared).unwrap());
+    assert!(maintain(&f.store, &shared, &f.account_id).unwrap());
+    assert!(
+        app.chat_presentation_checkpoint()
+            .unwrap()
+            .state
+            .active
+            .is_some()
+    );
+    assert!(
+        app.chat_list_pending_search_text(ChatListView::Chats, 100)
+            .unwrap()
+            .is_empty(),
+        "the selected peer's chats are not pending"
+    );
+    assert!(search_catch_up_owed(&app, &shared).unwrap());
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    assert!(!search_catch_up_owed(&app, &shared).unwrap());
+}
+
 /// Chats enter and leave a filtered window as the filtered fact changes, the
 /// window always equals the head of the same query's complete ID set, and no
 /// row appears twice.

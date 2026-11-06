@@ -212,6 +212,22 @@ pub(crate) fn prepare_window(
     Ok(())
 }
 
+/// Whether the account's committed catch-up checkpoint is behind the shared
+/// directory: profile changes some chat's stored search text may not reflect
+/// yet. Pending rows are checked by the storage read itself.
+pub(crate) fn search_catch_up_owed(
+    account: &SqliteAppStorage,
+    shared: &SqliteSharedStorage,
+) -> Result<bool, AppError> {
+    let state = account.chat_presentation_checkpoint()?.state;
+    let head = shared.directory_presentation_version()?;
+    // A peer selected for fan-out holds `revision` back until its chats are
+    // rewritten, so the revision covers it.
+    Ok(state.shared_epoch != head.store_epoch
+        || state.reconciling
+        || state.revision != head.revision)
+}
+
 /// Catch-up steps a text read runs before reporting "not ready".
 const SEARCH_CATCH_UP_STEPS: usize = 4;
 
@@ -221,6 +237,10 @@ const SEARCH_CATCH_UP_STEPS: usize = 4;
 /// pending in the view. The storage read reports pending rows as not ready;
 /// catch-up still owed after these steps is reported here as
 /// `ChatPresentationNotReady`, and the caller's retry continues it.
+///
+/// Readiness comes from the committed checkpoint ([`search_catch_up_owed`]),
+/// not from `maintain`'s result: `false` there also means another caller won
+/// the checkpoint, possibly before it refreshed the rows it selected.
 pub(crate) fn prepare_search_batch(
     app: &crate::MarmotApp,
     label: &str,
@@ -231,13 +251,13 @@ pub(crate) fn prepare_search_batch(
     let shared = app.shared_storage()?;
     let app_storage = account.app_storage();
     let before = app_storage.chat_presentation_version()?;
-    let mut owed = false;
     for _ in 0..SEARCH_CATCH_UP_STEPS {
-        owed = maintain(account, &shared, local)?;
-        if !owed {
+        if !search_catch_up_owed(&app_storage, &shared)? {
             break;
         }
+        maintain(account, &shared, local)?;
     }
+    let owed = search_catch_up_owed(&app_storage, &shared)?;
     let pending = app_storage.chat_list_pending_search_text(view, CHAT_PRESENTATION_BATCH_LIMIT)?;
     let prepared = prepare_window(&app_storage, &shared, local, &pending);
     if owed || !pending.is_empty() {
