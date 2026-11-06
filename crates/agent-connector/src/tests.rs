@@ -9079,14 +9079,32 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
         newcomer.account_id_hex.as_str(),
     );
 
-    // A non-admin cannot promote itself, invite or remove.
+    // The peer joins, then as a non-admin cannot promote itself, invite or remove.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while connector
+            .runtime
+            .accept_group_invite(&peer.label, &id)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer joins the group");
     for (member, change) in [
         (peer_id, change(true, false, false)),
         (new_id, change(false, true, false)),
         (agent_id, change(false, false, true)),
     ] {
-        assert!(status(peer_id, member, change).await.is_err());
+        let error = status(peer_id, member, change).await.unwrap_err();
+        assert_eq!(error.code(), "not_group_admin", "{error}");
     }
+    let short_id = &agent_id[2..];
+    let error = status(agent_id, short_id, change(false, false, false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_hex");
     // Read-only query, promotion, and an idempotent repeat.
     assert_eq!(
         status(agent_id, peer_id, change(false, false, false))

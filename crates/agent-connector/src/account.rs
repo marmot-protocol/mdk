@@ -177,7 +177,11 @@ impl AgentConnector {
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id = cgka_traits::GroupId::new(hex::decode(group_id_hex)?);
-        let member = crate::validation::normalize_hex(member_id_hex)?;
+        let member = hex::decode(member_id_hex)?;
+        if member.len() != 32 {
+            return Err(hex::FromHexError::InvalidStringLength.into());
+        }
+        let member = hex::encode(member);
         let before = self
             .runtime
             .group_member_ids_page(&account.label, std::slice::from_ref(&group_id))
