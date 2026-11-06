@@ -188,20 +188,13 @@ impl AgentConnector {
         let is_admin = before.iter().any(|g| g.admin_ids_hex.contains(&member));
         let mut message_ids = Vec::new();
         if change.remove {
+            // Removing an admin drops its admin key in the same commit.
             if is_member {
-                if is_admin {
-                    message_ids = self
-                        .runtime
-                        .demote_admin(&account.label, &group_id, &member)
-                        .await?
-                        .message_ids;
-                }
-                message_ids.extend(
-                    self.runtime
-                        .remove_members(&account.label, &group_id, std::slice::from_ref(&member))
-                        .await?
-                        .message_ids,
-                );
+                message_ids = self
+                    .runtime
+                    .remove_members(&account.label, &group_id, std::slice::from_ref(&member))
+                    .await?
+                    .message_ids;
             }
         } else if change.add && !is_member {
             let members = [member.clone()];

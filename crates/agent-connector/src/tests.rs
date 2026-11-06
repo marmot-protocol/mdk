@@ -9109,11 +9109,14 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
             .unwrap(),
         (true, true, 0)
     );
-    // Remove demotes and removes; it wins over add and promote and is idempotent.
-    let (member, admin, commits) = status(agent_id, new_id, change(true, true, true))
-        .await
-        .unwrap();
-    assert!(!member && !admin && commits > 0);
+    // Removing an admin publishes one commit that also drops its admin key;
+    // remove wins over add and promote and is idempotent.
+    assert_eq!(
+        status(agent_id, new_id, change(true, true, true))
+            .await
+            .unwrap(),
+        (false, false, 1)
+    );
     assert_eq!(
         status(agent_id, new_id, change(false, false, true))
             .await

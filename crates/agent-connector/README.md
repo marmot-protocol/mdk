@@ -327,10 +327,11 @@ idempotency key yet.
 
 The `group_admin` control request accepts an account id, group id and member id. With no flags it only reads the
 member's status. `promote: true` grants admin to a current member. `add: true` invites a missing member, as an initial
-admin when combined with `promote`. `remove: true` demotes the member if needed and removes it; it takes precedence over
-the other flags. Every change goes through the runtime's admin checks. The `group_admin_status` response carries a fresh
-`is_member`/`is_admin` readback and the message ids of the commits this request published; a request that changes
-nothing publishes no commit. After a timeout, send a read-only request and compare before retrying a change.
+admin when combined with `promote`. `remove: true` removes the member, dropping its admin rights in the same commit; it
+takes precedence over the other flags. Every change goes through the runtime's admin checks. The `group_admin_status`
+response carries a fresh `is_member`/`is_admin` readback and the message ids of the commits this request published; a
+request that changes nothing publishes no commit. After a timeout, send a read-only request and compare before retrying
+a change.
 
 ## Control plane security
 

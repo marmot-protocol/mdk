@@ -523,8 +523,8 @@ pub enum AgentControlRequest {
         /// `promote`, the member joins as an initial admin.
         #[serde(default)]
         add: bool,
-        /// Remove the member, demoting it first when it is an admin. Takes
-        /// precedence over `add` and `promote`.
+        /// Remove the member; an admin loses its admin rights in the same
+        /// commit. Takes precedence over `add` and `promote`.
         #[serde(default)]
         remove: bool,
     },
