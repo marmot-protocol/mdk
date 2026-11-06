@@ -100,8 +100,13 @@ additional verifier or dependency is needed. The development compatibility
 probe used Tamarin 1.12.0 and Maude 3.5.1.
 
 ```sh
-python3 formal/pairing/verify_pairing.py --out target/formal-pairing
+just tamarin
 ```
+
+This runs the existing convergence theory first, then this verifier's timeout
+regression and pairing model/control gate. The same checks run in the existing
+formal CI job. To select only the pairing theory and controls, run
+`python3 formal/pairing/verify_pairing.py --out target/formal-pairing`.
 
 The gate runs the whole theory, requires a verified result for every declared
 lemma, then requires the named falsification for each control below. It keeps
@@ -111,6 +116,10 @@ directory. A timeout, tool error, missing summary, omitted lemma, incomplete
 proof or unexpected control result fails the gate. Default budgets are 600
 seconds for the whole theory and 180 seconds per control; command-line options
 may change those wall-time budgets, not the theory or proof domain.
+On timeout the runner sends SIGTERM, waits at most two seconds, then escalates
+to SIGKILL with a bounded reap wait. Its separate process-control regression
+uses a synthetic prover that demonstrably ignores SIGTERM; a killed process
+is never counted as proof.
 
 The confirmed-group/sender lemma is marked `reuse`; later lemmas can use its
 conclusion. The gate requires that lemma's own proof in the same whole-theory

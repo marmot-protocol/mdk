@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+TERMINATION_GRACE_SECONDS = 2
+
 
 def replace_once(source, before, after):
     if source.count(before) != 1:
@@ -66,6 +68,7 @@ def check(tamarin, model, folder, name, expected, timeout):
     ]
     start = time.monotonic()
     timed_out = False
+    termination = None
     log = folder / "prover.log"
     with log.open("w") as output:
         process = subprocess.Popen(
@@ -75,8 +78,20 @@ def check(tamarin, model, folder, name, expected, timeout):
             status = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
-            status = process.wait()
+            termination = "SIGTERM"
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                termination = "SIGKILL"
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                status = process.wait(timeout=TERMINATION_GRACE_SECONDS)
     text = log.read_text()
     marker = "summary of summaries:"
     summary = text.split(marker, 1)[1] if marker in text else ""
@@ -95,6 +110,8 @@ def check(tamarin, model, folder, name, expected, timeout):
         "command": command,
         "exit": status,
         "timed_out": timed_out,
+        "termination": termination,
+        "termination_grace_seconds": TERMINATION_GRACE_SECONDS,
         "timeout_seconds": timeout,
         "elapsed_seconds": round(time.monotonic() - start, 3),
         "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),

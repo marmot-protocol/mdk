@@ -1426,6 +1426,12 @@ jobs:
       - name: Run Tamarin proofs
         run: make -C formal/tamarin prove
 
+      - name: Check pairing verifier timeout handling
+        run: python3 -B -m unittest discover -s formal/pairing -p 'test_*.py'
+
+      - name: Verify pairing authentication and model controls
+        run: python3 formal/pairing/verify_pairing.py --out target/formal-pairing
+
   hermes-installer-auth:
     name: Hermes installer auth
     needs: changes
