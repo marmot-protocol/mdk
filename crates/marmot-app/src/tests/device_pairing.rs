@@ -983,7 +983,8 @@ async fn a_request_from_a_slot_whose_rejection_the_roster_lacks_is_refused() {
 
 /// mdk#3010: Not now leaves a sign-in linkable, so its request gets the
 /// ordinary Link prompt. Rejected while that prompt shows its code, it gets
-/// no link: Link device is refused and the prompt ends rejected.
+/// no link: Link device is refused, the prompt ends rejected, and the new
+/// device is told its session ended, as Not now tells it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sign_in_put_off_is_offered_link_until_it_is_rejected() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
@@ -1022,6 +1023,16 @@ async fn a_sign_in_put_off_is_offered_link_until_it_is_rejected() {
     );
     let ended = phone.op(DeviceLinkOp::Read).await;
     assert_eq!(ended.prompt_for_slot(&laptop_slot).unwrap().state, REJECTED);
+    // The new device, shown the code, learns the session ended.
+    let told = laptop.step(&relay).await;
+    assert_eq!(
+        told.new_device,
+        Some(NewDeviceLinkState::Ended {
+            reason: DeviceLinkEndReason::CancelledElsewhere
+        })
+    );
+    let still = phone.step(&relay).await;
+    assert_eq!(still.prompt_for_slot(&laptop_slot).unwrap().state, REJECTED);
 }
 
 /// A new device that cancels while waiting for its Welcome withdraws the

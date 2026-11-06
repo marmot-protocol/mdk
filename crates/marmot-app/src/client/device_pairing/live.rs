@@ -1112,8 +1112,15 @@ impl AppClient {
                 prompt.stage = Stage::Rejected;
                 prompt.updated_at = now;
             }
-            if let Some(existing) = self.device_pairing.existing.as_mut() {
-                existing.cancel(&session_id);
+            // The new device was answered: end its session as Not now does.
+            if let Some(cancel) = self
+                .device_pairing
+                .existing
+                .as_mut()
+                .and_then(|existing| existing.cancel(&session_id))
+            {
+                self.device_pairing
+                    .send(PairingMessage::Cancel(cancel), now);
             }
             return Err(AppError::DeviceGroupRefused("sign_in_rejected"));
         }
