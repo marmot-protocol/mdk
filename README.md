@@ -132,6 +132,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | --- | --- |
 | The convergence model | [Distributed convergence](docs/marmot-architecture/distributed-convergence.md) |
 | The engine's canonicalization contract | [Canonicalization contract](docs/marmot-architecture/cgka-engine-canonicalization-contract.md) |
+| Temporal convergence and device-linking models | [Lifecycle models and implementation correspondence](formal/liveness/README.md) |
 | How it is tested: scenarios, vectors, generated chaos, property tests | [Conformance simulator](crates/cgka-conformance-simulator/README.md) |
 | Multi-process and container campaigns | [Campaign runner](crates/convergence-campaign-runner/README.md) |
 | Formal proofs and how they map to Rust tests | [Convergence model](formal/tamarin/README.md), [pairing authentication](formal/pairing/README.md) |
