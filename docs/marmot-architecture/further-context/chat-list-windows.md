@@ -94,7 +94,8 @@ requiring a new event. Internal query validation errors are terminal and retain
 their error classification. Losing a teardown signal closes the window conservatively:
 account cache eviction can preserve both account ID and durable store epoch, so a
 refresh alone cannot establish that its lifetime survived. Timed mute expiry
-refreshes only the retained window.
+refreshes the retained window when a visible row's mute expires, and when any
+chat in the view's mute expires if the window's filter tests mute.
 
 Pending invitations and Left rows have effective unread/mention/manual-attention
 fields suppressed in this API; raw stored read intent and lower-level APIs remain
@@ -123,11 +124,13 @@ manual unread and mention, which never match invitations or Left chats because
 their badges are hidden; pinned; pending leave and disbanding; a draft with
 non-blank text or an attachment; a last message showing a pending or failed send
 (an older unresolved send behind newer history does not count, as the row does
-not show it); and a group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
+not show it); conversation kind (direct or group, as the row's
+`conversation_kind` shows; a chat whose kind is still unknown matches neither);
+muted, as the row's `muted` shows at the time of the read; and a group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
 `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`, and an included ID
 never adds a chat outside the base view. An empty `All` matches every chat in the
-view and an empty `Any` none. Kind, mute, chat text, message text and people are
-later slices of #2983.
+view and an empty `Any` none. Chat text, message text and people are later slices
+of #2983.
 
 A query has at most 8 levels, 64 nodes and 500 group IDs in all. Over a bound, or
 with a malformed node list, every consumer fails with `InvalidChatListQuery`
@@ -136,8 +139,17 @@ before reading; host group IDs are normalized like any other host group ID.
 The filter compiles to SQL appended to the view's condition, ahead of keyset
 paging, with every value bound as a parameter. Reads still walk the view's page
 index in display order; each leaf is a `chat_list_rows` column or one keyed
-lookup per chat (account groups, engine leave and disband records, and the draft
-tables). Cost grows with the chats in the view, never with history.
+lookup per chat (account groups, engine leave and disband records, the draft
+tables and the mute settings). Cost grows with the chats in the view, never with
+history.
+
+Conversation kind is the `chat_list_rows.list_kind` column. Triggers keep it
+current from the classifier's inputs, the row's group name and the account
+group's member count, whichever writer changes them; the classifier still owns
+the presented row's kind. Mute is not a column: a mute has an expiry, so the
+`Muted` leaf tests the mute settings against the read's time, a bound parameter,
+and nothing is written when a mute expires. Each read evaluates the leaf and every
+row's `muted` at the same time, so they agree.
 
 Every read is self-contained: each window read, `chat_list_ids` and
 `revalidate_chat_list_ids` runs in one read transaction, so filtered and fixed
@@ -148,6 +160,9 @@ instead of continuing a stored page.
 Windows re-read on almost every account change already. Drafts are the exception:
 a draft change wakes a window only when the chat is visible, unless the window's
 filter tests drafts, in which case any draft change in the account re-reads it.
+Mute expiry is not a change anything writes, so a window whose filter tests mute
+also wakes at the next mute expiry among the chats in its view, visible or not:
+a chat leaves or enters a muted window at its expiry.
 
 ## Select all
 

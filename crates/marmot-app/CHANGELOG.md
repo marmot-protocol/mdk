@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Chat-list queries can filter by conversation kind (`ChatListCondition::Direct`, `Group`) and mute (`Muted`)
+  (mdk#2983). A window whose filter tests mute re-reads at the next mute expiry among the chats in its view, so a
+  chat leaves or enters it at its expiry even when it is off screen. Windows and select-all read mute at the same
+  time as each row's `muted`. Additive.
+
 - The coverage-ledger recovery runner now owns account history by default (mdk#2660 phase 4). Restart and reconnect
   gaps, post-join history and unresolved epoch gaps are fetched as bounded, paced runner work; the native backward
   pagers no longer run. A stalled or failing relay is retried on a backoff instead of being re-paged, so recovery

@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Append `Direct` (13), `Group` (14) and `Muted` (15) to the `MarmotChatListCondition` discriminants a filter node
+  carries (mdk#2983). Existing values are unchanged. Use the matching library.
+
 - Add filtered chat-list queries (mdk#2983): `marmot_open_chat_list_query_window`, `marmot_chat_list_query_ids` and
   `marmot_revalidate_chat_list_query_ids` take a borrowed `MarmotChatListViewQuery` whose filter is an array of
   `MarmotChatListFilterNode` (kind and condition are `uint32_t` discriminants). Append

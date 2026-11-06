@@ -94,6 +94,11 @@ over stored chat facts and group-ID lists). It compiles to SQL appended to the v
 bound as a parameter, and pages, counts and selects through the view's page index; each leaf is a row column or a
 keyed per-chat lookup, so cost grows with the view's chats, never with history. Queries are bounded (8 levels, 64
 nodes, 500 group IDs) and an over-bound query is a typed `ChatListQueryError` before any read.
+Conversation kind (`Direct`, `Group`) reads `chat_list_rows.list_kind`, which triggers keep equal to what the
+classifier derives from the row's group name and member count; an Unknown kind matches neither. `Muted` tests the
+mute settings against the read's `now_ms`, a bound parameter, so an expired mute needs no write; each read also
+evaluates every row's `muted` at that time. A window read whose query tests `Muted` reports the next mute expiry
+among the view's chats (`next_mute_expiry_ms`) so a live window can re-read then.
 `ChatListFilter::from_nodes` builds the tree from the bindings' flat node list. A `ChatListView` converts into the
 unfiltered query.
 
@@ -102,12 +107,12 @@ read transaction, and no cursor carries a position into a later read, so filtere
 live window keeps its place by re-reading around a stable anchor chat ID; paging grows the window rather than
 continuing a stored page.
 
-`chat_list_ids(query)` returns every chat ID the query matches, in display order, from one read transaction before
+`chat_list_ids(query, now_ms)` returns every chat ID the query matches, in display order, from one read transaction before
 any display paging. It reads no presentation, profile, roster or history blobs. Pending base-row work returns
 `ProjectionNotReady` rather than a falsely complete result; the runtime finishes its bounded base-row preparation
 before retrying.
 
-`revalidate_chat_list_ids(query, ids)` returns the subset of `ids` still matching, in the caller's order with
+`revalidate_chat_list_ids(query, ids, now_ms)` returns the subset of `ids` still matching, in the caller's order with
 duplicates dropped. It only removes: chats that matched since are never added. Both calls are stateless;
 hosts keep the selection. A bulk action revalidates first, and each per-chat command still enforces its own
 preconditions: this read is not an atomic authorization for a later write.

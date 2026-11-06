@@ -4,6 +4,9 @@ use crate::SqliteAccountStorage;
 use crate::base::test_support::chat_list_window_page;
 use rusqlite::params;
 
+/// No query here tests mute, so any read time will do.
+const NOW: i64 = 0;
+
 fn seed(
     store: &SqliteAccountStorage,
     id: &str,
@@ -38,7 +41,7 @@ fn ids_cover_the_whole_view_past_the_display_limit() {
         let display = chat_list_window_page(&app, ChatListView::Chats, 50).unwrap();
         assert_eq!(display.rows.len(), count.min(50));
         assert_eq!(
-            app.chat_list_ids(ChatListView::Chats).unwrap(),
+            app.chat_list_ids(ChatListView::Chats, NOW).unwrap(),
             (0..count).map(|n| format!("{n:032x}")).collect::<Vec<_>>()
         );
     }
@@ -64,7 +67,7 @@ fn ids_match_each_native_view_and_its_display_page() {
         (ChatListView::Archived, vec!["03"]),
         (ChatListView::Left, vec!["04", "05"]),
     ] {
-        assert_eq!(app.chat_list_ids(view).unwrap(), expected, "{view:?}");
+        assert_eq!(app.chat_list_ids(view, NOW).unwrap(), expected, "{view:?}");
         let page = chat_list_window_page(&app, view, 100).unwrap();
         assert_eq!(
             page.rows
@@ -88,17 +91,17 @@ fn revalidation_only_removes_and_keeps_the_callers_order() {
     seed(&store, "05", false, "member", 1, false);
     store.lock().unwrap().execute_batch("UPDATE chat_list_rows SET activity_sort_at = 999 WHERE group_id_hex = '01'; UPDATE account_groups SET archived = 1 WHERE group_id_hex = '02'; DELETE FROM chat_list_rows WHERE group_id_hex = '03';").unwrap();
     assert_eq!(
-        app.revalidate_chat_list_ids(ChatListView::Chats, &selected)
+        app.revalidate_chat_list_ids(ChatListView::Chats, &selected, NOW)
             .unwrap(),
         ["04", "01"]
     );
     assert_eq!(
-        app.revalidate_chat_list_ids(ChatListView::Archived, &selected)
+        app.revalidate_chat_list_ids(ChatListView::Archived, &selected, NOW)
             .unwrap(),
         ["02"]
     );
     assert!(
-        app.revalidate_chat_list_ids(ChatListView::Chats, &[])
+        app.revalidate_chat_list_ids(ChatListView::Chats, &[], NOW)
             .unwrap()
             .is_empty()
     );
@@ -111,11 +114,11 @@ fn pending_base_rows_return_not_ready_instead_of_a_partial_set() {
     seed(&store, "01", false, "member", 0, false);
     store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('missing', '', 0)", []).unwrap();
     assert!(matches!(
-        app.chat_list_ids(ChatListView::Chats),
+        app.chat_list_ids(ChatListView::Chats, NOW),
         Err(ChatListSelectionError::ProjectionNotReady)
     ));
     assert!(matches!(
-        app.revalidate_chat_list_ids(ChatListView::Chats, &strings(&["01"])),
+        app.revalidate_chat_list_ids(ChatListView::Chats, &strings(&["01"]), NOW),
         Err(ChatListSelectionError::ProjectionNotReady)
     ));
 }
@@ -132,13 +135,13 @@ fn caller_transaction_is_preserved() {
         .unwrap();
     seed(&store, "02", false, "member", 1, false);
     assert_eq!(
-        app.chat_list_ids(ChatListView::Chats).unwrap(),
+        app.chat_list_ids(ChatListView::Chats, NOW).unwrap(),
         ["01", "02"]
     );
     assert!(!store.lock().unwrap().is_autocommit());
     store.lock().unwrap().execute_batch("ROLLBACK").unwrap();
     assert_eq!(
-        app.revalidate_chat_list_ids(ChatListView::Chats, &strings(&["01", "02"]))
+        app.revalidate_chat_list_ids(ChatListView::Chats, &strings(&["01", "02"]), NOW)
             .unwrap(),
         ["01"]
     );

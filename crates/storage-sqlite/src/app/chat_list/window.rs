@@ -1,6 +1,6 @@
 //! Atomic bounded navigation plus selected presentation for runtime-owned windows.
 use super::pages::{PageQuery, read_page_tx};
-use super::query::ChatListViewQuery;
+use super::query::{ChatListCondition, ChatListViewQuery};
 use crate::base::connection::CachedSql;
 use crate::{
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatPresentationVersion,
@@ -17,6 +17,9 @@ pub struct ChatListWindowQuery {
     /// Preferred stable anchor, followed by fallback neighbors, at most 200 keys.
     pub anchors: Vec<String>,
     pub before_anchor: usize,
+    /// The read's time (Unix ms). A `Muted` leaf tests mute expiry against it,
+    /// and each row's `muted` is evaluated at it, so rows and filter agree.
+    pub now_ms: i64,
 }
 
 pub struct ChatListWindowRead {
@@ -25,6 +28,10 @@ pub struct ChatListWindowRead {
     /// Only these selected values need local preparation. No unrelated backfill barrier.
     pub pending_presentations: Vec<String>,
     pub anchor: Option<String>,
+    /// For a query that tests `Muted`: the earliest mute expiry after `now_ms`
+    /// among the chats in its view, visible or not. A live window re-reads then,
+    /// when such a chat enters or leaves the query's matches.
+    pub next_mute_expiry_ms: Option<i64>,
 }
 
 impl SqliteAppStorage {
@@ -65,6 +72,7 @@ impl SqliteAppStorage {
                             limit: query.before_anchor + 1,
                             direction: ChatListPageDirection::Backward,
                             boundary: None,
+                            now_ms: query.now_ms,
                         },
                         Some(anchor),
                     )?;
@@ -77,6 +85,7 @@ impl SqliteAppStorage {
                                 limit: remaining,
                                 direction: ChatListPageDirection::Forward,
                                 boundary: before.last.clone(),
+                                now_ms: query.now_ms,
                             },
                             None,
                         )?;
@@ -95,6 +104,7 @@ impl SqliteAppStorage {
                         limit: query.limit,
                         direction: ChatListPageDirection::Forward,
                         boundary: None,
+                        now_ms: query.now_ms,
                     },
                     None,
                 )?,
@@ -110,6 +120,7 @@ impl SqliteAppStorage {
                         limit: query.limit - page.rows.len(),
                         direction: ChatListPageDirection::Backward,
                         boundary: page.first.clone(),
+                        now_ms: query.now_ms,
                     },
                     None,
                 )?;
@@ -159,11 +170,17 @@ impl SqliteAppStorage {
                     rows,
                     presentation_version,
                 });
+            let next_mute_expiry_ms = if query.query.references(ChatListCondition::Muted) {
+                next_mute_expiry(conn, &query)?
+            } else {
+                None
+            };
             Ok(ChatListWindowRead {
                 page,
                 snapshot,
                 pending_presentations,
                 anchor,
+                next_mute_expiry_ms,
             })
         })
     }
@@ -172,7 +189,7 @@ fn choose_anchor(
     conn: &Connection,
     query: &ChatListWindowQuery,
 ) -> Result<Option<String>, ChatListPageError> {
-    let compiled = query.query.compile()?;
+    let compiled = query.query.compile(query.now_ms)?;
     let mut stmt = conn
         .prepare_cached(&format!(
             "SELECT group_id_hex FROM chat_list_rows WHERE {} AND lower(group_id_hex)=lower(?{})",
@@ -195,4 +212,25 @@ fn choose_anchor(
         }
     }
     Ok(None)
+}
+
+/// Earliest timed mute after the read's time among chats in the query's view.
+/// The view bounds which chats could ever match; the filter is not applied, so
+/// a spare wake only re-reads an unchanged window. Walks the account's mute
+/// rows, never message history.
+fn next_mute_expiry(
+    conn: &Connection,
+    query: &ChatListWindowQuery,
+) -> Result<Option<i64>, ChatListPageError> {
+    // Unqualified view columns resolve to the innermost `chat_list_rows`.
+    let sql = format!(
+        "SELECT min(mute.muted_until_ms) FROM chat_notification_settings AS mute
+         WHERE mute.muted_until_ms > ?1
+           AND EXISTS(SELECT 1 FROM chat_list_rows
+               WHERE chat_list_rows.group_id_hex = mute.group_id_hex AND {})",
+        query.query.view.predicate()
+    );
+    Ok(conn
+        .query_row_cached(&sql, [query.now_ms], |r| r.get(0))
+        .storage()?)
 }

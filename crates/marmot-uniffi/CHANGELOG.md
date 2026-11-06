@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `Direct`, `Group` and `Muted` to `ChatListConditionFfi` (mdk#2983). A chat whose conversation kind is still
+  `Unknown` matches neither kind; a window filtered on `Muted` updates when a mute expires. Regenerate bindings; an
+  exhaustive Swift/Kotlin `switch` over the enum needs the new cases.
+
 - Add filtered chat-list queries (mdk#2983): `open_chat_list_query_window`, `chat_list_query_ids` and
   `revalidate_chat_list_query_ids` take a `ChatListViewQueryFfi` whose filter is a flat `ChatListFilterNodeFfi` list
   (node 0 is the root; children are later indices). Invalid queries fail with the new

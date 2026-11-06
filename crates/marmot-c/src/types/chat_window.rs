@@ -120,6 +120,9 @@ c_enum! {
         HasDraft,
         PendingSend,
         FailedSend,
+        Direct,
+        Group,
+        Muted,
     }
 }
 c_enum! {
@@ -250,6 +253,9 @@ impl MarmotChatListCondition {
             Self::HasDraft => ChatListConditionFfi::HasDraft,
             Self::PendingSend => ChatListConditionFfi::PendingSend,
             Self::FailedSend => ChatListConditionFfi::FailedSend,
+            Self::Direct => ChatListConditionFfi::Direct,
+            Self::Group => ChatListConditionFfi::Group,
+            Self::Muted => ChatListConditionFfi::Muted,
         }
     }
 }

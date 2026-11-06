@@ -96,6 +96,15 @@ pub enum ChatListConditionFfi {
     PendingSend,
     /// The row's last message shows a failed send (`ChatListMessageDeliveryStateFfi::Failed`).
     FailedSend,
+    /// A one-to-one chat (`conversation_kind` is `Direct`). A chat whose kind
+    /// is still `Unknown` never matches.
+    Direct,
+    /// A group chat (`conversation_kind` is `Group`). A chat whose kind is
+    /// still `Unknown` never matches.
+    Group,
+    /// Muted now, as the row's `muted` shows: until unmuted, or until a later
+    /// time. A live window testing it updates when a mute expires.
+    Muted,
 }
 enums!(
     ChatListConditionFfi,
@@ -112,7 +121,10 @@ enums!(
     Disbanding,
     HasDraft,
     PendingSend,
-    FailedSend
+    FailedSend,
+    Direct,
+    Group,
+    Muted
 );
 
 /// Why a chat-list query was refused. Nothing was read.
