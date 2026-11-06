@@ -358,7 +358,32 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 return DispatchOutcome::Continue;
             }
-            if !ctx.dedupe.insert(message.message_id_hex.clone()).await {
+            let inbound = InboundPrompt {
+                account_ref: account_id_hex,
+                group_ref: group_id_hex,
+                message_ref: message.message_id_hex,
+                text: message.text,
+                media: message.media,
+            };
+            // Admit before recording the message ID, so a queue-full rejection
+            // stays recoverable through reconnect replay.
+            let disposition = classify_prompt(&inbound.text);
+            let admission =
+                if ctx.backend.supports_steering() && !bypasses_waiter_quota(&disposition) {
+                    ctx.queues
+                        .reserve_ingress(&inbound.group_ref)
+                        .await
+                        .map(Admission::Ingress)
+                } else {
+                    acquire_dispatch_permit(&ctx.queues, &inbound.group_ref, &disposition)
+                        .await
+                        .map(Admission::Turn)
+                };
+            let Some(admission) = admission else {
+                reply_queue_full(ctx, inbound, "try again shortly");
+                return DispatchOutcome::Continue;
+            };
+            if !ctx.dedupe.insert(inbound.message_ref.clone()).await {
                 debug!(
                     target: TRACE_TARGET,
                     method = "dispatch_event",
@@ -367,27 +392,13 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 return DispatchOutcome::Continue;
             }
-
-            let inbound = InboundPrompt {
-                account_ref: account_id_hex,
-                group_ref: group_id_hex,
-                message_ref: message.message_id_hex,
-                text: message.text,
-                media: message.media,
-            };
-            let disposition = classify_prompt(&inbound.text);
-            if bypasses_waiter_quota(&disposition) {
-                if let Some(permit) =
-                    acquire_dispatch_permit(&ctx.queues, &inbound.group_ref, &disposition).await
-                {
+            match admission {
+                Admission::Turn(permit) => {
                     tokio::spawn(handle_message(ctx, inbound, permit));
-                } else {
-                    reply_queue_full(ctx, inbound);
                 }
-            } else if let Some(ingress) = ctx.queues.reserve_ingress(&inbound.group_ref).await {
-                tokio::spawn(dispatch_authorized(ctx, inbound, ingress));
-            } else {
-                reply_queue_full(ctx, inbound);
+                Admission::Ingress(ingress) => {
+                    tokio::spawn(dispatch_authorized(ctx, inbound, ingress));
+                }
             }
             DispatchOutcome::Continue
         }
@@ -422,7 +433,13 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
     }
 }
 
-/// One ordered admission lane per group, independent of the running turn.
+enum Admission {
+    Turn(GroupPermit),
+    Ingress(IngressPermit),
+}
+
+/// One ordered admission lane per group for steering backends, independent of
+/// the running turn. Downloads and steering never block the global event stream.
 /// Downloads and native acknowledgements never block the global event stream.
 async fn dispatch_authorized(
     ctx: Arc<BridgeContext>,
@@ -490,7 +507,8 @@ async fn dispatch_authorized(
 
     let Some(mut permit) = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await
     else {
-        reply_queue_full(ctx, inbound);
+        // The message ID is already recorded, so replay will not recover it.
+        reply_queue_full(ctx, inbound, "send a new message shortly");
         return;
     };
     // Keep admission ordered until the handler actually owns its serial turn.
@@ -499,7 +517,7 @@ async fn dispatch_authorized(
     tokio::spawn(handle_message(ctx, inbound, permit));
 }
 
-fn reply_queue_full(ctx: Arc<BridgeContext>, inbound: InboundPrompt) {
+fn reply_queue_full(ctx: Arc<BridgeContext>, inbound: InboundPrompt, advice: &'static str) {
     warn!(target: TRACE_TARGET, method = "dispatch_event", event = "queue_full", "rejecting inbound event because group queue is full");
     tokio::spawn(async move {
         if let Err(err) = send_reply(
@@ -508,7 +526,7 @@ fn reply_queue_full(ctx: Arc<BridgeContext>, inbound: InboundPrompt) {
             &inbound.group_ref,
             &inbound.message_ref,
             &format!(
-                "[{}] too many prompts are already queued for this group; send a new message shortly.",
+                "[{}] too many prompts are already queued for this group; {advice}.",
                 ctx.cfg.spec.reply_prefix
             ),
             0,
@@ -659,7 +677,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             }
             let Some(pending) = permit.queue.pending.clone().try_acquire_owned().ok() else {
                 let text = format!(
-                    "[{}] too many prompts are already queued for this group; send a new message shortly.",
+                    "[{}] too many prompts are already queued for this group; try again shortly.",
                     ctx.cfg.spec.reply_prefix
                 );
                 let _ = send_reply(
@@ -3033,6 +3051,9 @@ mod tests {
     }
     #[async_trait]
     impl Backend for AdmissionProbe {
+        fn supports_steering(&self) -> bool {
+            true
+        }
         async fn steer(&self, group: &str, text: &str) -> crate::SteerOutcome {
             self.entered.send(format!("{group}:{text}")).await.unwrap();
             if group == "slow" {
@@ -3114,7 +3135,10 @@ mod tests {
     #[tokio::test]
     async fn inspect_and_recovery_bypass_saturated_ingress_at_dispatch_entry() {
         let root = tempfile::tempdir().unwrap();
-        let backend = Arc::new(RecordingBackend::default());
+        let backend = Arc::new(RecordingBackend {
+            steering: true,
+            ..Default::default()
+        });
         let mut config = test_config(root.path());
         config.allowed_senders.insert("sender".into());
         let listener = UnixListener::bind(&config.socket).unwrap();
@@ -3214,7 +3238,10 @@ mod tests {
             root.path(),
             &home,
             config,
-            Arc::new(RecordingBackend::default()),
+            Arc::new(RecordingBackend {
+                steering: true,
+                ..Default::default()
+            }),
         );
         ctx.sessions
             .record_session("group", "old-session".into(), home)
@@ -3610,6 +3637,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         invocations: Mutex<Vec<Invocation>>,
+        steering: bool,
     }
 
     #[derive(Debug)]
@@ -3717,6 +3745,10 @@ mod tests {
 
     #[async_trait]
     impl Backend for RecordingBackend {
+        fn supports_steering(&self) -> bool {
+            self.steering
+        }
+
         async fn run(
             &self,
             invocation: Invocation,
