@@ -541,7 +541,6 @@ fn schemeless_domain_does_not_override_authored_links_code_or_escapes() {
 #[test]
 fn schemeless_domain_idna_exposes_actual_host_without_rewriting_the_label() {
     for (source, dest) in [
-        ("еxample.chat", "https://xn--xample-2of.chat"), // Cyrillic e, not Latin e.
         ("bücher.de", "https://xn--bcher-kva.de"),
         ("пример.рф", "https://xn--e1afmkfd.xn--p1ai"),
         ("例子.中国", "https://xn--fsqu00a.xn--fiqs8s"),
@@ -550,6 +549,7 @@ fn schemeless_domain_idna_exposes_actual_host_without_rewriting_the_label() {
         assert_eq!(parse_inlines(source), vec![domain_link(source, dest)]);
     }
     for source in [
+        "еxample.chat", // Cyrillic e mixed with Latin letters.
         "ex\u{200b}ample.chat",
         "ex\u{00ad}ample.chat",
         "ex\u{202e}ample.chat",
@@ -635,6 +635,11 @@ fn schemeless_domains_do_not_absorb_unspaced_prose_or_sentence_stops() {
         "请访问example.chat",
         "詳しくはexample.com",
         "ไปที่example.com",
+        "네이버naver.com",
+        "ចូលexample.com",
+        "ເຂົ້າexample.com",
+        "သွားexample.com",
+        "ーexample.com",
         "谢谢。我爱你",
         "ありがとう。みんな",
         "收到。公司",
@@ -673,6 +678,15 @@ fn schemeless_domains_keep_internal_apostrophes_and_surrounding_punctuation() {
                 t("'")
             ]
         );
+    }
+    for source in [
+        "O'Reilly.com",
+        "O’Reilly.com",
+        "it's.me",
+        "I can't.Do",
+        "l‘example.fr",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source:?}");
     }
     for (left, right) in [
         ("“", "”"),

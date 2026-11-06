@@ -35,21 +35,30 @@ pub(crate) fn eligible_start(raw: &str, i: usize) -> bool {
             return prev.is_ascii_whitespace()
                 || matches!(
                     prev,
-                    b'(' | b'[' | b'"' | b'\'' | b',' | b';' | b'!' | b'*' | b'_' | b'~'
-                );
+                    b'(' | b'[' | b'"' | b',' | b';' | b'!' | b'*' | b'_' | b'~'
+                )
+                || (prev == b'\'' && opening_apostrophe(&raw[..i - 1]));
         }
     } else if !raw[i..].chars().next().is_some_and(char::is_alphanumeric) {
         return false;
     }
+    let mut before = raw[..i].chars();
     i == 0
-        || raw[..i].chars().next_back().is_some_and(|prev| {
+        || before.next_back().is_some_and(|prev| {
             prev.is_whitespace()
-                || matches!(
-                    prev,
-                    '(' | '[' | '"' | '\'' | ',' | ';' | '!' | '*' | '_' | '~'
-                )
-                || unicode_boundary(prev)
+                || matches!(prev, '(' | '[' | '"' | ',' | ';' | '!' | '*' | '_' | '~')
+                || (matches!(prev, '\'' | '‘' | '’') && opening_apostrophe(before.as_str()))
+                || (!matches!(prev, '‘' | '’') && unicode_boundary(prev))
         })
+}
+
+/// An apostrophe after a letter or digit is inside a word (`O'Reilly.com`,
+/// `can't.do`), so the text after it is not a separate host.
+fn opening_apostrophe(before: &str) -> bool {
+    !before
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
 }
 
 /// Common prose punctuation is a boundary, never an IDNA-mapped host separator.
@@ -190,24 +199,23 @@ fn infer(text: &str) -> Option<String> {
     Some(dest)
 }
 
-/// Refuse ambiguous glued prose without guessing a different host suffix.
+/// Refuse a label mixing Latin letters or ASCII digits with letters or digits
+/// of any other script. Glued prose (`네이버naver.com`, `ចូលexample.com`) and
+/// lookalike hosts (`еxample.chat` with a Cyrillic `е`) both take this shape;
+/// the parser cannot tell them from a real mixed-script domain and never
+/// guesses a different ASCII suffix.
 fn ambiguous_host_labels(host: &str) -> bool {
     host.split('.').any(|label| {
         if label.is_ascii() {
             return false;
         }
         let mut latin_or_digit = false;
-        let mut unspaced = false;
+        let mut other_script = false;
         for c in label.chars() {
             latin_or_digit |= c.is_ascii_digit() || c.script() == Script::Latin;
-            if !c.is_ascii() {
-                unspaced |= matches!(
-                    c.script(),
-                    Script::Han | Script::Hiragana | Script::Katakana | Script::Thai
-                );
-            }
+            other_script |= !c.is_ascii() && c.is_alphanumeric() && c.script() != Script::Latin;
         }
-        latin_or_digit && unspaced
+        latin_or_digit && other_script
     })
 }
 

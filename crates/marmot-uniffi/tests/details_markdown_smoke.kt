@@ -11,8 +11,8 @@ fun main() {
     check(copy is MarkdownBlockFfi.Details)
     check(copy.summary == block.summary && copy.open == block.open && copy.body == block.body)
     check(copy.blankLinesBefore.contentEquals(block.blankLinesBefore))
-    val authoredLabel = "еxample.chat" // First character is Cyrillic U+0435.
-    val destination = "https://xn--xample-2of.chat"
+    val authoredLabel = "bücher.de"
+    val destination = "https://xn--bcher-kva.de"
     val paragraph = MarkdownBlockFfi.Paragraph(listOf(
         MarkdownInlineFfi.Link(
             dest = destination,

@@ -660,15 +660,15 @@ mod tests {
 
     #[test]
     fn bridges_bare_idn_label_and_ascii_destination_without_reclassification() {
-        let document = parse_markdown_document("еxample.chat README.md archive.zip report.pdf");
+        let document = parse_markdown_document("bücher.de README.md archive.zip report.pdf");
         let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
             panic!("expected paragraph");
         };
         assert!(matches!(
             &inlines[0],
             MarkdownInlineFfi::Link { dest, children, classification: MarkdownLinkDestinationKindFfi::Web, .. }
-                if dest == "https://xn--xample-2of.chat"
-                    && matches!(children.as_slice(), [MarkdownInlineFfi::Text { content }] if content == "еxample.chat")
+                if dest == "https://xn--bcher-kva.de"
+                    && matches!(children.as_slice(), [MarkdownInlineFfi::Text { content }] if content == "bücher.de")
         ));
         assert!(matches!(&inlines[1], MarkdownInlineFfi::Text { content }
             if content == " README.md archive.zip report.pdf"));

@@ -156,10 +156,13 @@ explicit URLs retain their original parsing/classification contract.
 
 Bare inference uses ASCII periods between host labels. Ideographic/fullwidth stops
 and common Unicode quotes, brackets and sentence punctuation delimit prose. A host
-label mixing Latin letters or ASCII digits with Han, Hiragana, Katakana or Thai stays text:
-the parser cannot safely distinguish glued prose from a mixed-script domain. It does
+label mixing Latin letters or ASCII digits with letters or digits of another script
+stays text: the parser cannot safely distinguish glued prose (`네이버naver.com`) or a
+lookalike (`еxample.chat` with Cyrillic `е`) from a real mixed-script domain. It does
 not guess a different ASCII suffix. Explicit URLs remain available for those hosts.
-Accented Latin and pure Unicode IDNs with ASCII periods remain supported.
+Accented Latin and pure Unicode IDNs with ASCII periods remain supported. An
+apostrophe after a letter or digit stays inside the word, so `O'Reilly.com` and
+`it's.me` remain text instead of linking `reilly.com` or `s.me`.
 
 The filename exceptions prioritize common document, archive, source, video and
 shared-library names. They are a finite display policy, not file-type detection:
