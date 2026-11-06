@@ -701,7 +701,7 @@ link (`new_device`) and the prompts for sign-ins this device can link (`prompts`
   20 devices, when several sign-ins compete, and who added the device on another device.
 - For explicit local repair, `reset_device_group_for_repair` follows the [shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing)
   before fresh pairing: it preserves ordinary data but discards this copy's device-group continuity, may refuse while
-  busy, and guarantees no fresh admission.
+  busy, and does not guarantee fresh admission.
 - `device_link_snapshot` returns current linking and move progress. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
   also fires once each time the account's worker opens or reconnects. Unconfirmed comparisons end because their
   secrets are memory-only; admitted move bookkeeping resumes from storage.
