@@ -10,7 +10,7 @@ use super::*;
 use crate::client::device_group::{LINK_DEADLINE_SECS, WELCOME_WAIT_SECS};
 use crate::{
     DeviceLinkChoices, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPromptState,
-    DeviceLinkSnapshot, NewDeviceLinkState,
+    DeviceLinkSnapshot, NewDeviceLinkState, SignInResponse,
 };
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
@@ -909,6 +909,130 @@ async fn a_twenty_first_device_is_refused() {
             reason: DeviceLinkEndReason::CannotLink
         })
     );
+}
+
+const REJECTED: DeviceLinkPromptState = DeviceLinkPromptState::Ended {
+    reason: DeviceLinkEndReason::Rejected,
+};
+
+/// mdk#3010: a device with no device group keeps its own rejections, and a
+/// request from a slot it rejected gets no Link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_from_a_slot_rejected_here_is_refused_without_a_device_group() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let laptop_slot = laptop.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    phone
+        .client
+        .answer_sign_in(&laptop_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    assert_eq!(phone.client.trusted_device_group().unwrap(), None);
+
+    laptop.op(DeviceLinkOp::Start).await;
+    let refused = phone.step(&relay).await;
+    assert_eq!(
+        refused.prompt_for_slot(&laptop_slot).unwrap().state,
+        REJECTED
+    );
+}
+
+/// mdk#3010: in a device group whose roster does not hold this device's
+/// rejection yet (an earlier commit of its own is still in flight, so the
+/// rejection waits), a request from the rejected slot is refused as it
+/// would be once the roster holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_from_a_slot_whose_rejection_the_roster_lacks_is_refused() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let tablet_slot = tablet.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    relay.fail_publishes_as_unavailable();
+    let _ = phone.client.rotate_key_package().await;
+    phone
+        .client
+        .answer_sign_in(&tablet_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    relay.allow_publishes();
+    let rejection = phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .sign_in(&tablet_slot)
+        .unwrap()
+        .unwrap();
+    assert!(rejection.roster_pending);
+
+    tablet.op(DeviceLinkOp::Start).await;
+    let refused = phone.step(&relay).await;
+    assert_eq!(
+        refused.prompt_for_slot(&tablet_slot).unwrap().state,
+        REJECTED
+    );
+    let tablet_slot_id: [u8; 32] = hex::decode(&tablet_slot).unwrap().try_into().unwrap();
+    assert!(
+        !phone
+            .roster(&group)
+            .rejected_slots
+            .contains_key(&tablet_slot_id),
+        "refused on this device's own rejection alone"
+    );
+}
+
+/// mdk#3010: Not now leaves a sign-in linkable, so its request gets the
+/// ordinary Link prompt. Rejected while that prompt shows its code, it gets
+/// no link: Link device is refused, the prompt ends rejected, and the new
+/// device is told its session ended, as Not now tells it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sign_in_put_off_is_offered_link_until_it_is_rejected() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let laptop_slot = laptop.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    phone
+        .client
+        .answer_sign_in(&laptop_slot, SignInResponse::NotNow)
+        .await
+        .unwrap();
+
+    laptop.op(DeviceLinkOp::Start).await;
+    phone.step(&relay).await; // request in, answer out
+    laptop.step(&relay).await; // answer in, reveal out
+    let prompt = phone.step(&relay).await; // reveal in: the code
+    let (prompt_id, _) = prompt_code(&prompt, &laptop_slot);
+
+    phone
+        .client
+        .answer_sign_in(&laptop_slot, SignInResponse::Reject)
+        .await
+        .unwrap();
+    let refused = phone
+        .client
+        .device_link(DeviceLinkOp::Link {
+            prompt_id,
+            choices: DeviceLinkChoices::new("Laptop"),
+        })
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(AppError::DeviceGroupRefused("sign_in_rejected"))
+        ),
+        "{refused:?}"
+    );
+    let ended = phone.op(DeviceLinkOp::Read).await;
+    assert_eq!(ended.prompt_for_slot(&laptop_slot).unwrap().state, REJECTED);
+    // The new device, shown the code, learns the session ended.
+    let told = laptop.step(&relay).await;
+    assert_eq!(
+        told.new_device,
+        Some(NewDeviceLinkState::Ended {
+            reason: DeviceLinkEndReason::CancelledElsewhere
+        })
+    );
+    let still = phone.step(&relay).await;
+    assert_eq!(still.prompt_for_slot(&laptop_slot).unwrap().state, REJECTED);
 }
 
 /// A new device that cancels while waiting for its Welcome withdraws the

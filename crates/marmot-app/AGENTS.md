@@ -392,6 +392,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `MarmotAppConfig::dev_device_groups` is set with explicit `dev-device-groups` capability or policy tests). The Welcome peeler opens each gift wrap to the account once and hands
   pairing rumors to the `PairingInbox`; the engine still sees them refused. Pairing secrets (the code, keys and session
   ids) live only in the in-memory `marmot-pairing` sessions: never persist them, and never log them, a slot or a label.
+  An existing device answers no request whose slot the roster rejects or this device rejected itself, with or without a
+  device group and whether or not the roster has the rejection yet (`rejected_sign_in_here`): the prompt is `Rejected`
+  and offers no Link. Link refuses one rejected since the answer (`sign_in_rejected`), so a rejected slot never reaches
+  a link or the founding roster's exclusion of the linked slot.
   A device adds a sibling only after both users confirmed the code and the new device's confirmation verified, through
   exactly the confirmed `KeyPackageRef`: a first link creates the device group, a later one sends one
   `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome

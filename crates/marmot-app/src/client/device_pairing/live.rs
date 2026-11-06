@@ -262,6 +262,8 @@ enum LinkVerdict {
 
 struct FoundKeyPackage {
     slot: DeviceSlotId,
+    /// The KeyPackage's `d` as published, which a sign-in rejection names.
+    published_slot: String,
     key_package: KeyPackage,
 }
 
@@ -920,6 +922,7 @@ impl AppClient {
                 .and_then(|fetched| {
                     Some(FoundKeyPackage {
                         slot: device_slot(&fetched.key_package_id).ok()?,
+                        published_slot: fetched.key_package_id.clone(),
                         key_package: fetched.key_package.clone(),
                     })
                 });
@@ -966,6 +969,16 @@ impl AppClient {
             None => first_link_requirements(),
         };
         let roster = device_group.map(|(_, roster)| roster);
+        let Some(found) = self
+            .device_pairing
+            .prompts
+            .iter()
+            .find(|prompt| &prompt.session_id == session_id)
+            .and_then(|prompt| prompt.found.as_ref())
+        else {
+            return Ok(());
+        };
+        let rejected_here = self.rejected_sign_in_here(&found.published_slot, &found.slot)?;
         let Some(prompt) = self.device_pairing.prompt_mut(session_id) else {
             return Ok(());
         };
@@ -990,10 +1003,12 @@ impl AppClient {
         {
             // Already linked; the prompt shows who added it.
             return Ok(());
-        } else if roster
-            .as_ref()
-            .is_some_and(|roster| roster.rejected_slots.contains_key(&found.slot))
+        } else if rejected_here
+            || roster
+                .as_ref()
+                .is_some_and(|roster| roster.rejected_slots.contains_key(&found.slot))
         {
+            // This device rejected the slot itself, or the roster rejects it.
             Some(Stage::Rejected)
         } else {
             let missing = missing_capabilities(&required, &metadata);
@@ -1072,22 +1087,45 @@ impl AppClient {
         if choices.label.trim().is_empty() || choices.label.len() > DEVICE_ROSTER_TEXT_MAX_LEN {
             return Err(AppError::DeviceGroupRefused("label_invalid"));
         }
-        let (session_id, slot) = self
+        let (session_id, slot, published_slot) = self
             .device_pairing
             .prompts
             .iter()
             .find(|prompt| prompt.id == prompt_id)
             .filter(|prompt| matches!(prompt.stage, Stage::Answered))
-            .and_then(|prompt| Some((prompt.session_id, prompt.found.as_ref()?.slot)))
+            .and_then(|prompt| {
+                let found = prompt.found.as_ref()?;
+                Some((prompt.session_id, found.slot, found.published_slot.clone()))
+            })
             .ok_or(AppError::DeviceGroupRefused("unknown_prompt"))?;
         let device_group = self.trusted_device_roster()?;
-        if let Some((_, roster)) = &device_group {
-            if roster.devices.contains_key(&slot) {
-                return Err(AppError::DeviceGroupRefused("device_already_linked"));
+        let roster = device_group.as_ref().map(|(_, roster)| roster);
+        if roster.is_some_and(|roster| roster.devices.contains_key(&slot)) {
+            return Err(AppError::DeviceGroupRefused("device_already_linked"));
+        }
+        // Rejected since this device answered: refuse the link as the answer
+        // would have been refused, so a rejected slot never reaches a link.
+        if self.rejected_sign_in_here(&published_slot, &slot)?
+            || roster.is_some_and(|roster| roster.rejected_slots.contains_key(&slot))
+        {
+            if let Some(prompt) = self.device_pairing.prompt_mut(&session_id) {
+                prompt.stage = Stage::Rejected;
+                prompt.updated_at = now;
             }
-            if roster.devices.len() >= MAX_LEAVES_PER_ACCOUNT {
-                return Err(AppError::DeviceGroupRefused("too_many_devices"));
+            // The new device was answered: end its session as Not now does.
+            if let Some(cancel) = self
+                .device_pairing
+                .existing
+                .as_mut()
+                .and_then(|existing| existing.cancel(&session_id))
+            {
+                self.device_pairing
+                    .send(PairingMessage::Cancel(cancel), now);
             }
+            return Err(AppError::DeviceGroupRefused("sign_in_rejected"));
+        }
+        if roster.is_some_and(|roster| roster.devices.len() >= MAX_LEAVES_PER_ACCOUNT) {
+            return Err(AppError::DeviceGroupRefused("too_many_devices"));
         }
         let device_group_id = device_group
             .map(|(group_id, _)| group_id)

@@ -753,10 +753,29 @@ impl AppClient {
         }
     }
 
+    /// Whether this device rejected the sign-in whose KeyPackage it found in
+    /// `published_slot`, its `d` as published, which a link records in the
+    /// roster as `slot` ([`rejects_slot`]). It keeps that rejection until the
+    /// roster holds the slot as a device, whether or not it has a device
+    /// group and whether or not the roster has the rejection yet, and does
+    /// not link the slot meanwhile (device-group.md, "Before answering").
+    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
+    pub(crate) fn rejected_sign_in_here(
+        &self,
+        published_slot: &str,
+        slot: &DeviceSlotId,
+    ) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        Ok(rejects_slot(&storage.sign_ins()?, published_slot, slot))
+    }
+
     /// Rejections this device made while it had no device group, for the
     /// founding roster of the one it creates: every one but `linking`, the
     /// slot the user just confirmed, which the founding Add lists as a device
-    /// (D41). The commit that settles them reads that roster.
+    /// (D41). Pairing refuses to link a slot this device rejected, so
+    /// `linking` is among them only when the user rejected it after
+    /// confirming its link, and the link overrides that rejection
+    /// ("Answers"). The commit that settles them reads that roster.
     pub(crate) fn founding_sign_in_rejections(
         &self,
         roster: &mut DeviceRosterV1,
@@ -836,6 +855,21 @@ fn rejected_slots_here(records: &[SignInRecord]) -> BTreeSet<String> {
         .filter(|record| record.answer == SignInAnswer::Rejected)
         .map(|record| record.slot_id_hex.clone())
         .collect()
+}
+
+/// Whether one of `records` rejects linking a KeyPackage published in
+/// `published_slot`, which a link records in the roster as `slot`. A
+/// rejection names its slot as published, so a rejection of another spelling
+/// of a device's slot leaves that device linkable. One the roster can name
+/// also refuses any other spelling a link would record as that slot, since
+/// that link would end it.
+#[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
+fn rejects_slot(records: &[SignInRecord], published_slot: &str, slot: &DeviceSlotId) -> bool {
+    records.iter().any(|record| {
+        record.answer == SignInAnswer::Rejected
+            && (record.slot_id_hex == published_slot
+                || roster_slot(&record.slot_id_hex) == Some(*slot))
+    })
 }
 
 /// How a check classifies the publication `event_id_hex` in `slot_hex`.
@@ -1255,6 +1289,32 @@ mod tests {
                 rejected.slot_id_hex = "not-a-slot".into();
             }
             assert_eq!(rejected_slot(&rejected, &roster).unwrap(), None);
+        }
+    }
+
+    /// Pairing links no KeyPackage from a slot this device rejected, as
+    /// published, nor one whose link the roster would record as a slot this
+    /// device rejected. A rejection of another spelling of a device's slot
+    /// leaves that device linkable, and an answer other than Reject refuses
+    /// nothing.
+    #[test]
+    fn a_rejection_refuses_its_slot_as_published_and_as_the_roster_names_it() {
+        // Bytes whose hex has letters, so the two spellings differ.
+        let upper = |byte: u8| slot(byte).to_uppercase();
+        let mut alias = record(0xa7, SignInAnswer::Rejected, false);
+        alias.slot_id_hex = upper(0xa7);
+        let records = [
+            record(0xa5, SignInAnswer::Rejected, false),
+            alias,
+            record(0xa8, SignInAnswer::NotNow, false),
+            record(0xa9, SignInAnswer::Dismissed, false),
+        ];
+        assert!(rejects_slot(&records, &slot(0xa5), &[0xa5; 32]));
+        assert!(rejects_slot(&records, &upper(0xa5), &[0xa5; 32]));
+        assert!(rejects_slot(&records, &upper(0xa7), &[0xa7; 32]));
+        assert!(!rejects_slot(&records, &slot(0xa7), &[0xa7; 32]));
+        for byte in [0xa8, 0xa9] {
+            assert!(!rejects_slot(&records, &slot(byte), &[byte; 32]));
         }
     }
 
