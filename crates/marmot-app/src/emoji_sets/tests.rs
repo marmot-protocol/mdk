@@ -1101,6 +1101,29 @@ async fn an_image_over_the_budget_does_not_stop_later_ones() {
     );
 }
 
+/// No download dials once the install is cancelled, even one the stream
+/// starts before the install's `select!` looks at the control again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_install_starts_no_download() {
+    let fixture = fixture().await;
+    let entries = (0..3)
+        .map(|index| StoredEmojiSetEntry {
+            shortcode: format!("good{index}"),
+            url: fixture.host.url("/good.png"),
+        })
+        .collect::<Vec<_>>();
+    let control = EmojiSetInstallControl::new();
+    control.cancel();
+
+    let (kept, _) = fixture
+        .app
+        .download_set(&entries, MAX_INSTALLED_EMOJI_SET_BYTES, &control)
+        .await;
+
+    assert!(kept.is_empty());
+    assert_eq!(fixture.host.requests(), 0);
+}
+
 /// Bodies rejected after download still count toward the download stop, so
 /// a set of bad images cannot be pulled without bound; later entries are
 /// skipped without being fetched.

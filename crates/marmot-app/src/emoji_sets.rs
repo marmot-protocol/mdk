@@ -1186,7 +1186,9 @@ impl MarmotApp {
     /// later, smaller ones are still tried. Once the bytes transferred,
     /// valid or not, reach twice the budget, the rest are skipped without
     /// being fetched (beyond the few already in flight). Each finished entry
-    /// advances `control`'s progress; cancellation is the caller's to race.
+    /// advances `control`'s progress. No download starts once `control` or
+    /// the app's install stop is cancelled; returning early is the caller's
+    /// `select!`.
     async fn download_set(
         &self,
         entries: &[StoredEmojiSetEntry],
@@ -1204,8 +1206,16 @@ impl MarmotApp {
             .map(|entry| entry.url.clone())
             .enumerate()
             .collect();
+        // Each download checks cancellation before it dials: the stream can
+        // refill and start one within the poll that sees another finish,
+        // before the caller's `select!` looks at the control again.
         let mut downloads = futures::stream::iter(urls)
-            .map(|(index, url)| async move { (index, self.download_emoji(&url).await) })
+            .map(|(index, url)| async move {
+                if install_cancelled(&control.cancelled, &self.emoji_install_stop) {
+                    return (index, (Err(AppEmojiSkipReason::DownloadFailed), 0));
+                }
+                (index, self.download_emoji(&url).await)
+            })
             .buffered(EMOJI_DOWNLOAD_CONCURRENCY);
         let mut done = 0_usize;
         while let Some((index, (result, transferred))) = downloads.next().await {
