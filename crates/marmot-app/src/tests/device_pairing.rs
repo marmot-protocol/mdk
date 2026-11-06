@@ -22,6 +22,7 @@ use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
 
 mod device_group_moves;
 mod linked_device_chats;
+mod three_device_journeys;
 
 /// One of Alice's devices, with its own cursor over the shared relay.
 struct Device {
