@@ -131,6 +131,10 @@ pub struct SweepReport {
     pub complete: bool,
 }
 
+/// The sweep lock, held by a test. See [`MediaStore::hold_sweep_for_test`].
+#[cfg(any(test, feature = "test-support"))]
+pub struct SweepHoldForTest<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, SweepCursor>);
+
 #[derive(Default)]
 struct SweepCursor {
     /// Last row id checked in the current pass.
@@ -310,6 +314,13 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.inner.closed.store(true, Ordering::Release);
         lock(&self.inner.readers).clear();
         *lock(&self.inner.sweep) = SweepCursor::default();
+    }
+
+    /// Holds the sweep lock until the returned guard drops, as a batch
+    /// waiting on a busy catalog would. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_sweep_for_test(&self) -> SweepHoldForTest<'_> {
+        SweepHoldForTest(lock(&self.inner.sweep))
     }
 
     /// Makes the sweep fail on row `id` (or no row), after its cursor has
