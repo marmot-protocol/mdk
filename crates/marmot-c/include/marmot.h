@@ -704,7 +704,7 @@ typedef enum MarmotUnrecognizedSignInState {
 } MarmotUnrecognizedSignInState;
 
 /**
- * Why a link ended without one device adding the other.
+ * Why a device link attempt ended.
  */
 typedef enum MarmotDeviceLinkEndReason {
   /**
@@ -740,9 +740,9 @@ typedef enum MarmotDeviceLinkEndReason {
    */
   MARMOT_DEVICE_LINK_END_REASON_REJECTED,
   /**
-   * Both users confirmed, but adding the device failed, or the new device
-   * made no change in the device group within an hour of being added, so
-   * the device that added it removed it again.
+   * Both users confirmed, but adding or joining failed, or the new device's
+   * first Commit was not observed on the selected branch in time. Cleanup may
+   * still be pending; this reason alone does not establish current membership.
    */
   MARMOT_DEVICE_LINK_END_REASON_LINK_FAILED,
 } MarmotDeviceLinkEndReason;
