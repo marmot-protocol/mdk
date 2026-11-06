@@ -598,8 +598,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `connection_serial` so another opened database derives it again. Deferred outcomes never latch; they are rechecked
   hourly or after a media-row deletion (`media_cleanup_epoch`). The media sweep runs to completion at ownership, then
   only after a deletion on this connection, another connection's commit (`foreign_commit_version`), a failed
-  best-effort unlink (`MediaStore::take_sweep_owed`) or an unfinished batch. Keep new idle paths read-only until
-  they find work.
+  best-effort unlink (`MediaStore::take_sweep_owed`) or an unfinished batch. A failed batch owes a full rescan from
+  the start (`MediaStore::restart_sweep`) on the next hourly recheck, never a retry every tick. Keep new idle paths
+  read-only until they find work.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
