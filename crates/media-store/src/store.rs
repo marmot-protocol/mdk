@@ -164,6 +164,9 @@ struct Inner<C> {
     sweep_owed: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     full_disk_for_test: AtomicBool,
+    /// A row the sweep fails on, after its cursor has moved past it.
+    #[cfg(any(test, feature = "test-support"))]
+    fail_sweep_row_for_test: Mutex<Option<FileId>>,
     #[cfg(any(test, feature = "test-support"))]
     full_wire_for_test: AtomicBool,
 }
@@ -288,6 +291,8 @@ impl<C: MediaCatalog> MediaStore<C> {
                 #[cfg(any(test, feature = "test-support"))]
                 full_disk_for_test: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
+                fail_sweep_row_for_test: Mutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
                 full_wire_for_test: AtomicBool::new(false),
             }),
         }
@@ -305,6 +310,14 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.inner.closed.store(true, Ordering::Release);
         lock(&self.inner.readers).clear();
         *lock(&self.inner.sweep) = SweepCursor::default();
+    }
+
+    /// Makes the sweep fail on row `id` (or no row), after its cursor has
+    /// moved past it, as a catalog or file error there would. Test support
+    /// only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_sweep_row_for_test(&self, id: Option<FileId>) {
+        *lock(&self.inner.fail_sweep_row_for_test) = id;
     }
 
     /// Makes every publication fail as if the disk were full, until reset.
@@ -1023,6 +1036,13 @@ impl<C: MediaCatalog> MediaStore<C> {
         }
     }
 
+    /// Starts the next sweep batch at the beginning of a fresh pass. A batch
+    /// that failed may have left its cursor past what it failed on; a
+    /// restarted pass visits it again (mdk#2923).
+    pub fn restart_sweep(&self) {
+        *lock(&self.inner.sweep) = SweepCursor::default();
+    }
+
     /// Whether a best-effort unlink, wire truncate or abandon failed since
     /// the last call, leaving work only [`Self::sweep`] does. Clears it.
     pub fn take_sweep_owed(&self) -> bool {
@@ -1074,6 +1094,10 @@ impl<C: MediaCatalog> MediaStore<C> {
         for (id, state) in &rows {
             self.inner.ensure_open()?;
             cursor.row = Some(*id);
+            #[cfg(any(test, feature = "test-support"))]
+            if *lock(&self.inner.fail_sweep_row_for_test) == Some(*id) {
+                return Err(MediaError::Io(io::ErrorKind::Other));
+            }
             report.rows_checked += 1;
             if lock(&self.inner.in_flight).contains(id) {
                 continue;

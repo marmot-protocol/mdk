@@ -107,6 +107,14 @@ pub(super) struct HousekeepingLatches {
     sweep_foreign_seen: Option<i64>,
     /// The last sweep batch did not reach the end of the store, or failed.
     sweep_unfinished: Arc<std::sync::atomic::AtomicBool>,
+    /// A batch failed. Its cursor may have moved past what it failed on, so
+    /// a full pass from the start is owed. Finishing the current pass does
+    /// not clear it; only starting that rescan does.
+    sweep_rescan: Arc<std::sync::atomic::AtomicBool>,
+    /// When the owed rescan runs: one housekeeping recheck after the
+    /// failure, so a failure that persists costs one pass per recheck, not
+    /// one per tick.
+    sweep_rescan_due: Option<std::time::Instant>,
 }
 
 impl HousekeepingLatches {
@@ -156,11 +164,22 @@ fn spawn_media_sweep(
     }
     let latches = &mut admission.latches;
     latches.bind(storage);
+    // A failed batch owes a rescan from the start on the next recheck.
+    let mut rescan_now = false;
+    if latches.sweep_rescan.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        match latches.sweep_rescan_due {
+            None => latches.sweep_rescan_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
+            Some(due) if now >= due => rescan_now = true,
+            Some(_) => {}
+        }
+    }
     // Read before the batch starts, so a deletion while it runs is seen.
     // A failed read counts as a change.
     let cleanup = storage.media_cleanup_epoch().ok();
     let foreign = storage.foreign_commit_version().ok();
     let owed = until_complete
+        | rescan_now
         | media.take_sweep_owed()
         | latches.sweep_unfinished.load(Ordering::Acquire)
         | latches.sweep_cleanup_seen.is_none()
@@ -171,7 +190,14 @@ fn spawn_media_sweep(
     }
     latches.sweep_cleanup_seen = cleanup;
     latches.sweep_foreign_seen = foreign;
+    if rescan_now || until_complete {
+        // Either is a full pass from the start, which is what was owed.
+        media.restart_sweep();
+        latches.sweep_rescan.store(false, Ordering::Release);
+        latches.sweep_rescan_due = None;
+    }
     let unfinished = latches.sweep_unfinished.clone();
+    let rescan = latches.sweep_rescan.clone();
     // Timed on the blocking pool (mdk#2923); a batch that never runs or
     // panics drops its span, which records it as cancelled.
     let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
@@ -184,7 +210,11 @@ fn spawn_media_sweep(
                     break TelemetryOutcome::Success;
                 }
                 Err(_) => {
-                    unfinished.store(true, Ordering::Release);
+                    // Not again next tick: a failure that persists would
+                    // repeat every 15 s. A full rescan is owed instead, on
+                    // the next recheck.
+                    unfinished.store(false, Ordering::Release);
+                    rescan.store(true, Ordering::Release);
                     tracing::warn!(target: "marmot_app::runtime", method = "media_sweep",
                         "media store sweep deferred");
                     break TelemetryOutcome::Failure;

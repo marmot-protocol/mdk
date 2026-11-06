@@ -72,7 +72,8 @@
     checked again hourly, or sooner after a deletion. The housekeeping batch spawns only while a part is owed.
   - The media sweep still runs to completion when a worker takes ownership, then only after a media or partial row
     was deleted on this connection, another connection committed, a best-effort unlink failed, or its last batch
-    stopped short.
+    stopped short. A batch that fails owes a full rescan from the start on the next hourly recheck, which the current
+    pass finishing does not clear, so a row it failed on is visited again without retrying every tick.
   - Upload promotion starts only while a file-backed upload is staged.
   - All of this is keyed to the opened database, so a reopened, reset or replaced one derives it again.
 

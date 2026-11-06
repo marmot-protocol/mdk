@@ -2233,3 +2233,128 @@ async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
     );
     runtime.shutdown().await;
 }
+
+/// A sweep batch that fails on a row has already moved its cursor past it,
+/// so the rest of that pass would skip the row. A full rescan from the start
+/// is owed instead, on the hourly recheck, and finishing the pass does not
+/// clear it: the row is visited again then. A row that keeps failing costs
+/// one pass per recheck, never one per tick (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_sweep_row_is_revisited_by_the_hourly_rescan_not_every_tick() {
+    use media_store::{FileState, MediaCatalog};
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweeps = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMediaSweep)
+            .unwrap()
+            .completed
+    };
+    // A pending row is one the sweep removes: whether it is still there
+    // shows whether a pass got to it.
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let id = media_store::FileId([6; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [4; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    media.fail_sweep_row_for_test(Some(id));
+    let sweep = async |admission: &mut Admission, until_complete: bool| {
+        spawn_media_sweep(
+            admission,
+            &app_storage,
+            media.clone(),
+            until_complete,
+            &telemetry,
+        );
+        finish_media_sweep(admission).await;
+    };
+    let recheck_now = |admission: &mut Admission| {
+        admission.latches.sweep_rescan_due =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+    };
+
+    sweep(&mut admission, true).await;
+    assert_eq!(sweeps(), 1);
+    assert_eq!(catalog.file_state(id).unwrap(), Some(FileState::Pending));
+    for _ in 0..5 {
+        sweep(&mut admission, false).await;
+    }
+    assert_eq!(sweeps(), 1, "a failure is not retried every tick");
+    assert!(
+        admission.latches.sweep_rescan_due.is_some(),
+        "a rescan is owed"
+    );
+
+    // Another deletion owes the sweep again, and it finishes the current
+    // pass. That pass resumes past the failed row, so it does not settle
+    // the rescan.
+    let other = media_store::FileId([8; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: other,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [5; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(other).unwrap());
+    for _ in 0..1000 {
+        let before = sweeps();
+        sweep(&mut admission, false).await;
+        if sweeps() == before {
+            break;
+        }
+    }
+    assert!(sweeps() > 1, "the deletion owed a batch");
+    assert_eq!(catalog.file_state(id).unwrap(), Some(FileState::Pending));
+    assert!(
+        admission
+            .latches
+            .sweep_rescan
+            .load(std::sync::atomic::Ordering::Acquire),
+        "finishing the pass leaves the rescan owed"
+    );
+    let base = sweeps();
+
+    // A row that keeps failing: one pass per recheck.
+    for round in 1..=2 {
+        recheck_now(&mut admission);
+        sweep(&mut admission, false).await;
+        assert_eq!(sweeps(), base + round, "one rescan on the recheck");
+        for _ in 0..3 {
+            sweep(&mut admission, false).await;
+        }
+        assert_eq!(sweeps(), base + round, "and nothing until the next");
+    }
+
+    // Once the row no longer fails, the next recheck's rescan reaches it.
+    media.fail_sweep_row_for_test(None);
+    recheck_now(&mut admission);
+    for _ in 0..1000 {
+        let before = sweeps();
+        sweep(&mut admission, false).await;
+        if sweeps() == before {
+            break;
+        }
+    }
+    assert_eq!(
+        catalog.file_state(id).unwrap(),
+        None,
+        "the rescan removed it"
+    );
+}
