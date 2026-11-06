@@ -41,6 +41,7 @@ before changing this crate.
 - `src/control.rs` - `wn-agent` control-socket client.
 - `src/config.rs` - shared `ConfigSpec` env loading and defaults.
 - `src/commands.rs` - reserved chat commands.
+- `src/routing.rs` - shared multi-agent routing file, `/agent` handoff, and gating.
 - `src/repo_picker.rs` - `/<path>` workdir selection under `$HOME`.
 - `src/store.rs` - private per-group session/workdir/goal/recovery state.
 - `src/process.rs` - JSONL child-process runner and process-group cleanup.
