@@ -4739,3 +4739,6 @@ fn generated_setup_profile_adopts_a_selected_profile_only_before_local_readiness
         assert!(store, "{phase:?}");
     }
 }
+
+#[path = "housekeeping_mode_tests.rs"]
+mod housekeeping_mode_tests;

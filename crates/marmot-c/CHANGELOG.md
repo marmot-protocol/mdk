@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_set_housekeeping_mode` and `marmot_housekeeping_mode` with `MarmotHousekeepingMode` (`Normal` 0,
+  `Background` 1) discriminants (mdk#2923 PR P). Additive; use the matching header/library.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `MarmotAppGroupRecord` and `MarmotChatListRow` append
   `leave_blocked`, `MarmotGroupManagementState` appends `leave_blocked` and `can_cancel_leave`, and
   `MarmotConversationCapabilities` appends `can_cancel_leave`. New `marmot_cancel_leave` cancels the leave on this

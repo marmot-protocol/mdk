@@ -15,7 +15,7 @@ use crate::conversions::{
     DisbandRequestFfi, GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi,
     GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi,
     GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
-    KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
+    HousekeepingModeFfi, KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
     PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
     group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
     group_roster_ffi, normalize_member_ref_ffi,
@@ -1548,6 +1548,23 @@ impl Marmot {
 
     pub async fn resume_maintenance(&self, account_ref: String) -> Result<(), MarmotKitError> {
         Ok(self.runtime.resume_maintenance(&account_ref).await?)
+    }
+
+    pub fn set_housekeeping_mode(
+        &self,
+        account_ref: String,
+        mode: HousekeepingModeFfi,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_housekeeping_mode(&account_ref, mode.into())?)
+    }
+
+    pub fn housekeeping_mode(
+        &self,
+        account_ref: String,
+    ) -> Result<HousekeepingModeFfi, MarmotKitError> {
+        Ok(self.runtime.housekeeping_mode(&account_ref)?.into())
     }
 
     pub async fn run_due_maintenance(

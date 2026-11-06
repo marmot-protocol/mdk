@@ -4,6 +4,7 @@
 //! whose blocking file I/O, hashing and AEAD always run on the blocking pool.
 use super::*;
 use crate::AccountMediaStore;
+use crate::housekeeping_mode::{Admit, HousekeepingGate, HousekeepingJob};
 use crate::media::AttachmentDownloadFailure;
 use crate::runtime::attachment_controls::AttachmentUpdates;
 use media_store::{Category, MediaError};
@@ -149,6 +150,7 @@ impl HousekeepingLatches {
 /// takes ownership.
 fn spawn_media_sweep(
     admission: &mut Admission,
+    gate: &HousekeepingGate,
     storage: &SqliteAppStorage,
     media: AccountMediaStore,
     until_complete: bool,
@@ -160,6 +162,12 @@ fn spawn_media_sweep(
         .as_ref()
         .is_some_and(|task| !task.is_finished())
     {
+        return;
+    }
+    // Held in background housekeeping mode; a catch-up or backstop run
+    // sweeps once even with nothing owed (mdk#2923 PR P).
+    let admit = gate.admit(HousekeepingJob::MediaSweep);
+    if admit == Admit::Hold {
         return;
     }
     let latches = &mut admission.latches;
@@ -182,6 +190,7 @@ fn spawn_media_sweep(
     // cursor of a pass in progress, so it owes a pass from the start.
     let store_owed = media.take_sweep_owed();
     let owed = until_complete
+        | (admit == Admit::RunOnce)
         | rescan_now
         | store_owed
         | latches.sweep_unfinished.load(Ordering::Acquire)
@@ -323,6 +332,14 @@ pub(super) fn spawn_legacy_migration(
     {
         return;
     }
+    // Held in background housekeeping mode; a catch-up or backstop run is a
+    // recheck of everything (mdk#2923 PR P).
+    let admit = client
+        .housekeeping_gate()
+        .admit(HousekeepingJob::HousekeepingBatch);
+    if admit == Admit::Hold {
+        return;
+    }
     let Ok(storage) = client.app.account_storage(&client.state.label) else {
         return;
     };
@@ -335,7 +352,7 @@ pub(super) fn spawn_legacy_migration(
     let legacy_owed = !HousekeepingLatches::done(&latches.legacy_bodies_done);
     let avatars_owed = !HousekeepingLatches::done(&latches.database_avatars_done);
     let startup = !admission.startup_wal_settled.load(Ordering::Acquire);
-    let recheck = latches.recheck_due.is_none_or(|due| now >= due);
+    let recheck = admit == Admit::RunOnce || latches.recheck_due.is_none_or(|due| now >= due);
     // A deletion frees pages: reclaim checks again. A failed read counts as
     // one, so the batch still runs.
     let cleanup = app_storage.media_cleanup_epoch().ok();
@@ -507,6 +524,14 @@ pub(super) async fn compact_if_due(
             .legacy_migration
             .as_ref()
             .is_some_and(|task| !task.is_finished())
+    {
+        return;
+    }
+    // Held in background housekeeping mode (mdk#2923 PR P); it stays due.
+    if !client
+        .housekeeping_gate()
+        .admit(HousekeepingJob::Compaction)
+        .runs()
     {
         return;
     }
@@ -730,6 +755,31 @@ fn scheduler_now(client: &AppClient) -> u64 {
     now
 }
 
+/// The attachment pass's cleanup of expired and orphaned work: abandoned
+/// partial ciphertext, orphaned uploads and expired acquisitions. Held in
+/// background housekeeping mode (mdk#2923 PR P); nothing an in-flight send
+/// or download needs is among it. Returns how many of each went.
+fn prune_expired_work(
+    storage: &SqliteAppStorage,
+    now: u64,
+    gate: &HousekeepingGate,
+) -> Result<(usize, usize, usize), AppError> {
+    if !gate.admit(HousekeepingJob::PruneSweeps).runs() {
+        return Ok((0, 0, 0));
+    }
+    // Abandoned ciphertext expires even after automatic acquisition is disabled.
+    let partials = storage.prune_attachment_partials(now, 64)?;
+    let orphan_uploads = storage
+        .prune_attachment_uploads(now, 64)
+        .unwrap_or_else(|_| {
+            tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_prune",
+            "optional outgoing retention cleanup deferred");
+            0
+        });
+    let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
+    Ok((partials, orphan_uploads, expired))
+}
+
 pub(super) fn schedule(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -744,16 +794,9 @@ pub(super) fn schedule(
     }
     let storage = client.app.account_storage(&client.state.label)?;
     let now = scheduler_now(client);
-    // Abandoned ciphertext expires even after automatic acquisition is disabled.
-    let partials = storage.app_storage().prune_attachment_partials(now, 64)?;
-    let orphan_uploads = storage
-        .app_storage()
-        .prune_attachment_uploads(now, 64)
-        .unwrap_or_else(|_| {
-            tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_prune",
-            "optional outgoing retention cleanup deferred");
-            0
-        });
+    let gate = client.housekeeping_gate();
+    let (partials, orphan_uploads, expired) =
+        prune_expired_work(&storage.app_storage(), now, &gate)?;
     let policy = storage.app_storage().attachment_download_policy(
         &super::super::attachment_controls::default_policy(&client.app.config),
     )?;
@@ -778,6 +821,7 @@ pub(super) fn schedule(
         // Reclaim whatever a crash left in the media store before new work.
         spawn_media_sweep(
             admission,
+            &gate,
             &storage.app_storage(),
             client
                 .app
@@ -788,6 +832,7 @@ pub(super) fn schedule(
     } else {
         spawn_media_sweep(
             admission,
+            &gate,
             &storage.app_storage(),
             client
                 .app
@@ -796,9 +841,6 @@ pub(super) fn schedule(
             shared.observer.performance(),
         );
     }
-    let expired = storage
-        .app_storage()
-        .prune_expired_attachment_acquisitions(now, 64)?;
     let host_managed = client.app.config.attachment_acquisition_mode
         == crate::AttachmentAcquisitionMode::HostManaged;
     let identity = storage.app_storage().attachment_store_identity()?;

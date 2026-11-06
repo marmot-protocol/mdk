@@ -1633,6 +1633,14 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
 
 impl super::AppClient {
     pub(crate) fn backfill_content_reports(&mut self) -> Result<(), crate::AppError> {
+        // Held in background housekeeping mode (mdk#2923 PR P).
+        if !self
+            .housekeeping_gate()
+            .admit(crate::housekeeping_mode::HousekeepingJob::ContentBackfill)
+            .runs()
+        {
+            return Ok(());
+        }
         let started = std::time::Instant::now();
         let storage = match self.app.account_storage(&self.state.label) {
             Ok(storage) => storage,

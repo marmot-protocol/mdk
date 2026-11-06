@@ -1651,6 +1651,16 @@ typedef enum MarmotHostPerformanceOutcome {
 } MarmotHostPerformanceOutcome;
 
 /**
+ * Whether an account's housekeeping runs. Background holds cleanup of
+ * finished and expired work (apart from a run every 12 hours); messaging
+ * is unaffected. Normal is the default, and what a cold start uses.
+ */
+typedef enum MarmotHousekeepingMode {
+  MARMOT_HOUSEKEEPING_MODE_NORMAL,
+  MARMOT_HOUSEKEEPING_MODE_BACKGROUND,
+} MarmotHousekeepingMode;
+
+/**
  * Which user action produced a private moderation report.
  */
 typedef enum MarmotModerationReportOrigin {
@@ -12911,6 +12921,29 @@ MarmotStatus marmot_upload_media_files_with_client_token(const struct MarmotClie
                                                          const struct MarmotMediaFileTransferControl *control,
                                                          const char *client_token,
                                                          struct MarmotMediaUploadSubmission **out);
+
+/**
+ * Writes the account's housekeeping mode as a MarmotHousekeepingMode
+ * discriminant.
+ * # Safety
+ * Client and string must be live; out must be writable.
+ */
+MarmotStatus marmot_housekeeping_mode(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      uint32_t *out_mode);
+
+/**
+ * Sets the account's housekeeping mode (a MarmotHousekeepingMode
+ * discriminant). Background holds the prune sweeps, the media-store sweep,
+ * the housekeeping batch, the avatar pass, the content report backfill and
+ * legacy message promotion, each still run once every 12 hours; Normal runs
+ * each held job once. Process-local: set it again after a cold start.
+ * # Safety
+ * Client and string must be live.
+ */
+MarmotStatus marmot_set_housekeeping_mode(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          uint32_t mode);
 
 /**
  * Create an offline session from a bunker URI, client pairing config, or durable

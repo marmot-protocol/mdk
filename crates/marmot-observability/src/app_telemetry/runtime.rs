@@ -110,6 +110,8 @@ operations! {
     StorageWriteBegin => "storage_write_begin",
     ProjectionCheckpoint => "projection_checkpoint",
     ProjectionCheckpointSkipped => "projection_checkpoint_skipped",
+    // A housekeeping job held by the background housekeeping mode (mdk#2923).
+    HousekeepingHeld => "housekeeping_held",
     ProjectionCheckpointSkippedInvalidated => "projection_checkpoint_skipped_invalidated",
     HostConversationLocalVisible => "host_conversation_local_visible",
     HostConversationComposerReady => "host_conversation_composer_ready",

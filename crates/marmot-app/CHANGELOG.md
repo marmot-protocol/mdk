@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `MarmotAppRuntime::set_housekeeping_mode` and `housekeeping_mode` (mdk#2923 PR P). A host sets an account to
+  `HousekeepingMode::Background` while it is backgrounded: the prune sweeps, the media sweep, the housekeeping batch
+  and compaction, the avatar passes, content backfill and legacy promotion are held, while receives, sends, downloads,
+  the KeyPackage lifecycle, prepared-publication recovery, the recovery runner and push windows keep running. Held work
+  still runs once every 12 hours, and each job runs once on returning to `Normal`. The mode is process-local, survives
+  a worker reopen and starts `Normal`. `pause_maintenance` is unchanged. Holds count as `housekeeping_held`. Additive.
+
 - A starting account worker is given up on after 45 s without startup progress, not after 45 s in total
   (mdk#3145). Entering a startup step, or each migration an open of the account's database applies, starts the 45 s
   again, whichever caller runs that open. A slow device whose first open migrates for longer than that, as a second

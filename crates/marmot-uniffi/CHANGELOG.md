@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `set_housekeeping_mode(account_ref, mode)` and `housekeeping_mode(account_ref)` with `HousekeepingModeFfi`
+  (`Normal`, `Background`) (mdk#2923 PR P). Set `Background` while the app is backgrounded to hold housekeeping
+  without touching messaging, and `Normal` on return. Process-local: set it again after a cold start. Additive;
+  regenerate bindings to use them.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
   `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
   finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New

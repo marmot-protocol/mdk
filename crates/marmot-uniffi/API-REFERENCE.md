@@ -2469,6 +2469,30 @@ Resume maintenance for an account.
 
 [Source](src/commands/group.rs#L1549)
 
+### `Marmot::set_housekeeping_mode`
+
+**Current.**
+
+```rust
+pub fn set_housekeeping_mode( &self, account_ref: String, mode: HousekeepingModeFfi, ) -> Result<(), MarmotKitError>
+```
+
+Set an account's background housekeeping mode. Call it with `Background` when the app goes to the background (for example under a keep-connected service) and with `Normal` when it returns to the foreground. `Background` holds housekeeping only: the prune sweeps, the media-store sweep, the housekeeping batch (keep-media, reclaim and WAL truncate, compaction), the avatar pass, the content report backfill and legacy message promotion. Each still runs once every 12 hours. Messaging keeps running: receives, sends, downloads, notifications, the KeyPackage lifecycle, recovery of prepared publications, the recovery runner and push windows, and anything an in-flight send or download needs. Returning to `Normal` runs each held job once. The mode is process-local: it survives the account's worker restarting, and a cold start is `Normal`, so set it again after start. It is not `pause_maintenance`, which stops new protocol maintenance preparation, and it is not network suspension.
+
+[Source](src/commands/group.rs#L1553)
+
+### `Marmot::housekeeping_mode`
+
+**Current.**
+
+```rust
+pub fn housekeeping_mode( &self, account_ref: String, ) -> Result<HousekeepingModeFfi, MarmotKitError>
+```
+
+The account's current background housekeeping mode, as last set in this process; `Normal` when never set.
+
+[Source](src/commands/group.rs#L1563)
+
 ### `Marmot::run_due_maintenance`
 
 **Current.**
@@ -2479,7 +2503,7 @@ pub async fn run_due_maintenance( &self, account_ref: String, ) -> Result<Mainte
 
 Run due maintenance for an account.
 
-[Source](src/commands/group.rs#L1553)
+[Source](src/commands/group.rs#L1570)
 
 </details>
 

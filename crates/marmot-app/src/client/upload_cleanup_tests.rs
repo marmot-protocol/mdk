@@ -148,6 +148,18 @@ pub(crate) async fn upload_endpoint() -> (
     Arc<std::sync::atomic::AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    upload_endpoint_gated(None).await
+}
+
+/// [`upload_endpoint`], answering each PUT only once `gate` grants it a
+/// permit; the PUT is counted when its body has arrived.
+async fn upload_endpoint_gated(
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -187,6 +199,9 @@ pub(crate) async fn upload_endpoint() -> (
             }
             let hash = hex::encode(sha2::Sha256::digest(&request[end..end + size]));
             ledger.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let body=serde_json::json!({"url":format!("{server_url}/{hash}"),"sha256":hash,"size":size,"type":"application/octet-stream","uploaded":1}).to_string();
             socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
         }
@@ -948,4 +963,130 @@ async fn an_undelivered_upload_only_result_is_released() {
     })
     .await
     .expect("the undelivered upload and its staged file are released");
+}
+
+/// A file-backed send started in Normal completes after the account switches
+/// to Background housekeeping mode mid-upload: the upload is answered only
+/// after the switch, and the send still publishes and promotes its staged
+/// file into the slot while the attachment passes hold housekeeping
+/// (mdk#2923 PR P). Upload promotion and recovery are never held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_started_in_normal_completes_after_switching_to_background() {
+    use crate::housekeeping_mode::{Admit, HousekeepingJob};
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("generated background send", &[])
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    drop(client);
+    let connection = fault_connection(&app);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (url, puts, server) = upload_endpoint_gated(Some(gate.clone())).await;
+    let source_dir = tempfile::tempdir().unwrap();
+    let plain = (0..(64 * 1024 + 5))
+        .map(|i| (i % 241) as u8)
+        .collect::<Vec<_>>();
+    let path = source_dir.path().join("generated.bin");
+    std::fs::write(&path, &plain).unwrap();
+    let request = crate::MediaFileUploadRequest {
+        attachments: vec![crate::MediaFileUploadAttachmentRequest {
+            source_path: path.to_string_lossy().into_owned(),
+            expected_size: Some(plain.len() as u64),
+            file_name: "generated.bin".into(),
+            media_type: "application/octet-stream".into(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: true,
+        blossom_server: Some(url),
+        message_tags: Vec::new(),
+    };
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let control = Arc::new(crate::MediaFileTransferControl::default());
+    let send = tokio::spawn({
+        let runtime = runtime.clone();
+        let group = group.clone();
+        async move {
+            runtime
+                .upload_media_files("alice", &group, request, control)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while puts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upload reaches the server in Normal");
+    runtime
+        .set_housekeeping_mode("alice", crate::HousekeepingMode::Background)
+        .unwrap();
+    gate.add_permits(1);
+    let id = send.await.unwrap().unwrap().sent.unwrap().message_ids[0].clone();
+    let source = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(source) = runtime
+                .timeline_message("alice", &group_hex, &id)
+                .unwrap()
+                .and_then(|row| row.source_message_id_hex)
+            {
+                break source;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let target = crate::AttachmentLocalTarget {
+        message_id_hex: id.clone(),
+        source_message_id_hex: source,
+        attachment_index: 0,
+    };
+    let asset = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(asset) = runtime
+                .attachment_local_assets("alice", &group, vec![target.clone()])
+                .await
+                .unwrap()
+                .remove(0)
+            {
+                break asset;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the staged file is promoted in Background");
+    assert_eq!(asset.byte_count, plain.len() as u64);
+    assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        count(&connection, "outgoing_attachment_uploads"),
+        0,
+        "promotion consumed the upload"
+    );
+    assert_eq!(
+        runtime.housekeeping_mode("alice").unwrap(),
+        crate::HousekeepingMode::Background
+    );
+    assert!(
+        app.housekeeping_modes
+            .decisions("alice", HousekeepingJob::PruneSweeps, Admit::Hold)
+            > 0,
+        "the attachment passes ran in Background"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    server.abort();
 }

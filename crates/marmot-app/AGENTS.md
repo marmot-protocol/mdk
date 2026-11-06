@@ -624,6 +624,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   behind the cursor) or an unfinished batch. A failed batch owes a full rescan from
   the start (`MediaStore::restart_sweep`) on the next hourly recheck, never a retry every tick. Keep new idle paths
   read-only until they find work.
+- Background housekeeping mode (mdk#2923 PR P, `housekeeping_mode.rs`): `set_housekeeping_mode(account_ref,
+  Background)` holds housekeeping only (the prune sweeps, the media sweep, the housekeeping batch and compaction,
+  the avatar passes, content backfill and legacy promotion), each through `HousekeepingGate::admit` at the job's own
+  entry so every path that reaches it is refused alike. Never gate anything a send, download or receive needs (upload
+  promotion and recovery, download admission, delivery, KeyPackage lifecycle, prepared-publication recovery, the
+  recovery runner, push windows). The mode lives in `MarmotApp`, keyed by label, so it survives a worker reopen; a
+  cold start is Normal. Held work still runs once per `BACKGROUND_BACKSTOP` (12 h); returning to Normal runs each job
+  once. It is neither `pause_maintenance` (no new protocol maintenance preparation) nor network suspension (mdk#2600):
+  connections, subscriptions and receives are untouched.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,

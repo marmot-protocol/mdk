@@ -151,3 +151,64 @@ async fn report_backfill_retries_entire_batch_after_projection_failure() {
     client.backfill_content_reports().unwrap();
     assert!(client.take_pending_projection_updates().is_empty());
 }
+
+/// Background housekeeping mode holds the content-report backfill at its
+/// entry: the cursor stays put until the account returns to Normal
+/// (mdk#2923 PR P).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_mode_holds_the_report_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = hex::encode(client.create_group("held", &[]).await.unwrap().as_slice());
+    client.take_pending_projection_updates();
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute(
+            "INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,
+             kind,tags_json,recorded_at,received_at,moderation_grant,authority_state)
+             VALUES (?1,?2,'received',?3,'held target',9,'[]',?4,?4,0,0)",
+            rusqlite::params![
+                group,
+                hex::encode([11; 32]),
+                keys.public_key().to_hex(),
+                i64::try_from(unix_now_seconds()).unwrap(),
+            ],
+        )
+        .unwrap();
+    connection.execute_batch(
+        "UPDATE content_report_backfill SET after_order=0,through_order=(SELECT MAX(insert_order) FROM app_events)",
+    ).unwrap();
+    let finished = || -> bool {
+        connection
+            .query_row(
+                "SELECT after_order=through_order FROM content_report_backfill",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    app.set_housekeeping_mode("alice", crate::HousekeepingMode::Background);
+    client.backfill_content_reports().unwrap();
+    assert!(!finished(), "held while in Background");
+
+    app.set_housekeeping_mode("alice", crate::HousekeepingMode::Normal);
+    client.backfill_content_reports().unwrap();
+    assert!(finished(), "Normal runs the backfill");
+}
