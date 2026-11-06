@@ -365,6 +365,15 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 text: message.text,
                 media: message.media,
             };
+            if ctx.dedupe.contains(&inbound.message_ref).await {
+                debug!(
+                    target: TRACE_TARGET,
+                    method = "dispatch_event",
+                    event = "duplicate",
+                    "ignoring duplicate inbound event"
+                );
+                return DispatchOutcome::Continue;
+            }
             // Admit before recording the message ID, so a queue-full rejection
             // stays recoverable through reconnect replay.
             let disposition = classify_prompt(&inbound.text);
@@ -440,7 +449,6 @@ enum Admission {
 
 /// One ordered admission lane per group for steering backends, independent of
 /// the running turn. Downloads and steering never block the global event stream.
-/// Downloads and native acknowledgements never block the global event stream.
 async fn dispatch_authorized(
     ctx: Arc<BridgeContext>,
     inbound: InboundPrompt,
@@ -3013,6 +3021,10 @@ impl InboundDedupe {
             limit,
             inner: Mutex::new(InboundDedupeInner::default()),
         }
+    }
+
+    async fn contains(&self, message_ref: &str) -> bool {
+        self.inner.lock().await.seen.contains(message_ref)
     }
 
     async fn insert(&self, message_ref: String) -> bool {

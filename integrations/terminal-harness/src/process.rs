@@ -208,8 +208,9 @@ impl ProcessGroupGuard {
 /// Long-lived backend helper in its own process group. Dropping it kills the
 /// whole group and reaps the direct child, like an abandoned JSONL run.
 pub struct OwnedProcess {
-    child: Child,
+    // Dropped first: the group is killed before the leader can be reaped.
     process_group: ProcessGroupGuard,
+    child: Child,
 }
 
 impl OwnedProcess {
