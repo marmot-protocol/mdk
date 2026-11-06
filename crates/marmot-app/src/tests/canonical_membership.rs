@@ -1691,7 +1691,6 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     )
     .unwrap();
     drop(alice);
-    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let runtime = app.runtime();
     let mut notifications = runtime.subscribe();
     let mut timeline = runtime

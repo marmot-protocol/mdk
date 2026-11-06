@@ -1893,9 +1893,7 @@ impl AppClient {
 mod tests {
     use super::*;
     use crate::tests::{
-        ScriptedEosePump, ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-        scripted_eose_pump,
-    };
+        ScriptedPushRelayClient, client_on_app_relay_plane, };
     use cgka_traits::GroupStorage;
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
     use std::sync::Arc;
@@ -2010,7 +2008,6 @@ mod tests {
 
     struct Fixture {
         _dir: tempfile::TempDir,
-        _pump: ScriptedEosePump,
         relay: Arc<ScriptedPushRelayClient>,
         client: AppClient,
         storage: storage_sqlite::SqliteAccountStorage,
@@ -2077,7 +2074,6 @@ mod tests {
             app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
                 .unwrap();
         }
-        let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group_with_options(
@@ -2096,7 +2092,6 @@ mod tests {
         let storage = app.account_storage("alice").unwrap();
         Fixture {
             _dir: dir,
-            _pump: pump,
             relay,
             client,
             storage,
@@ -4513,8 +4508,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &fixture.client.relay_plane,
             &fixture.relay,
-            every_subscription,
-        )
+            )
         .await;
         fixture.client.synchronize_native_replay().await.unwrap();
         let grant = fixture

@@ -34,7 +34,6 @@ async fn start_runtime(
     app: &MarmotApp,
     relay: Arc<ScriptedPushRelayClient>,
 ) -> (MarmotAppRuntime, ScriptedEosePump) {
-    let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -103,7 +102,6 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         assert!(runtime.delete_group_local("alice", &broken).await.unwrap());
     }
     runtime.shutdown().await;
-    drop(eose);
 
     // Two ambiguous apply snapshots make alice's next open quarantine the
     // group with the production reason, without touching its stored state.

@@ -13,9 +13,7 @@ use crate::client::AppClient;
 use crate::client::recovery::AttemptGrant;
 use crate::client::sync::ScriptedComparisons;
 use crate::tests::{
-    ScriptedEosePump, ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-    scripted_eose_pump,
-};
+    ScriptedPushRelayClient, client_on_app_relay_plane, };
 use crate::unix_now_seconds;
 
 pub(super) const RELAY: &str = "wss://relay.example";
@@ -33,7 +31,6 @@ pub(in crate::client) fn relay() -> String {
 
 pub(in crate::client) struct Fixture {
     pub(in crate::client) _dir: tempfile::TempDir,
-    pub(in crate::client) _pump: ScriptedEosePump,
     pub(in crate::client) relay: Arc<ScriptedPushRelayClient>,
     pub(in crate::client) client: AppClient,
     pub(in crate::client) storage: SqliteAccountStorage,
@@ -79,7 +76,6 @@ pub(in crate::client) async fn fixture_on(
     );
     let app = app.with_recovery_runner_ownership_for_test(runner_owns_debt);
     *relay.stored_before_eose.lock().unwrap() = stored;
-    let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
     app.save_state(&state).unwrap();
@@ -108,7 +104,6 @@ pub(in crate::client) async fn fixture_on(
     let storage = app.account_storage("alice").unwrap();
     Fixture {
         _dir: dir,
-        _pump: pump,
         relay,
         client,
         storage,
@@ -1083,7 +1078,6 @@ async fn a_deferred_open_starts_the_goal_at_the_durable_welcome_floor() {
         storage,
         group,
         _dir,
-        _pump,
         relay: _relay,
     } = fixture_on(
         vec![RELAY.into()],

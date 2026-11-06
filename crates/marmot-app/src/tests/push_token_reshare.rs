@@ -52,8 +52,7 @@ impl Device {
         scripted_eose_pump(
             self.client.relay_plane.clone(),
             relay.clone(),
-            every_subscription,
-        )
+            )
     }
 
     pub(super) async fn receive(&mut self, relay: &ScriptedPushRelayClient) {

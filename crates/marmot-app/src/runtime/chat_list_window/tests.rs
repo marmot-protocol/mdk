@@ -1104,8 +1104,7 @@ async fn group_source_changes_refresh_selected_display_without_legacy_rebuild() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats() {
     use crate::tests::{
-        ScriptedPushRelayClient, every_subscription, remember_test_member_inbox, scripted_eose_pump,
-    };
+        ScriptedPushRelayClient, remember_test_member_inbox, };
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -1117,7 +1116,6 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     let plane = MarmotRelayPlane::new(None, relay.clone());
     // This scripted participant has no socket forwarder to report EOSE.
     // Let ordinary native ingress release its initial stored-event batches.
-    let _pump = scripted_eose_pump(plane.clone(), relay, every_subscription);
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await

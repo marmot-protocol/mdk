@@ -11,14 +11,11 @@ use super::recorded_v5_rows;
 use crate::client::AppClient;
 use crate::client::recovery::AttemptGrant;
 use crate::tests::{
-    ScriptedEosePump, ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-    scripted_eose_pump,
-};
+    ScriptedPushRelayClient, client_on_app_relay_plane, };
 use crate::unix_now_seconds;
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    _pump: ScriptedEosePump,
     app: crate::MarmotApp,
     client: AppClient,
     storage: storage_sqlite::SqliteAccountStorage,
@@ -39,7 +36,6 @@ async fn fixture() -> Fixture {
         .with_test_relay_client(relay.clone());
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
-    let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
     app.save_state(&state).unwrap();
@@ -64,7 +60,6 @@ async fn fixture() -> Fixture {
     .expect("the scripted native windows reach owner admission");
     Fixture {
         _dir: dir,
-        _pump: pump,
         app,
         client,
         storage,

@@ -601,7 +601,6 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
         .with_test_relay_client(relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let (client, group, ids) = queued_messages(&app).await;
     drop(client);
     struct HeldSchedule(String);
@@ -724,7 +723,6 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
         .with_test_relay_client(relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client
         .create_group_with_options(

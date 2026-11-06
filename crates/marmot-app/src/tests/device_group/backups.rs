@@ -1003,7 +1003,6 @@ async fn the_runtime_confirms_recovery_words() {
         ..
     } = phone_and_laptop().await;
     drop(phone);
-    let _eose = scripted_eose_pump(phone_app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     runtime.reconcile_accounts().await.unwrap();
 

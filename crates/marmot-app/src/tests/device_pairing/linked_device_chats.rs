@@ -927,11 +927,6 @@ async fn a_deferred_worker_attributes_an_accepted_sibling_departure() {
         .contains(&slot);
     // Finish cleanup before the intended before-fix assertion can fail.
     drop(reopened_store);
-    let _eose = scripted_eose_pump(
-        reopened.relay_plane.clone(),
-        relay.clone(),
-        every_subscription,
-    );
     runtime.shutdown_and_close().await.unwrap();
     assert!(
         recorded,

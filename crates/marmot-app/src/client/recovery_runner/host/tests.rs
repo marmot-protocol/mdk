@@ -216,7 +216,6 @@ async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
         mut client,
         storage,
         _dir,
-        _pump,
         ..
     } = fixture_on(
         vec!["wss://a.example".into()],
@@ -273,7 +272,6 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
         storage,
         group,
         _dir,
-        _pump,
         relay: _relay,
     } = fixture_on(
         vec!["wss://a.example".into(), "wss://b.example".into()],
@@ -438,7 +436,6 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
         storage,
         group,
         _dir,
-        _pump,
         relay: _relay,
     } = fixture_on(
         vec!["wss://a.example".into()],
@@ -663,7 +660,6 @@ async fn failed_route_goal_writes(failed_steps: usize) {
         mut client,
         storage,
         _dir,
-        _pump,
         relay: _relay,
         ..
     } = fixture_on(
@@ -785,7 +781,6 @@ async fn unreadable_welcome_metadata_never_widens_the_goal() {
         storage,
         group,
         _dir,
-        _pump,
         relay: _relay,
     } = fixture_on(
         vec!["wss://a.example".into()],
@@ -1282,7 +1277,6 @@ async fn a_direct_clients_pass_never_charges_an_idle_connected_account() {
         mut client,
         storage,
         _dir,
-        _pump,
         ..
     } = fixture().await;
     let app = storage.app_storage();
@@ -1314,7 +1308,6 @@ async fn each_chokepoint_wakes_the_runner() {
         storage,
         group,
         _dir,
-        _pump,
         ..
     } = fixture().await;
     let app: SqliteAppStorage = storage.app_storage();
@@ -1659,7 +1652,6 @@ async fn runner_loss_handoff_restores_the_guard_after_reclaim_failure() {
         mut client,
         storage,
         _dir,
-        _pump,
         relay: _relay,
         ..
     } = fixture_on(

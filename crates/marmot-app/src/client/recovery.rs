@@ -2637,8 +2637,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.replay_complete);
@@ -2817,8 +2816,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         reopened.synchronize_native_replay().await.unwrap();
         assert!(reopened.recovery_owner.replay_complete);
@@ -2835,8 +2833,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         let generation = client.adapter.replay_admission().await.generation();
@@ -2880,8 +2877,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         let generation = client.adapter.replay_admission().await.generation();
@@ -2928,8 +2924,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         let first = client.adapter.replay_admission().await.generation();
@@ -3180,8 +3175,7 @@ mod tests {
             crate::tests::report_scripted_eose(
                 &app.relay_plane,
                 &relay,
-                crate::tests::every_subscription,
-            )
+                crate::tests::)
             .await;
             client.synchronize_native_replay().await.unwrap();
             assert_eq!(client.recovery_owner.replay_complete, admitted, "{end:?}");
@@ -3256,8 +3250,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.replay_complete);
@@ -3271,8 +3264,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         let old_generation = client.recovery_owner.replay_generation.unwrap();
@@ -3544,11 +3536,6 @@ mod tests {
             &recipient.account_id_hex,
             "wss://relay.example",
         );
-        let pump = crate::tests::scripted_eose_pump(
-            app.relay_plane.clone(),
-            relay.clone(),
-            crate::tests::every_subscription,
-        );
         let mut receiver = crate::tests::client_on_app_relay_plane(&app, "bob").await;
         receiver.publish_key_package().await.unwrap();
         receiver.prepare_transport().await.unwrap();
@@ -3567,11 +3554,9 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         sender.synchronize_native_replay().await.unwrap();
-        drop(pump);
         // The terminal commit joins an unresolved native range. It cannot
         // bypass that range through local publication's ordinary queue.
         receiver.runtime.activate_transport(None).await.unwrap();
@@ -3607,8 +3592,7 @@ mod tests {
                 crate::tests::report_scripted_eose(
                     &app.relay_plane,
                     &relay,
-                    crate::tests::every_subscription,
-                )
+                    crate::tests::)
                 .await;
                 receiver.admit_native_turn().await.unwrap();
                 receiver
@@ -3627,8 +3611,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         receiver.synchronize_native_replay().await.unwrap();
         assert!(
@@ -3698,8 +3681,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         let ticket = client.recovery_owner.replay_ticket.unwrap();
@@ -3735,8 +3717,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         assert!(client.recovery_owner.replay_complete);
@@ -3777,8 +3758,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client.synchronize_native_replay().await.unwrap();
         assert!(!client.runtime.group_record(&group).unwrap().is_terminal());
@@ -4995,8 +4975,7 @@ mod tests {
     async fn verify_maintenance_boundary_request(incremental: bool) {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
-        };
+            };
         use cgka_traits::storage::MaintenanceStorage;
         let directory = tempfile::tempdir().unwrap();
         crate::AccountHome::open(directory.path())
@@ -5015,7 +4994,6 @@ mod tests {
             relay.clone(),
             true,
         );
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client
             .create_group("maintenance predicate", &[])
@@ -5155,9 +5133,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frozen_wake_preserves_recovery_debt_and_cost_until_explicit_full_repair() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let directory = tempfile::tempdir().unwrap();
         crate::AccountHome::open(directory.path())
             .create_account("alice")
@@ -5170,12 +5146,11 @@ mod tests {
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         // Startup source facts are passive native duty, not frozen-wake L1
         // recovery. Settle that lifecycle before capturing the full debt fence
         // whose preservation this test checks.
-        crate::tests::report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        crate::tests::report_scripted_eose(&app.relay_plane, &relay).await;
         client.synchronize_native_replay().await.unwrap();
         let storage = app.account_storage("alice").unwrap().app_storage();
         storage
@@ -5231,8 +5206,7 @@ mod tests {
     async fn post_join_maintenance_req_is_floored_at_its_welcome_not_the_join() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
-        };
+            };
         use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
         let directory = tempfile::tempdir().unwrap();
         crate::AccountHome::open(directory.path())
@@ -5246,7 +5220,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let joined = client.create_group("offline member", &[]).await.unwrap();
         let created_here = client.create_group("created here", &[]).await.unwrap();
@@ -5325,8 +5298,7 @@ mod tests {
     async fn verify_post_join_boundary_and_grace() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
-        };
+            };
         use cgka_traits::storage::MaintenanceStorage;
         let directory = tempfile::tempdir().unwrap();
         crate::AccountHome::open(directory.path())
@@ -5340,7 +5312,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client
             .create_group("maintenance predicate", &[])
@@ -5394,7 +5365,7 @@ mod tests {
         client.run_recovery_grant_for_test(grant).await.unwrap();
         assert_eq!(client.post_join_maintenance_subscriptions.len(), 1);
         // The boundary is the installed REQ's own end of stored events.
-        crate::tests::report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        crate::tests::report_scripted_eose(&app.relay_plane, &relay).await;
         client
             .advance_post_join_maintenance_subscriptions()
             .await
@@ -5537,8 +5508,7 @@ mod tests {
     async fn paused_post_join_sweep_requests_nothing_and_drops_its_session() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
-            every_subscription, scripted_eose_pump,
-        };
+            };
         use cgka_traits::storage::MaintenanceStorage;
         let directory = tempfile::tempdir().unwrap();
         crate::AccountHome::open(directory.path())
@@ -5552,7 +5522,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("paused post-join", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
@@ -5679,8 +5648,7 @@ mod tests {
         tempfile::TempDir,
         crate::MarmotApp,
         Arc<crate::tests::ScriptedPushRelayClient>,
-        crate::tests::ScriptedEosePump,
-        AppClient,
+        crate::tests::AppClient,
         cgka_traits::GroupId,
     ) {
         let directory = tempfile::tempdir().unwrap();
@@ -5696,11 +5664,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let pump = crate::tests::scripted_eose_pump(
-            app.relay_plane.clone(),
-            relay.clone(),
-            not_post_join_maintenance,
-        );
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         client.prepare_transport().await.unwrap();
         let group = client.create_group(name, &[]).await.unwrap();
@@ -5778,8 +5741,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -5881,8 +5843,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -5963,8 +5924,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -6033,8 +5993,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -6074,8 +6033,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -6115,8 +6073,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -6173,8 +6130,7 @@ mod tests {
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,
-            crate::tests::every_subscription,
-        )
+            crate::tests::)
         .await;
         client
             .advance_post_join_maintenance_subscriptions()
@@ -6222,9 +6178,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unrecoverable_groups_epoch_gap_is_suspended_once_the_runner_owns_debt() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         use cgka_traits::storage::GroupStorage;
         use storage_sqlite::{RecoveryCause, RecoveryEligibility};
         for owns_debt in [false, true] {
@@ -6239,8 +6193,6 @@ mod tests {
             if owns_debt {
                 app = app.with_recovery_runner_owning_debt();
             }
-            let _pump =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group = client.create_group("suspended", &[]).await.unwrap();
             let storage = app.account_storage("alice").unwrap();
@@ -6306,9 +6258,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_history_is_bounded_while_epoch_input_remains_retryable() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         use storage_sqlite::{RecoveryCause, RecoveryEligibility};
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
@@ -6318,7 +6268,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("retry policy", &[]).await.unwrap();
         let epoch = client.group_mls_state(&group).unwrap().epoch;
@@ -7080,8 +7029,7 @@ mod tests {
         Arc<crate::tests::ScriptedPushRelayClient>,
         crate::MarmotApp,
         AppClient,
-        crate::tests::ScriptedEosePump,
-    ) {
+        crate::tests::) {
         loss_fixture(Some(unix_now_seconds())).await
     }
 
@@ -7094,8 +7042,7 @@ mod tests {
         Arc<crate::tests::ScriptedPushRelayClient>,
         crate::MarmotApp,
         AppClient,
-        crate::tests::ScriptedEosePump,
-    ) {
+        crate::tests::) {
         loss_fixture_with_relays(bound, vec!["wss://relay.example".into()]).await
     }
 
@@ -7107,12 +7054,9 @@ mod tests {
         Arc<crate::tests::ScriptedPushRelayClient>,
         crate::MarmotApp,
         AppClient,
-        crate::tests::ScriptedEosePump,
-    ) {
+        crate::tests::) {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7125,7 +7069,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         // A checkpointed cursor: the account opens without an unbounded
         // no-cursor investigation, so the loss is the only debt.
         let mut state = app.load_state("alice").unwrap();
@@ -7520,9 +7463,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_parked_history_debt_leaves_no_comparison_slot_retrying() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7531,7 +7472,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("withheld history", &[]).await.unwrap();
         crate::tests::settle_live_replay(&app.relay_plane, &relay, &mut client).await;
@@ -7570,9 +7510,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_compares_routes_added_after_its_join_through_their_debt() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7587,7 +7525,6 @@ mod tests {
             relay.clone(),
             app.config.allow_loopback_relay_endpoints,
         );
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
         let app = storage.app_storage();
@@ -7675,9 +7612,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_executes_against_the_rebuilt_endpoint_set_without_false_coverage() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7686,7 +7621,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap();
@@ -7848,9 +7782,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incremental_recovery_follows_replaced_inbox_relays_without_a_comparison_request() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -7859,7 +7791,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
         storage
@@ -7964,9 +7895,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn best_effort_relay_failure_completes_on_the_operated_relay() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         use storage_sqlite::RecoveryComparisonOutcome as Outcome;
         const OPERATED: &str = "wss://operated.example";
         const BEST_EFFORT: &str = "wss://best-effort.example";
@@ -7985,7 +7914,6 @@ mod tests {
         )
         .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client
             .create_group_with_options(
@@ -8094,9 +8022,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_runtime_retries_failed_route_without_reissuing_successful_sibling() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -8105,7 +8031,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.create_group("comparison routes", &[]).await.unwrap();
         client.request_bounded_comparison().unwrap();
@@ -8203,7 +8128,7 @@ mod tests {
              retry together complete the cold-start debt"
         );
         client.prepare_transport().await.unwrap();
-        crate::tests::report_scripted_eose(&client.relay_plane, &relay, every_subscription).await;
+        crate::tests::report_scripted_eose(&client.relay_plane, &relay).await;
         client.synchronize_native_replay().await.unwrap();
         let revision = app.recovery_comparison().unwrap().revision;
         let cost = app.recovery_retry_state().unwrap();
@@ -8216,7 +8141,7 @@ mod tests {
                 .await
                 .unwrap();
             client.prepare_transport().await.unwrap();
-            crate::tests::report_scripted_eose(&client.relay_plane, &relay, every_subscription)
+            crate::tests::report_scripted_eose(&client.relay_plane, &relay)
                 .await;
             client
                 .run_pending_epoch_backfill(
@@ -8293,9 +8218,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn absent_comparison_backend_stays_parked_across_new_startup_requests() {
         use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
+            ScriptedPushRelayClient, client_on_app_relay_plane, };
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
             .create_account("alice")
@@ -8304,7 +8227,6 @@ mod tests {
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
         let storage = app.account_storage("alice").unwrap().app_storage();

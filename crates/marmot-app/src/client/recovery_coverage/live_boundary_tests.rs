@@ -601,7 +601,6 @@ async fn a_closed_req_ends_its_tail_and_the_next_eose_proves_the_gap() {
 async fn a_reopened_session_trusts_only_generations_it_saw_begin() {
     let Fixture {
         _dir,
-        _pump,
         client,
         storage,
         group,
@@ -621,7 +620,6 @@ async fn a_reopened_session_trusts_only_generations_it_saw_begin() {
         .unwrap();
     let mut fixture = Fixture {
         _dir,
-        _pump,
         client,
         storage,
         group,
