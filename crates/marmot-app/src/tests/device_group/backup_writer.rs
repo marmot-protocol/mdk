@@ -6,7 +6,8 @@
 //! does, unless the pointer it fetched lists that backup. Only the writer
 //! writes, at most daily, and new words mid-pass abandon the run. A sibling
 //! takes over a writer that is leaving or quiet for a week. The tests move
-//! time by dating the pointer and the ledger earlier, never the clock.
+//! due time by dating the pointer and ledger earlier. The startup admission
+//! regression advances Tokio time only while the real startup future is held.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -845,6 +846,64 @@ async fn the_archive_key_never_reaches_storage() {
             assert!(!sql.contains(secret.as_str()), "a secret reached storage");
         }
     }
+}
+
+// One thread permits clock control only while the real startup future is held.
+#[tokio::test(flavor = "current_thread")]
+async fn a_due_backup_request_waits_through_startup() {
+    let blossom = local_blossom();
+    let (devices, _chat, words) = lone_writer(&blossom).await;
+    let Devices {
+        _dirs,
+        phone_app,
+        phone,
+        relay,
+        ..
+    } = devices;
+    drop(phone);
+    let runtime = MarmotAppRuntime::new(phone_app);
+    runtime
+        .set_runtime_backup_background_conditions(true, true)
+        .unwrap();
+    let startup = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup.clone());
+    let mut upload = blossom.hold_upload();
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), startup.wait())
+        .await
+        .expect("the real worker reaches initial sync");
+    let mut completion = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut completion).is_pending());
+    // This snapshot reply is behind the request in the actual worker's FIFO:
+    // the backup command is deferred while the startup rendezvous stays held.
+    runtime.quarantined_groups("alice").await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(crate::APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT + Duration::from_millis(1))
+        .await;
+    let after_admission_bound = futures::poll!(&mut completion);
+    tokio::time::resume();
+    startup.wait().await;
+    if after_admission_bound.is_ready() {
+        upload.release();
+        runtime.shutdown().await;
+        panic!("backup request must keep waiting through held startup: {after_admission_bound:?}");
+    }
+    tokio::time::timeout(Duration::from_secs(10), upload.entered())
+        .await
+        .expect("startup release admits a real backup upload");
+    assert!(futures::poll!(&mut completion).is_pending());
+    upload.release();
+    let finished = tokio::time::timeout(Duration::from_secs(10), completion)
+        .await
+        .expect("the waiting host observes serialized backup settlement");
+    runtime.shutdown().await;
+    assert_eq!(
+        finished.unwrap(),
+        crate::BackgroundBackupOutcome::FinishedAttempt
+    );
+    assert_eq!(pointer(&relay, &words.public).len(), 1);
 }
 
 /// Through the runtime, the account worker's maintenance pass runs a due

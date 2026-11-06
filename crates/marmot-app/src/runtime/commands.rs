@@ -1376,6 +1376,8 @@ impl AccountManager {
             .report_backup_background_conditions(wifi, charging)
     }
 
+    /// Wait for one due pass, including startup catch-up before admission.
+    /// The caller owns its wait budget; cancellation detaches only its wait.
     pub async fn run_due_backup_pass(
         &self,
         account_ref: &str,
@@ -1390,8 +1392,8 @@ impl AccountManager {
             .send(AccountWorkerCommand::RunDueBackupPass { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        // Bound command admission, not the admitted pass's outer wait.
-        let Some(mut completion) = local_account_worker_response(response).await? else {
+        // The host owns this wait, including admission deferred by startup.
+        let Some(mut completion) = response.await.map_err(|_| AppError::TransportClosed)?? else {
             return Ok(super::BackgroundBackupOutcome::NotStarted);
         };
         loop {
