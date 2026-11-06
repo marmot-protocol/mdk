@@ -10737,6 +10737,7 @@ mod tests {
         relay.hold_replies(Some(crate::tests::every_reply));
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        relay.connect_relays(&["wss://relay.example"]).await;
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.sync_runtime_groups().await.unwrap();
         tokio::time::pause();
@@ -10769,6 +10770,7 @@ mod tests {
         relay.hold_replies(Some(crate::tests::every_reply));
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        relay.connect_relays(&["wss://relay.example"]).await;
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.sync_runtime_groups().await.unwrap();
         tokio::time::pause();

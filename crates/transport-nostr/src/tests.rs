@@ -1462,6 +1462,58 @@ async fn an_answer_sent_before_the_plane_first_yields_finishes_its_req() {
     relay_plane.shutdown().await;
 }
 
+/// A relay the plane heard connect before it issued a REQ there answers that
+/// REQ in the serial the adapter issued: its count streams from the REQ, even
+/// when the EOSE comes seconds later. Heard only after the REQ, the
+/// connection would restart the REQ as a reconnect does, and its count would
+/// stream only from the EOSE.
+#[tokio::test]
+async fn a_relay_connected_before_its_req_counts_from_the_req() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    relay.messages.connect(&endpoint);
+    relay.messages.handled().await;
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account,
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: Some(Timestamp(1_699_999_000)),
+        })
+        .await
+        .unwrap();
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let issued = now();
+    while now() <= issued {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let subscribed = relay.subscriptions.lock().unwrap().clone();
+    relay
+        .send_eose(&endpoint, subscribed[0].subscription_id())
+        .await;
+    let status = adapter.replay_admission().await;
+    let count = status
+        .sources()
+        .find_map(|source| {
+            source
+                .endpoints()
+                .find_map(|endpoint| endpoint.live_count())
+        })
+        .expect("the EOSE counted");
+    assert!(count.requested_at <= issued);
+    assert_eq!(count.live_from, count.requested_at);
+    drop(status);
+    relay_plane.shutdown().await;
+}
+
 /// A failed owner-granted capture retains actual loss without autonomous
 /// refetches or fresh account control records.
 #[tokio::test(start_paused = true)]

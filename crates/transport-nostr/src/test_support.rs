@@ -248,9 +248,10 @@ impl AccountPublishFixture {
 /// A scripted relay pool's own messages, which an injected test client hands
 /// its plane through [`NostrRelayClient::relay_notification_source`], so they
 /// reach the adapter through the dispatch the SDK pool's take. Each relay has
-/// one connection, which opens before the first REQ the client sends it
-/// ([`Self::connect`]); as the SDK's frontier does, every receiver hears that
-/// connection's boundary before any of its messages. Every receiver gets every
+/// one connection, which opens when a test connects it or at the latest when
+/// the client sends it its first REQ ([`Self::connect`]); as the SDK's
+/// frontier does, every receiver hears that connection's boundary before any
+/// of its messages. Every receiver gets every
 /// message sent after it subscribed, in order, and none is ever dropped: a
 /// scripted pool never shows its plane a lag.
 ///
@@ -297,8 +298,11 @@ impl ScriptedRelayMessages {
     const EPOCH: [u64; 2] = [1, 1];
 
     /// The relay at `endpoint` is connected: every plane hears its connection
-    /// open, ahead of the REQs the client is about to send it. A relay
-    /// connects once; later calls change nothing.
+    /// open, ahead of any message from it. A relay connects once; later calls
+    /// change nothing. A plane that hears it only after issuing a REQ there
+    /// restarts that REQ as on a reconnect, and counts the REQ only from its
+    /// EOSE. To have a REQ count from its issue, connect the relay and wait
+    /// for [`Self::handled`] before the plane issues it.
     pub fn connect(&self, endpoint: &TransportEndpoint) {
         self.pool
             .lock()

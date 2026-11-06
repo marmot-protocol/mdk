@@ -2603,6 +2603,7 @@ mod tests {
             relay.clone(),
             app.config.allow_loopback_relay_endpoints,
         );
+        relay.connect_relays(&["wss://relay.example"]).await;
         let client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         (dir, app, relay, client)
     }

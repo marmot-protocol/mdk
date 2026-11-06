@@ -983,7 +983,10 @@ impl ScriptedPushRelayClient {
     /// Answer an accepted REQ on each of its relays as a relay does, on the
     /// connection it went out on: the stored event a test scripted, then EOSE.
     /// A REQ the test holds stays unanswered until
-    /// [`Self::release_held_replies`].
+    /// [`Self::release_held_replies`]. A relay not yet connected connects
+    /// here, after the plane issued the REQ, so the plane restarts the REQ as
+    /// on a reconnect and counts it only from its EOSE; see
+    /// [`Self::connect_relays`].
     fn reply(&self, subscription: &NostrSubscription, id: &str) {
         let hold = *self.hold_replies.lock().unwrap();
         for endpoint in subscription.endpoints() {
@@ -1040,6 +1043,19 @@ impl ScriptedPushRelayClient {
     /// Answer every held REQ now, late, and wait until the planes handled it.
     pub(crate) async fn answer_held_replies(&self) {
         self.release_held_replies(|_, _| true).await;
+    }
+
+    /// These relays are connected, as a running app's relays are before its
+    /// account subscribes: wait until every plane on this relay has heard
+    /// each connection, so the REQs it issues there later count from their
+    /// own issue rather than from their EOSE. Call it once the plane exists
+    /// and before the account's first REQ.
+    pub(crate) async fn connect_relays(&self, endpoints: &[&str]) {
+        for endpoint in endpoints {
+            self.messages
+                .connect(&TransportEndpoint((*endpoint).to_owned()));
+        }
+        self.replies_handled().await;
     }
 
     /// Wait until every plane on this relay has handled every message the

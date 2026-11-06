@@ -61,6 +61,7 @@ pub(in crate::client) async fn fixture_on(
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
+    let endpoints = relays.clone();
     let mut app = crate::MarmotApp::with_relays_and_config(
         dir.path(),
         relays,
@@ -78,6 +79,9 @@ pub(in crate::client) async fn fixture_on(
     let mut state = app.load_state("alice").unwrap();
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
     app.save_state(&state).unwrap();
+    relay
+        .connect_relays(&endpoints.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client.create_group("coverage ledger", &[]).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
