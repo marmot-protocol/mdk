@@ -115,6 +115,11 @@ pub use app::device_group_moves::{
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
 pub use app::device_removals::DeviceRemovalRecord;
+pub use app::emoji_sets::{
+    EmojiSetInstallLimits, EmojiSetInstallOutcome, StoredEmojiSet, StoredEmojiSetEntry,
+    StoredEmojiSetVersion, StoredEmojiSkip, StoredInstalledEmoji, StoredInstalledEmojiRow,
+    StoredInstalledEmojiSet,
+};
 pub use app::history_deliveries::{
     HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryChat,
     ParkedHistoryDelivery,

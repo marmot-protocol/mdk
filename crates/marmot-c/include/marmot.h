@@ -293,6 +293,32 @@ enum MarmotStatus
    * Detail names the `MarmotChatListQueryError`; nothing was read.
    */
   MARMOT_STATUS_INVALID_CHAT_LIST_QUERY = 120,
+  /**
+   * An emoji set, its address or an entry is malformed, or no emoji in it
+   * could be installed. Retrying the same input cannot succeed.
+   */
+  MARMOT_STATUS_INVALID_EMOJI_SET = 121,
+  /**
+   * The emoji set, or the emoji in it, is not known locally.
+   */
+  MARMOT_STATUS_EMOJI_SET_NOT_FOUND = 122,
+  /**
+   * Relays or an image host could not be reached; retry later.
+   */
+  MARMOT_STATUS_EMOJI_SET_NETWORK = 123,
+  /**
+   * An emoji image is over 4 MiB, 4096 px per side, or 200 frames.
+   */
+  MARMOT_STATUS_EMOJI_IMAGE_TOO_LARGE = 124,
+  /**
+   * An emoji image is not PNG/APNG, GIF, WebP or JPEG, is malformed, or
+   * its stated MIME type does not match its bytes.
+   */
+  MARMOT_STATUS_EMOJI_IMAGE_UNSUPPORTED = 125,
+  /**
+   * The installed-set or stored-byte cap is reached.
+   */
+  MARMOT_STATUS_EMOJI_SET_LIMIT = 126,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1148,6 +1174,20 @@ typedef enum MarmotProductRecordResult {
   MARMOT_PRODUCT_RECORD_RESULT_IGNORED_DUPLICATE,
   MARMOT_PRODUCT_RECORD_RESULT_DROPPED_CAPACITY,
 } MarmotProductRecordResult;
+
+/**
+ * Why an emoji entry was not offered or not installed.
+ */
+typedef enum MarmotEmojiSkipReason {
+  MARMOT_EMOJI_SKIP_REASON_INVALID_SHORTCODE,
+  MARMOT_EMOJI_SKIP_REASON_INVALID_URL,
+  MARMOT_EMOJI_SKIP_REASON_DUPLICATE,
+  MARMOT_EMOJI_SKIP_REASON_OVER_CAP,
+  MARMOT_EMOJI_SKIP_REASON_DOWNLOAD_FAILED,
+  MARMOT_EMOJI_SKIP_REASON_TOO_LARGE,
+  MARMOT_EMOJI_SKIP_REASON_UNSUPPORTED_IMAGE,
+  MARMOT_EMOJI_SKIP_REASON_MIME_MISMATCH,
+} MarmotEmojiSkipReason;
 
 typedef enum MarmotReportReason {
   MARMOT_REPORT_REASON_NUDITY,
@@ -5744,6 +5784,158 @@ typedef struct MarmotStickerImportResult {
   uint32_t *skipped_signal_sticker_ids;
   uintptr_t skipped_signal_sticker_ids_len;
 } MarmotStickerImportResult;
+
+/**
+ * One valid entry of a discovered set. Load its image only through
+ * `marmot_fetch_emoji_set_asset`.
+ */
+typedef struct MarmotEmojiSetEmoji {
+  char *shortcode;
+  char *url;
+} MarmotEmojiSetEmoji;
+
+/**
+ * One skipped emoji entry. `position` is the entry's index among the
+ * event's `emoji` tags when it was dropped while reading the set.
+ */
+typedef struct MarmotEmojiSkip {
+  bool has_position;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t position;
+  char *shortcode;
+  enum MarmotEmojiSkipReason reason;
+} MarmotEmojiSkip;
+
+/**
+ * The installed snapshot of a set.
+ */
+typedef struct MarmotInstalledEmojiSetState {
+  char *event_id_hex;
+  uint64_t created_at;
+  uint64_t installed_at;
+  uint32_t emoji_count;
+  uint64_t byte_len;
+  bool update_available;
+} MarmotInstalledEmojiSetState;
+
+/**
+ * A kind-30030 emoji set, or the account's kind-10030 list read as the
+ * set of its loose emoji (`kind` 10030, empty `identifier`).
+ */
+typedef struct MarmotEmojiSet {
+  char *coordinate;
+  uint16_t kind;
+  char *author_pubkey_hex;
+  char *identifier;
+  char *event_id_hex;
+  uint64_t created_at;
+  char *title;
+  char *description;
+  char *image_url;
+  struct MarmotEmojiSetEmoji *emoji;
+  uintptr_t emoji_len;
+  struct MarmotEmojiSkip *skipped;
+  uintptr_t skipped_len;
+  uint32_t skipped_count;
+  struct MarmotInstalledEmojiSetState *installed;
+} MarmotEmojiSet;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotEmojiSetList {
+  struct MarmotEmojiSet *items;
+  uintptr_t len;
+} MarmotEmojiSetList;
+
+/**
+ * Counts from one text-only emoji set sync.
+ */
+typedef struct MarmotEmojiSetSyncResult {
+  uint32_t discovered;
+  uint32_t updated;
+  bool complete;
+} MarmotEmojiSetSyncResult;
+
+/**
+ * The account's own kind-10030 emoji list, read for suggestions.
+ */
+typedef struct MarmotUserEmojiList {
+  char *event_id_hex;
+  bool has_created_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t created_at;
+  struct MarmotEmojiSet *own_emoji;
+  struct MarmotEmojiSet *sets;
+  uintptr_t sets_len;
+  char **missing_set_coordinates;
+  uintptr_t missing_set_coordinates_len;
+  bool complete;
+} MarmotUserEmojiList;
+
+/**
+ * The installed set and every entry that was not installed.
+ */
+typedef struct MarmotEmojiSetInstallResult {
+  struct MarmotEmojiSet set;
+  uint32_t installed_count;
+  struct MarmotEmojiSkip *skipped;
+  uintptr_t skipped_len;
+} MarmotEmojiSetInstallResult;
+
+/**
+ * A validated preview image of one emoji. Not stored.
+ */
+typedef struct MarmotEmojiSetAsset {
+  char *set_coordinate;
+  char *shortcode;
+  char *mime;
+  uint32_t width;
+  uint32_t height;
+  uint32_t frames;
+  char *sha256;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+} MarmotEmojiSetAsset;
+
+/**
+ * One installed emoji for a picker. `shortcode_collision` flags a
+ * shortcode another installed set also uses; the host decides.
+ */
+typedef struct MarmotInstalledCustomEmoji {
+  char *set_coordinate;
+  char *set_title;
+  char *author_pubkey_hex;
+  char *shortcode;
+  char *mime;
+  uint32_t width;
+  uint32_t height;
+  uint32_t frames;
+  char *sha256;
+  uint64_t byte_len;
+  bool shortcode_collision;
+} MarmotInstalledCustomEmoji;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotInstalledCustomEmojiList {
+  struct MarmotInstalledCustomEmoji *items;
+  uintptr_t len;
+} MarmotInstalledCustomEmojiList;
+
+/**
+ * An installed emoji's stored bytes, checked against their SHA-256.
+ */
+typedef struct MarmotInstalledCustomEmojiAsset {
+  struct MarmotInstalledCustomEmoji emoji;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+} MarmotInstalledCustomEmojiAsset;
 
 /**
  * Downloaded sticker bytes plus the validated reference metadata.
@@ -11912,6 +12104,165 @@ MarmotStatus marmot_import_signal_sticker_pack(const struct MarmotClient *client
                                                struct MarmotStickerImportResult **out);
 
 /**
+ * Read stored emoji sets, or only installed ones in install order. `search`
+ * may be NULL; it matches title, description, author (hex or `npub`) and
+ * shortcodes. `installed_only` is a uint8_t flag. `has_limit` 0 leaves the
+ * limit unset. Local only. Free with `marmot_emoji_set_list_free`.
+ *
+ * # Safety
+ * `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+ */
+MarmotStatus marmot_emoji_sets(const struct MarmotClient *client,
+                               const char *account_ref,
+                               uint8_t installed_only,
+                               const char *search,
+                               uint8_t has_limit,
+                               uint32_t limit,
+                               struct MarmotEmojiSetList **out);
+
+/**
+ * Read one stored emoji set by coordinate or `naddr`. NULL when absent.
+ * Local only. Free with `marmot_emoji_set_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_emoji_set(const struct MarmotClient *client,
+                              const char *account_ref,
+                              const char *coordinate,
+                              struct MarmotEmojiSet **out);
+
+/**
+ * Fetch the newest kind-30030 emoji sets from the account's relays.
+ * Text only: never fetches an image. `search` may be NULL; an `npub` or
+ * hex public key narrows the fetch to that author. Free with
+ * `marmot_emoji_set_sync_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_sync_emoji_sets(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *search,
+                                    struct MarmotEmojiSetSyncResult **out);
+
+/**
+ * Fetch one emoji set from a pasted coordinate or `naddr`, trying up to
+ * 8 of its relay hints. Text only. Free with `marmot_emoji_set_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_fetch_emoji_set(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *input,
+                                    struct MarmotEmojiSet **out);
+
+/**
+ * Read the account's kind-10030 emoji list and the sets it points to,
+ * as suggestions. Text only; MDK never publishes or edits this list.
+ * Free with `marmot_user_emoji_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_user_emoji_list(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    struct MarmotUserEmojiList **out);
+
+/**
+ * Download each emoji of the stored set version once, validate it and
+ * store its bytes and SHA-256. Reveals the user's IP address to the
+ * set's image hosts: call only after the user taps Install. Free with
+ * `marmot_emoji_set_install_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_install_emoji_set(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *coordinate,
+                                      struct MarmotEmojiSetInstallResult **out);
+
+/**
+ * Remove an installed set and its stored bytes. Writes whether it was
+ * installed. Local only.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_uninstall_emoji_set(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *coordinate,
+                                        bool *out);
+
+/**
+ * Download one emoji of a stored set for a preview. Reveals the user's
+ * IP address to the image host: call only after the user opens the
+ * set. Nothing is stored. Free with `marmot_emoji_set_asset_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_fetch_emoji_set_asset(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *coordinate,
+                                          const char *shortcode,
+                                          struct MarmotEmojiSetAsset **out);
+
+/**
+ * Every installed emoji for a picker, in set install order then set
+ * order. Local only. Free with `marmot_installed_custom_emoji_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_installed_custom_emoji(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           struct MarmotInstalledCustomEmojiList **out);
+
+/**
+ * An installed emoji's stored bytes, checked against their SHA-256.
+ * Local only: never touches the network. Free with
+ * `marmot_installed_custom_emoji_asset_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_read_installed_custom_emoji(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *coordinate,
+                                                const char *shortcode,
+                                                struct MarmotInstalledCustomEmojiAsset **out);
+
+/**
  * Download one exact sticker asset. The reference is borrowed and not freed.
  * Free the result with `marmot_sticker_asset_free`.
  *
@@ -14207,6 +14558,94 @@ void marmot_message_draft_summary_free(struct MarmotMessageDraftSummary *ptr);
  * library.
  */
 void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_emoji_set_free(struct MarmotEmojiSet *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_emoji_set_list_free(struct MarmotEmojiSetList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_emoji_set_sync_result_free(struct MarmotEmojiSetSyncResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_emoji_set_install_result_free(struct MarmotEmojiSetInstallResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_user_emoji_list_free(struct MarmotUserEmojiList *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_emoji_set_asset_free(struct MarmotEmojiSetAsset *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_installed_custom_emoji_free(struct MarmotInstalledCustomEmoji *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_installed_custom_emoji_list_free(struct MarmotInstalledCustomEmojiList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_installed_custom_emoji_asset_free(struct MarmotInstalledCustomEmojiAsset *ptr);
 
 /**
  * Free an event returned by this library. NULL is a no-op.

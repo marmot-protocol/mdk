@@ -21,6 +21,7 @@ See [dev device linking](../cli/README.md#device-linking-dev-builds).
 - [Groups and invitations](#groups-and-invitations)
 - [Conversations](#conversations)
 - [Encrypted media endpoints](#encrypted-media-endpoints)
+- [Custom emoji sets](#custom-emoji-sets)
 - [Application-owned group state](#application-owned-group-state)
 - [Explicit full-history repair](#explicit-full-history-repair)
 - [History may be incomplete notices](#history-may-be-incomplete-notices)
@@ -389,6 +390,43 @@ does not rewrite existing group state. An active group admin can migrate an exis
 Encrypted group images differ: no endpoint is stored in group state, so upload and fetch both resolve against the
 deployment's `group_image_endpoint`. Clients configured with different values therefore look for group images in
 different places; re-setting the group image republishes it to the current endpoint.
+
+## Custom emoji sets
+
+`MarmotApp` reads NIP-51 emoji sets (kind 30030) so a host can offer opt-in custom emoji. Every network step is a
+separate call the host makes after a user action:
+
+| Call | Network | What it reaches |
+| --- | --- | --- |
+| `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | The sticker discovery relays (account relays), plus up to 8 relay hints from a pasted `naddr` |
+| `fetch_emoji_set_asset` | One image host | The host the set's author chose; nothing is stored |
+| `install_emoji_set` | Every image host in the set | Downloads each emoji once and stores the bytes |
+| `emoji_sets`, `emoji_set`, `installed_custom_emoji`, `read_installed_custom_emoji`, `uninstall_emoji_set` | None | Local storage only |
+
+Sync never fetches an image. Image fetches reveal the user's IP address to the image host, so hosts disclose them
+before calling. They use the hardened Blossom fetch: HTTPS on public hosts only, with loopback, private, link-local,
+unspecified and IPv4-mapped addresses refused before connecting and again after every redirect.
+
+Installing pins one set version (its event id) and stores each emoji's bytes and SHA-256 in the account database. A
+later change to the set's URLs or images reaches nothing until the user reinstalls; reads check the stored hash.
+`user_emoji_list` reads the account's kind-10030 list for suggestions; MDK never publishes or edits it. Installed
+emoji carry no URL: to use one in a chat, upload its bytes as an encrypted attachment, so the set's image URL and
+address never reach a group.
+
+Limits:
+
+| Limit | Value |
+| --- | --- |
+| Sets per discovery sync | 60 newest, at most 16 versions of one address per fetch |
+| Emoji per set | 500 (later entries skipped as over the cap) |
+| Shortcode | 1–64 bytes of ASCII letters, digits, `-` and `_` (the chat custom-emoji rule) |
+| Image | 4 MiB, 4096 px per side, 200 frames; PNG/APNG, GIF, WebP or JPEG whose bytes match the stated MIME type |
+| Installed sets | 50 |
+| Stored bytes | 32 MiB per set, 128 MiB in all |
+
+Invalid, duplicate, failed and over-cap entries are dropped and reported in `skipped`; a set fails only when no entry
+is usable. Shortcode collisions between installed sets are flagged on each `installed_custom_emoji` row and left to
+the host.
 
 ## Application-owned group state
 

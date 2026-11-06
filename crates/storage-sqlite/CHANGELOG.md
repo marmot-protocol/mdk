@@ -11,6 +11,11 @@
   adds `now_ms`; a window read's rows evaluate `muted` at that time too. `ChatListWindowRead` adds
   `next_mute_expiry_ms`, the next mute expiry in the view for a query that tests `Muted`.
 
+- Migration 0178 adds NIP-51 emoji set tables: the discovered projection and installed snapshots holding each
+  emoji's bytes and SHA-256. New `SqliteAppStorage` emoji set methods; installs verify every digest and the set and
+  byte caps in one transaction. Older native builds supporting only schema 0177 must upgrade before reopening a
+  migrated account database.
+
 - Migration 0177 adds a nullable coarse size diagnosis to existing pending Welcome repair pointers. Old rows remain
   Unknown; unknown future annotations preserve the pointer. Updating a failure diagnosis retains its existing identity
   and oldest-first position and adds no retry owner. Rust record literals add `size_class: None` when unknown;

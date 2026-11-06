@@ -18,6 +18,7 @@ pub(crate) mod device_groups;
 pub(crate) mod device_links;
 pub(crate) mod device_removals;
 pub(crate) mod device_renames;
+pub(crate) mod emoji_sets;
 pub(crate) mod encrypted_media_secrets;
 pub(crate) mod group_system;
 pub(crate) mod handle;

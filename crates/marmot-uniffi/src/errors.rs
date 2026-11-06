@@ -482,6 +482,25 @@ pub enum MarmotKitError {
     StickerImport { details: String },
     #[error("Signal sticker import is unavailable for external-signing accounts")]
     StickerImportUnsupported,
+    /// An emoji set, its address or an entry is malformed, or no emoji in it
+    /// could be installed.
+    #[error("invalid emoji set: {details}")]
+    InvalidEmojiSet { details: String },
+    #[error("emoji set or emoji is unavailable")]
+    EmojiSetNotFound,
+    /// Relays or an image host could not be reached.
+    #[error("emoji set network operation failed: {details}")]
+    EmojiSetNetwork { details: String },
+    /// Over 4 MiB, 4096 px per side, or 200 animation frames.
+    #[error("emoji image is too large: {details}")]
+    EmojiImageTooLarge { details: String },
+    /// Not PNG/APNG, GIF, WebP or JPEG, malformed, or its stated MIME type
+    /// does not match its bytes.
+    #[error("emoji image is unsupported: {details}")]
+    EmojiImageUnsupported { details: String },
+    /// Installed-set or stored-byte cap reached.
+    #[error("emoji set limit reached: {details}")]
+    EmojiSetLimit { details: String },
     /// This device was unlinked from the account by its other devices. The
     /// account stays signed out here: wipe it, then link the device again
     /// (mdk#2628 D67).
@@ -818,6 +837,22 @@ impl From<&AppError> for MarmotKitError {
                 details: details.clone(),
             },
             AppError::StickerExternalSignerImportUnsupported => Self::StickerImportUnsupported,
+            AppError::InvalidEmojiSet(details) => Self::InvalidEmojiSet {
+                details: details.clone(),
+            },
+            AppError::EmojiSetNotFound => Self::EmojiSetNotFound,
+            AppError::EmojiSetNetwork(details) => Self::EmojiSetNetwork {
+                details: details.clone(),
+            },
+            AppError::EmojiImageTooLarge(details) => Self::EmojiImageTooLarge {
+                details: details.clone(),
+            },
+            AppError::EmojiImageUnsupported(details) => Self::EmojiImageUnsupported {
+                details: details.clone(),
+            },
+            AppError::EmojiSetLimit(details) => Self::EmojiSetLimit {
+                details: details.clone(),
+            },
             other => Self::Runtime {
                 details: other.to_string(),
             },
@@ -1474,6 +1509,43 @@ mod tests {
             (AppError::StickerExternalSignerImportUnsupported, |e| {
                 matches!(e, MarmotKitError::StickerImportUnsupported)
             }),
+        ];
+        for (app_err, expected) in cases {
+            let label = format!("{app_err:?}");
+            let ffi = MarmotKitError::from(app_err);
+            assert!(expected(&ffi), "{label} mapped to {ffi:?}");
+        }
+    }
+
+    /// Each emoji set failure crosses the FFI as its own variant so hosts
+    /// can tell bad sets, image limits, network failures and caps apart.
+    #[test]
+    fn emoji_set_errors_map_to_their_typed_variants() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: Vec<(AppError, Expected)> = vec![
+            (
+                AppError::InvalidEmojiSet("no emoji".into()),
+                |e| matches!(e, MarmotKitError::InvalidEmojiSet { details } if details == "no emoji"),
+            ),
+            (AppError::EmojiSetNotFound, |e| {
+                matches!(e, MarmotKitError::EmojiSetNotFound)
+            }),
+            (
+                AppError::EmojiSetNetwork("offline".into()),
+                |e| matches!(e, MarmotKitError::EmojiSetNetwork { details } if details == "offline"),
+            ),
+            (
+                AppError::EmojiImageTooLarge("4 MiB".into()),
+                |e| matches!(e, MarmotKitError::EmojiImageTooLarge { details } if details == "4 MiB"),
+            ),
+            (
+                AppError::EmojiImageUnsupported("tiff".into()),
+                |e| matches!(e, MarmotKitError::EmojiImageUnsupported { details } if details == "tiff"),
+            ),
+            (
+                AppError::EmojiSetLimit("50 sets".into()),
+                |e| matches!(e, MarmotKitError::EmojiSetLimit { details } if details == "50 sets"),
+            ),
         ];
         for (app_err, expected) in cases {
             let label = format!("{app_err:?}");

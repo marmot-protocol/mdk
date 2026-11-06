@@ -387,6 +387,25 @@ pub enum AppError {
     StickerImport(String),
     #[error("Signal sticker import is unavailable for external-signing accounts")]
     StickerExternalSignerImportUnsupported,
+    /// A NIP-51 emoji set, its address or one of its entries is malformed,
+    /// or none of its emoji could be installed.
+    #[error("invalid emoji set: {0}")]
+    InvalidEmojiSet(String),
+    #[error("emoji set or emoji is unavailable")]
+    EmojiSetNotFound,
+    /// Relays or an image host could not be reached or answered with an error.
+    #[error("emoji set network operation failed: {0}")]
+    EmojiSetNetwork(String),
+    /// An emoji image is over the byte, dimension or animation-frame limit.
+    #[error("emoji image is too large: {0}")]
+    EmojiImageTooLarge(String),
+    /// An emoji image is not PNG/APNG, GIF, WebP or JPEG, is malformed, or its
+    /// stated MIME type does not match its bytes.
+    #[error("emoji image is unsupported: {0}")]
+    EmojiImageUnsupported(String),
+    /// An account-wide emoji cap (installed sets or stored bytes) was reached.
+    #[error("emoji set limit reached: {0}")]
+    EmojiSetLimit(String),
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
     #[error("invalid push token")]
@@ -726,6 +745,12 @@ impl AppError {
             Self::StickerExternalSignerImportUnsupported => {
                 "sticker_external_signer_import_unsupported"
             }
+            Self::InvalidEmojiSet(_) => "invalid_emoji_set",
+            Self::EmojiSetNotFound => "emoji_set_not_found",
+            Self::EmojiSetNetwork(_) => "emoji_set_network",
+            Self::EmojiImageTooLarge(_) => "emoji_image_too_large",
+            Self::EmojiImageUnsupported(_) => "emoji_image_unsupported",
+            Self::EmojiSetLimit(_) => "emoji_set_limit",
             Self::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             Self::InvalidPushToken(_) => "invalid_push_token",
             Self::InvalidPushServer(_) => "invalid_push_server",

@@ -4314,7 +4314,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L306)
+[Source](src/lib.rs#L308)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4324,7 +4324,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L321)
+[Source](src/lib.rs#L323)
 
 ### `Marmot::new_with_options`
 
@@ -4336,7 +4336,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L332)
+[Source](src/lib.rs#L334)
 
 ### `Marmot::new`
 
@@ -4348,7 +4348,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L361)
+[Source](src/lib.rs#L363)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4360,7 +4360,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L387)
+[Source](src/lib.rs#L389)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4372,7 +4372,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L418)
+[Source](src/lib.rs#L420)
 
 ### `Marmot::new_with_client_name`
 
@@ -4384,7 +4384,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L439)
+[Source](src/lib.rs#L441)
 
 ### `Marmot::start`
 
@@ -4396,7 +4396,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L477)
+[Source](src/lib.rs#L479)
 
 ### `Marmot::shutdown`
 
@@ -4408,7 +4408,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L489)
+[Source](src/lib.rs#L491)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4420,7 +4420,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L525)
+[Source](src/lib.rs#L527)
 
 ### `Marmot::storage_is_closed`
 
@@ -4432,7 +4432,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L533)
+[Source](src/lib.rs#L535)
 
 ### `Marmot::is_stopping`
 
@@ -4444,7 +4444,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L540)
+[Source](src/lib.rs#L542)
 
 </details>
 
@@ -5461,5 +5461,110 @@ pub async fn watch_backup_restore( &self, account_ref: String, ) -> Result<Arc<B
 Observe one initial snapshot and later progress/availability revisions. Closing the watch stops observation only. Keep its account context and cancel explicitly with the operation token when desired.
 
 [Source](src/commands/backups.rs#L136)
+
+</details>
+
+<details>
+<summary>commands/emoji_set.rs</summary>
+
+### `Marmot::emoji_set`
+
+```rust
+pub fn emoji_set( &self, account_ref: String, coordinate: String, ) -> Result<Option<EmojiSetFfi>, MarmotKitError>
+```
+
+Reads one stored set by coordinate (`30030:<pubkey>:<d>`) or `naddr` without network I/O. Returns none when it is not stored; use `fetch_emoji_set` for an explicit network fetch.
+
+[Source](src/commands/emoji_set.rs#L36)
+
+### `Marmot::emoji_sets`
+
+```rust
+pub fn emoji_sets( &self, account_ref: String, installed_only: bool, search: Option<String>, limit: Option<u32>, ) -> Result<Vec<EmojiSetFfi>, MarmotKitError>
+```
+
+Reads the encrypted emoji set projection off the UI thread. `installed_only` returns installed snapshots in install order; otherwise the newest discovered sets first. `search` matches title, description, author (hex or `npub`) and shortcodes. No network I/O.
+
+[Source](src/commands/emoji_set.rs#L17)
+
+### `Marmot::fetch_emoji_set`
+
+```rust
+pub async fn fetch_emoji_set( &self, account_ref: String, input: String, ) -> Result<EmojiSetFfi, MarmotKitError>
+```
+
+Fetches one set from a pasted coordinate or `naddr`, trying up to 8 of the `naddr`'s relay hints and then the account relays, and stores it. Text only. Refused with `InvalidEmojiSet` for malformed input or a set with no valid emoji, `EmojiSetNotFound` when no relay has it.
+
+[Source](src/commands/emoji_set.rs#L64)
+
+### `Marmot::fetch_emoji_set_asset`
+
+```rust
+pub async fn fetch_emoji_set_asset( &self, account_ref: String, coordinate: String, shortcode: String, ) -> Result<EmojiSetAssetFfi, MarmotKitError>
+```
+
+Downloads and validates one emoji of a stored set for a preview, with the same limits as install. Nothing is stored. Kept as its own call so the host can disclose it: it reveals the user's IP address to the image host the set's author chose, so call it only after the user opens the set.
+
+[Source](src/commands/emoji_set.rs#L121)
+
+### `Marmot::install_emoji_set`
+
+```rust
+pub async fn install_emoji_set( &self, account_ref: String, coordinate: String, ) -> Result<EmojiSetInstallResultFfi, MarmotKitError>
+```
+
+Snapshots the stored set version (its event id), downloads each emoji once over hardened HTTPS (public hosts only, redirects re-checked), validates it (4 MiB, 4096 px per side, 200 frames, PNG/APNG, GIF, WebP or JPEG, stated MIME matching the bytes) and stores the bytes and SHA-256 under the account. Invalid, duplicate, failed and over-cap entries are reported in `skipped`, not fatal. A later change to the set's URLs or images never reaches the stored bytes until the user reinstalls. Caps: 50 installed sets, 500 emoji and 32 MiB per set, 128 MiB in all (`EmojiSetLimit`). Reveals the user's IP address to every image host in the set: call only after the user taps Install.
+
+[Source](src/commands/emoji_set.rs#L93)
+
+### `Marmot::installed_custom_emoji`
+
+```rust
+pub fn installed_custom_emoji( &self, account_ref: String, ) -> Result<Vec<InstalledCustomEmojiFfi>, MarmotKitError>
+```
+
+Every installed emoji, flattened in set install order then set order, for a picker: set coordinate and title, author, shortcode, MIME, dimensions, frames, SHA-256 and size. No URL. Shortcode collisions between installed sets are flagged with `shortcode_collision`, not resolved; host built-ins such as `marmot` and `wn` win in the host. No network I/O.
+
+[Source](src/commands/emoji_set.rs#L137)
+
+### `Marmot::read_installed_custom_emoji`
+
+```rust
+pub fn read_installed_custom_emoji( &self, account_ref: String, coordinate: String, shortcode: String, ) -> Result<InstalledCustomEmojiAssetFfi, MarmotKitError>
+```
+
+Reads an installed emoji's stored bytes, checked against the SHA-256 recorded at install; a mismatch is an error, never other bytes. No network I/O. To use an emoji in a chat, upload these bytes as an encrypted attachment (`send_tagged_media`); never put the set's image URL or address in a message.
+
+[Source](src/commands/emoji_set.rs#L149)
+
+### `Marmot::sync_emoji_sets`
+
+```rust
+pub async fn sync_emoji_sets( &self, account_ref: String, search: Option<String>, ) -> Result<EmojiSetSyncResultFfi, MarmotKitError>
+```
+
+Fetches up to 60 of the newest kind-30030 sets from the account's relays (the sticker discovery relays), keeping only the newest version of each address and at most 16 versions per fetch. Sets with no valid emoji are hidden. A `search` that is an `npub` or hex public key narrows the fetch to that author. Text only: never fetches an image.
+
+[Source](src/commands/emoji_set.rs#L50)
+
+### `Marmot::uninstall_emoji_set`
+
+```rust
+pub async fn uninstall_emoji_set( &self, account_ref: String, coordinate: String, ) -> Result<bool, MarmotKitError>
+```
+
+Removes an installed snapshot and its stored bytes. Returns whether the set was installed. The discovered set stays in the projection. No network I/O.
+
+[Source](src/commands/emoji_set.rs#L107)
+
+### `Marmot::user_emoji_list`
+
+```rust
+pub async fn user_emoji_list( &self, account_ref: String, ) -> Result<UserEmojiListFfi, MarmotKitError>
+```
+
+Reads the account's own kind-10030 emoji list and the kind-30030 sets its `a` tags point to (at most 64), for suggestions. Its loose `emoji` tags come back as `own_emoji`, installable as the pseudo-set `10030:<pubkey>:`. Text only. MDK never publishes or edits kind 10030; it is a public list shared with other clients.
+
+[Source](src/commands/emoji_set.rs#L78)
 
 </details>

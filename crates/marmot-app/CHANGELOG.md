@@ -13,6 +13,13 @@
   them for every opener; the experimental constructor opens such an account. Accounts without a device group are
   unchanged.
 
+- Add NIP-51 emoji sets (kind 30030): text-only discovery and `naddr`/coordinate fetch, a read-only view of the
+  account's kind-10030 list, and local install snapshots that pin one set version and store each emoji's validated
+  bytes and SHA-256. Image bytes come only from `install_emoji_set` and `fetch_emoji_set_asset`, over the hardened
+  public-host fetch. New `AppError` variants `InvalidEmojiSet`, `EmojiSetNotFound`, `EmojiSetNetwork`,
+  `EmojiImageTooLarge`, `EmojiImageUnsupported` and `EmojiSetLimit`. Sticker image inspection moves to a shared
+  inspector that also reads JPEG; stickers still refuse JPEG. Additive.
+
 - The coverage-ledger recovery runner now owns account history by default (mdk#2660 phase 4). Restart and reconnect
   gaps, post-join history and unresolved epoch gaps are fetched as bounded, paced runner work; the native backward
   pagers no longer run. A stalled or failing relay is retried on a backoff instead of being re-paged, so recovery

@@ -85,6 +85,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/group_system.rs` | Local presentation of kind-1210 content (not a wire-format change). |
 | `src/app/transport/user_blocks.rs` | Account-private NIP-51 block state; never stored in the shared database. |
 | `src/app/transport/moderation_reports.rs` | Account-private outbox of signed NIP-59 moderation-report wraps: idempotency and rate-limit metadata, retry state, purge. Never stores the reported key or explanation in the clear. |
+| `src/app/emoji_sets.rs` | NIP-51 emoji sets (migration 0178): the discovered text-only projection (newest version per coordinate under NIP-01 replacement order, pruned beyond a cap except installed sets) and installed snapshots that pin one event id and hold each emoji's bytes and SHA-256. Install checks every digest and the set and byte caps in one transaction; reads fail on a digest mismatch. Tests in `emoji_sets_tests.rs`. |
 | `src/app/message_drafts.rs` | Revisioned encrypted composer drafts (`message_drafts/revisioned.rs`). |
 | `src/app/transport/prepared_group_image_upload.rs` | Staged founding-image upload (component data + Blossom upload secret; keep both out of diagnostics). |
 | `src/app/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |

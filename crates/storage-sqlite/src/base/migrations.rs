@@ -367,6 +367,8 @@ mod migration_0174_heartbeat_welcome_repair;
 mod migration_0176_device_group_moves;
 #[path = "migrations/0177_welcome_failure_size_class.rs"]
 mod migration_0177_welcome_failure_size_class;
+#[path = "migrations/0178_emoji_sets.rs"]
+mod migration_0178_emoji_sets;
 #[path = "migrations/0179_chat_list_kind.rs"]
 mod migration_0179_chat_list_kind;
 
@@ -1387,6 +1389,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0177_welcome_failure_size_class",
         suspend_foreign_keys: &[],
         apply: migration_0177_welcome_failure_size_class::apply,
+    },
+    Migration {
+        version: 178,
+        name: "0178_emoji_sets",
+        suspend_foreign_keys: &[],
+        apply: migration_0178_emoji_sets::apply,
     },
     Migration {
         version: 179,

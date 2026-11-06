@@ -137,11 +137,7 @@ fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) ->
     for tag in tags {
         if !(3..=4).contains(&tag.len())
             || tag[0] != "emoji"
-            || tag[1].is_empty()
-            || tag[1].len() > 64
-            || !tag[1]
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || !crate::emoji_sets::is_custom_emoji_shortcode(&tag[1])
             || tag[2].trim().is_empty()
             || !seen.insert(&tag[1])
         {

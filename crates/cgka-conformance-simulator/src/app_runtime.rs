@@ -3022,6 +3022,12 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::StickerExternalSignerImportUnsupported => {
             "sticker_external_signer_import_unsupported"
         }
+        AppError::InvalidEmojiSet(_) => "invalid_emoji_set",
+        AppError::EmojiSetNotFound => "emoji_set_not_found",
+        AppError::EmojiSetNetwork(_) => "emoji_set_network",
+        AppError::EmojiImageTooLarge(_) => "emoji_image_too_large",
+        AppError::EmojiImageUnsupported(_) => "emoji_image_unsupported",
+        AppError::EmojiSetLimit(_) => "emoji_set_limit",
         _ => "app_runtime_operation",
     }
 }
@@ -3102,6 +3108,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
         | AppError::StickerRelay(_)
+        | AppError::EmojiSetNetwork(_)
         | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,
         AppError::ProductAnalytics(_)
         | AppError::Json(_)
@@ -3130,6 +3137,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::UnsafeMediaFetch(_)
         | AppError::InvalidAppMessagePayload(_)
         | AppError::InvalidSticker(_)
+        | AppError::InvalidEmojiSet(_)
+        | AppError::EmojiImageUnsupported(_)
         | AppError::InvalidPushToken(_)
         | AppError::InvalidPushServer(_)
         | AppError::InvalidPushGossip(_)
@@ -3171,6 +3180,9 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::StickerNotFound
         | AppError::StickerImport(_)
         | AppError::StickerExternalSignerImportUnsupported
+        | AppError::EmojiSetNotFound
+        | AppError::EmojiImageTooLarge(_)
+        | AppError::EmojiSetLimit(_)
         | AppError::InvalidReportedPublicKey
         | AppError::CannotReportSelf
         | AppError::ModerationReportRateLimited
@@ -3544,6 +3556,36 @@ mod tests {
             (
                 AppError::StickerExternalSignerImportUnsupported,
                 "sticker_external_signer_import_unsupported",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::InvalidEmojiSet(marker.into()),
+                "invalid_emoji_set",
+                SubjectFailureCategory::Protocol,
+            ),
+            (
+                AppError::EmojiSetNotFound,
+                "emoji_set_not_found",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::EmojiSetNetwork(marker.into()),
+                "emoji_set_network",
+                SubjectFailureCategory::Resource,
+            ),
+            (
+                AppError::EmojiImageTooLarge(marker.into()),
+                "emoji_image_too_large",
+                SubjectFailureCategory::ExpectedRefusal,
+            ),
+            (
+                AppError::EmojiImageUnsupported(marker.into()),
+                "emoji_image_unsupported",
+                SubjectFailureCategory::Protocol,
+            ),
+            (
+                AppError::EmojiSetLimit(marker.into()),
+                "emoji_set_limit",
                 SubjectFailureCategory::ExpectedRefusal,
             ),
         ] {
