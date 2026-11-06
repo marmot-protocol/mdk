@@ -777,12 +777,16 @@ pub enum AgentControlResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
     },
-    /// Readback after a `group_admin` request. `message_ids_hex` lists the
-    /// commits published by this request; it is empty when nothing changed.
+    /// Readback after a `group_admin` request. `accept_disposition` is absent
+    /// when the request sent no change. When a change was accepted but is
+    /// `accepted_pending` or `completion_unknown`, the readback may not show it
+    /// yet and `message_ids_hex` may be empty; do not send the change again.
     GroupAdminStatus {
         is_member: bool,
         is_admin: bool,
         message_ids_hex: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accept_disposition: Option<AgentControlSendAcceptDisposition>,
     },
     GroupProfileUpdated {
         group_id_hex: String,
@@ -887,6 +891,16 @@ pub enum AgentControlAttachmentState {
     RetryExhausted,
     StorageBlocked,
     CleanedBySetting,
+}
+
+/// Whether an accepted group change reached the transport, waits in the
+/// group's durable outbound queue, or has unknown transport completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlSendAcceptDisposition {
+    Published,
+    AcceptedPending,
+    CompletionUnknown,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1545,12 +1559,14 @@ mod tests {
             AgentControlResponse::GroupAdminStatus {
                 is_member: true,
                 is_admin: false,
-                message_ids_hex: vec!["01".repeat(32)],
+                message_ids_hex: Vec::new(),
+                accept_disposition: Some(crate::AgentControlSendAcceptDisposition::AcceptedPending),
             },
         );
         let encoded = encode_frame(&response).unwrap();
         let json: Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(json["type"], "group_admin_status");
+        assert_eq!(json["accept_disposition"], "accepted_pending");
         assert_eq!(
             decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
             response

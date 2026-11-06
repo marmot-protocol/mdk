@@ -9057,7 +9057,18 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
                     is_member,
                     is_admin,
                     message_ids_hex,
-                } => Ok::<_, crate::ConnectorError>((is_member, is_admin, message_ids_hex.len())),
+                    accept_disposition,
+                } => {
+                    // The mock relay acknowledges at once, so every sent change
+                    // is published and a request that sends nothing has no
+                    // disposition.
+                    assert_eq!(
+                        accept_disposition,
+                        (!message_ids_hex.is_empty())
+                            .then_some(agent_control::AgentControlSendAcceptDisposition::Published)
+                    );
+                    Ok::<_, crate::ConnectorError>((is_member, is_admin, message_ids_hex.len()))
+                }
                 other => panic!("unexpected response {other:?}"),
             }
         }
@@ -9068,12 +9079,14 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
         newcomer.account_id_hex.as_str(),
     );
 
-    // A non-admin cannot promote itself.
-    assert!(
-        status(peer_id, peer_id, change(true, false, false))
-            .await
-            .is_err()
-    );
+    // A non-admin cannot promote itself, invite or remove.
+    for (member, change) in [
+        (peer_id, change(true, false, false)),
+        (new_id, change(false, true, false)),
+        (agent_id, change(false, false, true)),
+    ] {
+        assert!(status(peer_id, member, change).await.is_err());
+    }
     // Read-only query, promotion, and an idempotent repeat.
     assert_eq!(
         status(agent_id, peer_id, change(false, false, false))
@@ -9123,5 +9136,10 @@ async fn group_admin_checks_authority_changes_membership_and_reads_back() {
             .unwrap(),
         (false, false, 0)
     );
+    // Add alone invites a plain member.
+    let (member, admin, commits) = status(agent_id, new_id, change(false, true, false))
+        .await
+        .unwrap();
+    assert!(member && !admin && commits > 0);
     connector.runtime.shutdown().await;
 }

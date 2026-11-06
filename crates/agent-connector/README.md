@@ -329,9 +329,11 @@ The `group_admin` control request accepts an account id, group id and member id.
 member's status. `promote: true` grants admin to a current member. `add: true` invites a missing member, as an initial
 admin when combined with `promote`. `remove: true` removes the member, dropping its admin rights in the same commit; it
 takes precedence over the other flags. Every change goes through the runtime's admin checks. The `group_admin_status`
-response carries a fresh `is_member`/`is_admin` readback and the message ids of the commits this request published; a
-request that changes nothing publishes no commit. After a timeout, send a read-only request and compare before retrying
-a change.
+response carries a fresh `is_member`/`is_admin` readback. When the request sent a change, it also carries the change's
+`accept_disposition` and published message ids. `published` means the commit reached the relays. `accepted_pending` and
+`completion_unknown` mean the change is retained and may not show in the readback yet; do not send it again. A request
+that needs no change sends nothing and has no `accept_disposition`. An error can still follow a published change, so
+send a read-only request before retrying.
 
 ## Control plane security
 

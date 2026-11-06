@@ -190,6 +190,12 @@ impl AgentConnector {
             | AgentControlRequest::AccountRelayLists { .. }
             | AgentControlRequest::DiagnosticStatus { .. }
             | AgentControlRequest::GroupInfo { .. }
+            | AgentControlRequest::GroupAdmin {
+                promote: false,
+                add: false,
+                remove: false,
+                ..
+            }
             | AgentControlRequest::MaintenanceStatus { .. }
             | AgentControlRequest::KeyPackageMaintenanceStatus { .. }
             | AgentControlRequest::MaintenanceGetPolicy { .. }
