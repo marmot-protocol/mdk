@@ -1406,11 +1406,12 @@ runtime starts closed. An admitted pass settles after false, while later passes 
 the same runtime-wide facts and never starts its worker. Manual restore is independent.
 
 An OS background task can await `runDueBackupPass(accountRef)`: it joins the current pass or tries ordinary due
-admission once, waiting through startup catch-up before admission if necessary. `NotStarted` admits nothing;
+admission once. The admission wait includes other queued work and startup catch-up. `NotStarted` admits nothing;
 `FinishedAttempt` means the pass's serialized settlement attempt and
 credit release ended. It is not a publication-success receipt, forced backup, future-due wait or whole-runtime idle
 barrier. Cancelling this caller detaches its wait; worker stop/replacement returns `TransportClosed`. The host
-bounds its OS execution opportunity and supplies fresh facts to each new runtime. Disabled device-group support returns
+bounds its OS execution opportunity, since a queued caller's wait has no additional timeout, and supplies fresh facts
+to each new runtime. Disabled device-group support returns
 `NotStarted` without starting a worker; the fact-report method itself is local and available.
 
 `beginBackupRestore(accountRef, words)` starts one manual history-only operation per account and returns its status.

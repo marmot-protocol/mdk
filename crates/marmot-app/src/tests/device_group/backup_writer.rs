@@ -7,7 +7,7 @@
 //! writes, at most daily, and new words mid-pass abandon the run. A sibling
 //! takes over a writer that is leaving or quiet for a week. The tests move
 //! due time by dating the pointer and ledger earlier. The startup admission
-//! regression advances only the command-response clock while startup is held.
+//! regression advances Tokio time only while the real startup future is held.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
