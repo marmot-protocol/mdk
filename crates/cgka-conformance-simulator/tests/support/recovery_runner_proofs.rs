@@ -24,7 +24,7 @@ use cgka_conformance_simulator::{
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
 
-use super::recovery_scorecard::{percentiles, status_summary};
+use super::recovery_scorecard::{Sample, latencies, percentiles, periodic, status_summary};
 use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 
 /// They publish the owed backlog in parallel, so bob is the only account
@@ -583,7 +583,7 @@ mod runner_trace {
             let method = fields.0.get("method").and_then(Value::as_str);
             if matches!(
                 method,
-                Some("quantum" | "recheck" | "conversion" | "attempt_started")
+                Some("quantum" | "recheck" | "conversion" | "attempt_started" | "admit")
             ) {
                 fields.0.insert("at_ms".into(), json!(now_ms()));
                 EVENTS
@@ -661,7 +661,18 @@ mod runner_trace {
             .cloned()
     }
 
-    /// Every event captured at or after `from` on the trace clock.
+    /// Every captured event, admissions included, in `[from, to)` on the
+    /// trace clock.
+    pub(super) fn between(from: u64, to: u64) -> Vec<Value> {
+        let events = EVENTS.lock().expect("runner trace lock");
+        let inside = |event: &&Value| {
+            let at = event["at_ms"].as_u64();
+            at >= Some(from) && at < Some(to)
+        };
+        events.iter().filter(inside).cloned().collect()
+    }
+
+    /// Every attempt captured at or after `from` on the trace clock.
     pub(super) fn since(from: u64) -> Vec<Value> {
         let events = EVENTS.lock().expect("runner trace lock");
         let after = events
@@ -763,6 +774,90 @@ pub(super) fn native_pages(history: &[Vec<HistoryRequestV1>]) -> Vec<usize> {
                 .count()
         })
         .collect()
+}
+
+/// The runner's pacing in `[from, to)` on the trace clock, report only: the
+/// staged events it admitted and how fast, overall and while admitting back
+/// to back, and how long fetching stood still between debt quanta (from one
+/// quantum's settle to the next one's start).
+fn pacing(from: u64, to: u64) -> Value {
+    /// Admission turns at most this far apart count as back to back.
+    const BACK_TO_BACK_MS: u64 = 1_000;
+    let events = runner_trace::between(from, to);
+    let at = |event: &Value| event["at_ms"].as_u64().unwrap_or(0);
+    let admits = events.iter().filter(|event| event["method"] == "admit");
+    let admits = admits.collect::<Vec<_>>();
+    let admitted = |event: &&Value| event["events"].as_u64().unwrap_or(0);
+    let total = admits.iter().map(admitted).sum::<u64>();
+    // Each turn's event lands once it settled, so a rate counts the events of
+    // every turn after the first over the time since the first.
+    let span = admits
+        .first()
+        .zip(admits.last())
+        .map(|(first, last)| at(last) - at(first));
+    let after_first = total - admits.first().map_or(0, admitted);
+    let per_second = |events: u64, ms: u64| (ms > 0).then(|| events as f64 * 1e3 / ms as f64);
+    let (mut busy_events, mut busy_ms) = (0, 0);
+    for pair in admits.windows(2) {
+        let gap = at(pair[1]) - at(pair[0]);
+        if gap <= BACK_TO_BACK_MS {
+            busy_events += admitted(&pair[1]);
+            busy_ms += gap;
+        }
+    }
+    // A debt quantum runs from its `attempt_started` to its `quantum`.
+    let mut quanta = Vec::new();
+    let mut open = None;
+    for event in &events {
+        match event["method"].as_str() {
+            Some("attempt_started") => open = (event["recheck"] == false).then(|| at(event)),
+            Some("quantum") => quanta.extend(open.take().map(|start| (start, at(event)))),
+            _ => {}
+        }
+    }
+    let gaps = quanta
+        .windows(2)
+        .map(|pair| pair[1].0.saturating_sub(pair[0].1));
+    let gaps = gaps.collect::<Vec<_>>();
+    json!({
+        "admitted_events": total,
+        "admission_turns": admits.len(),
+        "admission_span_ms": span,
+        "admission_events_per_second": span.and_then(|ms| per_second(after_first, ms)),
+        "back_to_back_events_per_second": per_second(busy_events, busy_ms),
+        "debt_quanta": quanta.len(),
+        "fetch_busy_ms": quanta.iter().map(|(start, end)| end - start).sum::<u64>(),
+        "fetch_gap_ms": {"n": gaps.len(), "sum": gaps.iter().sum::<u64>(), "max": gaps.iter().max()},
+    })
+}
+
+/// Bob's worker command latency while recovery runs: one cheap status command
+/// every 250 ms, as the scorecard samples it. Report only.
+struct CommandProbe {
+    stop: Arc<AtomicBool>,
+    samples: tokio::task::JoinHandle<Vec<Sample>>,
+}
+
+impl CommandProbe {
+    fn start(bob: &AppRuntimeProbe, group: &GroupId) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (bob, group) = (bob.clone(), group.clone());
+        let samples = periodic(
+            &stop,
+            Duration::from_millis(250),
+            Instant::now(),
+            move |_| {
+                let (bob, group) = (bob.clone(), group.clone());
+                async move { bob.group_recovery_status(&group).await.map(|_| 0) }
+            },
+        );
+        Self { stop, samples }
+    }
+
+    async fn finish(self) -> TestResult<Value> {
+        self.stop.store(true, Ordering::Relaxed);
+        Ok(latencies(&self.samples.await?))
+    }
 }
 
 fn advancing(events: &[Value]) -> usize {
@@ -1803,6 +1898,7 @@ pub(super) async fn owed_history() {
         let trace_restart = runner_trace::now_ms();
         subject.set_online("bob", true).await?;
         let bob = subject.probe("bob")?;
+        let commands = CommandProbe::start(&bob, &busy);
         let live = Live::start(alice.clone(), bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
         let quiet_after_restart =
             visible_after(&alice, &bob, &quiet, "quiet-after-restart", Duration::from_secs(60)).await?;
@@ -1813,6 +1909,7 @@ pub(super) async fn owed_history() {
         // Visible history and the runner's own surveyed verdict must both
         // finish; neither the initial empty status nor a prior survey proves it.
         let (mut drained, mut reported_caught_up) = (None, None);
+        let mut drained_trace = None;
         while drained.is_none() || (!control && reported_caught_up.is_none()) {
             if t0.elapsed() >= RECOVERY_DEADLINE {
                 break;
@@ -1821,6 +1918,7 @@ pub(super) async fn owed_history() {
                 let (_, chat) = bob.chat_view(&busy, None).await?;
                 if chat.iter().filter(|text| text.starts_with("owed-")).count() == OWED_MESSAGES {
                     drained = Some(t0.elapsed().as_secs_f64());
+                    drained_trace = Some(runner_trace::now_ms());
                     note(started, "owed backlog visible");
                 }
             }
@@ -1830,6 +1928,7 @@ pub(super) async fn owed_history() {
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+        let worker_command_ms = commands.finish().await?;
         let (live_sent, live_visibility) = live.finish().await?;
         expected.extend(live_sent);
         let busy_exact = holds_exactly(&bob, &busy, &expected).await?;
@@ -1917,6 +2016,8 @@ pub(super) async fn owed_history() {
                 "bursts_per_endpoint": restart_bursts,
                 "runner": runner_summary(&restart_trace),
                 "runner_wasted": wasted(&restart_trace),
+                "pacing": pacing(trace_restart, drained_trace.unwrap_or(trace_idle)),
+                "worker_command_ms": worker_command_ms,
                 "history": summaries(&after_restart),
                 "bandwidth": bandwidth_view(&restart_traffic),
             },
@@ -2019,10 +2120,12 @@ pub(super) async fn ordered_backlog_regression() {
         save(out, "expected.json", &expected)?;
         note(started, "6,000-message failure backlog published");
         let clocks = relay_clocks(subject).await?;
+        let sessions = next_sessions(subject).await?;
         let trace_from = runner_trace::now_ms();
         let t0 = Instant::now();
         subject.set_online("bob", true).await?;
         let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
+        let commands = CommandProbe::start(&bob, &group);
         let live = Live::start(
             alice,
             bob.clone(),
@@ -2040,6 +2143,8 @@ pub(super) async fn ordered_backlog_regression() {
         )
         .await;
         let recovery_seconds = t0.elapsed().as_secs_f64();
+        let recovered_trace = runner_trace::now_ms();
+        let worker_command_ms = commands.finish().await?;
         let (live_sent, visibility) = live.finish().await?;
         expected.extend(live_sent);
         let exact = holds_exactly(&bob, &group, &expected).await?;
@@ -2058,6 +2163,8 @@ pub(super) async fn ordered_backlog_regression() {
         save(out, "expected.json", &expected)?;
         let proof = json!({"owed_messages": 6_000, "recovery_seconds": recovery_seconds,
             "timeline_exact": exact, "timeline": timeline, "live_visibility_ms": visibility,
+            "pacing": pacing(trace_from, recovered_trace), "worker_command_ms": worker_command_ms,
+            "bandwidth": bandwidth_view(&bob_traffic(subject, &sessions).await?),
             "native_paging_requests_per_endpoint": native_pages(&history)});
         save(out, "before-reopen.json", &proof)?;
         if recovery.is_err() || !exact || !live_complete(&visibility) {

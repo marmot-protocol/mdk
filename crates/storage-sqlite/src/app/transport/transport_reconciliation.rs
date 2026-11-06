@@ -80,6 +80,28 @@ fn route_state_floor_tx(
     Ok(floor)
 }
 
+/// Whether the account holds `item` (seen, no release journaled) on a route
+/// the engine has not deleted. The inbox is never deleted.
+fn held_on_live_route(
+    tx: &Transaction<'_>,
+    route: &TransportReconciliationRoute,
+    item: &TransportReconciliationItem,
+) -> StorageResult<bool> {
+    if !crate::app::transport::delivery_spill::already_seen(tx, &item.event_id)? {
+        return Ok(false);
+    }
+    match route {
+        TransportReconciliationRoute::Inbox => Ok(true),
+        TransportReconciliationRoute::Group(route_id) => tx
+            .query_row_cached(
+                crate::cross::views::GROUP_ROUTE_EXISTS_SQL,
+                [route_id.as_slice()],
+                |row| row.get(0),
+            )
+            .storage(),
+    }
+}
+
 fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> StorageResult<()> {
     let overflow_cutoff = tx
         .query_row_cached(
@@ -134,6 +156,40 @@ impl SqliteAppStorage {
             ),
         > + Clone,
     ) -> StorageResult<()> {
+        self.record_items(items, false)
+    }
+
+    /// As [`Self::record_reconciliation_items`], recording only the events the
+    /// seen index holds and no release has journaled, on routes the engine has
+    /// not deleted, judged in the same transaction. The seen test is the one
+    /// staging applies before it lets a staged copy go
+    /// (`remove_seen_staged_recovery_events`). A writer that records after its
+    /// ingests leaves what recording at each ingest would have left once a
+    /// release or route deletion in between had cleared it: it never
+    /// advertises an event released in between, nor recreates a deleted
+    /// route's inventory.
+    pub fn record_held_reconciliation_items<'a>(
+        &self,
+        items: impl Iterator<
+            Item = (
+                &'a TransportReconciliationRoute,
+                &'a TransportReconciliationItem,
+            ),
+        > + Clone,
+    ) -> StorageResult<()> {
+        self.record_items(items, true)
+    }
+
+    fn record_items<'a>(
+        &self,
+        items: impl Iterator<
+            Item = (
+                &'a TransportReconciliationRoute,
+                &'a TransportReconciliationItem,
+            ),
+        > + Clone,
+        held_only: bool,
+    ) -> StorageResult<()> {
         if items.clone().next().is_none() {
             return Ok(());
         }
@@ -153,6 +209,9 @@ impl SqliteAppStorage {
             let mut inventory_since = 0;
             let mut inserted = false;
             for (route, item) in items.clone() {
+                if held_only && !held_on_live_route(&tx, route, item)? {
+                    continue;
+                }
                 let created_at = i64::try_from(item.created_at).map_err(|_| {
                     StorageError::Serialization(
                         "transport reconciliation timestamp exceeds SQLite range".to_owned(),
@@ -932,5 +991,98 @@ mod tests {
             app.recovery_revision_fence().unwrap().inventory_revision,
             before.inventory_revision + 1
         );
+    }
+
+    /// A deferred writer records only what the account still holds on a
+    /// route the engine still has: an event seen and not released, on the
+    /// inbox or a standing group route. A released event, an unseen one and
+    /// one on a deleted route get no row, as recording each at its ingest would
+    /// have left them after the release or the route's deletion.
+    #[test]
+    fn held_items_skip_released_unseen_and_deleted_route_events() {
+        use crate::base::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let (standing, deleted) = ([0x44; 32], [0x45; 32]);
+        for route in [standing, deleted] {
+            store
+                .put_transport_group_route(&route, &gid(1), cgka_traits::EpochId(0))
+                .unwrap();
+        }
+        let now = unix_now_secs().unwrap();
+        let item = |id: u8| TransportReconciliationItem {
+            event_id: [id; 32],
+            created_at: now - u64::from(id),
+        };
+        let seen = |id: u8| {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO seen_events(event_id, seen_at) VALUES (?1, 1)",
+                    [hex::encode([id; 32])],
+                )
+                .unwrap();
+        };
+        for id in [1, 2, 4, 5] {
+            seen(id);
+        }
+        // Released: still in the seen ring, but journaled.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
+                 VALUES (?1, ?2, 0)",
+                params![[2u8; 32].as_slice(), gid(1).as_slice()],
+            )
+            .unwrap();
+        store.delete_transport_group_route(&deleted).unwrap();
+        let standing = TransportReconciliationRoute::Group(standing);
+        let deleted = TransportReconciliationRoute::Group(deleted);
+        let inbox = TransportReconciliationRoute::Inbox;
+        let records = [
+            (standing.clone(), item(1)),
+            (standing.clone(), item(2)),
+            (standing.clone(), item(3)),
+            (deleted.clone(), item(4)),
+            (inbox.clone(), item(5)),
+        ];
+        app.record_held_reconciliation_items(records.iter().map(|(route, item)| (route, item)))
+            .unwrap();
+        let ids = |route: &TransportReconciliationRoute| {
+            store
+                .lock()
+                .unwrap()
+                .prepare(
+                    "SELECT event_id FROM transport_reconciliation_items
+                     WHERE route_kind = ?1 AND route_id = ?2 ORDER BY event_id",
+                )
+                .unwrap()
+                .query_map(
+                    params![route.storage_key().0, route.storage_key().1],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap()
+                .map(|id| id.unwrap()[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&standing), [1]);
+        assert!(ids(&deleted).is_empty());
+        let (kind, id) = deleted.storage_key();
+        let deleted_state: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM transport_reconciliation_route_state
+                 WHERE route_kind = ?1 AND route_id = ?2",
+                params![kind, id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_state, 0, "a deleted route is not recreated");
+        assert_eq!(ids(&inbox), [5]);
     }
 }

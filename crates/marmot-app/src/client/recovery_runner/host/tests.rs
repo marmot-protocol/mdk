@@ -552,6 +552,137 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(passes(&client), 2);
 }
 
+/// Admission writes a command's inventory rows once, after its last ingest
+/// and before its settle. A crash between the two leaves a message the
+/// account holds, still staged, with no row. Here Bob's own runner fetches,
+/// stages and ingests Alice's message, and faults stop the inventory write
+/// and the settle where a crash would. Restarted, the runner admits the
+/// staged copy again as held: the message shows once, it gains its row,
+/// staging lets it go, and the second it was sent in stays proven.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_before_the_inventory_write_readmits_the_held_message() {
+    let (_relay, url) = published_relay::mock_relay().await;
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob = crate::AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let app = process_app(bob_dir.path(), &url);
+    let mut client = app.client("bob").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    client.sync().await.unwrap();
+    drop(client);
+    app.relay_plane.shutdown().await;
+    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone(), true).await;
+    let group = alice
+        .create_group_with_options(
+            "crash",
+            &[bob.account_id_hex.as_str()],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let joined = one_shot_sync(bob_dir.path(), &url).await;
+    assert_eq!(joined.joined_groups, std::slice::from_ref(&group));
+    alice.send(&group, b"held across a crash").await.unwrap();
+
+    let shown = |app: &crate::MarmotApp| {
+        app.messages("bob")
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.plaintext == "held across a crash")
+            .collect::<Vec<_>>()
+    };
+    let inventoried = |app: &crate::MarmotApp, route: &TransportReconciliationRoute| {
+        app.account_storage("bob")
+            .unwrap()
+            .app_storage()
+            .transport_reconciliation_inventory(route, unix_now_seconds() + 1)
+            .unwrap()
+            .items
+    };
+    // A loss owes the last hour before the restart: the pass fetches the
+    // message, stages it and ingests it, then the faults stop it.
+    let reopen = || process_app(bob_dir.path(), &url);
+    let app = reopen();
+    // Members share the group's Nostr route.
+    let route = alice
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|candidate| candidate.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap()
+        .route;
+    app.account_storage("bob")
+        .unwrap()
+        .app_storage()
+        .uncover_recovery_coverage(std::slice::from_ref(&route), unix_now_seconds() - HOUR)
+        .unwrap();
+    let mut client = app.client("bob").await.unwrap();
+    let candidate = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|candidate| candidate.route == route)
+        .unwrap();
+    let faults = fault_connection(&client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER crash_before_inventory BEFORE INSERT ON transport_reconciliation_items
+             BEGIN SELECT RAISE(FAIL, 'crashed before the inventory write'); END;
+             CREATE TRIGGER crash_before_settle BEFORE DELETE ON account_recovery_staged
+             BEGIN SELECT RAISE(FAIL, 'crashed before the settle'); END;",
+        )
+        .unwrap();
+    let _ = client.run_recovery_runner_pass().await;
+    assert_eq!(shown(&app).len(), 1, "the pass ingested the message");
+    let storage = app.account_storage("bob").unwrap().app_storage();
+    let staged = storage
+        .staged_recovery_events(std::slice::from_ref(&route), unix_now_seconds() + DAY, 2)
+        .unwrap()
+        .events;
+    assert_eq!(staged.len(), 1, "its staged copy stayed");
+    let event_id = <[u8; 32]>::try_from(staged[0].delivery.message.id.as_slice()).unwrap();
+    assert!(
+        !inventoried(&app, &route)
+            .iter()
+            .any(|item| item.event_id == event_id)
+    );
+    drop(client);
+    app.relay_plane.shutdown().await;
+    faults
+        .execute_batch("DROP TRIGGER crash_before_inventory; DROP TRIGGER crash_before_settle;")
+        .unwrap();
+
+    let app = reopen();
+    let mut client = app.client("bob").await.unwrap();
+    client.run_recovery_runner_pass().await.unwrap();
+    assert_eq!(shown(&app).len(), 1, "the message shows once");
+    let item = inventoried(&app, &route)
+        .into_iter()
+        .find(|item| item.event_id == event_id)
+        .expect("the held message gained its row");
+    let storage = app.account_storage("bob").unwrap().app_storage();
+    assert_eq!(
+        storage.staged_recovery_total().unwrap().events,
+        0,
+        "staging let the held copy go"
+    );
+    for relay in &candidate.required {
+        assert!(
+            storage
+                .recovery_coverage_ranges(&route, relay)
+                .unwrap()
+                .iter()
+                .any(|proved| proved.range.since_seconds <= item.created_at
+                    && proved.range.until_seconds >= item.created_at),
+            "the second the message was sent in stays proven"
+        );
+    }
+    drop(client);
+    app.relay_plane.shutdown().await;
+}
+
 /// Bob's app over `dir` on `url`, as one `wn` process opens it.
 fn process_app(dir: &std::path::Path, url: &str) -> crate::MarmotApp {
     crate::MarmotApp::with_relay_and_config(

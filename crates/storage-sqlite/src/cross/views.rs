@@ -88,6 +88,11 @@ pub(crate) const GROUP_ROUTE_IDS_SQL: &str = "SELECT transport_group_id
                          FROM cgka_transport_group_routes
                          WHERE group_id = ?1";
 
+/// Whether the engine still holds Nostr route `?1`. Every route deletion
+/// clears the route's app state with it (`delete_route_app_state`).
+pub(crate) const GROUP_ROUTE_EXISTS_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM cgka_transport_group_routes WHERE transport_group_id = ?1)";
+
 /// Whether the engine stored message `?1` of group `?2` after insert order `?3`.
 pub(crate) const MESSAGE_NEWER_THAN_FRONTIER_SQL: &str = "SELECT EXISTS(
                     SELECT 1

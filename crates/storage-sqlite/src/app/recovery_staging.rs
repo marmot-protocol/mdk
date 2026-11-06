@@ -252,21 +252,27 @@ impl SqliteAppStorage {
         Ok(items)
     }
 
-    /// Remove staged rows whose events are now in the seen index. Rows whose
-    /// events are not stay. Returns the rows removed.
-    pub fn remove_seen_staged_recovery_events(&self, event_ids: &[&[u8]]) -> StorageResult<usize> {
+    /// Remove staged rows whose events are now in the seen index, in one
+    /// transaction: a failure removes none. Rows whose events are not stay.
+    /// Returns, for each id, whether its row left.
+    pub fn remove_seen_staged_recovery_events(
+        &self,
+        event_ids: &[&[u8]],
+    ) -> StorageResult<Vec<bool>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let mut removed = 0;
+            let mut removed = Vec::with_capacity(event_ids.len());
             for event_id in event_ids {
-                if already_seen(&conn, event_id)? {
-                    removed += conn
-                        .execute_cached(
-                            "DELETE FROM account_recovery_staged WHERE event_id = ?1",
-                            [event_id],
-                        )
-                        .storage()?;
-                }
+                removed.push(
+                    already_seen(&conn, event_id)?
+                        && conn
+                            .execute_cached(
+                                "DELETE FROM account_recovery_staged WHERE event_id = ?1",
+                                [event_id],
+                            )
+                            .storage()?
+                            > 0,
+                );
             }
             Ok(removed)
         })

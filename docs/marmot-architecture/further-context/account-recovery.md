@@ -777,7 +777,12 @@ A proven slice's unseen events go to staging, keyed by event id, in the transact
 records its coverage through the subtracting write. A crash after that loses nothing and
 refetches nothing: the events are durable and the ledger-derived cursor is past the slice.
 Staging is not admission; a row leaves once its event is in the seen index, or, if it no
-longer decodes, by un-covering its second so it is fetched again.
+longer decodes, by un-covering its second so it is fetched again. An admission command writes
+the inventory rows of plain messages and held events once, after its last ingest and before
+its batch settles, and only for events still held on routes that still exist; structural input
+writes its row at ingest. A crash between ingest and that write leaves the event held and
+staged, and the next admission takes it again as held and writes its row. A batch's rows
+leave staging in one transaction.
 
 ### 9. The recovery runner
 

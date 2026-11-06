@@ -592,7 +592,7 @@ struct DeliveryIngest {
     inventory_record: Option<InventoryRecord>,
 }
 
-type InventoryRecord = (TransportReconciliationRoute, TransportReconciliationItem);
+pub(crate) type InventoryRecord = (TransportReconciliationRoute, TransportReconciliationItem);
 
 #[derive(Default)]
 struct InventoryBatch {
@@ -4077,6 +4077,39 @@ impl AppClient {
             tracing::warn!(
                 target: "marmot_app::relay_plane",
                 method = "record_reconciliation_items",
+                "could not persist transport reconciliation items"
+            );
+        }
+    }
+
+    /// Record the inventory rows one recovery-runner admission command
+    /// deferred, in one transaction, before the runner's settle lets any
+    /// staged copy go. Only events still held on routes still standing are
+    /// recorded (`record_held_reconciliation_items`): an event released in
+    /// between is unseen, so settle keeps its staged copy and admits it
+    /// again. A crash before this leaves the staged copies, which are
+    /// admitted again as held. A failed write leaves rows absent, never
+    /// wrong, as a failed immediate write does: a later reconciliation
+    /// fetches those events again.
+    pub(crate) fn record_deferred_reconciliation_items(&self, records: &[InventoryRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let recorded = self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| {
+                storage
+                    .app_storage()
+                    .record_held_reconciliation_items(
+                        records.iter().map(|(route, item)| (route, item)),
+                    )
+                    .map_err(AppError::from)
+            });
+        if recorded.is_err() {
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "record_deferred_reconciliation_items",
                 "could not persist transport reconciliation items"
             );
         }
