@@ -1038,13 +1038,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   progress only, retry transient contention, and halt durable decode failures
   without disabling legacy reads.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
-- A test relay behaves like a relay: `ScriptedPushRelayClient` answers every REQ it accepts with EOSE on each relay,
-  sent through its relay-message channel to the plane's own dispatch. A test that needs a relay still replaying,
-  never finishing, or closing a REQ asks for it (`hold_replies`, `release_held_replies`, `close_subscription`) with
-  a one-line reason. Never call the plane's adapter in place of a relay message. A relay connects at its first REQ
-  unless the fixture connects it first (`connect_relays`), and the plane restarts a REQ issued before it heard the
-  connection, counting it only from its EOSE; a fixture whose tests read live tails, coverage or debt connects its
-  relays before the account subscribes, as a running app's are.
+- A test relay behaves like a relay: every injected relay client a plane reads (`ScriptedPushRelayClient`, and the
+  smaller fakes such as onboarding's `Network`) answers every REQ it accepts with EOSE on each relay, sent through its
+  `relay_notification_source` (a `ScriptedRelayMessages`) to the plane's own dispatch. A test that needs a relay still
+  replaying, never finishing, or closing a REQ asks for it (`hold_replies`, `release_held_replies`,
+  `close_subscription`) with a one-line reason. Never call the plane's adapter in place of a relay message. A relay
+  connects at its first REQ unless the fixture connects it first (`connect_relays`), and the plane restarts a REQ issued
+  before it heard the connection, counting it only from its EOSE; a fixture whose tests read live tails, coverage or
+  debt connects its relays before the account subscribes, as a running app's are.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
 - Keep the relay-telemetry export path in the relay plane (`transport-nostr`, rollup in its `src/telemetry.rs`) and

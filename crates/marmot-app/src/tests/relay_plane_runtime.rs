@@ -22,11 +22,15 @@ use transport_nostr::{
     AccountDeliveryReceive, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
 };
 
-/// A relay client that records subscriptions and accepts nothing. A copy of
-/// the relay plane's own test fake: once the plane is its own crate, its test
-/// module is not visible here.
+/// A relay client that records subscriptions, answers each REQ with EOSE on
+/// each of its relays, and accepts no publish. A copy of the relay plane's own
+/// test fake: once the plane is its own crate, its test module is not visible
+/// here.
 #[derive(Default)]
 struct RecordingRelayClient {
+    /// What its relays send the plane: an EOSE for each accepted REQ on each
+    /// relay.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
@@ -44,6 +48,21 @@ impl DirectoryRelayFetcher for RecordingRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for RecordingRelayClient {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+
     async fn publish_event_for_account(
         &self,
         _account_id: &MemberId,
@@ -57,6 +76,10 @@ impl NostrRelayClient for RecordingRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let id = subscription.subscription_id();
+        for endpoint in subscription.endpoints() {
+            self.messages.eose(endpoint, &id);
+        }
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
     }
@@ -95,6 +118,19 @@ impl NostrRelayClient for RecordingRelayClient {
     }
 }
 
+impl RecordingRelayClient {
+    /// These relays are connected, as a running app's are before its account
+    /// subscribes: wait until the plane has heard each connection, so a REQ
+    /// it issues there later counts from its own issue.
+    async fn connect_relays(&self, endpoints: &[&str]) {
+        for endpoint in endpoints {
+            self.messages
+                .connect(&TransportEndpoint((*endpoint).to_owned()));
+        }
+        self.messages.handled().await;
+    }
+}
+
 fn inbox_subscription_count(relay: &RecordingRelayClient) -> usize {
     relay
         .subscriptions
@@ -114,6 +150,7 @@ async fn managed_account_worker_reopens_transport_after_notification_consumer_ex
     let relay = Arc::new(RecordingRelayClient::default());
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    relay.connect_relays(&["wss://relay.example"]).await;
     let relay_plane = app.relay_plane.clone();
     let runtime = crate::MarmotAppRuntime::new(app);
 
@@ -153,6 +190,7 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     let relay = Arc::new(RecordingRelayClient::default());
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    relay.connect_relays(&["wss://relay.example"]).await;
     let relay_plane = app.relay_plane.clone();
     let storage = app.account_storage("alice").unwrap().app_storage();
     let runtime = crate::MarmotAppRuntime::new(app);
