@@ -209,6 +209,7 @@ impl AgentConnector {
             | AgentControlRequest::AccountRelayListAdd { .. }
             | AgentControlRequest::AccountRelayListRemove { .. }
             | AgentControlRequest::GroupProfileUpdate { .. }
+            | AgentControlRequest::GroupAdmin { .. }
             | AgentControlRequest::SendMedia { .. }
             | AgentControlRequest::DownloadMedia { .. }
             | AgentControlRequest::DownloadAttachment { .. }
@@ -339,6 +340,26 @@ impl AgentConnector {
             } => {
                 self.leave_group_response(&account_id_hex, &group_id_hex)
                     .await
+            }
+            AgentControlRequest::GroupAdmin {
+                account_id_hex,
+                group_id_hex,
+                member_id_hex,
+                promote,
+                add,
+                remove,
+            } => {
+                self.group_admin_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    &member_id_hex,
+                    crate::account::GroupAdminChange {
+                        promote,
+                        add,
+                        remove,
+                    },
+                )
+                .await
             }
             AgentControlRequest::GroupInfo {
                 account_id_hex,

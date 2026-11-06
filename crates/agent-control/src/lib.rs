@@ -509,6 +509,25 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
     },
+    /// Read a member's membership and admin status in a group, or change it
+    /// through the account runtime's admin checks. With no flags set this is a
+    /// read-only status query.
+    GroupAdmin {
+        account_id_hex: String,
+        group_id_hex: String,
+        member_id_hex: String,
+        /// Grant admin to a current member that is not an admin yet.
+        #[serde(default)]
+        promote: bool,
+        /// Invite the member first when it is not in the group yet. With
+        /// `promote`, the member joins as an initial admin.
+        #[serde(default)]
+        add: bool,
+        /// Remove the member, demoting it first when it is an admin. Takes
+        /// precedence over `add` and `promote`.
+        #[serde(default)]
+        remove: bool,
+    },
     /// Update authenticated group profile fields. Omitted fields keep their
     /// current value; an empty string explicitly clears a field. Only a current
     /// group admin can publish this MLS commit.
@@ -757,6 +776,13 @@ pub enum AgentControlResponse {
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+    },
+    /// Readback after a `group_admin` request. `message_ids_hex` lists the
+    /// commits published by this request; it is empty when nothing changed.
+    GroupAdminStatus {
+        is_member: bool,
+        is_admin: bool,
+        message_ids_hex: Vec<String>,
     },
     GroupProfileUpdated {
         group_id_hex: String,
@@ -1489,6 +1515,46 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn group_admin_flags_default_to_a_read_only_status_query() {
+        let legacy = serde_json::json!({
+            "marmot_agent_control": crate::AGENT_CONTROL_PROTOCOL_V2,
+            "type": "group_admin",
+            "account_id_hex": "ab".repeat(32),
+            "group_id_hex": "cd".repeat(16),
+            "member_id_hex": "ef".repeat(32),
+        });
+        let decoded =
+            decode_envelope::<AgentControlRequest>(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            decoded.payload,
+            AgentControlRequest::GroupAdmin {
+                account_id_hex: "ab".repeat(32),
+                group_id_hex: "cd".repeat(16),
+                member_id_hex: "ef".repeat(32),
+                promote: false,
+                add: false,
+                remove: false,
+            }
+        );
+
+        let response = AgentControlEnvelope::new(
+            Some("admin-1".into()),
+            AgentControlResponse::GroupAdminStatus {
+                is_member: true,
+                is_admin: false,
+                message_ids_hex: vec!["01".repeat(32)],
+            },
+        );
+        let encoded = encode_frame(&response).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_admin_status");
+        assert_eq!(
+            decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -2265,6 +2331,17 @@ mod tests {
                     group_id_hex: group(),
                 },
                 "group_leave",
+            ),
+            (
+                AgentControlRequest::GroupAdmin {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    member_id_hex: account(),
+                    promote: true,
+                    add: true,
+                    remove: false,
+                },
+                "group_admin",
             ),
             (
                 AgentControlRequest::MaintenanceStatus {

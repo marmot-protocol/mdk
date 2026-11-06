@@ -164,6 +164,71 @@ impl AgentConnector {
         Ok(AgentControlResponse::Ack)
     }
 
+    /// Read, and optionally change, one member's membership and admin status.
+    /// Every mutation goes through the runtime's admin checks; the response is
+    /// a fresh readback plus the commits this request published, so callers can
+    /// reconcile an uncertain outcome before retrying.
+    pub(crate) async fn group_admin_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        member_id_hex: &str,
+        change: GroupAdminChange,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = cgka_traits::GroupId::new(hex::decode(crate::validation::normalize_hex(
+            group_id_hex,
+        )?)?);
+        let member = crate::validation::normalize_hex(member_id_hex)?;
+        let before = self
+            .runtime
+            .group_member_ids_page(&account.label, std::slice::from_ref(&group_id))
+            .await?;
+        let is_member = before.iter().any(|g| g.member_ids_hex.contains(&member));
+        let is_admin = before.iter().any(|g| g.admin_ids_hex.contains(&member));
+        let mut message_ids = Vec::new();
+        if change.remove {
+            if is_member {
+                if is_admin {
+                    message_ids = self
+                        .runtime
+                        .demote_admin(&account.label, &group_id, &member)
+                        .await?
+                        .message_ids;
+                }
+                message_ids.extend(
+                    self.runtime
+                        .remove_members(&account.label, &group_id, std::slice::from_ref(&member))
+                        .await?
+                        .message_ids,
+                );
+            }
+        } else if change.add && !is_member {
+            let members = [member.clone()];
+            let admins: &[String] = if change.promote { &members } else { &[] };
+            message_ids = self
+                .runtime
+                .invite_members_with_initial_admins(&account.label, &group_id, &members, admins)
+                .await?
+                .message_ids;
+        } else if change.promote && is_member && !is_admin {
+            message_ids = self
+                .runtime
+                .promote_admin(&account.label, &group_id, &member)
+                .await?
+                .message_ids;
+        }
+        let after = self
+            .runtime
+            .group_member_ids_page(&account.label, std::slice::from_ref(&group_id))
+            .await?;
+        Ok(AgentControlResponse::GroupAdminStatus {
+            is_member: after.iter().any(|g| g.member_ids_hex.contains(&member)),
+            is_admin: after.iter().any(|g| g.admin_ids_hex.contains(&member)),
+            message_ids_hex: message_ids,
+        })
+    }
+
     pub(crate) async fn publish_profile_response(
         &self,
         account_id_hex: &str,
@@ -366,4 +431,12 @@ impl AgentConnector {
                 .set_policy(&account.account_id_hex, policy)?,
         })
     }
+}
+
+/// Requested `group_admin` changes; all false is a read-only status query.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GroupAdminChange {
+    pub(crate) promote: bool,
+    pub(crate) add: bool,
+    pub(crate) remove: bool,
 }
