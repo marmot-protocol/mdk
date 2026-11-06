@@ -2358,3 +2358,44 @@ async fn a_failed_sweep_row_is_revisited_by_the_hourly_rescan_not_every_tick() {
         "the rescan removed it"
     );
 }
+
+/// Every media store call runs on the blocking pool: the sweep lock may be
+/// held by an earlier batch (for example one waiting on a compacting
+/// connection), so starting a sweep, even one that restarts the cursor,
+/// never takes it on the async worker (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_a_sweep_never_waits_for_the_store_sweep_lock() {
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let media = media.clone();
+        std::thread::spawn(move || {
+            let _hold = media.hold_sweep_for_test();
+            held_tx.send(()).unwrap();
+            // Released after 3 s, so a call that blocks shows as slow
+            // instead of hanging the test.
+            std::thread::sleep(Duration::from_secs(3));
+        })
+    };
+    held_rx.recv().unwrap();
+    let mut admission = Admission::default();
+    let started = std::time::Instant::now();
+    // An ownership sweep restarts the cursor from the start.
+    spawn_media_sweep(
+        &mut admission,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "starting the sweep waited for the held lock: {:?}",
+        started.elapsed()
+    );
+    holder.join().unwrap();
+    finish_media_sweep(&mut admission).await;
+}

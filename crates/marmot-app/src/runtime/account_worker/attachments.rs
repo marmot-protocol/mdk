@@ -190,9 +190,11 @@ fn spawn_media_sweep(
     }
     latches.sweep_cleanup_seen = cleanup;
     latches.sweep_foreign_seen = foreign;
-    if rescan_now || until_complete {
-        // Either is a full pass from the start, which is what was owed.
-        media.restart_sweep();
+    // Either is a full pass from the start, which is what was owed. The
+    // cursor restart takes the store's sweep lock, which an earlier batch
+    // may still hold, so it runs on the blocking pool with the sweep.
+    let restart = rescan_now || until_complete;
+    if restart {
         latches.sweep_rescan.store(false, Ordering::Release);
         latches.sweep_rescan_due = None;
     }
@@ -202,6 +204,9 @@ fn spawn_media_sweep(
     // panics drops its span, which records it as cancelled.
     let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
     admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
+        if restart {
+            media.restart_sweep();
+        }
         let outcome = loop {
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
