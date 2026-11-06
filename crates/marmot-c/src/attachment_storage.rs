@@ -483,25 +483,25 @@ mod tests {
                 ),
                 MarmotStatus::Ok
             );
-            assert_ne!(
+            assert_eq!(
                 marmot_attachment_storage_usage(client, c"absent".as_ptr(), &mut usage),
-                MarmotStatus::Ok,
+                MarmotStatus::UnknownAccount,
                 "an unknown account is an error"
             );
             assert!(usage.is_null());
             let mut removed = 9u64;
-            assert_ne!(
+            assert_eq!(
                 marmot_remove_chat_attachments(
                     client,
                     c"absent".as_ptr(),
                     c"abababababababababababababababab".as_ptr(),
                     &mut removed
                 ),
-                MarmotStatus::Ok
+                MarmotStatus::UnknownAccount
             );
             assert_eq!(removed, 0, "a failed call clears a stale count");
             removed = 9;
-            assert_ne!(
+            assert_eq!(
                 marmot_remove_attachments_older_than(
                     client,
                     c"absent".as_ptr(),
@@ -509,7 +509,7 @@ mod tests {
                     ptr::null(),
                     &mut removed
                 ),
-                MarmotStatus::Ok
+                MarmotStatus::UnknownAccount
             );
             assert_eq!(removed, 0);
             let mut keep = 9u32;
@@ -518,9 +518,9 @@ mod tests {
                 MarmotStatus::NullPointer
             );
             assert_eq!(keep, 0, "cleared before the call");
-            assert_ne!(
+            assert_eq!(
                 marmot_attachment_keep_media(client, c"absent".as_ptr(), &mut keep),
-                MarmotStatus::Ok
+                MarmotStatus::UnknownAccount
             );
             removed = 9;
             assert_eq!(
@@ -529,14 +529,14 @@ mod tests {
                 "an out-of-range setting is refused before any work"
             );
             assert_eq!(removed, 0);
-            assert_ne!(
+            assert_eq!(
                 marmot_set_attachment_keep_media(
                     client,
                     c"absent".as_ptr(),
                     MarmotAttachmentKeepMedia::ThirtyDays as u32,
                     &mut removed
                 ),
-                MarmotStatus::Ok
+                MarmotStatus::UnknownAccount
             );
             assert_eq!(crate::marmot_client_shutdown(client), MarmotStatus::Ok);
             crate::marmot_client_free(client);

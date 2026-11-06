@@ -145,6 +145,47 @@ pub unsafe extern "C" fn marmot_open_chat_list_window(
         }
     })
 }
+
+/// Open a live window over every chat a filtered query matches; `query` is
+/// borrowed. The filter runs in SQL before paging. A NULL initial_rows uses 50;
+/// otherwise requires 1–100. Returns `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY` for
+/// a query over a size bound or a node array that is not one tree. Take
+/// snapshot once, then receive replacements.
+/// # Safety
+/// client/string/query must be valid; initial_rows must be NULL or readable, out_sub writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_open_chat_list_query_window(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    query: *const MarmotChatListViewQuery,
+    initial_rows: *const u32,
+    out_sub: *mut *mut MarmotChatListWindowSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let query = try_arg!(unsafe { crate::commands::borrowed(query) });
+        let query = try_arg!(unsafe { query.to_ffi() });
+        let initial_rows = unsafe { initial_rows.as_ref() }.copied();
+        match client.block_on(client.marmot.open_chat_list_query_window(
+            account_ref,
+            query,
+            initial_rows,
+        )) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotChatListWindowSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(e) => status_from_error(&e),
+        }
+    })
+}
 /// Open independent signed-in account summaries; requires no active chat-list handle.
 /// # Safety
 /// client must be valid; out_sub writable.
@@ -443,6 +484,191 @@ mod tests {
         drop(relay);
         drop(client);
         // Clear owned error-detail storage used by these deliberate rejection tests.
+        let _ = crate::status::take_last_error();
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
+    /// A borrowed node array reaches the same filter for the window, select
+    /// all and revalidation; malformed arrays are refused before any read.
+    #[test]
+    fn c_filtered_query_node_arrays_reach_window_ids_and_revalidation() {
+        use crate::commands::{marmot_chat_list_query_ids, marmot_revalidate_chat_list_query_ids};
+        use crate::types::common::{MarmotStringList, marmot_string_list_free};
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let relay = rt.block_on(nostr_relay_builder::MockRelay::run()).unwrap();
+        let url = rt.block_on(relay.url()).to_string();
+        let kit = Marmot::new_with_options(
+            dir.path().to_str().unwrap().into(),
+            vec![url.clone()],
+            marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            Some(Arc::new(Store::default())),
+            marmot_uniffi::marmot_deployment_white_noise(),
+        )
+        .unwrap();
+        let client = MarmotClient {
+            runtime: rt,
+            marmot: kit,
+        };
+        let account = client
+            .block_on(
+                client
+                    .marmot
+                    .create_identity(vec![url.clone()], vec![url], Vec::new()),
+            )
+            .unwrap()
+            .account_id_hex;
+        let groups = ["One", "Two"].map(|name| {
+            client
+                .block_on(
+                    client
+                        .marmot
+                        .create_group(account.clone(), name.into(), vec![], None),
+                )
+                .unwrap()
+        });
+        client
+            .marmot
+            .set_chat_manually_unread(account.clone(), groups[0].clone(), true)
+            .unwrap();
+        let account = CString::new(account).unwrap();
+        let strings = |list: *mut MarmotStringList| unsafe {
+            let values = (0..(*list).len)
+                .map(|i| {
+                    std::ffi::CStr::from_ptr(*(*list).items.add(i))
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            marmot_string_list_free(list);
+            values
+        };
+        // Child index arrays the nodes point into; `'static` so they outlive every call.
+        const CHILD: &[u32] = &[1];
+        const CHILD_TWICE: &[u32] = &[1, 1];
+        let node =
+            |kind: MarmotChatListFilterNodeKind, condition: u32, children: &'static [u32]| {
+                MarmotChatListFilterNode {
+                    kind: kind as u32,
+                    condition,
+                    children: if children.is_empty() {
+                        ptr::null()
+                    } else {
+                        children.as_ptr()
+                    },
+                    children_len: children.len(),
+                    group_ids: ptr::null(),
+                    group_ids_len: 0,
+                }
+            };
+        let not_unread = [
+            node(MarmotChatListFilterNodeKind::Not, 0, CHILD),
+            node(
+                MarmotChatListFilterNodeKind::Condition,
+                MarmotChatListCondition::ManualUnread as u32,
+                &[],
+            ),
+        ];
+        let query = MarmotChatListViewQuery {
+            view: MarmotChatListView::Chats as u32,
+            filter: not_unread.as_ptr(),
+            filter_len: not_unread.len(),
+        };
+        unsafe {
+            let mut window = ptr::null_mut();
+            assert_eq!(
+                marmot_open_chat_list_query_window(
+                    &client,
+                    account.as_ptr(),
+                    &query,
+                    ptr::null(),
+                    &mut window
+                ),
+                MarmotStatus::Ok
+            );
+            let mut snapshot = ptr::null_mut();
+            assert_eq!(
+                marmot_chat_list_window_subscription_snapshot(window, &mut snapshot),
+                MarmotStatus::Ok
+            );
+            assert_eq!((*snapshot).rows_len, 1);
+            marmot_chat_list_window_snapshot_free(snapshot);
+            marmot_chat_list_window_subscription_free(window);
+            let mut list = ptr::null_mut();
+            assert_eq!(
+                marmot_chat_list_query_ids(&client, account.as_ptr(), &query, &mut list),
+                MarmotStatus::Ok
+            );
+            assert_eq!(strings(list), [groups[1].clone()]);
+            let selected = groups.clone().map(|id| CString::new(id).unwrap());
+            let selected = selected.iter().map(|id| id.as_ptr()).collect::<Vec<_>>();
+            assert_eq!(
+                marmot_revalidate_chat_list_query_ids(
+                    &client,
+                    account.as_ptr(),
+                    &query,
+                    selected.as_ptr(),
+                    selected.len(),
+                    &mut list
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(strings(list), [groups[1].clone()]);
+            // A NOT node needs exactly one child; discriminants are range-checked.
+            for nodes in [
+                [
+                    node(MarmotChatListFilterNodeKind::Not, 0, CHILD_TWICE),
+                    node(MarmotChatListFilterNodeKind::Condition, 0, &[]),
+                ],
+                [
+                    node(MarmotChatListFilterNodeKind::Not, 0, CHILD),
+                    node(MarmotChatListFilterNodeKind::Condition, 99, &[]),
+                ],
+            ] {
+                let query = MarmotChatListViewQuery {
+                    filter: nodes.as_ptr(),
+                    ..query
+                };
+                assert_eq!(
+                    marmot_chat_list_query_ids(&client, account.as_ptr(), &query, &mut list),
+                    MarmotStatus::InvalidArgument
+                );
+                assert!(list.is_null());
+            }
+            let shared = [
+                node(MarmotChatListFilterNodeKind::All, 0, CHILD_TWICE),
+                node(MarmotChatListFilterNodeKind::Condition, 0, &[]),
+            ];
+            assert_eq!(
+                marmot_open_chat_list_query_window(
+                    &client,
+                    account.as_ptr(),
+                    &MarmotChatListViewQuery {
+                        filter: shared.as_ptr(),
+                        ..query
+                    },
+                    ptr::null(),
+                    &mut window
+                ),
+                MarmotStatus::InvalidChatListQuery
+            );
+            assert!(window.is_null());
+            assert_eq!(
+                marmot_chat_list_query_ids(&client, account.as_ptr(), ptr::null(), &mut list),
+                MarmotStatus::NullPointer
+            );
+        }
+        client.block_on(client.marmot.shutdown_and_close()).unwrap();
+        drop(relay);
+        drop(client);
         let _ = crate::status::take_last_error();
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);

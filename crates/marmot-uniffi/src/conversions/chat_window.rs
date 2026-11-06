@@ -32,6 +32,167 @@ enums!(
     Backward
 );
 
+/// A chat-list query: a native view narrowed by an optional filter, matched in
+/// SQL over every chat in the view before paging. The live window, select-all
+/// IDs and revalidation all take it, so list, count and selection agree.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ChatListViewQueryFfi {
+    pub view: ChatListViewFfi,
+    /// The filter as a flat node list. Empty means no filter (the whole view).
+    /// Node 0 is the root; every other node is the child of exactly one node
+    /// listed before it. At most 64 nodes, 8 levels and 500 group IDs in all.
+    pub filter: Vec<ChatListFilterNodeFfi>,
+}
+
+/// One filter node. Child entries are indices into the query's node list.
+/// An empty `All` matches every chat in the view; an empty `Any` matches none.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatListFilterNodeFfi {
+    All {
+        children: Vec<u32>,
+    },
+    Any {
+        children: Vec<u32>,
+    },
+    Not {
+        child: u32,
+    },
+    Condition {
+        condition: ChatListConditionFfi,
+    },
+    /// Chats whose group ID is listed (hex, any case). Inclusion never adds a
+    /// chat outside the view; to exclude IDs, wrap this node in `Not`.
+    GroupIds {
+        group_ids: Vec<String>,
+    },
+}
+
+/// Chat facts a filter can test. Each matches what the presented row shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatListConditionFfi {
+    /// Neither archived nor departed, including invitations.
+    Active,
+    /// Archived and not departed.
+    Archived,
+    /// Departed, disbanded, or with a leave or disband outstanding.
+    Left,
+    /// An invitation not yet accepted or declined.
+    PendingInvite,
+    /// Shows an unread badge: unread messages or a manual mark. Never an
+    /// invitation or a Left chat.
+    Unread,
+    /// Unread because the user marked it so.
+    ManualUnread,
+    /// Unread with an unread mention of this account.
+    Mention,
+    Pinned,
+    /// A leave request is still outstanding.
+    PendingLeave,
+    /// A local or inbound disband awaits convergence.
+    Disbanding,
+    /// A draft with non-blank text or an attachment.
+    HasDraft,
+    /// The row's last message shows a pending send (`ChatListMessageDeliveryStateFfi::Pending`).
+    PendingSend,
+    /// The row's last message shows a failed send (`ChatListMessageDeliveryStateFfi::Failed`).
+    FailedSend,
+}
+enums!(
+    ChatListConditionFfi,
+    ChatListCondition,
+    Active,
+    Archived,
+    Left,
+    PendingInvite,
+    Unread,
+    ManualUnread,
+    Mention,
+    Pinned,
+    PendingLeave,
+    Disbanding,
+    HasDraft,
+    PendingSend,
+    FailedSend
+);
+
+/// Why a chat-list query was refused. Nothing was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatListQueryErrorFfi {
+    /// More than 8 nested levels.
+    TooDeep,
+    /// More than 64 nodes.
+    TooManyNodes,
+    /// More than 500 group IDs across all `GroupIds` nodes.
+    TooManyGroupIds,
+    /// A child index is past the end of the node list.
+    ChildOutOfRange,
+    /// A child index is at or before its parent's index.
+    ChildNotAfterParent,
+    /// A node is the child of more than one node.
+    SharedChild,
+    /// A node after the root is nobody's child.
+    UnreachableNode,
+}
+impl From<app::ChatListQueryError> for ChatListQueryErrorFfi {
+    fn from(v: app::ChatListQueryError) -> Self {
+        use app::ChatListQueryError as E;
+        match v {
+            E::TooDeep => Self::TooDeep,
+            E::TooManyNodes => Self::TooManyNodes,
+            E::TooManyGroupIds => Self::TooManyGroupIds,
+            E::ChildOutOfRange => Self::ChildOutOfRange,
+            E::ChildNotAfterParent => Self::ChildNotAfterParent,
+            E::SharedChild => Self::SharedChild,
+            E::UnreachableNode => Self::UnreachableNode,
+        }
+    }
+}
+impl std::fmt::Display for ChatListQueryErrorFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TooDeep => "too_deep",
+            Self::TooManyNodes => "too_many_nodes",
+            Self::TooManyGroupIds => "too_many_group_ids",
+            Self::ChildOutOfRange => "child_out_of_range",
+            Self::ChildNotAfterParent => "child_not_after_parent",
+            Self::SharedChild => "shared_child",
+            Self::UnreachableNode => "unreachable_node",
+        })
+    }
+}
+impl From<ChatListViewFfi> for ChatListViewQueryFfi {
+    fn from(view: ChatListViewFfi) -> Self {
+        Self {
+            view,
+            filter: Vec::new(),
+        }
+    }
+}
+impl TryFrom<ChatListViewQueryFfi> for app::ChatListViewQuery {
+    type Error = app::ChatListQueryError;
+    fn try_from(v: ChatListViewQueryFfi) -> Result<Self, Self::Error> {
+        let nodes = v
+            .filter
+            .into_iter()
+            .map(|node| match node {
+                ChatListFilterNodeFfi::All { children } => app::ChatListFilterNode::All(children),
+                ChatListFilterNodeFfi::Any { children } => app::ChatListFilterNode::Any(children),
+                ChatListFilterNodeFfi::Not { child } => app::ChatListFilterNode::Not(child),
+                ChatListFilterNodeFfi::Condition { condition } => {
+                    app::ChatListFilterNode::Condition(condition.into())
+                }
+                ChatListFilterNodeFfi::GroupIds { group_ids } => {
+                    app::ChatListFilterNode::GroupIds(group_ids)
+                }
+            })
+            .collect();
+        Ok(Self {
+            view: v.view.into(),
+            filter: app::ChatListFilter::from_nodes(nodes)?,
+        })
+    }
+}
+
 #[derive(Clone, uniffi::Enum)]
 pub enum ChatListAnchorOutcomeFfi {
     Top,

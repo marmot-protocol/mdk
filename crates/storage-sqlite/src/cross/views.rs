@@ -27,6 +27,25 @@ pub(crate) const CHAT_LIST_PAGE_ENGINE_COLUMNS: &str = "leave_request.record AS 
             EXISTS(SELECT 1 FROM cgka_disband_candidates
                 WHERE lower(hex(group_id)) = lower(row.group_id_hex)) AS page_candidate";
 
+/// Chat-list filter leaf: the engine holds a leave request for the row's group.
+/// A predicate on the unaliased `chat_list_rows` table.
+pub(crate) const CHAT_LIST_FILTER_PENDING_LEAVE_SQL: &str =
+    "EXISTS(SELECT 1 FROM cgka_leave_requests
+                WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex))";
+
+/// Chat-list filter leaf matching `ChatListRow::disbanding`: an inbound disband
+/// candidate, or a local request whose JSON status is pending (an unreadable
+/// record counts, as it does for list scope). A predicate on the unaliased
+/// `chat_list_rows` table.
+pub(crate) const CHAT_LIST_FILTER_DISBANDING_SQL: &str =
+    "(EXISTS(SELECT 1 FROM cgka_disband_candidates
+                WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex))
+            OR EXISTS(SELECT 1 FROM cgka_disband_requests
+                WHERE lower(hex(group_id)) = lower(chat_list_rows.group_id_hex)
+                  AND CASE WHEN json_valid(CAST(record AS TEXT))
+                      THEN COALESCE(json_extract(CAST(record AS TEXT), '$.status') = 'pending', 1)
+                      ELSE 1 END))";
+
 /// The joins `CHAT_LIST_PAGE_ENGINE_COLUMNS` reads.
 pub(crate) const CHAT_LIST_PAGE_ENGINE_JOINS: &str =
     "LEFT JOIN cgka_leave_requests AS leave_request

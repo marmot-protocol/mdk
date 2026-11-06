@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add typed chat-list queries (mdk#2983): a `ChatListView` plus an optional `ChatListFilter` (`All`/`Any`/`Not` over
+  scope, unread, manual unread, mention, pinned, pending leave, disbanding, draft, pending/failed send and group-ID
+  conditions), matched in SQL before paging. `open_chat_list_window`, `chat_list_ids` and `revalidate_chat_list_ids`
+  now take `impl Into<ChatListViewQuery>`, so fixed-view callers compile unchanged and list, count and select all
+  agree. Bounds (8 levels, 64 nodes, 500 group IDs) and malformed node lists return
+  `AppError::InvalidChatListQuery` before any read. A draft-filtered window re-reads on any draft change in the
+  account. No schema or wire change.
+
 - Add select all for the native chat-list views (mdk#2983): `MarmotAppRuntime::chat_list_ids(account, view)` returns
   every chat ID in the view in display order, beyond any open window, and `revalidate_chat_list_ids(account, view,
   ids)` returns the still-eligible subset in the caller's order, never adding chats. Pending base rows return

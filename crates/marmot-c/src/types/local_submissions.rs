@@ -66,14 +66,42 @@ mod tests {
             }),
         });
         assert!(!result.acceptance.is_null());
+        let acceptance = unsafe { &*result.acceptance };
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(acceptance.client_token) }.to_bytes(),
+            b"opaque-token"
+        );
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(acceptance.message_id_hex) }
+                .to_str()
+                .unwrap(),
+            "aa".repeat(32)
+        );
         unsafe { result.free_in_place() };
-        for status in [
+        for (expected, status) in [
             LocalSendStatusFfi::Queued,
             LocalSendStatusFfi::EngineOwned,
+            LocalSendStatusFfi::Completed { summary: marmot_uniffi::conversions::SendSummaryFfi {
+                published: 2,
+                message_ids: vec!["bb".repeat(32)],
+                accept_disposition: marmot_uniffi::conversions::SendAcceptDispositionFfi::AcceptedPending,
+                maintenance_disposition: marmot_uniffi::conversions::SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable,
+            } },
             LocalSendStatusFfi::Rejected,
-        ] {
+        ].into_iter().enumerate() {
             let mut mirror = MarmotLocalSendStatus::from(status);
-            assert!(mirror.summary.is_null());
+            assert_eq!(mirror.state, expected as u32);
+            if expected == 2 {
+                assert!(!mirror.summary.is_null());
+                let summary = unsafe { &*mirror.summary };
+                assert_eq!(summary.published, 2);
+                assert_eq!(summary.message_ids_len, 1);
+                assert_eq!(unsafe { std::ffi::CStr::from_ptr(*summary.message_ids) }.to_str().unwrap(), "bb".repeat(32));
+                assert_eq!(summary.accept_disposition, crate::types::account::MarmotSendAcceptDisposition::AcceptedPending);
+                assert_eq!(summary.maintenance_disposition, crate::types::account::MarmotSendMaintenanceDisposition::PostJoinRotationPendingRetryable);
+            } else {
+                assert!(mirror.summary.is_null());
+            }
             unsafe { mirror.free_in_place() };
         }
         #[cfg(feature = "alloc-audit")]

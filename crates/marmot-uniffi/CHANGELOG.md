@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add filtered chat-list queries (mdk#2983): `open_chat_list_query_window`, `chat_list_query_ids` and
+  `revalidate_chat_list_query_ids` take a `ChatListViewQueryFfi` whose filter is a flat `ChatListFilterNodeFfi` list
+  (node 0 is the root; children are later indices). Invalid queries fail with the new
+  `MarmotKitError::InvalidChatListQuery { reason: ChatListQueryErrorFfi }`. Fixed-view methods are unchanged.
+  Additive; regenerate bindings to use them.
+
 - Add `chat_list_ids(account_ref, view)` and `revalidate_chat_list_ids(account_ref, view, group_ids)` for select all
   over a whole chat-list view (mdk#2983). Hosts keep checkbox state, revalidate before a bulk action, then call the
   existing per-chat commands. Additive; regenerate bindings to use them.

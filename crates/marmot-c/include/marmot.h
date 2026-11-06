@@ -288,6 +288,11 @@ enum MarmotStatus
    * Detail contains only the artifact kind and coarse locally measured size.
    */
   MARMOT_STATUS_EVENT_TOO_LARGE = 119,
+  /**
+   * A chat-list query broke a size bound or its node list was not one tree.
+   * Detail names the `MarmotChatListQueryError`; nothing was read.
+   */
+  MARMOT_STATUS_INVALID_CHAT_LIST_QUERY = 120,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -5811,6 +5816,45 @@ typedef struct MarmotNativeStartupSnapshot {
   uint64_t dropped_events;
   uint64_t dropped_scopes;
 } MarmotNativeStartupSnapshot;
+
+/**
+ * One borrowed filter node. Child entries are indices into the query's node
+ * array; fields the kind does not read may hold anything (pointers NULL).
+ */
+typedef struct MarmotChatListFilterNode {
+  /**
+   * A `MarmotChatListFilterNodeKind` discriminant.
+   */
+  uint32_t kind;
+  /**
+   * For CONDITION: a `MarmotChatListCondition` discriminant.
+   */
+  uint32_t condition;
+  /**
+   * For ALL and ANY: the children. For NOT: exactly one child.
+   */
+  const uint32_t *children;
+  uintptr_t children_len;
+  /**
+   * For GROUP_IDS: the listed group IDs.
+   */
+  const char *const *group_ids;
+  uintptr_t group_ids_len;
+} MarmotChatListFilterNode;
+
+/**
+ * Borrowed chat-list query: a view narrowed by an optional filter. A NULL
+ * `filter` with `filter_len` 0 is no filter (the whole view). Node 0 is the
+ * root; every other node is the child of exactly one node listed before it.
+ */
+typedef struct MarmotChatListViewQuery {
+  /**
+   * A `MarmotChatListView` discriminant.
+   */
+  uint32_t view;
+  const struct MarmotChatListFilterNode *filter;
+  uintptr_t filter_len;
+} MarmotChatListViewQuery;
 
 /**
  * Borrowed private input. Its path is local only and is never published.
@@ -12073,6 +12117,41 @@ MarmotStatus marmot_revalidate_chat_list_ids(const struct MarmotClient *client,
                                              struct MarmotStringList **out);
 
 /**
+ * Select all for a filtered query: every chat ID `query` matches, in display
+ * order, including chats beyond any open window; the count is the list
+ * length. `query` is borrowed. Returns `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY`
+ * for a query over a size bound or a node array that is not one tree, and
+ * `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY`, never a partial list, while base
+ * rows are still being prepared. Free with `marmot_string_list_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, `query` a valid
+ * `MarmotChatListViewQuery`, and out writable.
+ */
+MarmotStatus marmot_chat_list_query_ids(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const struct MarmotChatListViewQuery *query,
+                                        struct MarmotStringList **out);
+
+/**
+ * The subset of `group_ids` still matching `query`, in the caller's order with
+ * duplicates dropped. Only removes; chats that matched since are never added.
+ * Call it right before a bulk action, then run the existing per-chat commands.
+ * Free with `marmot_string_list_free`.
+ *
+ * # Safety
+ * The client must be live, `query` a valid `MarmotChatListViewQuery`,
+ * `group_ids` must hold `group_ids_len` valid strings (or be NULL with length
+ * 0), and out must be writable.
+ */
+MarmotStatus marmot_revalidate_chat_list_query_ids(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const struct MarmotChatListViewQuery *query,
+                                                   const char *const *group_ids,
+                                                   uintptr_t group_ids_len,
+                                                   struct MarmotStringList **out);
+
+/**
  * White Noise's deployment, the one White Noise's clients pass to every
  * constructor. Free with marmot_deployment_free; a client constructed with
  * it keeps its own copy.
@@ -13451,6 +13530,21 @@ MarmotStatus marmot_open_chat_list_window(const struct MarmotClient *client,
                                           uint32_t view,
                                           const uint32_t *initial_rows,
                                           struct MarmotChatListWindowSubscription **out_sub);
+
+/**
+ * Open a live window over every chat a filtered query matches; `query` is
+ * borrowed. The filter runs in SQL before paging. A NULL initial_rows uses 50;
+ * otherwise requires 1–100. Returns `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY` for
+ * a query over a size bound or a node array that is not one tree. Take
+ * snapshot once, then receive replacements.
+ * # Safety
+ * client/string/query must be valid; initial_rows must be NULL or readable, out_sub writable.
+ */
+MarmotStatus marmot_open_chat_list_query_window(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const struct MarmotChatListViewQuery *query,
+                                                const uint32_t *initial_rows,
+                                                struct MarmotChatListWindowSubscription **out_sub);
 
 /**
  * Open independent signed-in account summaries; requires no active chat-list handle.

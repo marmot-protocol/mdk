@@ -126,8 +126,10 @@ mod presented_chat_list;
 mod reactions;
 pub use chat_list_window::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
-    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
-    ChatListWindowSnapshot, RuntimeChatListWindowSubscription,
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
+    ChatListQueryError, ChatListView, ChatListViewQuery, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS,
+    MAX_CHAT_LIST_FILTER_NODES, RuntimeChatListWindowSubscription,
 };
 pub use onboarding::*;
 pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};

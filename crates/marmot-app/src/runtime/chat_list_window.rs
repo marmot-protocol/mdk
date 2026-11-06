@@ -5,8 +5,12 @@ use super::{MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::{AppError, MarmotApp, MarmotAppEvent, PresentedChatRow};
 use std::{sync::Arc, time::Duration};
+pub use storage_sqlite::{
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
+    ChatListQueryError, ChatListView, ChatListViewQuery, MAX_CHAT_LIST_FILTER_DEPTH,
+    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,
+};
 use storage_sqlite::{ChatListCursor, ChatListWindowQuery, ChatListWindowRead};
-pub use storage_sqlite::{ChatListPageDirection, ChatListView};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub const CHAT_LIST_WINDOW_INITIAL_ROWS: usize = 50;
@@ -61,6 +65,7 @@ impl std::fmt::Debug for ChatListAnchorOutcome {
 pub struct ChatListWindowSnapshot {
     pub subscription_generation: String,
     pub sequence: u64,
+    /// The query's base view.
     pub view: ChatListView,
     pub rows: Vec<PresentedChatRow>,
     pub first: Option<ChatListCursor>,
@@ -181,16 +186,21 @@ struct Reader {
     label: String,
     account_id: String,
     store_epoch: Vec<u8>,
-    view: ChatListView,
+    query: ChatListViewQuery,
+    /// Re-read on a draft change to any chat, not only visible ones, because
+    /// the filter's matches depend on drafts.
+    drafts_anywhere: bool,
 }
 
 impl MarmotAppRuntime {
-    /// Additive four-list API. No legacy full-list subscription or account-wide
-    /// selected-presentation preparation is used on this path.
+    /// A live window over `query`: a fixed view (`ChatListView`), or a view
+    /// narrowed by a filter matched in SQL before paging. No legacy full-list
+    /// subscription or account-wide selected-presentation preparation is used
+    /// on this path. An invalid query fails here with `InvalidChatListQuery`.
     pub async fn open_chat_list_window(
         &self,
         account_ref: &str,
-        view: ChatListView,
+        query: impl Into<ChatListViewQuery>,
         initial_rows: Option<usize>,
     ) -> Result<RuntimeChatListWindowSubscription, ChatListWindowError> {
         self.shared.lifecycle().ensure_running()?;
@@ -198,6 +208,8 @@ impl MarmotAppRuntime {
         if !(1..=100).contains(&count) {
             return Err(ChatListWindowError::InvalidLimit);
         }
+        let query = super::chat_list_selection::prepare_query(query)?;
+        let view = query.view;
         let account = self.accounts.resolve(account_ref)?;
         // All invalidations attach BEFORE the first local read.
         let events = self.events.subscribe();
@@ -222,7 +234,8 @@ impl MarmotAppRuntime {
             label: account.label,
             account_id: account.account_id_hex,
             store_epoch: Vec::new(),
-            view,
+            drafts_anywhere: query.references(ChatListCondition::HasDraft),
+            query,
         };
         let position = Position {
             limit: count,
@@ -313,7 +326,7 @@ impl Reader {
             }
         }
         let query = ChatListWindowQuery {
-            view: self.view,
+            query: self.query.clone(),
             limit: position.limit,
             anchors,
             before_anchor: position.before,
@@ -381,7 +394,7 @@ impl Reader {
                 .collect::<Vec<_>>();
             app.hydrate_chat_list_rows(&mut rows)?;
             for (selected, mut row) in snapshot.rows.iter_mut().zip(rows) {
-                if row.pending_confirmation || query.view == ChatListView::Left {
+                if row.pending_confirmation || query.query.view == ChatListView::Left {
                     row.unread_count = 0;
                     row.unread_mention_count = 0;
                     row.has_unread = false;
@@ -399,6 +412,9 @@ impl Reader {
                 cgka_traits::storage::StorageError::NotFound,
             ) => AppError::ChatPresentationNotReady.into(),
             storage_sqlite::ChatListPageError::Storage(error) => AppError::Storage(error).into(),
+            storage_sqlite::ChatListPageError::InvalidQuery(error) => {
+                AppError::InvalidChatListQuery(error).into()
+            }
             error => ChatListWindowError::Query(Arc::new(error)),
         })
     }
@@ -485,7 +501,8 @@ impl Sources {
         loop {
             tokio::select! {
                 event = self.drafts.recv() => match event {
-                    Ok(event) if event.account_label == reader.label && rows.iter().any(|r| r.row.group_id_hex == event.group_id_hex) => return,
+                    Ok(event) if event.account_label == reader.label
+                        && (reader.drafts_anywhere || rows.iter().any(|r| r.row.group_id_hex == event.group_id_hex)) => return,
                     Err(_) => return, _ => {}
                 },
                 event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
@@ -652,7 +669,7 @@ async fn run(
                     &next,
                     current.subscription_generation.clone(),
                     current.sequence,
-                    reader.view,
+                    reader.query.view,
                 );
                 // Storage revisions also change for activity outside this window.
                 // Do not invalidate client commands or redraw unchanged visible content
