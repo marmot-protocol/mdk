@@ -1,0 +1,177 @@
+/*
+  Marmot pairing v1: symbolic authentication and Welcome binding.
+
+  The network is fully adversarial, including the account-key holder. Honest
+  device-local ephemeral and MLS signing keys are not compromised. CodeCompare
+  checks equality of independently derived SAS terms. This idealizes the 42-bit
+  comparison: guessing/collisions and careless user approvals are excluded.
+  Timers, crashes, cancellation, roster admission and MLS internals are outside
+  this model. See README.md for correspondence and negative controls.
+*/
+theory device_pairing_v1
+begin
+
+builtins: diffie-hellman, hashing, signing
+functions: kdf/2, mac/2
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction Inequality:
+  "All x y #i. Neq(x,y) @i ==> not (x = y)"
+
+/* A signing key belongs to an honest existing device, not to the account key. */
+rule ExistingDevice:
+  [ Fr(~slot), Fr(~group), Fr(~leaf_key) ]
+  -->
+  [ !ExistingIdentity('account',~slot,~group,~leaf_key),
+    Out(<'existing_device','account',~slot,~group,pk(~leaf_key)>) ]
+
+rule NewRequest:
+  let nkey = 'g'^~nx
+      commitment = h(<'commitment',nkey,~sid,'account',~event,~ref>)
+  in
+  [ Fr(~sid), Fr(~event), Fr(~ref), Fr(~nx) ]
+  --[ NewRequestSent(~sid,'account',~event,~ref,nkey) ]->
+  [ NewWaiting(~sid,'account',~event,~ref,~nx),
+    Out(<'request',~sid,'account',~event,~ref,commitment>) ]
+
+rule ExistingAnswer:
+  [ !ExistingIdentity(a,slot,gid,leaf_key),
+    In(<'request',sid,a,event,ref,commitment>), Fr(~ey) ]
+  --[ ExistingAnswerSent(sid,a,event,ref,slot,'g'^~ey) ]->
+  [ ExistingWaiting(sid,a,event,ref,commitment,slot,~ey,gid,leaf_key),
+    Out(<'answer',sid,slot,'g'^~ey>) ]
+
+rule NewTakeFirstAnswer:
+  let nkey = 'g'^nx
+      shared = ekey^nx
+      code = kdf(shared,<'sas',sid,a,ref,nkey,slot,ekey>)
+  in
+  [ NewWaiting(sid,a,event,ref,nx), In(<'answer',sid,slot,ekey>) ]
+  --[ NewCodeDisplayed(sid,code) ]->
+  [ NewCode(sid,a,event,ref,nx,slot,ekey,shared,code),
+    Out(<'reveal',sid,slot,nkey>) ]
+
+rule ExistingCheckReveal:
+  let ekey = 'g'^ey
+      shared = nkey^ey
+      code = kdf(shared,<'sas',sid,a,ref,nkey,slot,ekey>)
+  in
+  [ ExistingWaiting(sid,a,event,ref,commitment,slot,ey,gid,leaf_key),
+    In(<'reveal',sid,slot,nkey>) ]
+  --[ Eq(commitment,h(<'commitment',nkey,sid,a,event,ref>)),
+      ExistingCodeDisplayed(sid,code) ]->
+  [ ExistingCode(sid,a,event,ref,slot,ey,nkey,shared,code,gid,leaf_key) ]
+
+/*
+  The user compares two independently computed displays. Equality is on the
+  symbolic SAS term, not an assumed equality of the desired identities.
+  One successful comparison abstracts the two honest approvals; when the users
+  tap relative to confirmation delivery is not a temporal claim of this model.
+*/
+rule CodeCompare:
+  [ NewCode(ns,na,ne,nr,nx,nslot,ekey,nshared,ncode),
+    ExistingCode(es,ea,ee,er,eslot,ey,nkey,eshared,ecode,gid,leaf_key) ]
+  --[ Eq(ncode,ecode), CodeCompared(ns,es,ncode,ecode) ]->
+  [ NewApproved(ns,na,ne,nr,nx,nslot,ekey,nshared),
+    ExistingApproved(es,ea,ee,er,eslot,ey,nkey,eshared,gid,leaf_key) ]
+
+rule ExistingConfirm:
+  let tag = mac(kdf(shared,<'mac','existing',sid,a,ref,slot,'device_group'>),
+                <gid,pk(leaf_key)>)
+  in
+  [ ExistingApproved(sid,a,event,ref,slot,ey,nkey,shared,gid,leaf_key) ]
+  --[ ExistingConfirmSent(sid,a,event,ref,slot,gid,pk(leaf_key)) ]->
+  [ ExistingConfirmed(sid,a,event,ref,slot,shared,gid,leaf_key),
+    Out(<'existing_confirm',sid,gid,pk(leaf_key),tag>) ]
+
+rule NewVerifyAndConfirm:
+  let expected = mac(kdf(shared,<'mac','existing',sid,a,ref,slot,'device_group'>),
+                     <gid,sender_key>)
+      reply = mac(kdf(shared,<'mac','new',sid,a,ref,slot,'key_package_ref'>),ref)
+  in
+  [ NewApproved(sid,a,event,ref,nx,slot,ekey,shared),
+    In(<'existing_confirm',sid,gid,sender_key,tag>) ]
+  --[ Eq(tag,expected),
+      NewExistingConfirmVerified(sid,a,event,ref,slot,gid,sender_key),
+      NewConfirmSent(sid,a,event,ref,slot,gid,sender_key) ]->
+  [ !NewLink(sid,a,event,ref,slot,gid,sender_key), JoinPermit(sid),
+    Out(<'new_confirm',sid,reply>) ]
+
+rule ExistingVerifyNewConfirm:
+  let expected = mac(kdf(shared,<'mac','new',sid,a,ref,slot,'key_package_ref'>),ref)
+  in
+  [ ExistingConfirmed(sid,a,event,ref,slot,shared,gid,leaf_key),
+    In(<'new_confirm',sid,tag>) ]
+  --[ Eq(tag,expected), ExistingLinkEstablished(sid,a,event,ref,slot,gid,pk(leaf_key)) ]->
+  [ !CanWelcome(sid,a,event,ref,slot,gid,leaf_key) ]
+
+/* Combined MLS Welcome/GroupInfo validation is abstracted as this signed
+   binding. A real GroupInfo signature does not directly sign KeyPackageRef. */
+rule ExistingWelcome:
+  [ !CanWelcome(sid,a,event,ref,slot,gid,leaf_key), Fr(~body) ]
+  --[ ExistingWelcomeSent(sid,a,event,ref,slot,gid,pk(leaf_key)) ]->
+  [ Out(<'welcome',gid,ref,pk(leaf_key),~body,
+          sign(<'welcome',gid,ref,~body>,leaf_key)>) ]
+
+rule AcceptWelcome:
+  [ !NewLink(sid,a,event,ref,slot,gid,expected_sender), JoinPermit(sid),
+    In(<'welcome',gid,ref,actual_sender,body,signature>) ]
+  --[ Eq(actual_sender,expected_sender),
+      Eq(verify(signature,<'welcome',gid,ref,body>,actual_sender),true),
+      WelcomeAccepted(sid,a,event,ref,slot,gid,expected_sender,actual_sender) ]->
+  [ Trusted(sid,a,event,ref,slot,gid,actual_sender) ]
+
+/* Rejection is observational: it grants no join permission and mutates none. */
+rule RejectOtherSenderWelcome:
+  [ !NewLink(sid,a,event,ref,slot,gid,expected_sender),
+    In(<'welcome',gid,ref,actual_sender,body,signature>) ]
+  --[ Neq(actual_sender,expected_sender),
+      Eq(verify(signature,<'welcome',gid,ref,body>,actual_sender),true),
+      OtherSenderWelcomeRejected(sid,expected_sender,actual_sender) ]->
+  [ ]
+
+lemma pairing_successful_link_and_welcome:
+  exists-trace
+  "Ex sid a event ref slot gid sender #i #j.
+     ExistingLinkEstablished(sid,a,event,ref,slot,gid,sender) @i
+     & WelcomeAccepted(sid,a,event,ref,slot,gid,sender,sender) @j & i < j"
+
+lemma pairing_same_session_mismatched_codes_reachable:
+  exists-trace
+  "Ex sid ncode ecode #i #j.
+     NewCodeDisplayed(sid,ncode) @i & ExistingCodeDisplayed(sid,ecode) @j
+     & not (ncode = ecode)"
+
+lemma pairing_other_sender_welcome_then_real_one_reachable:
+  exists-trace
+  "Ex sid a event ref slot gid sender other #i #j.
+     OtherSenderWelcomeRejected(sid,sender,other) @i
+     & WelcomeAccepted(sid,a,event,ref,slot,gid,sender,sender) @j & i < j"
+
+lemma pairing_new_confirmation_follows_existing_confirmation:
+  "All sid a event ref slot gid sender #i.
+     NewConfirmSent(sid,a,event,ref,slot,gid,sender) @i ==>
+       (Ex #j. ExistingConfirmSent(sid,a,event,ref,slot,gid,sender) @j & j < i)"
+
+lemma pairing_confirmed_group_and_sender_agree [reuse]:
+  "All sid a event ref slot gid sender #i.
+     NewExistingConfirmVerified(sid,a,event,ref,slot,gid,sender) @i ==>
+       (Ex #j. ExistingConfirmSent(sid,a,event,ref,slot,gid,sender) @j & j < i)"
+
+lemma pairing_existing_link_requires_new_confirmation:
+  "All sid a event ref slot gid sender #i.
+     ExistingLinkEstablished(sid,a,event,ref,slot,gid,sender) @i ==>
+       (Ex #j. NewConfirmSent(sid,a,event,ref,slot,gid,sender) @j & j < i)"
+
+lemma pairing_welcome_sender_matches_confirmation:
+  "All sid a event ref slot gid expected actual #i.
+     WelcomeAccepted(sid,a,event,ref,slot,gid,expected,actual) @i ==> expected = actual"
+
+lemma pairing_welcome_requires_authenticated_existing_link:
+  "All sid a event ref slot gid expected actual #i.
+     WelcomeAccepted(sid,a,event,ref,slot,gid,expected,actual) @i ==>
+       (Ex #j. ExistingLinkEstablished(sid,a,event,ref,slot,gid,actual) @j & j < i)"
+
+end
