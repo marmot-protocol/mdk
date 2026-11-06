@@ -1031,6 +1031,11 @@ impl MarmotApp {
             () = &mut stop => return Err(AppError::EmojiSetInstallCancelled),
             downloaded = self.download_set(&set.emoji, budget, control) => downloaded,
         };
+        // A cancellation in the poll that finished the downloads still wins
+        // over a failed result.
+        if install_cancelled(&control.cancelled, &self.emoji_install_stop) {
+            return Err(AppError::EmojiSetInstallCancelled);
+        }
         if kept.is_empty() {
             return Err(nothing_installed_error(&install_skips));
         }
@@ -1054,7 +1059,7 @@ impl MarmotApp {
             // The write starts here, however long the task waited for the
             // blocking pool: the last point a cancellation or shutdown can
             // stop the install.
-            if cancelled.is_cancelled() || stopped.is_cancelled() {
+            if install_cancelled(&cancelled, &stopped) {
                 return Err(AppError::EmojiSetInstallCancelled);
             }
             Ok(writer.install_emoji_set(
@@ -1546,6 +1551,19 @@ where
     })
     .await
     .map_err(|_| AppError::BlockingTask("emoji set write task failed".into()))
+}
+
+/// Whether an install is cancelled, by its control or by the app stopping
+/// installs; the latter also cancels the control, so the host reads the
+/// same state.
+fn install_cancelled(
+    control: &tokio_util::sync::CancellationToken,
+    stop: &tokio_util::sync::CancellationToken,
+) -> bool {
+    if stop.is_cancelled() {
+        control.cancel();
+    }
+    control.is_cancelled()
 }
 
 /// The stored version of `coordinate` when it is the one the user was

@@ -1378,10 +1378,14 @@ async fn a_cancelled_reinstall_keeps_the_previous_snapshot() {
     );
 }
 
-/// Runtime shutdown cancels a running install the way its control does,
-/// and refuses later ones before any request.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_shutdown_cancels_a_running_install() {
+/// Start an install whose only stalled download is in flight, run `stop`,
+/// and check the install fails as cancelled, its control reads cancelled
+/// and the download is dropped.
+async fn stop_cancels_a_running_install<F, Fut>(stop: F) -> Fixture
+where
+    F: FnOnce(MarmotApp) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let fixture = fixture().await;
     let (app, account, host) = (&fixture.app, fixture.account(), &fixture.host);
     host.serve("/slow.png", Canned::stalled());
@@ -1397,7 +1401,7 @@ async fn runtime_shutdown_cancels_a_running_install() {
         .event_id_hex;
     let control = Arc::new(EmojiSetInstallControl::new());
     let install = tokio::spawn({
-        let (app, account, shown) = (app.clone(), account.to_owned(), shown.clone());
+        let (app, account) = (app.clone(), account.to_owned());
         let (coordinate, control) = (fixture.set_coordinate.clone(), control.clone());
         async move {
             app.install_emoji_set(&account, &coordinate, &shown, &control)
@@ -1409,11 +1413,11 @@ async fn runtime_shutdown_cancels_a_running_install() {
     })
     .await;
 
-    crate::MarmotAppRuntime::new(app.clone()).shutdown().await;
+    stop(app.clone()).await;
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), install)
         .await
-        .expect("shutdown cancels the install promptly")
+        .expect("stopping cancels the install promptly")
         .unwrap();
     assert!(
         matches!(result, Err(AppError::EmojiSetInstallCancelled)),
@@ -1424,18 +1428,43 @@ async fn runtime_shutdown_cancels_a_running_install() {
         host.stalled_dropped.load(Ordering::SeqCst) == 1
     })
     .await;
+    fixture
+}
+
+/// Runtime shutdown cancels a running install the way its control does,
+/// stores nothing, and refuses later installs before any request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_shutdown_cancels_a_running_install() {
+    let fixture = stop_cancels_a_running_install(|app| async move {
+        crate::MarmotAppRuntime::new(app).shutdown().await;
+    })
+    .await;
     fixture.assert_nothing_installed().await;
 
-    let requests = host.requests();
+    let shown = fixture.shown_event_id().await;
+    let requests = fixture.host.requests();
     assert!(matches!(
-        app.install_emoji_set(
-            account,
-            &fixture.set_coordinate,
-            &shown,
-            &EmojiSetInstallControl::new()
-        )
-        .await,
+        fixture
+            .app
+            .install_emoji_set(
+                fixture.account(),
+                &fixture.set_coordinate,
+                &shown,
+                &EmojiSetInstallControl::new()
+            )
+            .await,
         Err(AppError::EmojiSetInstallCancelled)
     ));
-    assert_eq!(host.requests(), requests);
+    assert_eq!(fixture.host.requests(), requests);
+}
+
+/// Closing storage, as `shutdown_and_close` does before a host suspends,
+/// cancels a running install too, so nothing keeps downloading or reaches
+/// the closing database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_close_cancels_a_running_install() {
+    stop_cancels_a_running_install(|app| async move {
+        app.close_storage().unwrap();
+    })
+    .await;
 }
