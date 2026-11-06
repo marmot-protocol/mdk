@@ -40,7 +40,8 @@ pub struct ChatListViewQueryFfi {
     pub view: ChatListViewFfi,
     /// The filter as a flat node list. Empty means no filter (the whole view).
     /// Node 0 is the root; every other node is the child of exactly one node
-    /// listed before it. At most 64 nodes, 8 levels and 500 group IDs in all.
+    /// listed before it. At most 64 nodes, 8 levels, 500 group IDs and 1024
+    /// bytes of search text in all.
     pub filter: Vec<ChatListFilterNodeFfi>,
 }
 
@@ -64,6 +65,16 @@ pub enum ChatListFilterNodeFfi {
     /// chat outside the view; to exclude IDs, wrap this node in `Not`.
     GroupIds {
         group_ids: Vec<String>,
+    },
+    /// Chats whose title, group name, description or direct-chat peer profile
+    /// name contains `text`, as a literal substring after trimming and
+    /// lowercasing both (the user directory's rule). Localized fallback titles
+    /// are not searchable; text that is blank after trimming matches nothing.
+    /// While any chat in the view still has presentation pending, a query with
+    /// this node fails with `ChatPresentationNotReady` rather than returning
+    /// part of the set.
+    Text {
+        text: String,
     },
 }
 
@@ -144,6 +155,8 @@ pub enum ChatListQueryErrorFfi {
     SharedChild,
     /// A node after the root is nobody's child.
     UnreachableNode,
+    /// More than 1024 bytes of text across all `Text` nodes.
+    TextTooLong,
 }
 impl From<app::ChatListQueryError> for ChatListQueryErrorFfi {
     fn from(v: app::ChatListQueryError) -> Self {
@@ -152,6 +165,7 @@ impl From<app::ChatListQueryError> for ChatListQueryErrorFfi {
             E::TooDeep => Self::TooDeep,
             E::TooManyNodes => Self::TooManyNodes,
             E::TooManyGroupIds => Self::TooManyGroupIds,
+            E::TextTooLong => Self::TextTooLong,
             E::ChildOutOfRange => Self::ChildOutOfRange,
             E::ChildNotAfterParent => Self::ChildNotAfterParent,
             E::SharedChild => Self::SharedChild,
@@ -165,6 +179,7 @@ impl std::fmt::Display for ChatListQueryErrorFfi {
             Self::TooDeep => "too_deep",
             Self::TooManyNodes => "too_many_nodes",
             Self::TooManyGroupIds => "too_many_group_ids",
+            Self::TextTooLong => "text_too_long",
             Self::ChildOutOfRange => "child_out_of_range",
             Self::ChildNotAfterParent => "child_not_after_parent",
             Self::SharedChild => "shared_child",
@@ -196,6 +211,7 @@ impl TryFrom<ChatListViewQueryFfi> for app::ChatListViewQuery {
                 ChatListFilterNodeFfi::GroupIds { group_ids } => {
                     app::ChatListFilterNode::GroupIds(group_ids)
                 }
+                ChatListFilterNodeFfi::Text { text } => app::ChatListFilterNode::Text(text),
             })
             .collect();
         Ok(Self {

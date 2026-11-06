@@ -187,6 +187,23 @@ pub(crate) fn select_chat_presentation(
     }
 }
 
+/// The peer profile names a direct chat is searchable by, cleaned as titles
+/// are. Only for the presentation's own eligible peer, whose profile `prepare`
+/// read; none without one.
+pub(crate) fn search_peer_names(
+    presentation: &ConversationPresentation,
+    profile: Option<&UserProfileMetadata>,
+) -> Vec<String> {
+    let Some(profile) = profile.filter(|_| presentation.peer_id.is_some()) else {
+        return Vec::new();
+    };
+    [profile.display_name.as_deref(), profile.name.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(safe_name)
+        .collect()
+}
+
 /// One key framing for selected headers and window identities. Preserve the
 /// shipped domain and framing so the same avatar uses the same cache entry.
 pub(crate) fn presentation_cache_key(
@@ -293,6 +310,8 @@ mod tests {
             members: vec!["aa".repeat(32), "bb".repeat(32)],
             avatar_url: None,
             avatar: None,
+            group_description: String::new(),
+            search_peer_names: Vec::new(),
         }
     }
     #[test]

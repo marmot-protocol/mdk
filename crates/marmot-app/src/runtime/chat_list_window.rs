@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 pub use storage_sqlite::{
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
     ChatListQueryError, ChatListView, ChatListViewQuery, MAX_CHAT_LIST_FILTER_DEPTH,
-    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,
+    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES,
 };
 use storage_sqlite::{ChatListWindowQuery, ChatListWindowRead};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -188,6 +188,10 @@ struct Reader {
     /// Re-read on a draft change to any chat, not only visible ones, because
     /// the filter's matches depend on drafts.
     drafts_anywhere: bool,
+    // A `Text` filter needs no flag: search text changes only when the
+    // presentation worker re-prepares a row (after a profile, name or
+    // description change anywhere in the account), and that bumps the
+    // presentation revision every window already re-reads on.
 }
 
 impl MarmotAppRuntime {
@@ -357,6 +361,17 @@ impl Reader {
                 &storage.app_storage(),
                 &account_id,
             )?;
+            // A text query waits for search text across its whole view. Prepare
+            // one bounded batch of it here; the account worker does the rest.
+            if query.query.references_text() {
+                crate::chat_presentation::maintenance::prepare_search_batch(
+                    &app,
+                    &label,
+                    &storage.app_storage(),
+                    &account_id,
+                    query.query.view,
+                )?;
+            }
             let read = || storage.app_storage().read_chat_list_window(query.clone());
             let mut result = match read().inspect_err(|_| app.presentation_signals.wake()) {
                 Ok(result) => result,
@@ -410,7 +425,10 @@ impl Reader {
         .map_err(|error| match error {
             storage_sqlite::ChatListPageError::Storage(
                 cgka_traits::storage::StorageError::NotFound,
-            ) => AppError::ChatPresentationNotReady.into(),
+            )
+            | storage_sqlite::ChatListPageError::SearchTextNotReady => {
+                AppError::ChatPresentationNotReady.into()
+            }
             storage_sqlite::ChatListPageError::Storage(error) => AppError::Storage(error).into(),
             storage_sqlite::ChatListPageError::InvalidQuery(error) => {
                 AppError::InvalidChatListQuery(error).into()

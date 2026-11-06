@@ -11,6 +11,12 @@
   `emoji_set`, `installed_custom_emoji` and `read_installed_custom_emoji` are now async. `MimeMismatch` now means a
   non-image response type; any `image/*` type is accepted. Regenerate bindings.
 
+- Add `ChatListFilterNodeFfi::Text { text }` and `ChatListQueryErrorFfi::TextTooLong` (mdk#2983): chats whose title,
+  group name, description or direct-chat peer profile name contains the text, trimmed and lowercased, at most 1024
+  bytes in all. While any chat in the view has pending presentation, a text query fails with
+  `ChatPresentationNotReady`; retry. Regenerate bindings; an exhaustive Swift/Kotlin `switch` over either enum needs
+  the new case.
+
 - Add `Direct`, `Group` and `Muted` to `ChatListConditionFfi` (mdk#2983). A chat whose conversation kind is still
   `Unknown` matches neither kind; a window filtered on `Muted` updates when a mute expires. Regenerate bindings; an
   exhaustive Swift/Kotlin `switch` over the enum needs the new cases.
@@ -744,7 +750,6 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   unavailable for about eight minutes. Hosts should offer Retry: it derives a
   missing key from retained epoch state, recovering attachments whose key was
   never cached. Retry budgets are unchanged. (#2106)
-
 
 ## 0.11.0 - 2026-09-29
 

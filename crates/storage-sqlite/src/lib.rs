@@ -96,10 +96,11 @@ pub use app::chat_list::{
     ChatListPageError, ChatListQuery, ChatListQueryError, ChatListRow, ChatListSelectionError,
     ChatListView, ChatListViewQuery, ChatListWindowQuery, ChatListWindowRead, ChatPinError,
     ChatPinState, ExistingDirectConversation, MAX_CHAT_LIST_FILTER_DEPTH,
-    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES, MAX_SMALL_STATE_NUMBER,
-    MuteSetting, ReadPosition, RetentionExpiryScan, SmallStateBroadcast, SmallStateItem,
-    SmallStateItemName, SmallStateRule, SmallStateSchedule, SmallStateSync, SmallStateValue,
-    SmallStateVersion, conversation_kind, select_reusable_direct_conversation,
+    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES,
+    MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, RetentionExpiryScan, SmallStateBroadcast,
+    SmallStateItem, SmallStateItemName, SmallStateRule, SmallStateSchedule, SmallStateSync,
+    SmallStateValue, SmallStateVersion, conversation_kind, normalize_search_text,
+    select_reusable_direct_conversation,
 };
 pub use app::chat_presentation::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,

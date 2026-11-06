@@ -779,7 +779,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         search.validate()?;
         let records =
             self.directory_search_records(&search.searcher_account_id_hex, search.radius_end)?;
-        let query = search.query.trim().to_lowercase();
+        let query = storage_sqlite::normalize_search_text(&search.query);
         if query.is_empty() {
             return Ok(Vec::new());
         }

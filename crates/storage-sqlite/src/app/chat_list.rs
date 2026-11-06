@@ -1,6 +1,7 @@
 mod attention;
 mod pages;
 mod query;
+pub(crate) mod search_text;
 mod selection;
 mod small_state;
 mod window;
@@ -27,8 +28,10 @@ pub use pages::{ChatListPage, ChatListPageDirection, ChatListPageError, ChatList
 pub use query::{
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListQueryError, ChatListViewQuery,
     MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,
+    MAX_CHAT_LIST_FILTER_TEXT_BYTES,
 };
 use rusqlite::{Connection, OptionalExtension, Params, params};
+pub use search_text::normalize_search_text;
 pub use selection::ChatListSelectionError;
 use serde::{Deserialize, Serialize};
 pub use small_state::{

@@ -16,6 +16,13 @@
   bound (mdk#3013). Its existing completion, cancellation and worker-stop outcomes are unchanged; the host still
   bounds its OS execution opportunity.
 
+- Chat-list queries can search chat text with `ChatListFilter::Text` (mdk#2983): title, group name, description and a
+  direct chat's peer profile names, trimmed and lowercased like user directory search, as a literal substring.
+  Localized fallback titles are not searchable. While any chat in the query's view has pending presentation, a text
+  query is not ready (`ChatPresentationNotReady`, never a partial set); each read first prepares one bounded batch of
+  those chats. Presentation preparation now passes the peer's profile names to storage, and an upgraded account
+  re-prepares every chat's presentation once in the background. Additive.
+
 - Chat-list queries can filter by conversation kind (`ChatListCondition::Direct`, `Group`) and mute (`Muted`)
   (mdk#2983). A window whose filter tests mute re-reads at the next mute expiry among the chats in its view, so a
   chat leaves or enters it at its expiry even when it is off screen. Windows and select-all read mute at the same
@@ -1634,7 +1641,6 @@
   endpoint policy; restart retries the same persisted signed event. Manual edit
   checkpoints use version 7, which older readers reject; no database migration
   or binding signature change is required. Follow-up to #1979.
-
 
 - File acquisition enforces disk reserve with or without resumable validators,
   saves interrupted ciphertext tails, retries a rejected resumed representation

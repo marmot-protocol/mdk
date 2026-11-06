@@ -1712,6 +1712,56 @@ async fn a_draft_filtered_window_rereads_on_an_off_screen_draft_change() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
+/// A text window opens once the view's search text is ready, and when a peer
+/// renames, the chats that match only after the presentation worker re-prepares
+/// them enter the window, though none was on screen before. A named direct
+/// chat, titled by its group name, matches by its peer's profile name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
+    // Every third chat is a direct chat with the same peer and no group name.
+    let f = Fixture::new(12);
+    f.mutate("0004", |group| group.profile_name = "Book club".into());
+    let query = filtered(ChatListFilter::Text("zebra".into()));
+    let mut window = f
+        .runtime
+        .open_chat_list_window("alice", query.clone(), Some(3))
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    let peer = "bb".repeat(32);
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: peer.clone(),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra Crossing".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    // The account worker's catch-up, then its notification.
+    let shared = f.app.shared_storage().unwrap();
+    while crate::chat_presentation::maintenance::maintain(&f.store, &shared, &f.account_id).unwrap()
+    {
+    }
+    f.signal();
+    let direct = ["0001", "0004", "0007", "000a"];
+    let updated = next_where(&mut window, |w| !w.rows.is_empty()).await;
+    let all = f.runtime.chat_list_ids("alice", query).await.unwrap();
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(sorted, direct);
+    assert_eq!(ids(&updated), all[..3]);
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
 /// Chats enter and leave a filtered window as the filtered fact changes, the
 /// window always equals the head of the same query's complete ID set, and no
 /// row appears twice.

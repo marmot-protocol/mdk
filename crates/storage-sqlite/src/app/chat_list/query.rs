@@ -5,8 +5,8 @@
 //! [`ChatListViewQuery::compile`], so list, count and selection cannot disagree.
 //! Every leaf reads a `chat_list_rows` column or an indexed per-chat lookup, so
 //! cost grows with the chats the view's index walks, never with message history.
-//! Values (group IDs, the draft whitespace set, the read's time) are bound
-//! parameters; the SQL text depends only on the filter's shape.
+//! Values (group IDs, search text, the draft whitespace set, the read's time)
+//! are bound parameters; the SQL text depends only on the filter's shape.
 use super::ChatListView;
 use rusqlite::types::Value;
 use std::fmt;
@@ -17,6 +17,9 @@ pub const MAX_CHAT_LIST_FILTER_DEPTH: usize = 8;
 pub const MAX_CHAT_LIST_FILTER_NODES: usize = 64;
 /// Most group IDs across every `GroupIds` leaf in one query.
 pub const MAX_CHAT_LIST_FILTER_GROUP_IDS: usize = 500;
+/// Most bytes of search text across every `Text` leaf in one query, measured
+/// before normalization.
+pub const MAX_CHAT_LIST_FILTER_TEXT_BYTES: usize = 1024;
 
 /// A native view as the base scope, narrowed by an optional filter. `filter: None`
 /// is the whole view, so the four views are the predefined queries.
@@ -44,10 +47,18 @@ pub enum ChatListFilter {
     Condition(ChatListCondition),
     /// Chats whose group ID is in the list, compared as case-insensitive hex.
     GroupIds(Vec<String>),
+    /// Chats whose searchable text contains this text: the title, group name,
+    /// description and a direct chat's peer profile names, matched as a
+    /// literal substring after trimming and Unicode lowercasing (the user
+    /// directory's rule). Localized fallback titles are not searchable, and
+    /// text that is empty after trimming matches no chat. While any chat in
+    /// the view still has presentation pending, a query with this leaf is not
+    /// ready rather than partial.
+    Text(String),
 }
 
 impl fmt::Debug for ChatListFilter {
-    // Group IDs never reach logs; show the shape and list sizes only.
+    // Group IDs and search text never reach logs; show the shape and list sizes only.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::All(children) => f.debug_tuple("All").field(children).finish(),
@@ -55,6 +66,7 @@ impl fmt::Debug for ChatListFilter {
             Self::Not(child) => f.debug_tuple("Not").field(child).finish(),
             Self::Condition(condition) => condition.fmt(f),
             Self::GroupIds(ids) => write!(f, "GroupIds({})", ids.len()),
+            Self::Text(_) => f.write_str("Text"),
         }
     }
 }
@@ -114,6 +126,7 @@ pub enum ChatListFilterNode {
     Not(u32),
     Condition(ChatListCondition),
     GroupIds(Vec<String>),
+    Text(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -124,6 +137,8 @@ pub enum ChatListQueryError {
     TooManyNodes,
     #[error("chat-list filter lists more than {MAX_CHAT_LIST_FILTER_GROUP_IDS} group IDs")]
     TooManyGroupIds,
+    #[error("chat-list filter search text exceeds {MAX_CHAT_LIST_FILTER_TEXT_BYTES} bytes")]
+    TextTooLong,
     #[error("chat-list filter node names a child index outside the node list")]
     ChildOutOfRange,
     #[error("chat-list filter node names a child at or before its own index")]
@@ -204,6 +219,7 @@ impl ChatListFilter {
             }
             ChatListFilterNode::Condition(condition) => Self::Condition(condition),
             ChatListFilterNode::GroupIds(ids) => Self::GroupIds(ids),
+            ChatListFilterNode::Text(text) => Self::Text(text),
         })
     }
 
@@ -216,7 +232,18 @@ impl ChatListFilter {
             }
             Self::Not(child) => child.references(condition),
             Self::Condition(leaf) => *leaf == condition,
-            Self::GroupIds(_) => false,
+            Self::GroupIds(_) | Self::Text(_) => false,
+        }
+    }
+
+    /// Whether any leaf is `Text`. Such a query waits for presentation across
+    /// its whole view, and a live window re-reads on any presentation change.
+    pub fn references_text(&self) -> bool {
+        match self {
+            Self::All(children) | Self::Any(children) => children.iter().any(Self::references_text),
+            Self::Not(child) => child.references_text(),
+            Self::Text(_) => true,
+            Self::Condition(_) | Self::GroupIds(_) => false,
         }
     }
 
@@ -228,7 +255,7 @@ impl ChatListFilter {
             match node {
                 Self::All(children) | Self::Any(children) => stack.extend(children.iter_mut()),
                 Self::Not(child) => stack.push(child),
-                Self::Condition(_) => {}
+                Self::Condition(_) | Self::Text(_) => {}
                 Self::GroupIds(ids) => lists.push(ids),
             }
         }
@@ -251,12 +278,18 @@ impl ChatListViewQuery {
             .is_some_and(|filter| filter.references(condition))
     }
 
+    pub fn references_text(&self) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(ChatListFilter::references_text)
+    }
+
     /// Check the size bounds. Every read validates; callers may check earlier.
     pub fn validate(&self) -> Result<(), ChatListQueryError> {
         let Some(filter) = &self.filter else {
             return Ok(());
         };
-        let (mut nodes, mut ids) = (0usize, 0usize);
+        let (mut nodes, mut ids, mut text) = (0usize, 0usize, 0usize);
         let mut stack = vec![(filter, 1usize)];
         while let Some((node, depth)) = stack.pop() {
             if depth > MAX_CHAT_LIST_FILTER_DEPTH {
@@ -276,6 +309,12 @@ impl ChatListViewQuery {
                     ids += list.len();
                     if ids > MAX_CHAT_LIST_FILTER_GROUP_IDS {
                         return Err(ChatListQueryError::TooManyGroupIds);
+                    }
+                }
+                ChatListFilter::Text(value) => {
+                    text += value.len();
+                    if text > MAX_CHAT_LIST_FILTER_TEXT_BYTES {
+                        return Err(ChatListQueryError::TextTooLong);
                     }
                 }
             }
@@ -304,6 +343,28 @@ impl ChatListViewQuery {
         }
         Ok(compiled)
     }
+}
+
+/// Up to `limit` chats in `view` whose presentation, and so whose search
+/// text, is still pending: never prepared, or invalidated since. A query with
+/// a `Text` leaf is not ready while any exist. Walks only the pending index.
+pub(super) fn pending_search_text(
+    conn: &rusqlite::Connection,
+    view: ChatListView,
+    limit: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let sql = format!(
+        "SELECT group_id_hex FROM chat_list_rows INDEXED BY chat_presentation_pending
+         WHERE (presentation_json IS NULL
+                OR presentation_applied_source_revision != presentation_source_revision)
+           AND {}
+         ORDER BY group_id_hex LIMIT ?1",
+        view.predicate()
+    );
+    let mut statement = conn.prepare_cached(&sql)?;
+    statement
+        .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| row.get(0))?
+        .collect()
 }
 
 // Correlated subqueries name the outer table `chat_list_rows`, unaliased in every
@@ -359,6 +420,19 @@ impl FilterWriter<'_> {
                 self.sql.push_str(&format!(
                     "lower(chat_list_rows.group_id_hex) IN (SELECT lower(value) FROM json_each(?{index}))"
                 ));
+            }
+            ChatListFilter::Text(text) => {
+                // `instr` is a literal match, so `%` and `_` need no escaping.
+                // The column holds no control characters, so a query with one
+                // could only match across a field separator: it matches nothing.
+                let needle = super::search_text::normalize_search_text(text);
+                if needle.is_empty() || needle.chars().any(char::is_control) {
+                    self.sql.push('0');
+                } else {
+                    let index = self.bind(Value::Text(needle));
+                    self.sql
+                        .push_str(&format!("instr(chat_list_rows.search_text, ?{index}) > 0"));
+                }
             }
         }
     }

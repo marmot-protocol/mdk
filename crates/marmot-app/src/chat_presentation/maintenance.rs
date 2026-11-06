@@ -38,7 +38,7 @@ fn prepare(
 ) -> Result<Vec<(ChatPresentationInput, StoredChatPresentation)>, AppError> {
     inputs
         .into_iter()
-        .map(|input| {
+        .map(|mut input| {
             let peer = presentation_peer(&input, local);
             let (profile, version) = if let Some(peer) = &peer {
                 let evidence = shared.directory_presentation(peer)?;
@@ -70,6 +70,7 @@ fn prepare(
             };
             let presentation =
                 select_chat_presentation(&input, local, peer.as_deref().zip(profile.as_ref()));
+            input.search_peer_names = super::search_peer_names(&presentation, profile.as_ref());
             Ok((
                 input,
                 StoredChatPresentation {
@@ -209,6 +210,32 @@ pub(crate) fn prepare_window(
         }
     }
     Ok(())
+}
+
+/// Prepare one bounded batch of the rows a text query over `view` waits for
+/// (pending presentation anywhere in the view), then notify windows and wake
+/// the account worker for the rest. Cost is one batch, whatever the view size.
+pub(crate) fn prepare_search_batch(
+    app: &crate::MarmotApp,
+    label: &str,
+    account: &SqliteAppStorage,
+    local: &str,
+    view: storage_sqlite::ChatListView,
+) -> Result<(), AppError> {
+    let pending = account.chat_list_pending_search_text(view, CHAT_PRESENTATION_BATCH_LIMIT)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let prepared = prepare_window(account, &app.shared_storage()?, local, &pending);
+    app.presentation_signals.wake();
+    let _ = app
+        .presentation_signals
+        .updates
+        .send(super::signals::PresentationInvalidation {
+            account_label: label.to_owned(),
+            version: account.chat_presentation_version()?,
+        });
+    prepared
 }
 
 #[cfg(test)]

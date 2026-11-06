@@ -137,7 +137,14 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         let tables: Vec<_> = PRESERVED_TABLES
             .iter()
             .map(|table| {
-                let columns = table_columns(&conn, table);
+                // 0200 invalidates every stored presentation once, so its
+                // search text is written; checked separately below.
+                let columns = table_columns(&conn, table)
+                    .into_iter()
+                    .filter(|column| {
+                        !(*table == "chat_list_rows" && column == "presentation_source_revision")
+                    })
+                    .collect::<Vec<_>>();
                 let rows = table_rows(&conn, table, &columns);
                 (columns, rows)
             })
@@ -212,6 +219,18 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
                 "{table} changed"
             );
         }
+        let current: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_list_rows WHERE presentation_json IS NOT NULL
+                 AND presentation_applied_source_revision = presentation_source_revision",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current, 0,
+            "every stored presentation is redone for its search text"
+        );
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
         assert_eq!(retained_routes(&conn), before_routes);
     }

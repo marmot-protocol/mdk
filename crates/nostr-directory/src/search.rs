@@ -298,7 +298,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
     emitter.remember_graph_accounts(1, &params.radius_one_seeds);
     // An empty query would match every candidate through `contains`, so it
     // finds nobody by definition rather than everybody.
-    let query = params.query.trim().to_lowercase();
+    let query = storage_sqlite::normalize_search_text(&params.query);
     if !query.is_empty() {
         let open_ranking = directory.config.open_ranking.clone();
         let open_ranking_search_endpoint = open_ranking

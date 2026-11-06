@@ -37,7 +37,7 @@ impl<R: DirectoryResources> Directory<R> {
         limit: usize,
     ) -> Result<(HashSet<String>, Vec<UserDirectorySearchResult>), DirectoryError> {
         let searcher = parse_account_id_hex(searcher_account_id_hex)?;
-        let query = query.trim().to_lowercase();
+        let query = storage_sqlite::normalize_search_text(query);
         if query.is_empty() || limit == 0 {
             return Ok((HashSet::new(), Vec::new()));
         }
