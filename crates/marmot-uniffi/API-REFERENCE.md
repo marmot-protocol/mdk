@@ -4172,7 +4172,7 @@ pub fn new() -> Arc<Self>
 
 Create one control per `install_emoji_set` call and pass it in; it is never reused across installs. A control that is already cancelled makes the install fail with `EmojiSetInstallCancelled` before any download.
 
-[Source](src/conversions/emoji_set.rs#L306)
+[Source](src/conversions/emoji_set.rs#L308)
 
 ### `EmojiSetInstallControlFfi::cancel`
 
@@ -4184,7 +4184,7 @@ pub fn cancel(&self)
 
 Request cancellation from any thread. The install starts no new download, drops those in flight, stores nothing and fails promptly with `EmojiSetInstallCancelled`; a cancelled reinstall leaves the previous snapshot readable. Install is all-or-nothing: the final atomic write is not interruptible, so a cancellation that arrives once it has started is too late and the install succeeds. Needed because cancelling the host's task does not reach the Rust future under UniFFI 0.29.
 
-[Source](src/conversions/emoji_set.rs#L312)
+[Source](src/conversions/emoji_set.rs#L314)
 
 ### `EmojiSetInstallControlFfi::is_cancelled`
 
@@ -4196,7 +4196,7 @@ pub fn is_cancelled(&self) -> bool
 
 Whether cancellation was requested, by `cancel()` or by the runtime: `shutdown` and `shutdown_and_close` cancel every running install the same way, so a backgrounded app never keeps downloading or writes after close.
 
-[Source](src/conversions/emoji_set.rs#L316)
+[Source](src/conversions/emoji_set.rs#L318)
 
 ### `EmojiSetInstallControlFfi::progress`
 
@@ -4208,7 +4208,7 @@ pub fn progress(&self) -> EmojiSetInstallProgressFfi
 
 Poll for a determinate progress bar: `completed_emoji` of `total_emoji` entries finished (stored, skipped or given up on), and `transferred_bytes` received from image hosts. `total_emoji` is the stored version's valid emoji count and stays 0 until the install has read it; `completed_emoji` reaches it when an install succeeds. Bytes are counted as each download finishes, not while it streams.
 
-[Source](src/conversions/emoji_set.rs#L320)
+[Source](src/conversions/emoji_set.rs#L322)
 
 </details>
 
@@ -4367,7 +4367,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L308)
+[Source](src/lib.rs#L309)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4377,7 +4377,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 Open a controlled development build with device-group capability and explicit runtime intent. The library must enable `dev-device-groups`; otherwise it returns Runtime with `experimental_device_groups_unavailable` before opening the root or acquiring host secret storage. It takes the same `MarmotOptions` and required deployment as `new_with_configuration`, preserving their ordinary meanings and ownership. Ordinary constructors remain disabled even in a capable library. Use this constructor for every foreground/background opener of the experimental root, a notification service extension included: an ordinary constructor does not open an account that holds or is joining a device group and reports Runtime with `experimental_device_groups_required`; see the [shared host test-build guidance](README.md#experimental-device-group-test-builds). Production timing is unchanged. This is not release activation or proof of mobile artifact/device validation.
 
-[Source](src/lib.rs#L323)
+[Source](src/lib.rs#L324)
 
 ### `Marmot::new_with_options`
 
@@ -4389,7 +4389,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L334)
+[Source](src/lib.rs#L335)
 
 ### `Marmot::new`
 
@@ -4401,7 +4401,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L363)
+[Source](src/lib.rs#L364)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4413,7 +4413,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L389)
+[Source](src/lib.rs#L390)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4425,7 +4425,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L420)
+[Source](src/lib.rs#L421)
 
 ### `Marmot::new_with_client_name`
 
@@ -4437,7 +4437,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L441)
+[Source](src/lib.rs#L442)
 
 ### `Marmot::start`
 
@@ -4449,7 +4449,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L479)
+[Source](src/lib.rs#L480)
 
 ### `Marmot::shutdown`
 
@@ -4461,7 +4461,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L491)
+[Source](src/lib.rs#L492)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4473,7 +4473,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L527)
+[Source](src/lib.rs#L528)
 
 ### `Marmot::storage_is_closed`
 
@@ -4485,7 +4485,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L535)
+[Source](src/lib.rs#L536)
 
 ### `Marmot::is_stopping`
 
@@ -4497,7 +4497,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L542)
+[Source](src/lib.rs#L543)
 
 </details>
 
