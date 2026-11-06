@@ -2302,10 +2302,16 @@ impl MarmotRelayPlane {
                         RelayNotificationConsumerExit::Closed,
                     );
                 }
-                *notification_forwarder = Some(spawn_relay_notification_supervisor_scoped(
-                    Arc::new(InjectedRelayNotificationSource(source.clone())),
+                let source: Arc<dyn RelayNotificationSource> =
+                    Arc::new(InjectedRelayNotificationSource(source.clone()));
+                // Read from now on: a fake relay answers a REQ as it is sent,
+                // which can be before the consumer task first runs.
+                let receiver = source.notifications();
+                *notification_forwarder = Some(spawn_relay_notification_supervisor_reading(
+                    source,
                     self.inner.transport.clone(),
                     None,
+                    Some(receiver),
                 ));
             }
         }
@@ -2880,9 +2886,20 @@ fn spawn_relay_notification_supervisor_scoped(
     transport: Arc<RelayPlaneTransport>,
     account_id: Option<MemberId>,
 ) -> JoinHandle<()> {
+    spawn_relay_notification_supervisor_reading(source, transport, account_id, None)
+}
+
+/// [`spawn_relay_notification_supervisor_scoped`], whose first consumer reads
+/// `receiver` when one is given instead of asking the source for one.
+fn spawn_relay_notification_supervisor_reading(
+    source: Arc<dyn RelayNotificationSource>,
+    transport: Arc<RelayPlaneTransport>,
+    account_id: Option<MemberId>,
+    receiver: Option<RelayNotificationStream>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _running = RunningSupervisorGuard::new(transport.notification_forwarder_health.clone());
-        let mut receiver = None;
+        let mut receiver = receiver;
         let mut restart_backoff = RelayNotificationRestartBackoff::default();
         loop {
             let adapter = transport.adapter.clone();

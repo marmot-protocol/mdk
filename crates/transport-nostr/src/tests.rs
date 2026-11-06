@@ -1438,6 +1438,30 @@ async fn lag_recovers_expired_history() {
     relay_plane.shutdown().await;
 }
 
+/// A relay can answer a REQ as soon as it is sent, before any task of the
+/// plane has run. The plane reads its injected client's relay messages from
+/// construction, so it hears that answer and the REQ finishes.
+#[tokio::test]
+async fn an_answer_sent_before_the_plane_first_yields_finishes_its_req() {
+    let relay =
+        crate::test_support::CountingClient::new(crate::test_support::PublishScript::Accept);
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account,
+            inbox_endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+            group_subscriptions: Vec::new(),
+            since: Some(Timestamp(1_699_999_000)),
+        })
+        .await
+        .unwrap();
+    relay.messages.handled().await;
+    assert!(adapter.account_subscription_eose().await.complete());
+    relay_plane.shutdown().await;
+}
+
 /// A failed owner-granted capture retains actual loss without autonomous
 /// refetches or fresh account control records.
 #[tokio::test(start_paused = true)]
