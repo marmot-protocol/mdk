@@ -22,14 +22,16 @@ impl SqliteAppStorage {
     /// the same compiled condition the live window pages through, before any
     /// display paging. The count is the length. Work and memory grow with the
     /// view's chats, never with profile or history size. Pending base-row work
-    /// returns `ProjectionNotReady`, never a partial set.
+    /// returns `ProjectionNotReady`, never a partial set. `now_ms` (Unix ms) is
+    /// the time a `Muted` leaf tests mute expiry against.
     pub fn chat_list_ids(
         &self,
         query: impl Into<ChatListViewQuery>,
+        now_ms: i64,
     ) -> Result<Vec<String>, ChatListSelectionError> {
         let query = query.into();
         self.connection
-            .with_deferred_read(|conn| eligible_ids(conn, &query))
+            .with_deferred_read(|conn| eligible_ids(conn, &query, now_ms))
     }
 
     /// The subset of `group_ids` still matching `query`, in the caller's order with
@@ -40,10 +42,12 @@ impl SqliteAppStorage {
         &self,
         query: impl Into<ChatListViewQuery>,
         group_ids: &[String],
+        now_ms: i64,
     ) -> Result<Vec<String>, ChatListSelectionError> {
         let query = query.into();
         self.connection.with_deferred_read(|conn| {
-            let mut eligible: HashSet<String> = eligible_ids(conn, &query)?.into_iter().collect();
+            let mut eligible: HashSet<String> =
+                eligible_ids(conn, &query, now_ms)?.into_iter().collect();
             Ok(group_ids
                 .iter()
                 .filter(|id| eligible.remove(id.as_str()))
@@ -56,8 +60,9 @@ impl SqliteAppStorage {
 fn eligible_ids(
     conn: &Connection,
     query: &ChatListViewQuery,
+    now_ms: i64,
 ) -> Result<Vec<String>, ChatListSelectionError> {
-    let compiled = query.compile()?;
+    let compiled = query.compile(now_ms)?;
     let missing_base: bool = conn
         .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)",

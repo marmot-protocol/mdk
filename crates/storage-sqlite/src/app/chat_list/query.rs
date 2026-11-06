@@ -5,8 +5,8 @@
 //! [`ChatListViewQuery::compile`], so list, count and selection cannot disagree.
 //! Every leaf reads a `chat_list_rows` column or an indexed per-chat lookup, so
 //! cost grows with the chats the view's index walks, never with message history.
-//! Values (group IDs, the draft whitespace set) are bound parameters; the SQL text
-//! depends only on the filter's shape.
+//! Values (group IDs, the draft whitespace set, the read's time) are bound
+//! parameters; the SQL text depends only on the filter's shape.
 use super::ChatListView;
 use rusqlite::types::Value;
 use std::fmt;
@@ -91,6 +91,18 @@ pub enum ChatListCondition {
     /// The row's preview message is a send whose publish failed, as its delivery
     /// state shows. An older send behind newer history does not count.
     FailedSend,
+    /// A one-to-one chat: the row's `conversation_kind` is
+    /// [`ChatConversationKind::Direct`](crate::ChatConversationKind::Direct).
+    /// A chat whose kind is still Unknown never matches.
+    Direct,
+    /// A group chat: the row's `conversation_kind` is
+    /// [`ChatConversationKind::Group`](crate::ChatConversationKind::Group).
+    /// A chat whose kind is still Unknown never matches.
+    Group,
+    /// Muted at the time of the read, as the row's `muted` shows: muted until
+    /// unmuted, or until a time later than the read's. Nothing is written when
+    /// a mute expires; a live window testing this wakes at the next expiry.
+    Muted,
 }
 
 /// One node of the flat encoding the bindings use. Node 0 is the root; every
@@ -271,7 +283,9 @@ impl ChatListViewQuery {
         Ok(())
     }
 
-    pub(super) fn compile(&self) -> Result<CompiledQuery, ChatListQueryError> {
+    /// Compile for a read at `now_ms` (Unix milliseconds), the time a `Muted`
+    /// leaf tests mute expiry against.
+    pub(super) fn compile(&self, now_ms: i64) -> Result<CompiledQuery, ChatListQueryError> {
         self.validate()?;
         let mut compiled = CompiledQuery {
             view: self.view,
@@ -280,7 +294,13 @@ impl ChatListViewQuery {
         };
         if let Some(filter) = &self.filter {
             compiled.predicate.push_str(" AND ");
-            write_filter(filter, &mut compiled.predicate, &mut compiled.params);
+            let mut writer = FilterWriter {
+                sql: &mut compiled.predicate,
+                params: &mut compiled.params,
+                now_ms,
+                now_param: None,
+            };
+            writer.filter(filter);
         }
         Ok(compiled)
     }
@@ -289,100 +309,138 @@ impl ChatListViewQuery {
 // Correlated subqueries name the outer table `chat_list_rows`, unaliased in every
 // statement that embeds a predicate. Every leaf is a non-NULL boolean, so `NOT`
 // is plain negation.
-fn write_filter(filter: &ChatListFilter, sql: &mut String, params: &mut Vec<Value>) {
-    match filter {
-        ChatListFilter::All(children) | ChatListFilter::Any(children) if children.is_empty() => {
-            sql.push_str(if matches!(filter, ChatListFilter::All(_)) {
-                "1"
-            } else {
-                "0"
-            });
-        }
-        ChatListFilter::All(children) | ChatListFilter::Any(children) => {
-            let joiner = if matches!(filter, ChatListFilter::All(_)) {
-                " AND "
-            } else {
-                " OR "
-            };
-            sql.push('(');
-            for (index, child) in children.iter().enumerate() {
-                if index > 0 {
-                    sql.push_str(joiner);
-                }
-                write_filter(child, sql, params);
-            }
-            sql.push(')');
-        }
-        ChatListFilter::Not(child) => {
-            sql.push_str("NOT (");
-            write_filter(child, sql, params);
-            sql.push(')');
-        }
-        ChatListFilter::Condition(condition) => write_condition(*condition, sql, params),
-        ChatListFilter::GroupIds(ids) => {
-            // One JSON parameter per list keeps the SQL text independent of its size.
-            params.push(Value::Text(
-                serde_json::to_string(ids).expect("string list encodes"),
-            ));
-            sql.push_str(&format!(
-                "lower(chat_list_rows.group_id_hex) IN (SELECT lower(value) FROM json_each(?{}))",
-                params.len()
-            ));
-        }
-    }
+struct FilterWriter<'a> {
+    sql: &'a mut String,
+    params: &'a mut Vec<Value>,
+    now_ms: i64,
+    /// The read's time is bound once, however many `Muted` leaves use it.
+    now_param: Option<usize>,
 }
 
-fn write_condition(condition: ChatListCondition, sql: &mut String, params: &mut Vec<Value>) {
-    // Badges are hidden for invitations (`list_unread` already excludes them) and
-    // in the Left scope, so attention leaves never match there.
-    const SHOWS_UNREAD: &str = "chat_list_rows.list_unread = 1 AND chat_list_rows.list_scope != 2";
-    let text = match condition {
-        ChatListCondition::Active => "chat_list_rows.list_scope = 0".to_owned(),
-        ChatListCondition::Archived => "chat_list_rows.list_scope = 1".to_owned(),
-        ChatListCondition::Left => "chat_list_rows.list_scope = 2".to_owned(),
-        ChatListCondition::PendingInvite => {
-            "COALESCE((SELECT pending.pending_confirmation FROM account_groups AS pending
-                WHERE pending.group_id_hex = chat_list_rows.group_id_hex),
-                chat_list_rows.pending_confirmation) != 0"
-                .to_owned()
+impl FilterWriter<'_> {
+    fn filter(&mut self, filter: &ChatListFilter) {
+        match filter {
+            ChatListFilter::All(children) | ChatListFilter::Any(children)
+                if children.is_empty() =>
+            {
+                self.sql
+                    .push_str(if matches!(filter, ChatListFilter::All(_)) {
+                        "1"
+                    } else {
+                        "0"
+                    });
+            }
+            ChatListFilter::All(children) | ChatListFilter::Any(children) => {
+                let joiner = if matches!(filter, ChatListFilter::All(_)) {
+                    " AND "
+                } else {
+                    " OR "
+                };
+                self.sql.push('(');
+                for (index, child) in children.iter().enumerate() {
+                    if index > 0 {
+                        self.sql.push_str(joiner);
+                    }
+                    self.filter(child);
+                }
+                self.sql.push(')');
+            }
+            ChatListFilter::Not(child) => {
+                self.sql.push_str("NOT (");
+                self.filter(child);
+                self.sql.push(')');
+            }
+            ChatListFilter::Condition(condition) => self.condition(*condition),
+            ChatListFilter::GroupIds(ids) => {
+                // One JSON parameter per list keeps the SQL text independent of its size.
+                let index = self.bind(Value::Text(
+                    serde_json::to_string(ids).expect("string list encodes"),
+                ));
+                self.sql.push_str(&format!(
+                    "lower(chat_list_rows.group_id_hex) IN (SELECT lower(value) FROM json_each(?{index}))"
+                ));
+            }
         }
-        ChatListCondition::Unread => format!("({SHOWS_UNREAD})"),
-        ChatListCondition::ManualUnread => {
-            format!("({SHOWS_UNREAD} AND chat_list_rows.manually_marked_unread != 0)")
-        }
-        ChatListCondition::Mention => {
-            format!("({SHOWS_UNREAD} AND chat_list_rows.unread_mention_count > 0)")
-        }
-        ChatListCondition::Pinned => "chat_list_rows.list_pin_ordinal >= 0".to_owned(),
-        ChatListCondition::PendingLeave => {
-            crate::cross::views::CHAT_LIST_FILTER_PENDING_LEAVE_SQL.to_owned()
-        }
-        ChatListCondition::Disbanding => {
-            crate::cross::views::CHAT_LIST_FILTER_DISBANDING_SQL.to_owned()
-        }
-        ChatListCondition::HasDraft => {
-            params.push(Value::Text(
-                crate::app::chat_presentation::row_contract::DRAFT_WHITE_SPACE.to_owned(),
-            ));
-            format!(
-                "EXISTS(SELECT 1 FROM message_drafts AS draft
-                    WHERE draft.group_id_hex = chat_list_rows.group_id_hex
-                      AND (trim(draft.content, ?{}) != ''
-                           OR EXISTS(SELECT 1 FROM message_draft_attachments AS attachment
-                               WHERE attachment.group_id_hex = draft.group_id_hex)))",
-                params.len()
-            )
-        }
-        // The delivery state the row shows for its preview message, so the leaf
-        // agrees with the row and reads no message history.
-        ChatListCondition::PendingSend => {
-            "chat_list_rows.last_message_delivery_state = 'pending'".to_owned()
-        }
-        ChatListCondition::FailedSend => {
-            "chat_list_rows.last_message_delivery_state = 'failed'".to_owned()
-        }
-    };
-    sql.push_str(&text);
+    }
+
+    fn bind(&mut self, value: Value) -> usize {
+        self.params.push(value);
+        self.params.len()
+    }
+
+    fn condition(&mut self, condition: ChatListCondition) {
+        // Badges are hidden for invitations (`list_unread` already excludes them) and
+        // in the Left scope, so attention leaves never match there.
+        const SHOWS_UNREAD: &str =
+            "chat_list_rows.list_unread = 1 AND chat_list_rows.list_scope != 2";
+        let text = match condition {
+            ChatListCondition::Active => "chat_list_rows.list_scope = 0".to_owned(),
+            ChatListCondition::Archived => "chat_list_rows.list_scope = 1".to_owned(),
+            ChatListCondition::Left => "chat_list_rows.list_scope = 2".to_owned(),
+            ChatListCondition::PendingInvite => {
+                "COALESCE((SELECT pending.pending_confirmation FROM account_groups AS pending
+                    WHERE pending.group_id_hex = chat_list_rows.group_id_hex),
+                    chat_list_rows.pending_confirmation) != 0"
+                    .to_owned()
+            }
+            ChatListCondition::Unread => format!("({SHOWS_UNREAD})"),
+            ChatListCondition::ManualUnread => {
+                format!("({SHOWS_UNREAD} AND chat_list_rows.manually_marked_unread != 0)")
+            }
+            ChatListCondition::Mention => {
+                format!("({SHOWS_UNREAD} AND chat_list_rows.unread_mention_count > 0)")
+            }
+            ChatListCondition::Pinned => "chat_list_rows.list_pin_ordinal >= 0".to_owned(),
+            ChatListCondition::PendingLeave => {
+                crate::cross::views::CHAT_LIST_FILTER_PENDING_LEAVE_SQL.to_owned()
+            }
+            ChatListCondition::Disbanding => {
+                crate::cross::views::CHAT_LIST_FILTER_DISBANDING_SQL.to_owned()
+            }
+            ChatListCondition::HasDraft => {
+                let white_space = self.bind(Value::Text(
+                    crate::app::chat_presentation::row_contract::DRAFT_WHITE_SPACE.to_owned(),
+                ));
+                format!(
+                    "EXISTS(SELECT 1 FROM message_drafts AS draft
+                        WHERE draft.group_id_hex = chat_list_rows.group_id_hex
+                          AND (trim(draft.content, ?{white_space}) != ''
+                               OR EXISTS(SELECT 1 FROM message_draft_attachments AS attachment
+                                   WHERE attachment.group_id_hex = draft.group_id_hex)))"
+                )
+            }
+            // The delivery state the row shows for its preview message, so the leaf
+            // agrees with the row and reads no message history.
+            ChatListCondition::PendingSend => {
+                "chat_list_rows.last_message_delivery_state = 'pending'".to_owned()
+            }
+            ChatListCondition::FailedSend => {
+                "chat_list_rows.last_message_delivery_state = 'failed'".to_owned()
+            }
+            // `list_kind` is maintained from the classifier's inputs (migration
+            // 0179): 0 Unknown, 1 Direct, 2 Group.
+            ChatListCondition::Direct => "chat_list_rows.list_kind = 1".to_owned(),
+            ChatListCondition::Group => "chat_list_rows.list_kind = 2".to_owned(),
+            // The rule the row's `muted` follows (`chat_mute_is_effective`), at the
+            // read's time, so an expired mute needs no write.
+            ChatListCondition::Muted => {
+                let now = match self.now_param {
+                    Some(index) => index,
+                    None => {
+                        let index = self.bind(Value::Integer(self.now_ms));
+                        self.now_param = Some(index);
+                        index
+                    }
+                };
+                format!(
+                    "EXISTS(SELECT 1 FROM chat_notification_settings AS mute
+                        WHERE mute.group_id_hex = chat_list_rows.group_id_hex
+                          AND (mute.muted_until_ms IS NULL OR mute.muted_until_ms > ?{now}))"
+                )
+            }
+        };
+        self.sql.push_str(&text);
+    }
 }
 
 #[cfg(test)]

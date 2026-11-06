@@ -151,6 +151,8 @@ pub(crate) struct PageQuery {
     pub(crate) limit: usize,
     pub(crate) direction: ChatListPageDirection,
     pub(crate) boundary: Option<SortKey>,
+    /// The read's time (Unix ms): the `Muted` leaf and each row's `muted` use it.
+    pub(crate) now_ms: i64,
 }
 
 #[derive(Clone)]
@@ -185,7 +187,7 @@ pub(super) fn read_page_tx(
     mut query: PageQuery,
     anchor: Option<&str>,
 ) -> Result<ChatListPage, ChatListPageError> {
-    let compiled = query.query.compile()?;
+    let compiled = query.query.compile(query.now_ms)?;
     if let Some(group) = anchor {
         let key = tx
                 .query_row_cached(
@@ -255,7 +257,7 @@ pub(super) fn read_page_tx(
             None => (false, false),
         },
     };
-    let rows = page_rows(tx, &keys)?;
+    let rows = page_rows(tx, &keys, query.now_ms)?;
     Ok(ChatListPage {
         rows,
         first,
@@ -283,7 +285,11 @@ fn page_rows_sql() -> String {
     )
 }
 
-fn page_rows(tx: &Connection, keys: &[SortKey]) -> Result<Vec<ChatListRow>, ChatListPageError> {
+fn page_rows(
+    tx: &Connection,
+    keys: &[SortKey],
+    now: i64,
+) -> Result<Vec<ChatListRow>, ChatListPageError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -291,7 +297,6 @@ fn page_rows(tx: &Connection, keys: &[SortKey]) -> Result<Vec<ChatListRow>, Chat
     let ids_json = serde_json::to_string(&ids)
         .map_err(|_| StorageError::Serialization("chat page key encoding failed".into()))?;
     let mut statement = tx.prepare_cached(&page_rows_sql()).storage()?;
-    let now = super::unix_now_ms();
     let records = statement
         .query_map([ids_json], |r| {
             Ok((

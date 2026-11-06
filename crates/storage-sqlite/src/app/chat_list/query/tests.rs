@@ -13,14 +13,26 @@ use cgka_traits::storage::{
 use cgka_traits::types::GroupId;
 use rusqlite::params;
 
+/// The time every read here runs at, unless a test sets its own.
+const NOW: i64 = 1_000_000;
+
 /// One chat, with optional base facts. Activity orders rows: earlier seeds sort first.
+/// Kind facts: `direct` (two member accounts), `trio` (three), `named` (a group
+/// name). With none the member count is unknown and the name empty: Unknown kind.
 fn seed(store: &SqliteAccountStorage, id: &str, facts: &[&str]) {
     let has = |fact| facts.contains(&fact);
+    let member_count = if has("direct") {
+        Some(2)
+    } else if has("trio") {
+        Some(3)
+    } else {
+        None
+    };
     let conn = store.lock().unwrap();
     conn.execute(
-        "INSERT INTO account_groups(group_id_hex, endpoint, updated_at, archived, self_membership, pending_confirmation)
-         VALUES (?1, '', 0, ?2, ?3, ?4)",
-        params![id, has("archived"), if has("left") { "left" } else { "member" }, has("invite")],
+        "INSERT INTO account_groups(group_id_hex, endpoint, updated_at, archived, self_membership, pending_confirmation, member_count)
+         VALUES (?1, '', 0, ?2, ?3, ?4, ?5)",
+        params![id, has("archived"), if has("left") { "left" } else { "member" }, has("invite"), member_count],
     )
     .unwrap();
     let activity: i64 = conn
@@ -28,8 +40,8 @@ fn seed(store: &SqliteAccountStorage, id: &str, facts: &[&str]) {
         .unwrap();
     conn.execute(
         "INSERT INTO chat_list_rows(group_id_hex, updated_at, activity_sort_at, archived, self_membership,
-             pending_confirmation, unread_count, manually_marked_unread, unread_mention_count)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             pending_confirmation, unread_count, manually_marked_unread, unread_mention_count, group_name)
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             id,
             1000 - activity,
@@ -39,6 +51,7 @@ fn seed(store: &SqliteAccountStorage, id: &str, facts: &[&str]) {
             if has("unread") || has("mention") { 3 } else { 0 },
             has("manual"),
             i64::from(has("mention")),
+            if has("named") { "Team" } else { "" },
         ],
     )
     .unwrap();
@@ -50,6 +63,19 @@ fn seed(store: &SqliteAccountStorage, id: &str, facts: &[&str]) {
         )
         .unwrap();
     }
+}
+
+/// Mute a chat until `until_ms`, or until unmuted with `None`.
+fn mute(store: &SqliteAccountStorage, id: &str, until_ms: Option<i64>) {
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO chat_notification_settings(group_id_hex, muted_until_ms, updated_at_ms)
+             VALUES (?1, ?2, 0)",
+            params![id, until_ms],
+        )
+        .unwrap();
 }
 
 /// Install base rows as complete: the fixture writes them directly.
@@ -133,13 +159,39 @@ fn receive(app: &SqliteAppStorage, group: &str, id: &str) {
 }
 
 fn ids(app: &SqliteAppStorage, view: ChatListView, filter: ChatListFilter) -> Vec<String> {
+    ids_at(app, view, filter, NOW)
+}
+
+/// Window rows of `query` read at `now_ms`.
+fn rows_at(
+    app: &SqliteAppStorage,
+    query: impl Into<ChatListViewQuery>,
+    now_ms: i64,
+) -> crate::ChatListWindowRead {
+    app.read_chat_list_window(crate::ChatListWindowQuery {
+        query: query.into(),
+        limit: 100,
+        anchors: Vec::new(),
+        before_anchor: 0,
+        now_ms,
+    })
+    .unwrap()
+}
+
+/// Select-all IDs read at `now_ms`, checked against the window and revalidation
+/// of every chat in the account at the same time: all three compile one query.
+fn ids_at(
+    app: &SqliteAppStorage,
+    view: ChatListView,
+    filter: ChatListFilter,
+    now_ms: i64,
+) -> Vec<String> {
     let query = ChatListViewQuery {
         view,
         filter: Some(filter),
     };
-    let ids = app.chat_list_ids(query.clone()).unwrap();
-    // The window path compiles the same query; list and select-all must agree.
-    let page = chat_list_window_page(app, query, 100).unwrap();
+    let ids = app.chat_list_ids(query.clone(), now_ms).unwrap();
+    let page = rows_at(app, query.clone(), now_ms).page;
     assert_eq!(
         page.rows
             .iter()
@@ -147,6 +199,22 @@ fn ids(app: &SqliteAppStorage, view: ChatListView, filter: ChatListFilter) -> Ve
             .collect::<Vec<_>>(),
         ids.iter().collect::<Vec<_>>()
     );
+    let mut every_chat: Vec<String> = [
+        ChatListView::Chats,
+        ChatListView::Archived,
+        ChatListView::Left,
+    ]
+    .into_iter()
+    .flat_map(|view| app.chat_list_ids(view, now_ms).unwrap())
+    .collect();
+    every_chat.reverse();
+    let mut kept = app
+        .revalidate_chat_list_ids(query, &every_chat, now_ms)
+        .unwrap();
+    kept.sort();
+    let mut expected = ids.clone();
+    expected.sort();
+    assert_eq!(kept, expected, "revalidation of every chat");
     ids
 }
 
@@ -165,9 +233,9 @@ fn every_condition_matches_exactly_the_chats_with_that_fact() {
     for (id, facts) in [
         ("a0", &[][..]),
         ("a1", &["invite", "unread", "mention", "manual"]),
-        ("a2", &["unread"]),
-        ("a3", &["manual"]),
-        ("a4", &["mention"]),
+        ("a2", &["unread", "direct"]),
+        ("a3", &["manual", "named"]),
+        ("a4", &["mention", "trio"]),
         ("a5", &["pinned"]),
         ("a6", &[]),
         ("a7", &[]),
@@ -176,13 +244,18 @@ fn every_condition_matches_exactly_the_chats_with_that_fact() {
         ("aa", &[]),
         ("ab", &[]),
         ("ac", &[]),
-        ("ad", &["archived", "unread", "pinned"]),
+        ("ad", &["archived", "unread", "pinned", "named"]),
         ("ae", &["left", "unread", "mention", "manual"]),
         ("af", &[]),
         ("b0", &[]),
     ] {
         seed(&store, id, facts);
     }
+    // Muted until unmuted, until after the read, and until exactly the read's time.
+    mute(&store, "a5", None);
+    mute(&store, "a6", Some(NOW + 1));
+    mute(&store, "a8", Some(NOW));
+    mute(&store, "ad", None);
     draft(&store, "a6", "  draft text  ", false);
     // Whitespace-only text with a reply target is a reply-only draft: no draft.
     draft(&store, "a7", " \u{3000}\n", false);
@@ -279,6 +352,10 @@ fn every_condition_matches_exactly_the_chats_with_that_fact() {
         (C::HasDraft, &["a6", "a8"], &[]),
         (C::PendingSend, &["a9", "aa"], &[]),
         (C::FailedSend, &["ab"], &[]),
+        // Every other chat has an unknown kind, so it matches neither.
+        (C::Direct, &["a2"], &[]),
+        (C::Group, &["a3", "a4"], &["ad"]),
+        (C::Muted, &["a5", "a6"], &["ad"]),
     ] {
         assert_eq!(
             sorted(ids(&app, ChatListView::Chats, cond(condition))),
@@ -290,23 +367,27 @@ fn every_condition_matches_exactly_the_chats_with_that_fact() {
             .flat_map(|view| ids(&app, view, cond(condition)))
             .collect();
         assert_eq!(sorted(others), other_matches, "{condition:?} elsewhere");
-        // Send leaves match exactly the rows that show that delivery state.
-        let shows = |state| match condition {
-            C::PendingSend => state == ChatListMessageDeliveryState::Pending,
-            C::FailedSend => state == ChatListMessageDeliveryState::Failed,
-            _ => unreachable!(),
+        // Send, kind and mute leaves match exactly the rows that show that fact,
+        // read at the same time.
+        let delivery = |row: &crate::ChatListRow, state| {
+            row.last_message
+                .as_ref()
+                .is_some_and(|message| message.delivery_state == state)
         };
-        if matches!(condition, C::PendingSend | C::FailedSend) {
-            let rows = chat_list_window_page(&app, ChatListView::Chats, 100)
-                .unwrap()
-                .rows;
-            let showing: Vec<_> = rows
+        let shows: Option<&dyn Fn(&crate::ChatListRow) -> bool> = match condition {
+            C::PendingSend => Some(&|row| delivery(row, ChatListMessageDeliveryState::Pending)),
+            C::FailedSend => Some(&|row| delivery(row, ChatListMessageDeliveryState::Failed)),
+            C::Direct => Some(&|row| row.conversation_kind == crate::ChatConversationKind::Direct),
+            C::Group => Some(&|row| row.conversation_kind == crate::ChatConversationKind::Group),
+            C::Muted => Some(&|row| row.muted),
+            _ => None,
+        };
+        if let Some(shows) = shows {
+            let showing: Vec<_> = rows_at(&app, ChatListView::Chats, NOW)
+                .page
+                .rows
                 .into_iter()
-                .filter(|row| {
-                    row.last_message
-                        .as_ref()
-                        .is_some_and(|message| shows(message.delivery_state))
-                })
+                .filter(|row| shows(row))
                 .map(|row| row.group_id_hex)
                 .collect();
             assert_eq!(sorted(showing), chats_matches, "{condition:?} rows");
@@ -357,6 +438,238 @@ fn operators_follow_boolean_truth_tables() {
     assert_eq!(
         query(F::Not(Box::new(F::Any(Vec::new())))),
         ["00", "01", "10", "11"]
+    );
+}
+
+#[test]
+fn kind_and_mute_leaves_follow_boolean_truth_tables() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    // (kind, muted): Unknown, Direct, Group (named and three members) x 0, 1
+    for (id, facts) in [
+        ("u0", &[][..]),
+        ("u1", &[]),
+        ("d0", &["direct"]),
+        ("d1", &["direct"]),
+        ("g0", &["named"]),
+        ("g1", &["trio"]),
+    ] {
+        seed(&store, id, facts);
+    }
+    for id in ["u1", "d1", "g1"] {
+        mute(&store, id, Some(NOW + 1));
+    }
+    ready(&store);
+    let query = |filter| {
+        let mut ids = ids(&app, ChatListView::Chats, filter);
+        ids.sort();
+        ids
+    };
+    let not = |filter| F::Not(Box::new(filter));
+    let (direct, group, muted) = (|| cond(C::Direct), || cond(C::Group), || cond(C::Muted));
+    assert_eq!(query(direct()), ["d0", "d1"]);
+    assert_eq!(query(group()), ["g0", "g1"]);
+    assert_eq!(query(muted()), ["d1", "g1", "u1"]);
+    // An Unknown kind is neither a group nor a DM, so only negation reaches it.
+    assert_eq!(query(not(group())), ["d0", "d1", "u0", "u1"]);
+    assert_eq!(query(not(direct())), ["g0", "g1", "u0", "u1"]);
+    assert_eq!(query(not(F::Any(vec![direct(), group()]))), ["u0", "u1"]);
+    assert_eq!(query(F::All(vec![direct(), group()])), Vec::<String>::new());
+    assert_eq!(query(F::All(vec![group(), muted()])), ["g1"]);
+    assert_eq!(
+        query(F::Any(vec![direct(), muted()])),
+        ["d0", "d1", "g1", "u1"]
+    );
+    assert_eq!(query(not(muted())), ["d0", "g0", "u0"]);
+    assert_eq!(
+        query(F::All(vec![not(muted()), not(group())])),
+        ["d0", "u0"]
+    );
+}
+
+/// `list_kind` tracks the classifier's inputs whichever table a write lands in,
+/// and the leaf always agrees with the kind the row presents.
+#[test]
+fn kind_leaves_follow_the_classifier_inputs_through_every_write() {
+    use crate::ChatConversationKind::{Direct, Group, Unknown};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let insert = |id: &str, name: &str, members: Option<i64>| {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at, member_count)
+             VALUES (?1, '', 0, ?2)",
+            params![id, members],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_list_rows(group_id_hex, updated_at, group_name) VALUES (?1, 0, ?2)",
+            params![id, name],
+        )
+        .unwrap();
+    };
+    insert("01", "", None);
+    insert("02", "", Some(2));
+    insert("03", "", Some(3));
+    // Only this account is left.
+    insert("04", "", Some(1));
+    // A name of Unicode white space is no name.
+    insert("05", "\u{3000} \n", Some(2));
+    insert("06", "Team", Some(2));
+    insert("07", "Team", None);
+    ready(&store);
+    let check = |expected: &[(&str, crate::ChatConversationKind)]| {
+        let rows = rows_at(&app, ChatListView::Chats, NOW).page.rows;
+        let mut presented: Vec<_> = rows
+            .iter()
+            .map(|row| (row.group_id_hex.as_str(), row.conversation_kind))
+            .collect();
+        presented.sort_by_key(|(id, _)| *id);
+        assert_eq!(presented, expected, "presented kinds");
+        for (condition, kind) in [(C::Direct, Direct), (C::Group, Group)] {
+            let mut matched = ids(&app, ChatListView::Chats, cond(condition));
+            matched.sort();
+            let kinds: Vec<_> = expected
+                .iter()
+                .filter(|(_, k)| *k == kind)
+                .map(|(id, _)| (*id).to_owned())
+                .collect();
+            assert_eq!(matched, kinds, "{condition:?}");
+        }
+    };
+    check(&[
+        ("01", Unknown),
+        ("02", Direct),
+        ("03", Group),
+        ("04", Group),
+        ("05", Direct),
+        ("06", Group),
+        ("07", Group),
+    ]);
+    // Member counts change in `account_groups`, names in `chat_list_rows`.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "UPDATE account_groups SET member_count = 2 WHERE group_id_hex = '01';
+             UPDATE account_groups SET member_count = 3 WHERE group_id_hex = '02';
+             UPDATE account_groups SET member_count = NULL WHERE group_id_hex = '03';
+             UPDATE chat_list_rows SET group_name = '' WHERE group_id_hex = '06';
+             UPDATE chat_list_rows SET group_name = 'Renamed' WHERE group_id_hex = '05';",
+        )
+        .unwrap();
+    ready(&store);
+    check(&[
+        ("01", Direct),
+        ("02", Group),
+        ("03", Unknown),
+        ("04", Group),
+        ("05", Group),
+        ("06", Direct),
+        ("07", Group),
+    ]);
+}
+
+/// A timed mute stops matching exactly at its expiry, with no write, and a
+/// window read reports the next expiry among every chat in its view.
+#[test]
+fn muted_leaf_flips_exactly_at_expiry_and_reports_the_next_expiry_in_the_view() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for (id, facts) in [
+        ("m1", &[][..]),
+        ("m2", &[]),
+        ("m3", &[]),
+        ("m4", &[]),
+        ("m5", &["archived"]),
+    ] {
+        seed(&store, id, facts);
+    }
+    mute(&store, "m1", Some(NOW + 500));
+    mute(&store, "m2", Some(NOW + 900));
+    mute(&store, "m3", None);
+    // Earlier, but outside the Chats view.
+    mute(&store, "m5", Some(NOW + 100));
+    ready(&store);
+    let muted = || cond(C::Muted);
+    let unmuted = || F::Not(Box::new(muted()));
+    let at = |now, filter| {
+        let mut ids = ids_at(&app, ChatListView::Chats, filter, now);
+        ids.sort();
+        ids
+    };
+    let next = |view, filter, now| {
+        rows_at(
+            &app,
+            ChatListViewQuery {
+                view,
+                filter: Some(filter),
+            },
+            now,
+        )
+        .next_mute_expiry_ms
+    };
+    assert_eq!(at(NOW + 499, muted()), ["m1", "m2", "m3"]);
+    assert_eq!(at(NOW + 499, unmuted()), ["m4"]);
+    // m1 is not in the unmuted window, yet its expiry is when it enters.
+    assert_eq!(
+        next(ChatListView::Chats, unmuted(), NOW + 499),
+        Some(NOW + 500)
+    );
+    assert_eq!(at(NOW + 500, muted()), ["m2", "m3"]);
+    assert_eq!(at(NOW + 500, unmuted()), ["m1", "m4"]);
+    assert_eq!(
+        next(ChatListView::Chats, muted(), NOW + 500),
+        Some(NOW + 900)
+    );
+    // Only indefinite mutes remain: nothing to wake for.
+    assert_eq!(next(ChatListView::Chats, muted(), NOW + 900), None);
+    assert_eq!(
+        next(ChatListView::Archived, muted(), NOW + 99),
+        Some(NOW + 100)
+    );
+    // A query that does not test mute needs no wake.
+    assert_eq!(next(ChatListView::Chats, F::All(Vec::new()), NOW), None);
+}
+
+/// The next-expiry lookup a Muted window read adds walks the view, not the
+/// account's mute settings: muting chats outside the view adds no work.
+#[test]
+fn mute_wake_lookup_cost_grows_with_the_view_not_the_accounts_mutes() {
+    let _serial = crate::base::query_work_test_support::QUERY_MEASUREMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "0000", &["unread"]);
+    mute(&store, "0000", Some(NOW + 10));
+    let mut archived = 0;
+    let mut mute_archived = |count: usize| {
+        for _ in 0..count {
+            archived += 1;
+            let id = format!("{archived:04x}");
+            seed(&store, &id, &["archived", "unread"]);
+            mute(&store, &id, Some(NOW + 1));
+        }
+        ready(&store);
+    };
+    let query = || ChatListViewQuery {
+        view: ChatListView::Unread,
+        filter: Some(cond(C::Muted)),
+    };
+    let steps = || {
+        let (read, steps) =
+            crate::base::query_work_test_support::measure(&store, || rows_at(&app, query(), NOW));
+        assert_eq!(read.next_mute_expiry_ms, Some(NOW + 10));
+        steps
+    };
+    mute_archived(16);
+    let few = steps();
+    mute_archived(2048);
+    let many = steps();
+    assert!(
+        many <= few + few / 10,
+        "mute wake lookup: {few} VM steps with 16 muted chats elsewhere, {many} with 2064"
     );
 }
 
@@ -446,13 +759,13 @@ fn bounds_and_node_lists_fail_with_typed_errors_and_no_partial_result() {
             ready(&store);
         }
         assert!(matches!(
-            app.chat_list_ids(too_many_ids.clone()),
+            app.chat_list_ids(too_many_ids.clone(), NOW),
             Err(ChatListSelectionError::InvalidQuery(
                 ChatListQueryError::TooManyGroupIds
             ))
         ));
         assert!(matches!(
-            app.revalidate_chat_list_ids(too_many_ids.clone(), &["01".to_owned()]),
+            app.revalidate_chat_list_ids(too_many_ids.clone(), &["01".to_owned()], NOW),
             Err(ChatListSelectionError::InvalidQuery(
                 ChatListQueryError::TooManyGroupIds
             ))
@@ -469,6 +782,7 @@ fn bounds_and_node_lists_fail_with_typed_errors_and_no_partial_result() {
                 limit: 10,
                 anchors: Vec::new(),
                 before_anchor: 0,
+                now_ms: NOW,
             }),
             Err(ChatListPageError::InvalidQuery(
                 ChatListQueryError::TooManyGroupIds
@@ -559,6 +873,9 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
         cond(C::HasDraft),
         cond(C::PendingSend),
         cond(C::FailedSend),
+        cond(C::Direct),
+        cond(C::Group),
+        cond(C::Muted),
         F::Not(Box::new(group_ids(&["01"]))),
     ]);
     for view in [
@@ -571,7 +888,7 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
             view,
             filter: Some(every_leaf.clone()),
         }
-        .compile()
+        .compile(NOW)
         .unwrap();
         let conn = store.lock().unwrap();
         let sql = format!(
@@ -609,6 +926,7 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
             "idx_disband_requests_hex",
             "SEARCH draft USING INDEX",
             "SEARCH pending USING INDEX",
+            "SEARCH mute USING INDEX",
         ] {
             assert!(plan.contains(lookup), "{view:?} missing {lookup}:\n{plan}");
         }
@@ -616,25 +934,40 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
 }
 
 /// Past the 200-row window cap, windows over a filtered query (each one read)
-/// tile exactly its select-all ID set, in order; the count is that length.
+/// tile exactly its select-all ID set, in order; the count is that length, and
+/// revalidating every chat keeps exactly that set.
 #[test]
 fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     let mut expected = Vec::new();
+    let mut every_chat = Vec::new();
     let excluded = ["0000", "0002", "01f6"];
     for n in 0..520 {
-        let facts: &[&str] = match n % 4 {
-            0 => &["unread"],
-            1 => &["pinned"],
-            2 => &["unread", "pinned"],
-            _ => &[],
+        let mut facts = match n % 4 {
+            0 => vec!["unread"],
+            1 => vec!["pinned"],
+            2 => vec!["unread", "pinned"],
+            _ => vec![],
         };
+        if n % 3 == 0 {
+            facts.push("direct");
+        }
         let id = format!("{n:04x}");
-        if n % 4 != 3 && !excluded.contains(&id.as_str()) {
+        // Muted DMs are dropped: some until after the read, some indefinitely,
+        // and some whose mute expired exactly at the read's time (kept).
+        let muted_direct = n % 3 == 0 && n % 5 < 2;
+        if n % 4 != 3 && !excluded.contains(&id.as_str()) && !muted_direct {
             expected.push(id.clone());
         }
-        seed(&store, &id, facts);
+        seed(&store, &id, &facts);
+        match n % 5 {
+            0 => mute(&store, &id, Some(NOW + 1)),
+            1 => mute(&store, &id, None),
+            2 => mute(&store, &id, Some(NOW)),
+            _ => {}
+        }
+        every_chat.push(id);
     }
     ready(&store);
     let query = ChatListViewQuery {
@@ -642,10 +975,12 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
         filter: Some(F::All(vec![
             F::Any(vec![cond(C::Unread), cond(C::Pinned)]),
             F::Not(Box::new(group_ids(&excluded))),
+            F::Not(Box::new(F::All(vec![cond(C::Direct), cond(C::Muted)]))),
         ])),
     };
-    let all = app.chat_list_ids(query.clone()).unwrap();
-    assert_eq!(all.len(), 387);
+    let all = app.chat_list_ids(query.clone(), NOW).unwrap();
+    assert_eq!(all.len(), expected.len());
+    assert!(all.len() > 200);
     let mut sorted = all.clone();
     sorted.sort();
     assert_eq!(sorted, expected);
@@ -655,6 +990,7 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
             limit,
             anchors,
             before_anchor: 0,
+            now_ms: NOW,
         })
         .unwrap()
         .page
@@ -672,4 +1008,13 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
         .map(|row| row.group_id_hex.clone())
         .collect();
     assert_eq!(tiled, all);
+    // Revalidation keeps the caller's order and exactly the matching chats.
+    every_chat.reverse();
+    let kept = app
+        .revalidate_chat_list_ids(query, &every_chat, NOW)
+        .unwrap();
+    let mut reversed = all.clone();
+    reversed.sort();
+    reversed.reverse();
+    assert_eq!(kept, reversed);
 }

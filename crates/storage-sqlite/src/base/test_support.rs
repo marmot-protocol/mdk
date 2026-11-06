@@ -86,6 +86,7 @@ pub(crate) fn chat_list_window_page(
         limit,
         anchors: Vec::new(),
         before_anchor: 0,
+        now_ms: crate::base::codec::unix_now_ms(),
     })
     .map(|read| read.page)
 }

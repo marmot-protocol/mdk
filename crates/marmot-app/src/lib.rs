@@ -611,6 +611,10 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Maps tokio's (pausable) clock onto Unix ms for chat-list reads, so a
+    /// test advances mute expiry and window wake-ups together.
+    #[cfg(test)]
+    chat_list_virtual_clock: Option<(i64, tokio::time::Instant)>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -1776,6 +1780,8 @@ impl MarmotApp {
             #[cfg(test)]
             directory_test_clock: None,
             #[cfg(test)]
+            chat_list_virtual_clock: None,
+            #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1890,6 +1896,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
+            #[cfg(test)]
+            chat_list_virtual_clock: None,
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -8014,6 +8022,25 @@ impl MarmotApp {
         Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
             client, stop,
         ))
+    }
+
+    /// The time chat-list reads test mute expiry against (Unix ms). Live
+    /// windows also wake by it, so a window and its reads agree on "now".
+    pub(crate) fn chat_list_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some((base_ms, started)) = self.chat_list_virtual_clock {
+            let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            return base_ms.saturating_add(elapsed);
+        }
+        notifications::unix_now_ms()
+    }
+
+    /// Chat-list time starts at `base_ms` and follows tokio's clock, which a
+    /// test pauses and advances. Call inside the test's runtime.
+    #[cfg(test)]
+    fn with_virtual_chat_list_clock(mut self, base_ms: i64) -> Self {
+        self.chat_list_virtual_clock = Some((base_ms, tokio::time::Instant::now()));
+        self
     }
 
     #[cfg(test)]

@@ -254,13 +254,14 @@ impl MarmotAppRuntime {
             .store_epoch
             .clone();
         let generation = hex::encode(rand::random::<[u8; 16]>());
+        let mute_wake = read.next_mute_expiry_ms;
         let snapshot = snapshot(read, &position, generation, 0, view);
         let (updates, rx) = watch::channel(Ok(snapshot.clone()));
         let (commands, command_rx) = mpsc::channel(8);
         tokio::spawn(run(
             reader,
             position,
-            snapshot.clone(),
+            (snapshot.clone(), mute_wake),
             Sources {
                 drafts,
                 avatars,
@@ -328,6 +329,7 @@ impl Reader {
             limit: position.limit,
             anchors,
             before_anchor: position.before,
+            now_ms: self.app.chat_list_now_ms(),
         };
         let app = self.app.clone();
         let label = self.label.clone();
@@ -526,7 +528,7 @@ impl Sources {
                     _ => {},
                 },
                 _ = async {
-                    if let Some(at) = expiry { tokio::time::sleep(Duration::from_millis(at.saturating_sub(crate::notifications::unix_now_ms()).max(0) as u64)).await; }
+                    if let Some(at) = expiry { tokio::time::sleep(Duration::from_millis(at.saturating_sub(reader.app.chat_list_now_ms()).max(0) as u64)).await; }
                     else { std::future::pending::<()>().await; }
                 } => return,
             }
@@ -598,7 +600,9 @@ fn command_position(
 async fn run(
     reader: Reader,
     mut position: Position,
-    mut current: ChatListWindowSnapshot,
+    // The published window, and for a Muted filter the next mute expiry its
+    // read reported among chats in the view, visible or not.
+    (mut current, mut mute_wake): (ChatListWindowSnapshot, Option<i64>),
     mut sources: Sources,
     mut resets: broadcast::Receiver<String>,
     mut commands: mpsc::Receiver<Command>,
@@ -609,10 +613,13 @@ async fn run(
     // First published sequence showing the viewport the latest command moved to.
     let mut viewport_sequence = current.sequence;
     loop {
+        // Visible rows show their mute state; a Muted filter's matches also
+        // change when an off-screen chat's mute expires.
         let expiry = current
             .rows
             .iter()
             .filter_map(|r| r.row.muted_until_ms)
+            .chain(mute_wake)
             .min();
         let command = if dirty {
             tokio::select! {
@@ -660,6 +667,7 @@ async fn run(
         };
         match result {
             Ok(read) => {
+                mute_wake = read.next_mute_expiry_ms;
                 let mut replacement = snapshot(
                     read,
                     &next,

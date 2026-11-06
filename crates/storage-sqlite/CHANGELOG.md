@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add `Direct`, `Group` and `Muted` chat-list filter conditions (mdk#2983). Migration 0179 adds
+  `chat_list_rows.list_kind`, kept equal to the classifier's conversation kind by triggers on the row's group name and
+  the account group's member count, and backfills existing rows; an Unknown kind matches neither leaf. `Muted` tests
+  mute settings against the read's time, so nothing is written when a mute expires. The migration also drops migration
+  0072's unread navigation-revision triggers; `chat_list_navigation_meta` stays for the pin-rewrite flag.
+  **Breaking:** `chat_list_ids` and `revalidate_chat_list_ids` take a trailing `now_ms`, and `ChatListWindowQuery`
+  adds `now_ms`; a window read's rows evaluate `muted` at that time too. `ChatListWindowRead` adds
+  `next_mute_expiry_ms`, the next mute expiry in the view for a query that tests `Muted`.
+
 - Migration 0177 adds a nullable coarse size diagnosis to existing pending Welcome repair pointers. Old rows remain
   Unknown; unknown future annotations preserve the pointer. Updating a failure diagnosis retains its existing identity
   and oldest-first position and adds no retry owner. Rust record literals add `size_class: None` when unknown;

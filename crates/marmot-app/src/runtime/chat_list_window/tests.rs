@@ -15,12 +15,22 @@ impl Fixture {
         Self::with_base_rows(count, true)
     }
     fn with_base_rows(count: usize, prepared: bool) -> Self {
+        Self::build(count, prepared, None)
+    }
+    /// Chat-list time starts at `base_ms` and follows tokio's paused clock.
+    fn at(count: usize, base_ms: i64) -> Self {
+        Self::build(count, true, Some(base_ms))
+    }
+    fn build(count: usize, prepared: bool, clock_base_ms: Option<i64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        if let Some(base_ms) = clock_base_ms {
+            app = app.with_virtual_chat_list_clock(base_ms);
+        }
         app.ensure_account_state("alice").unwrap();
         let store = app.account_storage("alice").unwrap();
         let groups = (0..count)
@@ -460,18 +470,13 @@ async fn archive_and_anchor_loss_recover_neighbors_then_reset_without_stale_spli
 // Overflows the invalidation broadcast without yielding so the window must
 // recover from lag; only one thread guarantees it cannot drain meanwhile.
 #[tokio::test(flavor = "current_thread")]
-async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire() {
+async fn lag_and_cancelled_receiver_recover_without_new_events() {
     let f = Fixture::new(20);
-    f.store
-        .app_storage()
-        .set_chat_muted("0000", Some(crate::notifications::unix_now_ms() + 1500))
-        .unwrap();
     let mut sub = f
         .runtime
         .open_chat_list_window("alice", ChatListView::Chats, Some(10))
         .await
         .unwrap();
-    assert!(sub.snapshot.rows[0].row.muted);
     assert!(
         tokio::time::timeout(Duration::from_millis(20), sub.recv())
             .await
@@ -494,9 +499,6 @@ async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire(
     }
     let unread = next(&mut sub).await;
     assert!(unread.rows[0].row.has_unread);
-    let unmuted = next(&mut sub).await;
-    assert!(!unmuted.rows[0].row.muted);
-    assert!(unmuted.sequence > unread.sequence);
     f.runtime.shutdown_and_close().await.unwrap();
     assert!(sub.recv().await.unwrap().is_none());
 }
@@ -1839,5 +1841,57 @@ async fn invalid_queries_fail_before_any_read() {
             .await,
         Err(AppError::Hex(_))
     ));
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Nothing is written when a mute expires. A visible row's mute icon, a Muted
+/// window and an unmuted window still change at the expiry, in virtual time:
+/// never before it, and within the window's invalidation coalescing after it.
+/// The unmuted window never showed the chat, so only the expiry its read
+/// reported for the whole view can wake it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn mute_expiry_changes_windows_at_expiry_even_off_screen() {
+    const BASE_MS: i64 = 1_700_000_000_000;
+    const EXPIRY: Duration = Duration::from_secs(60);
+    // The window waits this long after an invalidation before it re-reads.
+    const COALESCED: Duration = Duration::from_millis(10);
+    let f = Fixture::at(20, BASE_MS);
+    let store = f.store.app_storage();
+    store
+        .set_chat_muted("0000", Some(BASE_MS + EXPIRY.as_millis() as i64))
+        .unwrap();
+    store.set_chat_muted("0001", None).unwrap();
+    let started = tokio::time::Instant::now();
+    let open = |query: ChatListViewQuery| f.runtime.open_chat_list_window("alice", query, Some(5));
+    let mut plain = open(ChatListView::Chats.into()).await.unwrap();
+    let mut muted = open(filtered(ChatListFilter::Condition(
+        ChatListCondition::Muted,
+    )))
+    .await
+    .unwrap();
+    let mut unmuted = open(filtered(ChatListFilter::Not(Box::new(
+        ChatListFilter::Condition(ChatListCondition::Muted),
+    ))))
+    .await
+    .unwrap();
+    assert!(plain.snapshot.rows[0].row.muted);
+    assert_eq!(ids(&muted.snapshot), ["0000", "0001"]);
+    assert!(!ids(&unmuted.snapshot).contains(&"0000"));
+    let at_expiry = |elapsed: Duration| (EXPIRY..=EXPIRY + COALESCED).contains(&elapsed);
+    // A millisecond early, nothing has changed.
+    assert!(
+        tokio::time::timeout(EXPIRY - Duration::from_millis(1), muted.recv())
+            .await
+            .is_err()
+    );
+    let left = next(&mut muted).await;
+    assert!(at_expiry(started.elapsed()), "{:?}", started.elapsed());
+    assert_eq!(ids(&left), ["0001"]);
+    let entered = next(&mut unmuted).await;
+    assert!(at_expiry(started.elapsed()), "{:?}", started.elapsed());
+    assert_eq!(ids(&entered)[0], "0000");
+    let row = next(&mut plain).await;
+    assert!(at_expiry(started.elapsed()), "{:?}", started.elapsed());
+    assert!(!row.rows[0].row.muted);
     f.runtime.shutdown_and_close().await.unwrap();
 }

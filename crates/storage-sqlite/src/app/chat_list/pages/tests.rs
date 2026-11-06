@@ -67,6 +67,7 @@ fn query(
         limit,
         direction,
         boundary,
+        now_ms: 0,
     }
 }
 
@@ -473,7 +474,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                     let sql = format!(
                         "EXPLAIN QUERY PLAN {}",
                         navigation_sql(
-                            &ChatListViewQuery::from(view).compile().unwrap(),
+                            &ChatListViewQuery::from(view).compile(0).unwrap(),
                             relation,
                             direction,
                             false
@@ -822,6 +823,7 @@ fn window_query(
         limit,
         anchors: anchors.iter().map(|s| (*s).into()).collect(),
         before_anchor,
+        now_ms: 0,
     }
 }
 fn prepare_window_fixture(store: &SqliteAppStorage, id: &str) {

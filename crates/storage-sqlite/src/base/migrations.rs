@@ -367,6 +367,8 @@ mod migration_0174_heartbeat_welcome_repair;
 mod migration_0176_device_group_moves;
 #[path = "migrations/0177_welcome_failure_size_class.rs"]
 mod migration_0177_welcome_failure_size_class;
+#[path = "migrations/0179_chat_list_kind.rs"]
+mod migration_0179_chat_list_kind;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1385,6 +1387,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0177_welcome_failure_size_class",
         suspend_foreign_keys: &[],
         apply: migration_0177_welcome_failure_size_class::apply,
+    },
+    Migration {
+        version: 179,
+        name: "0179_chat_list_kind",
+        suspend_foreign_keys: &[],
+        apply: migration_0179_chat_list_kind::apply,
     },
 ];
 

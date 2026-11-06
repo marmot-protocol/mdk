@@ -33,8 +33,10 @@ impl MarmotAppRuntime {
         query: impl Into<ChatListViewQuery>,
     ) -> Result<Vec<String>, AppError> {
         let query = prepare_query(query)?;
-        self.read_selection(account_ref, move |storage| storage.chat_list_ids(query))
-            .await
+        self.read_selection(account_ref, move |storage, now_ms| {
+            storage.chat_list_ids(query, now_ms)
+        })
+        .await
     }
 
     /// The subset of `group_ids` still matching `query`, in the caller's order
@@ -53,8 +55,8 @@ impl MarmotAppRuntime {
             .iter()
             .map(|id| crate::ids::normalize_group_id_hex_app(id))
             .collect::<Result<Vec<_>, _>>()?;
-        self.read_selection(account_ref, move |storage| {
-            storage.revalidate_chat_list_ids(query, &group_ids)
+        self.read_selection(account_ref, move |storage, now_ms| {
+            storage.revalidate_chat_list_ids(query, &group_ids, now_ms)
         })
         .await
     }
@@ -62,13 +64,14 @@ impl MarmotAppRuntime {
     async fn read_selection(
         &self,
         account_ref: &str,
-        read: impl FnOnce(&SqliteAppStorage) -> Result<Vec<String>, ChatListSelectionError>
+        read: impl FnOnce(&SqliteAppStorage, i64) -> Result<Vec<String>, ChatListSelectionError>
         + Send
         + 'static,
     ) -> Result<Vec<String>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let app = self.accounts.app.clone();
+        let now_ms = app.chat_list_now_ms();
         blocking_app_task(move || {
             // The label may have been reused by another identity since it was
             // resolved; never read the replacement account's chats.
@@ -83,7 +86,7 @@ impl MarmotAppRuntime {
                 &storage,
                 &account.account_id_hex,
             )?;
-            read(&storage).map_err(|error| match error {
+            read(&storage, now_ms).map_err(|error| match error {
                 ChatListSelectionError::ProjectionNotReady => AppError::ChatPresentationNotReady,
                 ChatListSelectionError::InvalidQuery(error) => {
                     AppError::InvalidChatListQuery(error)
