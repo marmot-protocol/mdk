@@ -298,4 +298,4 @@ pub(super) fn repaired(turn: &DebtTurn<'_>, requested: u64) -> StorageResult<boo
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+mod tests;

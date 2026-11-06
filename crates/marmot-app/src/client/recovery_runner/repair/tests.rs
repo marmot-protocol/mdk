@@ -375,10 +375,7 @@ async fn an_unadmitted_staged_event_is_never_a_covered_window() {
 }
 
 /// A group message on `route` the engine has never seen.
-pub(in crate::client::recovery_runner) fn unadmitted(
-    route: &TransportReconciliationRoute,
-    at: u64,
-) -> cgka_traits::TransportDelivery {
+fn unadmitted(route: &TransportReconciliationRoute, at: u64) -> cgka_traits::TransportDelivery {
     use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
     let TransportReconciliationRoute::Group(transport_group_id) = route else {
         panic!("a group route");
