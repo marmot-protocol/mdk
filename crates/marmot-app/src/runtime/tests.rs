@@ -4577,7 +4577,6 @@ fn generated_setup_profile_adopts_a_selected_profile_only_before_local_readiness
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_invite_decline_does_not_leave_the_group() {
-    use crate::tests::{every_subscription, scripted_eose_pump};
     let dir = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -4586,8 +4585,7 @@ async fn abandoned_invite_decline_does_not_leave_the_group() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
-    let plane = transport_nostr::MarmotRelayPlane::new(None, relay.clone());
-    let _pump = scripted_eose_pump(plane.clone(), relay, every_subscription);
+    let plane = transport_nostr::MarmotRelayPlane::new(None, relay);
     let group = {
         let mut alice = app
             .client_with_relay_plane("alice", &plane, None)
@@ -4617,6 +4615,9 @@ async fn abandoned_invite_decline_does_not_leave_the_group() {
 
     let runtime = MarmotAppRuntime::new(app.clone());
     let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+    // Startup hydration defers declines but runs accepts immediately; the
+    // incident ordering needs the steady-state worker's FIFO.
+    runtime.catch_up_accounts().await.unwrap();
     let (respond, response) = oneshot::channel();
     drop(response);
     commands
@@ -4627,12 +4628,13 @@ async fn abandoned_invite_decline_does_not_leave_the_group() {
         .await
         .unwrap();
 
-    // The abandoned decline is skipped, so the invite is still pending for
-    // the decline the account actually waits for.
-    let declined = runtime
-        .decline_group_invite("bob", &group)
+    // A caller that gave up on that decline accepts instead. The accept is
+    // queued behind the abandoned decline, which must not leave the group.
+    let accepted = runtime
+        .accept_group_invite("bob", &group)
         .await
         .expect("an abandoned decline must not consume the pending invite");
-    assert_eq!(declined.summary.published, 1);
+    assert!(!accepted.pending_confirmation);
+    assert_eq!(accepted.self_membership, crate::SelfMembership::Member);
     runtime.shutdown_and_close().await.unwrap();
 }
