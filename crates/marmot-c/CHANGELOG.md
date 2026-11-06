@@ -14,6 +14,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   opens: its calls return `MARMOT_STATUS_RUNTIME` with `experimental_device_groups_required` (mdk#3012). Open
   experimental device-group roots with `marmot_client_new_with_experimental_device_groups` in every opener.
 
+- Add NIP-51 emoji sets: `marmot_sync_emoji_sets`, `marmot_emoji_sets`, `marmot_emoji_set`,
+  `marmot_fetch_emoji_set`, `marmot_user_emoji_list`, `marmot_install_emoji_set`, `marmot_uninstall_emoji_set`,
+  `marmot_fetch_emoji_set_asset`, `marmot_installed_custom_emoji` and `marmot_read_installed_custom_emoji`, with
+  their owned records and free functions. Append statuses 121–126 (`MARMOT_STATUS_INVALID_EMOJI_SET` through
+  `MARMOT_STATUS_EMOJI_SET_LIMIT`). Additive; use the matching header/library.
+
 - Add filtered chat-list queries (mdk#2983): `marmot_open_chat_list_query_window`, `marmot_chat_list_query_ids` and
   `marmot_revalidate_chat_list_query_ids` take a borrowed `MarmotChatListViewQuery` whose filter is an array of
   `MarmotChatListFilterNode` (kind and condition are `uint32_t` discriminants). Append

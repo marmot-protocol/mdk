@@ -1567,6 +1567,12 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::StickerExternalSignerImportUnsupported => {
             "read_marker_failed:sticker_external_signer_import_unsupported"
         }
+        AppError::InvalidEmojiSet(_) => "read_marker_failed:invalid_emoji_set",
+        AppError::EmojiSetNotFound => "read_marker_failed:emoji_set_not_found",
+        AppError::EmojiSetNetwork(_) => "read_marker_failed:emoji_set_network",
+        AppError::EmojiImageTooLarge(_) => "read_marker_failed:emoji_image_too_large",
+        AppError::EmojiImageUnsupported(_) => "read_marker_failed:emoji_image_unsupported",
+        AppError::EmojiSetLimit(_) => "read_marker_failed:emoji_set_limit",
         AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
         AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",

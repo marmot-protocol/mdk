@@ -16,6 +16,7 @@ mod compromise_warning;
 mod device_link;
 mod directory;
 mod draft;
+mod emoji_set;
 mod group;
 mod history_import;
 mod history_notice;

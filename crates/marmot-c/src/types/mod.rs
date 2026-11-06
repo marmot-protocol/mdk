@@ -16,6 +16,7 @@ pub mod compromise_warning;
 pub mod device_link;
 pub mod directory;
 pub mod draft;
+pub mod emoji_set;
 pub mod event;
 pub mod group;
 pub mod history_import;

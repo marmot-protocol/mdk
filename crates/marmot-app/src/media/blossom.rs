@@ -710,6 +710,63 @@ pub(crate) async fn fetch_blossom_blob_limited(
     fetch_blossom_blob_limited_with_transport(url, &transport).await
 }
 
+/// Bounded fetch of a public image named by someone else (a custom emoji in a
+/// NIP-51 set): the same URL, DNS-pinning, redirect, proxy and timeout policy
+/// as [`fetch_blossom_blob_limited`], returning the response's `Content-Type`
+/// so the caller can check it against the bytes' magic numbers.
+pub(crate) async fn fetch_public_image_limited(
+    url: &str,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+) -> Result<(Vec<u8>, Option<String>), PublicImageFetchError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_http).with_download_limit(max_bytes);
+    fetch_blossom_blob_bounded_classified(
+        url,
+        &transport,
+        None,
+        tokio::time::Instant::now() + transport.transfer_timeout,
+        transport.download_limit,
+    )
+    .await
+    .map(|blob| (blob.bytes, blob.content_type))
+    .map_err(|failure| match failure {
+        AttachmentDownloadFailure::SizeLimit(..) => PublicImageFetchError::TooLarge,
+        failure => match failure.into_error() {
+            // The in-memory body reader reports a declared or streamed
+            // overrun as a stopped `BlobStore` failure with this wording.
+            AppError::BlobStore(detail) if detail.starts_with("download exceeds ") => {
+                PublicImageFetchError::TooLarge
+            }
+            AppError::UnsafeMediaFetch(_) => PublicImageFetchError::Refused,
+            _ => PublicImageFetchError::Failed,
+        },
+    })
+}
+
+/// Why [`fetch_public_image_limited`] returned no bytes. Details stay out:
+/// they can name the host the set author chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicImageFetchError {
+    /// The body exceeded the caller's ceiling (declared or streamed).
+    TooLarge,
+    /// The URL failed the destination policy before anything was dialed.
+    Refused,
+    /// Anything else: DNS, connect, TLS, HTTP status, redirect, timeout.
+    Failed,
+}
+
+/// The response's media type without parameters, lowercased, when it is a
+/// short printable header value.
+fn response_content_type(response: &reqwest::Response) -> Option<String> {
+    let value = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?;
+    let media_type = value.split(';').next()?.trim();
+    (!media_type.is_empty() && media_type.len() <= 128).then(|| media_type.to_ascii_lowercase())
+}
+
 /// The overall deadline is the transport's transfer bound, like every other
 /// download; candidate startup keeps its own shorter bound inside the fetch.
 /// The byte ceiling is the transport's clamped limit, never a caller value
@@ -1165,6 +1222,9 @@ pub(super) struct FetchedBlob {
     pub response_url: Url,
     /// The body contains saved checkpoint bytes and may need one clean retry.
     pub resumed: bool,
+    /// The final response's `Content-Type`, when it sent a readable one. A
+    /// body completed from a saved checkpoint has none.
+    pub content_type: Option<String>,
 }
 
 pub(super) async fn fetch_blossom_blob_classified_until(
@@ -1422,6 +1482,7 @@ where
                 bytes: partial.expect("checked").1,
                 response_url: current,
                 resumed: true,
+                content_type: None,
             });
         }
         // DNS/host setup is network work too: failed resolution must consume
@@ -1545,6 +1606,7 @@ where
             }
         };
         let status = response.status();
+        let content_type = response_content_type(&response);
         if status.is_server_error() && !retried {
             retried = true;
             drop(response);
@@ -1626,6 +1688,7 @@ where
                     bytes,
                     response_url: current,
                     resumed,
+                    content_type,
                 });
             }
         }
@@ -1644,6 +1707,7 @@ where
                 bytes,
                 response_url: current,
                 resumed: false,
+                content_type,
             });
         }
         if !status.is_redirection() {

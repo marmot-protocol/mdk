@@ -10,6 +10,12 @@
   `experimental_device_groups_required` (mdk#3012). Open experimental device-group roots with
   `newWithExperimentalDeviceGroups` in every opener, including notification service extensions.
 
+- Add NIP-51 emoji sets: `sync_emoji_sets`, `emoji_sets`, `emoji_set`, `fetch_emoji_set`, `user_emoji_list`,
+  `install_emoji_set`, `uninstall_emoji_set`, `fetch_emoji_set_asset`, `installed_custom_emoji` and
+  `read_installed_custom_emoji`, with their records and `EmojiSkipReasonFfi`. New `MarmotKitError` cases
+  `InvalidEmojiSet`, `EmojiSetNotFound`, `EmojiSetNetwork`, `EmojiImageTooLarge`, `EmojiImageUnsupported` and
+  `EmojiSetLimit`; exhaustive Swift/Kotlin error switches need the new cases. Regenerate bindings to use them.
+
 - Add filtered chat-list queries (mdk#2983): `open_chat_list_query_window`, `chat_list_query_ids` and
   `revalidate_chat_list_query_ids` take a `ChatListViewQueryFfi` whose filter is a flat `ChatListFilterNodeFfi` list
   (node 0 is the root; children are later indices). Invalid queries fail with the new

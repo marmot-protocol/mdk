@@ -48,12 +48,16 @@ use crypto::{
 #[cfg(not(test))]
 use crypto::{derive_media_file_key, media_aad};
 pub(crate) use host_safety::parse_profile_image_fetch_url;
-use host_safety::{validate_blossom_fetch_url, validate_locator};
+pub(crate) use host_safety::validate_blossom_fetch_url;
+use host_safety::validate_locator;
 
 pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
 #[cfg(test)]
 pub(crate) use blossom::fetch_blossom_blob;
-pub(crate) use blossom::{BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_limited};
+pub(crate) use blossom::{
+    BlossomHttpTransport, PublicImageFetchError, blossom_blob_url, fetch_blossom_blob_limited,
+    fetch_public_image_limited,
+};
 pub use group_image::{MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS};
 pub(crate) use group_image::{
     fetch_group_image_with_transport, prepare_group_image_upload, upload_group_image,

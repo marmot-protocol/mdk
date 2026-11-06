@@ -95,6 +95,7 @@ mod directory_resources;
 #[cfg(test)]
 mod directory_tests;
 mod drafts;
+mod emoji_sets;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod backup_archive;
@@ -108,6 +109,7 @@ mod history_delivery;
 mod history_notices;
 pub use history_notices::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 mod ids;
+mod image_inspect;
 mod key_package_records;
 #[cfg(test)]
 mod local_open_test_gate;
@@ -150,6 +152,14 @@ mod test_support;
 pub use cgka_traits::EventSizeClass;
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
+pub use emoji_sets::{
+    AppEmojiSet, AppEmojiSetAsset, AppEmojiSetEmoji, AppEmojiSetInstallResult,
+    AppEmojiSetSyncResult, AppEmojiSkip, AppEmojiSkipReason, AppInstalledCustomEmoji,
+    AppInstalledCustomEmojiAsset, AppInstalledEmojiSetState, AppUserEmojiList, EMOJI_SET_KIND,
+    MAX_CUSTOM_EMOJI_SHORTCODE_BYTES, MAX_DISCOVERY_EMOJI_SETS, MAX_EMOJI_IMAGE_BYTES,
+    MAX_EMOJI_PER_SET, MAX_INSTALLED_EMOJI_BYTES, MAX_INSTALLED_EMOJI_SET_BYTES,
+    MAX_INSTALLED_EMOJI_SETS, USER_EMOJI_LIST_KIND, parse_emoji_set_input,
 };
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
@@ -667,6 +677,7 @@ pub struct MarmotApp {
     /// The mutex values are lifecycle-only; protocol truth and pending intent
     /// remain in the account SQLCipher database.
     sticker_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    emoji_set_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1815,6 +1826,7 @@ impl MarmotApp {
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_set_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1932,6 +1944,7 @@ impl MarmotApp {
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_set_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

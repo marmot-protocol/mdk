@@ -1105,7 +1105,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
   reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host
   correlation; no relay I/O),
-  `user_blocks.rs` (block policy and NIP-51 sync), `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
+  `user_blocks.rs` (block policy and NIP-51 sync), `emoji_sets.rs` (NIP-51 emoji sets: text-only discovery,
+  the account's kind-10030 list read only, installed snapshots pinned by event id and SHA-256; tests in
+  `emoji_sets/tests.rs`; image bytes only from `install_emoji_set` and `fetch_emoji_set_asset`, never from sync, and
+  never write kind 10030 or put a set URL or address in a message), `image_inspect.rs` (PNG/APNG, GIF, WebP and JPEG
+  header inspection and dimension/frame caps shared by stickers and emoji sets; stickers still refuse JPEG),
+  `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
   to the deployment operator: config validation, staged outbox, retry, purge; tests in
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in

@@ -205,6 +205,20 @@ pub enum MarmotStatus {
     /// A chat-list query broke a size bound or its node list was not one tree.
     /// Detail names the `MarmotChatListQueryError`; nothing was read.
     InvalidChatListQuery = 120,
+    /// An emoji set, its address or an entry is malformed, or no emoji in it
+    /// could be installed. Retrying the same input cannot succeed.
+    InvalidEmojiSet = 121,
+    /// The emoji set, or the emoji in it, is not known locally.
+    EmojiSetNotFound = 122,
+    /// Relays or an image host could not be reached; retry later.
+    EmojiSetNetwork = 123,
+    /// An emoji image is over 4 MiB, 4096 px per side, or 200 frames.
+    EmojiImageTooLarge = 124,
+    /// An emoji image is not PNG/APNG, GIF, WebP or JPEG, is malformed, or
+    /// its stated MIME type does not match its bytes.
+    EmojiImageUnsupported = 125,
+    /// The installed-set or stored-byte cap is reached.
+    EmojiSetLimit = 126,
 }
 
 thread_local! {
@@ -303,6 +317,12 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::StickerNetwork { .. } => MarmotStatus::StickerNetwork,
         MarmotKitError::StickerImport { .. } => MarmotStatus::StickerImport,
         MarmotKitError::StickerImportUnsupported => MarmotStatus::StickerImportUnsupported,
+        MarmotKitError::InvalidEmojiSet { .. } => MarmotStatus::InvalidEmojiSet,
+        MarmotKitError::EmojiSetNotFound => MarmotStatus::EmojiSetNotFound,
+        MarmotKitError::EmojiSetNetwork { .. } => MarmotStatus::EmojiSetNetwork,
+        MarmotKitError::EmojiImageTooLarge { .. } => MarmotStatus::EmojiImageTooLarge,
+        MarmotKitError::EmojiImageUnsupported { .. } => MarmotStatus::EmojiImageUnsupported,
+        MarmotKitError::EmojiSetLimit { .. } => MarmotStatus::EmojiSetLimit,
         MarmotKitError::AccountUnlinked { .. } => MarmotStatus::AccountUnlinked,
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
@@ -633,6 +653,22 @@ mod tests {
                 details: "d".into(),
             },
             MarmotKitError::StickerImportUnsupported,
+            MarmotKitError::InvalidEmojiSet {
+                details: "d".into(),
+            },
+            MarmotKitError::EmojiSetNotFound,
+            MarmotKitError::EmojiSetNetwork {
+                details: "d".into(),
+            },
+            MarmotKitError::EmojiImageTooLarge {
+                details: "d".into(),
+            },
+            MarmotKitError::EmojiImageUnsupported {
+                details: "d".into(),
+            },
+            MarmotKitError::EmojiSetLimit {
+                details: "d".into(),
+            },
             MarmotKitError::AccountUnlinked {
                 account_ref: "a".into(),
             },
@@ -650,7 +686,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            111,
+            117,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(MarmotStatus::GroupInviteNotPending as i32, 61);
@@ -751,6 +787,18 @@ mod tests {
                 size_class: marmot_uniffi::EventSizeClassFfi::Under64Kib,
             }) as i32,
             119
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::InvalidEmojiSet {
+                details: "d".into()
+            }) as i32,
+            121
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::EmojiSetLimit {
+                details: "d".into()
+            }) as i32,
+            126
         );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {
