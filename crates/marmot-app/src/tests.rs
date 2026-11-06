@@ -531,6 +531,9 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
     });
 }
 
+/// Which (REQ, relay) a [`ScriptedPushRelayClient`] leaves unanswered.
+pub(crate) type HeldReply = fn(&NostrSubscription, &TransportEndpoint) -> bool;
+
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
     pub(crate) acquisition_result:
@@ -551,7 +554,7 @@ pub(crate) struct ScriptedPushRelayClient {
     /// What the scripted relays send the plane: each accepted REQ's reply.
     messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
     /// Which (REQ, endpoint) the relay leaves unanswered; none by default.
-    hold_replies: std::sync::Mutex<Option<fn(&NostrSubscription, &TransportEndpoint) -> bool>>,
+    hold_replies: std::sync::Mutex<Option<HeldReply>>,
     /// Accepted REQs (wire id, subscription, endpoint) the relay has not
     /// answered yet.
     held_replies: std::sync::Mutex<Vec<(String, NostrSubscription, TransportEndpoint)>>,
@@ -1008,10 +1011,7 @@ impl ScriptedPushRelayClient {
     /// Leave each (REQ, relay) that `hold` selects unanswered from now on,
     /// as a relay that has not finished, or never finishes, its stored
     /// events. `None` answers every later REQ again.
-    pub(crate) fn hold_replies(
-        &self,
-        hold: Option<fn(&NostrSubscription, &TransportEndpoint) -> bool>,
-    ) {
+    pub(crate) fn hold_replies(&self, hold: Option<HeldReply>) {
         *self.hold_replies.lock().unwrap() = hold;
     }
 

@@ -372,18 +372,19 @@ impl ScriptedRelayMessages {
         };
         tokio::time::timeout(Duration::from_secs(10), async {
             for spin in 0usize.. {
-                let flushed = self
-                    .flushed
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // A plane that shut down meanwhile handles nothing more.
-                if pending
-                    .iter()
-                    .all(|(id, sender)| flushed.contains(id) || sender.is_closed())
-                {
+                let done = {
+                    let flushed = self
+                        .flushed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // A plane that shut down meanwhile handles nothing more.
+                    pending
+                        .iter()
+                        .all(|(id, sender)| flushed.contains(id) || sender.is_closed())
+                };
+                if done {
                     return;
                 }
-                drop(flushed);
                 // Yield first: a paused clock must not move while the plane
                 // catches up.
                 if spin < 10_000 {
