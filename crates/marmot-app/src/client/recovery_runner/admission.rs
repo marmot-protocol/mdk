@@ -930,15 +930,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 .iter()
                 .map(|(_, event_id)| event_id.clone())
                 .collect::<Vec<_>>();
+            // One transaction: a failure lets no row of the batch go, and the
+            // next admission settles each again.
             let removed = match self
                 .host
                 .turn(move |turn| {
-                    event_ids
-                        .iter()
-                        .map(|event_id| {
-                            Ok(turn.app.remove_seen_staged_recovery_events(&[event_id])? > 0)
-                        })
-                        .collect::<StorageResult<Vec<bool>>>()
+                    let event_ids = event_ids.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                    turn.app.remove_seen_staged_recovery_events(&event_ids)
                 })
                 .await
             {

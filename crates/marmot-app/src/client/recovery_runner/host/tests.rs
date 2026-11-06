@@ -555,6 +555,104 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(passes(&client), 2);
 }
 
+/// Admission writes a command's inventory rows once, after its last ingest
+/// and before its settle. A crash between the two leaves an event the
+/// account holds, still staged, with no row. The restarted runner admits the
+/// staged copy again as held: the event gains its row, staging lets it go,
+/// and the window its slice proved stays proven. Nothing is fetched again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_before_the_inventory_write_readmits_the_held_event() {
+    use storage_sqlite::{RecoveryCoverageRange, RecoveryStagedSlice};
+    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let group = client.create_group("group", &[]).await.unwrap();
+    let route = group_routes(&client).remove(0);
+    let relay = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|candidate| candidate.route == route)
+        .unwrap()
+        .required[0]
+        .clone();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let now = unix_now_seconds();
+    cover_inbox(&client, &storage);
+    storage
+        .record_recovery_coverage(
+            &[RecoveryCoverageSlice {
+                route: &route,
+                relay: &relay,
+                since_seconds: 0,
+                until_seconds: now + DAY,
+                proof: RecoveryCoverageProof::Comparison,
+            }],
+            now + DAY,
+        )
+        .unwrap();
+    // A group message the plane routed, as a sweep stages it.
+    let mut held = super::super::repair::tests::unadmitted(&route, now - 60);
+    held.group_id_hint = Some(group);
+    let window = RecoveryCoverageRange {
+        since_seconds: now - HOUR,
+        until_seconds: now,
+    };
+    storage
+        .stage_recovery_slice(
+            &RecoveryStagedSlice {
+                route: &route,
+                relay: &relay,
+                events: std::slice::from_ref(&held),
+                fetched_bytes: 0,
+                covered: &[window],
+                proof: RecoveryCoverageProof::SweepSlice,
+                mark: storage.recovery_coverage_mark().unwrap(),
+            },
+            now + DAY,
+        )
+        .unwrap();
+    // The ingest committed and the process died before the command wrote
+    // its inventory.
+    client.remember_seen_event(hex::encode(held.message.id.as_slice()));
+    client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    drop(client);
+    let inventory = || {
+        storage
+            .transport_reconciliation_inventory(&route, now + 1)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.event_id.to_vec())
+            .collect::<Vec<_>>()
+    };
+    let proven = || {
+        storage
+            .recovery_coverage_ranges(&route, &relay)
+            .unwrap()
+            .iter()
+            .any(|proved| {
+                proved.range.since_seconds <= window.since_seconds
+                    && proved.range.until_seconds >= window.until_seconds
+            })
+    };
+    assert!(!inventory().contains(&held.message.id.as_slice().to_vec()));
+    assert_eq!(storage.staged_recovery_total().unwrap().events, 1);
+    assert!(proven());
+
+    let mut client = app.client("alice").await.unwrap();
+    client.run_recovery_runner_pass().await.unwrap();
+    assert!(
+        inventory().contains(&held.message.id.as_slice().to_vec()),
+        "the held event gained its row"
+    );
+    assert_eq!(
+        storage.staged_recovery_total().unwrap().events,
+        0,
+        "staging let the held copy go"
+    );
+    assert!(proven(), "the slice's window stays proven");
+}
+
 /// Bob's app over `dir` on `url`, as one `wn` process opens it.
 fn process_app(dir: &std::path::Path, url: &str) -> crate::MarmotApp {
     crate::MarmotApp::with_relay_and_config(

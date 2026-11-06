@@ -38,7 +38,7 @@ use super::{
     RecoveryRunnerPolicy, RepairEnd, RunnerHost, TARGET, UnitKey, WorkerTurn,
 };
 use crate::MarmotApp;
-use crate::client::sync::{RecoveredDelivery, TRANSPORT_RECONCILIATION_QUANTUM};
+use crate::client::sync::{InventoryRecord, RecoveredDelivery, TRANSPORT_RECONCILIATION_QUANTUM};
 use crate::client::{AppClient, InventoryWrite};
 use crate::relay_caps::RelayCapsCache;
 
@@ -289,8 +289,9 @@ impl RunnerHost for AccountRunnerHost {
         self.on_client(true, move |client| {
             Box::pin(async move {
                 let mut outcomes = Vec::with_capacity(deliveries.len());
+                let mut inventory = Vec::with_capacity(deliveries.len());
                 for delivery in deliveries {
-                    let outcome = admit(client, &delivery).await;
+                    let outcome = admit(client, &delivery, &mut inventory).await;
                     let stopped = !matches!(outcome, Ok(Admitted::Kept));
                     outcomes.push(outcome);
                     // Same bounded batch as comparison admission. Publish any
@@ -303,6 +304,8 @@ impl RunnerHost for AccountRunnerHost {
                         break;
                     }
                 }
+                // Before the runner's settle can let any staged copy go.
+                client.record_deferred_reconciliation_items(&inventory);
                 Some(outcomes)
             })
         })
@@ -332,15 +335,20 @@ impl RunnerHost for AccountRunnerHost {
 
 /// Admit one staged delivery through the account's recovered-ingest path. An
 /// event the account holds, or now persisted, is kept; one the engine kept no
-/// trace of, or refused for its group's resources, stays fetchable.
+/// trace of, or refused for its group's resources, stays fetchable. A plain
+/// message's or a held event's inventory row joins `inventory`, which the
+/// command records once at its end; structural input records its own row at
+/// once, as the native path's turns do (`InventoryWrite::NativeTurn`).
 async fn admit(
     client: &mut AppClient,
     delivery: &TransportDelivery,
+    inventory: &mut Vec<InventoryRecord>,
 ) -> Result<Admitted, &'static str> {
-    let (summary, settled, _) = client
-        .admit_recovered_delivery(delivery, InventoryWrite::Immediate)
+    let (summary, settled, record) = client
+        .admit_recovered_delivery(delivery, InventoryWrite::NativeTurn)
         .await
         .map_err(|error| error.privacy_safe_kind())?;
+    inventory.extend(record);
     client.pending_applied_sync_summary.merge(summary);
     Ok(match settled {
         RecoveredDelivery::AlreadyHeld

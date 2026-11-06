@@ -250,7 +250,7 @@ fn only_seen_rows_leave_staging() {
     assert_eq!(
         app.remove_seen_staged_recovery_events(&[&one, &three])
             .unwrap(),
-        1
+        [true, false]
     );
     assert_eq!(
         staged_ids(
@@ -260,6 +260,49 @@ fn only_seen_rows_leave_staging() {
         vec![3]
     );
     assert_eq!(app.staged_recovery_total().unwrap().events, 1);
+}
+
+/// A batch's removal is one transaction: a failure part-way through removes
+/// none of its rows, so each stays staged for the next admission to settle.
+#[test]
+fn a_failed_removal_leaves_the_whole_batch_staged() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let route = group(1);
+    let mark = app.recovery_coverage_mark().unwrap();
+    stage(
+        &app,
+        &route,
+        RELAY,
+        &[delivery(1), delivery(2), delivery(3)],
+        range(0, 10),
+        mark,
+    );
+    for id in [1, 2, 3] {
+        mark_seen(&app, id);
+    }
+    app.lock()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_second BEFORE DELETE ON account_recovery_staged
+             WHEN old.event_id = x'{}' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            hex::encode([2u8; 32])
+        ))
+        .unwrap();
+    let ids = [[1u8; 32], [2u8; 32], [3u8; 32]];
+    let ids = ids.iter().map(<[u8; 32]>::as_slice).collect::<Vec<_>>();
+    assert!(app.remove_seen_staged_recovery_events(&ids).is_err());
+    assert_eq!(app.staged_recovery_total().unwrap().events, 3);
+
+    app.lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_second")
+        .unwrap();
+    assert_eq!(
+        app.remove_seen_staged_recovery_events(&ids).unwrap(),
+        [true, true, true]
+    );
+    assert_eq!(app.staged_recovery_total().unwrap().events, 0);
 }
 
 /// A row that no longer decodes is reported, and discarding it owes its
