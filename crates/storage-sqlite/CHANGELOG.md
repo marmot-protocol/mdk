@@ -48,6 +48,13 @@
   `ChatPresentationInput` adds `group_description` (captured) and `search_peer_names` (set by preparation), and
   `ChatListFilter`, `ChatListFilterNode`, `ChatListQueryError` and `ChatListPageError` gain variants.
 
+- Idle maintenance reads answer without a writer transaction (mdk#2923 step 1): upload recovery and pruning,
+  recovery-job retention, the push join-window count, chat presentation inputs, recovery conversion and loss
+  import, and legacy message promotion each check read-only first. New reads: `content_reports_backfill_complete`,
+  `has_legacy_attachment_work`, `has_database_held_avatars`, `has_file_backed_uploads`, `media_cleanup_epoch` (a
+  per-connection count of deleted `media_files` and `attachment_partial` rows, kept in TEMP tables; no migration)
+  and `connection_serial`, unique to each opened handle.
+
 - Add `Direct`, `Group` and `Muted` chat-list filter conditions (mdk#2983). Migration 0179 adds
   `chat_list_rows.list_kind`, kept equal to the classifier's conversation kind by triggers on the row's group name and
   the account group's member count, and backfills existing rows; an Unknown kind matches neither leaf. `Muted` tests

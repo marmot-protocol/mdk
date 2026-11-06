@@ -3195,6 +3195,84 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.shutdown().await;
 }
 
+/// What idle ticks do once a worker's startup housekeeping has settled
+/// (mdk#2923 §4): no writer transaction, no blocking-pool housekeeping
+/// batch, media sweep or upload promotion, while every tick still runs its
+/// phases and sets its passes due.
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    // The first tick fires on entry and starts the startup housekeeping:
+    // let it, its passes and the blocking work they spawn all finish.
+    let settle = || async {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first maintenance tick completes");
+    settle().await;
+    const COUNTED: [RuntimeOp; 7] = [
+        RuntimeOp::WorkerMaintenance,
+        RuntimeOp::StorageWriteBegin,
+        RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+        RuntimeOp::WorkerMediaSweep,
+        RuntimeOp::WorkerUploadPromotion,
+        RuntimeOp::WorkerAttachmentPass,
+        RuntimeOp::WorkerPresentationPass,
+    ];
+    let snapshot = || COUNTED.map(count);
+    // Settle one more tick, which may still finish startup work.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    settle().await;
+    let before = snapshot();
+    for _ in 0..3 {
+        let ticks = count(RuntimeOp::WorkerMaintenance);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while count(RuntimeOp::WorkerMaintenance) == ticks {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an idle tick completes");
+        settle().await;
+    }
+    let after = snapshot();
+    let delta = |index: usize| after[index] - before[index];
+    assert_eq!(delta(0), 3, "three idle ticks ran");
+    assert_eq!(
+        delta(1),
+        0,
+        "an idle tick takes no app-storage writer transaction"
+    );
+    assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
+    assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");
+    assert_eq!(delta(4), 0, "no staged upload spawns no promotion");
+    // Each tick still sets its passes due (per-account wakes are step 2).
+    assert_eq!(delta(5), 3, "one attachment pass per tick");
+    assert_eq!(delta(6), 3, "one presentation pass per tick");
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_worker_open_records_no_startup_stage_spans() {
     let dir = tempfile::tempdir().expect("tempdir");

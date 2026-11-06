@@ -1641,6 +1641,21 @@ impl super::AppClient {
                 return Err(error);
             }
         };
+        // The backfill only ever finishes: once its cursor reaches the frozen
+        // prefix, stop asking, and take no writer (mdk#2923 §4). The first
+        // finished check is still audited.
+        let serial = storage.app_storage().connection_serial();
+        if self.content_report_backfill_done == Some(serial) {
+            return Ok(());
+        }
+        if matches!(
+            storage.app_storage().content_reports_backfill_complete(),
+            Ok(true)
+        ) {
+            self.content_report_backfill_done = Some(serial);
+            self.record_v5_content_report_backfill(Ok(&Vec::new()), started.elapsed());
+            return Ok(());
+        }
         // A failed chat-list conversion must roll back the backfill cursor and
         // all projections. Queue the complete batch only after it commits.
         let updates = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {

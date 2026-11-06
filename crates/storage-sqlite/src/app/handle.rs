@@ -27,4 +27,11 @@ impl SqliteAppStorage {
     pub fn shares_connection_with(&self, other: &SqliteAppStorage) -> bool {
         self.connection.same_as(&other.connection)
     }
+
+    /// A process-unique number for this opened handle, never reused. State
+    /// derived from the database's data keys on it, so a reopened, reset or
+    /// replaced database derives it again (mdk#2923).
+    pub fn connection_serial(&self) -> u64 {
+        self.connection.serial()
+    }
 }
