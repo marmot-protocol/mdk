@@ -724,6 +724,29 @@ mod experimental_host {
                                 .contains("pairing_unsupported")
                         );
                         unsafe { marmot_c::marmot_string_free(detail) };
+                        refused = std::ptr::dangling_mut();
+                        assert_ne!(
+                            unsafe {
+                                marmot_reset_device_group_for_repair(
+                                    clients[0],
+                                    account.as_ref().unwrap().as_ptr(),
+                                    &mut refused,
+                                )
+                            },
+                            MarmotStatus::Ok
+                        );
+                        assert!(
+                            refused.is_null(),
+                            "ordinary opens also refuse explicit reset"
+                        );
+                        let detail = marmot_c::marmot_last_error_message();
+                        assert!(
+                            unsafe { CStr::from_ptr(detail) }
+                                .to_str()
+                                .unwrap()
+                                .contains("pairing_unsupported")
+                        );
+                        unsafe { marmot_c::marmot_string_free(detail) };
                         check(unsafe {
                             marmot_c::commands::marmot_client_shutdown_and_close(clients[0])
                         });
@@ -820,6 +843,13 @@ mod experimental_host {
                     }
                     (existing_linked && new_linked).then_some(())
                 });
+                let mut reset = std::ptr::null_mut();
+                check(unsafe {
+                    marmot_reset_device_group_for_repair(clients[2], account.as_ptr(), &mut reset)
+                });
+                assert!(!reset.is_null());
+                assert!(unsafe { (*reset).new_device.is_null() });
+                unsafe { marmot_device_link_snapshot_free(reset) };
                 for (index, client) in clients.into_iter().enumerate().skip(1) {
                     check(unsafe { marmot_c::commands::marmot_client_shutdown_and_close(client) });
                     unsafe { marmot_client_free(client) };

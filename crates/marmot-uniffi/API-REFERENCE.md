@@ -1312,7 +1312,7 @@ pub async fn cancel_device_link( &self, account_ref: String, ) -> Result<DeviceL
 
 On the new device, request cancellation of the link and notify the other device. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if that fails, the call returns the error, the link stays `Joining`, and the worker retries. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused with `no_link_in_progress` when no link is in progress.
 
-[Source](src/commands/device_link.rs#L37)
+[Source](src/commands/device_link.rs#L53)
 
 ### `Marmot::confirm_device_link_match`
 
@@ -1324,7 +1324,7 @@ pub async fn confirm_device_link_match( &self, account_ref: String, ) -> Result<
 
 On the new device, record that the user says both screens show the same emoji. `new_device` moves to `WaitingForOtherDevice` until the other device's user chooses Link device, then `Joining` while that device adds this one, then `Linked` once its Welcome arrives. This device joins only through a Welcome into the device group the other device's verified confirmation named, sent by the leaf that confirmation named, and only while the link waits for it. A mismatch is the user's to report: cancel instead. Refused with `no_link_in_progress` when there is no link to confirm, and ends the link with a reason when the exchange fails a check or time ran out.
 
-[Source](src/commands/device_link.rs#L25)
+[Source](src/commands/device_link.rs#L41)
 
 ### `Marmot::decline_device_link`
 
@@ -1336,7 +1336,7 @@ pub async fn decline_device_link( &self, account_ref: String, prompt_id: String,
 
 On a device already signed in, Not now for the prompt `prompt_id`: the prompt goes and the new device's link ends with `CancelledElsewhere`. Refused with `unknown_prompt` for a stale prompt.
 
-[Source](src/commands/device_link.rs#L69)
+[Source](src/commands/device_link.rs#L85)
 
 ### `Marmot::device_link_snapshot`
 
@@ -1348,7 +1348,7 @@ pub async fn device_link_snapshot( &self, account_ref: String, ) -> Result<Devic
 
 Current linking and durable move progress: `new_device` while this device asked to be linked, `prompts` for the sign-ins it can link, newest last, and `moves` as described in [move guidance](README.md#moving-this-device-to-another-device-group). Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; unconfirmed comparisons end because their secrets are memory-only, while admitted native/move work keeps its durable owner. Refused when the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends what linking owes.
 
-[Source](src/commands/device_link.rs#L99)
+[Source](src/commands/device_link.rs#L115)
 
 ### `Marmot::dismiss_device_group_move_sibling`
 
@@ -1361,7 +1361,7 @@ hint's `slot_id_hex`; this neither links, removes nor trusts the sibling. The re
 Refused when device linking is disabled or the move/sibling is unknown. Refresh on `DeviceLinkChanged`; see
 [move guidance](README.md#moving-this-device-to-another-device-group).
 
-[Source](src/commands/device_link.rs#L83)
+[Source](src/commands/device_link.rs#L99)
 
 ### `Marmot::link_device`
 
@@ -1373,7 +1373,20 @@ pub async fn link_device( &self, account_ref: String, prompt_id: String, label: 
 
 On a device already signed in, Link device for the prompt `prompt_id`, offered while its state is `Comparing`. `label` is the name the user gave the new device: not blank, at most 64 bytes (`label_invalid`). Offer `add_to_all_chats` and `bring_history` as toggles, both on by default. The prompt moves to `Linking` until the new device's confirmation verifies; then this device creates the account's device group on a first link, or adds the new device to the one it trusts, in one commit that also writes its roster entry. That commit is the approval. Its Welcome goes out only once relays confirm the commit, and the prompt remains `Linking` until the new device's first selected own change is present; a Welcome not taken by relays remains under its existing bounded delivery owner. A commit whose publish is retried keeps the prompt `Linking`. A device group that is still settling makes this device retry while the new device waits for its Welcome. A commit that rolls back, or a link not confirmed before the new device stops waiting, ends the prompt with `LinkFailed`. Refused with `unknown_prompt` for a stale prompt, including one from before the client reopened, `link_unavailable` while more than one sign-in competes or the code is not shown, `device_already_linked`, or `too_many_devices` at 20 devices (remove one first).
 
-[Source](src/commands/device_link.rs#L48)
+[Source](src/commands/device_link.rs#L64)
+
+### `Marmot::reset_device_group_for_repair`
+
+**Current.**
+
+```rust
+pub async fn reset_device_group_for_repair( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+After explicit user confirmation, discard only this device's quiet trusted hidden device-group copy before fresh code pairing. Keeps ordinary chat data, drafts/settings, account credentials and stable slot; abandons old link-bound preparations, while shared values and security decisions retain their ordinary synchronization rules. This sends no removal, authenticates no device and repairs no chat membership. Active pairing/Move or unsettled native work returns `device_group_busy` without a deadline; no trusted copy returns `no_device_group`. An unlinked device cannot bypass removal. Cancellation after reset restores nothing, while a fresh already-confirmed link keeps its ordinary durable Welcome wait. Duplicate membership, rejection and capacity can still refuse the new link. Requires the explicit experimental capability/constructor; see [the shared reset contract](README.md#explicit-local-device-group-reset-before-fresh-pairing).
+
+[Source](src/commands/device_link.rs#L29)
+
 
 ### `Marmot::start_device_link`
 

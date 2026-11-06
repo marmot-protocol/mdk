@@ -7,6 +7,8 @@
   and oldest-first position and adds no retry owner. Rust record literals add `size_class: None` when unknown;
   older native builds supporting only schema 0176 must upgrade before reopening a migrated account database.
 
+- Retire old device-sync preparations atomically only when explicitly forgetting an active trusted nonterminal device-group copy with no unfinished Move. Preserve ordinary chat data, admitted work, issued private keys and taken-reference tombstones; no migration.
+
 ### Breaking changes
 
 - Add `ChatListViewQuery` (a `ChatListView` plus an optional `ChatListFilter`) compiled to SQL on the view's page

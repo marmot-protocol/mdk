@@ -217,6 +217,9 @@ pub enum DeviceLinkOp {
     /// Ask another device to link this one. With an existing trusted device
     /// group this begins a move; trust changes only after the new own Commit.
     Start,
+    /// Explicitly discard this device's quiet trusted device-group copy
+    /// before fresh code pairing. Ordinary chat data and identity survive.
+    ResetForRepair,
     /// On the new device: "They match".
     ConfirmMatch,
     /// On the new device: cancel.

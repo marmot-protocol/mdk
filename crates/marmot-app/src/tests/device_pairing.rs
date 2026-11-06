@@ -311,6 +311,452 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
     assert!(joins.device_group_joins().unwrap().is_empty());
 }
 
+/// A real made link can disappear from the approver's selected roster. Its
+/// local context never authenticates a new publication; explicit reset and
+/// fresh code pairing preserve ordinary chat data through encrypted reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
+    use crate::tests::device_group::converge_device_group;
+
+    let (relay, [mut phone, mut tablet, mut laptop]) = alice_devices::<3>().await;
+    // A real ordinary chat and its local content must survive resetting only
+    // the hidden device group. This uses the same existing three-device world.
+    let chat = laptop
+        .client
+        .create_group("Keep my chat", &[])
+        .await
+        .unwrap();
+    let message = crate::tests::device_group::history_delivery::send_text(
+        &mut laptop.client,
+        &chat,
+        "Keep my local history",
+    )
+    .await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let saved_draft = laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .save_message_draft(&chat_hex, "Keep my unfinished message", None, &[])
+        .unwrap();
+    let saved_settings = laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .set_chat_muted(&chat_hex, None)
+        .unwrap();
+    let account_id = laptop.client.runtime.self_id().clone();
+    let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    let pre_add_epoch = tablet.client.runtime.group_record(&group).unwrap().epoch;
+    let tablet_slot_hex = tablet.slot_hex();
+    let tablet_slot: [u8; 32] = hex::decode(&tablet_slot_hex).unwrap().try_into().unwrap();
+    let laptop_slot_hex = laptop.slot_hex();
+    let laptop_slot: [u8; 32] = hex::decode(&laptop_slot_hex).unwrap().try_into().unwrap();
+
+    let linked_group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    assert!(linked_group == group);
+    // Have an ordinary unconsumed publication BEFORE the split, so both
+    // discovery and the busy-comparison control use real existing supply.
+    // Its announcement is fully delivered before Tablet's deeper fork wins.
+    let replacement = laptop.client.rotate_key_package().await.unwrap();
+    let replacement_ref = marmot_session::key_package_metadata(&replacement)
+        .unwrap()
+        .key_package_ref_hex;
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 8).await;
+    assert_eq!(
+        phone.roster(&group).devices[&laptop_slot]
+            .announced_key_package
+            .as_deref(),
+        Some(hex::decode(&replacement_ref).unwrap().as_slice())
+    );
+    let made = link_record(&phone, &group, &laptop_slot_hex);
+    assert_eq!(made.outcome, DeviceLinkOutcome::Linked);
+    assert!(made.decided_at.is_some());
+    assert!(phone.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(matches!(
+        phone.client.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        !phone
+            .client
+            .runtime
+            .has_pending_convergence_inputs(&group)
+            .unwrap()
+    );
+    let linked_epoch = phone.client.runtime.group_record(&group).unwrap().epoch;
+    assert!(linked_epoch > pre_add_epoch);
+    assert!(tablet.client.runtime.group_record(&group).unwrap().epoch == pre_add_epoch);
+    assert!(!tablet.roster(&group).devices.contains_key(&laptop_slot));
+
+    // No Laptop traffic was delivered to Tablet. Each real own roster edit
+    // advances its branch from the epoch before the Add, without constructing
+    // a replacement roster or touching stored branch state.
+    let mut winning_label = String::new();
+    for index in 1..=4 {
+        if tablet.client.runtime.group_record(&group).unwrap().epoch > linked_epoch {
+            break;
+        }
+        winning_label = format!("Tablet branch {index}");
+        tablet
+            .client
+            .rename_linked_device(&tablet_slot_hex, &winning_label)
+            .await
+            .unwrap();
+    }
+    let branch_epoch = tablet.client.runtime.group_record(&group).unwrap().epoch;
+    assert!(
+        branch_epoch > linked_epoch,
+        "the genuine sibling branch must be deeper"
+    );
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 8).await;
+    let selected = phone.roster(&group);
+    let selected_deeper_branch = selected
+        .devices
+        .get(&tablet_slot)
+        .is_some_and(|entry| entry.label == winning_label)
+        && phone.client.runtime.group_record(&group).unwrap().epoch >= branch_epoch;
+    let approver_lists_target = selected.devices.contains_key(&laptop_slot);
+    let durable_link_unchanged = link_record(&phone, &group, &laptop_slot_hex) == made;
+    eprintln!(
+        "completed_link_loss: selected_deeper_branch={selected_deeper_branch}, approver_lists_target={approver_lists_target}, durable_link_unchanged={durable_link_unchanged}"
+    );
+    assert!(
+        selected_deeper_branch,
+        "normal branch selection must choose the genuine deeper branch"
+    );
+    assert!(
+        !approver_lists_target,
+        "the selected pre-Add branch does not admit Laptop"
+    );
+    assert!(
+        durable_link_unchanged,
+        "a made approval remains durable Linked after branch selection"
+    );
+
+    // Present those actual published commits to Laptop as well. It joined
+    // after their fork point, so a removal notification must not be inferred
+    // merely from another device selecting a branch it cannot follow.
+    converge_device_group(&mut laptop.client, &relay, &mut laptop.cursor, &group, 8).await;
+    let target_group_retained = laptop.client.runtime.group_record(&group).is_ok();
+    let target_lists_own_key =
+        laptop
+            .roster(&group)
+            .devices
+            .get(&laptop_slot)
+            .is_some_and(|entry| {
+                entry.tag_signature_key.as_ref() == Some(&laptop.client.runtime.own_signature_key())
+            });
+    let target_unlinked = laptop.client.device_unlinked();
+    let target_still_trusts = laptop.trust(&group) == Some(DeviceGroupTrust::Linked);
+    let target_view = laptop.op(DeviceLinkOp::Read).await;
+    let target_view_linked = target_view.new_device == Some(NewDeviceLinkState::Linked);
+    eprintln!(
+        "completed_link_loss: target_group_retained={target_group_retained}, target_lists_own_key={target_lists_own_key}, target_unlinked={target_unlinked}, target_still_trusts={target_still_trusts}, target_view_linked={target_view_linked}"
+    );
+    assert!(target_group_retained && target_lists_own_key && target_still_trusts);
+    assert!(
+        !target_unlinked,
+        "no selected removal has unlinked the target"
+    );
+    assert!(
+        target_view_linked,
+        "the current pairing view has no failed-link/removal notice"
+    );
+
+    // Prerequisite for the explicit local reset: these are the real
+    // existing helpers used by old-copy cleanup, including accepted native
+    // application bookkeeping awaiting its App ACK. No retained row is
+    // removed or synthetic acknowledgement supplied to make them quiet.
+    let pending_fanout = laptop
+        .client
+        .runtime
+        .has_pending_outbound_fanouts(&group)
+        .unwrap();
+    let queued_intent = laptop
+        .client
+        .runtime
+        .has_queued_outbound_intents(&group)
+        .unwrap();
+    eprintln!(
+        "repair_reset_prerequisite: pending_fanout={pending_fanout}, queued_intent={queued_intent}"
+    );
+    assert!(
+        !pending_fanout,
+        "the actual split copy must have no unsettled native fanout or accepted bookkeeping"
+    );
+    assert!(
+        !queued_intent,
+        "the actual split copy must have no queued native work"
+    );
+
+    // Read the authentic publication the relay already holds. Publishing
+    // anew while Laptop still trusts its split copy also announces the KP
+    // in a native group Commit, which can heal the split during pairing.
+    // Observation alone must not introduce that separate producer here.
+    phone.client.check_sign_ins().await.unwrap();
+    assert!(!phone.roster(&group).devices.contains_key(&laptop_slot));
+    let sign_ins = phone.client.unrecognized_sign_ins().unwrap();
+    let missing = sign_ins
+        .iter()
+        .find(|row| row.slot_id_hex == laptop_slot_hex)
+        .unwrap();
+    assert_eq!(missing.state, crate::UnrecognizedSignInState::Prompt);
+    assert!(missing.signed_in);
+    assert!(
+        missing.previously_linked_here,
+        "the actual retained made link must annotate this missing slot"
+    );
+
+    let used = made.key_package_ref_hex.clone();
+    // Refuse an active comparison while the old trusted copy still exists.
+    laptop.op(DeviceLinkOp::Start).await;
+    let busy = laptop
+        .client
+        .device_link(DeviceLinkOp::ResetForRepair)
+        .await;
+    assert!(
+        matches!(busy, Err(AppError::DeviceGroupRefused("device_group_busy"))),
+        "{busy:?}"
+    );
+    assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
+    laptop.op(DeviceLinkOp::Cancel).await;
+    let reset = laptop.op(DeviceLinkOp::ResetForRepair).await;
+    assert_eq!(reset.new_device, None);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    assert!(
+        !laptop.client.device_unlinked(),
+        "an explicit local reset is not a removal"
+    );
+    assert!(laptop.client.runtime.group_record(&chat).is_ok());
+    laptop = reopen(laptop).await;
+    assert_eq!(laptop.slot_hex(), laptop_slot_hex);
+    assert_eq!(laptop.client.runtime.self_id(), account_id);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    let app = laptop.app.account_storage("alice").unwrap().app_storage();
+    assert!(app.timeline_message(&chat_hex, &message).unwrap().is_some());
+    assert!(app.message_draft(&chat_hex).unwrap().as_ref() == Some(&saved_draft));
+    assert_eq!(
+        app.chat_notification_settings(&chat_hex).unwrap(),
+        saved_settings
+    );
+    assert!(laptop.client.runtime.group_record(&chat).is_ok());
+
+    // A cancelled fresh comparison leaves needs-link; it never restores the
+    // discarded copy. Publishing a new reference follows the ordinary owner.
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    let fresh = laptop.client.rotate_key_package().await.unwrap();
+    let fresh_ref = marmot_session::key_package_metadata(&fresh)
+        .unwrap()
+        .key_package_ref_hex;
+    assert_ne!(fresh_ref, used);
+    assert_ne!(fresh_ref, replacement_ref);
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    laptop.op(DeviceLinkOp::Start).await;
+    let already_reset = laptop
+        .client
+        .device_link(DeviceLinkOp::ResetForRepair)
+        .await;
+    assert!(
+        matches!(
+            already_reset,
+            Err(AppError::DeviceGroupRefused("no_device_group"))
+        ),
+        "{already_reset:?}"
+    );
+    assert!(laptop.op(DeviceLinkOp::Read).await.new_device.is_some());
+    laptop.op(DeviceLinkOp::Cancel).await;
+    laptop = reopen(laptop).await;
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    // Re-deliver the real relay history, including the old Welcome. Existing
+    // replay/authentication owners, not an inferred unlink signal, reject it.
+    let mut replay_cursor = 0;
+    deliver_new(&mut laptop.client, &relay, &mut replay_cursor).await;
+    assert_eq!(laptop.client.trusted_device_group().unwrap(), None);
+    assert!(laptop.client.runtime.group_record(&group).is_err());
+    let current = laptop
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        current
+            .current_key_package_ref
+            .as_ref()
+            .map(hex::encode)
+            .as_deref(),
+        Some(used.as_str()),
+        "fresh pairing must not name the installed KeyPackage"
+    );
+    assert_eq!(
+        current
+            .current_key_package_ref
+            .as_ref()
+            .map(hex::encode)
+            .as_deref(),
+        Some(fresh_ref.as_str())
+    );
+    let private_init_present = laptop
+        .client
+        .runtime
+        .durably_owned_key_packages()
+        .unwrap()
+        .iter()
+        .any(|kp| {
+            marmot_session::key_package_metadata(kp)
+                .unwrap()
+                .key_package_ref_hex
+                == fresh_ref
+        });
+    assert!(
+        private_init_present,
+        "the fresh confirmed reference must still own its private OpenMLS bundle"
+    );
+    let own_key = laptop.client.runtime.own_signature_key();
+    let selected_members = phone.client.runtime.group_record(&group).unwrap().members;
+    let old_leaf_present = selected_members
+        .iter()
+        .any(|member| member.credential == own_key);
+    eprintln!(
+        "repair_admission_prerequisite: selected_leaf_count={}, old_leaf_present={old_leaf_present}",
+        selected_members.len()
+    );
+    assert!(
+        !old_leaf_present,
+        "ordinary fresh admission requires the approver not to retain the old signature key"
+    );
+    let exact = phone
+        .client
+        .runtime
+        .own_account_leaf_claims(&group, &phone.roster(&group))
+        .unwrap();
+    assert!(
+        !exact.iter().any(|(key, _)| *key == own_key),
+        "the actual native tree must permit ordinary readmission"
+    );
+
+    assert_eq!(
+        link(&relay, &mut phone, &mut laptop, "Laptop repaired").await,
+        group
+    );
+    assert_eq!(laptop.trust(&group), Some(DeviceGroupTrust::Linked));
+    let repaired = link_record(&phone, &group, &laptop_slot_hex);
+    assert_eq!(repaired.outcome, DeviceLinkOutcome::Linked);
+    assert_ne!(repaired.key_package_ref_hex, used);
+    assert_eq!(laptop.slot_hex(), laptop_slot_hex);
+    assert!(phone.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(laptop.roster(&group).devices.contains_key(&laptop_slot));
+    assert!(
+        !phone
+            .client
+            .unrecognized_sign_ins()
+            .unwrap()
+            .iter()
+            .any(|row| row.slot_id_hex == laptop_slot_hex && row.previously_linked_here)
+    );
+    assert!(
+        laptop
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .timeline_message(&chat_hex, &message)
+            .unwrap()
+            .is_some()
+    );
+
+    // A real selected removal of the first linked sibling is different from
+    // branch selection dropping an Add. Its still-published sign-in must not
+    // become a lost-link warning, even with the made approval retained.
+    let departed = link_record(&phone, &group, &tablet_slot_hex);
+    assert_eq!(departed.outcome, DeviceLinkOutcome::Linked);
+    let departed_key = hex::decode(&departed.leaf_signature_key_hex).unwrap();
+    let claims = phone
+        .client
+        .runtime
+        .own_account_leaf_claims(&group, &phone.roster(&group))
+        .unwrap();
+    assert!(claims.iter().any(|(key, claim)| {
+        *key == departed_key
+            && *claim == cgka_traits::app_components::DeviceTagClaim::Device(tablet_slot)
+    }));
+    phone
+        .client
+        .unlink_device_from_group(
+            &group,
+            departed_key.clone(),
+            vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot)],
+        )
+        .await
+        .unwrap();
+    let selected = phone.roster(&group);
+    assert!(!selected.devices.contains_key(&tablet_slot));
+    assert!(!selected.rejected_slots.contains_key(&tablet_slot));
+    assert!(
+        !phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .has_device_removal(&hex::encode(group.as_slice()), &tablet_slot_hex)
+            .unwrap()
+    );
+    assert!(
+        phone
+            .client
+            .runtime
+            .group_record(&group)
+            .unwrap()
+            .device_roster_departures
+            .iter()
+            .any(|fact| fact.slot == tablet_slot
+                && fact.tag_signature_key.as_ref() == Some(&departed_key))
+    );
+    assert_eq!(
+        link_record(&phone, &group, &tablet_slot_hex).outcome,
+        DeviceLinkOutcome::Linked
+    );
+    assert!(phone.client.trusted_device_group().unwrap() == Some(group.clone()));
+    assert!(matches!(
+        phone.client.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        !phone
+            .client
+            .runtime
+            .has_pending_convergence_inputs(&group)
+            .unwrap()
+    );
+    use cgka_traits::storage::RosterTagKeyStorage as _;
+    assert!(
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .roster_tag_keys(&group, 0)
+            .unwrap()
+            .iter()
+            .all(|known| known.slot != tablet_slot
+                || known.tag_signature_key != departed_key
+                || !known.held_as_removed)
+    );
+    phone.client.check_sign_ins().await.unwrap();
+    let rows = phone.client.unrecognized_sign_ins().unwrap();
+    let known_departure = rows
+        .iter()
+        .find(|row| row.slot_id_hex == tablet_slot_hex)
+        .expect("the authentic still-published sibling is listed");
+    assert!(known_departure.signed_in);
+    assert!(!known_departure.previously_linked_here);
+}
+
 /// A later link adds the new device to the device group in one commit, by a
 /// device that joined through a Welcome. First ready wins: the other
 /// sibling's session ends, and its prompt then says who added the device.
@@ -1359,6 +1805,14 @@ async fn a_link_is_made_across_a_restart_by_the_new_devices_first_commit() {
     let mut phone = reopen(phone).await;
     let record = link_record(&phone, &group, &slot);
     assert_eq!(record.outcome, DeviceLinkOutcome::Pending);
+    assert!(phone.client.trusted_device_group().unwrap() == Some(group.clone()));
+    let reset = phone.client.device_link(DeviceLinkOp::ResetForRepair).await;
+    assert!(matches!(
+        reset,
+        Err(AppError::DeviceGroupRefused("device_group_busy"))
+    ));
+    assert!(phone.client.trusted_device_group().unwrap() == Some(group.clone()));
+    assert_eq!(link_record(&phone, &group, &slot), record);
     let key_package_ref = hex::decode(&record.key_package_ref_hex).unwrap();
     assert_eq!(
         phone

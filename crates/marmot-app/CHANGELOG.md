@@ -18,6 +18,8 @@
 - Keep uncertain sends pending for ordinary recovery when later SDK retries or an authentication fallback are
   refused; acknowledgements still succeed.
 
+- Add qualified prior-linked-slot context and explicit user-controlled local device-group reset before fresh pairing. Preserve ordinary local chat data/identity; busy native work may refuse indefinitely and ordinary admission/removal rules still apply. No schema or wire migration.
+
 - Surface conclusive all-target event-size refusals as `AppError::EventTooLarge` with a coarse artifact and size
   class. Mixed, ambiguous and message-only KeyPackage failures remain generic; publication/Welcome lifecycle is unchanged.
 
