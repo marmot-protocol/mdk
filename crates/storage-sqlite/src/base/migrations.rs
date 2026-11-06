@@ -371,6 +371,8 @@ mod migration_0177_welcome_failure_size_class;
 mod migration_0178_emoji_sets;
 #[path = "migrations/0179_chat_list_kind.rs"]
 mod migration_0179_chat_list_kind;
+#[path = "migrations/0180_removal_validation.rs"]
+mod migration_0180_removal_validation;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1401,6 +1403,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0179_chat_list_kind",
         suspend_foreign_keys: &[],
         apply: migration_0179_chat_list_kind::apply,
+    },
+    Migration {
+        version: 180,
+        name: "0180_removal_validation",
+        suspend_foreign_keys: &[],
+        apply: migration_0180_removal_validation::apply,
     },
 ];
 
@@ -4021,14 +4029,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
         let key = SqlCipherKey::new("migration key").unwrap();
+        let group = sample_group(gid(1), 0, 0);
 
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             assert_eq!(applied_migrations(&store).len(), MIGRATIONS.len());
+            store.put_group(&group).unwrap();
+            store.close().unwrap();
         }
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(applied_migrations(&reopened), expected_migrations());
+        assert_eq!(reopened.get_group(&group.id).unwrap(), group);
+        reopened.close().unwrap();
+
+        // This is the registry the preceding 179 writer knew. Excluding the
+        // validation entry by name keeps that historical boundary faithful
+        // even if its new version is accidentally moved below 179 again.
+        let old179: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|migration| {
+                migration.version <= 179 && !migration.name.ends_with("_removal_validation")
+            })
+            .map(|migration| Migration {
+                version: migration.version,
+                name: migration.name,
+                suspend_foreign_keys: migration.suspend_foreign_keys,
+                apply: migration.apply,
+            })
+            .collect();
+        assert_eq!(old179.last().unwrap().version, 179);
+        fs_private::ensure_private_db_files(&path).unwrap();
+        let mut older = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&older, &key, SqlCipherHardening::live_cache()).unwrap();
+        let before_group: Vec<u8> = older
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id=?1",
+                [group.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before_ledger = applied_migrations_from_connection(&older);
+        let error = run(&mut older, &old179)
+            .expect_err("the old writer must refuse validation-bearing storage");
+        assert!(
+            matches!(error, StorageError::UnsupportedSchemaVersion { found, latest_supported: 179 }
+            if found == MIGRATIONS.last().unwrap().version)
+        );
+        let after_group: Vec<u8> = older
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id=?1",
+                [group.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_group, before_group,
+            "downgrade refusal preserves the account's group"
+        );
+        assert_eq!(applied_migrations_from_connection(&older), before_ledger);
+        older.close().unwrap();
     }
 
     #[test]

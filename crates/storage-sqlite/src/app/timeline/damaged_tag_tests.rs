@@ -506,6 +506,62 @@ fn secure_prune_of_a_damaged_removal_keeps_its_target_hidden() {
     assert!(hidden(&app));
 }
 
+#[test]
+fn secure_prune_of_a_damaged_duplicate_reference_removal_keeps_its_target_visible() {
+    use cgka_traits::app_event::AppMessageAuthority;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.ensure_account_projection_with_identity("local", "alice")
+        .unwrap();
+    let (target_id, removal_id) = ("66".repeat(32), "77".repeat(32));
+    let mut target = chat(&target_id, 10, "still visible");
+    target.sender = "bob".to_owned();
+    app.record_app_event(&target).unwrap();
+
+    let mut removal = targeting(
+        &removal_id,
+        MARMOT_APP_EVENT_KIND_REMOVE,
+        &target_id,
+        11,
+        r#"{"v":1,"action":"remove"}"#,
+    );
+    // The removal contract requires exactly one reference, even when two
+    // references name the same target. All other admission inputs are valid.
+    removal.tags.push(removal.tags[0].clone());
+    removal.moderation_grant = true;
+    let authority = AppMessageAuthority {
+        source_context: [7; 32],
+        moderation_grant: true,
+    };
+    app.record_app_event_with_source(
+        &removal,
+        Some(AppMessageRetentionDecision::new(11, 10)),
+        Some(authority),
+    )
+    .unwrap();
+    let before = app
+        .timeline_message(&group(), &target_id)
+        .unwrap()
+        .expect("the invalid removal must leave its target present");
+    assert!(!before.deleted);
+    assert_eq!(before.plaintext, "still visible");
+
+    damage_tags(&app, &removal_id);
+    app.secure_prune_expired_app_events(&group(), 25, "local", &no_mentions)
+        .expect("a damaged tag blob must not block expiration pruning");
+
+    let after = app
+        .timeline_message(&group(), &target_id)
+        .unwrap()
+        .expect("tag recovery must not remove a previously unaffected target");
+    assert!(
+        !after.deleted,
+        "recovering damaged tags must not validate an originally invalid removal"
+    );
+    assert_eq!(after.plaintext, "still visible");
+}
+
 // A damaged dismissal names no report, so it is left out of the report's
 // dismissals, and the report list still reads. Damage that is not even text
 // must not fail the read either.

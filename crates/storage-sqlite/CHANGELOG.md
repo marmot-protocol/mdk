@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Migration 0180 preserves original removal validation separately from source authority, so damaged tags cannot turn
+  an invalid removal into a valid one (#3016). Validated removals retain their effect through pruning. Uncertain legacy
+  removals preserve only already-hidden targets and cannot hide new targets; verified repair remains tracked in #3017.
+
 - Add `Direct`, `Group` and `Muted` chat-list filter conditions (mdk#2983). Migration 0179 adds
   `chat_list_rows.list_kind`, kept equal to the classifier's conversation kind by triggers on the row's group name and
   the account group's member count, and backfills existing rows; an Unknown kind matches neither leaf. `Muted` tests
