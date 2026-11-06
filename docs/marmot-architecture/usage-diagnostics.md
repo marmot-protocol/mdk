@@ -112,8 +112,9 @@ real retry; a **transition** is a changed persisted phase; **backlog** is curren
 outstanding state; **coverage** describes an enabled reporting interval. Never sum
 backlog over scheduler ticks. Maintenance observes successful persistence edges,
 and per-worker backlog samples are combined across accounts. Backfill reporting
-belongs to the worker's recovery seam (`refresh_recovery_at_seam`); an incomplete pass is an
-attempt, not a newly started recovery. Broadcast fan-out does not record analytics.
+belongs to the worker's recovery seam (`refresh_recovery_at_seam`), which samples armed
+epoch-gap debt and records no fetch: the recovery runner fetches. Broadcast fan-out does
+not record analytics.
 Message acceptance and relay publication are distinct from recipient receipt,
 decryption, display, and reading. Provisional preview success is separate from
 final MLS acceptance.
