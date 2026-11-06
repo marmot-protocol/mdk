@@ -1659,9 +1659,23 @@ impl AppClient {
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
         self.drive_history_deliveries().await;
-        let held = self.epoch_gap_held_groups()?;
-        self.sync_key_package_announcement_group()?;
-        self.sync_device_tag_group()?;
+        let prepared = self.epoch_gap_held_groups().and_then(|held| {
+            self.sync_key_package_announcement_group()?;
+            self.sync_device_tag_group()?;
+            Ok(held)
+        });
+        // An early return would drop the span and the sweep observation,
+        // recording them as cancelled rather than failed.
+        let held = match prepared {
+            Ok(held) => held,
+            Err(error) => {
+                finish_maintenance_step(app_passes, marmot_observability::Outcome::Failure);
+                if let Some(sweep) = sweep {
+                    sweep.finish("failure");
+                }
+                return Err(error);
+            }
+        };
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
         let mut private_stock = private_key_packages::PrivateKeyPackageSelection::default();
