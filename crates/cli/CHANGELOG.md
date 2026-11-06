@@ -9,6 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Recover TUI chat and notification feeds for the selected account when a background chat-list retry succeeds
+  after a failed account switch, while preserving the open conversation and matching live subscriptions (#2968).
+
 - Add dev-only `devices link reset --confirm`, forwarding the shared user-controlled local device-group reset. Ordinary chat data/credentials remain; fresh pairing may be refused by existing admission rules.
 
 - Report conclusive all-target size refusals as JSON `event_too_large` with coarse `artifact` and `size_class`;
