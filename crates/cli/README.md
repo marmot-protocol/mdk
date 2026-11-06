@@ -697,8 +697,8 @@ The `devices` commands themselves refuse local execution: without an auto-discov
 
 Other existing dev account commands can still start one-shot live workers. Such a worker can answer a pending link,
 then exit and lose the unconfirmed comparison session. Comparison sessions and prompt ids are also lost on a
-daemon/worker restart. If an unconfirmed exchange is interrupted, start both daemons, cancel on the new device and
-start a fresh link with a fresh comparison. Already committed links and owed Welcomes retain their existing durable
+daemon/worker restart. If an unconfirmed exchange is interrupted, start both daemons and cancel on the new device only if its exchange
+is still active; then start a fresh link with a fresh comparison. Already committed links and owed Welcomes retain their existing durable
 behavior, so inspect `devices list` before retrying. Restarting does not roll back an approved link.
 
 This dogfood CLI does not expose the existing-device **Not now** action. Do not approve an unwanted request or
