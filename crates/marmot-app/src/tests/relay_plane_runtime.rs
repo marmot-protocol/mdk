@@ -250,10 +250,15 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     runtime.shutdown().await;
 }
 
+/// A notification lag reaches the worker's receive boundary with its own
+/// token and REQ floor, and its overflow identity survives a receiver
+/// replacement. An unexpected consumer exit still closes the route, and a
+/// later lag whose control record cannot reach the closed queue is received
+/// before the closed queue is. What the ledger owes for a lag is the
+/// recovery coverage scenario tests' (`notification_lag_*`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn notification_loss_is_durable_and_survives_receiver_replacement() {
+async fn notification_lag_reaches_the_receive_boundary_and_survives_receiver_replacement() {
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
-    use storage_sqlite::RecoveryLossCause::NotificationConsumer;
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
@@ -264,10 +269,8 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
         "wss://relay.example",
         crate::MarmotAppConfig::white_noise(),
     )
-    .with_recovery_runner_ownership_for_test(false)
     .with_test_relay_client(relay);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let storage = app.account_storage("alice").unwrap().app_storage();
     let account = client.adapter.account_id().clone();
     app.relay_plane
         .set_account_delivery_recovery_marker_for_test(
@@ -283,53 +286,21 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     assert_eq!(loss.dropped, 0);
     assert_eq!(loss.notification_losses, 1);
     assert_eq!(loss.notification_floor, Some(1_700_000_000));
-    assert!(
-        storage
-            .recovery_loss_watermarks("alice", NotificationConsumer)
-            .unwrap()
-            .is_empty()
-    );
-    // The real worker receive boundary persists the typed lag, bounded by
-    // the REQ floor read at the lag, and the route stays open.
+    // The real worker receive boundary takes the typed lag, bounded by the
+    // REQ floor read at the lag, and the route stays open.
     assert!(matches!(
         client.receive_next_delivery().await,
         Ok(AccountDeliveryReceive::Overflow(overflow))
             if overflow.notification_token == loss.notification_token
+                && overflow.notification_floor == Some(1_700_000_000)
     ));
-    let evidence = storage
-        .recovery_loss_watermarks("alice", NotificationConsumer)
-        .unwrap();
-    assert_eq!(evidence.len(), 1);
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor("alice", NotificationConsumer)
-            .unwrap(),
-        Some(1_700_000_000)
-    );
-    assert!(
-        storage
-            .pending_recovery_demands()
-            .unwrap()
-            .iter()
-            .any(|d| d.cause == storage_sqlite::RecoveryCause::NotificationLoss)
-    );
-    assert!(
-        storage
-            .account_delivery_recovery("alice")
-            .unwrap()
-            .is_none()
-    );
     let prior = client.adapter.delivery_overflow_identity_for_test();
     drop(client);
     let mut replacement = client_on_app_relay_plane(&app, "alice").await;
     assert!(prior.same_as(&replacement.adapter.delivery_overflow_identity_for_test()));
-    let attempt = replacement
-        .adapter
-        .start_delivery_overflow_recovery(loss.marker_token);
     // An unexpected consumer exit still closes the route.
     app.relay_plane
         .simulate_notification_consumer_exit_for_test();
-    assert_eq!(replacement.adapter.notification_losses_for_test(), 1);
     // A lag whose control record cannot reach the closed queue, and whose
     // floor is unknown.
     app.relay_plane.simulate_notification_lag_for_test(
@@ -337,37 +308,16 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
         1,
         NostrNotificationLossFloor::Unbounded,
     );
-    assert!(
-        replacement
-            .adapter
-            .finish_delivery_overflow_recovery(attempt)
-            .is_none()
-    );
-    replacement.adapter.fail_delivery_overflow_recovery();
     let newer = replacement.adapter.pending_delivery_overflow().unwrap();
-    assert_eq!(newer.notification_losses, 2);
     assert_ne!(newer.notification_token, loss.notification_token);
     assert_eq!(newer.notification_floor, None);
-    // Persisted without its control record, before the closed queue is seen.
+    // Received without its control record, before the closed queue is seen.
     assert!(matches!(
         replacement.receive_next_delivery().await,
         Ok(AccountDeliveryReceive::Overflow(overflow))
             if overflow.notification_token == newer.notification_token
+                && overflow.notification_floor.is_none()
     ));
-    assert_eq!(
-        storage
-            .recovery_loss_watermarks("alice", NotificationConsumer)
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor("alice", NotificationConsumer)
-            .unwrap(),
-        None,
-        "an unknown floor leaves the whole goal unbounded"
-    );
     assert!(matches!(
         replacement.receive_next_delivery().await,
         Err(crate::AppError::TransportClosed)

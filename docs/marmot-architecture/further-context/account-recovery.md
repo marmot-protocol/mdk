@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-06
+updated: 2026-11-07
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -799,7 +799,8 @@ leave staging in one transaction.
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
 fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
 on. The old owner's grant, native capture and comparison job are deleted (5c2a846b4 is the last
-commit with them); the gate's off arm remains only in tests until the gate itself goes. Before any
+commit with them), and so are the gate's off arms; the gate itself remains only so tests can keep the
+runner from starting, until it goes. Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
 ledger debt. Autonomous clamp continuation is disabled for app-owned accounts; ordinary native
 input, count facts and bounded fences remain. Supported
@@ -1063,11 +1064,16 @@ the old owner):
 - The gate-off native replay source sync that kept `SubscriptionReplay` goals and capture tokens.
 - The epoch-backfill reporting arm, the scripted comparison test seams and the worker's
   comparison test commands, and the tests that pinned only the deleted path.
+- The gate's off arms: legacy loss import and restore at open and on overflow, the
+  IncrementalHistory request at open, the gate-off coverage request seam, empty ledger notices
+  and status, and the post-join maintenance subscriptions and history sessions a grant
+  installed. Every account runs the runner's loss import, notices and post-join collection.
 
 Still to delete:
 
-- The old owner's remaining paths: native-replay ownership leftovers, legacy loss import,
-  notices and the post-join maintenance path; then the gate itself and its test fixtures.
+- The gate itself and its test fixtures, and old-owner paths no current data reaches: the
+  comparison slot `request_bounded_comparison` still joins, qualified-stagnation escalation,
+  capacity-wait eligibility, and the storage and adapter APIs only the old owner called.
 - The adapter's native pager and `SubscriptionReplay` (row 8).
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
@@ -1086,7 +1092,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - The Welcome floor (design section 5): a joined group's standing goal starts at the
   Welcome that installed the copy, less a fifteen-minute clock-skew allowance. The
   runner's post-join collection (`recovery_runner/post_join.rs`) replaces the
-  maintenance subscriptions a grant installed; nothing installs those any more.
+  maintenance subscriptions a grant installed, which are deleted.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed
   row cap, until qualified completion (an explicit deep repair counts only when it achieves

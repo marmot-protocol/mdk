@@ -1429,7 +1429,7 @@ async fn each_chokepoint_wakes_the_runner() {
     client.synchronize_recovery_loss(&app).unwrap();
     assert!(woken(&mut wake), "loss import");
 
-    client.record_coverage_request(RecoveryCause::ExplicitHistory);
+    client.record_open_coverage_goals();
     assert!(woken(&mut wake), "goal widening");
 
     client.routing.replace(client.routing.snapshot());

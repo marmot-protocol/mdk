@@ -647,13 +647,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs`.
-- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
-  at owner seams only: account open (`record_open_coverage_goals`), the runner's routing-change settlement,
-  loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
-  routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
-  requests (`record_recovery_request`) and native
-  synchronization (`synchronize_native_replay`). Its writes are best effort in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
-  fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
+- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660). It records at owner seams only:
+  account open (`record_open_coverage_goals`), the runner's routing-change settlement, loss imports
+  (`synchronize_recovery_loss`; storage un-covers the ledger inside the import transaction, and inside each receipt
+  release) and native synchronization (`synchronize_native_replay`). Conversion and new loss imports are
+  authoritative and fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
   records its per-cause aggregate `conversion` trace before the first quantum, acknowledges that report and imports
   ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. A newly armed
   epoch-gap obligation and invalidation of its group's existing ledger goals commit together through
@@ -987,15 +985,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
   adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
   first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
-- Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626).
-  `advance_post_join_maintenance_subscriptions` keeps a group's session while its fetch is owed, whatever phase commits
-  moved the obligation to, and ends the fetch only through `settle_post_join_history_fetch`: `Fetched` needs the
-  session's qualified boundary, open native ingress and the adapter's placement verdict for that subscription, and
-  the deadline expires only a session whose boundary has not qualified. While a fetch is owed, its session is
-  requested and retained under the fetch's job alone; an early-phase obligation (a re-armed one, or an earlier copy's
-  after a replacement Welcome) keeps the session alive but never picks its job. A session installed for another fetch
-  id (an earlier copy), or whose demand is gone before its boundary qualified, never ends the current one. The fetch never moves the obligation, so self-update timing stays the
-  obligation's own.
+- Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626). The runner's
+  post-join collection (`src/client/recovery_runner/post_join.rs`, advanced by
+  `advance_post_join_maintenance_subscriptions`) keeps a copy's collection while its fetch is owed, whatever phase
+  commits moved the obligation to. It ends the fetch as `Fetched` only once the coverage ledger covers the copy's
+  whole requested range on its required relays, nothing of the route is staged and every source is placed; the
+  deadline expires only a fetch whose range was never acquired. A collection for another copy never ends the current
+  one. The fetch never moves the obligation, so self-update timing stays the obligation's own.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not

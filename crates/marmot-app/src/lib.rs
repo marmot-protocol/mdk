@@ -1477,9 +1477,6 @@ struct OpenAppAccount {
     routing: AppTransportRouting,
     state: AccountState,
     delivery_overflow_recovery_pending: bool,
-    delivery_overflow_recovery_marker_token: Option<u64>,
-    /// Loss the open imported, recorded once the client exists.
-    recovery_loss_imports: Vec<storage_sqlite::RecoveryLossImport>,
     signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
 }
 
@@ -2164,7 +2161,6 @@ impl MarmotApp {
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
-            self.recovery_runner_owns_debt(),
         )?;
         // Before the client activates any REQ; a failed read trusts none.
         let live_coverage = client::LiveCoverage::open(
@@ -2175,24 +2171,7 @@ impl MarmotApp {
             &open.adapter,
         )
         .await;
-        let incremental_request = if !self.recovery_runner_owns_debt()
-            && relay_plane
-                .subscription_rebuild_since(open.state.last_transport_timestamp)
-                .is_none()
-        {
-            Some(
-                self.account_storage(&open.state.label)?
-                    .app_storage()
-                    .request_recovery_observed(
-                        storage_sqlite::RecoveryRequest::IncrementalHistory,
-                        client::recovery::wall_now_ms()?,
-                    )?,
-            )
-        } else {
-            None
-        };
         let cursor_audit_placements = open.adapter.delivery_placement_counts();
-        let recovery_loss_imports = open.recovery_loss_imports;
         let audit = open.runtime.audit_recorder().clone();
         let audit_v5_enabled = marmot_forensics::ForensicRecorder::records_v5(&audit);
         let mut client = AppClient {
@@ -2302,7 +2281,7 @@ impl MarmotApp {
             #[cfg(test)]
             fail_ingest_of: None,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
-            delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
+            delivery_overflow_recovery_marker_token: None,
             delivery_spill: Default::default(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
@@ -2334,8 +2313,6 @@ impl MarmotApp {
             fail_next_terminal_recovery_retire: false,
             #[cfg(test)]
             fail_next_convergence_retry_advance: false,
-            post_join_maintenance_subscriptions: HashMap::new(),
-            post_join_history_sessions: HashMap::new(),
             runner_post_join: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
@@ -2345,16 +2322,6 @@ impl MarmotApp {
             )),
         };
         client.record_open_coverage_goals();
-        // Loss the open imported, and the startup history request, become
-        // audit rows once the client that records them exists.
-        client.record_recovery_loss_imports(recovery_loss_imports);
-        if let Some((ticket, transition)) = incremental_request {
-            client.record_recovery_request(
-                storage_sqlite::RecoveryCause::IncrementalHistory,
-                ticket,
-                transition,
-            );
-        }
         // Initial access also restores durable backfill work, with or without
         // new releases, so open does not read the intent table twice.
         client.transport_receipts()?;
@@ -5123,49 +5090,18 @@ impl MarmotApp {
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
-        let (
-            recovery_loss_imports,
-            delivery_overflow_recovery_pending,
-            delivery_overflow_recovery_marker_token,
-        ) = if self.recovery_runner_owns_debt() {
-            // Retain the local cursor guard until fallible conversion/import
-            // runs with current routing. Reopen never recreates old jobs.
+        // Retain the local cursor guard until fallible conversion/import runs
+        // with current routing. Reopen never recreates old jobs.
+        let delivery_overflow_recovery_pending = {
             let app = recovery_storage.app_storage();
-            let pending = !app
-                .recovery_loss_snapshot(label, storage_sqlite::RecoveryLossCause::Queue)?
+            !app.recovery_loss_snapshot(label, storage_sqlite::RecoveryLossCause::Queue)?
                 .is_empty()
                 || !app
                     .recovery_loss_snapshot(
                         label,
                         storage_sqlite::RecoveryLossCause::NotificationConsumer,
                     )?
-                    .is_empty();
-            (Vec::new(), pending, None)
-        } else {
-            recovery_storage
-                .app_storage()
-                .restore_unacknowledged_recovery_loss()?;
-            let recovery_loss_imports = recovery_storage
-                .app_storage()
-                .synchronize_account_delivery_loss(label)?;
-            let delivery_overflow_recovery = recovery_storage
-                .app_storage()
-                .account_delivery_recovery(label)?;
-            let notification_loss = recovery_storage
-                .app_storage()
-                .pending_recovery_demands()?
-                .into_iter()
-                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
-            let delivery_overflow_recovery_pending =
-                delivery_overflow_recovery.is_some() || notification_loss.is_some();
-            let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
-                .map(|recovery| recovery.marker_token)
-                .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
-            (
-                recovery_loss_imports,
-                delivery_overflow_recovery_pending,
-                delivery_overflow_recovery_marker_token,
-            )
+                    .is_empty()
         };
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
@@ -5371,8 +5307,6 @@ impl MarmotApp {
             routing,
             state,
             delivery_overflow_recovery_pending,
-            delivery_overflow_recovery_marker_token,
-            recovery_loss_imports,
             signer: nostr_signer,
         })
     }
