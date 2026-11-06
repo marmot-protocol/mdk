@@ -8,7 +8,12 @@ use crate::tests::device_group::history_delivery::send_text;
 
 /// Drive normal inbound, convergence and maintenance until the three
 /// independently stored copies agree. No wall-clock sleep supplies settlement.
-async fn settle(relay: &ScriptedPushRelayClient, devices: &mut [&mut Device], group: &GroupId) {
+async fn settle(
+    relay: &ScriptedPushRelayClient,
+    devices: &mut [&mut Device],
+    group: &GroupId,
+    phase: &str,
+) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             for device in devices.iter_mut() {
@@ -50,7 +55,9 @@ async fn settle(relay: &ScriptedPushRelayClient, devices: &mut [&mut Device], gr
         }
     })
     .await
-    .expect("all linked copies settle through their ordinary app paths");
+    .unwrap_or_else(|error| {
+        panic!("{phase}: all linked copies settle through their ordinary app paths: {error:?}")
+    });
 }
 
 fn assert_messages(client: &AppClient, chat: &GroupId, expected: &[(String, &str)]) {
@@ -92,7 +99,13 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
         let (relay, [mut phone, mut tablet, mut laptop]) = alice_devices::<3>().await;
         let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
         assert_eq!(link(&relay, &mut phone, &mut laptop, "Laptop").await, group);
-        settle(&relay, &mut [&mut phone, &mut tablet, &mut laptop], &group).await;
+        settle(
+            &relay,
+            &mut [&mut phone, &mut tablet, &mut laptop],
+            &group,
+            "after linking all three devices",
+        )
+        .await;
         assert_eq!(phone.roster(&group).devices.len(), 3);
         let laptop_slot = laptop.slot_hex();
         let laptop_slot_bytes: [u8; 32] = hex::decode(&laptop_slot).unwrap().try_into().unwrap();
@@ -138,7 +151,13 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
         tablet.client.accept_group_invite(&chat).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                settle(&relay, &mut [&mut phone, &mut tablet, &mut laptop], &group).await;
+                settle(
+                    &relay,
+                    &mut [&mut phone, &mut tablet, &mut laptop],
+                    &group,
+                    "sharing Accept",
+                )
+                .await;
                 if [&phone, &tablet, &laptop].iter().all(|device| {
                     !device
                         .client
@@ -161,7 +180,13 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
                 &[(before.clone(), "before Laptop closes")],
             );
         }
-        settle(&relay, &mut [&mut phone, &mut tablet, &mut laptop], &group).await;
+        settle(
+            &relay,
+            &mut [&mut phone, &mut tablet, &mut laptop],
+            &group,
+            "before closing Laptop",
+        )
+        .await;
 
         // Drop both owner and client, not only the client's in-memory view.
         // This is orderly close/reopen, not an abrupt process crash.
@@ -240,7 +265,13 @@ fn three_linked_devices_converge_after_competing_edits_and_a_durable_reopen() {
             &chat,
             &[(before.clone(), "before Laptop closes")],
         );
-        settle(&relay, &mut [&mut phone, &mut tablet, &mut laptop], &group).await;
+        settle(
+            &relay,
+            &mut [&mut phone, &mut tablet, &mut laptop],
+            &group,
+            "after reopening Laptop",
+        )
+        .await;
         for device in [&phone, &tablet, &laptop] {
             assert_eq!(
                 device.roster(&group).devices[&laptop_slot_bytes].label,

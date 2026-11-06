@@ -85,6 +85,13 @@ filter = 'binary(process_orchestrator) & (test(=app_runtime_and_process_adapters
 threads-required = "num-cpus"
 priority = 90
 
+# This composed app journey owns three linked runtimes and their encrypted
+# stores. Account for that work while it waits for the real settlement state.
+[[profile.default.overrides]]
+filter = 'package(marmot-app) & test(=tests::device_pairing::three_device_journeys::three_linked_devices_converge_after_competing_edits_and_a_durable_reopen)'
+threads-required = "num-cpus"
+priority = 90
+
 # CI profile (`cargo nextest run --profile ci`).
 #
 # Retries are a safety net for transient infrastructure hiccups (mock-relay bind
