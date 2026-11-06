@@ -249,6 +249,12 @@ pub enum SteerOutcome {
 /// Backend-specific command construction and event parsing boundary.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// Whether this backend can ever steer an active turn. Backends that
+    /// cannot keep the plain per-group turn queue.
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
     /// Whether this group currently has a backend turn that accepts steering.
     fn has_active_turn(&self, _group: &str) -> bool {
         false

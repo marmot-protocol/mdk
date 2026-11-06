@@ -205,6 +205,79 @@ impl ProcessGroupGuard {
     fn disarm(&mut self) {}
 }
 
+/// Long-lived backend helper in its own process group. Dropping it kills the
+/// whole group and reaps the direct child, like an abandoned JSONL run.
+pub struct OwnedProcess {
+    child: Child,
+    process_group: ProcessGroupGuard,
+}
+
+impl OwnedProcess {
+    /// Spawns with the current turn's routing environment, null stdin and
+    /// stderr, and piped stdout for the caller to read.
+    pub fn spawn(
+        executable: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        environment: Vec<EnvironmentChange>,
+    ) -> std::io::Result<Self> {
+        let mut command = Command::new(executable);
+        crate::group_profile::configure_command(&mut command);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        apply_environment(&mut command, environment);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.as_std_mut().process_group(0);
+        }
+        let child = command.spawn()?;
+        let process_group = ProcessGroupGuard::new(&child);
+        Ok(Self {
+            child,
+            process_group,
+        })
+    }
+
+    /// Takes the piped stdout once.
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// Whether the direct child has exited. It is not reaped, so its PID cannot
+    /// be reused while this value is alive.
+    pub fn has_exited(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.process_group.has_exited().unwrap_or(true)
+        }
+        // Without a waitable group the caller's own request errors report a
+        // dead server instead.
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+fn apply_environment(command: &mut Command, environment: Vec<EnvironmentChange>) {
+    for change in environment {
+        match change {
+            EnvironmentChange::Remove(name) => {
+                command.env_remove(name);
+            }
+            EnvironmentChange::Set { name, value } => {
+                command.env(name, value);
+            }
+        }
+    }
+}
+
 async fn wait_for_child_and_cleanup(
     child: &mut Child,
     process_group: &mut ProcessGroupGuard,
@@ -367,32 +440,7 @@ impl fmt::Debug for ParsedEvent {
 pub async fn run_jsonl_process<Parse, ParseError>(
     spec: ProcessSpec,
     tx: mpsc::Sender<RunnerEvent>,
-    parse_event: Parse,
-) -> std::result::Result<Outcome, RunFailure>
-where
-    Parse: FnMut(&str) -> std::result::Result<ParsedEvent, ParseError>,
-{
-    run_jsonl_process_inner(spec, tx, parse_event, None).await
-}
-
-/// Run the same bounded child with persistent JSONL input. `None` closes stdin.
-pub async fn run_interactive_jsonl_process<Parse, ParseError>(
-    spec: ProcessSpec,
-    tx: mpsc::Sender<RunnerEvent>,
-    parse_event: Parse,
-    input: mpsc::Receiver<Option<String>>,
-) -> std::result::Result<Outcome, RunFailure>
-where
-    Parse: FnMut(&str) -> std::result::Result<ParsedEvent, ParseError>,
-{
-    run_jsonl_process_inner(spec, tx, parse_event, Some(input)).await
-}
-
-async fn run_jsonl_process_inner<Parse, ParseError>(
-    spec: ProcessSpec,
-    tx: mpsc::Sender<RunnerEvent>,
     mut parse_event: Parse,
-    input: Option<mpsc::Receiver<Option<String>>>,
 ) -> std::result::Result<Outcome, RunFailure>
 where
     Parse: FnMut(&str) -> std::result::Result<ParsedEvent, ParseError>,
@@ -416,16 +464,7 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for change in environment {
-        match change {
-            EnvironmentChange::Remove(name) => {
-                command.env_remove(name);
-            }
-            EnvironmentChange::Set { name, value } => {
-                command.env(name, value);
-            }
-        }
-    }
+    apply_environment(&mut command, environment);
     match &prompt {
         PromptTransport::Stdin(_) => {
             command.stdin(Stdio::piped());
@@ -449,20 +488,7 @@ where
     let total_deadline = Instant::now() + total_timeout;
     let mut writer_task = match prompt {
         PromptTransport::Stdin(prompt) => match child.stdin.take() {
-            Some(stdin) => Some(match input {
-                Some(mut input) => tokio::spawn(async move {
-                    let mut stdin = stdin;
-                    stdin.write_all(prompt.as_bytes()).await?;
-                    stdin.flush().await?;
-                    while let Some(Some(record)) = input.recv().await {
-                        stdin.write_all(record.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        stdin.flush().await?;
-                    }
-                    stdin.shutdown().await
-                }),
-                None => write_stdin(stdin, prompt),
-            }),
+            Some(stdin) => Some(write_stdin(stdin, prompt)),
             None => {
                 kill_and_reap(&mut child, &mut process_group).await;
                 return Err(spawn_failure());
