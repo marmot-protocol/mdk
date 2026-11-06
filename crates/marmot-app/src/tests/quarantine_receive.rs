@@ -9,6 +9,7 @@ async fn wait_for_message(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
     account_label: &str,
     plaintext: &str,
+    timeout_storage: Option<(&storage_sqlite::SqliteAppStorage, &str, &[String])>,
 ) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -27,7 +28,21 @@ async fn wait_for_message(
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{account_label} never received {plaintext:?}"));
+    .unwrap_or_else(|_| {
+        if let Some((storage, group, ids)) = timeout_storage {
+            let rows = ids
+                .iter()
+                .map(|id| storage.app_message(group, id))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "phase=receive_timeout durable_read_ok={} expected_record_present={} summary_ids={}",
+                rows.iter().all(Result::is_ok),
+                rows.iter().any(|row| matches!(row, Ok(Some(_)))),
+                ids.len()
+            );
+        }
+        panic!("{account_label} never received {plaintext:?}")
+    });
 }
 
 async fn start_runtime(app: &MarmotApp) -> MarmotAppRuntime {
@@ -89,12 +104,12 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         .send_message("alice", &healthy, b"warmup alice".to_vec())
         .await
         .unwrap();
-    wait_for_message(&mut events, "bob", "warmup alice").await;
+    wait_for_message(&mut events, "bob", "warmup alice", None).await;
     runtime
         .send_message("bob", &healthy, b"warmup bob".to_vec())
         .await
         .unwrap();
-    wait_for_message(&mut events, "alice", "warmup bob").await;
+    wait_for_message(&mut events, "alice", "warmup bob", None).await;
     if locally_deleted {
         assert!(runtime.delete_group_local("alice", &broken).await.unwrap());
     }
@@ -126,12 +141,41 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         // The worker drains alice's startup quarantine event before serving
         // commands, so this covers the drain entry. The send-before-drain
         // ordering is pinned by the client-level projection retry test.
+        // Clone only the store the running worker already opened. No open,
+        // hydration, route installation or extra await precedes the send.
+        let timeout_storage = app
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("bob")
+            .expect("runtime already opened bob storage")
+            .app_storage();
+        let healthy_hex = hex::encode(healthy.as_slice());
+        eprintln!(
+            "phase=before_send pass={} accepted_reqs_total={} relay_publications_total={}",
+            pass,
+            relay.subscriptions.lock().unwrap().len(),
+            relay.published_events.lock().unwrap().len()
+        );
         let outgoing = format!("alice outgoing {pass}");
-        runtime
+        let sent = runtime
             .send_message("alice", &healthy, outgoing.clone().into_bytes())
             .await
             .unwrap();
-        wait_for_message(&mut events, "bob", &outgoing).await;
+        eprintln!(
+            "phase=send_completed pass={} published={} accepted_reqs_total={} relay_publications_total={}",
+            pass,
+            sent.published,
+            relay.subscriptions.lock().unwrap().len(),
+            relay.published_events.lock().unwrap().len()
+        );
+        wait_for_message(
+            &mut events,
+            "bob",
+            &outgoing,
+            Some((&timeout_storage, &healthy_hex, &sent.message_ids)),
+        )
+        .await;
 
         // Bob also writes in the quarantined group. Alice's copy keeps a
         // route for it, and the engine holds the input until recovery.
@@ -202,7 +246,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
             .unwrap()
     );
     for message in &held {
-        wait_for_message(&mut events, "alice", message).await;
+        wait_for_message(&mut events, "alice", message, None).await;
     }
     assert!(app.group("alice", &broken_hex).unwrap().is_some());
     runtime.shutdown().await;
