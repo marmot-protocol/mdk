@@ -1310,7 +1310,7 @@ Read only the requested local attachment, rejecting a changed selected draft.
 pub async fn cancel_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-On the new device, request cancellation of the link and notify the other device. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if that fails, the call returns the error, the link stays `Joining`, and the worker retries. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused with `no_link_in_progress` when no link is in progress.
+On the new device, request cancellation of the link. This does not guarantee notification of the other device: cancellation while waiting in `Joining` can end locally without sending a cancellation message. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if that fails, the call returns the error, the link stays `Joining`, and the worker retries. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused with `no_link_in_progress` when no link is in progress.
 
 [Source](src/commands/device_link.rs#L37)
 
