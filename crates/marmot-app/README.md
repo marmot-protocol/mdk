@@ -664,6 +664,10 @@ link this device. It is refused before the first check and once this device trus
 says whether it did so and still has no device group, so the app can say that only chats it is invited to from now on
 are here.
 
+`UnrecognizedSignIn::previously_linked_here` is optional local context for a retained link missing from the
+currently trusted, settled roster; false means no affirmative context, and the flag neither authenticates the current
+publication nor proves permanent loss.
+
 ## Compromise warning
 
 `MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
@@ -695,6 +699,9 @@ link (`new_device`) and the prompts for sign-ins this device can link (`prompts`
   group arrives, which the new device makes as soon as it joins; with none within an hour, this device removes it
   again and both sides show `LinkFailed`. A prompt also says when the sign-in can't be linked, when the account has
   20 devices, when several sign-ins compete, and who added the device on another device.
+- For explicit local repair, `reset_device_group_for_repair` follows the [shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing)
+  before fresh pairing: it preserves ordinary data but discards this copy's device-group continuity, may refuse while
+  busy, and does not guarantee fresh admission.
 - `device_link_snapshot` returns current linking and move progress. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
   also fires once each time the account's worker opens or reconnects. Unconfirmed comparisons end because their
   secrets are memory-only; admitted move bookkeeping resumes from storage.

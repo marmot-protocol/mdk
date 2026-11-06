@@ -108,6 +108,14 @@ pub(crate) enum DeviceLinkCommand {
     },
     #[command(about = "On the new device, cancel the link")]
     Cancel,
+    #[command(about = "Discard only this device's local device-group copy before fresh pairing")]
+    Reset {
+        #[arg(
+            long,
+            help = "Confirm abandoning local device sync; keeps ordinary chats and credentials"
+        )]
+        confirm: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]

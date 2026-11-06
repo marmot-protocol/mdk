@@ -952,6 +952,13 @@ c_cmd! {
     /// Free with `marmot_device_link_snapshot_free`.
     async fn marmot_start_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = start_device_link;
 
+    /// Explicit local device-group reset before fresh code pairing. Keeps
+    /// credentials, slot and ordinary chat data; abandons unfinished device
+    /// sync without removing any member. Active pairing/Move or unsettled
+    /// native work can refuse indefinitely. Requires experimental gates.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_reset_device_group_for_repair(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = reset_device_group_for_repair;
+
     /// On the new device: the user says both screens show the same emoji.
     /// Free with `marmot_device_link_snapshot_free`.
     async fn marmot_confirm_device_link_match(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = confirm_device_link_match;

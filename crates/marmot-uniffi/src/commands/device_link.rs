@@ -21,6 +21,22 @@ impl Marmot {
         Ok(self.runtime.start_device_link(&account_ref).await?.into())
     }
 
+    /// User-controlled local device-group reset before fresh code pairing.
+    /// Keeps credentials, slot and ordinary data; abandons old link-bound
+    /// preparation, not shared state/security sync. No membership repair/removal. Busy
+    /// native work/pairing/Move can refuse indefinitely; cancellation after
+    /// reset does not restore old trust. Requires explicit experimental gates.
+    pub async fn reset_device_group_for_repair(
+        &self,
+        account_ref: String,
+    ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .reset_device_group_for_repair(&account_ref)
+            .await?
+            .into())
+    }
+
     /// On the new device: the user says both screens show the same emoji.
     pub async fn confirm_device_link_match(
         &self,

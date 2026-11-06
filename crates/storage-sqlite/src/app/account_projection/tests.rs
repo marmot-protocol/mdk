@@ -5077,6 +5077,299 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap(),
         1
     );
+
+    // D112: forgetting an ACTIVE trusted device group abandons its local
+    // device-sync preparations in this same transaction. Ordinary chat
+    // content, issued native keys and taken-reference tombstones survive.
+    let repair = cgka_traits::GroupId::new(vec![0xcc]);
+    store
+        .put_group(&crate::base::test_support::sample_group(
+            repair.clone(),
+            2,
+            1,
+        ))
+        .unwrap();
+    let app = store.app_storage();
+    assert!(
+        app.insert_device_group(&crate::DeviceGroupRecord {
+            group_id_hex: "cc".into(),
+            trust: crate::DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some("fresh".into()),
+            recorded_at: 1,
+        })
+        .unwrap()
+    );
+    app.trust_device_group(
+        "cc",
+        crate::DeviceGroupTrust::Creating,
+        crate::DeviceGroupTrust::Created,
+        None,
+        1,
+        &crate::FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    app.put_device_rename(&crate::DeviceRenameRecord {
+        slot_id_hex: "old-slot".into(),
+        label: "Old edit".into(),
+        settings: None,
+        written: vec![[1; 16]],
+        replaced: vec![None],
+    })
+    .unwrap();
+    app.start_small_state().unwrap();
+    store.lock().unwrap().execute_batch(
+        "INSERT INTO small_state_items(group_id_hex,item,version,change_id,flag,unsent,updated_at)
+         VALUES('bb','pin',7,x'01010101010101010101010101010101',1,0,1);"
+    ).unwrap();
+    let kept_items = app.small_state_items().unwrap();
+    assert_eq!(kept_items.len(), 1);
+    let kept_choice = app
+        .record_invitation_decision("bb", [4; 32], false)
+        .unwrap();
+    app.begin_small_state_broadcast(12, 7).unwrap();
+    app.mark_small_state_sent(&kept_items).unwrap();
+    app.mark_invitation_decisions_sent(std::slice::from_ref(&kept_choice))
+        .unwrap();
+    app.small_state_broadcast_request_sent().unwrap();
+    let kept_schedule = app.small_state_schedule().unwrap();
+    store.lock().unwrap().execute_batch(
+        "INSERT INTO private_key_packages_received VALUES ('unused','old-slot',1,999,x'01',1,NULL);
+         INSERT INTO private_key_packages_received VALUES ('taken','old-slot',1,999,x'',1,2);
+         INSERT INTO cgka_private_key_packages VALUES (x'ff',1,x'01');
+         INSERT INTO private_key_package_requests VALUES ('old-slot',1,1);
+         CREATE TRIGGER fail_repair_forget BEFORE DELETE ON cgka_groups
+         WHEN OLD.id = x'cc' BEGIN SELECT RAISE(ABORT, 'repair forget failed'); END;"
+    ).unwrap();
+    assert_fails_with(
+        store.forget_group_local(&repair, cgka_traits::Timestamp(100)),
+        "repair forget failed",
+    );
+    assert_eq!(
+        app.device_group("cc").unwrap().unwrap().trust,
+        crate::DeviceGroupTrust::Created
+    );
+    assert!(store.get_group(&repair).is_ok());
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_repair_forget")
+        .unwrap();
+    // This fault is AFTER preparation retirement, so all of that work and
+    // the native/trust deletion must roll back together as well.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_repair_bootstrap BEFORE INSERT ON small_state_sync
+         BEGIN SELECT RAISE(ABORT, 'repair bootstrap failed'); END;",
+        )
+        .unwrap();
+    assert_fails_with(
+        store.forget_group_local(&repair, cgka_traits::Timestamp(100)),
+        "repair bootstrap failed",
+    );
+    assert_eq!(
+        app.device_group("cc").unwrap().unwrap().trust,
+        crate::DeviceGroupTrust::Created
+    );
+    assert!(store.get_group(&repair).is_ok());
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM private_key_packages_received",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(app.small_state_items().unwrap(), kept_items);
+    assert_eq!(app.small_state_schedule().unwrap(), kept_schedule);
+    assert!(app.unsent_small_state_items().unwrap().is_empty());
+    assert_eq!(
+        app.invitation_decision("bb", &[4; 32]).unwrap().as_ref(),
+        Some(&kept_choice)
+    );
+    assert!(app.unsent_invitation_decisions().unwrap().is_empty());
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_repair_bootstrap")
+        .unwrap();
+    assert!(
+        store
+            .forget_group_local(&repair, cgka_traits::Timestamp(100))
+            .unwrap()
+    );
+    assert!(
+        app.device_renames().unwrap().is_empty(),
+        "explicit active-DG reset must retire the old rename intent"
+    );
+    let conn = store.lock().unwrap();
+    for (table, expected) in [
+        ("private_key_packages_received", 1),
+        ("private_key_package_requests", 0),
+        ("cgka_private_key_packages", 1),
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            expected,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT key_package_ref_hex FROM private_key_packages_received",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "taken"
+    );
+    drop(conn);
+    assert!(
+        store
+            .list_groups()
+            .unwrap()
+            .contains(&cgka_traits::GroupId::new(vec![0xbb]))
+    );
+    let schedule = app.small_state_schedule().unwrap().unwrap();
+    assert!(schedule.request_owed && schedule.answer_owed);
+    assert_eq!(schedule.last_broadcast, None);
+    assert_eq!(app.small_state_items().unwrap(), kept_items);
+    assert_eq!(app.unsent_small_state_items().unwrap(), kept_items);
+    assert_eq!(
+        app.invitation_decision("bb", &[4; 32]).unwrap().as_ref(),
+        Some(&kept_choice)
+    );
+    assert_eq!(
+        app.unsent_invitation_decisions().unwrap(),
+        vec![kept_choice]
+    );
+
+    // A selected removal's ordinary forget is not this reset. Nor is
+    // forgetting an ordinary chat: neither may retire account-local debt.
+    let removed_id = cgka_traits::GroupId::new(vec![0xdd]);
+    let mut removed = crate::base::test_support::sample_group(removed_id.clone(), 2, 1);
+    removed.removed = true;
+    store.put_group(&removed).unwrap();
+    assert!(
+        app.insert_device_group(&crate::DeviceGroupRecord {
+            group_id_hex: "dd".into(),
+            trust: crate::DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some("old".into()),
+            recorded_at: 1,
+        })
+        .unwrap()
+    );
+    app.trust_device_group(
+        "dd",
+        crate::DeviceGroupTrust::Creating,
+        crate::DeviceGroupTrust::Created,
+        None,
+        1,
+        &crate::FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    app.put_device_rename(&crate::DeviceRenameRecord {
+        slot_id_hex: "kept-slot".into(),
+        label: "Kept".into(),
+        settings: None,
+        written: vec![[2; 16]],
+        replaced: vec![None],
+    })
+    .unwrap();
+    assert!(
+        store
+            .forget_group_local(&removed_id, cgka_traits::Timestamp(101))
+            .unwrap()
+    );
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+    assert!(
+        store
+            .forget_group_local(
+                &cgka_traits::GroupId::new(vec![0xbb]),
+                cgka_traits::Timestamp(101)
+            )
+            .unwrap()
+    );
+    assert_eq!(app.device_renames().unwrap().len(), 1);
+
+    // The generic forget still discards an unreadable trusted copy. That
+    // record cannot authorize the extra active-reset retirement above.
+    let unreadable_id = cgka_traits::GroupId::new(vec![0xee]);
+    store
+        .put_group(&crate::base::test_support::sample_group(
+            unreadable_id.clone(),
+            2,
+            1,
+        ))
+        .unwrap();
+    assert!(
+        app.insert_device_group(&crate::DeviceGroupRecord {
+            group_id_hex: "ee".into(),
+            trust: crate::DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some("unreadable".into()),
+            recorded_at: 1,
+        })
+        .unwrap()
+    );
+    app.trust_device_group(
+        "ee",
+        crate::DeviceGroupTrust::Creating,
+        crate::DeviceGroupTrust::Created,
+        None,
+        1,
+        &crate::FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 1,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let kept_preparations = app.device_renames().unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE cgka_groups SET record = x'ff' WHERE id = x'ee'", [])
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        store.get_group(&unreadable_id),
+        Err(cgka_traits::storage::StorageError::Serialization(_))
+    ));
+    assert!(
+        store
+            .forget_group_local(&unreadable_id, cgka_traits::Timestamp(102))
+            .expect("generic forget must discard an unreadable trusted copy")
+    );
+    assert!(store.is_group_forgotten(&unreadable_id).unwrap());
+    assert_eq!(
+        store.group_local_reset_cutoff(&unreadable_id).unwrap(),
+        Some(cgka_traits::Timestamp(102))
+    );
+    assert!(!store.list_groups().unwrap().contains(&unreadable_id));
+    assert!(app.device_group("ee").unwrap().is_none());
+    assert_eq!(app.device_renames().unwrap(), kept_preparations);
 }
 
 #[test]

@@ -301,6 +301,10 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return Err(AppError::DeviceGroupRefused("pairing_unsupported"));
         }
+        if op == DeviceLinkOp::ResetForRepair {
+            self.reset_device_group_for_repair().await?;
+            return self.device_link_snapshot();
+        }
         let now = unix_now_seconds();
         let result = match op {
             DeviceLinkOp::Start => self.start_new_device_link(now),
@@ -315,11 +319,91 @@ impl AppClient {
                 slot_id_hex,
             } => self.dismiss_move_sibling(&move_id, &slot_id_hex),
             DeviceLinkOp::Read => Ok(()),
+            DeviceLinkOp::ResetForRepair => unreachable!("handled before the pairing drive"),
         };
         // Send what the op owes even when it was refused.
         self.drive_device_pairing_live().await;
         result?;
         self.device_link_snapshot()
+    }
+
+    /// Deliberate local abandonment, not a removal, Move or unlink signal.
+    /// Forget's existing SQL transaction commits before native/cache cleanup;
+    /// never wrap it in an outer transaction or restore the old copy on error.
+    async fn reset_device_group_for_repair(&mut self) -> Result<(), AppError> {
+        if self.signing_out() {
+            return Err(AppError::DeviceGroupRefused("device_group_busy"));
+        }
+        self.follow_device_group_removal_live().await?;
+        if self.device_unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+            ));
+        }
+        let account = self.app.account_storage(&self.state.label)?;
+        if account
+            .key_package_lifecycle()?
+            .is_some_and(|state| state.slot_withdrawn_at.is_some())
+        {
+            return Err(AppError::DeviceGroupRefused("device_group_busy"));
+        }
+        let Some(group) = self.trusted_device_group()? else {
+            return Err(AppError::DeviceGroupRefused("no_device_group"));
+        };
+        let storage = account.app_storage();
+        let pairing_active = self
+            .device_pairing
+            .new_device
+            .as_ref()
+            .is_some_and(|link| link.outcome.is_none())
+            || self.device_pairing.prompts.iter().any(|prompt| {
+                !prompt.stage.is_terminal()
+                    || prompt.approval.is_some()
+                    || prompt.publication.is_some()
+            });
+        let stored_pairing = storage.device_groups()?.iter().any(|row| {
+            matches!(
+                row.trust,
+                DeviceGroupTrust::Creating | DeviceGroupTrust::AwaitingWelcome
+            )
+        }) || storage
+            .device_links()?
+            .iter()
+            .any(|link| link.outcome == DeviceLinkOutcome::Pending);
+        let moving = storage
+            .device_group_moves()?
+            .iter()
+            .any(|movement| movement.phase != storage_sqlite::DeviceGroupMovePhase::Finished);
+        if pairing_active
+            || stored_pairing
+            || moving
+            || self
+                .stored_group(&group)?
+                .is_none_or(|record| record.is_terminal())
+            || !self.device_group_settled(&group)
+            || self.runtime.has_pending_outbound_fanouts(&group)?
+            || self.runtime.has_queued_outbound_intents(&group)?
+        {
+            return Err(AppError::DeviceGroupRefused("device_group_busy"));
+        }
+        self.forget_group_local(&group).await?;
+        // The committed wipe retired only old device-sync preparation. Keep
+        // all ordinary group caches and admitted carrier ownership intact.
+        self.sibling_chat_gaps = Default::default();
+        self.received_private_key_package_generation =
+            self.received_private_key_package_generation.wrapping_add(1);
+        self.inactive_siblings = None;
+        self.leaving_siblings.clear();
+        self.sibling_welcome_retirement_cursor = None;
+        self.runtime.set_key_package_announcement_group(None);
+        let _ = self.runtime.set_device_tag_group(None);
+        let inbox = self.device_pairing.inbox.take();
+        *self.device_pairing = DevicePairing::new(inbox);
+        self.note_device_roster_changed();
+        self.device_link_changed = true;
+        self.chat_history_imports_changed = true;
+        self.refresh_device_labels(true);
+        Ok(())
     }
 
     pub(super) async fn drive_device_pairing_live(&mut self) {
