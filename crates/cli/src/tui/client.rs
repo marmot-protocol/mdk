@@ -737,6 +737,7 @@ impl TuiApp {
         }
         let result = self.client.run_json(Some(&account_id), &args)?;
         let stream_id = value_string(&result, "stream_id").unwrap_or_else(|| "unknown".to_owned());
+        self.adopt_message_account(&account_id);
         self.streaming = Some(StreamComposer {
             stream_id: stream_id.clone(),
             group_id: preview_group_id.clone(),
@@ -2247,21 +2248,32 @@ impl TuiApp {
     }
 
     /// Reset the pane to a loading state (only when switching to a different
-    /// group, so a same-chat reload never flashes empty), tag the pending target
-    /// for the stale guard, and queue the timeline load.
+    /// account/group, so a same-chat reload never flashes empty), tag the pending
+    /// target for the stale guard, and queue the timeline load.
     pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
         // Any explicit or fired load supersedes a pending flick-through preview.
         self.flick_countdown = None;
-        if self.messages_group_id.as_deref() != Some(group_id.as_str()) {
+        self.adopt_message_account(&account_id);
+        if self.messages_account_id.as_deref() != Some(account_id.as_str())
+            || self.messages_group_id.as_deref() != Some(group_id.as_str())
+        {
             // Drop the prior chat's pane and its per-group subscriptions so their
             // drains cannot pollute the pane while the new chat loads.
             self.clear_timeline_pane();
+            self.messages_account_id = None;
             self.messages_group_id = None;
             self.group_state_subscription = None;
             self.group_diagnostics = None;
         }
-        self.loading_chat = Some(group_id.clone());
+        self.loading_chat = Some((account_id.clone(), group_id.clone()));
         self.status = "loading chat...".to_owned();
+        // The account-wide feed belongs to the adopted live account even if
+        // this group's page fails. Same-account loads reuse its existing child.
+        if self.daemon.running
+            && let Err(err) = self.ensure_message_subscription(&account_id)
+        {
+            self.status = format!("message subscription failed: {err}");
+        }
         self.effects.enqueue(Effect::LoadTimeline {
             account: account_id,
             group: group_id,
@@ -2269,15 +2281,22 @@ impl TuiApp {
     }
 
     /// Fold a completed timeline load into the pane, exactly as the synchronous
-    /// path did after its `run_json` returned — but dropping a result whose group
-    /// no longer matches the pending target (a newer open superseded it).
+    /// path did after its `run_json` returned — but dropping a result whose
+    /// account/group no longer matches the pending target (a newer open
+    /// superseded it).
     fn fold_load_timeline(
         &mut self,
         account: String,
         group: String,
         result: Result<Vec<Value>, String>,
     ) {
-        if self.loading_chat.as_deref() != Some(group.as_str()) {
+        if !self
+            .loading_chat
+            .as_ref()
+            .is_some_and(|(pending_account, pending_group)| {
+                pending_account == &account && pending_group == &group
+            })
+        {
             // A newer load (an explicit open or a fired preview) already claimed
             // the pane; leave `loading_chat` pointing at that pending target so
             // this stale fold cannot cancel it.
@@ -2306,7 +2325,9 @@ impl TuiApp {
                 return;
             }
         };
-        if self.messages_group_id.as_deref() == Some(group.as_str()) {
+        if self.messages_account_id.as_deref() == Some(account.as_str())
+            && self.messages_group_id.as_deref() == Some(group.as_str())
+        {
             // Same-chat reload: the pane and its timeline subscription stayed live
             // (a different-chat open clears them and reloads fresh, so a stale
             // fold there is harmless). A subscription insert may have landed
@@ -2572,7 +2593,25 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Move the account-wide feed and preview buffer together. Pane loads and
+    /// empty-list refreshes both cross this boundary; reconnecting the same
+    /// account or navigating its groups keeps already observed preview text.
+    fn adopt_message_account(&mut self, account_id: &str) {
+        if self
+            .message_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.account_id != account_id)
+        {
+            self.message_subscription = None;
+        }
+        if self.stream_previews_account_id.as_deref() != Some(account_id) {
+            self.live_stream_previews.clear();
+            self.stream_previews_account_id = Some(account_id.to_owned());
+        }
+    }
+
     pub(crate) fn ensure_message_subscription(&mut self, account_id: &str) -> TuiResult<()> {
+        self.adopt_message_account(account_id);
         if !self.daemon.running {
             self.message_subscription = None;
             return Ok(());
@@ -2911,6 +2950,7 @@ impl TuiApp {
         let Some(subscription) = self.message_subscription.as_ref() else {
             return false;
         };
+        let account_id = subscription.account_id.clone();
         let mut events = Vec::new();
         loop {
             match subscription.rx.try_recv() {
@@ -2925,6 +2965,7 @@ impl TuiApp {
         if events.is_empty() {
             return false;
         }
+        self.adopt_message_account(&account_id);
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {

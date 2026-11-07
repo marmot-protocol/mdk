@@ -1074,6 +1074,17 @@ impl TuiApp {
             .unwrap_or_else(|| "Messages".to_owned())
     }
 
+    /// A retained pane can outlive the foreground account's list/feed. Only
+    /// that pane's own account-wide source may contribute its preview text.
+    fn message_stream_previews(&self) -> &[LiveStreamPreview] {
+        match self.messages_account_id.as_deref() {
+            Some(account) if self.stream_previews_account_id.as_deref() == Some(account) => {
+                &self.live_stream_previews
+            }
+            _ => &[],
+        }
+    }
+
     pub(crate) fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Messages;
         let base_title = self.loaded_chat_title();
@@ -1103,7 +1114,7 @@ impl TuiApp {
             .as_deref()
             .or_else(|| self.selected_chat_row().map(|chat| chat.group_id.as_str()));
         let preview_lines =
-            stream_preview_lines(&self.daemon, &self.live_stream_previews, group_id);
+            stream_preview_lines(&self.daemon, self.message_stream_previews(), group_id);
         let bottom_block = if self.timeline_scroll.is_pinned() {
             u16::try_from(preview_lines.len()).unwrap_or(u16::MAX)
         } else {
