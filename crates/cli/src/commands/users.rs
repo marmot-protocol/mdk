@@ -230,6 +230,111 @@ mod tests {
                 .expect("no MLS session means no co-members, not an error");
             assert!(seeds.is_empty());
         }
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let alice_home = AccountHome::open(alice_dir.path());
+        let alice = alice_home.create_nostr_account().unwrap();
+        let bob = AccountHome::open(bob_dir.path())
+            .create_nostr_account()
+            .unwrap();
+        let config =
+            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+        let bob_app = MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config.clone());
+        bob_app
+            .client(&bob.account_id_hex)
+            .await
+            .unwrap()
+            .publish_key_package()
+            .await
+            .unwrap();
+        bob_app
+            .publish_user_profile(
+                &bob.account_id_hex,
+                marmot_app::UserProfileMetadata {
+                    about: Some("co-member-needle".into()),
+                    ..Default::default()
+                },
+                marmot_app::AccountRelayListBootstrap::new(vec![url.clone().into()], Vec::new()),
+            )
+            .await
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(alice_dir.path(), url, config);
+        let runtime = app.runtime();
+        runtime.start().await.unwrap();
+        runtime
+            .key_package_maintenance_status(&alice.account_id_hex)
+            .await
+            .unwrap();
+        runtime
+            .create_group(
+                &alice.account_id_hex,
+                "search peers",
+                &[bob.account_id_hex.clone()],
+                None,
+            )
+            .await
+            .unwrap();
+        let found = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (1, 1),
+            },
+            Some(alice.account_id_hex.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.json["users"].as_array().unwrap().len(), 1);
+        assert_eq!(found.json["users"][0]["account_id_hex"], bob.account_id_hex);
+        assert_eq!(found.json["users"][0]["radius"], 1);
+        assert_eq!(found.json["users"][0]["matched_field"], "about");
+        assert_eq!(
+            radius_one_seeds(Some(&runtime), &alice, 0).await.unwrap(),
+            Vec::<String>::new(),
+        );
+        alice_home
+            .set_account_signed_out(&alice.account_id_hex, true)
+            .unwrap();
+        runtime.reconcile_accounts().await.unwrap();
+        let signed_out = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (1, 1),
+            },
+            Some(alice.account_id_hex.clone()),
+        )
+        .await
+        .expect("signed-out searches do not require an MLS worker");
+        assert_eq!(signed_out.json["users"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            signed_out.json["users"][0]["account_id_hex"],
+            bob.account_id_hex
+        );
+        assert_eq!(signed_out.json["users"][0]["radius"], 255);
+        alice_home.add_public_account(&bob.account_id_hex).unwrap();
+        runtime.reconcile_accounts().await.unwrap();
+        let public_only = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (1, 1),
+            },
+            Some(bob.account_id_hex.clone()),
+        )
+        .await
+        .expect("public-only searches do not require an MLS worker");
+        assert_eq!(public_only.json["account_id"], bob.account_id_hex);
+        runtime.shutdown().await;
+        relay.shutdown();
     }
 
     #[tokio::test]
