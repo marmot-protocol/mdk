@@ -10,6 +10,23 @@ use transport_nostr::{EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup
 
 use super::*;
 
+#[cfg(feature = "otlp-export")]
+#[test]
+fn production_export_intervals_stay_within_their_jitter_bounds() {
+    use std::time::Duration;
+
+    for (interval, earliest, latest) in [(10, 5, 15), (60, 50, 70), (3600, 3590, 3610)] {
+        for _ in 0..32 {
+            let delay = jittered_export_interval(Duration::from_secs(interval));
+            assert!(
+                (Duration::from_secs(earliest)..=Duration::from_secs(latest)).contains(&delay),
+                "configured {interval}s produced out-of-bounds delay {delay:?}",
+            );
+            assert_eq!(delay.subsec_nanos() % 1_000_000, 0);
+        }
+    }
+}
+
 fn hist(count: u64) -> DurationHistogramSnapshot {
     DurationHistogramSnapshot {
         buckets: vec![HistogramBucket {
