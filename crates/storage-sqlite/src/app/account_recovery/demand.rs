@@ -1,7 +1,5 @@
 //! The old recovery owner's obligations that the runner still reads: the
-//! pending demand read, maintenance reclamation, terminal-group retirement and
-//! epoch-gap capacity pressure. Duplicate pressure joins one row and one
-//! waiting period.
+//! pending demand read, maintenance reclamation and terminal-group retirement.
 use super::*;
 #[cfg(test)]
 use crate::SqliteAccountStorage;
@@ -191,53 +189,6 @@ impl SqliteAppStorage {
     }
 }
 
-impl SqliteAppStorage {
-    /// Admission pressure is demand, not permission for immediate replay into
-    /// the same queue. Duplicate pressure joins one row and one waiting period.
-    pub fn record_recovery_capacity_pressure(
-        &self,
-        group: &[u8],
-        epoch: u64,
-        now_ms: u64,
-    ) -> StorageResult<()> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let qualified: bool = conn.query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations WHERE cause=1 AND group_id=?1 AND state=1)",
-                [group], |row| row.get(0),
-            ).storage()?;
-            join_epoch_tx(&conn, group, sqlite_integer(epoch)?, sqlite_integer(now_ms / 1000)?, qualified)?;
-            conn.execute_cached(
-                "UPDATE account_recovery_obligations SET eligibility=2,updated_at_ms=?2
-                 WHERE cause=1 AND group_id=?1 AND stalled_epoch=?3 AND state=0 AND eligibility!=2",
-                params![group,sqlite_integer(now_ms)?,sqlite_integer(epoch)?],
-            ).storage()?;
-            Ok(())
-        })
-    }
-
-    /// The existing owner tick may authorize a bounded pressure probe after the
-    /// minimum relief interval. The account retry reservation still applies;
-    /// this does not reset pacing, increment attempts or start network work.
-    pub fn release_due_recovery_capacity_probes(
-        &self,
-        now_ms: u64,
-        minimum_delay_ms: u64,
-    ) -> StorageResult<()> {
-        let Some(before) = now_ms.checked_sub(minimum_delay_ms) else {
-            return Ok(());
-        };
-        self.lock()?
-            .execute_cached(
-                "UPDATE account_recovery_obligations SET eligibility=1
-             WHERE state=0 AND eligibility=2 AND updated_at_ms<=?1",
-                [sqlite_integer(before)?],
-            )
-            .storage()?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,51 +268,5 @@ mod tests {
                 == loss
         );
         assert!(!app.retire_terminal_group_recovery(&group).unwrap());
-    }
-}
-
-#[cfg(test)]
-mod capacity_tests {
-    use super::*;
-    use crate::base::test_support::{gid, sample_group};
-    use cgka_traits::storage::GroupStorage;
-
-    fn only_demand(app: &SqliteAppStorage) -> (RecoveryDemandTicket, RecoveryEligibility) {
-        let demands = app.pending_recovery_demands().unwrap();
-        assert_eq!(demands.len(), 1, "duplicate pressure joins one row");
-        (demands[0].ticket, demands[0].eligibility)
-    }
-
-    #[test]
-    fn admission_pressure_waits_its_relief_interval_before_a_probe() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
-        app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 1_000)
-            .unwrap();
-        let (original, eligibility) = only_demand(&app);
-        assert_eq!(eligibility, RecoveryEligibility::WaitingCapacity);
-        app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 5_000)
-            .unwrap();
-        assert!(only_demand(&app) == (original, RecoveryEligibility::WaitingCapacity));
-
-        // The waiting period runs from the first pressure, not the duplicate.
-        app.release_due_recovery_capacity_probes(15_999, 15_000)
-            .unwrap();
-        assert_eq!(only_demand(&app).1, RecoveryEligibility::WaitingCapacity);
-        app.release_due_recovery_capacity_probes(16_000, 15_000)
-            .unwrap();
-        assert_eq!(only_demand(&app).1, RecoveryEligibility::Retry);
-
-        // New pressure on the probe starts a new waiting period.
-        app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 16_001)
-            .unwrap();
-        assert_eq!(only_demand(&app).1, RecoveryEligibility::WaitingCapacity);
-        app.release_due_recovery_capacity_probes(31_000, 15_000)
-            .unwrap();
-        assert_eq!(only_demand(&app).1, RecoveryEligibility::WaitingCapacity);
-        app.release_due_recovery_capacity_probes(31_001, 15_000)
-            .unwrap();
-        assert_eq!(only_demand(&app).1, RecoveryEligibility::Retry);
     }
 }

@@ -22,7 +22,6 @@ pub use loss::{
     RecoveryLossWatermark,
 };
 pub use notice::ParkedRecoveryObligation;
-use plan::RECOVERY_PARK_AFTER_ATTEMPTS;
 pub use plan::RecoveryEligibility;
 
 #[cfg(test)]
@@ -235,40 +234,6 @@ pub(crate) fn loss_bound_values(
         Some(seconds) => (1, Some(sqlite_integer(seconds)?)),
         None => (2, None),
     })
-}
-
-impl SqliteAppStorage {
-    /// Observe current desired route/capability policy, not a historical goal.
-    /// Reconnect/open with an identical snapshot is a read-equivalent no-op.
-    /// A changed policy bumps the route revision and makes every pending
-    /// obligation Ready again, which releases a capacity wait, except a park
-    /// the old owner's attempt cap left. It is not new evidence about history,
-    /// so it leaves obligation revisions alone (mdk#2110). Deleted with
-    /// capacity-wait eligibility (mdk#2660).
-    pub fn observe_recovery_route_snapshot(&self, snapshot: [u8; 32]) -> StorageResult<bool> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let previous: Option<Vec<u8>> = conn.query_row_cached(
-                "SELECT route_snapshot FROM account_recovery_state WHERE singleton=1", [], |row| row.get(0),
-            ).storage()?;
-            if previous.as_deref() == Some(snapshot.as_slice()) { return Ok(false); }
-            let changed = previous.is_some() || conn.query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes WHERE snapshot_state=1)", [], |row| row.get::<_,bool>(0),
-            ).storage()?;
-            conn.execute_cached("UPDATE account_recovery_state SET route_snapshot=?1,route_revision=route_revision+?2 WHERE singleton=1",
-                params![snapshot.as_slice(),i64::from(changed)]).storage()?;
-            if changed {
-                // A goal parked by its attempt cap waits for new loss or a
-                // dismissal, not for a route change elsewhere.
-                conn.execute_cached(
-                    "UPDATE account_recovery_obligations SET eligibility=0
-                     WHERE state=0 AND NOT (eligibility=4 AND recovery_attempts>=?1)",
-                    [sqlite_integer(RECOVERY_PARK_AFTER_ATTEMPTS)?],
-                ).storage()?;
-            }
-            Ok(changed)
-        })
-    }
 }
 
 #[cfg(test)]

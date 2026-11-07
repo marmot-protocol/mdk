@@ -35,11 +35,10 @@ pub(super) struct RecoveryEndpointCheckpoint {
     first_boundary: bool,
 }
 
-/// The old owner's attempt cap: an obligation it parked after this many
-/// reserved attempts without progress (`recovery_attempts`, migration 0124)
-/// stays parked through a route change (mdk#2660).
-pub(super) const RECOVERY_PARK_AFTER_ATTEMPTS: u64 = 24;
-
+/// A pending obligation's eligibility. `WaitingCapacity` and
+/// `WaitingCapability` are waits the old owner wrote and nothing writes now
+/// (mdk#2660). An upgraded epoch gap in either is visited like a ready one:
+/// only a park (`NeedsDeepRepair`) stops its visits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
 pub enum RecoveryEligibility {

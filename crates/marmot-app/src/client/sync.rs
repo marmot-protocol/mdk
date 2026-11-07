@@ -3887,27 +3887,6 @@ impl AppClient {
             // being force-killed.
             self.persist_epoch_stall_evidence(std::slice::from_ref(group_id));
         }
-        if trigger == EpochStallBackfillTrigger::ResourceRefusal {
-            let pressure = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(storage.app_storage().record_recovery_capacity_pressure(
-                        group_id.as_slice(),
-                        stalled_epoch,
-                        self.recovery_owner.logical_now_ms(Instant::now())?,
-                    )?)
-                });
-            if pressure.is_ok() {
-                self.pending_recovery_capacity_writes.remove(group_id);
-            }
-            if let Err(error) = pressure {
-                self.pending_recovery_capacity_writes
-                    .insert(group_id.clone(), stalled_epoch);
-                tracing::warn!(target: "marmot_app::recovery", method = "record_recovery_capacity_pressure",
-                    error_kind=error.privacy_safe_kind(), "admission pressure remains pending persistence");
-            }
-        }
         if let BackfillDecision::ArmAndEscalate { arms } = decision {
             // The replay is armed above regardless: escalating reports that
             // replay alone is not repairing this group, it does not replace the
@@ -4395,7 +4374,6 @@ impl AppClient {
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
-        terminal.extend(self.pending_recovery_capacity_writes.keys().cloned());
         terminal.extend(intents.into_iter().filter_map(|intent| {
             hex::decode(intent.group_id_hex)
                 .ok()
@@ -4405,7 +4383,6 @@ impl AppClient {
         for group in terminal {
             if self.retire_terminal_group_recovery(&group) {
                 self.pending_recovery_arm_writes.remove(&group);
-                self.pending_recovery_capacity_writes.remove(&group);
             }
         }
     }
@@ -4444,7 +4421,6 @@ impl AppClient {
     /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
     pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
         !self.pending_recovery_arm_writes.is_empty()
-            || !self.pending_recovery_capacity_writes.is_empty()
             || self
                 .app
                 .account_storage(&self.state.label)
@@ -4484,7 +4460,6 @@ impl AppClient {
     fn recovery_pending(&self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         Ok(!self.pending_recovery_arm_writes.is_empty()
-            || !self.pending_recovery_capacity_writes.is_empty()
             || !storage.pending_recovery_demands()?.is_empty())
     }
 
@@ -7562,7 +7537,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contested_fork_and_capacity_facts_keep_independent_recovery_demand() {
+    async fn contested_fork_evidence_keeps_independent_recovery_demand() {
         use crate::client::epoch_stall::BackfillDecision;
         use cgka_traits::ingest::{DeferralLineage, IngestOutcome};
         use marmot_forensics::EpochStallBackfillTrigger;
@@ -7616,26 +7591,90 @@ mod tests {
         );
         assert!(client.pending_convergence_groups.contains(&group));
         assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
+    }
 
-        // A paced local reassessment can coincide with actual refusal. The
-        // local-work decision must not discard the separate pressure fact.
-        client.apply_backfill_decision(
-            &group,
-            epoch,
-            BackfillDecision::Reassess,
-            EpochStallBackfillTrigger::ResourceRefusal,
-        );
-        let demand = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
+    /// A resource refusal arms an ordinary epoch gap whose first runner visit
+    /// begins at once. Every later refusal at that epoch, skipped or paced into
+    /// a local reassessment, leaves the gap's demand and visit to the runner's
+    /// own schedule: no re-arm, no wait, no wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resource_refusal_arms_one_ordinary_runner_visit() {
+        use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
             .unwrap();
-        assert_eq!(
-            demand.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapacity
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client.create_group("refused", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let refused = IngestOutcome::ResourceRefused {
+            group_id: group.clone(),
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+        };
+        let wake = client.routing.recovery_runner_wake();
+        let wakes = || *wake.borrow();
+        let gap = || {
+            let demand = storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
+                .expect("the refusal armed an epoch gap");
+            let visit = storage.recovery_epoch_gap_retry(demand.ticket).unwrap();
+            (demand.ticket, demand.eligibility, visit)
+        };
+        let before = wakes();
+        client.detect_epoch_stall(
+            Some(group.clone()),
+            "refused-0",
+            &refused,
+            cgka_traits::transport::Timestamp(crate::unix_now_seconds()),
         );
+        let (ticket, eligibility, visit) = gap();
+        assert_eq!(eligibility, storage_sqlite::RecoveryEligibility::Ready);
+        assert!(
+            visit.is_some_and(|visit| visit.in_progress && visit.visits == 1),
+            "the refusal's arm begins the runner's first visit"
+        );
+        assert_eq!(wakes(), before + 1);
+        assert!(client.pending_recovery_arm_writes.is_empty());
+
+        // The cap stays full, so every further message is refused too: first
+        // skipped, then paced into a local reassessment on every refusal.
+        let refuse = |client: &mut crate::AppClient, index| {
+            client.detect_epoch_stall(
+                Some(group.clone()),
+                &format!("refused-{index}"),
+                &refused,
+                cgka_traits::transport::Timestamp(crate::unix_now_seconds()),
+            );
+        };
+        for index in 1..10 {
+            refuse(&mut client, index);
+        }
+        client.pending_convergence_groups.clear();
+        client.epoch_stall =
+            std::mem::take(&mut client.epoch_stall).with_wedge_rearm_interval_ms(0);
+        for index in 10..20 {
+            refuse(&mut client, index);
+        }
         assert!(client.pending_convergence_groups.contains(&group));
+        let (after, eligibility, still) = gap();
+        assert!(after == ticket, "a repeated refusal never re-arms the gap");
+        assert_eq!(eligibility, storage_sqlite::RecoveryEligibility::Ready);
+        assert_eq!(still, visit, "the runner alone moves its visit on");
+        assert_eq!(
+            wakes(),
+            before + 1,
+            "repeated refusals never wake the runner"
+        );
+        assert!(client.pending_recovery_arm_writes.is_empty());
     }
 
     /// A commit or retry can release several retained messages in one effects batch.

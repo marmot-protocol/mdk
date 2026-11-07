@@ -2101,10 +2101,7 @@ impl MarmotApp {
             crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
-        let recovery_owner = client::recovery::AccountRecoveryOwner::open(
-            client::recovery::wall_now_ms()?,
-            Instant::now(),
-        );
+        let recovery_owner = client::recovery::AccountRecoveryOwner::open();
         // Before the client activates any REQ; a failed read trusts none.
         let live_coverage = client::LiveCoverage::open(
             self.account_storage(&open.state.label)?
@@ -2247,7 +2244,6 @@ impl MarmotApp {
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             pending_recovery_arm_writes: HashMap::new(),
-            pending_recovery_capacity_writes: HashMap::new(),
             released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
