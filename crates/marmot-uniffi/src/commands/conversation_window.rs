@@ -515,7 +515,11 @@ mod tests {
         // Poll the real close first: it sends the closed watch before waiting
         // for the receiver lock, so this same pending receive cannot win with
         // a replacement if the runtime scheduling policy changes.
-        let ((), closed) = tokio::join!(biased; close, next);
+        let ((), closed) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(biased; close, next)
+        })
+        .await
+        .unwrap();
         assert!(closed.unwrap().is_none());
         window.cancel().await;
         assert!(matches!(
