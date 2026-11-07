@@ -86,7 +86,7 @@ impl SqliteAppStorage {
                 let current: Option<i64> = conn
                     .query_row_cached(
                         "SELECT stalled_epoch FROM account_recovery_obligations
-                     WHERE id=?1 AND revision=?2 AND cause=1 AND state=0 AND eligibility IN (0,1)",
+                     WHERE id=?1 AND revision=?2 AND cause=1 AND state=0 AND eligibility!=4",
                         params![ticket.id.as_slice(), integer(ticket.revision)?],
                         |row| row.get(0),
                     )
@@ -149,7 +149,7 @@ impl SqliteAppStorage {
                 "UPDATE account_recovery_epoch_gap_retries SET in_progress=0,next_retry_at_seconds=?4,exhausted=?5
                  WHERE obligation_id=?1 AND visits=?3 AND in_progress=1
                  AND EXISTS(SELECT 1 FROM account_recovery_obligations
-                     WHERE id=?1 AND revision=?2 AND cause=1 AND state=0 AND eligibility IN (0,1)
+                     WHERE id=?1 AND revision=?2 AND cause=1 AND state=0 AND eligibility!=4
                          AND stalled_epoch=account_recovery_epoch_gap_retries.stalled_epoch)",
                 params![ticket.id.as_slice(),integer(ticket.revision)?,integer(visits)?,
                     integer(now_seconds.saturating_add(delay_seconds))?, exhausted],

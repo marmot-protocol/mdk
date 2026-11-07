@@ -1068,7 +1068,6 @@ pub struct AppClient {
     /// Detector observations whose SQL write failed. At most one epoch per
     /// group; this buffer owns no dispatch, completion or retry policy.
     pub(crate) pending_recovery_arm_writes: HashMap<GroupId, u64>,
-    pub(crate) pending_recovery_capacity_writes: HashMap<GroupId, u64>,
     /// Initial account open or release consumption requires a backfill reload.
     /// Keep this armed after a failed read even if the journal is already empty;
     /// the next synchronized receipt access retries on this same client.
@@ -3467,7 +3466,6 @@ impl AppClient {
             .retain(|event| &event.group_id != group_id);
         self.epoch_stall.clear_recovered_group(group_id);
         self.pending_recovery_arm_writes.remove(group_id);
-        self.pending_recovery_capacity_writes.remove(group_id);
         self.encrypted_media_not_required_epochs.remove(&group_hex);
         self.pending_convergence_groups.remove(group_id);
         self.forget_pending_effect_projections(group_id);

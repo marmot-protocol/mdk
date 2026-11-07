@@ -338,7 +338,15 @@ async fn epoch_gap_retry_is_not_starved_by_a_large_staged_admission() {
 // Paused time needs the current-thread runtime; network answers are immediate.
 #[tokio::test(start_paused = true)]
 async fn unresolved_epoch_gap_revisits_are_paced_bounded_and_suspendable() {
-    for resolve_early in [false, true] {
+    use storage_sqlite::RecoveryEligibility as E;
+    // A gap the old owner left waiting for capacity or a capability gets the
+    // same budget: nothing releases those waits any more.
+    for (resolve_early, waiting) in [
+        (false, None),
+        (true, None),
+        (false, Some(E::WaitingCapacity)),
+        (false, Some(E::WaitingCapability)),
+    ] {
         let account = account();
         account
             .fault_connection()
@@ -370,6 +378,15 @@ async fn unresolved_epoch_gap_revisits_are_paced_bounded_and_suspendable() {
             .find(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
             .unwrap()
             .ticket;
+        if let Some(waiting) = waiting {
+            account
+                .fault_connection()
+                .execute(
+                    "UPDATE account_recovery_obligations SET eligibility = ?1 WHERE cause = 1",
+                    [waiting as i64],
+                )
+                .unwrap();
+        }
         let policy = test_policy();
         let (mut owner, _) = runner(&host, policy);
         for visit in 1..=u64::from(policy.unit.break_after_no_progress) {
@@ -452,5 +469,131 @@ async fn unresolved_epoch_gap_revisits_are_paced_bounded_and_suspendable() {
                 clock.advance_to(state.next_retry_at_seconds);
             }
         }
+    }
+}
+
+// Paused time steps through admission's holds without waiting on wall time.
+#[tokio::test(start_paused = true)]
+async fn a_refused_epoch_gap_is_visited_on_the_runners_schedule_and_never_while_held() {
+    use storage_sqlite::RecoveryEligibility as E;
+    // `Ready` is the gap a resource refusal arms. The old owner's capacity
+    // pressure and capability checks left it waiting; nothing here releases
+    // that wait: no higher-epoch arm, no released receipt, no route change.
+    for eligibility in [E::Ready, E::WaitingCapacity, E::WaitingCapability] {
+        let account = account();
+        account
+            .fault_connection()
+            .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+            .unwrap();
+        let clock = Clock::new();
+        let now = clock.now();
+        let route = group(1);
+        account.goal(&route, now - 100);
+        account
+            .app
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: "0a".into(),
+                stalled_epoch: 1,
+            }])
+            .unwrap();
+        let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
+        // The refusal's arm begins the first visit.
+        account
+            .app
+            .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), now - 100)], now)
+            .unwrap();
+        account
+            .fault_connection()
+            .execute(
+                "UPDATE account_recovery_obligations SET eligibility = ?1 WHERE cause = 1",
+                [eligibility as i64],
+            )
+            .unwrap();
+        let events = every([1; 32], now - 100, now, 10);
+        let mut owned = required(&route, &[RELAY]);
+        owned.group_id = Some(vec![0x0a]);
+        let relay = ModelRelay::new(RELAY, caps(500, false))
+            .with_events(events.clone())
+            .build();
+        let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
+        host.tails.stand(&route, RELAY, now);
+        // The engine refuses the group's second event for its resources.
+        host.no_trace
+            .lock()
+            .unwrap()
+            .insert(events[1].id.to_bytes().to_vec());
+        let policy = test_policy();
+        let (mut owner, _) = runner(&host, policy);
+
+        // The visit sweeps its reopened goal.
+        assert_eq!(ran(owner.step().await).outcome, Outcome::Advanced);
+        let swept = relay.requests();
+
+        // Admission then holds the group behind the refused event, twice as
+        // long on each retry the engine refuses again. Nothing more is fetched
+        // for the group meanwhile, and its visit stays open.
+        let mut holds = Vec::new();
+        for _ in 0..3 {
+            let due = idle(owner.step().await).expect("the held group is retried");
+            holds.push(due - clock.now());
+            clock.advance_to(due);
+        }
+        let base = policy.local_failure_backoff_base_seconds;
+        assert_eq!(holds, [base, 2 * base, 4 * base]);
+        assert_eq!(
+            relay.requests(),
+            swept,
+            "a group admission holds is never swept"
+        );
+        assert_eq!(account.admitted_events(), 1);
+        let open = account
+            .app
+            .recovery_epoch_gap_retry(ticket)
+            .unwrap()
+            .unwrap();
+        assert!(open.in_progress && open.visits == 1);
+
+        // Once the engine takes it, the group drains and the visit finishes,
+        // pacing the next one by the runner's own backoff.
+        host.no_trace.lock().unwrap().clear();
+        let in_progress = || {
+            account
+                .app
+                .recovery_epoch_gap_retry(ticket)
+                .unwrap()
+                .unwrap()
+                .in_progress
+        };
+        for _ in 0..8 {
+            let step = owner.step().await;
+            if !in_progress() {
+                break;
+            }
+            if let Step::Idle {
+                next_due: Some(due),
+            } = step
+            {
+                clock.advance_to(due);
+            }
+        }
+        let state = account
+            .app
+            .recovery_epoch_gap_retry(ticket)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !state.in_progress,
+            "the visit finishes once its group drains"
+        );
+        assert_eq!(state.visits, 1);
+        assert_eq!(
+            state.next_retry_at_seconds,
+            clock.now() + policy.unit.backoff_base_seconds
+        );
+        assert_eq!(account.admitted_events(), events.len() as u64);
+        assert!(
+            account.app.pending_recovery_demands().unwrap()[0].ticket == ticket,
+            "nothing re-armed the gap"
+        );
     }
 }

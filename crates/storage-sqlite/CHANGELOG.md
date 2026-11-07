@@ -64,6 +64,12 @@
   the caller imports it into the ledger. Conversion, the loss evidence writers, epoch-gap demand and parked notices
   stay. No migration; no table is dropped.
 
+- Remove capacity-wait eligibility (mdk#2660 rows 9–10): `record_recovery_capacity_pressure`,
+  `release_due_recovery_capacity_probes` and `observe_recovery_route_snapshot`, the route-policy snapshot that was
+  all that released the wait. Epoch-gap visits (`begin_recovery_epoch_gap_retry`, `finish_recovery_epoch_gap_retry`)
+  now accept every pending gap that is not parked, so a gap the old owner left waiting for capacity or a capability
+  is served. `RecoveryEligibility` keeps its variants for stored rows. No migration; no table is dropped.
+
 - Remove cross-read chat-list paging (mdk#2983): `chat_list_page`, `chat_list_page_from_anchor`, `ChatListPageQuery`,
   `ChatListCursor`, the `first`/`last` cursors on `ChatListPage`, and the `InvalidLimit`, `CursorMismatch`,
   `StaleCursor` and `FilteredCursorUnsupported` errors. Nothing outside storage tests called them: the runtime window

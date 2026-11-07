@@ -43,8 +43,9 @@
 //!
 //! Arm-run detection remains process-local. Qualified frozen-epoch counts and
 //! observation marks are durable, so restart neither erases evidence nor earns
-//! credit. Resource refusal preserves debt and enters owner-paced capacity
-//! handling; it cannot count a qualified completion or clear a retry deadline.
+//! credit. A resource refusal arms an ordinary epoch gap whose visits the
+//! recovery runner paces; it cannot count a qualified completion or clear a
+//! visit's backoff.
 //! `sync_with_partial_progress` moves a one-shot escalation into either its
 //! success summary or its failure prefix before the managed runtime can rebuild
 //! the client. The compatibility `sync()` API instead leaves it stashed after

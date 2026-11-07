@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 42] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -238,14 +238,6 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
     // bounds change input or explicit loss, not selection given equal input.
     decision(
         "A17",
-        ConstantInfluence::InputAcquisition,
-        VersioningRule::OperationalNonInterference,
-    ),
-    // Only the old owner's attempt cap remains, keeping a capped park through
-    // a route change; parking certifies nothing, so it changes which history
-    // arrives, never what counts as covered.
-    decision(
-        "A18",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

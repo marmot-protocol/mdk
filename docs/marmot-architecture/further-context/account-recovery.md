@@ -928,7 +928,11 @@ Thus an unavailable relay cannot prevent return visits to healthy relays. After 
 obligation parks visibly. Partial sweep progress does not reset this visit budget. Its count, unfinished-visit
 state and next retry time survive restart, and revisions of a ticket at the same missing epoch preserve them.
 A higher stalled epoch or explicit repair starts a fresh budget. Actual local epoch advancement clears the gap;
-reading all history successfully does not. Suspended groups receive no visits. These visits are unfenced.
+reading all history successfully does not. Suspended groups receive no visits, and neither does a group admission
+holds behind an event the engine refused; a visit does not finish while its group's fetched history still waits for
+admission. A resource refusal arms an ordinary gap and never holds it in a wait of its own, so a repeated refusal
+changes neither the visit budget nor its backoff. A gap an upgraded account's old owner left waiting for capacity or a
+capability is visited like any other. These visits are unfenced.
 Healthy routes retain the six-hour NIP-77-only periodic policy.
 
 
@@ -1108,20 +1112,23 @@ the old owner):
   A discarded spill row now records loss evidence only, and the worker imports it into the
   ledger as it does overflow. The recovery seams refresh on every call, which is what the
   slot, never settled by anything, already made them do.
+- Capacity-wait eligibility (rows 9–10, slice C): `record_recovery_capacity_pressure`,
+  `release_due_recovery_capacity_probes` and the app's buffer and logical clock for them,
+  and the route-policy snapshot that was all that released the wait under the runner, with
+  the attempt cap's guard (A18) that kept a capped park through a route change. A resource
+  refusal now arms an ordinary epoch gap, and the runner's own visit budget and admission
+  holds pace it. Epoch-gap visits take every pending gap that is not parked, so one the old
+  owner left waiting for capacity or a capability is served too. A route change no longer
+  rewrites eligibility.
 
 Still to delete:
 
-- Capacity-wait eligibility (`record_recovery_capacity_pressure`,
-  `release_due_recovery_capacity_probes`) and the route-policy snapshot that is all that
-  releases it, with the attempt cap's guard (A18) that keeps a capped park through a route
-  change. Under the runner a capacity-pressured epoch gap waits for a route change, a released
-  receipt or a higher epoch; this waits on a decision.
 - The epoch-stall detector's fruitless-completion count and its threshold (A10): nothing has
   produced a count since the stall samples went, so only evidence a 0.14.0 process persisted
   can restore one.
 - An epoch gap the old owner certified (state 1) while the engine stayed stalled: the runner
   reads only pending rows, so it never revisits one, and a same-epoch re-arm does not reopen
-  it.
+  it. Conversion fixes it before the #2660 release (mdk#3059).
 - Data-dead APIs no production code calls since row 8: the maintenance REQ API
   (`install_group_maintenance_*`) and the window acquisition scopes (`AccountInboxWindow`,
   `GroupWindow`, `GroupsWindow`). The storage `SubscriptionReplay` APIs went in rows 9–10.

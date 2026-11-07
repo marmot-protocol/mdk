@@ -269,7 +269,7 @@ runner supplies validated facts and owns execution policy. Design:
   inventory; consumption falls back to conservative invalidation only if neither inventory bounds nor that durable
   flag exist. No-op admission never scans recovery scopes, and idempotent deletes void nothing.
 - **Demand and notices (`account_recovery/demand.rs`, `notice.rs`).** Epoch-gap demand the runner arms and serves,
-  capacity-wait eligibility, and terminal-group retirement, which deletes the group's epoch-gap, maintenance and
+  and terminal-group retirement, which deletes the group's epoch-gap, maintenance and
   known-event rows atomically with its failure report. A parked occurrence is one "history may be incomplete"
   notice; dismissal retires exactly that revision (`state = 2`, never coverage).
 - **Retention.** `retained_recovery_event` checks exact route, event, and frozen window membership after the caller

@@ -35,15 +35,16 @@ pub(super) fn advance(
     let floor = turn
         .now
         .saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    // Only a park stops visits. The old owner's capacity and capability waits
+    // have no releaser under the runner, so an upgraded gap in one is visited
+    // like a ready one; admission's hold below is what keeps a group it cannot
+    // drain from being swept.
     for demand in app
         .pending_recovery_demands()?
         .into_iter()
         .filter(|demand| {
             demand.cause == RecoveryCause::EpochGap
-                && matches!(
-                    demand.eligibility,
-                    RecoveryEligibility::Ready | RecoveryEligibility::Retry
-                )
+                && demand.eligibility != RecoveryEligibility::NeedsDeepRepair
         })
     {
         let routes = turn

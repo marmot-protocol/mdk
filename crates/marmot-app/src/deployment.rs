@@ -12,8 +12,7 @@ pub struct MarmotDeployment {
     /// Relays this deployment operates. A route's history certifies once its
     /// operated relays finish an untruncated comparison; every other relay on
     /// the route is best effort and never blocks completion. A route with no
-    /// operated relay requires all of its relays. The raw strings feed the
-    /// recovery route-policy hash, so a change rebuilds pending scopes.
+    /// operated relay requires all of its relays.
     pub recovery_operated_relays: Vec<String>,
     /// Public relays onboarding and account setup also search for an account's
     /// relay list and profile, besides the discovery relays the host passes.
@@ -202,9 +201,9 @@ mod tests {
     use super::*;
 
     /// The preset must keep White Noise's behaviour: these are the values MDK
-    /// compiled in before they became configuration. The recovery set's raw
-    /// strings feed the route-policy hash, so any drift there would rebuild
-    /// every pending recovery scope.
+    /// compiled in before they became configuration. The recovery set decides
+    /// each route's required relays, so any drift there would change which
+    /// relays recovery waits on.
     #[test]
     fn white_noise_preset_keeps_the_values_mdk_compiled_in() {
         let deployment = MarmotDeployment::white_noise();

@@ -1,8 +1,7 @@
 //! Account recovery seams. The recovery runner owns every history fetch
-//! (mdk#2660 phase 4); this module keeps the account's native replay ingress,
-//! flushes the recovery observations each seam owes the ledger, and keeps the
-//! logical clock the ledger's deadlines are read against.
-use std::time::{Duration, Instant};
+//! (mdk#2660 phase 4); this module keeps the account's native replay ingress
+//! and flushes the recovery observations each seam owes the ledger.
+use std::time::Duration;
 
 use super::AppClient;
 use crate::{AppError, unix_now_seconds};
@@ -15,8 +14,6 @@ pub(crate) struct AccountRecoveryOwner {
     pub(super) retained_spill: std::collections::HashMap<cgka_traits::MessageId, i64>,
     pub(super) native_cursor_target: Option<u64>,
     pub(super) native_receive_pending: bool,
-    wall_anchor_ms: u64,
-    monotonic_anchor: Instant,
     replay_generation: Option<u64>,
     /// The replay generation the last full synchronization saw, authorized or
     /// not. The adapter bumps its generation only when its replay sources
@@ -45,15 +42,13 @@ impl AccountRecoveryOwner {
         self.replay_generation == Some(generation) && self.replay_complete
     }
 
-    pub(crate) fn open(wall_now_ms: u64, monotonic_now: Instant) -> Self {
+    pub(crate) fn open() -> Self {
         Self {
             native_batch: None,
             native_ingress: None,
             retained_spill: std::collections::HashMap::new(),
             native_cursor_target: None,
             native_receive_pending: false,
-            wall_anchor_ms: wall_now_ms,
-            monotonic_anchor: monotonic_now,
             replay_generation: None,
             replay_observed_generation: None,
             replay_complete: false,
@@ -63,19 +58,6 @@ impl AccountRecoveryOwner {
     #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn test_replay_complete(&self) -> bool {
         self.replay_complete
-    }
-
-    pub(super) fn logical_now_ms(&self, now: Instant) -> StorageResult<u64> {
-        let elapsed = now
-            .checked_duration_since(self.monotonic_anchor)
-            .ok_or_else(|| {
-                StorageError::Serialization("recovery monotonic clock moved backward".into())
-            })?;
-        self.wall_anchor_ms
-            .checked_add(duration_ms(elapsed)?)
-            .ok_or_else(|| {
-                StorageError::Serialization("recovery clock outside supported range".into())
-            })
     }
 }
 
@@ -218,58 +200,6 @@ impl AppClient {
             .map(|created_at| crate::history_floor(created_at.0))
     }
 
-    pub(crate) fn observe_recovery_route_policy(&self) -> Result<(), AppError> {
-        use sha2::{Digest, Sha256};
-        let routing = self.routing.snapshot();
-        let mut inbox = routing
-            .local_inbox_endpoints
-            .iter()
-            .map(|endpoint| &endpoint.0)
-            .collect::<Vec<_>>();
-        inbox.sort();
-        inbox.dedup();
-        let mut groups = routing
-            .group_routes
-            .iter()
-            .map(|route| {
-                let mut endpoints = route
-                    .endpoints
-                    .iter()
-                    .map(|endpoint| &endpoint.0)
-                    .collect::<Vec<_>>();
-                endpoints.sort();
-                endpoints.dedup();
-                (
-                    route.group_id.as_slice(),
-                    route.transport_group_id.as_slice(),
-                    endpoints,
-                )
-            })
-            .collect::<Vec<_>>();
-        groups.sort();
-        groups.dedup();
-        // The operated set decides which relays certify a scope, so changing it
-        // is a policy change that rebuilds every pending scope.
-        let mut operated = self
-            .app
-            .config
-            .deployment
-            .recovery_operated_relays
-            .iter()
-            .collect::<Vec<_>>();
-        operated.sort();
-        operated.dedup();
-        let canonical = serde_json::to_vec(&("history-route-policy-v2", inbox, groups, operated))
-            .map_err(|_| {
-            StorageError::Serialization("invalid recovery route snapshot".into())
-        })?;
-        self.app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .observe_recovery_route_snapshot(Sha256::digest(canonical).into())?;
-        Ok(())
-    }
-
     /// Imported ledger debt replaces the cursor's loss fence. This is a
     /// durable handoff, not proof of recovery and not a recovery-success metric.
     pub(crate) fn finish_runner_loss_import(&mut self) -> Result<bool, AppError> {
@@ -362,8 +292,8 @@ impl AppClient {
     }
 
     /// Flush recovery observations at a recovery seam: synchronize native
-    /// replay facts, import loss, retry buffered epoch-gap arms and capacity
-    /// pressure, and observe the current route policy. A wake-collection
+    /// replay facts, import loss, retry buffered epoch-gap arms and consume
+    /// released receipts. A wake-collection
     /// (`CursorPersistence::Frozen`) process leaves them to an Advance runtime.
     /// The recovery runner owns every history fetch (mdk#2660 phase 4).
     pub(crate) async fn refresh_account_recovery(&mut self) -> Result<(), AppError> {
@@ -385,16 +315,8 @@ impl AppClient {
             .collect::<Vec<_>>();
         self.arm_epoch_gap_recovery(&arms)?;
         self.pending_recovery_arm_writes.clear();
-        for (group, epoch) in &self.pending_recovery_capacity_writes {
-            storage.app_storage().record_recovery_capacity_pressure(
-                group.as_slice(),
-                *epoch,
-                self.recovery_owner.logical_now_ms(Instant::now())?,
-            )?;
-        }
-        self.pending_recovery_capacity_writes.clear();
         drop(self.transport_receipts()?);
-        self.observe_recovery_route_policy()
+        Ok(())
     }
 }
 
