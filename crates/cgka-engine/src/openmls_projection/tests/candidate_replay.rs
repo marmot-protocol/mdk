@@ -340,8 +340,8 @@ async fn candidate_probe_preserves_a_real_proposal_rejection() {
         DEFAULT_CIPHERSUITE.signature_algorithm(),
     )
     .unwrap();
-    // Author genuine bytes in temporary native state, then restore every
-    // proposal/own-leaf write before the independent probe reads its source.
+    // Restore group-scoped proposal/own-leaf state after authoring genuine bytes.
+    // The unreferenced global leaf key is not part of the probe's inputs.
     let before = storage.group_replay_state_fingerprint(&group_id).unwrap();
     assert!(before.is_some());
     let proposal = {
