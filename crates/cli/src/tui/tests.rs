@@ -8511,36 +8511,74 @@ fn group_detail_leave_confirms_before_the_authoritative_command() {
         (self_id.clone(), "npubself".to_owned()),
         (peer_id.clone(), "npubpeer".to_owned()),
     ];
-    let mut app = test_tui_app(test_unused_client(), &self_id);
-    app.screen = Screen::GroupDetail;
-
-    // The confirmation is a coarse entry to the real command. Core owns
-    // demotion and last-admin refusal; the TUI must not block eligible admins.
+    // Core owns demotion and last-admin refusal; eligible admins and ordinary
+    // members must both reach the authoritative command after confirmation.
     for is_admin in [true, false] {
-        let admins = if is_admin {
-            vec![self_id.clone(), peer_id.clone()]
-        } else {
-            vec![peer_id.clone()]
-        };
-        let view = build_group_detail("g1", "Ops", "", &members, &admins, &[], &self_id, true);
-        let self_row = view
-            .members
-            .iter()
-            .find(|member| member.is_self)
-            .expect("the current member has a self row");
-        assert_eq!(self_row.member_id, self_id);
-        assert_eq!(self_row.is_admin, is_admin);
-        app.group_detail = Some(view);
-        app.popup = None;
-        app.handle_key(char_key('L'))
-            .expect("L opens Leave confirmation");
-        assert!(matches!(
-            &app.popup,
-            Some(Popup::Confirm {
-                purpose: ConfirmPurpose::LeaveGroup { group_id },
-                ..
-            }) if group_id == "g1"
-        ));
+        for local_signing in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (exe, args_file) = test_appending_arg_executable(
+                dir.path(),
+                r#"{"ok":true,"result":{"published":3}}"#,
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &self_id,
+            );
+            app.daemon.running = false;
+            app.accounts[0].local_signing = local_signing;
+            app.chats = vec![flick_chat("other-group", "Other")];
+            app.screen = Screen::GroupDetail;
+            let admins = if is_admin {
+                vec![self_id.clone(), peer_id.clone()]
+            } else {
+                vec![peer_id.clone()]
+            };
+            let view = build_group_detail("g1", "Ops", "", &members, &admins, &[], &self_id, true);
+            let self_row = view
+                .members
+                .iter()
+                .find(|member| member.is_self)
+                .expect("self row");
+            assert_eq!(self_row.member_id, self_id);
+            assert_eq!(self_row.is_admin, is_admin);
+            app.group_detail = Some(view);
+            app.handle_key(char_key('L'))
+                .expect("L opens Leave confirmation");
+            assert!(matches!(
+                &app.popup,
+                Some(Popup::Confirm { purpose: ConfirmPurpose::LeaveGroup { group_id }, .. }) if group_id == "g1"
+            ));
+            app.handle_key(char_key('n')).expect("cancel leave");
+            assert!(app.popup.is_none());
+            assert!(
+                !args_file.exists(),
+                "cancel leaves native membership untouched"
+            );
+            app.handle_key(char_key('L')).expect("reopen leave");
+            app.handle_key(char_key('y')).expect("confirm leave");
+            if !local_signing {
+                assert_eq!(
+                    app.status,
+                    "error: selected account is public-only and cannot sign"
+                );
+                assert!(
+                    !args_file.exists(),
+                    "public-only account must not spawn a mutation"
+                );
+                continue;
+            }
+            assert_eq!(app.status, "left group; published=3");
+            assert_eq!(app.screen, Screen::Main);
+            assert!(app.group_detail.is_none());
+            let recorded = std::fs::read_to_string(&args_file).expect("recorded calls");
+            assert_eq!(
+                recorded.lines().next().map(str::trim_end),
+                Some(format!("--json --account {self_id} groups leave g1").as_str())
+            );
+        }
     }
 }
 
@@ -8767,6 +8805,131 @@ fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
             ..
         })
     ));
+
+    #[cfg(unix)]
+    for (key, pasted, arguments, acknowledgement) in [
+        (
+            'R',
+            " Renamed",
+            "groups rename g1 Ops Room Renamed",
+            "renamed group; published=3",
+        ),
+        (
+            'A',
+            "npubchosen",
+            "groups add-members g1 npubchosen",
+            "added member(s); published=3",
+        ),
+        (
+            'x',
+            "",
+            "groups remove-members g1 npubchosen",
+            "removed member(s); published=3",
+        ),
+        (
+            'P',
+            "",
+            "groups promote g1 npubchosen",
+            "promoted admin; published=3",
+        ),
+    ] {
+        for local_signing in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (exe, args_file) = test_appending_arg_executable(
+                dir.path(),
+                r#"{"ok":true,"result":{"published":3}}"#,
+            );
+            let account = "aa".repeat(32);
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = false;
+            app.accounts[0].local_signing = local_signing;
+            app.accounts.insert(
+                0,
+                AccountRow {
+                    account_id: "bb".repeat(32),
+                    npub: "npubother".into(),
+                    display_name: None,
+                    local_signing: true,
+                },
+            );
+            app.selected_account = 1;
+            app.chats = vec![flick_chat("other-group", "Other")];
+            app.screen = Screen::GroupDetail;
+            app.group_detail = Some(GroupDetailView {
+                group_id: "g1".into(),
+                name: "Ops Room".into(),
+                description: String::new(),
+                members: vec![
+                    GroupMemberRow {
+                        member_id: account.clone(),
+                        npub: "npubself".into(),
+                        is_admin: true,
+                        is_self: true,
+                    },
+                    GroupMemberRow {
+                        member_id: "cc".repeat(32),
+                        npub: "npubchosen".into(),
+                        is_admin: false,
+                        is_self: false,
+                    },
+                ],
+                relays: Vec::new(),
+                selected: 1,
+            });
+            app.handle_key(char_key(key)).expect("open action popup");
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .expect("cancel");
+            assert!(app.popup.is_none());
+            assert!(!args_file.exists(), "cancel must not invoke a command");
+            app.handle_key(char_key(key)).expect("reopen action popup");
+            if !pasted.is_empty() {
+                app.handle_paste(pasted.to_owned());
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("submit");
+            assert!(app.popup.is_none());
+            if !local_signing {
+                assert_eq!(
+                    app.status,
+                    "error: selected account is public-only and cannot sign"
+                );
+                assert!(
+                    !args_file.exists(),
+                    "a public-only account cannot spawn the mutation"
+                );
+                continue;
+            }
+            assert_eq!(app.status, acknowledgement);
+            assert_eq!(app.loading_group_detail.as_deref(), Some("g1"));
+            finish_queued_effects(&mut app);
+            let recorded = std::fs::read_to_string(&args_file).expect("recorded calls");
+            assert_eq!(
+                recorded.lines().next(),
+                Some(format!("--json --account {account} {arguments}").as_str())
+            );
+        }
+    }
+
+    // These are local UI refusals. Native authorization remains in the CLI/core.
+    let view = app.group_detail.as_mut().expect("existing detail view");
+    view.members[0].is_self = true;
+    app.popup = None;
+    app.handle_key(char_key('x')).expect("remove self refusal");
+    assert!(app.popup.is_none());
+    assert_eq!(app.status, "cannot remove yourself; press L to leave");
+    let member = &mut app.group_detail.as_mut().unwrap().members[0];
+    member.is_self = false;
+    member.is_admin = true;
+    app.handle_key(char_key('P'))
+        .expect("existing admin refusal");
+    assert!(app.popup.is_none());
+    assert_eq!(app.status, "member is already an admin");
 }
 
 #[test]
@@ -12997,57 +13160,110 @@ fn parse_profile_view_reads_fields_and_follows() {
 #[cfg(unix)]
 #[test]
 fn profile_edit_publishes_only_the_selected_field() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let (exe, args_file) =
-        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
-    let client = WnClient {
-        exe,
-        home: None,
-        socket: None,
-        relay: None,
-        discovery_relays: Vec::new(),
-        default_account_relays: Vec::new(),
-        secret_store: None,
-        keychain_service: None,
-    };
-    let mut app = test_tui_app(client, &"aa".repeat(32));
-    app.screen = Screen::Profile;
-    let mut view = ProfileView {
-        npub: "npub1self".to_owned(),
-        ..ProfileView::default()
-    };
-    view.fields[1] = Some("Al".to_owned()); // display_name
-    view.selected = 1;
-    app.profile_view = Some(view);
-
-    // Enter opens the edit popup for the selected field, prefilled.
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .expect("open edit popup");
-    assert!(matches!(
-        app.popup,
-        Some(Popup::Text {
-            purpose: TextPurpose::EditProfileField {
-                field: ProfileField::DisplayName
-            },
-            ..
-        })
-    ));
-    // Enter submits the prefilled value, publishing only --display-name.
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .expect("submit edit");
-
-    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
-    let updates: Vec<_> = recorded
-        .lines()
-        .filter(|line| line.contains("profile update"))
-        .collect();
-    assert_eq!(
-        updates,
-        [format!(
-            "--json --account {} profile update --display-name Al",
-            "aa".repeat(32)
-        )]
-    );
+    for (index, field, flag, value, acknowledgement) in [
+        (0, ProfileField::Name, "--name", "Alice", "updated name"),
+        (
+            1,
+            ProfileField::DisplayName,
+            "--display-name",
+            "Al",
+            "updated display name",
+        ),
+        (
+            2,
+            ProfileField::About,
+            "--about",
+            "ships tools",
+            "updated about",
+        ),
+        (
+            3,
+            ProfileField::Picture,
+            "--picture",
+            "https://example.test/avatar.png",
+            "updated picture",
+        ),
+        (
+            4,
+            ProfileField::Nip05,
+            "--nip05",
+            "alice@example.test",
+            "updated nip05",
+        ),
+        (
+            5,
+            ProfileField::Lud16,
+            "--lud16",
+            "tips@example.test",
+            "updated lud16",
+        ),
+    ] {
+        for local_signing in [true, false] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let (exe, args_file) =
+                test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+            let account = "aa".repeat(32);
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = false;
+            app.accounts[0].local_signing = local_signing;
+            app.accounts.insert(
+                0,
+                AccountRow {
+                    account_id: "bb".repeat(32),
+                    npub: "npubother".into(),
+                    display_name: None,
+                    local_signing: true,
+                },
+            );
+            app.selected_account = 1;
+            app.screen = Screen::Profile;
+            let mut view = ProfileView {
+                npub: "npub1self".into(),
+                ..ProfileView::default()
+            };
+            view.fields[index] = Some(value.to_owned());
+            view.selected = index;
+            app.profile_view = Some(view);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("open edit");
+            assert!(matches!(
+                &app.popup,
+                Some(Popup::Text { purpose: TextPurpose::EditProfileField { field: selected }, input, .. })
+                    if *selected == field && input.value() == value
+            ));
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("submit edit");
+            if !local_signing {
+                assert_eq!(
+                    app.status,
+                    "error: selected account is public-only and cannot sign"
+                );
+                assert!(
+                    !args_file.exists(),
+                    "public-only account must not spawn a mutation"
+                );
+                continue;
+            }
+            assert_eq!(app.status, acknowledgement);
+            let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+            let updates: Vec<_> = recorded
+                .lines()
+                .filter(|line| line.contains("profile update"))
+                .collect();
+            assert_eq!(
+                updates,
+                [format!(
+                    "--json --account {account} profile update {flag} {value}"
+                )]
+            );
+        }
+    }
 }
 
 #[test]
@@ -13283,64 +13499,102 @@ fn logout_is_discoverable_in_help_and_suggestions() {
 #[cfg(unix)]
 #[test]
 fn follows_child_invocation_borrows_the_setup_relay_only_without_a_global_relay() {
-    // `follows add`/`profile update` require a relay; without a launch-time global
-    // `--relay` the TUI lends the first configured setup relay so the child does not
-    // hard-fail. `--relay` is a global clap flag, so a command-local position lands
-    // in the same slot the handler reads, and it is never appended twice.
-    let account_id = "aa".repeat(32);
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (exe, args_file) = test_arg_recording_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
-    let mut client = WnClient {
-        exe,
-        home: None,
-        socket: None,
-        relay: None,
-        discovery_relays: vec!["wss://discovery".to_owned()],
-        default_account_relays: vec!["wss://default".to_owned()],
-        secret_store: None,
-        keychain_service: None,
-    };
-    let mut app = test_tui_app(client.clone(), &account_id);
-    app.follow_user("npub1bob").expect("follow");
-    let args: Vec<String> = std::fs::read_to_string(&args_file)
-        .expect("args file")
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    assert!(
-        args.windows(2)
-            .any(|window| window == ["--relay", "wss://default"]),
-        "follows add borrows the default account relay: {args:?}"
-    );
-
-    // No relay configured at all: nothing is fabricated, so the child still reaches
-    // the CLI's clear MissingRelay error naming the setup flags.
-    client.discovery_relays.clear();
-    client.default_account_relays.clear();
-    let mut app = test_tui_app(client, &account_id);
-    app.follow_user("npub1bob").expect("follow");
-    let recorded = std::fs::read_to_string(&args_file).expect("args file");
-    assert!(
-        !recorded.lines().any(|line| line == "--relay"),
-        "no relay is invented when none is configured: {recorded:?}"
-    );
-
-    let client = WnClient {
-        relay: Some("wss://global".to_owned()),
-        discovery_relays: vec!["wss://discovery".to_owned()],
-        default_account_relays: vec!["wss://default".to_owned()],
-        ..app.client.clone()
-    };
-    let mut app = test_tui_app(client, &account_id);
-    app.follow_user("npub1bob")
-        .expect("follow with global relay");
-    let recorded = std::fs::read_to_string(&args_file).expect("args file");
-    let args: Vec<_> = recorded.lines().collect();
-    assert_eq!(args.iter().filter(|arg| **arg == "--relay").count(), 1);
-    assert!(
-        args.windows(2)
-            .any(|pair| pair == ["--relay", "wss://global"])
-    );
+    let account = "aa".repeat(32);
+    // Keep all three original relay-source contrasts through the actual Profile
+    // popup callers. Search-result follow effects have a separate owner.
+    for (relay, setup, expected_prefix, expected_suffix) in [
+        (None, true, "--json", " --relay wss://default"),
+        (None, false, "--json", ""),
+        (
+            Some("wss://global"),
+            true,
+            "--json --relay wss://global",
+            "",
+        ),
+    ] {
+        for (key, peer, verb, acknowledgement) in [
+            ('f', "npub1bob", "add", "followed npub1bob"),
+            ('x', "npubselected", "remove", "unfollowed npubselected"),
+        ] {
+            for local_signing in [true, false] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (exe, args_file) =
+                    test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+                let client = WnClient {
+                    exe,
+                    home: None,
+                    socket: None,
+                    relay: relay.map(str::to_owned),
+                    discovery_relays: if setup {
+                        vec!["wss://discovery".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    default_account_relays: if setup {
+                        vec!["wss://default".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    secret_store: None,
+                    keychain_service: None,
+                };
+                let mut app = test_tui_app(client, &account);
+                app.accounts[0].local_signing = local_signing;
+                app.accounts.insert(
+                    0,
+                    AccountRow {
+                        account_id: "bb".repeat(32),
+                        npub: "npubother".into(),
+                        display_name: None,
+                        local_signing: true,
+                    },
+                );
+                app.selected_account = 1;
+                app.screen = Screen::Profile;
+                app.profile_view = Some(ProfileView {
+                    follows: vec!["npubfirst".into(), "npubselected".into()],
+                    selected: 7,
+                    ..ProfileView::default()
+                });
+                app.handle_key(char_key(key)).expect("open follow popup");
+                assert!(app.popup.is_some());
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .expect("cancel");
+                assert!(app.popup.is_none());
+                assert!(!args_file.exists(), "cancel must not change follows");
+                app.handle_key(char_key(key)).expect("reopen follow popup");
+                if key == 'f' {
+                    app.handle_paste(peer.to_owned());
+                }
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .expect("submit");
+                assert!(app.popup.is_none());
+                if !local_signing {
+                    assert_eq!(
+                        app.status,
+                        "error: selected account is public-only and cannot sign"
+                    );
+                    assert!(
+                        !args_file.exists(),
+                        "public-only account must not spawn a mutation"
+                    );
+                    continue;
+                }
+                assert_eq!(app.status, acknowledgement);
+                let recorded = std::fs::read_to_string(&args_file).expect("recorded calls");
+                let mutations: Vec<_> = recorded
+                    .lines()
+                    .filter(|line| line.contains(&format!(" follows {verb} ")))
+                    .collect();
+                assert_eq!(
+                    mutations,
+                    [format!(
+                        "{expected_prefix} --account {account} follows {verb} {peer}{expected_suffix}"
+                    )]
+                );
+            }
+        }
+    }
 }
 
 #[test]
