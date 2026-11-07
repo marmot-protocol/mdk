@@ -320,6 +320,10 @@ impl RunnerHost for AccountRunnerHost {
             .map(NostrSdkRelayClient::relay_connections)
     }
 
+    fn transport_stopping(&self) -> bool {
+        self.relay_plane.is_shutting_down()
+    }
+
     fn surveyed(&self, catching_up: BTreeSet<UnitKey>) {
         self.catching_up.send_if_modified(|last| {
             let changed = last.as_ref() != Some(&catching_up);

@@ -80,7 +80,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::compare::CompareRelay;
-use transport_nostr_adapter::sweep::{RelayCaps, SweepRelay, SweepRoute};
+use transport_nostr_adapter::sweep::{RelayCaps, SweepEnd, SweepRelay, SweepRoute};
 
 pub(crate) use admission::{Admitted, LiveCount, LiveFence};
 pub(crate) use policy::RecoveryRunnerPolicy;
@@ -273,9 +273,31 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     fn relay_connections(&self) -> Option<watch::Receiver<BTreeMap<String, u64>>> {
         None
     }
+    /// Whether the account's relay plane has begun shutting down. Its
+    /// teardown drops the requests in flight, which then read as unreachable
+    /// relays, and it runs alongside the worker's runner stop.
+    fn transport_stopping(&self) -> bool {
+        false
+    }
     /// What the last survey found still catching up, for the account's
     /// recovery status. Called after every survey; the host keeps the last.
     fn surveyed(&self, catching_up: BTreeSet<UnitKey>);
+}
+
+/// A quantum the relay plane's shutdown cut is preempted, not refused: the
+/// teardown that dropped its request in flight is this process's, and the
+/// worker's runner stop it races would have settled it as a preemption
+/// (`SweepEnd::Cancelled`). Settling it as the relay's `Unreachable` verdict
+/// would hold the unit back for the unreachable retry delay in the next
+/// process that serves the account.
+fn preempted_by_transport_stop<H: RunnerHost + ?Sized>(
+    host: &H,
+    mut report: quantum::QuantumReport,
+) -> quantum::QuantumReport {
+    if matches!(report.end, SweepEnd::Unreachable(_)) && host.transport_stopping() {
+        report.end = SweepEnd::Cancelled;
+    }
+    report
 }
 
 /// One quantum's result. Not `Debug`: it carries its unit.
@@ -861,6 +883,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 }
             }
         };
+        let report = preempted_by_transport_stop(&*self.host, report);
         if let (Some(compared), Some(facts)) = (&plan.compare, facts)
             && compare::would_not_compare(compared, facts.end)
         {
@@ -967,6 +990,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 }
             }
         };
+        let report = preempted_by_transport_stop(&*self.host, report);
         if compare::would_not_compare(&plan.compare, facts.end) {
             self.memory.would_not_compare(&candidate.key.relay);
         }

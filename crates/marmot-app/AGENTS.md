@@ -737,7 +737,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
   A quantum cut by its deadline, shutdown or the pass deadline interrupts its request in flight rather than dropping
   it, so the reply it was reading is charged too (`SweepRelay::interrupt`); an interrupted request is no answer and
-  never clears a rate limit.
+  never clears a rate limit. Runtime shutdown tears the relay plane down alongside the workers' runner stops, so a
+  request that teardown dropped before the stop arrived settles as that shutdown's preemption (`SweepEnd::Cancelled`),
+  never as the relay's `Unreachable` verdict (`preempted_by_transport_stop`).
   A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
   A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it

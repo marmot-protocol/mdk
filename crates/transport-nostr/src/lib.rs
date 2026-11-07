@@ -2186,6 +2186,13 @@ impl MarmotRelayPlane {
             .await
     }
 
+    /// Whether [`Self::shutdown`] has begun. It is set before the relay pools
+    /// are torn down, so a request that failed because of that teardown sees
+    /// it set.
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.transport.shutting_down.load(Ordering::SeqCst)
+    }
+
     pub async fn shutdown(&self) {
         self.inner
             .transport
