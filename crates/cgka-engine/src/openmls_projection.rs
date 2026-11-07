@@ -4033,7 +4033,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 mls_group
                     .store_pending_proposal(provider.storage(), *queued)
                     .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!("store_pending_proposal: {e:?}"))
+                        OpenMlsProjectionError::Storage(format!("store_pending_proposal: {e:?}"))
                     })?;
                 observations.push(OpenMlsReplayObservation::ProposalStored {
                     message_id,

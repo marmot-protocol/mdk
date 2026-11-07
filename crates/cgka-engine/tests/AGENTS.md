@@ -164,9 +164,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
     a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
-  `native_replay_storage_failure_retains_the_authenticated_commit_for_retry` owns actual native merge backend
-  propagation: a conditional public-context SQL write fault must retain a genuine peer Commit and charge retry,
-  instead of classifying it invalid; encrypted reopen and healing apply that same input and restore real delivery.
+  `native_replay_storage_failure_retains_the_authenticated_commit_for_retry` owns native merge backend propagation;
+  `native_proposal_store_failure_retains_the_authenticated_branch_for_retry` owns native proposal-queue writes.
+  Conditional SQL faults must retain genuine admitted Commits/proposals and charge retry rather than reject the
+  peer branch. Both keep encrypted reopen, healing the same input and real delivery; the proposal-store owner
+  also compares complete native rows through an independent connection.
 
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in

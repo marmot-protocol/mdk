@@ -4452,3 +4452,215 @@ async fn native_replay_storage_failure_retains_the_authenticated_commit_for_retr
         IngestOutcome::Processed
     ));
 }
+
+/// Real native proposal persistence is infrastructure, not a verdict on its
+/// authenticated sender or the peer commit replaying that source epoch.
+#[tokio::test]
+async fn native_proposal_store_failure_retains_the_authenticated_branch_for_retry() {
+    use cgka_engine::{ConvergenceClock, ManualConvergenceClock};
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory
+        .path()
+        .join("native-proposal-storage-failure.sqlite");
+    let key = SqlCipherKey::raw([0x82; 32]);
+    let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .convergence_clock(Arc::new(clock.clone()))
+            .build()
+            .unwrap()
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut carol = build(b"native-proposal-carol", storage.clone());
+    let mut alice = build(
+        b"native-proposal-alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut bob = build(
+        b"native-proposal-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "native proposal storage".into(),
+            description: String::new(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current founding result")
+    };
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    let SendResult::GroupEvolution {
+        msg: add_commit,
+        pending,
+        mut welcomes,
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("real peer invite")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let add_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..add_commit
+    };
+    carol.ingest(add_commit).await.unwrap();
+    clock.advance_ms(10_000);
+    carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    let SendResult::Proposal { msg: proposal } = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("actual SelfRemove proposal")
+    };
+    let proposal = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..proposal
+    };
+    assert!(matches!(
+        carol.ingest(proposal.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let proposal_id = MessageId::new(hex::decode(content_hex(&proposal)).unwrap());
+    let retained_proposal = storage.get_message(&proposal_id).unwrap();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("real peer self update")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let content_id = MessageId::new(hex::decode(content_hex(&commit)).unwrap());
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    let native_rows = |connection: &rusqlite::Connection| {
+        let mut query = connection
+            .prepare("SELECT * FROM openmls_values ORDER BY provider_version, storage_key")
+            .unwrap();
+        let columns = query.column_count();
+        query
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let native_before = native_rows(&observer);
+    observer.execute_batch("CREATE TRIGGER fail_native_proposal_store BEFORE INSERT ON openmls_values WHEN CAST(NEW.label AS TEXT) = 'QueuedProposal' BEGIN SELECT RAISE(ABORT, 'native-proposal-store-fault'); END;").unwrap();
+    let direct = cgka_engine::openmls_projection::replay_openmls_messages(
+        &storage,
+        &group_id,
+        &[proposal.clone(), commit.clone()],
+    );
+    assert!(
+        matches!(&direct, Err(OpenMlsProjectionError::Replay(detail) | OpenMlsProjectionError::Storage(detail)) if detail.contains("native-proposal-store-fault")),
+        "real proposal replay must reach native fault: {direct:?}"
+    );
+    assert_eq!(
+        native_rows(&observer),
+        native_before,
+        "native proposal probe failed to restore all columns"
+    );
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let retained_commit = storage.get_message(&content_id).unwrap();
+    assert_eq!(retained_commit.state, MessageState::Created);
+    carol.drain_events();
+    clock.advance_ms(10_000);
+    let failure = carol.converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms);
+    assert!(
+        matches!(&failure, Err(OpenMlsProjectionError::Storage(detail)) if detail.contains("native-proposal-store-fault")),
+        "native proposal storage failure must retain the real branch: {failure:?}"
+    );
+    assert_eq!(native_rows(&observer), native_before);
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained_commit);
+    assert_eq!(
+        storage.get_message(&proposal_id).unwrap(),
+        retained_proposal
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(carol.drain_events().is_empty());
+    let pass = storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(
+        pass.retry.as_ref().unwrap().failed_step,
+        cgka_traits::ConvergencePassStep::Select
+    );
+    assert_eq!(pass.retry.as_ref().unwrap().failed_attempts, 1);
+    drop(carol);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained_commit);
+    assert_eq!(
+        storage.get_message(&proposal_id).unwrap(),
+        retained_proposal
+    );
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    assert_eq!(native_rows(&observer), native_before);
+    observer
+        .execute_batch("DROP TRIGGER fail_native_proposal_store")
+        .unwrap();
+    let mut carol = build(b"native-proposal-carol", storage.clone());
+    carol.hydrate_all_stored_groups().unwrap();
+    clock.advance_ms(10_000);
+    carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        storage.get_message(&content_id).unwrap().state,
+        MessageState::Processed
+    );
+    let application = send_chat(&mut alice, &group_id, "after native proposal retry").await;
+    assert!(matches!(
+        carol.ingest(application).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
