@@ -2269,10 +2269,10 @@ impl TuiApp {
         self.status = "loading chat...".to_owned();
         // The account-wide feed belongs to the adopted live account even if
         // this group's page fails. Same-account loads reuse its existing child.
-        if self.daemon.running {
-            if let Err(err) = self.ensure_message_subscription(&account_id) {
-                self.status = format!("message subscription failed: {err}");
-            }
+        if self.daemon.running
+            && let Err(err) = self.ensure_message_subscription(&account_id)
+        {
+            self.status = format!("message subscription failed: {err}");
         }
         self.effects.enqueue(Effect::LoadTimeline {
             account: account_id,
