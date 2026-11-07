@@ -604,20 +604,32 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(error.into());
             }
         }
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
-        let welcomes = self.record_staged_welcomes(
-            welcomes,
-            &group_id,
-            &commit_msg.id,
-            pre_commit_epoch,
-            None,
-        )?;
-        self.storage.put_group(&group_record)?;
+        // These artifacts have no publication owner until staging returns.
+        // A late Welcome or group-projection failure must roll them back as
+        // one durable unit; the pending-commit guard separately clears MLS.
+        let (welcomes, content_id) = self.storage.with_transaction(|storage| {
+            let content_id = self.persist_sent_openmls_message_with_application_stamp(
+                &commit_msg,
+                commit_bytes.as_slice(),
+                &group_id,
+                pre_commit_epoch,
+                None,
+            )?;
+            let welcomes = self.persist_staged_welcomes(
+                welcomes,
+                &group_id,
+                &commit_msg.id,
+                pre_commit_epoch,
+                None,
+            )?;
+            storage.put_group(&group_record)?;
+            Ok::<_, EngineError>((welcomes, content_id))
+        })?;
+        self.sent_message_ids.insert(commit_msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        for welcome in &welcomes {
+            self.sent_message_ids.insert(welcome.id.clone());
+        }
 
         if recovery_evolution.is_some() {
             crate::test_crash_hooks::pause_if_requested("recovery_after_staging");
@@ -686,7 +698,7 @@ impl<S: StorageProvider> Engine<S> {
     /// "Delivery"). This writes nothing, and a caller wraps every Welcome
     /// before it records its Commit: a Welcome that cannot be wrapped, as one
     /// for a KeyPackage that names no publication, refuses the intent with
-    /// nothing written. [`Self::record_staged_welcomes`] records them.
+    /// nothing written. [`Self::persist_staged_welcomes`] records them.
     /// Parsed packages follow ordinary packages, then recovery packages.
     pub(crate) async fn wrap_staged_welcomes(
         &self,
@@ -739,8 +751,8 @@ impl<S: StorageProvider> Engine<S> {
     /// its Commit is recorded. Invites and same-account Adds deliver their
     /// Welcomes this way. A device link's Welcome records `deliver_until`,
     /// after which it is never published.
-    pub(crate) fn record_staged_welcomes(
-        &mut self,
+    pub(crate) fn persist_staged_welcomes(
+        &self,
         welcomes: Vec<WrappedWelcome>,
         group_id: &GroupId,
         commit_id: &MessageId,
@@ -750,7 +762,7 @@ impl<S: StorageProvider> Engine<S> {
         welcomes
             .into_iter()
             .map(|welcome| {
-                self.record_staged_invite_welcome(
+                self.persist_staged_invite_welcome(
                     &welcome.message,
                     commit_id,
                     welcome.key_package_ref,
@@ -965,18 +977,17 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
 
         let mut group_record = existing;
         group_record
             .members
             .retain(|member| !target_set.contains(&member.id));
-        self.storage.put_group(&group_record)?;
+        self.record_sent_openmls_message_with_group(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_record,
+            pre_commit_epoch,
+        )?;
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));

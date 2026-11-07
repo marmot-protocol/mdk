@@ -127,6 +127,11 @@ mod sibling_welcomes;
 #[path = "account_devices/tagged_siblings.rs"]
 mod tagged_siblings;
 
+// Late writes before a link or same-account Add hands off its pending ref.
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/staging_atomicity.rs"]
+mod staging_atomicity;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {

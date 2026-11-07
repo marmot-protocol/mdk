@@ -2174,37 +2174,9 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let wrapped = route_wrapped_group_message(wrapped, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &wrapped,
-            commit_bytes.as_slice(),
-            group_id,
-            pre_commit_epoch,
-        )?;
-
+        // Derive the pending membership projection before exposing any sent
+        // artifacts. A late group write rolls back the Commit and marker too.
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        let staged =
-            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
-        self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            pre_commit_epoch,
-            new_epoch,
-            staged,
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
-
-        // Project the post-merge record only after every other fallible
-        // staging step has succeeded: a torn record (epoch N+1 with members
-        // dropped while MLS and the state machine stay at N) permanently
-        // strands auto-commit replay, which bails on any epoch mismatch
-        // (mdk#333).
-        // Read-then-project as one fallible unit: a failed read is no more
-        // recoverable than a failed write here (both leave the state machine
-        // pending at N+1 with no matching durable record), so both funnel
-        // through the same compensation.
         let removed_leaf_keys = staged_commit
             .queued_proposals()
             .filter_map(|proposal| {
@@ -2220,40 +2192,31 @@ impl<S: StorageProvider> Engine<S> {
                     .map(|member| member.signature_key)
             })
             .collect::<Vec<_>>();
-        let projection = self.storage.get_group(group_id).and_then(|mut g| {
-            g.epoch = new_epoch;
-            // A staged device departure must preserve the other leaves of its account.
-            g.members
-                .retain(|member| !removed_leaf_keys.contains(&member.credential));
-            self.storage.put_group(&g)
-        });
-        if let Err(err) = projection {
-            // The pending slot was never handed off to a caller, so
-            // `publish_failed` can never reach it — rewind the state
-            // machine here (in-memory, so the storage pressure that
-            // failed the read/write cannot also defeat the compensation);
-            // the still-armed guard clears the staged OpenMLS commit on the
-            // early return.
-            if self.epoch_manager.rollback_publish(pending_ref).is_err() {
-                tracing::warn!(
-                    target: "cgka_engine::message_processor",
-                    method = "stage_auto_commit_for_queued_proposals",
-                    "state-machine rollback failed after group record projection failure"
-                );
-            }
-            self.audit_group(
-                group_id,
-                crate::audit_helpers::epoch_state_changed_event(
-                    Some("pending_publish"),
-                    "stable",
-                    pre_commit_epoch,
-                    "auto_commit_stage_failed",
-                    Some(pending_ref),
-                    Some("group_evolution"),
-                ),
-            );
-            return Err(err.into());
-        }
+        let mut projected = self.storage.get_group(group_id)?;
+        projected.epoch = new_epoch;
+        projected
+            .members
+            .retain(|member| !removed_leaf_keys.contains(&member.credential));
+        self.record_sent_openmls_message_with_group(
+            &wrapped,
+            commit_bytes.as_slice(),
+            &projected,
+            pre_commit_epoch,
+        )?;
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
+        let staged =
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(group_id);
+        self.epoch_manager.begin_pending(
+            group_id.clone(),
+            pre_commit_epoch,
+            new_epoch,
+            staged,
+            pending_ref,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+
         self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
         self.auto_publish_buf.push_back(AutoPublish {
             msg: wrapped,

@@ -143,8 +143,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut addressed = payload.ciphertext.clone();
+        addressed.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&addressed),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -1809,9 +1811,11 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
 
     let snapshot_baseline = handle.list_group_snapshots(&group_id).unwrap().len();
 
+    let messages_before = handle.list_messages(&group_id, EpochId(0)).unwrap();
+
     // The due auto-commit stages on the convergence tick; fail exactly the
-    // record projection's `put_group` (every staging step before it has
-    // succeeded by then, including `begin_pending`).
+    // record projection's `put_group` after its sent artifacts are written
+    // in the same transaction, before `begin_pending`.
     fault.arm(1);
     let staged = alice.advance_convergence(&group_id).await;
     assert!(
@@ -1842,7 +1846,12 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
         "recovery snapshot must be released on the failed staging"
     );
 
-    // The group stays fully usable: the state machine rewound to Stable, the
+    assert!(
+        handle.list_messages(&group_id, EpochId(0)).unwrap() == messages_before,
+        "failed automatic staging left unowned signed Commit or content marker"
+    );
+
+    // The group stays fully usable: the state machine remained Stable, the
     // staged OpenMLS commit was cleared, AND the stored SelfRemove proposal
     // was removed from the proposal store (left behind, OpenMLS 0.8.1 panics
     // when this remove_members filters it against the Remove for bob's
@@ -2719,8 +2728,8 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
 }
 
 /// A profile projection failure occurs after the MLS commit is staged. It must
-/// rewind the pending state and clear the staged commit rather than leaving a
-/// projected record that no caller can confirm or roll back (mdk#824).
+/// leave pending state clear rather than retain an unowned sent Commit or
+/// a projected record that no caller can confirm or roll back (mdk#824).
 #[tokio::test]
 async fn update_group_data_record_write_failure_leaves_group_stable() {
     let fault = PutGroupFault::default();
@@ -2744,6 +2753,7 @@ async fn update_group_data_record_write_failure_leaves_group_stable() {
     alice.confirm_published(pending).await.unwrap();
     let snapshot_baseline = handle.list_group_snapshots(&group_id).unwrap().len();
 
+    let messages_before = handle.list_messages(&group_id, EpochId(0)).unwrap();
     fault.arm(1);
     let failed = alice
         .send(SendIntent::UpdateGroupData {
@@ -2769,6 +2779,11 @@ async fn update_group_data_record_write_failure_leaves_group_stable() {
         handle.list_group_snapshots(&group_id).unwrap().len(),
         snapshot_baseline,
         "failed staging must release its recovery snapshot"
+    );
+
+    assert!(
+        handle.list_messages(&group_id, EpochId(0)).unwrap() == messages_before,
+        "failed group-data projection left unowned signed Commit or content marker"
     );
 
     let retry = alice
@@ -4714,4 +4729,201 @@ async fn late_welcome_anchor_failure_restores_complete_join_across_reopen() {
         restarted.join_welcome(welcome).await,
         Err(EngineError::WelcomeAlreadyProcessed)
     ));
+}
+
+/// Ordinary Invite has no native-recovery descriptor to compensate its
+/// unreturned Commit and Welcomes. A late projection fault must leave no
+/// publication work owned by a handle the caller never received (mdk#3071).
+#[tokio::test]
+async fn ordinary_invite_late_projection_failure_rewinds_staged_artifacts() {
+    late_member_projection_failure(true).await;
+}
+
+#[tokio::test]
+async fn ordinary_removal_late_projection_failure_rewinds_sent_artifacts() {
+    late_member_projection_failure(false).await;
+}
+
+async fn late_member_projection_failure(invite: bool) {
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("ordinary-invite-rollback.sqlite");
+    let key = SqlCipherKey::raw([0x71; 32]);
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap()
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut alice = build(b"ordinary-invite-rollback-alice", storage.clone());
+    let mut bob = build(
+        b"ordinary-invite-rollback-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut carol = invite.then(|| {
+        build(
+            b"ordinary-invite-rollback-carol",
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
+        )
+    });
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "ordinary invite rollback".into(),
+            description: String::new(),
+            members: if invite {
+                vec![]
+            } else {
+                vec![bob.fresh_key_package().await.unwrap()]
+            },
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = result else {
+        panic!("Current founding result")
+    };
+    if !invite {
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    }
+    let intent = if invite {
+        SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.as_mut().unwrap().fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        }
+    } else {
+        SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        }
+    };
+    let record_before = storage.get_group(&group_id).unwrap();
+    let outstanding_before = alice.outstanding_sent_welcomes().unwrap();
+    let messages_before = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    if invite {
+        assert!(messages_before.is_empty());
+    }
+    let observer = open_observer();
+    let mls_rows = |connection: &rusqlite::Connection| {
+        connection
+            .prepare("SELECT storage_key, value FROM openmls_values ORDER BY storage_key")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let mls_before = mls_rows(&observer);
+    alice.drain_events();
+    observer
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_ordinary_invite_projection BEFORE UPDATE ON cgka_groups
+         WHEN NEW.id = X'{}' AND json_array_length(json_extract(NEW.record, '$.members')) = {}
+          AND (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.id) = {}
+         BEGIN SELECT RAISE(ABORT, 'ordinary-invite-projection-fault'); END;",
+            hex::encode(group_id.as_slice()),
+            if invite { 3 } else { 1 },
+            messages_before.len() + if invite { 4 } else { 2 },
+        ))
+        .unwrap();
+    let failed = alice.send(intent.clone()).await;
+    assert!(
+        matches!(&failed, Err(EngineError::Storage(StorageError::Backend(detail)))
+            if detail.contains("ordinary-invite-projection-fault")),
+        "the group projection must fail after every staged artifact: {failed:?}"
+    );
+    assert_eq!(storage.get_group(&group_id).unwrap(), record_before);
+    assert_eq!(alice.epoch(&group_id).unwrap(), record_before.epoch);
+    assert!(alice.drain_events().is_empty());
+    assert!(
+        mls_rows(&observer) == mls_before,
+        "failed staging changed the live MLS state"
+    );
+    assert!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap() == messages_before,
+        "failed ordinary member staging left unowned Commit, marker or Welcome artifacts"
+    );
+    assert_eq!(
+        alice.outstanding_sent_welcomes().unwrap(),
+        outstanding_before
+    );
+
+    drop(alice);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let observer = open_observer();
+    assert!(mls_rows(&observer) == mls_before);
+    assert_eq!(storage.get_group(&group_id).unwrap(), record_before);
+    assert!(storage.list_messages(&group_id, EpochId(0)).unwrap() == messages_before);
+    observer
+        .execute_batch("DROP TRIGGER fail_ordinary_invite_projection")
+        .unwrap();
+    let mut alice = build(b"ordinary-invite-rollback-alice", storage);
+    alice.hydrate_all_stored_groups().unwrap();
+    let retry = alice.send(intent).await.unwrap();
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        msg,
+    } = retry
+    else {
+        panic!("retry must acquire a publication handle: {retry:?}")
+    };
+    assert_eq!(welcomes.len(), if invite { 2 } else { 0 });
+    alice.confirm_published(pending).await.unwrap();
+    if invite {
+        assert_eq!(
+            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        assert_eq!(
+            carol
+                .as_mut()
+                .unwrap()
+                .join_welcome(welcomes.remove(0))
+                .await
+                .unwrap(),
+            group_id
+        );
+    } else {
+        let routed = TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        };
+        assert!(matches!(
+            bob.ingest(routed).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ));
+        bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+        assert!(bob.group_record(&group_id).unwrap().removed);
+    }
+    assert_eq!(
+        alice.epoch(&group_id).unwrap(),
+        EpochId(record_before.epoch.0 + 1)
+    );
+    assert_eq!(
+        alice.members(&group_id).unwrap().len(),
+        if invite { 3 } else { 1 }
+    );
 }

@@ -157,7 +157,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `record_write_atomicity.rs`
   - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
-    seam that projects the record. No torn record,
+    seam that projects the record. Ordinary Current-profile Invite and member removal own rollback of staged
+    Commit/content-marker and applicable Welcome artifacts on a late group-projection failure, with independent
+    MLS reads, encrypted reopen and real recipient join/removal on retry (mdk#3071, mdk#3127). The existing group-data
+    and automatic SelfRemove projection-failure owners also compare complete sent rows, preserving their generic
+    fault-provider, native/proposal/snapshot cleanup and real successful retry. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
@@ -281,6 +285,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     an update that doesn't remove exactly one listed entry, or while an own Commit is in flight or an intent waits in
     the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
     cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
+
+  `account_devices/staging_atomicity.rs` owns late LinkDevice, AddOwnAccountDevices and UnlinkDevice projection
+  faults before a pending ref is exposed: real SQLCipher faults after outbound staging, complete independent prior
+  rows restored, physical failure/success reopens, same-KeyPackage retry with actual transport/sibling joins for
+  additions and an accepted removal for Unlink (mdk#3106, mdk#3127). It runs in policy-test builds.
 
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored
