@@ -10397,22 +10397,25 @@ fn ordinary_builds_do_not_expose_device_link_commands() {
 #[cfg(all(feature = "dev-device-groups", not(feature = "test-policy-overrides")))]
 #[test]
 fn dev_devices_link_across_daemon_commands_at_production_timing() {
-    /// The command words of `args` for a failure message: no account id,
-    /// prompt id or label.
+    /// The command words of `args` for a failure message. Only known command
+    /// words are printed, never an argument: no account id, prompt id or label.
     fn command_name(args: &[&str]) -> String {
-        let mut words = Vec::new();
-        let mut args = args.iter();
-        while let Some(arg) = args.next() {
-            if *arg == "--account" {
-                args.next();
-            } else if !arg.is_empty() && arg.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-')
-            {
-                words.push(*arg);
-            } else {
-                break;
-            }
-        }
-        words.join(" ")
+        const COMMAND_WORDS: &[&str] = &[
+            "devices",
+            "link",
+            "list",
+            "start",
+            "status",
+            "approve",
+            "confirm-match",
+            "reset",
+        ];
+        args.iter()
+            .skip_while(|arg| !COMMAND_WORDS.contains(arg))
+            .take_while(|arg| COMMAND_WORDS.contains(arg))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     /// The result, or the error object of a refused command.
     fn try_invoke(
