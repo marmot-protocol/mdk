@@ -166,6 +166,14 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
     a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
+  `native_replay_storage_failure_retains_the_authenticated_commit_for_retry` owns native merge backend propagation;
+  `native_proposal_store_failure_retains_the_authenticated_branch_for_retry` owns native proposal-queue writes;
+  `native_private_message_storage_failure_retains_the_authenticated_branch_for_retry` owns native private-message
+  ratchet persistence and its Storage error class. Conditional SQL faults retain genuine admitted input and charge
+  retry. All three keep encrypted reopen and healing the same input; the latter two compare complete native rows
+  through an independent connection, and private processing proves exact once public/durable output and duplicate
+  suppression. Genuine validation failures keep their existing input-rejection behavior.
+
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
     release with `--ignored --nocapture`; it reports timings and never asserts a threshold
