@@ -9,7 +9,7 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
 - Runs the relay client the process's accounts share and a delivery queue per account, with a durable overflow tail
   (`delivery_spill.rs`) when an account's queue is full.
 - Forwards ordered relay notifications and actual loss to the right account. It exposes guarded replay facts
-  and executes the account recovery owner's frozen capture plans without re-issuing live subscriptions.
+  and runs the recovery runner's bounded acquisitions without re-issuing live subscriptions.
 - Hands complete historical group batches to the account owner's ordered admission path. Those batches do
   not enter live-queue/spill alternation; unacknowledged frames keep holding the cursor.
 - Builds and caches each account's signer-bound publish client, so setup publishes and the account worker share one

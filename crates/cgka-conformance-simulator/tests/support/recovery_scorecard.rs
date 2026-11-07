@@ -865,7 +865,7 @@ pub(super) async fn run() {
             json!("two endpoints of one relay process over one retained store");
         report["workload"]["source_commit"] = json!(std::env::var("GITHUB_SHA").ok());
         report["workload"]["history_owner"] =
-            json!("recovery runner, both native backward pagers disabled");
+            json!("recovery runner; the adapter has no native backward pager");
         let (before, after) = (
             &report["telemetry"]["before"],
             &report["telemetry"]["after"],

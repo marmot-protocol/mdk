@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,13 +16,12 @@ use nostr::nips::nip59::GiftWrapBuilder;
 use nostr::prelude::{FinalizeEvent, FinalizeUnsignedEvent, Kind, RelayUrl};
 use tokio::sync::{Barrier, Notify};
 use transport_nostr_adapter::{
-    GROUP_BATCH_ROUTES, GroupBatchRoute, NostrAcquisitionCancellation, NostrAcquisitionEnd,
-    NostrAcquisitionEndpoint, NostrAcquisitionError, NostrAcquisitionRequest,
-    NostrAcquisitionResult, NostrAcquisitionScope, NostrNotificationLossFloor, NostrPublishOutcome,
-    NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
-    RELAY_REPLAY_PAGE_LIMIT, RelayExportConsent, RelayIndex, ReplayCaptureOutcome,
-    ReplayCapturePlan, SUBSCRIPTION_REFUSAL_REPORT_LIMIT, SubscriptionRefusal,
-    SubscriptionRefusalDisposition, SubscriptionRefusalReport, SubscriptionRouteKind,
+    GROUP_BATCH_ROUTES, GroupBatchRoute, NostrAcquisitionCancellation, NostrAcquisitionError,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrNotificationLossFloor,
+    NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
+    NostrTransportAdapter, RelayExportConsent, RelayIndex, SUBSCRIPTION_REFUSAL_REPORT_LIMIT,
+    SubscriptionRefusal, SubscriptionRefusalDisposition, SubscriptionRefusalReport,
+    SubscriptionRouteKind,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
@@ -370,67 +369,17 @@ impl NostrRelayClient for PartialFailureRelayClient {
 }
 
 #[derive(Default)]
-struct AcquisitionHold {
-    captured: Notify,
-    release: Notify,
-    returned: Notify,
-}
-
-#[derive(Default)]
 struct FakeRelayClient {
     scoped: Mutex<Vec<(String, NostrSubscription)>>,
     scoped_removed: Mutex<Vec<String>>,
     fail_scoped_remove: AtomicBool,
-    pages: Mutex<VecDeque<(NostrAcquisitionEnd, Vec<NostrTransportEvent>)>>,
-    retained: Mutex<Option<Vec<(MemberId, TransportEndpoint, NostrTransportEvent)>>>,
+    /// History acquisitions asked of the relay client. The adapter itself
+    /// asks for none; the recovery runner owns history acquisition.
     acquisitions: Mutex<Vec<NostrAcquisitionRequest>>,
-    active_acquisitions: Arc<AtomicUsize>,
-    acquisition_delays: Mutex<VecDeque<Duration>>,
-    acquisition_holds: Mutex<VecDeque<(TransportEndpoint, Arc<AcquisitionHold>)>>,
-    panic_acquisition: Mutex<Option<(TransportEndpoint, Arc<Notify>)>>,
-    hold_acquisition: AtomicBool,
-    release_acquisition: Notify,
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
     unsubscribed: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
     unsubscribed_accounts: Mutex<Vec<MemberId>>,
     published: Mutex<Vec<(Vec<TransportEndpoint>, NostrTransportEvent, usize)>>,
-}
-
-fn same_relay(a: &TransportEndpoint, b: &TransportEndpoint) -> bool {
-    RelayUrl::parse(a.as_str()).expect("fixture relay URL parses")
-        == RelayUrl::parse(b.as_str()).expect("fixture relay URL parses")
-}
-
-fn retained_in_scope(event: &NostrTransportEvent, scope: &NostrAcquisitionScope) -> bool {
-    let matches_group = |id: &[u8; 32]| {
-        event.kind == KIND_MARMOT_GROUP_MESSAGE
-            && event.tags.iter().any(|tag| {
-                tag.first().is_some_and(|name| name == "h")
-                    && tag.get(1).is_some_and(|value| *value == hex::encode(id))
-            })
-    };
-    match scope {
-        NostrAcquisitionScope::KnownEventIds(ids) => {
-            ids.iter().any(|id| event.id == hex::encode(id))
-        }
-        NostrAcquisitionScope::AccountInboxWindow { since, until } => {
-            event.kind == 1059 && (*since..=*until).contains(&event.created_at)
-        }
-        NostrAcquisitionScope::GroupWindow {
-            transport_group_id,
-            since,
-            until,
-            ..
-        } => matches_group(transport_group_id) && (*since..=*until).contains(&event.created_at),
-        NostrAcquisitionScope::GroupsWindow {
-            transport_group_ids,
-            since,
-            until,
-        } => {
-            transport_group_ids.iter().any(matches_group)
-                && (*since..=*until).contains(&event.created_at)
-        }
-    }
 }
 
 impl FakeRelayClient {
@@ -450,84 +399,8 @@ impl NostrRelayClient for FakeRelayClient {
         request: NostrAcquisitionRequest,
         _cancellation: NostrAcquisitionCancellation,
     ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
-        struct ActiveAcquisition(Arc<AtomicUsize>);
-        impl Drop for ActiveAcquisition {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        self.active_acquisitions.fetch_add(1, Ordering::SeqCst);
-        let _active = ActiveAcquisition(self.active_acquisitions.clone());
-        let endpoint = request.endpoints[0].clone();
-        self.acquisitions.lock().unwrap().push(request.clone());
-        let panic_release = {
-            self.panic_acquisition
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(source, _)| same_relay(source, &endpoint))
-                .map(|(_, release)| release.clone())
-        };
-        if let Some(release) = panic_release {
-            release.notified().await;
-            panic!("scripted replay executor failure");
-        }
-        let delay = self.acquisition_delays.lock().unwrap().pop_front();
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
-        if self.hold_acquisition.load(Ordering::SeqCst) {
-            self.release_acquisition.notified().await;
-        }
-        let page = self.pages.lock().unwrap().pop_front().or_else(|| {
-            let retained = self.retained.lock().unwrap();
-            let retained = retained.as_ref()?;
-            let mut events = retained
-                .iter()
-                .filter(|(account, source, event)| {
-                    *account == request.account_id
-                        && same_relay(source, &endpoint)
-                        && retained_in_scope(event, &request.scope)
-                })
-                .map(|(_, _, event)| event.clone())
-                .collect::<Vec<_>>();
-            events.sort_unstable_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
-            Some((NostrAcquisitionEnd::RequestPolicySatisfied, events))
-        });
-        let Some((end, events)) = page else {
-            return Err(NostrAcquisitionError::Unsupported);
-        };
-        let hold = {
-            let mut holds = self.acquisition_holds.lock().unwrap();
-            holds
-                .iter()
-                .position(|(source, _)| same_relay(source, &endpoint))
-                .and_then(|index| holds.remove(index))
-                .map(|(_, hold)| hold)
-        };
-        if let Some(hold) = hold {
-            struct HeldSnapshot(Arc<AcquisitionHold>);
-            impl Drop for HeldSnapshot {
-                fn drop(&mut self) {
-                    self.0.returned.notify_one();
-                }
-            }
-            let _snapshot = HeldSnapshot(hold.clone());
-            hold.captured.notify_one();
-            hold.release.notified().await;
-        }
-        Ok(NostrAcquisitionResult {
-            endpoints: vec![NostrAcquisitionEndpoint {
-                endpoint,
-                session_generation: None,
-                stats: transport_nostr_adapter::NostrAcquisitionStats {
-                    received_items: events.len(),
-                    ..Default::default()
-                },
-                events,
-                end,
-            }],
-        })
+        self.acquisitions.lock().unwrap().push(request);
+        Err(NostrAcquisitionError::Unsupported)
     }
 
     async fn publish_event_for_account(
@@ -4506,83 +4379,8 @@ fn issued_group_id(issued: &[NostrSubscription], group: &cgka_traits::GroupId) -
         .subscription_id()
 }
 
-/// Owner grants select exact live sources, never unrelated maintenance windows.
 #[tokio::test]
-async fn capture_keeps_original_window() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xE5; 32]);
-    let mut group = sync_fixture_group(0x51);
-    let a = group.endpoints[0].clone();
-    let b = TransportEndpoint("wss://pending.example".into());
-    group.endpoints.push(b.clone());
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-    adapter.handle_relay_eose(a.clone(), id.clone()).await;
-    let maintenance = adapter
-        .install_group_maintenance_recovery_subscription(
-            &account,
-            &group,
-            7,
-            Some(Timestamp(floor + 100)),
-        )
-        .await
-        .unwrap();
-    relay.take_issued_subscriptions();
-    let older = group_event_at("original floor only", &group, floor + 1);
-    let newer = group_event_at("inside both windows", &group, floor + 101);
-    let excluded = group_event_at("before original floor", &group, floor - 1);
-    *relay.retained.lock().unwrap() = Some(vec![
-        (account.clone(), b.clone(), newer.clone()),
-        (account.clone(), b.clone(), older.clone()),
-        (account.clone(), b.clone(), excluded),
-    ]);
-    let plan = capture_plan(&adapter, &account, 1).await;
-    assert_eq!(
-        plan.sources.len(),
-        1,
-        "only B's live source lacks admission"
-    );
-    let capture = spawn_capture(&adapter, &account, plan);
-    // Empty maintenance is a separate source; retire it without granting it IO.
-    adapter
-        .remove_group_maintenance_recovery_subscription(&account, &maintenance)
-        .await
-        .unwrap();
-    for event in [&older, &newer] {
-        assert_group_delivery(&adapter, &account, event).await;
-    }
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    wait_replay_eose(&adapter, &id).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert!(adapter.take_replay_status(&account).await.loss.is_none());
-    let requests = relay.acquisitions.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.endpoints.len() == 1 && same_relay(&request.endpoints[0], &b))
-    );
-    assert!(requests.iter().all(|request| matches!(&request.scope,
-        NostrAcquisitionScope::GroupsWindow { since, .. } if *since == floor)));
-    assert!(
-        relay.take_issued_subscriptions().is_empty(),
-        "capture never resends live REQs"
-    );
-    assert!(relay.unsubscribed.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn source_change_wakes_owner_and_rejects_frozen_old_capture() {
+async fn source_change_wakes_owner() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
     let account = MemberId::new(vec![0xE1; 32]);
@@ -4597,7 +4395,6 @@ async fn source_change_wakes_owner_and_rejects_frozen_old_capture() {
         })
         .await
         .unwrap();
-    let old = capture_plan(&adapter, &account, 1).await;
     let mut changes = adapter.replay_changes(&account).await.unwrap();
     let before = *changes.borrow_and_update();
     adapter
@@ -4617,16 +4414,9 @@ async fn source_change_wakes_owner_and_rejects_frozen_old_capture() {
         before,
         "membership changes wake the owner with a new source generation"
     );
-    assert_eq!(
-        adapter
-            .capture_replay(&account, old, NostrAcquisitionCancellation::new())
-            .await
-            .unwrap(),
-        ReplayCaptureOutcome::Stale
-    );
     assert!(
         relay.acquisitions.lock().unwrap().is_empty(),
-        "stale grants cannot launch IO"
+        "a source change launches no IO of the adapter's own"
     );
     let status = adapter.take_replay_status(&account).await;
     assert!(status.sources().all(|source| !source.admitted()));
@@ -4634,253 +4424,6 @@ async fn source_change_wakes_owner_and_rejects_frozen_old_capture() {
         status.loss.is_none(),
         "a new query is admission debt, not receiver loss"
     );
-}
-
-/// An abandoned initial range cannot poison an owner-granted full capture.
-/// The same immutable attempt joins unexpired work and withholds newer suffixes.
-#[tokio::test(start_paused = true)]
-async fn capture_restores_old_range() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xD4; 32]);
-    let group = sync_fixture_group(0x53);
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-    let older = group_event_at("missing initial history", &group, floor + 1);
-    let newer = group_event_at("abandoned initial prefix", &group, floor + 2);
-    route_group_copy(&adapter, &group, &id, &newer).await;
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(31)).await;
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor)
-    );
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert_eq!(adapter.subscription_synced(&id).await, Some(false));
-
-    *relay.retained.lock().unwrap() = Some(vec![
-        (account.clone(), group.endpoints[0].clone(), newer.clone()),
-        (account.clone(), group.endpoints[0].clone(), older.clone()),
-        (
-            account.clone(),
-            group.endpoints[0].clone(),
-            group_event_at("below floor", &group, floor - 1),
-        ),
-    ]);
-    relay.hold_acquisition.store(true, Ordering::SeqCst);
-    let plan = capture_plan(&adapter, &account, 1).await;
-    let capture = spawn_capture(&adapter, &account, plan.clone());
-    wait_until("fresh full-window acquisition starts", || {
-        !relay.acquisitions.lock().unwrap().is_empty()
-    })
-    .await;
-    assert!(
-        adapter.take_replay_status(&account).await.loss.is_none(),
-        "capture must not charge the already transferred source loss twice"
-    );
-    let joined = spawn_capture(&adapter, &account, plan);
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-        .await;
-    let live = group_event_at("live after physical boundary", &group, floor + 3);
-    route_group_copy(&adapter, &group, &id, &live).await;
-    assert_no_delivery(&adapter).await;
-    assert_eq!(adapter.subscription_synced(&id).await, Some(false));
-    relay.hold_acquisition.store(false, Ordering::SeqCst);
-    relay.release_acquisition.notify_waiters();
-    for event in [&older, &newer, &live] {
-        assert_group_delivery(&adapter, &account, event).await;
-    }
-    wait_replay_eose(&adapter, &id).await;
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    assert_eq!(joined.await.unwrap(), ReplayCaptureOutcome::Complete);
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert!(
-        relay.take_issued_subscriptions().is_empty(),
-        "the original live REQ was not resent"
-    );
-    assert!(relay.unsubscribed.lock().unwrap().is_empty());
-}
-
-/// Owner grants preserve account isolation on a shared receiver, never capturing
-/// a deactivated account even when its capability was frozen before retirement.
-#[tokio::test]
-async fn capture_keeps_accounts_apart() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let endpoint = TransportEndpoint("wss://shared.example".into());
-    let floor = 1_700_000_000;
-    let mut expected = HashSet::new();
-    let mut owners = Vec::new();
-    let mut retained = Vec::new();
-    for byte in [0xA1, 0xB2, 0xC3] {
-        let account = MemberId::new(vec![byte; 32]);
-        let mut group = sync_fixture_group(byte);
-        group.endpoints = vec![endpoint.clone()];
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![],
-                group_subscriptions: vec![group.clone()],
-                since: Some(Timestamp(floor)),
-            })
-            .await
-            .unwrap();
-        let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-        let event = group_event_at("account-owned retained history", &group, floor + 1);
-        if byte != 0xC3 {
-            expected.insert((account.clone(), event.to_transport_message().unwrap().id));
-        }
-        retained.push((account.clone(), endpoint.clone(), event));
-        owners.push((account, id));
-    }
-    *relay.retained.lock().unwrap() = Some(retained);
-    let mut plans = Vec::new();
-    for (account, _) in &owners {
-        plans.push(capture_plan(&adapter, account, 1).await);
-    }
-    assert_eq!(
-        adapter
-            .capture_replay(
-                &owners[0].0,
-                plans[1].clone(),
-                NostrAcquisitionCancellation::new()
-            )
-            .await
-            .unwrap(),
-        ReplayCaptureOutcome::Stale,
-        "an account wrapper cannot spend another account's source capability"
-    );
-    assert!(relay.acquisitions.lock().unwrap().is_empty());
-    adapter.deactivate_account(&owners[2].0).await.unwrap();
-    assert_eq!(
-        adapter
-            .capture_replay(
-                &owners[2].0,
-                plans.pop().unwrap(),
-                NostrAcquisitionCancellation::new()
-            )
-            .await
-            .unwrap(),
-        ReplayCaptureOutcome::Stale
-    );
-    let captures = plans
-        .into_iter()
-        .zip(&owners[..2])
-        .map(|(plan, (account, _))| spawn_capture(&adapter, account, plan))
-        .collect::<Vec<_>>();
-    for _ in 0..2 {
-        let delivery = tokio::time::timeout(Duration::from_secs(1), adapter.receive())
-            .await
-            .expect("active account history arrives")
-            .unwrap()
-            .unwrap();
-        assert!(
-            expected.remove(&(delivery.account_id.clone(), delivery.message.id.clone())),
-            "only exact active-account history is released once"
-        );
-        adapter
-            .ack_replay_delivery(&delivery.account_id, &delivery.message.id)
-            .await;
-    }
-    assert!(expected.is_empty());
-    for (account, id) in &owners[..2] {
-        wait_replay_eose(&adapter, id).await;
-        assert_replay_idle(&adapter, account).await;
-    }
-    assert_replay_idle(&adapter, &owners[2].0).await;
-    assert_eq!(adapter.subscription_synced(&owners[2].1).await, None);
-    assert_no_delivery(&adapter).await;
-    for capture in captures {
-        assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    }
-    assert!(
-        relay
-            .acquisitions
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|request| request.account_id != owners[2].0)
-    );
-    assert!(relay.take_issued_subscriptions().is_empty());
-    assert!(relay.unsubscribed.lock().unwrap().is_empty());
-}
-
-/// A lag can precede the event worker's queued stored prefix. Recovery must
-/// acquire and order the whole window, not release its newest prefix.
-#[tokio::test]
-async fn capture_orders_queued_history() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xF6; 32]);
-    let group = sync_fixture_group(0xF7);
-    let floor = 1_700_000_000;
-    let mut history = (0..600)
-        .map(|index| group_event_at(&format!("queued-{index}"), &group, floor + index / 3))
-        .collect::<Vec<_>>();
-    history.sort_unstable_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-    relay.pages.lock().unwrap().extend([
-        (
-            NostrAcquisitionEnd::RequestPolicySatisfied,
-            history.iter().rev().cloned().collect(),
-        ),
-        (NostrAcquisitionEnd::RequestPolicySatisfied, Vec::new()),
-    ]);
-    relay.hold_acquisition.store(true, Ordering::SeqCst);
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-    for event in history.iter().rev().take(12) {
-        route_group_copy(&adapter, &group, &id, event).await;
-    }
-    let capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 1).await,
-    );
-    wait_until("full-window capture is held", || {
-        !relay.acquisitions.lock().unwrap().is_empty()
-    })
-    .await;
-    assert_no_delivery(&adapter).await;
-    assert_eq!(adapter.subscription_synced(&id).await, Some(false));
-    for event in history.iter().rev().skip(12) {
-        route_group_copy(&adapter, &group, &id, event).await;
-    }
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-        .await;
-    let live = group_event_at("live behind queued history", &group, floor + 1_000);
-    route_group_copy(&adapter, &group, &id, &live).await;
-    assert_no_delivery(&adapter).await;
-    assert_eq!(adapter.subscription_synced(&id).await, Some(false));
-    relay.hold_acquisition.store(false, Ordering::SeqCst);
-    relay.release_acquisition.notify_waiters();
-    for event in history.iter().chain(std::iter::once(&live)) {
-        assert_group_delivery(&adapter, &account, event).await;
-    }
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    wait_replay_eose(&adapter, &id).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
 }
 
 /// A superseded activation's end-of-stored-events report must not satisfy the
@@ -5268,6 +4811,8 @@ async fn cancelled_live_is_owned() {
     assert_replay_idle(&adapter, &account).await;
 }
 
+/// Receiver-loss metadata racing status readers discards no ciphertext and
+/// launches no IO: the source stays unadmitted for the recovery runner.
 #[tokio::test(start_paused = true)]
 async fn cancelled_epoch_keeps_owner_fence() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -5297,9 +4842,6 @@ async fn cancelled_epoch_keeps_owner_fence() {
     adapter
         .handle_relay_eose(endpoint.clone(), id.clone())
         .await;
-    let missing = group_event_at("capture survives cancelled metadata", &group, floor + 1);
-    *relay.retained.lock().unwrap() =
-        Some(vec![(account.clone(), endpoint.clone(), missing.clone())]);
 
     // Queue the metadata writer before a second status reader. The fair lock
     // lets metadata commit once, then holds any later write behind that reader.
@@ -5337,14 +4879,14 @@ async fn cancelled_epoch_keeps_owner_fence() {
         relay.acquisitions.lock().unwrap().is_empty(),
         "receiver fencing cannot launch IO"
     );
-    let capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 1).await,
+    assert!(
+        adapter
+            .take_replay_status(&account)
+            .await
+            .sources()
+            .all(|source| !source.admitted()),
+        "the cut source waits for the recovery runner"
     );
-    assert_group_delivery(&adapter, &account, &missing).await;
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    wait_replay_eose(&adapter, &id).await;
     assert_no_delivery(&adapter).await;
     assert_replay_idle(&adapter, &account).await;
 }
@@ -7109,50 +6651,6 @@ async fn assert_group_delivery(
         .await;
 }
 
-#[tokio::test]
-async fn capture_ignores_refused_peer() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xB1; 32]);
-    let mut group = sync_fixture_group(0xB2);
-    let refused = TransportEndpoint("wss://refused.example".into());
-    group.endpoints.push(refused.clone());
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = relay
-        .take_issued_subscriptions()
-        .into_iter()
-        .find(|source| matches!(source, NostrSubscription::GroupBatch { .. }))
-        .unwrap()
-        .subscription_id();
-    adapter
-        .handle_relay_closed(
-            refused,
-            id,
-            refusal(None, SubscriptionRefusalDisposition::Dropped),
-        )
-        .await;
-    let event = group_event_at("history from the surviving issued peer", &group, floor + 1);
-    *relay.retained.lock().unwrap() = Some(vec![(
-        account.clone(),
-        group.endpoints[0].clone(),
-        event.clone(),
-    )]);
-    let plan = capture_plan(&adapter, &account, 1).await;
-    let capture = spawn_capture(&adapter, &account, plan);
-    assert_group_delivery(&adapter, &account, &event).await;
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    assert_replay_idle(&adapter, &account).await;
-}
-
 fn retained_delivery(
     account: &MemberId,
     group: &TransportGroupSubscription,
@@ -7171,112 +6669,6 @@ fn retained_delivery(
             wire: None,
         },
     }
-}
-
-#[tokio::test]
-async fn executor_failure_records_loss_cancels_io_and_preserves_retained_input() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xE1; 32]);
-    let mut group = sync_fixture_group(0xE2);
-    group
-        .endpoints
-        .push(TransportEndpoint("wss://sibling.example".into()));
-    let floor = 1_700_000_000;
-    let retained = group_event_at("durable supplement", &group, floor + 1);
-    let mut ingress = adapter
-        .open_replay_ingress(
-            &account,
-            vec![retained_delivery(&account, &group, &retained)],
-        )
-        .await
-        .unwrap();
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = group_subscription_id(&adapter, &account, &group).await;
-    let remote = group_event_at("unplaced remote history", &group, floor + 2);
-    route_group_copy(&adapter, &group, &id, &remote).await;
-    let panic_release = Arc::new(Notify::new());
-    *relay.panic_acquisition.lock().unwrap() =
-        Some((group.endpoints[0].clone(), panic_release.clone()));
-    relay.hold_acquisition.store(true, Ordering::SeqCst);
-    *relay.retained.lock().unwrap() = Some(vec![]);
-    let credits = Arc::new(tokio::sync::Semaphore::new(1));
-    let mut plan = capture_plan(&adapter, &account, 1).await;
-    assert_eq!(plan.sources.len(), 2);
-    plan.credit = Arc::new(credits.clone().acquire_owned().await.unwrap());
-    let capture = spawn_capture(&adapter, &account, plan);
-    wait_until("both real replay children entered acquisition", || {
-        relay.active_acquisitions.load(Ordering::SeqCst) == 2
-    })
-    .await;
-    assert_eq!(credits.available_permits(), 0);
-    panic_release.notify_one();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), capture)
-            .await
-            .expect("executor failure settles its capture")
-            .unwrap(),
-        ReplayCaptureOutcome::Incomplete
-    );
-    // Account-wide execution loss uses the lowest issued query floor,
-    // including the inbox's NIP-59 timestamp allowance.
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor - 172_800)
-    );
-    wait_until(
-        "failed replay IO is destroyed and its credit is released",
-        || {
-            relay.active_acquisitions.load(Ordering::SeqCst) == 0
-                && credits.available_permits() == 1
-        },
-    )
-    .await;
-    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
-    assert!(!adapter.account_subscription_eose(&account).await.complete());
-    {
-        let status = adapter.take_replay_status(&account).await;
-        assert!(status.sources().all(|source| !source.admitted()));
-        let source = status
-            .sources()
-            .find(|source| source.id() == id.as_str())
-            .expect("the failed group request remains observable debt");
-        assert!(
-            !source.terminally_refused(),
-            "executor failure leaves unfinished sources recoverable"
-        );
-        assert_eq!(source.endpoints().count(), 2);
-    }
-    let transport_nostr_adapter::ReplayBatchTake::Ready(mut batch) =
-        ingress.take_batch(Some(&group.group_id)).await
-    else {
-        panic!("the durable supplement stays owned after executor failure");
-    };
-    assert_eq!(
-        batch.delivery().unwrap().message,
-        retained.to_transport_message().unwrap()
-    );
-    batch.acknowledge().await;
-    assert!(
-        batch.delivery().is_none(),
-        "the discarded remote body must not leak as a newer suffix"
-    );
-    batch.acknowledge().await;
-    drop(batch);
-    assert!(matches!(
-        ingress.take_batch(None).await,
-        transport_nostr_adapter::ReplayBatchTake::Empty
-    ));
-    assert_replay_idle(&adapter, &account).await;
-    assert_no_delivery(&adapter).await;
 }
 
 #[tokio::test]
@@ -7395,333 +6787,6 @@ async fn local_publish_joins_native_history_and_fans_out_once_per_account_route(
     ));
 }
 
-/// A comparison deadline cuts the owner capture between pages. The page it
-/// already fetched is the obligation's own re-fetch: the cut mints no loss
-/// (which would restart the obligation), the source stays unadmitted, and the
-/// next grant recovers the window.
-#[tokio::test]
-async fn cut_capture_mints_no_loss() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xC1; 32]);
-    let group = sync_fixture_group(0xC2);
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let events = (1..=RELAY_REPLAY_PAGE_LIMIT as u64)
-        .map(|offset| group_event_at(&format!("paged body {offset}"), &group, floor + offset))
-        .collect::<Vec<_>>();
-    // A full first page, then a second page the cut interrupts.
-    relay.pages.lock().unwrap().push_back((
-        NostrAcquisitionEnd::RequestPolicySatisfied,
-        events.iter().rev().cloned().collect(),
-    ));
-    relay
-        .acquisition_delays
-        .lock()
-        .unwrap()
-        .extend([Duration::ZERO, Duration::from_secs(3600)]);
-    let credits = Arc::new(tokio::sync::Semaphore::new(1));
-    let mut plan = capture_plan(&adapter, &account, 1).await;
-    assert!(!plan.sources.is_empty());
-    plan.credit = Arc::new(credits.clone().acquire_owned().await.unwrap());
-    let cut = NostrAcquisitionCancellation::new();
-    let capture = tokio::spawn({
-        let (adapter, account, cut) = (adapter.clone(), account.clone(), cut.clone());
-        async move { adapter.capture_replay(&account, plan, cut).await.unwrap() }
-    });
-    wait_until("the capture asks for its second page", || {
-        relay.acquisitions.lock().unwrap().len() == 2
-    })
-    .await;
-    cut.cancel();
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Cancelled);
-    wait_until("the cut capture cleans up and frees its credit", || {
-        credits.available_permits() == 1
-    })
-    .await;
-    {
-        let status = adapter.take_replay_status(&account).await;
-        assert!(
-            status.loss.is_none(),
-            "the cut capture's own discarded page charges no loss"
-        );
-        assert!(
-            status
-                .sources()
-                .any(|source| source.endpoints().any(|endpoint| !endpoint.admitted())),
-            "the cut source stays owed to the next grant"
-        );
-    }
-    assert_no_delivery(&adapter).await;
-
-    *relay.retained.lock().unwrap() = Some(
-        events
-            .iter()
-            .map(|event| (account.clone(), group.endpoints[0].clone(), event.clone()))
-            .collect(),
-    );
-    let plan = capture_plan(&adapter, &account, 2).await;
-    assert!(!plan.sources.is_empty());
-    let capture = spawn_capture(&adapter, &account, plan);
-    for event in &events {
-        assert_group_delivery(&adapter, &account, event).await;
-    }
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    assert_replay_idle(&adapter, &account).await;
-}
-
-/// The incident's path (mdk#2660): a clamped relay's live REQ delivers its
-/// stored page, native paging starts, and the owner's grant takes the source
-/// over before the comparison deadline cuts it. The REQ copies the cut
-/// discards are still owed, so it records no loss; a reconnect that readmits
-/// the source without a capture charges it.
-#[tokio::test]
-async fn cut_capture_defers_req_page_loss() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xC5; 32]);
-    let group = sync_fixture_group(0xC6);
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    assert!(
-        adapter
-            .observe_replay_epoch(
-                Some(&account),
-                &group.endpoints[0],
-                [1, 1],
-                transport_nostr_adapter::ReplayRestart::Connection
-            )
-            .await
-    );
-    let id = group_subscription_id(&adapter, &account, &group).await;
-    for offset in 1..=RELAY_REPLAY_PAGE_LIMIT as u64 {
-        let event = group_event_at(&format!("stored body {offset}"), &group, floor + offset);
-        route_group_copy(&adapter, &group, &id, &event).await;
-    }
-    // Native paging and the owner's capture each wait on their first page.
-    relay
-        .acquisition_delays
-        .lock()
-        .unwrap()
-        .extend([Duration::from_secs(3600), Duration::from_secs(3600)]);
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-        .await;
-    wait_until("the clamped REQ starts native paging", || {
-        relay.acquisitions.lock().unwrap().len() == 1
-    })
-    .await;
-    let plan = capture_plan(&adapter, &account, 1).await;
-    assert!(!plan.sources.is_empty());
-    let cut = NostrAcquisitionCancellation::new();
-    let capture = tokio::spawn({
-        let (adapter, account, cut) = (adapter.clone(), account.clone(), cut.clone());
-        async move { adapter.capture_replay(&account, plan, cut).await.unwrap() }
-    });
-    wait_until("the owner's capture asks for its first page", || {
-        relay.acquisitions.lock().unwrap().len() == 2
-    })
-    .await;
-    cut.cancel();
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Cancelled);
-    {
-        let status = adapter.take_replay_status(&account).await;
-        assert!(
-            status.loss.is_none(),
-            "the cut capture's REQ page is still owed"
-        );
-        assert!(
-            status
-                .sources()
-                .any(|source| source.endpoints().any(|endpoint| !endpoint.admitted())),
-            "the cut source stays owed to the next grant"
-        );
-    }
-    assert_no_delivery(&adapter).await;
-    assert!(
-        adapter
-            .observe_replay_epoch(
-                Some(&account),
-                &group.endpoints[0],
-                [1, 2],
-                transport_nostr_adapter::ReplayRestart::Connection
-            )
-            .await
-    );
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor),
-        "a reconnect readmits the source without the capture"
-    );
-}
-
-async fn capture_plan(
-    adapter: &NostrTransportAdapter,
-    account: &MemberId,
-    attempt_serial: u64,
-) -> ReplayCapturePlan {
-    let status = adapter.take_replay_status(account).await;
-    let sources = status
-        .sources()
-        .flat_map(|source| {
-            source
-                .endpoints()
-                .filter(|endpoint| !endpoint.admitted())
-                .map(|endpoint| endpoint.capture_token())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    drop(status);
-    ReplayCapturePlan {
-        attempt_serial,
-        sources,
-        credit: Arc::new(
-            Arc::new(tokio::sync::Semaphore::new(1))
-                .acquire_owned()
-                .await
-                .unwrap(),
-        ),
-    }
-}
-
-fn spawn_capture(
-    adapter: &NostrTransportAdapter,
-    account: &MemberId,
-    plan: ReplayCapturePlan,
-) -> tokio::task::JoinHandle<ReplayCaptureOutcome> {
-    let adapter = adapter.clone();
-    let account = account.clone();
-    tokio::spawn(async move {
-        adapter
-            .capture_replay(&account, plan, NostrAcquisitionCancellation::new())
-            .await
-            .unwrap()
-    })
-}
-
-/// Dropping a caller cannot free a credit before its accepted IO is destroyed,
-/// and cancellation must clean queued routes and a placement-blocked drain.
-#[tokio::test]
-async fn abort_keeps_capture_credit() {
-    for blocked_placement in [false, true] {
-        let relay = Arc::new(FakeRelayClient::default());
-        let adapter = NostrTransportAdapter::new(relay.clone());
-        let account = MemberId::new(vec![0xD1; 32]);
-        let first = sync_fixture_group(0xD2);
-        let second = sync_fixture_group(0xD3);
-        let floor = 1_700_000_000;
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![],
-                group_subscriptions: vec![second, first.clone()],
-                since: Some(Timestamp(floor)),
-            })
-            .await
-            .unwrap();
-        let event = group_event_at("first captured route awaiting placement", &first, floor + 1);
-        *relay.retained.lock().unwrap() = Some(vec![(
-            account.clone(),
-            first.endpoints[0].clone(),
-            event.clone(),
-        )]);
-        relay
-            .hold_acquisition
-            .store(!blocked_placement, Ordering::SeqCst);
-        let credits = Arc::new(tokio::sync::Semaphore::new(1));
-        let mut plan = capture_plan(&adapter, &account, 1).await;
-        plan.credit = Arc::new(credits.clone().acquire_owned().await.unwrap());
-        let mut caller =
-            Box::pin(adapter.capture_replay(&account, plan, NostrAcquisitionCancellation::new()));
-        assert!(
-            poll_fn(|cx| Poll::Ready(caller.as_mut().poll(cx)))
-                .await
-                .is_pending()
-        );
-        wait_until("the accepted first route starts IO", || {
-            !relay.acquisitions.lock().unwrap().is_empty()
-        })
-        .await;
-        let placement = if blocked_placement {
-            let delivery = tokio::time::timeout(Duration::from_secs(1), adapter.receive())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(delivery.account_id, account);
-            assert_eq!(delivery.message, event.to_transport_message().unwrap());
-            assert!(
-                adapter.take_replay_status(&account).await.pending,
-                "enqueue alone is not placement acknowledgment"
-            );
-            Some(delivery.message.id)
-        } else {
-            assert_eq!(relay.active_acquisitions.load(Ordering::SeqCst), 1);
-            None
-        };
-        assert_eq!(credits.available_permits(), 0);
-        let acquisitions_before_abort = relay.acquisitions.lock().unwrap().len();
-        drop(caller);
-        if !blocked_placement {
-            // The held backend cannot have cleaned up without an executor turn.
-            assert_eq!(
-                credits.available_permits(),
-                0,
-                "caller destruction cannot release an accepted IO credit"
-            );
-            assert_eq!(relay.active_acquisitions.load(Ordering::SeqCst), 1);
-        }
-        wait_until("accepted IO and its credit are cleaned together", || {
-            relay.active_acquisitions.load(Ordering::SeqCst) == 0
-                && credits.available_permits() == 1
-        })
-        .await;
-        if let Some(id) = placement {
-            assert!(
-                adapter.take_replay_status(&account).await.pending,
-                "caller cancellation cannot erase an outstanding placement fence"
-            );
-            adapter.ack_replay_delivery(&account, &id).await;
-        }
-        assert_eq!(
-            relay.acquisitions.lock().unwrap().len(),
-            acquisitions_before_abort,
-            "cancellation cannot start another queued acquisition"
-        );
-        assert_replay_idle(&adapter, &account).await;
-        assert_no_delivery(&adapter).await;
-    }
-}
-
-async fn wait_snapshot(hold: &AcquisitionHold) {
-    tokio::time::timeout(Duration::from_secs(1), hold.captured.notified())
-        .await
-        .expect("the backend captured its held snapshot");
-}
-
-async fn release_snapshot(hold: &AcquisitionHold) {
-    hold.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), hold.returned.notified())
-        .await
-        .expect("the backend returned or discarded its captured snapshot");
-}
-
 async fn wait_replay_eose(adapter: &NostrTransportAdapter, id: &str) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while adapter.subscription_synced(id).await != Some(true) {
@@ -7811,7 +6876,7 @@ async fn late_replay_keeps_proof(stored: usize) {
     assert_group_delivery(&adapter, &account, &healthy).await;
     let mut loss = adapter.take_replay_status(&account).await.loss;
 
-    let mut history = (0..stored)
+    let history = (0..stored)
         .map(|index| {
             group_event_at(
                 &format!("late B {index}"),
@@ -7820,20 +6885,8 @@ async fn late_replay_keeps_proof(stored: usize) {
             )
         })
         .collect::<Vec<_>>();
-    if stored >= transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-        let older = group_event_at("B history below its clamped prefix", &group, floor + 10);
-        relay.pages.lock().unwrap().push_back((
-            NostrAcquisitionEnd::RequestPolicySatisfied,
-            vec![older.clone()],
-        ));
-        for event in history.iter().rev() {
-            route_group_copy(&adapter, &late, &id, event).await;
-        }
-        history.insert(0, older);
-    } else {
-        for event in history.iter().rev() {
-            route_group_copy(&adapter, &late, &id, event).await;
-        }
+    for event in history.iter().rev() {
+        route_group_copy(&adapter, &late, &id, event).await;
     }
     assert_no_delivery(&adapter).await;
     adapter
@@ -7891,474 +6944,6 @@ async fn late_short_replay_keeps_proof() {
 #[tokio::test(start_paused = true)]
 async fn late_clamp_replay_keeps_proof() {
     late_replay_keeps_proof(transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn newer_loss_needs_own_proof() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xC5; 32]);
-    let group = sync_fixture_group(0xC6);
-    let endpoint = &group.endpoints[0];
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            endpoint,
-            [1, 1],
-            transport_nostr_adapter::ReplayRestart::Connection,
-        )
-        .await;
-    adapter
-        .handle_relay_eose(endpoint.clone(), id.clone())
-        .await;
-    let older = group_event_at("first capture's complete snapshot", &group, floor + 1);
-    let missing = group_event_at("lost after the first capture began", &group, floor + 2);
-    relay.pages.lock().unwrap().extend([
-        (
-            NostrAcquisitionEnd::RequestPolicySatisfied,
-            vec![older.clone()],
-        ),
-        (
-            NostrAcquisitionEnd::RequestPolicySatisfied,
-            vec![missing.clone(), older.clone()],
-        ),
-    ]);
-    let first_snapshot = Arc::new(AcquisitionHold::default());
-    let next_snapshot = Arc::new(AcquisitionHold::default());
-    relay.acquisition_holds.lock().unwrap().extend([
-        (endpoint.clone(), first_snapshot.clone()),
-        (endpoint.clone(), next_snapshot.clone()),
-    ]);
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            endpoint,
-            [2, 1],
-            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
-        )
-        .await;
-    let first_capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 1).await,
-    );
-    wait_snapshot(&first_snapshot).await;
-    assert!(adapter.take_replay_status(&account).await.loss.is_none());
-    tokio::time::advance(Duration::from_secs(5)).await;
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            endpoint,
-            [3, 1],
-            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
-        )
-        .await;
-    tokio::task::yield_now().await;
-    assert_eq!(relay.acquisitions.lock().unwrap().len(), 1);
-    release_snapshot(&first_snapshot).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        relay.acquisitions.lock().unwrap().len(),
-        1,
-        "a newer boundary never grants a follow-up"
-    );
-    let capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 2).await,
-    );
-    wait_snapshot(&next_snapshot).await;
-    assert_eq!(
-        adapter.subscription_endpoint_eose(&id, endpoint).await,
-        Some(false)
-    );
-    assert!(!adapter.account_subscription_eose(&account).await.complete());
-    {
-        let status = adapter.take_replay_status(&account).await;
-        assert!(
-            status.pending,
-            "newer demand remains an admission gate while its capture is held"
-        );
-        if let Some(loss) = status.loss {
-            assert_eq!(loss, NostrNotificationLossFloor::Since(floor));
-        }
-    }
-    release_snapshot(&next_snapshot).await;
-    assert_group_delivery(&adapter, &account, &older).await;
-    let next = tokio::time::timeout(Duration::from_secs(1), adapter.receive())
-        .await
-        .expect("the newer lost body is recovered")
-        .unwrap()
-        .unwrap();
-    assert_eq!(next.account_id, account);
-    adapter
-        .ack_replay_delivery(&account, &next.message.id)
-        .await;
-    if next.message == older.to_transport_message().unwrap() {
-        // A fresh owned history acquisition deliberately bypasses live-copy
-        // dedup, so a serial full-window refetch may repeat its older body.
-        assert_group_delivery(&adapter, &account, &missing).await;
-    } else {
-        assert_eq!(next.message, missing.to_transport_message().unwrap());
-    }
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    let _ = first_capture.await.unwrap();
-    assert!(relay.acquisitions.lock().unwrap().iter().all(|request| matches!(&request.scope, NostrAcquisitionScope::GroupsWindow { since, .. } if *since == floor)));
-    wait_replay_eose(&adapter, &id).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
-    assert!(relay.take_issued_subscriptions().is_empty());
-}
-
-/// A newer boundary needs a new owner grant and the original full window;
-/// finishing an older capture cannot automatically start or certify its successor.
-#[tokio::test(start_paused = true)]
-async fn new_loss_needs_fresh_grant() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xCB; 32]);
-    let group = sync_fixture_group(0xCC);
-    let endpoint = &group.endpoints[0];
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            endpoint,
-            [1, 1],
-            transport_nostr_adapter::ReplayRestart::Connection,
-        )
-        .await;
-    adapter
-        .handle_relay_eose(endpoint.clone(), id.clone())
-        .await;
-    let original = group_event_at("first retained snapshot", &group, floor + 1);
-    *relay.retained.lock().unwrap() =
-        Some(vec![(account.clone(), endpoint.clone(), original.clone())]);
-    let first = Arc::new(AcquisitionHold::default());
-    let followup = Arc::new(AcquisitionHold::default());
-    relay.acquisition_holds.lock().unwrap().extend([
-        (endpoint.clone(), first.clone()),
-        (endpoint.clone(), followup.clone()),
-    ]);
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            endpoint,
-            [2, 1],
-            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
-        )
-        .await;
-    let first_capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 1).await,
-    );
-    wait_snapshot(&first).await;
-    assert!(adapter.take_replay_status(&account).await.loss.is_none());
-
-    // The first result is already materialized. Only the next full-window
-    // acquisition can see this tail; no live copy is sent to the adapter.
-    let missing = group_event_at("tail lost after first snapshot", &group, floor + 2);
-    relay.retained.lock().unwrap().as_mut().unwrap().push((
-        account.clone(),
-        endpoint.clone(),
-        missing.clone(),
-    ));
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            endpoint,
-            [3, 1],
-            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
-        )
-        .await;
-    assert!(adapter.take_replay_status(&account).await.loss.is_none());
-    release_snapshot(&first).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        relay.acquisitions.lock().unwrap().len(),
-        1,
-        "no autonomous follow-up"
-    );
-    let capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 2).await,
-    );
-    wait_snapshot(&followup).await;
-    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
-    assert_eq!(
-        adapter.subscription_endpoint_eose(&id, endpoint).await,
-        Some(false),
-        "the first snapshot cannot certify input lost after it was captured"
-    );
-    release_snapshot(&followup).await;
-
-    let original_message = original.to_transport_message().unwrap();
-    let missing_message = missing.to_transport_message().unwrap();
-    let mut original_copies = 0;
-    loop {
-        let delivery = tokio::time::timeout(Duration::from_secs(1), adapter.receive())
-            .await
-            .expect("the owned follow-up delivers the actual lost tail")
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivery.account_id, account);
-        assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
-        adapter
-            .ack_replay_delivery(&account, &delivery.message.id)
-            .await;
-        if delivery.message == missing_message {
-            assert!(original_copies > 0, "history precedes the newer lost tail");
-            break;
-        }
-        assert_eq!(delivery.message, original_message);
-        original_copies += 1;
-        // Historical refetches intentionally bypass live-copy dedup. Either
-        // the first snapshot is withheld, or each full-window pass releases it.
-        assert!(original_copies <= 2);
-    }
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    let _ = first_capture.await.unwrap();
-    assert!(relay.acquisitions.lock().unwrap().iter().all(|request| matches!(&request.scope, NostrAcquisitionScope::GroupsWindow { since, .. } if *since == floor)));
-    wait_replay_eose(&adapter, &id).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
-    assert!(relay.take_issued_subscriptions().is_empty());
-}
-
-#[tokio::test(start_paused = true)]
-async fn batch_units_have_own_budget() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xC7; 32]);
-    let groups = [
-        sync_fixture_group(0xC8),
-        sync_fixture_group(0xC9),
-        sync_fixture_group(0xCA),
-    ];
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![groups[2].clone(), groups[0].clone(), groups[1].clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let issued = relay.take_issued_subscriptions();
-    let id = issued_group_id(&issued, &groups[0].group_id);
-    let mut history = [Vec::new(), Vec::new(), Vec::new()];
-    for index in (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT).rev() {
-        let group_index = index % groups.len();
-        let event = group_event_at(
-            &format!("clamped group {group_index} event {index}"),
-            &groups[group_index],
-            floor + 1_000 * (3 - group_index) as u64 + index as u64,
-        );
-        route_group_copy(&adapter, &groups[group_index], &id, &event).await;
-        history[group_index].push(event);
-    }
-    let mut retained = Vec::new();
-    for (index, group) in groups.iter().enumerate() {
-        let older = group_event_at(
-            "older per-route page body",
-            group,
-            floor + 10 + index as u64,
-        );
-        retained.push((account.clone(), group.endpoints[0].clone(), older.clone()));
-        history[index].push(older);
-        history[index].sort_unstable_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-    }
-    *relay.retained.lock().unwrap() = Some(retained);
-    relay
-        .acquisition_delays
-        .lock()
-        .unwrap()
-        .extend([Duration::from_secs(12); 3]);
-    let started = tokio::time::Instant::now();
-    adapter
-        .handle_relay_eose(groups[0].endpoints[0].clone(), id.clone())
-        .await;
-    for (index, events) in history.iter().enumerate() {
-        wait_until("the next canonical group starts service", || {
-            relay.acquisitions.lock().unwrap().len() == index + 1
-        })
-        .await;
-        assert_eq!(
-            adapter
-                .subscription_endpoint_eose(&id, &groups[0].endpoints[0])
-                .await,
-            Some(false)
-        );
-        tokio::time::advance(Duration::from_secs(12)).await;
-        for event in events {
-            assert_group_delivery(&adapter, &account, event).await;
-        }
-        assert!(
-            adapter.take_replay_status(&account).await.loss.is_none(),
-            "queued groups do not spend their service allowance while an earlier group pages"
-        );
-    }
-    assert!(started.elapsed() >= Duration::from_secs(36));
-    wait_replay_eose(&adapter, &id).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-}
-
-/// A's completed network work cannot spend its remaining service budget on B.
-/// B starts later and finishes within its own unchanged thirty-second lease.
-#[tokio::test(start_paused = true)]
-async fn peer_wait_keeps_next_group() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xCD; 32]);
-    let a = TransportEndpoint("wss://source-a.example".into());
-    let b = TransportEndpoint("wss://source-b.example".into());
-    let mut first_group = sync_fixture_group(0xCE);
-    let mut next_group = sync_fixture_group(0xCF);
-    first_group.endpoints = vec![a.clone(), b.clone()];
-    next_group.endpoints = first_group.endpoints.clone();
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![next_group.clone(), first_group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let issued = relay.take_issued_subscriptions();
-    let id = issued_group_id(&issued, &first_group.group_id);
-    assert_eq!(id, issued_group_id(&issued, &next_group.group_id));
-    for endpoint in [&a, &b] {
-        adapter
-            .observe_replay_epoch(
-                Some(&account),
-                endpoint,
-                [1, 1],
-                transport_nostr_adapter::ReplayRestart::Connection,
-            )
-            .await;
-        adapter
-            .handle_relay_eose(endpoint.clone(), id.clone())
-            .await;
-    }
-
-    let shared = group_event_at("shared first-group history", &first_group, floor + 1);
-    let unique = group_event_at("only A has the next group", &next_group, floor + 2);
-    *relay.retained.lock().unwrap() = Some(vec![
-        (account.clone(), a.clone(), shared.clone()),
-        (account.clone(), b.clone(), shared.clone()),
-        (account.clone(), a.clone(), unique.clone()),
-    ]);
-    let a_hold = Arc::new(AcquisitionHold::default());
-    let b_hold = Arc::new(AcquisitionHold::default());
-    relay
-        .acquisition_holds
-        .lock()
-        .unwrap()
-        .extend([(a.clone(), a_hold.clone()), (b.clone(), b_hold.clone())]);
-    let a_started = tokio::time::Instant::now();
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            &a,
-            [2, 1],
-            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
-        )
-        .await;
-    let mut a_plan = capture_plan(&adapter, &account, 1).await;
-    {
-        let status = adapter.take_replay_status(&account).await;
-        a_plan.sources = status
-            .sources()
-            .flat_map(|source| {
-                source
-                    .endpoints()
-                    .filter(|endpoint| same_relay(endpoint.endpoint(), &a))
-                    .map(|endpoint| endpoint.capture_token())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-    }
-    let a_capture = spawn_capture(&adapter, &account, a_plan);
-    wait_snapshot(&a_hold).await;
-    assert!(adapter.take_replay_status(&account).await.loss.is_none());
-
-    tokio::time::advance(Duration::from_secs(10)).await;
-    let b_started = tokio::time::Instant::now();
-    adapter
-        .observe_replay_epoch(
-            Some(&account),
-            &b,
-            [2, 1],
-            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
-        )
-        .await;
-    let mut b_plan = capture_plan(&adapter, &account, 2).await;
-    {
-        let status = adapter.take_replay_status(&account).await;
-        b_plan.sources = status
-            .sources()
-            .flat_map(|source| {
-                source
-                    .endpoints()
-                    .filter(|endpoint| same_relay(endpoint.endpoint(), &b))
-                    .map(|endpoint| endpoint.capture_token())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-    }
-    let b_capture = spawn_capture(&adapter, &account, b_plan);
-    wait_snapshot(&b_hold).await;
-    assert!(adapter.take_replay_status(&account).await.loss.is_none());
-
-    tokio::time::advance(Duration::from_secs(10)).await;
-    release_snapshot(&a_hold).await;
-    assert!(a_started.elapsed() < Duration::from_secs(30));
-    // A's complete G1 result is now held only by B's still-running G1. Pass
-    // A's original deadline while B retains nine seconds of its own budget.
-    tokio::time::advance(Duration::from_secs(11)).await;
-    assert_no_delivery(&adapter).await;
-    tokio::time::advance(Duration::from_secs(4)).await;
-    assert!(a_started.elapsed() > Duration::from_secs(30));
-    assert!(b_started.elapsed() < Duration::from_secs(30));
-    release_snapshot(&b_hold).await;
-
-    assert_group_delivery(&adapter, &account, &shared).await;
-    assert_group_delivery(&adapter, &account, &unique).await;
-    let _ = a_capture.await.unwrap();
-    assert_eq!(b_capture.await.unwrap(), ReplayCaptureOutcome::Complete);
-    wait_replay_eose(&adapter, &id).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert!(relay.take_issued_subscriptions().is_empty());
 }
 
 #[tokio::test]
@@ -8422,296 +7007,9 @@ async fn refused_peer_releases_history() {
     );
 }
 
-#[tokio::test]
-async fn removed_page_never_leaks() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0x83; 32]);
-    let group = sync_fixture_group(0x84);
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(1_700_000_500)),
-        })
-        .await
-        .unwrap();
-    let live_id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), live_id.clone())
-        .await;
-    let before = group_event_at("ready live route", &group, 1_700_001_000);
-    route_group_copy(&adapter, &group, &live_id, &before).await;
-    assert_group_delivery(&adapter, &account, &before).await;
-
-    let maintenance = adapter
-        .install_group_maintenance_recovery_subscription(
-            &account,
-            &group,
-            1,
-            Some(Timestamp(1_700_000_000)),
-        )
-        .await
-        .unwrap();
-    let mut partial = Vec::new();
-    for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-        let event = group_event_at(
-            &format!("partial {index}"),
-            &group,
-            1_700_000_500 + index as u64,
-        );
-        route_group_copy(&adapter, &group, &maintenance, &event).await;
-        partial.push(event);
-    }
-    let staged_live = group_event_at("live while wider history is pending", &group, 1_700_001_001);
-    route_group_copy(&adapter, &group, &live_id, &staged_live).await;
-    assert!(adapter.take_replay_status(&account).await.pending);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), adapter.receive())
-            .await
-            .is_err()
-    );
-    let older = group_event_at("late acquisition result", &group, 1_700_000_001);
-    relay.pages.lock().unwrap().push_back((
-        NostrAcquisitionEnd::RequestPolicySatisfied,
-        vec![older.clone()],
-    ));
-    relay.hold_acquisition.store(true, Ordering::SeqCst);
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), maintenance.clone())
-        .await;
-    wait_until("maintenance page acquisition starts", || {
-        !relay.acquisitions.lock().unwrap().is_empty()
-    })
-    .await;
-    adapter
-        .remove_group_maintenance_recovery_subscription(&account, &maintenance)
-        .await
-        .unwrap();
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(1_700_000_000)
-    );
-    relay.release_acquisition.notify_one();
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), maintenance.clone())
-        .await;
-    for event in partial.iter().chain(std::iter::once(&older)) {
-        route_group_copy(&adapter, &group, &maintenance, event).await;
-    }
-    assert_group_delivery(&adapter, &account, &staged_live).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), adapter.receive())
-            .await
-            .is_err()
-    );
-    let after = group_event_at("future live route", &group, 1_700_001_002);
-    route_group_copy(&adapter, &group, &live_id, &after).await;
-    assert_group_delivery(&adapter, &account, &after).await;
-    wait_replay_eose(&adapter, &live_id).await;
-    let status = adapter.take_replay_status(&account).await;
-    assert!(!status.pending);
-    assert!(status.loss.is_none());
-}
-
-#[tokio::test]
-async fn page_retry_retains_events() {
-    for end in [
-        NostrAcquisitionEnd::Deadline,
-        NostrAcquisitionEnd::Disconnected,
-        NostrAcquisitionEnd::RelayClosed,
-    ] {
-        let relay = Arc::new(FakeRelayClient::default());
-        let adapter = NostrTransportAdapter::new(relay.clone());
-        let account = MemberId::new(vec![0x89; 32]);
-        let group = sync_fixture_group(0x8A);
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![],
-                group_subscriptions: vec![group.clone()],
-                since: Some(Timestamp(1_700_000_000)),
-            })
-            .await
-            .unwrap();
-        let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-        let oldest = group_event_at("retry reaches oldest history", &group, 1_700_000_050);
-        let interrupted = group_event_at("retained interrupted response", &group, 1_700_000_100);
-        relay.pages.lock().unwrap().extend([
-            (end, vec![interrupted.clone()]),
-            (
-                NostrAcquisitionEnd::RequestPolicySatisfied,
-                vec![interrupted.clone(), oldest.clone()],
-            ),
-        ]);
-        let mut initial = Vec::new();
-        for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-            let event = group_event_at(
-                &format!("initial {index}"),
-                &group,
-                1_700_000_500 + index as u64,
-            );
-            route_group_copy(&adapter, &group, &id, &event).await;
-            initial.push(event);
-        }
-        adapter
-            .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-            .await;
-        for event in [&oldest, &interrupted].into_iter().chain(initial.iter()) {
-            assert_group_delivery(&adapter, &account, event).await;
-        }
-        {
-            let requests = relay.acquisitions.lock().unwrap();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(requests[0].scope, requests[1].scope);
-            assert!(matches!(
-                requests[0].scope,
-                NostrAcquisitionScope::GroupsWindow {
-                    since: 1_700_000_000,
-                    ..
-                }
-            ));
-        }
-        wait_replay_eose(&adapter, &id).await;
-        {
-            let status = adapter.take_replay_status(&account).await;
-            assert!(!status.pending);
-            assert!(status.loss.is_none());
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), adapter.receive())
-                .await
-                .is_err()
-        );
-    }
-}
-
-#[tokio::test]
-async fn failed_paging_keeps_live() {
-    for end in [
-        NostrAcquisitionEnd::Rejected,
-        NostrAcquisitionEnd::Deadline,
-        NostrAcquisitionEnd::RequestPolicySatisfied,
-    ] {
-        let relay = Arc::new(FakeRelayClient::default());
-        let adapter = NostrTransportAdapter::new(relay.clone());
-        let account = MemberId::new(vec![0x8B; 32]);
-        let group = sync_fixture_group(0x8C);
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![],
-                group_subscriptions: vec![group.clone()],
-                since: Some(Timestamp(1_700_000_000)),
-            })
-            .await
-            .unwrap();
-        let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
-        let events = if end == NostrAcquisitionEnd::RequestPolicySatisfied {
-            // A full page stuck in the inclusive oldest second cannot prove
-            // either the rest of that second or anything before it was served.
-            (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT)
-                .map(|index| group_event_at(&format!("same second {index}"), &group, 1_700_000_500))
-                .collect()
-        } else {
-            vec![group_event_at("partial failed page", &group, 1_700_000_100)]
-        };
-        relay.pages.lock().unwrap().push_back((end, events.clone()));
-        if end == NostrAcquisitionEnd::Deadline {
-            relay.pages.lock().unwrap().push_back((end, events));
-        }
-        for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-            let event = group_event_at(
-                &format!("initial {index}"),
-                &group,
-                1_700_000_500 + index as u64,
-            );
-            route_group_copy(&adapter, &group, &id, &event).await;
-        }
-        adapter
-            .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-            .await;
-        assert_eq!(
-            replay_loss(&adapter, &account).await,
-            NostrNotificationLossFloor::Since(1_700_000_000)
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), adapter.receive())
-                .await
-                .is_err()
-        );
-        let live = group_event_at("live after failed paging", &group, 1_700_001_001);
-        route_group_copy(&adapter, &group, &id, &live).await;
-        assert_group_delivery(&adapter, &account, &live).await;
-        assert!(!adapter.account_subscription_eose(&account).await.complete());
-        let status = adapter.take_replay_status(&account).await;
-        assert!(!status.pending);
-        assert!(status.loss.is_none());
-        assert_eq!(
-            relay.acquisitions.lock().unwrap().len(),
-            if end == NostrAcquisitionEnd::Deadline {
-                2
-            } else {
-                1
-            }
-        );
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn batch_failure_is_local() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xA0; 32]);
-    let busy = sync_fixture_group(0xA1);
-    let quiet = sync_fixture_group(0xA3);
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![busy.clone(), quiet.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = group_subscription_id(&adapter, &account, &busy).await;
-    assert_eq!(id, group_subscription_id(&adapter, &account, &quiet).await);
-    let failed = group_event_at("interrupted busy-route page", &busy, floor + 100);
-    relay.pages.lock().unwrap().extend([
-        (NostrAcquisitionEnd::Deadline, vec![failed.clone()]),
-        (NostrAcquisitionEnd::Deadline, vec![failed]),
-        (NostrAcquisitionEnd::RequestPolicySatisfied, vec![]),
-    ]);
-    for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-        let event = group_event_at(
-            &format!("busy initial {index}"),
-            &busy,
-            floor + 500 + index as u64,
-        );
-        route_group_copy(&adapter, &busy, &id, &event).await;
-    }
-    assert!(adapter.take_replay_status(&account).await.pending);
-    adapter
-        .handle_relay_eose(busy.endpoints[0].clone(), id.clone())
-        .await;
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor)
-    );
-    assert_no_delivery(&adapter).await;
-    let live = group_event_at("quiet sibling remains live", &quiet, floor + 2_000);
-    route_group_copy(&adapter, &quiet, &id, &live).await;
-    assert_group_delivery(&adapter, &account, &live).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert!(!adapter.account_subscription_eose(&account).await.complete());
-    let requests = relay.acquisitions.lock().unwrap();
-    assert!(requests.len() >= 2, "the interrupted busy page was retried");
-    assert_eq!(requests[0].scope, requests[1].scope);
-}
-
+/// Receiver loss ends a source's admission without IO of the adapter's own.
+/// The source's late stored suffix still belongs to the cut historical owner,
+/// so it is owed, not delivered; only input after the physical EOSE is live.
 #[tokio::test]
 async fn forced_replay_holds_history() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -8753,12 +7051,6 @@ async fn forced_replay_holds_history() {
         relay.acquisitions.lock().unwrap().is_empty(),
         "metadata does not grant IO"
     );
-    let capture = spawn_capture(
-        &adapter,
-        &account,
-        capture_plan(&adapter, &account, 1).await,
-    );
-    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Incomplete);
     let mut loss = None;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -8776,15 +7068,15 @@ async fn forced_replay_holds_history() {
         }
     })
     .await
-    .expect("unsupported owned refetch terminates admission");
+    .expect("receiver loss terminates admission");
     assert_eq!(
         loss, None,
-        "unsupported empty acquisition cannot invent discarded ciphertext"
+        "an empty source cut by receiver loss discards no ciphertext"
     );
 
     // Reader loss is not the physical stream's EOSE. Its late stored suffix
-    // still belongs to the failed historical owner, not the live queue.
-    let history = group_event_at("stored after failed refetch", &group, floor + 1);
+    // still belongs to the cut historical owner, not the live queue.
+    let history = group_event_at("stored after receiver loss", &group, floor + 1);
     route_group_copy(&adapter, &group, &id, &history).await;
     assert_no_delivery(&adapter).await;
     adapter
@@ -8848,12 +7140,6 @@ async fn full_overflow_drops_pages() {
         replay_loss(&adapter, &account).await,
         NostrNotificationLossFloor::Since(floor)
     );
-    let older = group_event_at("older page must never become live", &group, floor + 1);
-    relay
-        .pages
-        .lock()
-        .unwrap()
-        .push_back((NostrAcquisitionEnd::RequestPolicySatisfied, vec![older]));
     adapter
         .handle_relay_eose(group.endpoints[0].clone(), id.clone())
         .await;
@@ -8864,106 +7150,6 @@ async fn full_overflow_drops_pages() {
     assert_group_delivery(&adapter, &account, &live).await;
     assert_no_delivery(&adapter).await;
     assert_replay_idle(&adapter, &account).await;
-    assert_eq!(
-        adapter
-            .subscription_endpoint_eose(&id, &group.endpoints[0])
-            .await,
-        Some(false)
-    );
-    assert!(!adapter.account_subscription_eose(&account).await.complete());
-}
-
-#[tokio::test(start_paused = true)]
-async fn page_overflow_keeps_peer() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xA8; 32]);
-    let mut group = sync_fixture_group(0xA9);
-    group
-        .endpoints
-        .push(TransportEndpoint("wss://complete.example".into()));
-    let mut complete = group.clone();
-    complete.endpoints.swap(0, 1);
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor)),
-        })
-        .await
-        .unwrap();
-    let id = group_subscription_id(&adapter, &account, &group).await;
-    let initial_body = "i".repeat(8 * 1024);
-    for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-        let event = group_event_at(
-            &format!("paging owner initial {index} {initial_body}"),
-            &group,
-            floor + 500 + index as u64,
-        );
-        route_group_copy(&adapter, &group, &id, &event).await;
-    }
-    let healthy = group_event_at("healthy older peer", &group, floor + 100);
-    route_group_copy(&adapter, &complete, &id, &healthy).await;
-    adapter
-        .handle_relay_eose(complete.endpoints[0].clone(), id.clone())
-        .await;
-    let body = "x".repeat(3 * 1024 * 1024);
-    // The acquired page itself fits its wire budget. Together with this
-    // owner's initial history it exceeds the pending-body allowance.
-    let mut page = (0..10)
-        .map(|index| group_event_at(&body, &group, floor + 10 + index))
-        .collect::<Vec<_>>();
-    for index in page.len()..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT - 1 {
-        page.push(group_event_at(
-            &format!("small page tail {index}"),
-            &group,
-            floor + 30,
-        ));
-    }
-    page.push(group_event_at(
-        "small tail after overflow",
-        &group,
-        floor + 1,
-    ));
-    relay.pages.lock().unwrap().extend([
-        (NostrAcquisitionEnd::RequestPolicySatisfied, page),
-        (
-            NostrAcquisitionEnd::RequestPolicySatisfied,
-            vec![group_event_at("subsequent older page", &group, floor)],
-        ),
-    ]);
-    relay.hold_acquisition.store(true, Ordering::SeqCst);
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-        .await;
-    wait_until("backward page is held", || {
-        !relay.acquisitions.lock().unwrap().is_empty()
-    })
-    .await;
-    let live = group_event_at("raw live during owned page", &group, floor + 2_000);
-    route_group_copy(&adapter, &group, &id, &live).await;
-    assert!(adapter.take_replay_status(&account).await.pending);
-    assert_no_delivery(&adapter).await;
-    relay.release_acquisition.notify_one();
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor)
-    );
-    assert_group_delivery(&adapter, &account, &healthy).await;
-    assert_group_delivery(&adapter, &account, &live).await;
-    assert_no_delivery(&adapter).await;
-    let later = group_event_at("raw live after page overflow", &group, floor + 2_001);
-    route_group_copy(&adapter, &group, &id, &later).await;
-    assert_group_delivery(&adapter, &account, &later).await;
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    assert_eq!(
-        relay.acquisitions.lock().unwrap().len(),
-        1,
-        "abandoning an overflowed page stops subsequent historical acquisitions"
-    );
     assert_eq!(
         adapter
             .subscription_endpoint_eose(&id, &group.endpoints[0])
@@ -9198,87 +7384,6 @@ async fn partial_peer_expires() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn maintenance_after_failure() {
-    let relay = Arc::new(FakeRelayClient::default());
-    let adapter = NostrTransportAdapter::new(relay.clone());
-    let account = MemberId::new(vec![0xB2; 32]);
-    let group = sync_fixture_group(0xB3);
-    let floor = 1_700_000_000;
-    adapter
-        .activate_account(TransportAccountActivation {
-            account_id: account.clone(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![group.clone()],
-            since: Some(Timestamp(floor + 1_000)),
-        })
-        .await
-        .unwrap();
-    let live_id = group_subscription_id(&adapter, &account, &group).await;
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), live_id.clone())
-        .await;
-    let first = adapter
-        .install_group_maintenance_recovery_subscription(
-            &account,
-            &group,
-            1,
-            Some(Timestamp(floor + 100)),
-        )
-        .await
-        .unwrap();
-    let reacquired = group_event_at("failed page later reacquired", &group, floor + 200);
-    relay.pages.lock().unwrap().extend([
-        (NostrAcquisitionEnd::Deadline, vec![reacquired.clone()]),
-        (NostrAcquisitionEnd::Deadline, vec![reacquired.clone()]),
-    ]);
-    for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-        let event = group_event_at(
-            &format!("failed maintenance initial {index}"),
-            &group,
-            floor + 500 + index as u64,
-        );
-        route_group_copy(&adapter, &group, &first, &event).await;
-    }
-    assert!(adapter.take_replay_status(&account).await.pending);
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), first.clone())
-        .await;
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor + 100)
-    );
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-    let second = adapter
-        .install_group_maintenance_recovery_subscription(
-            &account,
-            &group,
-            2,
-            Some(Timestamp(floor)),
-        )
-        .await
-        .unwrap();
-    assert_ne!(first, second);
-    let older = group_event_at("fresh request reaches older history", &group, floor + 1);
-    route_group_copy(&adapter, &group, &second, &reacquired).await;
-    route_group_copy(&adapter, &group, &second, &older).await;
-    let live = group_event_at("live held behind fresh maintenance", &group, floor + 2_000);
-    route_group_copy(&adapter, &group, &live_id, &live).await;
-    assert!(adapter.take_replay_status(&account).await.pending);
-    assert_no_delivery(&adapter).await;
-    adapter
-        .handle_relay_eose(group.endpoints[0].clone(), second.clone())
-        .await;
-    for event in [&older, &reacquired, &live] {
-        assert_group_delivery(&adapter, &account, event).await;
-    }
-    wait_replay_eose(&adapter, &second).await;
-    assert_eq!(adapter.subscription_synced(&first).await, Some(false));
-    assert_no_delivery(&adapter).await;
-    assert_replay_idle(&adapter, &account).await;
-}
-
-#[tokio::test(start_paused = true)]
 async fn wider_source_survives_failure() {
     for retire_complete in [false, true] {
         let relay = Arc::new(FakeRelayClient::default());
@@ -9366,102 +7471,12 @@ async fn wider_source_survives_failure() {
     }
 }
 
+/// A replay that delivered a full page may have been clamped by the relay.
+/// Its EOSE admits what it sent, oldest first and without loss, but cannot
+/// prove the older history was served, so it never completes or settles the
+/// coverage: the recovery runner owes the rest (#2263).
 #[tokio::test(start_paused = true)]
-async fn failed_peer_keeps_loss() {
-    for end in [
-        NostrAcquisitionEnd::Deadline,
-        NostrAcquisitionEnd::ByteLimitReached,
-    ] {
-        let relay = Arc::new(FakeRelayClient::default());
-        let adapter = NostrTransportAdapter::new(relay.clone());
-        let account = MemberId::new(vec![0xB8; 32]);
-        let mut group = sync_fixture_group(0xB9);
-        group
-            .endpoints
-            .push(TransportEndpoint("wss://paging.example".into()));
-        let mut paging = group.clone();
-        paging.endpoints.swap(0, 1);
-        let floor = 1_700_000_000;
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![],
-                group_subscriptions: vec![group.clone()],
-                since: Some(Timestamp(floor)),
-            })
-            .await
-            .unwrap();
-        let id = group_subscription_id(&adapter, &account, &group).await;
-        let healthy = group_event_at("healthy peer history", &group, floor + 100);
-        let shared = group_event_at("healthy peer also owns this", &group, floor + 500);
-        route_group_copy(&adapter, &group, &id, &shared).await;
-        route_group_copy(&adapter, &group, &id, &healthy).await;
-        route_group_copy(&adapter, &paging, &id, &shared).await;
-        for index in 1..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
-            let event = group_event_at(
-                &format!("unavailable peer initial {index}"),
-                &group,
-                floor + 500 + index as u64,
-            );
-            route_group_copy(&adapter, &paging, &id, &event).await;
-        }
-        adapter
-            .handle_relay_eose(group.endpoints[0].clone(), id.clone())
-            .await;
-        let live = group_event_at("healthy live while peer pages", &group, floor + 2_000);
-        route_group_copy(&adapter, &group, &id, &live).await;
-        let failed = group_event_at("failed page never admitted", &group, floor + 1);
-        relay
-            .pages
-            .lock()
-            .unwrap()
-            .push_back((end, vec![failed.clone()]));
-        if end == NostrAcquisitionEnd::Deadline {
-            relay.pages.lock().unwrap().push_back((end, vec![failed]));
-        }
-        relay.hold_acquisition.store(true, Ordering::SeqCst);
-        adapter
-            .handle_relay_eose(paging.endpoints[0].clone(), id.clone())
-            .await;
-        wait_until("failed peer starts paging", || {
-            !relay.acquisitions.lock().unwrap().is_empty()
-        })
-        .await;
-        assert!(adapter.take_replay_status(&account).await.pending);
-        assert_no_delivery(&adapter).await;
-        relay.hold_acquisition.store(false, Ordering::SeqCst);
-        relay.release_acquisition.notify_one();
-        assert_eq!(
-            replay_loss(&adapter, &account).await,
-            NostrNotificationLossFloor::Since(floor),
-            "a completed peer cannot erase an interrupted or saturated owner's loss"
-        );
-        for event in [&healthy, &shared, &live] {
-            assert_group_delivery(&adapter, &account, event).await;
-        }
-        assert_no_delivery(&adapter).await;
-        assert_replay_idle(&adapter, &account).await;
-        assert!(!adapter.account_subscription_eose(&account).await.complete());
-        assert_eq!(
-            adapter
-                .subscription_endpoint_eose(&id, &group.endpoints[0])
-                .await,
-            Some(true)
-        );
-        assert_eq!(
-            adapter
-                .subscription_endpoint_eose(&id, &paging.endpoints[0])
-                .await,
-            Some(false)
-        );
-    }
-}
-
-/// A replay that delivered a full page may have been clamped by the relay. A
-/// backend that cannot page backwards cannot prove the older history was
-/// served, so that relay's EOSE must not complete the coverage (#2263).
-#[tokio::test(start_paused = true)]
-async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
+async fn a_full_page_replay_is_delivered_without_completing_coverage() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone() as Arc<dyn NostrRelayClient>);
     let account_id = MemberId::new(vec![0xF8; 32]);
@@ -9489,6 +7504,7 @@ async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
         .subscription_id();
     let group_id = issued_group_id(&issued, &group.group_id);
     let endpoint = group.endpoints[0].clone();
+    let mut stored = Vec::new();
     for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
         let event = group_event_at(
             &format!("{index:04x}"),
@@ -9496,19 +7512,15 @@ async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
             1_700_000_500 + index as u64,
         );
         route_group_copy(&adapter, &group, &group_id, &event).await;
+        stored.push(event);
     }
     adapter.handle_relay_eose(inbox, inbox_id).await;
     adapter.handle_relay_eose(endpoint, group_id.clone()).await;
-    assert_eq!(
-        replay_loss(&adapter, &account_id).await,
-        NostrNotificationLossFloor::Since(1_700_000_000)
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), adapter.receive())
-            .await
-            .is_err()
-    );
-    let live = group_event_at("live after unsupported paging", &group, 1_700_001_001);
+    for event in &stored {
+        assert_group_delivery(&adapter, &account_id, event).await;
+    }
+    assert_no_delivery(&adapter).await;
+    let live = group_event_at("live after a full page", &group, 1_700_001_001);
     route_group_copy(&adapter, &group, &group_id, &live).await;
     assert_group_delivery(&adapter, &account_id, &live).await;
     {
@@ -9517,10 +7529,7 @@ async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
         assert!(status.loss.is_none());
     }
     let eose = adapter.account_subscription_eose(&account_id).await;
-    assert!(
-        !eose.complete(),
-        "a full page with no paging is not coverage"
-    );
+    assert!(!eose.complete(), "a full page is not coverage");
     assert!(
         !eose.settled(),
         "incomplete history cannot settle replay coverage"

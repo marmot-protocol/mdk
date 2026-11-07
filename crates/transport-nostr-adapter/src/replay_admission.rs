@@ -1,43 +1,9 @@
 //! Borrowed wire facts and immutable requests for the account recovery owner.
 use super::*;
-use tokio::sync::OwnedSemaphorePermit;
-
-/// An opaque current-source capability. Identities are never diagnostic output.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ReplayCaptureToken {
-    pub(super) account_id: MemberId,
-    pub(super) generation: u64,
-    pub(super) request: Arc<str>,
-    pub(super) relay: RelayIndex,
-}
-
-/// A recovery owner's frozen request. Accepted IO retains this credit until cleanup.
-#[derive(Clone)]
-pub struct ReplayCapturePlan {
-    /// The existing account owner's frozen attempt serial.
-    pub attempt_serial: u64,
-    /// Current issued sources authorized by that attempt.
-    pub sources: Vec<ReplayCaptureToken>,
-    /// The process recovery credit retained through accepted IO cleanup.
-    pub credit: Arc<OwnedSemaphorePermit>,
-}
-
-/// Request execution, not exhaustive history or durable recovery completion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplayCaptureOutcome {
-    /// Every requested source finished original-window capture and placement.
-    Complete,
-    /// A requested source did not finish; no history certificate is implied.
-    Incomplete,
-    /// The owner cancelled the operation.
-    Cancelled,
-    /// An account, issued source, epoch or attempt no longer matches.
-    Stale,
-}
 
 /// One source generation: one REQ on one relay from its last (re)start. It
 /// changes whenever the source restarts, so a count never carries across a
-/// disconnect, receiver loss or capture. Opaque; never diagnostic output.
+/// disconnect or receiver loss. Opaque; never diagnostic output.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReplaySourceGeneration(pub(super) u64);
 
@@ -67,7 +33,7 @@ impl RelayConnection {
 }
 
 /// What one relay's live REQ returned before its physical EOSE in one source
-/// generation. Backward paging of a clamped replay does not change it.
+/// generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplayLiveCount {
     /// Stored events the relay sent before EOSE.
@@ -95,8 +61,7 @@ pub struct ReplayLiveCount {
 
 impl ReplayLiveCount {
     /// The relay sent a full replay page or more before EOSE, so it may have
-    /// clamped the reply. Native paging fetches such a window backwards; its
-    /// count never fences.
+    /// clamped the reply: the owner's recovery runner fetches what it cut.
     pub fn clamped(&self) -> bool {
         self.events >= RELAY_REPLAY_PAGE_LIMIT
     }
@@ -237,7 +202,7 @@ impl ReplayRequestView<'_> {
     }
 
     /// Every issued peer terminally refused this live request. Such a source
-    /// remains observable debt, but supplies no private-capture capability.
+    /// remains observable debt; nothing revives it with a private fetch.
     pub fn terminally_refused(&self) -> bool {
         self.coverage
             .subscriptions
@@ -348,16 +313,6 @@ impl ReplayEndpointView<'_> {
             .endpoint_deadlines
             .get(self.id)
             .and_then(|relays| relays.get(&self.relay))
-    }
-
-    /// Freeze this source, not an arbitrary account/endpoint/window request.
-    pub fn capture_token(&self) -> ReplayCaptureToken {
-        ReplayCaptureToken {
-            account_id: self.account.clone(),
-            generation: self.coverage.wire_generation,
-            request: Arc::from(self.id),
-            relay: self.relay,
-        }
     }
 }
 

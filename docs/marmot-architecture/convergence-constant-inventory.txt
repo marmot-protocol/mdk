@@ -74,10 +74,9 @@ A14|crates/marmot-app/src/lib.rs|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE
 # A16's backward epoch-gap paging was deleted with the comparison job; the runner's epoch-gap visits (A19) replace it.
 # A17 bounds ordered subscription replay, its deadlines and native input queue.
 A17|crates/transport-nostr-adapter/src/lib.rs|RELAY_REPLAY_PAGE_LIMIT
-A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_MAX_PAGES
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_ITEMS
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_BYTES
-A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_LIMITS
+A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_WAIT_LIMIT
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_OPEN_UNTIL
 A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY
 # A18 parks recovery obligations that cannot progress: scope streaks and the attempt cap.

@@ -4,9 +4,9 @@
 //! other participant run in their own processes. Both relay endpoints share
 //! one store and publish the production NIP-11 document.
 //!
-//! The runner owns recovery with both native backward-paging entry points
-//! disabled. Assertions require positive runner work and wire evidence, exact
-//! visible timelines and bounded holds.
+//! The runner owns recovery; the adapter has no native backward pager.
+//! Assertions require positive runner work and wire evidence, exact visible
+//! timelines and bounded holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -719,9 +719,9 @@ fn labeled(history: &[Vec<HistoryRequestV1>], labels: &BTreeMap<String, String>)
     json!(endpoints.collect::<Vec<_>>())
 }
 
-/// Owner capture and autonomous clamp continuation both use window REQs
-/// without a limit (ReplayWindow::acquisition_scope -> acquisition_filter).
-/// Runner slices and by-id fetches carry limits; live REQs have no `until`.
+/// Native backward paging, deleted in #2660 row 8, issued window REQs without
+/// a limit; a nonzero count means it came back. Runner slices and by-id
+/// fetches carry limits; live REQs have no `until`.
 pub(super) fn native_pages(history: &[Vec<HistoryRequestV1>]) -> Vec<usize> {
     history
         .iter()

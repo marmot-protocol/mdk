@@ -34,11 +34,9 @@ use nostr_sdk::prelude::{
 };
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    GROUP_BATCH_ROUTES, NostrAcquisitionCancellation, NostrNotificationLossFloor,
-    NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
+    GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
     NostrSdkNotification, NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter,
-    RELAY_REPLAY_PAGE_LIMIT, ReplayCaptureOutcome, ReplayCapturePlan, ReplayRestart,
-    SubscriptionAttempt, SubscriptionRouteKind, dispatch_sdk_replay,
+    RELAY_REPLAY_PAGE_LIMIT, SubscriptionAttempt, SubscriptionRouteKind, dispatch_sdk_replay,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -739,195 +737,6 @@ async fn reconnect_storm_at_the_limit_does_not_resend_the_refused_req() {
 // (d) Aborted / failed activation leak (#2262)
 // ---------------------------------------------------------------------------
 
-/// The SDK restores its own REQs after a transport-only reconnect. The adapter
-/// and SDK context remain alive, so their completed initial replay must not let
-/// a clamped newest-first replay escape before its older pages are acquired.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn warm_reconnect_backlog600() {
-    const STORED: usize = 600;
-    const START: u64 = 1_700_000_000;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    let url = fx.limit.url();
-    let group = groups(1, &url).remove(0);
-    let mut activation = fx.activation(std::slice::from_ref(&url), vec![group.clone()]);
-    activation.since = Some(cgka_traits::Timestamp(SINCE));
-    fx.adapter.activate_account(activation).await.unwrap();
-    await_account_eose(&fx).await;
-    let initial = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    assert_eq!(initial.active_now(), live_reqs(1));
-    assert_eq!(initial.total_reqs, live_reqs(1));
-    let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
-    let original_ids = relay
-        .subscriptions()
-        .await
-        .into_keys()
-        .collect::<HashSet<_>>();
-    assert_eq!(original_ids.len(), live_reqs(1));
-
-    // An explicit SDK disconnect prevents its retry loop from racing backlog
-    // publication. Neither the adapter nor the existing REQs are reopened.
-    relay.disconnect();
-    assert!(
-        fx.limit
-            .wait_for(SETTLE_TIMEOUT, |stats| stats.open_connections() == 0)
-            .await,
-        "the SDK transport stays disconnected during publication"
-    );
-    let publisher = Client::default();
-    publisher.add_relay(fx.upstream_url.as_str()).await.unwrap();
-    publisher.connect().await;
-    let keys = Keys::generate();
-    let mut expected = Vec::with_capacity(STORED);
-    let publication_relay = nostr_sdk::prelude::RelayUrl::parse(&fx.upstream_url).unwrap();
-    for index in 0..STORED {
-        // Three events per second, not a saturated 500-event timestamp tie.
-        let timestamp = START + index as u64 / 3;
-        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("offline-{index}"))
-            .tags([Tag::custom("h", [hex::encode(route(0))])])
-            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
-            .finalize(&keys)
-            .unwrap();
-        let published = publisher.send_event(&event).await.unwrap();
-        assert!(
-            published.success.contains_key(&publication_relay),
-            "every offline event must be accepted, not just sent: {:?}",
-            published.failed
-        );
-        expected.push((timestamp, event.id.to_bytes()));
-    }
-    expected.sort_unstable();
-    let offline = fx.limit.stats();
-    assert_eq!(offline.open_connections(), 0);
-    assert_eq!(offline.connections.len(), initial.connections.len());
-    assert_eq!(offline.total_reqs, initial.total_reqs);
-    assert!(
-        relay
-            .subscriptions()
-            .await
-            .into_keys()
-            .collect::<HashSet<_>>()
-            == original_ids,
-        "disconnect retains exactly the SDK's existing subscription ids"
-    );
-    assert!(
-        tokio::time::timeout(QUIET, fx.adapter.receive())
-            .await
-            .is_err(),
-        "the independent publisher cannot deliver through a disconnected transport"
-    );
-
-    relay.connect();
-    assert!(
-        fx.limit
-            .wait_for(SETTLE_TIMEOUT, |stats| {
-                stats.connections.len() > initial.connections.len()
-                    && stats.active_now() >= original_ids.len()
-            })
-            .await,
-        "the same SDK context restores its registered subscriptions"
-    );
-    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
-    for (position, (timestamp, id)) in expected.iter().enumerate() {
-        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
-            .await
-            .unwrap_or_else(|_| {
-                let stats = fx.limit.stats();
-                panic!("offline replay stopped at {position}/{STORED}; forwarder_finished={}; SDK_loss={:?}; REQs={}, active={}, clamped={}",
-                    fx.forwarder.as_ref().is_some_and(JoinHandle::is_finished),
-                    fx.sdk.notification_loss().unwrap().borrow().as_ref(),
-                    stats.total_reqs, stats.active_now(), stats.clamped_filters);
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            delivery.message.timestamp.0, *timestamp,
-            "position {position}"
-        );
-        assert!(
-            delivery.message.id.as_slice() == id,
-            "every offline event arrives once in timestamp/id order at position {position}"
-        );
-        assert!(delivery.account_id == fx.account);
-        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
-        fx.adapter
-            .ack_replay_delivery(&fx.account, &delivery.message.id)
-            .await;
-    }
-    await_account_eose(&fx).await;
-
-    let live_timestamp = START + STORED as u64;
-    let live = EventBuilder::new(Kind::MlsGroupMessage, "live after warm reconnect")
-        .tags([Tag::custom("h", [hex::encode(route(0))])])
-        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(live_timestamp))
-        .finalize(&keys)
-        .unwrap();
-    publisher.send_event(&live).await.unwrap();
-    let delivery = tokio::time::timeout(SETTLE_TIMEOUT, fx.adapter.receive())
-        .await
-        .expect("the next live marker follows all offline history")
-        .unwrap()
-        .unwrap();
-    assert!(delivery.message.id.as_slice() == live.id.to_bytes());
-    assert_eq!(delivery.message.timestamp.0, live_timestamp);
-    assert!(delivery.account_id == fx.account);
-    assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
-    fx.adapter
-        .ack_replay_delivery(&fx.account, &delivery.message.id)
-        .await;
-    assert!(
-        tokio::time::timeout(QUIET, fx.adapter.receive())
-            .await
-            .is_err(),
-        "neither restored raw copies nor backward pages duplicate admission"
-    );
-    {
-        let status = fx.adapter.take_replay_status(&fx.account).await;
-        assert!(
-            !status.pending,
-            "every historical and live delivery was placed"
-        );
-        assert!(
-            status.loss.is_none(),
-            "healthy reconnect has no admission loss"
-        );
-    }
-    let restored = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    assert_eq!(restored.open_connections(), 1);
-    assert_eq!(restored.active_now(), original_ids.len());
-    assert!(
-        relay
-            .subscriptions()
-            .await
-            .into_keys()
-            .collect::<HashSet<_>>()
-            == original_ids,
-        "paging leaves exactly the original physical live subscriptions"
-    );
-    for id in &original_ids {
-        assert_eq!(
-            restored
-                .req_log
-                .iter()
-                .filter(|record| {
-                    record.connection >= initial.connections.len()
-                        && record.subscription_id == id.as_str()
-                })
-                .count(),
-            1,
-            "each original REQ is restored once without adapter reactivation"
-        );
-    }
-    assert_eq!(restored.reqs_with_active_id, 0);
-    assert_eq!(restored.rejections_total(), 0);
-    assert!(
-        restored.total_reqs > initial.total_reqs + original_ids.len(),
-        "the clamped restored replay fetched older history"
-    );
-    assert_eq!(restored.neg_opens, 0, "warm replay does not use NIP-77");
-    publisher.shutdown().await;
-    fx.shutdown().await;
-}
-
 async fn await_account_eose(fx: &Fixture) {
     tokio::time::timeout(SETTLE_TIMEOUT, async {
         while !fx
@@ -1149,344 +958,10 @@ async fn queued_eose_after_reconnect() {
     fx.shutdown().await;
 }
 
-/// Replacing a reader cannot wait for another EOSE on unchanged live REQs.
-/// The owner must grant a refetch of SDK-seen history across the new epoch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reader_loss_refetches_seen() {
-    const STORED: usize = 200;
-    const START: u64 = 1_700_000_000;
-    let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
-    let mut source = fx.sdk.notifications();
-    let url = fx.limit.url();
-    let group = groups(1, &url).remove(0);
-    let keys = Keys::generate();
-    let mut expected = Vec::with_capacity(STORED);
-    for index in 0..STORED {
-        let timestamp = START + index as u64 / 3;
-        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("lost-reader-{index}"))
-            .tags([Tag::custom("h", [hex::encode(route(0))])])
-            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
-            .finalize(&keys)
-            .unwrap();
-        fx.database
-            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-            .await
-            .unwrap();
-        expected.push((timestamp, event.id.to_bytes()));
-    }
-    expected.sort_unstable();
-    let mut activation = fx.activation(std::slice::from_ref(&url), vec![group.clone()]);
-    activation.since = Some(cgka_traits::Timestamp(SINCE));
-    fx.adapter.activate_account(activation).await.unwrap();
-    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
-    let mut eose = 0;
-    let mut cached = HashSet::new();
-    let mut held_eose = Vec::new();
-    let mut held_raw = None;
-    while eose < live_reqs(1) {
-        let update = tokio::time::timeout_at(deadline, source.next())
-            .await
-            .unwrap()
-            .unwrap();
-        let NotificationUpdate::Notification(notification) = update else {
-            panic!("the native reader must receive the small initial range intact");
-        };
-        match notification {
-            boundary @ (NostrSdkNotification::Replay { .. }
-            | NostrSdkNotification::Disconnected { .. }) => {
-                assert!(
-                    !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
-                        .sdk
-                        .subscription_refusal(reason))
-                    .await
-                );
-            }
-            NostrSdkNotification::Payload {
-                notification: ClientNotification::Event { event, .. },
-                ..
-            } => {
-                if event.kind == Kind::MlsGroupMessage {
-                    cached.insert(event.id.to_bytes());
-                }
-            }
-            payload @ NostrSdkNotification::Payload {
-                notification: ClientNotification::Message { .. },
-                ..
-            } => {
-                let NostrSdkNotification::Payload {
-                    notification: ClientNotification::Message { message, .. },
-                    ..
-                } = &payload
-                else {
-                    unreachable!();
-                };
-                match message.as_ref() {
-                    RelayMessage::EndOfStoredEvents(_) => {
-                        eose += 1;
-                        held_eose.push(payload);
-                    }
-                    RelayMessage::Event { event, .. }
-                        if event.id.to_bytes() == expected.last().unwrap().1 =>
-                    {
-                        // Retain real ciphertext for the cutover to discard;
-                        // empty input alone must never manufacture core loss.
-                        assert!(held_raw.is_none());
-                        assert!(
-                            !dispatch_sdk_replay(payload.clone(), &fx.adapter, None, &|reason| fx
-                                .sdk
-                                .subscription_refusal(reason))
-                            .await
-                        );
-                        held_raw = Some(payload);
-                    }
-                    _ => {}
-                }
-            }
-            NostrSdkNotification::Payload { .. } | NostrSdkNotification::Shutdown => {
-                panic!("the real SDK must remain alive through the initial replay");
-            }
-        }
-    }
-    assert!(
-        cached == expected.iter().map(|(_, id)| *id).collect::<HashSet<_>>(),
-        "the SDK saw exactly the history deliberately withheld from the adapter"
-    );
-    let held_raw = held_raw.expect("the newest real raw copy is staged before the gap");
-    let NostrSdkNotification::Payload {
-        epoch: old_epoch, ..
-    } = &held_raw
-    else {
-        unreachable!();
-    };
-    let old_epoch = *old_epoch;
-    let (old_generation, stale_sources, original_floors) = {
-        let status = fx.adapter.take_replay_status(&fx.account).await;
-        assert!(
-            status.pending,
-            "the staged newer copy must wait for the whole range"
-        );
-        assert!(status.loss.is_none());
-        let mut sources = Vec::new();
-        let mut original_floors = BTreeMap::new();
-        for source in status.sources() {
-            assert!(
-                source.since() <= SINCE,
-                "recovery cannot narrow an issued query's floor"
-            );
-            original_floors.insert(source.group_routes().next().copied(), source.since());
-            sources.extend(source.endpoints().map(|endpoint| endpoint.capture_token()));
-        }
-        (status.generation(), sources, original_floors)
-    };
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
-            .await
-            .is_err()
-    );
-    let initial = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
-    let original_ids = relay
-        .subscriptions()
-        .await
-        .into_keys()
-        .collect::<HashSet<_>>();
-    assert_eq!(original_ids.len(), live_reqs(1));
-    for id in &original_ids {
-        assert_eq!(relay.subscription_received_eose(id).await, Some(true));
-    }
-    drop(source);
-
-    let mut source = fx.sdk.notifications();
-    let update = tokio::time::timeout(SETTLE_TIMEOUT, source.next())
-        .await
-        .unwrap()
-        .unwrap();
-    let NotificationUpdate::Notification(boundary) = update else {
-        panic!("reader replacement emits an ordered boundary, not fabricated skipped bytes");
-    };
-    let NostrSdkNotification::Replay {
-        epoch,
-        reason: ReplayRestart::ReceiverLoss,
-        ..
-    } = &boundary
-    else {
-        panic!("reader replacement must fence the old native epoch");
-    };
-    assert!(epoch[0] > old_epoch[0]);
-    assert_eq!(epoch[1], old_epoch[1], "reader loss is not a reconnect");
-    assert!(
-        !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
-            .sdk
-            .subscription_refusal(reason))
-        .await
-    );
-    for stale in std::iter::once(held_raw).chain(held_eose) {
-        assert!(
-            !dispatch_sdk_replay(stale, &fx.adapter, None, &|reason| fx
-                .sdk
-                .subscription_refusal(reason))
-            .await
-        );
-    }
-    let coverage = fx.adapter.account_subscription_eose(&fx.account).await;
-    assert_eq!(coverage.with_eose, 0);
-    assert_eq!(coverage.relay_subscription_attempts_with_eose, 0);
-    assert!(
-        !coverage.complete(),
-        "old raw EOSE cannot certify the replacement epoch"
-    );
-    let credit = Arc::new(
-        Arc::new(tokio::sync::Semaphore::new(1))
-            .acquire_owned()
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        fx.adapter
-            .capture_replay(
-                &fx.account,
-                ReplayCapturePlan {
-                    attempt_serial: 1,
-                    sources: stale_sources,
-                    credit: credit.clone(),
-                },
-                NostrAcquisitionCancellation::new(),
-            )
-            .await
-            .unwrap(),
-        ReplayCaptureOutcome::Stale,
-        "the owner cannot reuse capabilities from before the reader gap"
-    );
-    let sources = {
-        let status = fx.adapter.take_replay_status(&fx.account).await;
-        assert!(status.generation() > old_generation);
-        assert!(
-            matches!(status.loss, Some(NostrNotificationLossFloor::Since(floor)) if floor <= START),
-            "actual discarded ciphertext keeps its original loss floor"
-        );
-        let mut sources = Vec::new();
-        for source in status.sources() {
-            assert_eq!(
-                source.since(),
-                original_floors[&source.group_routes().next().copied()]
-            );
-            for endpoint in source.endpoints() {
-                assert!(!endpoint.admitted());
-                sources.push(endpoint.capture_token());
-            }
-        }
-        assert_eq!(sources.len(), live_reqs(1));
-        sources
-    };
-    let waiting = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    assert_eq!(
-        waiting.total_reqs, initial.total_reqs,
-        "ReceiverLoss and a stale grant cannot start autonomous recovery IO"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
-            .await
-            .is_err(),
-        "neither stale raw copies nor an ungranted fence may release history"
-    );
-    let capture = tokio::spawn({
-        let adapter = fx.adapter.clone();
-        let account = fx.account.clone();
-        async move {
-            adapter
-                .capture_replay(
-                    &account,
-                    ReplayCapturePlan {
-                        attempt_serial: 2,
-                        sources,
-                        credit,
-                    },
-                    NostrAcquisitionCancellation::new(),
-                )
-                .await
-                .unwrap()
-        }
-    });
-    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
-    for (timestamp, id) in expected {
-        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
-            .await
-            .expect(
-                "the owner grant refetches SDK-seen lost history, including older missing copies",
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivery.message.timestamp.0, timestamp);
-        assert!(delivery.message.id.as_slice() == id);
-        assert!(delivery.account_id == fx.account);
-        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
-        fx.adapter
-            .ack_replay_delivery(&fx.account, &delivery.message.id)
-            .await;
-    }
-    assert_eq!(
-        tokio::time::timeout_at(deadline, capture)
-            .await
-            .unwrap()
-            .unwrap(),
-        ReplayCaptureOutcome::Complete
-    );
-    await_account_eose(&fx).await;
-    assert!(
-        tokio::time::timeout(QUIET, fx.adapter.receive())
-            .await
-            .is_err()
-    );
-    {
-        let status = fx.adapter.take_replay_status(&fx.account).await;
-        assert!(!status.pending);
-        assert!(status.sources().all(|source| source.admitted()));
-        assert!(
-            status.loss.is_none(),
-            "capture does not manufacture or re-charge the already imported byte loss"
-        );
-    }
-    assert!(
-        tokio::time::timeout(QUIET, source.next()).await.is_err(),
-        "private capture replies cannot appear as live raw copies or EOSE"
-    );
-    let restored = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    assert_eq!(
-        restored.connections.len(),
-        initial.connections.len(),
-        "no transport reconnect can supply a replacement EOSE"
-    );
-    assert!(
-        relay
-            .subscriptions()
-            .await
-            .into_keys()
-            .collect::<HashSet<_>>()
-            == original_ids
-    );
-    assert_eq!(restored.active_now(), original_ids.len());
-    assert_eq!(restored.total_reqs - initial.total_reqs, live_reqs(1));
-    assert_eq!(restored.reqs_with_active_id, 0);
-    assert!(
-        restored
-            .req_log
-            .iter()
-            .skip(initial.req_log.len())
-            .all(|record| {
-                !original_ids
-                    .iter()
-                    .any(|id| id.as_str() == record.subscription_id)
-            })
-    );
-    for id in &original_ids {
-        assert_eq!(relay.subscription_received_eose(id).await, Some(true));
-    }
-    assert_eq!(restored.neg_opens, 0);
-    fx.shutdown().await;
-}
-
 /// Collect B's real native frames before advancing virtual time: socket timing
 /// cannot decide whether its first consumer-visible Connected boundary is late.
+/// A late full reply admits exactly the range the relay served and proves
+/// nothing more: the recovery runner owes what the clamp withheld.
 async fn sdk_late_replay_proof(stored: usize) {
     const START: u64 = 1_700_000_000;
     let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
@@ -1552,6 +1027,7 @@ async fn sdk_late_replay_proof(stored: usize) {
     let mut held = Vec::new();
     let mut ended = HashSet::new();
     let mut raw_b = 0;
+    let mut served_b = HashSet::new();
     let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     while ended.len() < 2 {
         let update = tokio::time::timeout_at(deadline, source.next())
@@ -1580,7 +1056,10 @@ async fn sdk_late_replay_proof(stored: usize) {
                 RelayMessage::EndOfStoredEvents(subscription) if subscription.as_str() == id => {
                     ended.insert(endpoint.to_owned());
                 }
-                RelayMessage::Event { .. } if endpoint == b => raw_b += 1,
+                RelayMessage::Event { event, .. } if endpoint == b => {
+                    raw_b += 1;
+                    served_b.insert(event.id.to_bytes().to_vec());
+                }
                 _ => {}
             }
         }
@@ -1653,12 +1132,40 @@ async fn sdk_late_replay_proof(stored: usize) {
         let status = fx.adapter.take_replay_status(&fx.account).await;
         loss = status.loss.or(loss);
     }
-    if delivered == expected {
-        await_account_eose(&fx).await;
+    // A full reply may have been clamped: only the range the relay actually
+    // served is admitted, and the recovery runner owes the older remainder.
+    let clamped = stored >= RELAY_REPLAY_PAGE_LIMIT;
+    let served = expected
+        .iter()
+        .filter(|message| served_b.contains(message.id.as_slice()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !delivered.is_empty() && delivered == served {
+        if clamped {
+            assert!(served.len() < expected.len(), "the relay clamped the reply");
+            assert_eq!(loss, None, "the late full reply discarded nothing");
+            assert_eq!(
+                fx.adapter
+                    .subscription_endpoint_eose(&id, &group.endpoints[1])
+                    .await,
+                Some(false),
+                "a full reply never proves its whole window"
+            );
+            assert_eq!(fx.adapter.subscription_synced(&id).await, Some(false));
+            assert!(
+                !fx.adapter
+                    .account_subscription_eose(&fx.account)
+                    .await
+                    .complete(),
+                "the recovery runner owes the history the clamp withheld"
+            );
+        } else {
+            await_account_eose(&fx).await;
+        }
     } else {
         assert!(
             delivered.is_empty(),
-            "late native stored copies cannot release a newer partial range"
+            "late native stored copies cannot release a partial or reordered range"
         );
         assert_eq!(
             loss,
@@ -2951,15 +2458,24 @@ async fn reconciliation_names_why_each_relay_failed() {
 enum OrderedReplay {
     Activation,
     Sync,
-    Maintenance,
 }
 
-/// Multiple newest-first relay pages must become one ascending replay, not
-/// individually sorted pages. Ties exercise the event-id secondary key.
+/// A newest-first relay reply larger than the delivery queue must become one
+/// ascending replay that live input cannot overtake. Ties exercise the
+/// event-id secondary key. The relay does not clamp, so the reply is whole,
+/// but at this size it may have been clamped: it ends delegated, and the
+/// adapter fetches no older pages of its own.
 async fn assert_replay_before_live(mode: OrderedReplay) {
     const STORED: usize = 2_200;
     const START: u64 = 1_700_000_000;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let fx = Fixture::new(
+        LimitConfig {
+            req_limit_clamp: None,
+            ..LimitConfig::default()
+        },
+        false,
+    )
+    .await;
     let keys = Keys::generate();
     let mut expected = Vec::with_capacity(STORED + 1);
     for index in 0..STORED {
@@ -2992,22 +2508,12 @@ async fn assert_replay_before_live(mode: OrderedReplay) {
         ))
         .await
         .unwrap();
-    let maintenance_id = match mode {
-        OrderedReplay::Activation => None,
-        OrderedReplay::Sync => {
-            fx.adapter
-                .sync_account_groups(group_sync(&fx, vec![group.clone()]))
-                .await
-                .unwrap();
-            None
-        }
-        OrderedReplay::Maintenance => Some(
-            fx.adapter
-                .install_group_maintenance_recovery_subscription(&fx.account, &group, 1, None)
-                .await
-                .unwrap(),
-        ),
-    };
+    if matches!(mode, OrderedReplay::Sync) {
+        fx.adapter
+            .sync_account_groups(group_sync(&fx, vec![group.clone()]))
+            .await
+            .unwrap();
+    }
 
     let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     let first = tokio::time::timeout_at(deadline, fx.adapter.receive())
@@ -3061,34 +2567,24 @@ async fn assert_replay_before_live(mode: OrderedReplay) {
             .await;
     }
     tokio::time::timeout_at(deadline, async {
-        loop {
-            let complete = if let Some(id) = &maintenance_id {
-                fx.adapter
-                    .subscription_endpoint_eose(id, &TransportEndpoint(url.clone()))
-                    .await
-                    == Some(true)
-            } else {
-                fx.adapter
-                    .account_subscription_eose(&fx.account)
-                    .await
-                    .complete()
-            };
-            if complete {
-                break;
-            }
+        while fx.adapter.take_replay_status(&fx.account).await.pending {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("coverage completes after the ordered replay is placed");
-    if let Some(id) = &maintenance_id {
-        assert_eq!(fx.adapter.subscription_synced(id).await, Some(true));
-    }
-    let stats = fx.limit.stats();
-    assert!(stats.clamped_filters > 0);
+    .expect("admission settles after the ordered replay is placed");
     assert!(
-        stats.total_reqs >= 6,
-        "multiple backward pages were fetched"
+        !fx.adapter
+            .account_subscription_eose(&fx.account)
+            .await
+            .complete(),
+        "a full reply never certifies coverage"
+    );
+    let stats = fx.limit.stats();
+    assert_eq!(stats.clamped_filters, 0);
+    assert_eq!(
+        stats.total_reqs, 2,
+        "the adapter fetches no older pages of its own"
     );
     assert_eq!(stats.neg_opens, 0, "replay does not require NIP-77");
     assert!(
@@ -3108,11 +2604,6 @@ async fn activation_replay_is_ordered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn synced_replay_is_ordered() {
     assert_replay_before_live(OrderedReplay::Sync).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn maintenance_replay_is_ordered() {
-    assert_replay_before_live(OrderedReplay::Maintenance).await;
 }
 
 /// Drain and place replay until admission has no outstanding work. Silence
@@ -3165,197 +2656,6 @@ async fn store_events_at(database: &MemoryDatabase, timestamps: impl IntoIterato
             .await
             .unwrap();
     }
-}
-
-/// A batch's routes share each 500-event replay page. 50 groups with 15
-/// events each are 750 stored events behind one batch REQ: the relay clamps
-/// the replay, and paging the batch's filter must deliver every group's
-/// history before the batch's EOSE counts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_batch_replay_past_500_events_is_paged_for_every_group() {
-    const PER_GROUP: usize = 15;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    store_events_per_group(&fx.database, GROUP_BATCH_ROUTES, PER_GROUP).await;
-    let url = fx.limit.url();
-    fx.adapter
-        .activate_account(
-            fx.activation(std::slice::from_ref(&url), groups(GROUP_BATCH_ROUTES, &url)),
-        )
-        .await
-        .unwrap();
-    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
-    let complete = fx
-        .adapter
-        .account_subscription_eose(&fx.account)
-        .await
-        .complete();
-    let stats = fx.limit.stats();
-    eprintln!(
-        "[h] batch delivered={delivered} complete={complete} {}",
-        stats.summary()
-    );
-    assert_eq!(stats.active_now(), live_reqs(GROUP_BATCH_ROUTES));
-    assert_eq!(delivered, GROUP_BATCH_ROUTES * PER_GROUP);
-    assert!(complete, "the paged batch counts as coverage");
-    fx.shutdown().await;
-}
-
-/// Store `per_group` kind-445 events for each of the first `groups` routes.
-async fn store_events_per_group(database: &MemoryDatabase, groups: usize, per_group: usize) {
-    let keys = Keys::generate();
-    for group in 0..groups {
-        for index in 0..per_group {
-            let event =
-                EventBuilder::new(Kind::MlsGroupMessage, format!("batched-{group}-{index}"))
-                    .tags([Tag::custom("h", [hex::encode(route(group))])])
-                    .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
-                        1_700_000_000 + (group * per_group + index) as u64,
-                    ))
-                    .finalize(&keys)
-                    .unwrap();
-            database
-                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-                .await
-                .unwrap();
-        }
-    }
-}
-
-/// One live batch holds more than the aggregate admission budget, although
-/// each group's complete history fits. Release one ordered group at a time
-/// instead of accumulating the whole batch before admitting any history.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batch_replay_over_buffer() {
-    const GROUPS: usize = 6;
-    const PER_GROUP: usize = 600;
-    const CONTENT_BYTES: usize = 10 * 1024;
-    const BUFFER_BYTES: usize = 32 * 1024 * 1024;
-    const START: u64 = 1_700_000_000;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    let keys = Keys::generate();
-    let padding = "x".repeat(CONTENT_BYTES - 8);
-    let mut expected = Vec::with_capacity(GROUPS);
-    for group in 0..GROUPS {
-        let mut history = Vec::with_capacity(PER_GROUP);
-        for index in 0..PER_GROUP {
-            // Three tied events per group, eighteen across the batch: well
-            // below the 500-event same-second saturation boundary.
-            let timestamp = START + index as u64 / 3;
-            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("{index:08}{padding}"))
-                .tags([Tag::custom("h", [hex::encode(route(group))])])
-                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
-                .finalize(&keys)
-                .unwrap();
-            history.push((timestamp, event.id.to_bytes()));
-            fx.database
-                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-                .await
-                .unwrap();
-        }
-        history.sort_unstable();
-        expected.push(history);
-    }
-    let url = fx.limit.url();
-    let subscriptions = groups(GROUPS, &url);
-    let mut activation = fx.activation(std::slice::from_ref(&url), subscriptions.clone());
-    activation.since = Some(cgka_traits::Timestamp(SINCE));
-    fx.adapter.activate_account(activation).await.unwrap();
-
-    // Each group waits for its predecessor to drain before its paging starts.
-    // Bound lack of group progress, rather than charging all groups one window.
-    let mut deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
-    let mut positions = [0; GROUPS];
-    let mut payload_bytes = [0; GROUPS];
-    for received in 0..GROUPS * PER_GROUP {
-        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
-            .await
-            .unwrap_or_else(|_| {
-                let stats = fx.limit.stats();
-                panic!("co-batched replay stopped at {received}, positions={positions:?}; forwarder_finished={}; SDK_loss={:?}; REQs={}, active={}, clamped={}",
-                    fx.forwarder.as_ref().is_some_and(JoinHandle::is_finished),
-                    fx.sdk.notification_loss().unwrap().borrow().as_ref(),
-                    stats.total_reqs, stats.active_now(), stats.clamped_filters);
-            })
-            .unwrap()
-            .unwrap();
-        assert!(delivery.account_id == fx.account);
-        let group = subscriptions
-            .iter()
-            .position(|group| delivery.group_id_hint.as_ref() == Some(&group.group_id))
-            .expect("delivery belongs to a subscribed MLS group");
-        let position = positions[group];
-        let (timestamp, id) = expected[group]
-            .get(position)
-            .expect("no group delivers more than its stored history");
-        assert_eq!(delivery.message.timestamp.0, *timestamp);
-        assert!(
-            delivery.message.id.as_slice() == id,
-            "every event arrives exactly once in timestamp/id order within its group"
-        );
-        positions[group] += 1;
-        payload_bytes[group] += delivery.message.payload.len();
-        fx.adapter
-            .ack_replay_delivery(&fx.account, &delivery.message.id)
-            .await;
-        if positions[group] == PER_GROUP {
-            deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
-        }
-    }
-    assert!(positions.into_iter().all(|count| count == PER_GROUP));
-    assert!(payload_bytes.iter().all(|bytes| *bytes < BUFFER_BYTES));
-    assert!(payload_bytes.iter().sum::<usize>() > BUFFER_BYTES);
-    tokio::time::timeout_at(deadline, async {
-        loop {
-            if fx
-                .adapter
-                .account_subscription_eose(&fx.account)
-                .await
-                .complete()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("every route's history completes after placement");
-    {
-        let status = fx.adapter.take_replay_status(&fx.account).await;
-        assert!(!status.pending, "all received history was placed");
-        assert!(
-            status.loss.is_none(),
-            "batch size creates no admission loss"
-        );
-    }
-    assert!(
-        tokio::time::timeout(QUIET, fx.adapter.receive())
-            .await
-            .is_err(),
-        "no duplicate history remains after every expected event"
-    );
-
-    // The shared initial page reaches second 172. Each route's inclusive
-    // backward window therefore holds 519 events: one full page and a short
-    // final page, while only the inbox and one GroupBatch stay live.
-    flush_client_frames(&fx).await;
-    let stats = fx.limit.stats();
-    assert_eq!(stats.total_reqs, live_reqs(GROUPS) + 2 * GROUPS);
-    assert_eq!(stats.distinct_req_ids(), stats.total_reqs);
-    assert_eq!(stats.active_now(), live_reqs(GROUPS));
-    assert_eq!(stats.closes, 2 * GROUPS);
-    assert_eq!(stats.max_tag_values_seen, GROUPS);
-    assert_eq!(stats.clamped_filters, stats.total_reqs);
-    assert_eq!(stats.rejections_total(), 0);
-    assert_eq!(stats.reqs_with_active_id, 0);
-    assert_eq!(stats.neg_opens, 0, "replay does not require NIP-77");
-    assert!(
-        stats
-            .req_log
-            .iter()
-            .all(|request| { request.filters == 1 && request.outcome == ReqOutcome::Accepted })
-    );
-    assert_filter_shapes(&stats);
-    fx.shutdown().await;
 }
 
 fn group_sync(fx: &Fixture, groups: Vec<TransportGroupSubscription>) -> TransportGroupSync {
@@ -3484,151 +2784,6 @@ async fn a_group_sync_resends_only_the_changed_family() {
     fx.shutdown().await;
 }
 
-/// A group sync's batches are paged like an activation's: 50 groups added by
-/// one sync, with 750 stored events behind their shared batch REQ, all
-/// arrive and their replay counts as coverage.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_synced_batch_replay_past_500_events_is_paged_for_every_group() {
-    const PER_GROUP: usize = 15;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    store_events_per_group(&fx.database, GROUP_BATCH_ROUTES, PER_GROUP).await;
-    let url = fx.limit.url();
-    fx.adapter
-        .activate_account(fx.activation(std::slice::from_ref(&url), Vec::new()))
-        .await
-        .unwrap();
-    fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    fx.adapter
-        .sync_account_groups(group_sync(&fx, groups(GROUP_BATCH_ROUTES, &url)))
-        .await
-        .unwrap();
-    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
-    let complete = fx
-        .adapter
-        .account_subscription_eose(&fx.account)
-        .await
-        .complete();
-    eprintln!(
-        "[h] synced batch delivered={delivered} complete={complete} {}",
-        fx.limit.stats().summary()
-    );
-    assert_eq!(delivered, GROUP_BATCH_ROUTES * PER_GROUP);
-    assert!(complete, "the paged synced batch counts as coverage");
-    fx.shutdown().await;
-}
-
-/// A batch's routes share each page, so a full page can be one second of
-/// several routes' history: 50 groups with 10 events each in the newest
-/// second fill it, and paging the batch cannot move past that second. Each
-/// route then pages on its own, as it would unbatched, and the older history
-/// behind that second still arrives.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_batch_page_saturated_by_one_second_is_paged_per_route() {
-    const NEWEST: usize = 10;
-    const OLDER: usize = 5;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    let keys = Keys::generate();
-    for group in 0..GROUP_BATCH_ROUTES {
-        for index in 0..NEWEST + OLDER {
-            let created_at = if index < NEWEST {
-                1_700_100_000
-            } else {
-                1_700_000_000 + (group * OLDER + index) as u64
-            };
-            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("second-{group}-{index}"))
-                .tags([Tag::custom("h", [hex::encode(route(group))])])
-                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
-                .finalize(&keys)
-                .unwrap();
-            fx.database
-                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-                .await
-                .unwrap();
-        }
-    }
-    let url = fx.limit.url();
-    fx.adapter
-        .activate_account(
-            fx.activation(std::slice::from_ref(&url), groups(GROUP_BATCH_ROUTES, &url)),
-        )
-        .await
-        .unwrap();
-    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
-    let complete = fx
-        .adapter
-        .account_subscription_eose(&fx.account)
-        .await
-        .complete();
-    eprintln!(
-        "[h] saturated batch delivered={delivered} complete={complete} {}",
-        fx.limit.stats().summary()
-    );
-    assert_eq!(delivered, GROUP_BATCH_ROUTES * (NEWEST + OLDER));
-    assert!(complete, "every route's own paging completed");
-    fx.shutdown().await;
-}
-
-/// One route that saturates a second on its own keeps the batch
-/// incomplete, but never keeps the batch's other routes from paging their
-/// older history. Route 0 sorts first and holds 500 events in the newest
-/// second; every other route's history still arrives.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_route_that_saturates_alone_does_not_stop_the_others_paging() {
-    const NEWEST: usize = 10;
-    const OLDER: usize = 5;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    let keys = Keys::generate();
-    let mut stored = 0;
-    for group in 0..GROUP_BATCH_ROUTES {
-        let (newest, older) = if group == 0 {
-            (RELAY_REPLAY_PAGE_LIMIT, 0)
-        } else {
-            (NEWEST, OLDER)
-        };
-        for index in 0..newest + older {
-            let created_at = if index < newest {
-                1_700_100_000
-            } else {
-                1_700_000_000 + (group * OLDER + index) as u64
-            };
-            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("alone-{group}-{index}"))
-                .tags([Tag::custom("h", [hex::encode(route(group))])])
-                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
-                .finalize(&keys)
-                .unwrap();
-            fx.database
-                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-                .await
-                .unwrap();
-            stored += 1;
-        }
-    }
-    let url = fx.limit.url();
-    fx.adapter
-        .activate_account(
-            fx.activation(std::slice::from_ref(&url), groups(GROUP_BATCH_ROUTES, &url)),
-        )
-        .await
-        .unwrap();
-    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
-    let complete = fx
-        .adapter
-        .account_subscription_eose(&fx.account)
-        .await
-        .complete();
-    eprintln!(
-        "[h] one saturated route delivered={delivered}/{stored} complete={complete} {}",
-        fx.limit.stats().summary()
-    );
-    assert_eq!(
-        delivered,
-        stored - RELAY_REPLAY_PAGE_LIMIT,
-        "complete routes deliver, but the saturated route withholds its partial replay"
-    );
-    assert!(!complete, "the saturated route keeps the batch incomplete");
-    fx.shutdown().await;
-}
-
 /// Groups joined one sync at a time stay packed: 199 joins on top of an
 /// inbox hold the same few REQs one activation of 199 groups would, far
 /// from the relay's limit. Each repack briefly holds both packings.
@@ -3703,14 +2858,6 @@ async fn a_group_left_and_joined_again_gets_what_was_published_meanwhile() {
 
 /// Replay one group route over `stored` events and report what arrived.
 async fn replay_one_group(stored: usize, clamp: Option<u64>) -> (usize, bool, LimitStats) {
-    replay_one_group_at((0..stored as u64).map(|index| 1_700_000_000 + index), clamp).await
-}
-
-/// Replay one group route over events stored at `timestamps`.
-async fn replay_one_group_at(
-    timestamps: impl IntoIterator<Item = u64>,
-    clamp: Option<u64>,
-) -> (usize, bool, LimitStats) {
     let fx = Fixture::new(
         LimitConfig {
             req_limit_clamp: clamp,
@@ -3719,9 +2866,11 @@ async fn replay_one_group_at(
         false,
     )
     .await;
-    let timestamps = timestamps.into_iter().collect::<Vec<_>>();
-    let stored = timestamps.len();
-    store_events_at(&fx.database, timestamps).await;
+    store_events_at(
+        &fx.database,
+        (0..stored as u64).map(|index| 1_700_000_000 + index),
+    )
+    .await;
     let url = fx.limit.url();
     fx.adapter
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
@@ -3742,101 +2891,10 @@ async fn replay_one_group_at(
     (delivered, complete, stats)
 }
 
-/// A live group REQ carries no `limit`, so strfry serves at most 500 stored
-/// events (newest first) and then EOSE. The adapter must page the rest of the
-/// window backwards before that relay's EOSE counts as coverage, instead of
-/// reporting complete with the older history silently missing.
+/// A replay that stays under a full page is complete as delivered and issues
+/// no REQ beyond the live ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stored_replay_beyond_500_is_paged_before_counting_complete() {
-    const STORED: usize = 1_200;
-    for clamp in [None, Some(limit_relay::REQ_LIMIT_CLAMP)] {
-        let (delivered, complete, stats) = replay_one_group(STORED, clamp).await;
-        assert_eq!(
-            delivered, STORED,
-            "clamp={clamp:?}: every stored event arrives"
-        );
-        assert!(complete, "clamp={clamp:?}: coverage completes once paged");
-        if clamp.is_some() {
-            assert!(stats.clamped_filters >= 1);
-            // The live inbox and group REQs, plus at least two backward pages.
-            assert!(stats.total_reqs >= 4, "paged: {}", stats.summary());
-        }
-    }
-}
-
-/// More than a page of events sharing one second saturates the inclusive
-/// `until` bound: the backward page cannot move past that second, so the rest
-/// of it and everything older stay unfetched. Coverage must stay incomplete
-/// rather than count that relay's EOSE, and the newer partial history must
-/// remain withheld rather than advancing a ratchet past inaccessible history.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn saturated_boundary_second_keeps_replay_incomplete() {
-    const BOUNDARY: u64 = 1_700_100_000;
-    let older = (0..100).map(|index| BOUNDARY - 1_000 + index);
-    let boundary = std::iter::repeat_n(BOUNDARY, 600);
-    let (delivered, complete, _) =
-        replay_one_group_at(older.chain(boundary), Some(limit_relay::REQ_LIMIT_CLAMP)).await;
-    assert_eq!(
-        delivered, 0,
-        "an incomplete replay cannot release its newer tail"
-    );
-    assert!(!complete, "a saturated boundary must not count as coverage");
-}
-
-/// A stored event that does not map to a transport message (here a kind-445
-/// with an extra tag) is skipped by the live replay. A backward page holding
-/// one must skip it too and keep paging, or the relay would stay in paging and
-/// the cursor would never promote.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unmappable_event_on_a_backward_page_does_not_wedge_paging() {
-    const VALID: usize = 600;
-    let fx = Fixture::new(
-        LimitConfig {
-            req_limit_clamp: Some(limit_relay::REQ_LIMIT_CLAMP),
-            ..LimitConfig::default()
-        },
-        false,
-    )
-    .await;
-    store_events_at(
-        &fx.database,
-        (0..VALID as u64).map(|index| 1_700_000_000 + index),
-    )
-    .await;
-    // Older than the live replay's newest 500, so it lands on the first page.
-    let keys = Keys::generate();
-    let unmappable = EventBuilder::new(Kind::MlsGroupMessage, "extra-tagged")
-        .tags([
-            Tag::custom("h", [hex::encode(route(0))]),
-            Tag::custom("x", ["unexpected"]),
-        ])
-        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(1_700_000_010))
-        .finalize(&keys)
-        .unwrap();
-    fx.database
-        .save_event(&serde_json::from_str(unmappable.as_json().as_str()).unwrap())
-        .await
-        .unwrap();
-    let url = fx.limit.url();
-    fx.adapter
-        .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
-        .await
-        .unwrap();
-    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
-    let complete = fx
-        .adapter
-        .account_subscription_eose(&fx.account)
-        .await
-        .complete();
-    fx.shutdown().await;
-    assert_eq!(delivered, VALID, "every valid event arrives");
-    assert!(complete, "the unmappable event does not wedge paging");
-}
-
-/// A replay that stays under a full page is complete as delivered and opens
-/// no backward page.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stored_replay_under_a_page_is_not_paged() {
+async fn stored_replay_under_a_page_is_complete() {
     const STORED: usize = 499;
     let (delivered, complete, stats) =
         replay_one_group(STORED, Some(limit_relay::REQ_LIMIT_CLAMP)).await;

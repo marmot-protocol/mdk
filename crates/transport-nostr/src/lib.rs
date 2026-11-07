@@ -36,8 +36,8 @@ use transport_nostr_adapter::{
 };
 
 pub use transport_nostr_adapter::{
-    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, ReplayAdmissionStatus, ReplayCaptureOutcome,
-    ReplayCapturePlan, ReplayFence, ReplayFencePlan, ReplayFenceTicket,
+    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, ReplayAdmissionStatus, ReplayFence, ReplayFencePlan,
+    ReplayFenceTicket,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -3870,21 +3870,6 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
-    /// Execute only the immutable source batch authorized by the account owner.
-    #[doc(hidden)]
-    pub async fn capture_replay(
-        &self,
-        plan: ReplayCapturePlan,
-        cancellation: NostrAcquisitionCancellation,
-    ) -> Result<ReplayCaptureOutcome, TransportAdapterError> {
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .capture_replay(&self.account_id, plan, cancellation)
-            .await
-    }
-
     /// Hold this account's groups' live frames behind the owner's fences from
     /// now on (mdk#2660). Call it before activation, so the first counts are
     /// held too.
@@ -3896,19 +3881,6 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .enable_replay_fencing(&self.account_id)
             .await;
-    }
-
-    /// Install ledger-owned recovery before this account activates. The
-    /// adapter continues subscription ingress but starts neither native
-    /// backward-paging entry point for the account.
-    #[doc(hidden)]
-    pub async fn delegate_replay_recovery(&self) -> Result<(), TransportAdapterError> {
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .delegate_replay_recovery(&self.account_id)
-            .await
     }
 
     /// Apply the owner's fences on this account's groups' live frames, as of
