@@ -321,3 +321,226 @@ impl From<KeyPackageLifecycleState> for KeyPackageMaintenanceStatusFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::{
+        GroupId, GroupMaintenanceState, MessageId, Timestamp, TransportEndpoint, TransportEnvelope,
+        TransportFanoutTarget, TransportMessage, TransportPublishTarget, TransportSource,
+    };
+
+    #[test]
+    fn maintenance_and_evolution_states_keep_their_host_choices() {
+        for (native, expected) in [
+            (MaintenancePhase::CatchUp, MaintenancePhaseFfi::CatchUp),
+            (
+                MaintenancePhase::EoseTimeout,
+                MaintenancePhaseFfi::EoseTimeout,
+            ),
+            (MaintenancePhase::Grace, MaintenancePhaseFfi::Grace),
+            (MaintenancePhase::Quiet, MaintenancePhaseFfi::Quiet),
+            (MaintenancePhase::Jitter, MaintenancePhaseFfi::Jitter),
+            (MaintenancePhase::Overdue, MaintenancePhaseFfi::Overdue),
+            (MaintenancePhase::Paused, MaintenancePhaseFfi::Paused),
+            (
+                MaintenancePhase::ClockSkewBlocked,
+                MaintenancePhaseFfi::ClockSkewBlocked,
+            ),
+            (
+                MaintenancePhase::PendingPublication,
+                MaintenancePhaseFfi::PendingPublication,
+            ),
+            (MaintenancePhase::Fanout, MaintenancePhaseFfi::Fanout),
+            (MaintenancePhase::Retry, MaintenancePhaseFfi::Retry),
+            (
+                MaintenancePhase::SupersededByConvergence,
+                MaintenancePhaseFfi::SupersededByConvergence,
+            ),
+            (MaintenancePhase::Complete, MaintenancePhaseFfi::Complete),
+            (MaintenancePhase::Failed, MaintenancePhaseFfi::Failed),
+        ] {
+            assert_eq!(MaintenancePhaseFfi::from(native), expected);
+        }
+        for (native, expected) in [
+            (
+                MaintenanceTrigger::PostJoin,
+                MaintenanceTriggerFfi::PostJoin,
+            ),
+            (
+                MaintenanceTrigger::Periodic,
+                MaintenanceTriggerFfi::Periodic,
+            ),
+            (MaintenanceTrigger::Manual, MaintenanceTriggerFfi::Manual),
+        ] {
+            assert_eq!(MaintenanceTriggerFfi::from(native), expected);
+        }
+        for (native, expected) in [
+            (
+                GroupEvolutionPhase::Preparing,
+                GroupEvolutionPhaseFfi::Preparing,
+            ),
+            (
+                GroupEvolutionPhase::Prepared,
+                GroupEvolutionPhaseFfi::Prepared,
+            ),
+            (
+                GroupEvolutionPhase::Attempting,
+                GroupEvolutionPhaseFfi::Attempting,
+            ),
+            (
+                GroupEvolutionPhase::Confirmed,
+                GroupEvolutionPhaseFfi::Confirmed,
+            ),
+            (
+                GroupEvolutionPhase::SupersededByConvergence,
+                GroupEvolutionPhaseFfi::SupersededByConvergence,
+            ),
+        ] {
+            assert_eq!(GroupEvolutionPhaseFfi::from(native), expected);
+        }
+    }
+
+    #[test]
+    fn periodic_policy_preserves_both_host_and_native_choices() {
+        assert_eq!(
+            PeriodicMaintenancePolicyFfi::from(PeriodicMaintenancePolicy::EnabledForNewGroups),
+            PeriodicMaintenancePolicyFfi::EnabledForNewGroups
+        );
+        assert_eq!(
+            PeriodicMaintenancePolicyFfi::from(PeriodicMaintenancePolicy::Disabled),
+            PeriodicMaintenancePolicyFfi::Disabled
+        );
+        assert_eq!(
+            PeriodicMaintenancePolicy::from(PeriodicMaintenancePolicyFfi::EnabledForNewGroups),
+            PeriodicMaintenancePolicy::EnabledForNewGroups
+        );
+        assert_eq!(
+            PeriodicMaintenancePolicy::from(PeriodicMaintenancePolicyFfi::Disabled),
+            PeriodicMaintenancePolicy::Disabled
+        );
+    }
+
+    fn fanout_targets() -> Vec<TransportFanoutTarget> {
+        let states = [
+            TransportFanoutAttemptState::Accepted,
+            TransportFanoutAttemptState::Unattempted,
+            TransportFanoutAttemptState::Unattempted,
+            TransportFanoutAttemptState::AttemptedFailed,
+            TransportFanoutAttemptState::AttemptedFailed,
+            TransportFanoutAttemptState::AttemptedFailed,
+            TransportFanoutAttemptState::PolicyProhibited,
+            TransportFanoutAttemptState::PolicyProhibited,
+            TransportFanoutAttemptState::PolicyProhibited,
+            TransportFanoutAttemptState::PolicyProhibited,
+        ];
+        states
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| {
+                let attempted = matches!(
+                    state,
+                    TransportFanoutAttemptState::Accepted
+                        | TransportFanoutAttemptState::AttemptedFailed
+                );
+                TransportFanoutTarget {
+                    endpoint: TransportEndpoint(format!("wss://endpoint-{index}.example")),
+                    state,
+                    attempt_count: u32::from(attempted),
+                    last_attempt_at: attempted.then_some(Timestamp(13)),
+                    failure_code: (state == TransportFanoutAttemptState::AttemptedFailed)
+                        .then(|| "transport_closed".into()),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fanout_counts_classify_each_target_instead_of_counting_the_total() {
+        let targets = fanout_targets();
+        let group = GroupId::new(vec![0xab; 16]);
+        let endpoints = targets
+            .iter()
+            .map(|target| target.endpoint.clone())
+            .collect();
+        // Status conversion is transport-neutral; this payload is never signed,
+        // sent or interpreted, and supplies none of the expected target counts.
+        let fanout = DurableTransportFanout {
+            id: MessageId::new(vec![0x19; 32]),
+            group_id: Some(group.clone()),
+            evolution_id: None,
+            exact_message: TransportMessage {
+                id: MessageId::new(vec![0x19; 32]),
+                payload: vec![],
+                timestamp: Timestamp(11),
+                causal_deps: vec![],
+                source: TransportSource("status-fixture".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![0xcd; 32],
+                },
+            },
+            target: TransportPublishTarget::Group {
+                group_id: group,
+                transport_group_id: vec![0xcd; 32],
+                endpoints,
+            },
+            targets,
+            required_acks: 2,
+            evolution_confirmed: false,
+            possible_exposure: true,
+            created_at: Timestamp(11),
+            bounded_until: Some(Timestamp(71)),
+        };
+        let value = TransportFanoutStatusFfi::from(fanout);
+        assert_eq!(
+            (
+                value.accepted,
+                value.unattempted,
+                value.attempted_failed,
+                value.policy_prohibited
+            ),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(value.required_acks, 2);
+        assert!(!value.evolution_confirmed);
+        assert_eq!(value.bounded_until, Some(71));
+    }
+
+    #[test]
+    fn group_status_distinguishes_no_enrollment_from_recorded_rotation_times() {
+        let group = GroupId::new(vec![0xab; 16]);
+        for (state, expected) in [
+            (None, (None, false, None, None)),
+            (
+                Some(GroupMaintenanceState {
+                    group_id: group.clone(),
+                    enrolled_at: Some(Timestamp(11)),
+                    periodic_enrolled: true,
+                    last_own_leaf_rotation_at: Some(Timestamp(23)),
+                    next_periodic_rotation_at: Some(Timestamp(47)),
+                    leaf_refresh_due_at: None,
+                    post_join_history: None,
+                }),
+                (Some(11), true, Some(23), Some(47)),
+            ),
+        ] {
+            let value = GroupMaintenanceStatusFfi::from(GroupMaintenanceStatus {
+                group_id: group.clone(),
+                state,
+                obligations: vec![],
+                evolutions: vec![],
+                fanouts: vec![],
+                paused: false,
+            });
+            assert_eq!(
+                (
+                    value.enrolled_at,
+                    value.periodic_enrolled,
+                    value.last_own_leaf_rotation_at,
+                    value.next_periodic_rotation_at
+                ),
+                expected
+            );
+        }
+    }
+}

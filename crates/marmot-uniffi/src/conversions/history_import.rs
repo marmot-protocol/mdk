@@ -101,3 +101,76 @@ impl From<marmot_app::HistoryImportProvenance> for HistoryImportProvenanceFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiving_and_imported_history_preserve_their_distinct_contexts() {
+        for retrying in [false, true] {
+            let value = ChatHistoryImportFfi::from(ChatHistoryImport {
+                group_id_hex: "ab".repeat(16),
+                state: ChatHistoryImportState::Receiving { retrying },
+            });
+            assert_eq!(value.group_id_hex, "ab".repeat(16));
+            assert_eq!(
+                value.state,
+                ChatHistoryImportStateFfi::Receiving { retrying }
+            );
+        }
+        let value = ChatHistoryImportFfi::from(ChatHistoryImport {
+            group_id_hex: "cd".repeat(16),
+            state: ChatHistoryImportState::Imported {
+                from: HistoryImportSource {
+                    device_slot_id_hex: "11".repeat(32),
+                    device_label: "Desk device".into(),
+                },
+                at: 71,
+            },
+        });
+        assert_eq!(value.group_id_hex, "cd".repeat(16));
+        assert_eq!(
+            value.state,
+            ChatHistoryImportStateFfi::Imported {
+                from: HistoryImportSourceFfi {
+                    device_slot_id_hex: "11".repeat(32),
+                    device_label: "Desk device".into()
+                },
+                at: 71,
+            }
+        );
+    }
+
+    #[test]
+    fn backup_history_keeps_archive_identity_instead_of_inventing_a_device_source() {
+        let device = HistoryImportProvenanceFfi::from(marmot_app::HistoryImportProvenance::Device(
+            [0x12; 32],
+        ));
+        assert_eq!(
+            device,
+            HistoryImportProvenanceFfi::Device {
+                device_slot_id_hex: "12".repeat(32)
+            }
+        );
+        let backup = HistoryImportProvenanceFfi::from(marmot_app::HistoryImportProvenance::Backup(
+            marmot_app::BackupHistorySource {
+                recovery_public_key: [0x23; 32],
+                backup_id: [0x45; 16],
+                head_sha256: [0x67; 32],
+                written_at: 89,
+            },
+        ));
+        assert_eq!(
+            backup,
+            HistoryImportProvenanceFfi::Backup {
+                source: BackupHistorySourceFfi {
+                    recovery_public_key_hex: "23".repeat(32),
+                    backup_id_hex: "45".repeat(16),
+                    head_sha256_hex: "67".repeat(32),
+                    written_at: 89,
+                }
+            }
+        );
+    }
+}

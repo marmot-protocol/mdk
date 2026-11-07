@@ -99,3 +99,42 @@ impl From<AccountRecoveryStatus> for AccountRecoveryStatusFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn produced_recovery_notice_causes_remain_distinct_at_the_host_boundary() {
+        // Current recovery producers include UnprovenHistory. KnownEvent and
+        // MaintenanceBoundary remain reserved policy cases, not live-journey proof.
+        for (native, expected) in [
+            (
+                HistoryNoticeCause::DeliveryLoss,
+                HistoryNoticeCauseFfi::DeliveryLoss,
+            ),
+            (
+                HistoryNoticeCause::NotificationLoss,
+                HistoryNoticeCauseFfi::NotificationLoss,
+            ),
+            (
+                HistoryNoticeCause::EpochGap,
+                HistoryNoticeCauseFfi::EpochGap,
+            ),
+            (
+                HistoryNoticeCause::IncrementalHistory,
+                HistoryNoticeCauseFfi::IncrementalHistory,
+            ),
+            (
+                HistoryNoticeCause::ExplicitRepair,
+                HistoryNoticeCauseFfi::ExplicitRepair,
+            ),
+            (
+                HistoryNoticeCause::UnprovenHistory,
+                HistoryNoticeCauseFfi::UnprovenHistory,
+            ),
+        ] {
+            assert_eq!(HistoryNoticeCauseFfi::from(native), expected);
+        }
+    }
+}
