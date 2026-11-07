@@ -15058,8 +15058,8 @@ fn slash_account_setup_adopts_the_returned_identity_and_signing_state() {
         let recorded = std::fs::read_to_string(args).unwrap();
         let mut expected = vec!["--json".to_owned()];
         expected.extend(command);
-        assert_eq!(recorded.lines().collect::<Vec<_>>(), expected);
         assert!(!recorded.contains(&nsec), "the secret is never an argument");
+        assert_eq!(recorded.lines().collect::<Vec<_>>(), expected);
         if action == "logged in identity" {
             assert!(
                 std::fs::read_to_string(stdin).unwrap() == format!("{nsec}\n"),
