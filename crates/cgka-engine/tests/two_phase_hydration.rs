@@ -21,9 +21,9 @@ use cgka_traits::engine::{
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::Group;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{GroupStorage, StorageProvider};
+use cgka_traits::storage::{GroupStorage, MessageStorage, StorageError, StorageProvider};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -171,8 +171,15 @@ async fn create_confirmed_group(
     engine: &mut Engine<SqliteAccountStorage>,
     with_route: bool,
 ) -> GroupId {
-    let app_components = if with_route {
-        let routing = NostrRoutingV1::new(ROUTE_BYTES, vec!["wss://relay.example".into()])
+    create_confirmed_group_with_route(engine, with_route.then_some(ROUTE_BYTES)).await
+}
+
+async fn create_confirmed_group_with_route(
+    engine: &mut Engine<SqliteAccountStorage>,
+    route: Option<[u8; 32]>,
+) -> GroupId {
+    let app_components = if let Some(route) = route {
+        let routing = NostrRoutingV1::new(route, vec!["wss://relay.example".into()])
             .expect("routing component");
         vec![AppComponentData {
             component_id: NOSTR_ROUTING_COMPONENT_ID,
@@ -528,6 +535,210 @@ async fn ingest_backfills_route_for_record_predating_route_table() {
         "backfill must repopulate the durable route table"
     );
     assert!(reopened.members(&group_id).is_ok());
+}
+
+#[tokio::test]
+async fn unknown_route_backfill_probes_at_most_four_pending_groups() {
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
+    let mut initial = build_routed_engine(storage.clone());
+    let routes = [[0x41; 32], [0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+    let mut expected = Vec::new();
+    let mut before_groups = Vec::new();
+    for route in routes {
+        let group_id = create_confirmed_group_with_route(&mut initial, Some(route)).await;
+        before_groups.push(storage.get_group(&group_id).unwrap());
+        expected.push((route.to_vec(), group_id));
+    }
+    assert_eq!(route_pairs(&storage), expected);
+    let expected_ids: std::collections::HashSet<_> =
+        expected.iter().map(|(_, id)| id.clone()).collect();
+    assert_eq!(expected_ids.len(), 5, "five independent native groups");
+    for (_, group_id) in &expected {
+        storage
+            .delete_transport_group_routes_for_group(group_id)
+            .unwrap();
+    }
+    drop(initial);
+    assert!(route_pairs(&storage).is_empty());
+
+    let mut reopened = build_routed_engine(storage.clone());
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    assert_eq!(
+        reopened
+            .unhydrated_group_ids()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        expected_ids
+    );
+    for (id, expected_count) in [
+        (b"bounded-backfill-first".as_slice(), 4),
+        (b"bounded-backfill-second".as_slice(), 5),
+    ] {
+        let msg = inbound([0xee; 32], id);
+        assert!(matches!(
+            reopened.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup
+            }
+        ));
+        assert!(reopened.last_ingest_left_object_unpersisted());
+        assert!(matches!(
+            storage.get_message(&msg.id),
+            Err(StorageError::NotFound)
+        ));
+        assert!(!storage.has_ingress_dedup_marker(&msg.id).unwrap());
+        let indexed = route_pairs(&storage);
+        assert_eq!(
+            indexed.len(),
+            expected_count,
+            "one miss may probe only four groups"
+        );
+        assert!(indexed.iter().all(|pair| expected.contains(pair)));
+        if expected_count == 5 {
+            assert_eq!(indexed, expected);
+        }
+        assert_eq!(
+            reopened
+                .unhydrated_group_ids()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            expected_ids,
+            "backfill probes do not fully hydrate unrelated groups"
+        );
+        for before in &before_groups {
+            assert_eq!(storage.get_group(&before.id).unwrap(), *before);
+            assert!(matches!(
+                reopened.check_group_live(&before.id),
+                Err(EngineError::GroupNotHydrated(id)) if id == before.id
+            ));
+        }
+        assert!(reopened.quarantined_groups().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn failed_route_backfill_retries_after_group_context_is_repaired() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("route-backfill.db");
+    let key = storage_sqlite::SqlCipherKey::raw([0x53; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut initial = build_routed_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial, true).await;
+    let before = storage.get_group(&group_id).unwrap();
+    let members = initial.members(&group_id).unwrap();
+    storage
+        .delete_transport_group_routes_for_group(&group_id)
+        .unwrap();
+    drop(initial);
+    drop(storage);
+
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut reopened = build_routed_engine(storage.clone());
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+    assert!(route_pairs(&storage).is_empty());
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &observer,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let group_key = serde_json::to_vec(&mls_group_id).unwrap();
+    let context_count: i64 = observer
+        .query_row(
+            "SELECT COUNT(*) FROM openmls_values WHERE label = ?1 AND group_key = ?2",
+            rusqlite::params![b"GroupContext".as_slice(), &group_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(context_count, 1, "one actual native GroupContext row");
+    let context: (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = observer
+        .query_row(
+            "SELECT provider_version, label, storage_key, group_key, value
+             FROM openmls_values WHERE label = ?1 AND group_key = ?2",
+            rusqlite::params![b"GroupContext".as_slice(), &group_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    let write_context = |value: &[u8]| {
+        assert_eq!(
+            observer
+                .execute(
+                    "UPDATE openmls_values SET value = ?1 WHERE provider_version = ?2
+                     AND label = ?3 AND storage_key = ?4 AND group_key = ?5",
+                    rusqlite::params![value, context.0, &context.1, &context.2, &context.3],
+                )
+                .unwrap(),
+            1
+        );
+    };
+    let read_context = || -> Vec<u8> {
+        observer
+            .query_row(
+                "SELECT value FROM openmls_values WHERE provider_version = ?1
+                 AND label = ?2 AND storage_key = ?3 AND group_key = ?4",
+                rusqlite::params![context.0, &context.1, &context.2, &context.3],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    write_context(b"{");
+    assert!(matches!(
+        openmls::group::MlsGroup::load(storage.mls_storage(), &mls_group_id),
+        Err(storage_sqlite::SqliteOpenMlsStorageError::Serialization(_))
+    ));
+
+    let msg = inbound(ROUTE_BYTES, b"retry-after-context-repair");
+    assert!(matches!(
+        reopened.ingest(msg.clone()).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::UnknownGroup
+        }
+    ));
+    assert!(reopened.last_ingest_left_object_unpersisted());
+    assert!(matches!(
+        storage.get_message(&msg.id),
+        Err(StorageError::NotFound)
+    ));
+    assert!(!storage.has_ingress_dedup_marker(&msg.id).unwrap());
+    assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+    assert!(matches!(
+        reopened.check_group_live(&group_id),
+        Err(EngineError::GroupNotHydrated(id)) if id == group_id
+    ));
+    assert!(route_pairs(&storage).is_empty());
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(storage.get_group(&group_id).unwrap(), before);
+    assert_eq!(read_context(), b"{");
+
+    // Repair only the bytes. The same engine must revisit its pending route
+    // on exact wrapper redelivery, without explicit hydration or another nudge.
+    write_context(&context.4);
+    assert!(matches!(
+        reopened.ingest(msg).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidEncoding
+        }
+    ));
+    assert_eq!(
+        route_pairs(&storage),
+        vec![(ROUTE_BYTES.to_vec(), group_id.clone())]
+    );
+    assert!(reopened.unhydrated_group_ids().is_empty());
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(reopened.members(&group_id).unwrap(), members);
+    assert_eq!(storage.get_group(&group_id).unwrap(), before);
+    assert_eq!(read_context(), context.4);
 }
 
 /// (route bytes, group id) pairs, epoch stamps elided, sorted for comparison.

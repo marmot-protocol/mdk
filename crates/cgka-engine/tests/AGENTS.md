@@ -190,7 +190,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`
     promotion and quarantine parity, cheap-pass idempotency, durable transport-route seeding, the bounded ingest
     route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
-    retention-window route retirement across rotation and restart
+    retention-window route retirement across rotation and restart. `unknown_route_backfill_probes_at_most_four_pending_groups`
+    owns the per-message four-group bound; `failed_route_backfill_retries_after_group_context_is_repaired` owns
+    an unsuccessful native route probe remaining eligible after encrypted context repair on the same engine (mdk#3187)
 
 - **File:** `sqlite_storage.rs`
   - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke, sender-ratchet migration,
