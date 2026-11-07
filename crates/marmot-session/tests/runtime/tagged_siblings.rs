@@ -771,7 +771,10 @@ mod tagged_siblings {
 
     /// `adder` carries `owed` as a 461 in `device_group`, pinned to the
     /// group's epoch and branch as the app sends it, and marks it delivered
-    /// once the message is published. Returns the message.
+    /// once the message is published. Adds a secondary group relay to this
+    /// fixture's default routing and checks that repair remains held through
+    /// the outstanding relay and the host's final acknowledgement. Returns
+    /// the message; the caller retains its real sibling-join proof.
     pub(super) async fn carry(
         adder: &mut Device,
         device_group: &GroupId,
@@ -839,9 +842,10 @@ mod tagged_siblings {
                 .as_deref(),
             Some(carrier.as_slice())
         );
-        adder
-            .adapter
-            .fail_endpoints_as(vec![secondary], TransportEndpointFailureKind::PossiblyExposed);
+        adder.adapter.fail_endpoints_as(
+            vec![secondary],
+            TransportEndpointFailureKind::PossiblyExposed,
+        );
         wall.set(wall.0.load(Ordering::SeqCst) + 3_600);
         let effects = adder.runtime.resume_outbound_fanouts().await.unwrap();
         assert!(
@@ -856,30 +860,100 @@ mod tagged_siblings {
                 .sibling_welcome_delivered(&owed.id, &carrier)
                 .unwrap()
         );
-        adder.runtime.acknowledge_published_app_messages(&effects.published_app_messages).unwrap();
-        let fanouts = adder.runtime.outbound_fanouts_for_group(device_group).unwrap();
+        adder
+            .runtime
+            .acknowledge_published_app_messages(&effects.published_app_messages)
+            .unwrap();
+        let fanouts = adder
+            .runtime
+            .outbound_fanouts_for_group(device_group)
+            .unwrap();
         assert_eq!(fanouts.len(), 1);
         assert_eq!(fanouts[0].outcome().accepted_targets, 1);
         assert_eq!(fanouts[0].outcome().outstanding_targets, 1);
         assert_eq!(
-            adder.runtime.rearm_sibling_welcome(
-                &owed.id,
-                &carrier,
-                Timestamp(NOW),
-                &roster(&adder.runtime, device_group),
-            ).unwrap(),
+            adder
+                .runtime
+                .rearm_sibling_welcome(
+                    &owed.id,
+                    &carrier,
+                    Timestamp(NOW),
+                    &roster(&adder.runtime, device_group),
+                )
+                .unwrap(),
             marmot_session::SiblingWelcomeResendOutcome::Held,
             "a delivered carrier must finish its frozen secondary before repair",
         );
-        assert_eq!(adder.runtime.outbound_fanouts_for_group(device_group).unwrap(), fanouts);
-        assert!(adder.runtime.owed_sibling_welcomes(Timestamp(NOW)).unwrap().is_empty());
-        adder.adapter.fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
+        assert_eq!(
+            adder
+                .runtime
+                .outbound_fanouts_for_group(device_group)
+                .unwrap(),
+            fanouts
+        );
+        assert!(
+            adder
+                .runtime
+                .owed_sibling_welcomes(Timestamp(NOW))
+                .unwrap()
+                .is_empty()
+        );
+        adder
+            .adapter
+            .fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
         wall.set(wall.0.load(Ordering::SeqCst) + 3_600);
         let settled = adder.runtime.resume_outbound_fanouts().await.unwrap();
-        adder.runtime.acknowledge_published_app_messages(&settled.published_app_messages).unwrap();
-        assert!(adder.runtime.outbound_fanouts_for_group(device_group).unwrap().is_empty());
+        let accepted = adder
+            .runtime
+            .outbound_fanouts_for_group(device_group)
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].outcome().accepted_targets, 2);
+        assert_eq!(accepted[0].outcome().outstanding_targets, 0);
+        assert_eq!(
+            adder
+                .runtime
+                .rearm_sibling_welcome(
+                    &owed.id,
+                    &carrier,
+                    Timestamp(NOW),
+                    &roster(&adder.runtime, device_group),
+                )
+                .unwrap(),
+            marmot_session::SiblingWelcomeResendOutcome::Held,
+            "a fully accepted carrier must await its host acknowledgement before repair",
+        );
+        assert_eq!(
+            adder
+                .runtime
+                .outbound_fanouts_for_group(device_group)
+                .unwrap(),
+            accepted
+        );
+        assert!(
+            adder
+                .runtime
+                .owed_sibling_welcomes(Timestamp(NOW))
+                .unwrap()
+                .is_empty()
+        );
+        adder
+            .runtime
+            .acknowledge_published_app_messages(&settled.published_app_messages)
+            .unwrap();
+        assert!(
+            adder
+                .runtime
+                .outbound_fanouts_for_group(device_group)
+                .unwrap()
+                .is_empty()
+        );
         let messages = &group_messages(adder)[before..];
-        assert_eq!(messages.len(), 5, "two initial attempts, two retries, then the secondary");
+        assert_eq!(
+            messages.len(),
+            5,
+            "two initial attempts, two retries, then the secondary"
+        );
         assert!(messages.iter().all(|message| message == &messages[0]));
         messages[0].clone()
     }
