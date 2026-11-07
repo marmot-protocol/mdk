@@ -2049,6 +2049,167 @@ async fn read_product_batch(stream: &mut tokio::net::TcpStream) -> Vec<serde_jso
 }
 
 #[cfg(feature = "product-analytics-export")]
+#[tokio::test]
+async fn delivery_worker_replaces_connectivity_samples_from_actual_sdk_health() {
+    use std::future::Future;
+    use std::task::Poll;
+    use tokio::io::AsyncWriteExt;
+
+    crate::collector_host_safety::hand_in_direct_http_builder();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let collector_origin = format!("http://{}", listener.local_addr().unwrap());
+    let (batches, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let batch = read_product_batch(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            batches.send(batch).unwrap();
+        }
+    });
+    let (collector, clock) = configured();
+    let mut config = collector.config_for_test();
+    config.events_endpoint = Some(format!("{collector_origin}/api/v0/events"));
+    collector.configure(config, collector_origin).unwrap();
+    grant(&collector);
+
+    let relays = [
+        nostr_relay_builder::MockRelay::run().await.unwrap(),
+        nostr_relay_builder::MockRelay::run().await.unwrap(),
+    ];
+    let urls = [
+        relays[0].url().await.to_string(),
+        relays[1].url().await.to_string(),
+    ];
+    let plane = transport_nostr::MarmotRelayPlane::full_history_with_loopback(true);
+    let keys = nostr_sdk::prelude::Keys::generate();
+    let account = cgka_traits::MemberId::new(keys.public_key().to_bytes().to_vec());
+    plane
+        .set_transport_signer(&account, Arc::new(keys))
+        .await
+        .unwrap();
+    let account_client = plane
+        .sdk_relay_client_for_test()
+        .unwrap()
+        .account_relay_client(&account)
+        .await
+        .unwrap();
+    for url in &urls {
+        account_client
+            .client()
+            .add_relay(url.as_str())
+            .await
+            .unwrap();
+    }
+    let worker = collector.clone().run(plane.clone());
+    tokio::pin!(worker);
+    for (minute, expected, connected) in [(0, "none", 0), (1, "partial", 1), (2, "available", 2)] {
+        if minute > 0 {
+            clock.mono.store(minute as u64 * 60_000, Ordering::Relaxed);
+            clock
+                .wall
+                .store(1800 + minute as u64 * 60, Ordering::Relaxed);
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::resume();
+            // Advancing the timer can expire SDK heartbeat timers as well. Establish
+            // the actual health precondition after advancing, before polling the worker.
+            for url in &urls[..minute] {
+                account_client
+                    .client()
+                    .connect_relay(url.as_str())
+                    .await
+                    .unwrap();
+                account_client
+                    .client()
+                    .relay(url.as_str())
+                    .await
+                    .unwrap()
+                    .expect("the configured relay remains registered")
+                    .wait_for_connection(Duration::from_secs(5))
+                    .await;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let health = plane.relay_health().await;
+                if (health.connected, health.total_relays) == (connected, 2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real SDK connections must establish the health precondition");
+        let sample_clock = (
+            1800 + minute as u64 * 60,
+            Duration::from_secs(minute as u64 * 60),
+        );
+        assert_ne!(
+            collector.lock().last_clock,
+            Some(sample_clock),
+            "the fixture must not advance the collector to the new sample clock"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(
+                    worker.as_mut().poll(cx).is_pending(),
+                    "granted worker must remain alive"
+                );
+                // Only this tick can advance the collector to the new fake-clock
+                // values. A sender can reopen a window at the previous sample.
+                // Observe completion without waiting for the expected availability.
+                if collector.lock().last_clock == Some(sample_clock) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the worker must sample health before the window is sealed");
+        collector.activity(ProductAnalyticsActivity::AccountChanged);
+        tokio::time::timeout(Duration::from_secs(5), collector.send_pending())
+            .await
+            .expect("the sampled batch must send without waiting on the parked worker");
+        let batch = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let connectivity: Vec<_> = batch
+            .iter()
+            .filter(|event| event["eventName"] == "mdk_connectivity_summary")
+            .collect();
+        assert_eq!(connectivity.len(), 1);
+        assert_eq!(connectivity[0]["props"]["operation"], "availability");
+        assert_eq!(connectivity[0]["props"]["outcome"], expected);
+        assert_eq!(connectivity[0]["props"]["unit"], "coverage");
+        assert_eq!(connectivity[0]["props"]["count_bucket"], "1");
+        assert_eq!(
+            (
+                collector.status().queued_events,
+                collector.status().failed_batches,
+                collector.status().dropped_events
+            ),
+            (0, 0, 0)
+        );
+    }
+    collector.revoke_memory();
+    tokio::time::timeout(Duration::from_secs(1), &mut worker)
+        .await
+        .unwrap();
+    plane.shutdown().await;
+    for relay in relays {
+        relay.shutdown();
+    }
+    server.await.unwrap();
+}
+
+#[cfg(feature = "product-analytics-export")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivery_retry_budget_and_long_cooldowns_drop_an_unaccepted_batch_once() {
     use tokio::io::AsyncWriteExt;
