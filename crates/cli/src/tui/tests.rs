@@ -3988,6 +3988,51 @@ fn relist_recovery_realigns_the_live_account_feeds() {
         app.status, "draft saved",
         "successful ambient repair stays quiet"
     );
+
+    // A's real recovered chat feed has adopted A's account-wide stream source,
+    // while the retained pane deliberately still belongs to B.
+    let foreground_account = app.selected_account_row().unwrap().account_id.clone();
+    let (tx, rx) = mpsc::channel();
+    app.message_subscription = Some(MessageSubscription {
+        account_id: foreground_account.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Result(serde_json::json!({
+        "type":"agent_stream_delta","agent_stream_delta":{
+            "group_id":group,"stream_id":"ff".repeat(32),"text":"foreground account preview"
+        }
+    })))
+    .unwrap();
+    assert!(app.drain_message_subscription());
+    app.focus = Focus::Messages;
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.timeline_scroll.is_pinned());
+    assert_eq!(app.messages_account_id.as_deref(), Some(b.as_str()));
+    assert!(
+        !rendered_buffer(&mut app).contains("foreground account preview"),
+        "A's account-wide preview cannot render inside B's retained pane"
+    );
+    app.refresh_messages().expect("open the recovered A chat");
+    app.apply_effect_done(EffectDone {
+        effect: Effect::LoadTimeline {
+            account: foreground_account.clone(),
+            group,
+        },
+        result: Ok(vec![serde_json::json!({"messages":[{
+            "message_id":"A recovered row","direction":"received","from":"peer",
+            "plaintext":"A recovered timeline","timeline_at":3,"received_at":3
+        }]})]),
+    });
+    assert_eq!(
+        app.messages_account_id.as_deref(),
+        Some(foreground_account.as_str())
+    );
+    assert!(
+        rendered_buffer(&mut app).contains("foreground account preview"),
+        "the same observed preview remains visible in its own account's pane"
+    );
 }
 
 #[cfg(unix)]
@@ -14281,6 +14326,115 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
         !rendered_buffer(&mut app).contains("outgoing account preview"),
         "A's preview must not survive B's empty-list account transition"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_account_page_keeps_its_live_feed_and_reuses_it_on_retry() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(16);
+    let dir = tempfile::tempdir().unwrap();
+    let mut gate = TestCommandGate::new(dir.path());
+    let first_page = dir.path().join("first-page");
+    let chat = serde_json::json!({"ok":true,"result":{"chats":[{
+        "group_id":group,"profile":{"name":"B room"}
+    }]}})
+    .to_string();
+    let page = serde_json::json!({"ok":true,"result":{"messages":[{
+        "message_id":"B retry row","direction":"received","from":"peer",
+        "plaintext":"B recovered page","timeline_at":2,"received_at":2
+    }],"has_more_before":false}})
+    .to_string();
+    let incoming = serde_json::json!({"ok":true,"result":{
+        "type":"agent_stream_delta","agent_stream_delta":{
+            "group_id":group,"stream_id":"dd".repeat(32),"text":"B live after page error"
+        }
+    }})
+    .to_string();
+    let exe = dir.path().join("wn-page-error");
+    write_fake_wn(
+        &exe,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in\n\
+         *' --account {account_b} messages subscribe '*)\n{}printf '%s\\n' '{incoming}'\nexec sleep 60\n;;\n\
+         *' chats list '*) printf '%s\\n' '{chat}';;\n\
+         *' messages timeline list '*)\nif mkdir '{}' 2>/dev/null; then\nprintf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"timeline offline\"}}}}'\nelse\nprintf '%s\\n' '{page}'\nfi\n;;\n\
+         *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+         *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+            gate.script(),
+            first_page.display()
+        ),
+    );
+    let mut app = test_tui_app(
+        WnClient {
+            exe,
+            ..test_unused_client()
+        },
+        &account_a,
+    );
+    app.daemon.running = true;
+    app.accounts.push(AccountRow {
+        account_id: account_b.clone(),
+        npub: "npub1bob".into(),
+        display_name: None,
+        local_signing: true,
+    });
+    app.chats = vec![flick_chat(&group, "A room")];
+    app.chats_account_id = Some(account_a.clone());
+    app.messages_account_id = Some(account_a.clone());
+    app.messages_group_id = Some(group.clone());
+    app.timeline = vec![timeline_row("A row", 1)];
+    app.ensure_message_subscription(&account_a)
+        .expect("A's live feed");
+    let outgoing_child = app.message_subscription.as_ref().unwrap().child.id();
+    app.select_account_by_selector(&account_b)
+        .expect("B's real nonempty list");
+    finish_queued_effects(&mut app);
+    assert_eq!(app.status, "error: timeline offline");
+    assert!(app.loading_chat.is_none());
+    assert_eq!(
+        app.message_subscription
+            .as_ref()
+            .map(|feed| feed.account_id.as_str()),
+        Some(account_b.as_str()),
+        "a failed B page must keep B's account-wide feed"
+    );
+    let incoming_child = app.message_subscription.as_ref().unwrap().child.id();
+    assert_ne!(incoming_child, outgoing_child);
+    gate.wait_until_entered();
+    assert!(
+        app.message_subscription
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.live_stream_previews.is_empty() {
+        app.drain_message_subscription();
+        assert!(
+            Instant::now() < deadline,
+            "B's actual child did not deliver after the page error"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    app.refresh_messages().expect("retry B's page");
+    assert_eq!(
+        app.message_subscription.as_ref().unwrap().child.id(),
+        incoming_child
+    );
+    finish_queued_effects(&mut app);
+    assert_eq!(
+        app.message_subscription.as_ref().unwrap().child.id(),
+        incoming_child
+    );
+    assert_eq!(app.messages_account_id, Some(account_b));
+    assert_eq!(timeline_ids(&app.timeline), vec!["B retry row"]);
+    assert!(rendered_buffer(&mut app).contains("B live after page error"));
 }
 
 #[test]

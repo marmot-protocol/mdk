@@ -9,9 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
-- Keep TUI timeline loads and account-wide stream previews bound to their actual account, including switches
-  through an empty chat list. Old results cannot cancel the new load, and old previews cannot appear under the
-  new account; same-account navigation and feed reconnects preserve observed previews (#2441).
+- Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
+  retained panes under a different account's list. Start the adopted account's live feed even when its page
+  fails; same-account navigation and feed reconnects preserve the feed and observed previews (#2441).
 
 - Recover TUI chat and notification feeds for the selected account when a background chat-list retry succeeds
   after a failed account switch, while preserving the open conversation and matching live subscriptions (#2968).
