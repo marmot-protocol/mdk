@@ -255,7 +255,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let app = MarmotApp::with_relay_and_config(alice_dir.path(), url, config);
+        let app = MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config);
         let runtime = app.runtime();
         runtime.start().await.unwrap();
         runtime
@@ -271,6 +271,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // Explicitly fetch and persist the real published profile. Search's
+        // ephemeral tier and the background directory sync are not a fence for
+        // a later signed-out read of the shared directory.
+        let profile = app
+            .directory()
+            .fetch_current_user_profile_for_account_id(&bob.account_id_hex, vec![url.into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.about.as_deref(), Some("co-member-needle"));
         let found = users_command_with_runtime(
             &alice_home,
             &app,
@@ -309,6 +319,18 @@ mod tests {
             .set_account_signed_out(&alice.account_id_hex, true)
             .unwrap();
         runtime.reconcile_accounts().await.unwrap();
+        let shared_bob = app
+            .directory()
+            .directory_entry_for_account_id(&bob.account_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_bob
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.about.as_deref()),
+            Some("co-member-needle")
+        );
         let signed_out = users_command_with_runtime(
             &alice_home,
             &app,
