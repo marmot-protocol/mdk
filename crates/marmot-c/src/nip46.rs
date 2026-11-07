@@ -1312,67 +1312,141 @@ mod tests {
         ));
     }
     #[derive(Default)]
-    struct Store(std::sync::Mutex<std::collections::HashMap<String, String>>);
-    impl marmot_uniffi::SecretStore for Store {
-        fn has_secret_for_label(&self, label: String) -> std::result::Result<bool, MarmotKitError> {
-            Ok(self.0.lock().unwrap().contains_key(&label))
+    struct Store(Mutex<Vec<(String, String, String)>>);
+    impl Store {
+        unsafe fn input(value: *const c_char) -> String {
+            unsafe { std::ffi::CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned()
         }
-        fn has_secret_for_account_id(
-            &self,
-            _: String,
-        ) -> std::result::Result<bool, MarmotKitError> {
-            Ok(false)
+        unsafe extern "C" fn has(
+            data: *mut std::ffi::c_void,
+            key: *const c_char,
+            out: *mut u8,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let key = unsafe { Self::input(key) };
+            let Ok(entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            unsafe {
+                out.write(u8::from(
+                    entries
+                        .iter()
+                        .any(|(label, account, _)| label == &key || account == &key),
+                ))
+            };
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
         }
-        fn write_secret(
-            &self,
-            label: String,
-            _: String,
-            key: String,
-        ) -> std::result::Result<(), MarmotKitError> {
-            self.0.lock().unwrap().insert(label, key);
-            Ok(())
+        unsafe extern "C" fn write(
+            data: *mut std::ffi::c_void,
+            label: *const c_char,
+            account: *const c_char,
+            secret: *const c_char,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let (label, account, secret) = unsafe {
+                (
+                    Self::input(label),
+                    Self::input(account),
+                    Self::input(secret),
+                )
+            };
+            let Ok(mut entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            entries.retain(|(old_label, old_account, _)| {
+                old_label != &label && old_account != &account
+            });
+            entries.push((label, account, secret));
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
         }
-        fn load_secret(
-            &self,
-            label: String,
-            _: String,
-        ) -> std::result::Result<String, MarmotKitError> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(&label)
-                .cloned()
-                .ok_or(MarmotKitError::SecretNotFound {
-                    details: "test store".into(),
-                })
+        unsafe extern "C" fn load(
+            data: *mut std::ffi::c_void,
+            label: *const c_char,
+            account: *const c_char,
+            out: *mut *mut c_char,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let (label, account) = unsafe { (Self::input(label), Self::input(account)) };
+            let Ok(entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            let Some((_, _, secret)) = entries
+                .iter()
+                .find(|(l, a, _)| l == &label || a == &account)
+            else {
+                return crate::secret_store::MarmotSecretStoreStatus::NotFound as u32;
+            };
+            let Ok(secret) = std::ffi::CString::new(secret.as_str()) else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            unsafe { out.write(secret.into_raw()) };
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
         }
-        fn remove_secret(
-            &self,
-            label: String,
-            _: String,
-        ) -> std::result::Result<(), MarmotKitError> {
-            self.0.lock().unwrap().remove(&label);
-            Ok(())
+        unsafe extern "C" fn remove(
+            data: *mut std::ffi::c_void,
+            label: *const c_char,
+            account: *const c_char,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let (label, account) = unsafe { (Self::input(label), Self::input(account)) };
+            let Ok(mut entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            entries.retain(|(l, a, _)| l != &label && a != &account);
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
+        }
+        unsafe extern "C" fn free(_: *mut std::ffi::c_void, value: *mut c_char) {
+            drop(unsafe { std::ffi::CString::from_raw(value) });
+        }
+        unsafe extern "C" fn destroy(data: *mut std::ffi::c_void) {
+            drop(unsafe { Arc::from_raw(data.cast::<Store>()) });
         }
     }
 
     struct OwnedClient(*mut MarmotClient);
     impl OwnedClient {
         fn open(root: &std::path::Path, relay: &str, store: Arc<Store>) -> Self {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            let marmot = Marmot::new_with_options(
-                root.to_str().unwrap().into(),
-                vec![relay.into()],
-                marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
-                Some(store),
-                marmot_uniffi::marmot_deployment_neutral(),
-            )
-            .unwrap();
-            Self(memory::boxed(MarmotClient { runtime, marmot }))
+            let root = std::ffi::CString::new(root.to_str().unwrap()).unwrap();
+            let relay = std::ffi::CString::new(relay).unwrap();
+            let relays = [relay.as_ptr()];
+            let data = Arc::into_raw(store).cast_mut().cast();
+            let store = crate::secret_store::MarmotSecretStore {
+                user_data: data,
+                has_secret_for_label: Some(Store::has),
+                has_secret_for_account_id: Some(Store::has),
+                write_secret: Some(Store::write),
+                load_secret: Some(Store::load),
+                remove_secret: Some(Store::remove),
+                free_secret: Some(Store::free),
+                destroy: Some(Store::destroy),
+            };
+            let mut deployment = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { crate::deployment::marmot_deployment_neutral(&mut deployment) },
+                MarmotStatus::Ok
+            );
+            let mut client = std::ptr::null_mut();
+            let status = unsafe {
+                crate::marmot_client_new_with_options(
+                    root.as_ptr(),
+                    relays.as_ptr(),
+                    1,
+                    crate::MarmotRelayPolicy::AllowLoopback as u32,
+                    &store,
+                    deployment,
+                    &mut client,
+                )
+            };
+            unsafe { crate::deployment::marmot_deployment_free(deployment) };
+            if status != MarmotStatus::Ok {
+                // The public constructor takes no host-context ownership on failure.
+                unsafe { Store::destroy(data) };
+            }
+            assert_eq!(status, MarmotStatus::Ok);
+            assert!(!client.is_null());
+            Self(client)
         }
     }
     impl Drop for OwnedClient {
@@ -1383,9 +1457,20 @@ mod tests {
             }
         }
     }
+    type PeerSessions = Arc<Mutex<Vec<Weak<Session>>>>;
+    struct CancelOnPeerFailure(PeerSessions);
+    impl Drop for CancelOnPeerFailure {
+        fn drop(&mut self) {
+            // A failed fixture task must interrupt real blocking callers rather
+            // than leave them waiting for the production 90-second RPC timeout.
+            for session in self.0.lock().unwrap().iter().filter_map(Weak::upgrade) {
+                session.cancel();
+            }
+        }
+    }
     struct OwnedSession(*mut MarmotNip46Session);
     impl OwnedSession {
-        fn open(client: &OwnedClient, config: &Value) -> Self {
+        fn open(client: &OwnedClient, config: &Value, peers: &PeerSessions) -> Self {
             let config = std::ffi::CString::new(config.to_string()).unwrap();
             let mut session = std::ptr::null_mut();
             assert_eq!(
@@ -1393,6 +1478,10 @@ mod tests {
                 MarmotStatus::Ok
             );
             assert!(!session.is_null());
+            peers
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(&unsafe { &*session }.inner));
             Self(session)
         }
         fn connect(&self) -> String {
@@ -1495,6 +1584,7 @@ mod tests {
             .unwrap();
         });
         let observed = Arc::new(Mutex::new(Vec::<(PublicKey, String, Option<Kind>)>::new()));
+        let peers = PeerSessions::default();
         let (held_request, entered_request) = std::sync::mpsc::channel();
         let (release_request, mut released_request) = tokio::sync::oneshot::channel();
         let peer_task = {
@@ -1503,8 +1593,11 @@ mod tests {
             let user = user.clone();
             let observed = observed.clone();
             let url = url.clone();
+            let peers = peers.clone();
             peer_runtime.spawn(async move {
-                let mut connected = std::collections::HashSet::new();
+                let _cancel_on_failure = CancelOnPeerFailure(peers);
+                let mut connected = std::collections::HashMap::<PublicKey, std::collections::HashSet<String>>::new();
+                let mut used_secrets = std::collections::HashSet::new();
                 while let Some(notification) = notifications.next().await {
                     let ClientNotification::Event { event, .. } = notification else { continue };
                     event.verify().unwrap();
@@ -1519,12 +1612,33 @@ mod tests {
                         Some(serde_json::from_value::<Kind>(unsigned["kind"].clone()).unwrap())
                     } else { None };
                     observed.lock().unwrap().push((receiver, method.into(), kind));
+                    let permission = match method {
+                        "sign_event" => Some(format!("sign_event:{}", kind.unwrap().as_u16())),
+                        "nip44_encrypt" | "nip44_decrypt" => Some(method.into()),
+                        _ => None,
+                    };
+                    let authorized = if method == "connect" {
+                        let secret = params.get(1).and_then(Value::as_str);
+                        let permissions = params.get(2).and_then(Value::as_str);
+                        if let (Some(secret), Some(permissions)) = (secret, permissions)
+                            && params.first().and_then(Value::as_str) == Some(remote.public_key().to_hex().as_str())
+                            && matches!(secret, "fixture-a" | "fixture-b")
+                            && !connected.contains_key(&receiver)
+                            && used_secrets.insert(secret.to_owned())
+                        {
+                            connected.insert(receiver, permissions.split(',').map(str::to_owned).collect());
+                            true
+                        } else { false }
+                    } else {
+                        connected.get(&receiver).is_some_and(|permissions| permission.as_ref().is_none_or(|permission| permissions.contains(permission)))
+                    };
+                    if !authorized {
+                        let denied = response_to(&remote, receiver, json!({"id":id,"error":"unauthorized"}));
+                        assert!(!peer.send_event(&denied).await.unwrap().success.is_empty());
+                        continue;
+                    }
                     let result = match method {
-                        "connect" => {
-                            assert_eq!(params[1], "one-use-fixture");
-                            assert!(connected.insert(receiver), "a consumed bunker secret was replayed");
-                            json!("ack")
-                        }
+                        "connect" => json!("ack"),
                         "get_public_key" => {
                             // A genuine encrypted but unrelated response must be
                             // ignored by the live RPC loop, not pinned as the user.
@@ -1553,7 +1667,7 @@ mod tests {
                             let from = PublicKey::from_hex(params[0].as_str().unwrap()).unwrap();
                             json!(nip44::decrypt(user.secret_key(), &from, params[1].as_str().unwrap()).unwrap())
                         }
-                        "logout" => json!("ack"),
+                        "logout" => { connected.remove(&receiver); json!("ack") },
                         other => panic!("unimplemented fixture RPC: {other}"),
                     };
                     let response = response_to(&remote, receiver, json!({"id":id,"result":result}));
@@ -1564,19 +1678,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::default());
         let client = OwnedClient::open(root.path(), &url, store.clone());
-        let uri = NostrConnectUri::Bunker {
-            remote_signer_public_key: remote.public_key(),
-            relays: vec![RelayUrl::parse(&url).unwrap()],
-            secret: Some("one-use-fixture".into()),
-        }
-        .to_string();
+        let uri = |secret: &str| {
+            NostrConnectUri::Bunker {
+                remote_signer_public_key: remote.public_key(),
+                relays: vec![RelayUrl::parse(&url).unwrap()],
+                secret: Some(secret.into()),
+            }
+            .to_string()
+        };
         let session = OwnedSession::open(
             &client,
-            &json!({"uri":uri,"client_secret":client_a.secret_key().to_secret_hex()}),
+            &json!({"uri":uri("fixture-a"),"client_secret":client_a.secret_key().to_secret_hex()}),
+            &peers,
         );
         let independent = OwnedSession::open(
             &client,
-            &json!({"uri":uri,"client_secret":client_b.secret_key().to_secret_hex()}),
+            &json!({"uri":uri("fixture-b"),"client_secret":client_b.secret_key().to_secret_hex()}),
+            &peers,
         );
         assert_eq!(session.connect(), user.public_key().to_hex());
         assert_eq!(independent.connect(), user.public_key().to_hex());
@@ -1690,14 +1808,18 @@ mod tests {
             unsafe { account_snapshot(&client) },
             (user.public_key().to_hex(), true, false)
         );
-        assert!(
-            observed
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, method, kind)| method == "sign_event"
-                    && kind.is_some_and(|kind| kind.as_u16() == 450))
-        );
+        for expected in [450, 30_443] {
+            assert!(
+                observed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(sender, method, kind)| *sender == client_a.public_key()
+                        && method == "sign_event"
+                        && kind.is_some_and(|kind| kind.as_u16() == expected)),
+                "login did not request signed kind {expected}"
+            );
+        }
         let mut export = std::ptr::null_mut();
         assert_eq!(
             unsafe { marmot_nip46_export(session.0, &mut export) },
@@ -1714,7 +1836,11 @@ mod tests {
             saved["remote_signer_public_key"],
             remote.public_key().to_hex()
         );
-        assert!(saved.get("uri").is_none() && !export.contains("one-use-fixture"));
+        assert!(
+            saved.get("uri").is_none()
+                && !export.contains("fixture-a")
+                && !export.contains("fixture-b")
+        );
         drop(independent);
         drop(session);
         drop(client);
@@ -1726,7 +1852,11 @@ mod tests {
                 .any(|(_, method, _)| method == "logout")
         );
         let client = OwnedClient::open(root.path(), &url, store);
-        let session = OwnedSession::open(&client, &saved);
+        let session = OwnedSession::open(&client, &saved, &peers);
+        assert_eq!(
+            unsafe { crate::marmot_client_start(client.0) },
+            MarmotStatus::Ok
+        );
         assert_eq!(session.connect(), user.public_key().to_hex());
         assert_eq!(
             unsafe { marmot_nip46_register(client.0, account_ref.as_ptr(), session.0) },
@@ -1784,13 +1914,12 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            history
-                .iter()
-                .filter(|(_, method, _)| method == "logout")
-                .count(),
-            1
-        );
+        let logout_senders = history
+            .iter()
+            .filter(|(_, method, _)| method == "logout")
+            .map(|(sender, _, _)| *sender)
+            .collect::<Vec<_>>();
+        assert_eq!(logout_senders, vec![client_a.public_key()]);
         drop(history);
         peer_task.abort();
         peer_runtime.block_on(async {
