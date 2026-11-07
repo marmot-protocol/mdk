@@ -5,8 +5,9 @@
 //! It owns every history fetch since PR 5g. The account worker spawns it and
 //! stops it with the worker, and a directly owned client runs it in place for
 //! one pass from `sync()` and `next_event()` ([`host`]). Only tests still turn
-//! the internal `runner_owns_debt` gate off, and then nothing constructs it and
-//! nothing fetches history.
+//! the internal `runner_owns_debt` gate off. That skips ownership preparation
+//! and the runner: no conversion before subscriptions, no replay delegation, no
+//! live fences and no runner, so the adapter's own clamp paging still runs.
 //!
 //! One step:
 //!

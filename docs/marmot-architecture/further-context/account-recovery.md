@@ -798,8 +798,9 @@ leave staging in one transaction.
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
 fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
 on. The old owner's grant, native capture and comparison job are deleted (5c2a846b4 is the last
-commit with them), and so are the gate's off arms; the gate itself remains only so tests can keep the
-runner from starting, until it goes. Before any
+commit with them), and so are the gate's off arms. Until the gate goes, a test that turns it off
+skips ownership preparation and the runner: no conversion before subscriptions, no replay
+delegation, no live fences, so the adapter's clamp paging still runs. Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
 ledger debt. Autonomous clamp continuation is disabled for app-owned accounts; ordinary native
 input, count facts and bounded fences remain. Supported

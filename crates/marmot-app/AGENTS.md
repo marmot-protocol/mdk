@@ -699,9 +699,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
   fetch (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the internal `runner_owns_debt` gate off
   through the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed.
-  With it off nothing constructs or seats the runner, so nothing fetches history; every other recovery seam (loss
-  import, ledger notices, recovery status and its event, post-join collection) runs the same either way. The old
-  owner's grant, comparison job and off arms no longer exist.
+  With it off `prepare_runner_ownership` returns at once and nothing seats the runner: no conversion before
+  subscriptions, no `delegate_replay_recovery`, no live fences, so a full live reply still takes the adapter's clamp
+  paging. Notice, recovery status and post-join code no longer branch on the gate; the catching-up status stays empty
+  until a runner surveys. The old owner's grant, comparison job and off arms no longer exist.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
