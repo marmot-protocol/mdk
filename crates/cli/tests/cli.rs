@@ -10397,7 +10397,29 @@ fn ordinary_builds_do_not_expose_device_link_commands() {
 #[cfg(all(feature = "dev-device-groups", not(feature = "test-policy-overrides")))]
 #[test]
 fn dev_devices_link_across_daemon_commands_at_production_timing() {
-    fn invoke(home: &std::path::Path, socket: &std::path::Path, args: &[&str]) -> Value {
+    /// The command words of `args` for a failure message: no account id,
+    /// prompt id or label.
+    fn command_name(args: &[&str]) -> String {
+        let mut words = Vec::new();
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            if *arg == "--account" {
+                args.next();
+            } else if !arg.is_empty() && arg.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-')
+            {
+                words.push(*arg);
+            } else {
+                break;
+            }
+        }
+        words.join(" ")
+    }
+    /// The result, or the error object of a refused command.
+    fn try_invoke(
+        home: &std::path::Path,
+        socket: &std::path::Path,
+        args: &[&str],
+    ) -> Result<Value, Value> {
         let output = wn(home)
             .arg("--socket")
             .arg(socket)
@@ -10405,25 +10427,30 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
             .args(args)
             .output()
             .unwrap();
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(
-            output.status.success(),
-            "device command failed: {}: {}",
-            value["error"]["code"],
-            value["error"]["message"]
-        );
-        value["result"].clone()
+        let mut value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if output.status.success() {
+            Ok(value["result"].take())
+        } else {
+            Err(value["error"].take())
+        }
     }
-    fn wait(mut read: impl FnMut() -> Option<Value>) -> Value {
+    fn invoke(home: &std::path::Path, socket: &std::path::Path, args: &[&str]) -> Value {
+        try_invoke(home, socket, args).unwrap_or_else(|error| {
+            panic!(
+                "`{}` failed: {}: {}",
+                command_name(args),
+                error["code"],
+                error["message"]
+            )
+        })
+    }
+    fn wait(what: &str, mut read: impl FnMut() -> Option<Value>) -> Value {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if let Some(value) = read() {
                 return value;
             }
-            assert!(
-                Instant::now() < deadline,
-                "device link state did not advance"
-            );
+            assert!(Instant::now() < deadline, "{what} did not advance");
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -10499,7 +10526,7 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
         assert_eq!(started["new_device"]["state"], "waiting_for_answer");
         // This is another process/RPC. A one-shot runtime would lose the session.
         assert!(!selected(1, &["link", "status"])["new_device"].is_null());
-        let prompt = wait(|| {
+        let prompt = wait("existing-device prompt", || {
             selected(0, &["link", "status"])["prompts"]
                 .as_array()
                 .unwrap()
@@ -10507,7 +10534,7 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
                 .find(|prompt| prompt["state"] == "comparing")
                 .cloned()
         });
-        let new = wait(|| {
+        let new = wait("new-device comparison", || {
             let snapshot = selected(1, &["link", "status"]);
             (snapshot["new_device"]["state"] == "comparing").then(|| snapshot["new_device"].clone())
         });
@@ -10560,7 +10587,7 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
             "one confirmation cannot create the device group"
         );
         selected(1, &["link", "confirm-match"]);
-        wait(|| {
+        wait("device link", || {
             let new = selected(1, &["link", "status"]);
             let existing = selected(0, &["link", "status"]);
             (new["new_device"]["state"] == "linked"
@@ -10636,7 +10663,37 @@ fn dev_devices_link_across_daemon_commands_at_production_timing() {
                 selected(1, &["list"])["devices"].as_array().unwrap().len(),
                 2
             );
-            let reset = selected(1, &["link", "reset", "--confirm"]);
+            // Reset refuses unsettled device-group work as `device_group_busy`
+            // and changes nothing; settlement clears it, with no deadline
+            // promised. Each daemon's first 15 s maintenance tick after the
+            // link commits in the device group, which leaves this device's
+            // copy unsettled for the quiescence window; a slow run can reach
+            // reset inside it (mdk#3203).
+            let reset_args = [
+                "--account",
+                accounts[1].as_str(),
+                "devices",
+                "link",
+                "reset",
+                "--confirm",
+            ];
+            let reset = wait("busy device-group reset", || {
+                match try_invoke(homes[1].path(), &sockets[1], &reset_args) {
+                    Ok(reset) => Some(reset),
+                    Err(error) if error["message"] == "device group refused: device_group_busy" => {
+                        assert_eq!(
+                            selected(1, &["list"])["devices"].as_array().unwrap().len(),
+                            2,
+                            "a busy reset keeps the device group"
+                        );
+                        None
+                    }
+                    Err(error) => panic!(
+                        "`devices link reset --confirm` failed: {}: {}",
+                        error["code"], error["message"]
+                    ),
+                }
+            });
             assert!(reset["new_device"].is_null());
             assert!(
                 selected(1, &["list"])["devices"]
