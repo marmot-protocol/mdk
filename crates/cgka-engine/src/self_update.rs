@@ -214,16 +214,28 @@ impl<S: StorageProvider> Engine<S> {
         let wrapped =
             crate::message_processor::route_wrapped_group_message(wrapped, &pre_commit_ctx);
 
-        // Exact signed transport bytes are durable before this result can
-        // escape to a network caller.
-        self.record_sent_openmls_message(&wrapped, &commit_bytes, &group_id, source_epoch)?;
         evolution.phase = GroupEvolutionPhase::Prepared;
         evolution.signed_message_id = Some(wrapped.id.clone());
 
         let pending_ref = self.epoch_manager.next_pending_ref()?;
         evolution.pending_ref = Some(pending_ref);
-        self.maintenance_storage()?
-            .put_group_evolution(&evolution)?;
+        // A Prepared descriptor and its exact signed Commit/content marker
+        // are one staging unit. Preparing predates the transport await; the
+        // guards compensate that intent and native pending state on failure.
+        let content_id = self.storage.with_transaction(|storage| {
+            let content_id = self.persist_sent_openmls_message_with_application_stamp(
+                &wrapped,
+                &commit_bytes,
+                &group_id,
+                source_epoch,
+                None,
+            )?;
+            storage
+                .maintenance_storage()
+                .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))?
+                .put_group_evolution(&evolution)?;
+            Ok::<_, EngineError>(content_id)
+        })?;
         self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
@@ -235,6 +247,8 @@ impl<S: StorageProvider> Engine<S> {
             self.current_audit_context.clone(),
         )?;
         self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
+        self.sent_message_ids.insert(wrapped.id.clone());
+        self.sent_message_ids.insert(content_id);
         pending_commit_guard.disarm();
         preparation_guard.disarm();
 

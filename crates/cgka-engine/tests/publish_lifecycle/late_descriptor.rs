@@ -223,13 +223,18 @@ async fn assert_failed_descriptor_retry(disband: bool) {
         reopened.get_group(&group_id).unwrap().epoch,
         EpochId(before_epoch.0 + 1)
     );
-    assert!(
-        stored_mls_group(&reopened, &group_id)
-            .pending_commit()
-            .is_none()
-    );
+    let native = openmls::group::MlsGroup::load(
+        reopened.mls_storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap();
     if disband {
+        // Terminal settling deletes native MLS state while retaining the
+        // authenticated tombstone and former group projection.
+        assert!(native.is_none());
         assert!(reopened.disband_tombstone(&group_id).unwrap().is_some());
+    } else {
+        assert!(native.unwrap().pending_commit().is_none());
     }
     reopened.close().unwrap();
 }
