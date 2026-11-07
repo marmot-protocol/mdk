@@ -46,6 +46,8 @@ fn setup() -> (tempfile::TempDir, MarmotApp, ChatPresentationInput) {
         members: vec![account.account_id_hex, "bb".repeat(32)],
         avatar_url: None,
         avatar: None,
+        group_description: String::new(),
+        search_peer_names: Vec::new(),
     };
     (dir, app, input)
 }

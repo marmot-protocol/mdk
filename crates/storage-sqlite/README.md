@@ -93,12 +93,20 @@ A `ChatListViewQuery` is one of the four native `ChatListView`s plus an optional
 over stored chat facts and group-ID lists). It compiles to SQL appended to the view's condition, with every value
 bound as a parameter, and pages, counts and selects through the view's page index; each leaf is a row column or a
 keyed per-chat lookup, so cost grows with the view's chats, never with history. Queries are bounded (8 levels, 64
-nodes, 500 group IDs) and an over-bound query is a typed `ChatListQueryError` before any read.
+nodes, 500 group IDs, 1024 bytes of search text) and an over-bound query is a typed `ChatListQueryError` before any
+read.
 Conversation kind (`Direct`, `Group`) reads `chat_list_rows.list_kind`, which triggers keep equal to what the
 classifier derives from the row's group name and member count; an Unknown kind matches neither. `Muted` tests the
 mute settings against the read's `now_ms`, a bound parameter, so an expired mute needs no write; each read also
 evaluates every row's `muted` at that time. A window read whose query tests `Muted` reports the next mute expiry
 among the view's chats (`next_mute_expiry_ms`) so a live window can re-read then.
+A `Text` leaf matches `chat_list_rows.search_text`, which `store_chat_presentation` writes from the literal title,
+group name, description and the direct-chat peer names preparation passes in (`search_peer_names`); localized
+fallback titles are not searchable. Fields and query are normalized by `normalize_search_text` (trim, Unicode
+lowercase; user directory search uses the same function) and matched as a literal substring of one field with
+`instr`, so `%` and `_` are literal. While any chat in the view has pending presentation, a `Text` query is not ready
+(`ProjectionNotReady` from the selection calls, `SearchTextNotReady` from a window read);
+`chat_list_pending_search_text(view, limit)` lists those chats so a caller can prepare a batch and retry.
 `ChatListFilter::from_nodes` builds the tree from the bindings' flat node list. A `ChatListView` converts into the
 unfiltered query.
 

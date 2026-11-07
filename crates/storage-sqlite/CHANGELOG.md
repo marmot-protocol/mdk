@@ -6,6 +6,19 @@
   an invalid removal into a valid one (#3016). Validated removals retain their effect through pruning. Uncertain legacy
   removals preserve only already-hidden targets and cannot hide new targets; verified repair remains tracked in #3017.
 
+- Add a `Text` chat-list filter leaf (mdk#2983): a literal substring match, after trimming and Unicode lowercasing,
+  against the title, group name, description and a direct chat's peer profile names. Migration 0200 adds
+  `chat_list_rows.search_text`, written by `store_chat_presentation`; widens `chat_presentation_dependencies.roles`
+  with a search role so every eligible peer is a dependency; makes a group description change invalidate the row's
+  presentation; and invalidates every stored presentation once, so a text query is not ready until the account's
+  presentation worker has rewritten them. While any chat in the view has pending presentation, a `Text` query returns
+  `ProjectionNotReady` (selection) or the new `ChatListPageError::SearchTextNotReady` (window read); other queries are
+  unaffected. A presentation write that changes only the search text still advances the presentation revision. New:
+  `normalize_search_text` (shared with user directory search), `MAX_CHAT_LIST_FILTER_TEXT_BYTES` (1024, across all
+  leaves; `ChatListQueryError::TextTooLong`) and `chat_list_pending_search_text`. **Breaking:**
+  `ChatPresentationInput` adds `group_description` (captured) and `search_peer_names` (set by preparation), and
+  `ChatListFilter`, `ChatListFilterNode`, `ChatListQueryError` and `ChatListPageError` gain variants.
+
 - Add `Direct`, `Group` and `Muted` chat-list filter conditions (mdk#2983). Migration 0179 adds
   `chat_list_rows.list_kind`, kept equal to the classifier's conversation kind by triggers on the row's group name and
   the account group's member count, and backfills existing rows; an Unknown kind matches neither leaf. `Muted` tests

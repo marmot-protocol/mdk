@@ -9,6 +9,8 @@ use std::collections::HashSet;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChatListSelectionError {
+    /// Base rows, or for a `Text` query the view's presentation, are still
+    /// being prepared. Nothing partial was returned; retry later.
     #[error("chat-list base projection is not ready")]
     ProjectionNotReady,
     #[error(transparent)]
@@ -21,8 +23,9 @@ impl SqliteAppStorage {
     /// Every ID matching `query`, in display order, read in one transaction with
     /// the same compiled condition the live window pages through, before any
     /// display paging. The count is the length. Work and memory grow with the
-    /// view's chats, never with profile or history size. Pending base-row work
-    /// returns `ProjectionNotReady`, never a partial set. `now_ms` (Unix ms) is
+    /// view's chats, never with profile or history size. Pending base-row work,
+    /// or for a query with a `Text` leaf pending presentation anywhere in the
+    /// view, returns `ProjectionNotReady`, never a partial set. `now_ms` (Unix ms) is
     /// the time a `Muted` leaf tests mute expiry against.
     pub fn chat_list_ids(
         &self,
@@ -71,6 +74,14 @@ fn eligible_ids(
         )
         .storage()?;
     if missing_base {
+        return Err(ChatListSelectionError::ProjectionNotReady);
+    }
+    // Search text is written with presentation; a pending row could match.
+    if query.references_text()
+        && !super::query::pending_search_text(conn, query.view, 1)
+            .storage()?
+            .is_empty()
+    {
         return Err(ChatListSelectionError::ProjectionNotReady);
     }
     let sql = format!(

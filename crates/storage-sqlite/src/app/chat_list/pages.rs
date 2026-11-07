@@ -172,6 +172,10 @@ pub enum ChatListPageError {
     InvalidWindowQuery,
     #[error("chat anchor is absent or no longer matches the selected query")]
     AnchorUnavailable,
+    /// The query has a `Text` leaf and a chat in its view still has its
+    /// presentation (and so its search text) pending. Nothing was read.
+    #[error("chat-list search text is not ready")]
+    SearchTextNotReady,
     #[error(transparent)]
     InvalidQuery(#[from] ChatListQueryError),
     #[error(transparent)]

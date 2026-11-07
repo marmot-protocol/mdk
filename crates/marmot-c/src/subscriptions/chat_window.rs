@@ -567,6 +567,7 @@ mod tests {
                     children_len: children.len(),
                     group_ids: ptr::null(),
                     group_ids_len: 0,
+                    text: ptr::null(),
                 }
             };
         let not_unread = [
@@ -661,6 +662,30 @@ mod tests {
                 MarmotStatus::InvalidChatListQuery
             );
             assert!(window.is_null());
+            // A TEXT node reads `text`, trimmed and lowercased; it is required.
+            let search = CString::new(" oNE ").unwrap();
+            let mut text_node = [node(MarmotChatListFilterNodeKind::Text, 0, &[])];
+            text_node[0].text = search.as_ptr();
+            let text_query = MarmotChatListViewQuery {
+                filter: text_node.as_ptr(),
+                filter_len: text_node.len(),
+                ..query
+            };
+            assert_eq!(
+                marmot_chat_list_query_ids(&client, account.as_ptr(), &text_query, &mut list),
+                MarmotStatus::Ok
+            );
+            assert_eq!(strings(list), [groups[0].clone()]);
+            let null_text = [node(MarmotChatListFilterNodeKind::Text, 0, &[])];
+            let null_query = MarmotChatListViewQuery {
+                filter: null_text.as_ptr(),
+                ..text_query
+            };
+            assert_eq!(
+                marmot_chat_list_query_ids(&client, account.as_ptr(), &null_query, &mut list),
+                MarmotStatus::NullPointer
+            );
+            assert!(list.is_null());
             assert_eq!(
                 marmot_chat_list_query_ids(&client, account.as_ptr(), ptr::null(), &mut list),
                 MarmotStatus::NullPointer

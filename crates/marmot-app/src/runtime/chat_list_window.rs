@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 pub use storage_sqlite::{
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
     ChatListQueryError, ChatListView, ChatListViewQuery, MAX_CHAT_LIST_FILTER_DEPTH,
-    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES,
+    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES,
 };
 use storage_sqlite::{ChatListWindowQuery, ChatListWindowRead};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -188,6 +188,10 @@ struct Reader {
     /// Re-read on a draft change to any chat, not only visible ones, because
     /// the filter's matches depend on drafts.
     drafts_anywhere: bool,
+    /// Re-read on a profile change to anyone, because a `Text` filter's
+    /// matches depend on peer names. The read itself catches search text up
+    /// (`prepare_search_batch`), so this holds without an account worker.
+    profiles_anywhere: bool,
 }
 
 impl MarmotAppRuntime {
@@ -233,6 +237,7 @@ impl MarmotAppRuntime {
             account_id: account.account_id_hex,
             store_epoch: Vec::new(),
             drafts_anywhere: query.references(ChatListCondition::HasDraft),
+            profiles_anywhere: query.references_text(),
             query,
         };
         let position = Position {
@@ -357,6 +362,17 @@ impl Reader {
                 &storage.app_storage(),
                 &account_id,
             )?;
+            // A text query waits for search text across its whole view. Prepare
+            // one bounded batch of it here; the account worker does the rest.
+            if query.query.references_text() {
+                crate::chat_presentation::maintenance::prepare_search_batch(
+                    &app,
+                    &label,
+                    &storage,
+                    &account_id,
+                    query.query.view,
+                )?;
+            }
             let read = || storage.app_storage().read_chat_list_window(query.clone());
             let mut result = match read().inspect_err(|_| app.presentation_signals.wake()) {
                 Ok(result) => result,
@@ -410,7 +426,10 @@ impl Reader {
         .map_err(|error| match error {
             storage_sqlite::ChatListPageError::Storage(
                 cgka_traits::storage::StorageError::NotFound,
-            ) => AppError::ChatPresentationNotReady.into(),
+            )
+            | storage_sqlite::ChatListPageError::SearchTextNotReady => {
+                AppError::ChatPresentationNotReady.into()
+            }
             storage_sqlite::ChatListPageError::Storage(error) => AppError::Storage(error).into(),
             storage_sqlite::ChatListPageError::InvalidQuery(error) => {
                 AppError::InvalidChatListQuery(error).into()
@@ -505,7 +524,7 @@ impl Sources {
                 },
                 event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 profile = self.profiles.recv() => match profile {
-                    Ok(profile) if rows.iter().any(|r| {
+                    Ok(profile) if reader.profiles_anywhere || rows.iter().any(|r| {
                         r.row.last_message.as_ref().is_some_and(|m| {
                             m.sender.eq_ignore_ascii_case(&profile)
                                 || m.group_system.as_ref().is_some_and(|e| {

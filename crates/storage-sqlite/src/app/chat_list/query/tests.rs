@@ -218,6 +218,79 @@ fn ids_at(
     ids
 }
 
+/// The peer every `present` call with peer names selects.
+fn peer() -> String {
+    "bb".repeat(32)
+}
+
+/// Store a chat's presentation through the production writer, which writes its
+/// search text from `title` (`None`: a localized fallback), the stored group
+/// name and description, and `peer_names` (the peer's profile names, read by
+/// preparation; a `direct` seed). `group_avatar` selects a group avatar, so a
+/// peer is a dependency for search alone.
+fn present(
+    app: &SqliteAppStorage,
+    id: &str,
+    title: Option<&str>,
+    peer_names: &[&str],
+    group_avatar: bool,
+) {
+    use crate::{
+        ChatPresentationWrite, ConversationPresentation, PresentationResolution,
+        PresentationSource, PresentationText, SelectedAvatar, StoredChatPresentation,
+    };
+    let peer = (!peer_names.is_empty()).then(peer);
+    if let Some(peer) = &peer {
+        app.set_chat_presentation_members(id, &["aa".repeat(32), peer.clone()])
+            .unwrap();
+    }
+    let mut input = app.chat_presentation_input(id).unwrap().unwrap();
+    input.search_peer_names = peer_names.iter().map(|name| (*name).to_owned()).collect();
+    let avatar_source = if group_avatar {
+        PresentationSource::Group
+    } else {
+        PresentationSource::GroupFallback
+    };
+    let write = app
+        .store_chat_presentation(
+            &input,
+            &StoredChatPresentation {
+                presentation: ConversationPresentation {
+                    title: title.map_or(
+                        PresentationText::UnnamedGroup { member_count: None },
+                        |title| PresentationText::Literal(title.to_owned()),
+                    ),
+                    avatar: SelectedAvatar::Placeholder {
+                        stable_seed: id.to_owned(),
+                        source: avatar_source,
+                    },
+                    title_source: PresentationSource::Group,
+                    avatar_source,
+                    peer_id: peer,
+                    resolution: PresentationResolution::Cached,
+                },
+                profile_version: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(write, ChatPresentationWrite::Applied);
+}
+
+fn describe(store: &SqliteAccountStorage, id: &str, description: &str) {
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_groups SET profile_description = ?2 WHERE group_id_hex = ?1",
+            params![id, description],
+        )
+        .unwrap();
+}
+
+fn text(query: &str) -> ChatListFilter {
+    F::Text(query.to_owned())
+}
+
 fn cond(condition: ChatListCondition) -> ChatListFilter {
     F::Condition(condition)
 }
@@ -704,6 +777,142 @@ fn excluded_ids_win_and_included_ids_never_leave_the_view() {
     );
 }
 
+/// Search is a literal substring of the trimmed, Unicode-lowercased query in
+/// one trimmed, lowercased field: title, group name, description or a direct
+/// chat's peer profile names. Localized fallback titles have no text.
+#[test]
+fn text_leaf_matches_a_normalized_literal_substring_of_one_field() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for (id, facts) in [
+        ("01", &[][..]),
+        ("02", &[]),
+        ("03", &[]),
+        ("04", &[]),
+        ("05", &["direct", "named"]),
+        ("06", &[]),
+    ] {
+        seed(&store, id, facts);
+    }
+    ready(&store);
+    describe(&store, "01", "  Hiking\nand  Camping ");
+    present(&app, "01", Some("Weekend Plans"), &[], false);
+    present(&app, "02", Some("ÉCOLE Ölçü ΣΟΦΙΑ"), &[], false);
+    present(&app, "03", Some("100% done_now"), &[], false);
+    // An unnamed group's title is the host's localized fallback.
+    present(&app, "04", None, &[], false);
+    // A named direct chat shows its group name; its peer's names still match.
+    present(
+        &app,
+        "05",
+        Some("Team"),
+        &["Alice Liddell", "alice_l"],
+        true,
+    );
+    present(&app, "06", Some("Ordinary"), &[], false);
+    for (query, expected) in [
+        ("weekend", &["01"][..]),
+        ("WEEKEND", &["01"]),
+        ("  Weekend Plans \t", &["01"]),
+        ("end pl", &["01"]),
+        // Descriptions: trimmed, a line break reads as a space.
+        ("hiking and", &["01"]),
+        ("école", &["02"]),
+        ("ölçü", &["02"]),
+        ("σοφια", &["02"]),
+        // LIKE wildcards are literal.
+        ("%", &["03"]),
+        ("_", &["03", "05"]),
+        ("0% d", &["03"]),
+        ("e_n", &["03"]),
+        ("liddell", &["05"]),
+        ("ALICE_L", &["05"]),
+        ("team", &["05"]),
+        // No field spans another, so a query never matches across two.
+        ("planshiking", &[]),
+        ("plans\u{1f}hiking", &[]),
+        ("plans\nhiking", &[]),
+        ("unnamed", &[]),
+        ("", &[]),
+        ("   ", &[]),
+    ] {
+        let mut expected = expected.to_vec();
+        expected.sort();
+        let mut found = ids(&app, ChatListView::Chats, text(query));
+        found.sort();
+        assert_eq!(found, expected, "{query:?}");
+    }
+    // The peer is a dependency for search alone, so a profile change re-prepares
+    // the named chat even though neither its title nor its avatar uses the peer.
+    assert_eq!(
+        app.chat_presentation_dependents(&peer(), None).unwrap(),
+        ["05"]
+    );
+}
+
+/// While any chat in the view has its presentation, and so its search text,
+/// pending, every read of a `Text` query fails as not ready instead of
+/// returning a partial set. Queries without text, and views without pending
+/// rows, are unaffected.
+#[test]
+fn text_queries_are_not_ready_while_any_presentation_in_the_view_is_pending() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "01", &[]);
+    seed(&store, "02", &[]);
+    seed(&store, "03", &["archived"]);
+    seed(&store, "04", &["left"]);
+    ready(&store);
+    present(&app, "01", Some("Alpha"), &[], false);
+    present(&app, "04", Some("Alpha left"), &[], false);
+    let query = |view, filter| ChatListViewQuery {
+        view,
+        filter: Some(filter),
+    };
+    let not_ready = |view| {
+        let query = query(view, text("alpha"));
+        assert!(matches!(
+            app.chat_list_ids(query.clone(), NOW),
+            Err(ChatListSelectionError::ProjectionNotReady)
+        ));
+        assert!(matches!(
+            app.revalidate_chat_list_ids(query.clone(), &["01".to_owned()], NOW),
+            Err(ChatListSelectionError::ProjectionNotReady)
+        ));
+        assert!(matches!(
+            app.read_chat_list_window(crate::ChatListWindowQuery {
+                query,
+                limit: 10,
+                anchors: Vec::new(),
+                before_anchor: 0,
+                now_ms: NOW,
+            }),
+            Err(ChatListPageError::SearchTextNotReady)
+        ));
+    };
+    // 02 was never prepared; 03 is pending in another view.
+    not_ready(ChatListView::Chats);
+    not_ready(ChatListView::Archived);
+    assert_eq!(
+        app.chat_list_pending_search_text(ChatListView::Chats, 10)
+            .unwrap(),
+        ["02"]
+    );
+    assert_eq!(ids(&app, ChatListView::Left, text("alpha")), ["04"]);
+    assert_eq!(
+        app.chat_list_ids(query(ChatListView::Chats, cond(C::Active)), NOW)
+            .unwrap(),
+        ["01", "02"]
+    );
+    present(&app, "02", Some("Beta"), &[], false);
+    assert_eq!(ids(&app, ChatListView::Chats, text("alpha")), ["01"]);
+    // A description change invalidates the row until it is prepared again.
+    describe(&store, "02", "alpha team");
+    not_ready(ChatListView::Chats);
+    present(&app, "02", Some("Beta"), &[], false);
+    assert_eq!(ids(&app, ChatListView::Chats, text("alpha")), ["01", "02"]);
+}
+
 #[test]
 fn bounds_and_node_lists_fail_with_typed_errors_and_no_partial_result() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -729,6 +938,18 @@ fn bounds_and_node_lists_fail_with_typed_errors_and_no_partial_result() {
     assert_eq!(
         query(wide(MAX_CHAT_LIST_FILTER_NODES)).validate(),
         Err(ChatListQueryError::TooManyNodes)
+    );
+    // The text bound counts bytes across every leaf, before normalization.
+    let text_bytes =
+        |a: usize, b: usize| F::All(vec![text(&"é".repeat(a / 2)), text(&"x".repeat(b))]);
+    assert!(
+        query(text_bytes(MAX_CHAT_LIST_FILTER_TEXT_BYTES - 2, 2))
+            .validate()
+            .is_ok()
+    );
+    assert_eq!(
+        query(text_bytes(MAX_CHAT_LIST_FILTER_TEXT_BYTES - 2, 3)).validate(),
+        Err(ChatListQueryError::TextTooLong)
     );
     let id_list = |count: usize| F::GroupIds(vec!["01".to_owned(); count]);
     assert!(
@@ -807,6 +1028,10 @@ fn node_lists_decode_to_one_tree_or_a_typed_error() {
             group_ids(&["01"]),
         ])))
     );
+    assert_eq!(
+        ChatListFilter::from_nodes(vec![N::Not(1), N::Text("Plans".into())]),
+        Ok(Some(F::Not(Box::new(text("Plans")))))
+    );
     for (nodes, error) in [
         (
             vec![N::Any(vec![1, 5]), N::Condition(C::Unread)],
@@ -849,6 +1074,10 @@ fn node_lists_decode_to_one_tree_or_a_typed_error() {
             ],
             ChatListQueryError::TooManyGroupIds,
         ),
+        (
+            vec![N::Text("x".repeat(MAX_CHAT_LIST_FILTER_TEXT_BYTES + 1))],
+            ChatListQueryError::TextTooLong,
+        ),
     ] {
         assert_eq!(ChatListFilter::from_nodes(nodes), Err(error));
     }
@@ -877,6 +1106,7 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
         cond(C::Group),
         cond(C::Muted),
         F::Not(Box::new(group_ids(&["01"]))),
+        text("plans"),
     ]);
     for view in [
         ChatListView::Chats,
@@ -935,7 +1165,7 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
 
 /// Past the 200-row window cap, windows over a filtered query (each one read)
 /// tile exactly its select-all ID set, in order; the count is that length, and
-/// revalidating every chat keeps exactly that set.
+/// revalidating every chat keeps exactly that set. The query searches text too.
 #[test]
 fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -957,10 +1187,22 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
         // Muted DMs are dropped: some until after the read, some indefinitely,
         // and some whose mute expired exactly at the read's time (kept).
         let muted_direct = n % 3 == 0 && n % 5 < 2;
-        if n % 4 != 3 && !excluded.contains(&id.as_str()) && !muted_direct {
+        let titled = n % 7 != 6;
+        if n % 4 != 3 && !excluded.contains(&id.as_str()) && !muted_direct && titled {
             expected.push(id.clone());
         }
         seed(&store, &id, &facts);
+        present(
+            &app,
+            &id,
+            Some(&if titled {
+                format!("Weekly {n}")
+            } else {
+                format!("Other {n}")
+            }),
+            &[],
+            false,
+        );
         match n % 5 {
             0 => mute(&store, &id, Some(NOW + 1)),
             1 => mute(&store, &id, None),
@@ -976,6 +1218,7 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
             F::Any(vec![cond(C::Unread), cond(C::Pinned)]),
             F::Not(Box::new(group_ids(&excluded))),
             F::Not(Box::new(F::All(vec![cond(C::Direct), cond(C::Muted)]))),
+            text(" WEEK"),
         ])),
     };
     let all = app.chat_list_ids(query.clone(), NOW).unwrap();

@@ -199,8 +199,8 @@ pub use runtime::{
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
     ChatListQueryError, ChatListView, ChatListViewQuery, ChatListWindowError, ChatListWindowHandle,
     ChatListWindowSnapshot, MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS,
-    MAX_CHAT_LIST_FILTER_NODES, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
-    RuntimePresentedChatListSubscription,
+    MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES, PresentedChatListUpdate,
+    RuntimeChatListWindowSubscription, RuntimePresentedChatListSubscription,
 };
 pub use runtime::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,

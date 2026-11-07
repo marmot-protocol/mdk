@@ -62,6 +62,13 @@ impl SqliteAppStorage {
             if missing_base {
                 return Err(cgka_traits::storage::StorageError::NotFound.into());
             }
+            if query.query.references_text()
+                && !super::query::pending_search_text(conn, query.query.view, 1)
+                    .storage()?
+                    .is_empty()
+            {
+                return Err(ChatListPageError::SearchTextNotReady);
+            }
             let anchor = choose_anchor(conn, &query)?;
             let mut page = match &anchor {
                 Some(anchor) => {
@@ -185,6 +192,20 @@ impl SqliteAppStorage {
         })
     }
 }
+impl SqliteAppStorage {
+    /// Up to `limit` chats in `view` whose presentation is pending, the rows a
+    /// query with a `Text` leaf waits for. A caller may prepare these and retry.
+    pub fn chat_list_pending_search_text(
+        &self,
+        view: crate::ChatListView,
+        limit: usize,
+    ) -> cgka_traits::storage::StorageResult<Vec<String>> {
+        self.connection.with_deferred_read(|conn| {
+            super::query::pending_search_text(conn, view, limit).storage()
+        })
+    }
+}
+
 fn choose_anchor(
     conn: &Connection,
     query: &ChatListWindowQuery,

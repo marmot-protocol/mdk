@@ -126,13 +126,14 @@ non-blank text or an attachment; a last message showing a pending or failed send
 (an older unresolved send behind newer history does not count, as the row does
 not show it); conversation kind (direct or group, as the row's
 `conversation_kind` shows; a chat whose kind is still unknown matches neither);
-muted, as the row's `muted` shows at the time of the read; and a group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
+muted, as the row's `muted` shows at the time of the read; chat text; and a
+group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
 `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`, and an included ID
 never adds a chat outside the base view. An empty `All` matches every chat in the
-view and an empty `Any` none. Chat text, message text and people are later slices
-of #2983.
+view and an empty `Any` none. Message text and people are later slices of #2983.
 
-A query has at most 8 levels, 64 nodes and 500 group IDs in all. Over a bound, or
+A query has at most 8 levels, 64 nodes, 500 group IDs and 1024 bytes of search
+text in all. Over a bound, or
 with a malformed node list, every consumer fails with `InvalidChatListQuery`
 before reading; host group IDs are normalized like any other host group ID.
 
@@ -151,6 +152,38 @@ the presented row's kind. Mute is not a column: a mute has an expiry, so the
 and nothing is written when a mute expires. Each read evaluates the leaf and every
 row's `muted` at the same time, so they agree.
 
+Chat text is the `chat_list_rows.search_text` column, written with each stored
+presentation: the literal title, the group name, the description and, for a
+direct chat with an eligible peer, the peer's profile display name and name.
+Localized fallback titles (an unnamed group, an unavailable conversation) are the
+host's text, so they are not searchable. Each field and the query are normalized
+the way user directory search normalizes its query, by trimming and Unicode
+lowercasing (`storage_sqlite::normalize_search_text`), and the query matches as a
+literal substring of one field: `instr`, so `%` and `_` are ordinary characters,
+and fields are joined by a control character no field or query can contain.
+Text that is empty after trimming matches no chat. Accent and compatibility
+folding are not applied; adding them is a deliberate format change.
+
+The search text is only as current as the stored presentation. While any chat
+in the query's view has its presentation pending (never prepared, or invalidated
+by a name, description, avatar or membership change), a query with a text leaf
+is not ready, never a partial set: `chat_list_ids` and `revalidate_chat_list_ids`
+return `ChatPresentationNotReady`; opening a window waits, as it does for base
+rows; and an open window publishes `ChatPresentationNotReady` and retries. Before
+each such read the runtime runs a few bounded steps of the account's profile
+catch-up and prepares one batch of the view's pending rows, so a text read does
+not depend on a running account worker; catch-up still owed after those steps
+is reported as not ready too. Readiness is durable state, not the result of a
+step: no chat in the view has pending presentation, and the account's committed
+catch-up checkpoint has reached the shared directory's head. That holds because
+every stored presentation is written under a compare-and-set: on the chat's
+source revision for group fields and membership, and on the catch-up checkpoint
+for peer profiles, so a value prepared from a profile read before a catch-up
+step passed a change is refused and its chat stays pending. Queries without a
+text leaf never wait on presentation outside their window.
+Every eligible direct-chat peer is a presentation dependency, even under a group
+name, so a peer's profile change re-prepares the chat's search text.
+
 Every read is self-contained: each window read, `chat_list_ids` and
 `revalidate_chat_list_ids` runs in one read transaction, so filtered and fixed
 views behave alike. Storage keeps no cursor between reads. A window keeps its
@@ -162,7 +195,11 @@ a draft change wakes a window only when the chat is visible, unless the window's
 filter tests drafts, in which case any draft change in the account re-reads it.
 Mute expiry is not a change anything writes, so a window whose filter tests mute
 also wakes at the next mute expiry among the chats in its view, visible or not:
-a chat leaves or enters a muted window at its expiry.
+a chat leaves or enters a muted window at its expiry. A text window also re-reads
+on a profile change to anyone, and its read catches the search text up; every
+stored presentation change, including one that alters only the search text,
+advances the presentation revision every window re-reads on. So a profile or
+description change makes an off-screen chat enter or leave a text window.
 
 ## Select all
 

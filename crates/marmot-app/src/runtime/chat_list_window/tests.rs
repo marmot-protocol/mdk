@@ -1016,6 +1016,7 @@ async fn invalid_window_query_is_distinct_from_readiness() {
         store_epoch: vec![],
         query: ChatListView::Chats.into(),
         drafts_anywhere: false,
+        profiles_anywhere: false,
     };
     let result = reader
         .read(
@@ -1710,6 +1711,164 @@ async fn a_draft_filtered_window_rereads_on_an_off_screen_draft_change() {
     f.app.delete_message_draft("alice", "0003").unwrap();
     assert!(next(&mut window).await.rows.is_empty());
     f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A text window opens once the view's search text is ready, and when a peer
+/// renames, the chats that now match enter the window, though none was on
+/// screen before. No account worker runs here: the text read catches search
+/// text up itself, for a live window and for a one-shot ID read. A named
+/// direct chat, titled by its group name, matches by its peer's profile name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
+    // Every third chat is a direct chat with the same peer and no group name.
+    let f = Fixture::new(12);
+    f.mutate("0004", |group| group.profile_name = "Book club".into());
+    let query = filtered(ChatListFilter::Text("zebra".into()));
+    let mut window = f
+        .runtime
+        .open_chat_list_window("alice", query.clone(), Some(3))
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    let rename = |name: &str, created_at| {
+        f.app
+            .directory()
+            .save_directory_entry_for_test(&UserDirectoryRecord {
+                account_id_hex: "bb".repeat(32),
+                npub: "fixture".into(),
+                local_account: None,
+                profile: Some(UserProfileMetadata {
+                    name: Some(name.into()),
+                    created_at,
+                    ..Default::default()
+                }),
+                follows: vec![],
+                follow_source_relays: vec![],
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap()
+    };
+    rename("Zebra Crossing", 200);
+    let direct = ["0001", "0004", "0007", "000a"];
+    let updated = next_where(&mut window, |w| !w.rows.is_empty()).await;
+    let all = f
+        .runtime
+        .chat_list_ids("alice", query.clone())
+        .await
+        .unwrap();
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(sorted, direct);
+    assert_eq!(ids(&updated), all[..3]);
+    // An ID read straight after a rename sees it, whether or not the window
+    // has caught up yet.
+    rename("Yak", 300);
+    assert_eq!(
+        f.runtime.chat_list_ids("alice", query).await.unwrap(),
+        Vec::<String>::new()
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Search readiness follows the committed catch-up checkpoint, not a step's
+/// result: once a step has selected a renamed peer for fan-out, its chats are
+/// neither refreshed nor marked pending, and only the checkpoint shows the
+/// catch-up is still owed. A text read that lost that step to another caller
+/// must see the same.
+#[test]
+fn search_catch_up_is_owed_until_a_selected_peer_is_fanned_out() {
+    use crate::chat_presentation::maintenance::{maintain, search_catch_up_owed};
+    let f = Fixture::new(6);
+    let shared = f.app.shared_storage().unwrap();
+    let app = f.store.app_storage();
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    assert!(!search_catch_up_owed(&app, &shared).unwrap());
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: "bb".repeat(32),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    assert!(search_catch_up_owed(&app, &shared).unwrap());
+    assert!(maintain(&f.store, &shared, &f.account_id).unwrap());
+    assert!(
+        app.chat_presentation_checkpoint()
+            .unwrap()
+            .state
+            .active
+            .is_some()
+    );
+    assert!(
+        app.chat_list_pending_search_text(ChatListView::Chats, 100)
+            .unwrap()
+            .is_empty(),
+        "the selected peer's chats are not pending"
+    );
+    assert!(search_catch_up_owed(&app, &shared).unwrap());
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    assert!(!search_catch_up_owed(&app, &shared).unwrap());
+}
+
+/// A window's preparation stores nothing once the catch-up checkpoint has
+/// moved since it read profiles: the step that moved it may have passed a
+/// change to a peer the pending chat did not depend on yet. The chat stays
+/// pending and a fresh read stores it.
+#[test]
+fn a_window_batch_read_before_a_catch_up_step_is_read_again() {
+    use crate::chat_presentation::maintenance::{commit_window_batch, maintain, read_window_batch};
+    let f = Fixture::new(6);
+    let shared = f.app.shared_storage().unwrap();
+    let app = f.store.app_storage();
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    f.mutate("0001", |group| group.profile_name = "Pals".into());
+    let pending = || {
+        app.chat_list_pending_search_text(ChatListView::Chats, 100)
+            .unwrap()
+    };
+    assert_eq!(pending(), ["0001"]);
+    let batch = read_window_batch(&app, &shared, &f.account_id, &["0001".into()]).unwrap();
+    // Meanwhile another caller's catch-up step passes a directory change.
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: "cc".repeat(32),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    let checkpoint = app.chat_presentation_checkpoint().unwrap();
+    let mut next = checkpoint.state.clone();
+    next.revision = shared.directory_presentation_version().unwrap().revision;
+    assert!(
+        app.commit_chat_presentation_batch(&checkpoint, &next, &[])
+            .unwrap()
+    );
+    assert!(!commit_window_batch(&app, &batch).unwrap(), "read again");
+    assert_eq!(pending(), ["0001"]);
+    let batch = read_window_batch(&app, &shared, &f.account_id, &["0001".into()]).unwrap();
+    assert!(commit_window_batch(&app, &batch).unwrap());
+    assert!(pending().is_empty());
 }
 
 /// Chats enter and leave a filtered window as the filtered fact changes, the

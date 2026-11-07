@@ -373,9 +373,41 @@ mod tests {
             })
         ));
         assert!(matches!(
-            kit.open_chat_list_query_window(account, shared, None).await,
+            kit.open_chat_list_query_window(account.clone(), shared, None)
+                .await,
             Err(MarmotKitError::InvalidChatListQuery {
                 reason: ChatListQueryErrorFfi::SharedChild
+            })
+        ));
+        // A text node searches titles; its bound is a typed refusal.
+        let search = |text: String| ChatListViewQueryFfi {
+            view: ChatListViewFfi::Chats,
+            filter: vec![ChatListFilterNodeFfi::Text { text }],
+        };
+        let found = kit
+            .chat_list_query_ids(account.clone(), search(" tWO ".into()))
+            .await
+            .unwrap();
+        let window = kit
+            .open_chat_list_query_window(account.clone(), search(" tWO ".into()), None)
+            .await
+            .unwrap();
+        let rows = window.snapshot().unwrap().rows;
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.row.group_id_hex.clone())
+                .collect::<Vec<_>>(),
+            found
+        );
+        assert!(matches!(
+            &rows[..],
+            [row] if matches!(&row.presentation.title, PresentationTextFfi::Literal { text } if text == "Two")
+        ));
+        assert!(matches!(
+            kit.chat_list_query_ids(account, search("x".repeat(1025)))
+                .await,
+            Err(MarmotKitError::InvalidChatListQuery {
+                reason: ChatListQueryErrorFfi::TextTooLong
             })
         ));
         kit.runtime.shutdown_and_close().await.unwrap();

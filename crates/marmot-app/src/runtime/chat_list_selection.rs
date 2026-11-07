@@ -26,14 +26,17 @@ impl MarmotAppRuntime {
     /// A fixed view (`ChatListView`) is a query without a filter. The window
     /// pages through the same compiled query, so list, count and selection agree.
     /// The set is complete or the call fails: while base rows are still being
-    /// prepared it returns `ChatPresentationNotReady`, and the caller retries.
+    /// prepared, or for a `Text` filter while any chat in the view still has
+    /// presentation pending, it returns `ChatPresentationNotReady`, and the
+    /// caller retries.
     pub async fn chat_list_ids(
         &self,
         account_ref: &str,
         query: impl Into<ChatListViewQuery>,
     ) -> Result<Vec<String>, AppError> {
         let query = prepare_query(query)?;
-        self.read_selection(account_ref, move |storage, now_ms| {
+        let search_view = query.references_text().then_some(query.view);
+        self.read_selection(account_ref, search_view, move |storage, now_ms| {
             storage.chat_list_ids(query, now_ms)
         })
         .await
@@ -55,15 +58,19 @@ impl MarmotAppRuntime {
             .iter()
             .map(|id| crate::ids::normalize_group_id_hex_app(id))
             .collect::<Result<Vec<_>, _>>()?;
-        self.read_selection(account_ref, move |storage, now_ms| {
+        let search_view = query.references_text().then_some(query.view);
+        self.read_selection(account_ref, search_view, move |storage, now_ms| {
             storage.revalidate_chat_list_ids(query, &group_ids, now_ms)
         })
         .await
     }
 
+    /// `search_view` is the view of a query with a `Text` leaf, whose pending
+    /// presentation gets one bounded batch of preparation before the read.
     async fn read_selection(
         &self,
         account_ref: &str,
+        search_view: Option<storage_sqlite::ChatListView>,
         read: impl FnOnce(&SqliteAppStorage, i64) -> Result<Vec<String>, ChatListSelectionError>
         + Send
         + 'static,
@@ -79,13 +86,23 @@ impl MarmotAppRuntime {
             {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
-            let storage = app.account_storage(&account.label)?.app_storage();
+            let account_storage = app.account_storage(&account.label)?;
+            let storage = account_storage.app_storage();
             // Legacy/imported accounts can lack base rows. Repair one bounded
             // batch here, as the window does; the rest is "not ready".
             crate::chat_presentation::maintenance::prepare_base_rows(
                 &storage,
                 &account.account_id_hex,
             )?;
+            if let Some(view) = search_view {
+                crate::chat_presentation::maintenance::prepare_search_batch(
+                    &app,
+                    &account.label,
+                    &account_storage,
+                    &account.account_id_hex,
+                    view,
+                )?;
+            }
             read(&storage, now_ms).map_err(|error| match error {
                 ChatListSelectionError::ProjectionNotReady => AppError::ChatPresentationNotReady,
                 ChatListSelectionError::InvalidQuery(error) => {

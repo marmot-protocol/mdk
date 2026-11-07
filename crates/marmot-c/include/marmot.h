@@ -6053,6 +6053,10 @@ typedef struct MarmotChatListFilterNode {
    */
   const char *const *group_ids;
   uintptr_t group_ids_len;
+  /**
+   * For TEXT: the search text, NUL-terminated UTF-8.
+   */
+  const char *text;
 } MarmotChatListFilterNode;
 
 /**

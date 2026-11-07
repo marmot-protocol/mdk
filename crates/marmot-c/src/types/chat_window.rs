@@ -136,6 +136,7 @@ c_enum! {
         ChildNotAfterParent,
         SharedChild,
         UnreachableNode,
+        TextTooLong,
     }
 }
 c_enum! {
@@ -151,6 +152,8 @@ c_enum! {
         Condition,
         /// The chat's group ID is in `group_ids` (hex, any case).
         GroupIds,
+        /// The chat's searchable text contains `text` (trimmed, lowercased).
+        Text,
     }
 }
 
@@ -168,6 +171,8 @@ pub struct MarmotChatListFilterNode {
     /// For GROUP_IDS: the listed group IDs.
     pub group_ids: *const *const c_char,
     pub group_ids_len: usize,
+    /// For TEXT: the search text, NUL-terminated UTF-8.
+    pub text: *const c_char,
 }
 
 /// Borrowed chat-list query: a view narrowed by an optional filter. A NULL
@@ -227,6 +232,9 @@ impl MarmotChatListViewQuery {
                         group_ids: unsafe {
                             crate::memory::str_array(node.group_ids, node.group_ids_len)
                         }?,
+                    },
+                    MarmotChatListFilterNodeKind::Text => ChatListFilterNodeFfi::Text {
+                        text: unsafe { crate::memory::required_str(node.text) }?,
                     },
                 })
             })

@@ -38,7 +38,7 @@ fn prepare(
 ) -> Result<Vec<(ChatPresentationInput, StoredChatPresentation)>, AppError> {
     inputs
         .into_iter()
-        .map(|input| {
+        .map(|mut input| {
             let peer = presentation_peer(&input, local);
             let (profile, version) = if let Some(peer) = &peer {
                 let evidence = shared.directory_presentation(peer)?;
@@ -70,6 +70,7 @@ fn prepare(
             };
             let presentation =
                 select_chat_presentation(&input, local, peer.as_deref().zip(profile.as_ref()));
+            input.search_peer_names = super::search_peer_names(&presentation, profile.as_ref());
             Ok((
                 input,
                 StoredChatPresentation {
@@ -193,20 +194,153 @@ fn commit_progress(
 
 /// Prepare only missing selections required by a bounded screen window. This does
 /// not advance the account-wide catch-up checkpoint or wait for unrelated rows.
+/// A batch whose checkpoint moved while it was prepared is read again, up to
+/// [`WINDOW_PREPARE_ATTEMPTS`] times; rows it could not store stay pending.
 pub(crate) fn prepare_window(
     account: &SqliteAppStorage,
     shared: &SqliteSharedStorage,
     local: &str,
     groups: &[String],
 ) -> Result<(), AppError> {
-    let epoch = shared.directory_presentation_version()?.store_epoch;
-    for group in groups {
-        let Some(input) = account.chat_presentation_input(group)? else {
-            continue;
-        };
-        for (input, selected) in prepare(shared, local, &epoch, vec![input])? {
-            account.store_chat_presentation(&input, &selected)?;
+    for chunk in groups.chunks(CHAT_PRESENTATION_BATCH_LIMIT) {
+        for _ in 0..WINDOW_PREPARE_ATTEMPTS {
+            let batch = read_window_batch(account, shared, local, chunk)?;
+            if commit_window_batch(account, &batch)? {
+                break;
+            }
         }
+    }
+    Ok(())
+}
+
+/// Attempts per window batch when the catch-up checkpoint moves under it.
+const WINDOW_PREPARE_ATTEMPTS: usize = 3;
+
+/// One window batch, prepared from profiles read after `checkpoint`.
+pub(crate) struct WindowBatch {
+    checkpoint: storage_sqlite::ChatPresentationCheckpoint,
+    epoch: Vec<u8>,
+    values: Vec<(ChatPresentationInput, StoredChatPresentation)>,
+}
+
+pub(crate) fn read_window_batch(
+    account: &SqliteAppStorage,
+    shared: &SqliteSharedStorage,
+    local: &str,
+    groups: &[String],
+) -> Result<WindowBatch, AppError> {
+    // Captured before any profile is read; see `commit_window_batch`.
+    let checkpoint = account.chat_presentation_checkpoint()?;
+    let epoch = shared.directory_presentation_version()?.store_epoch;
+    let mut inputs = Vec::with_capacity(groups.len());
+    for group in groups {
+        if let Some(input) = account.chat_presentation_input(group)? {
+            inputs.push(input);
+        }
+    }
+    let values = prepare(shared, local, &epoch, inputs)?;
+    Ok(WindowBatch {
+        checkpoint,
+        epoch,
+        values,
+    })
+}
+
+/// Store a window batch only if the catch-up checkpoint has not moved since
+/// its profiles were read. A pending chat has no profile dependencies, so a
+/// catch-up step can pass a change to its peer without touching it; a value
+/// read before that change and stored after it would never be revisited.
+/// Returns false when the checkpoint moved and the batch should be read again.
+pub(crate) fn commit_window_batch(
+    account: &SqliteAppStorage,
+    batch: &WindowBatch,
+) -> Result<bool, AppError> {
+    if batch.checkpoint.state.shared_epoch != batch.epoch {
+        // The catch-up has not adopted this directory yet. Adopting it starts a
+        // pass that re-reads every chat's current profile, and a store never
+        // moves a chat's profile version back.
+        for (input, value) in &batch.values {
+            account.store_chat_presentation(input, value)?;
+        }
+        return Ok(true);
+    }
+    if account.commit_chat_presentation_batch(
+        &batch.checkpoint,
+        &batch.checkpoint.state,
+        &batch.values,
+    )? {
+        return Ok(true);
+    }
+    // Nothing applied: either every value was stale or unchanged (done), or
+    // the checkpoint moved (read again).
+    Ok(account.chat_presentation_checkpoint()?.generation == batch.checkpoint.generation)
+}
+
+/// Whether the account's committed catch-up checkpoint is behind the shared
+/// directory: profile changes some chat's stored search text may not reflect
+/// yet. Pending rows are checked by the storage read itself.
+pub(crate) fn search_catch_up_owed(
+    account: &SqliteAppStorage,
+    shared: &SqliteSharedStorage,
+) -> Result<bool, AppError> {
+    let state = account.chat_presentation_checkpoint()?.state;
+    let head = shared.directory_presentation_version()?;
+    // A peer selected for fan-out holds `revision` back until its chats are
+    // rewritten, so the revision covers it.
+    Ok(state.shared_epoch != head.store_epoch
+        || state.reconciling
+        || state.revision != head.revision)
+}
+
+/// Catch-up steps a text read runs before reporting "not ready".
+const SEARCH_CATCH_UP_STEPS: usize = 4;
+
+/// Bring the search text a query over `view` matches up to date, in bounded
+/// work, so a text read never needs a running account worker: a few steps of
+/// the account-wide profile catch-up (`maintain`), then one batch of the rows
+/// pending in the view. The storage read reports pending rows as not ready;
+/// catch-up still owed after these steps is reported here as
+/// `ChatPresentationNotReady`, and the caller's retry continues it.
+///
+/// Readiness comes from the committed checkpoint ([`search_catch_up_owed`]),
+/// not from `maintain`'s result: `false` there also means another caller won
+/// the checkpoint, possibly before it refreshed the rows it selected.
+pub(crate) fn prepare_search_batch(
+    app: &crate::MarmotApp,
+    label: &str,
+    account: &SqliteAccountStorage,
+    local: &str,
+    view: storage_sqlite::ChatListView,
+) -> Result<(), AppError> {
+    let shared = app.shared_storage()?;
+    let app_storage = account.app_storage();
+    let before = app_storage.chat_presentation_version()?;
+    for _ in 0..SEARCH_CATCH_UP_STEPS {
+        if !search_catch_up_owed(&app_storage, &shared)? {
+            break;
+        }
+        maintain(account, &shared, local)?;
+    }
+    let owed = search_catch_up_owed(&app_storage, &shared)?;
+    let pending = app_storage.chat_list_pending_search_text(view, CHAT_PRESENTATION_BATCH_LIMIT)?;
+    let prepared = prepare_window(&app_storage, &shared, local, &pending);
+    if owed || !pending.is_empty() {
+        app.presentation_signals.wake();
+    }
+    let after = app_storage.chat_presentation_version()?;
+    if after != before {
+        // Other windows re-read rows this step rewrote.
+        let _ = app
+            .presentation_signals
+            .updates
+            .send(super::signals::PresentationInvalidation {
+                account_label: label.to_owned(),
+                version: after,
+            });
+    }
+    prepared?;
+    if owed {
+        return Err(AppError::ChatPresentationNotReady);
     }
     Ok(())
 }

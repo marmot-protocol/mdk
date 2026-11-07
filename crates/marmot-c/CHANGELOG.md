@@ -16,6 +16,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_installed_custom_emoji` and `marmot_read_installed_custom_emoji` now read off the runtime's workers while
   blocking. Use the matching header and library.
 
+- Add the `Text` filter node kind (5), read from the new trailing `MarmotChatListFilterNode.text` field (borrowed,
+  NUL-terminated UTF-8, required for that kind), and append `TextTooLong` (7) to `MarmotChatListQueryError`
+  (mdk#2983). Existing discriminants are unchanged, but the node struct grows: rebuild against the regenerated
+  `marmot.h` and use the matching library, and set `text` (NULL is fine) for other kinds.
+
 - Append `Direct` (13), `Group` (14) and `Muted` (15) to the `MarmotChatListCondition` discriminants a filter node
   carries (mdk#2983). Existing values are unchanged. Use the matching library.
 

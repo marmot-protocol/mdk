@@ -111,6 +111,12 @@ pub struct ChatPresentationInput {
     pub members: Vec<String>,
     pub avatar_url: Option<String>,
     pub avatar: Option<ChatListAvatar>,
+    /// The group's description, searchable with the title.
+    pub group_description: String,
+    /// Not captured: preparation sets the eligible peer's profile names
+    /// (display name, name) from its cached profile, so a direct chat is
+    /// found by them even when a group name is its title. Empty without a peer.
+    pub search_peer_names: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatPresentationRead {
@@ -271,6 +277,23 @@ impl SqliteAppStorage {
         {
             return Err(invalid("presentation peer is not in captured roster"));
         }
+        if value.presentation.peer_id.is_none() && !input.search_peer_names.is_empty() {
+            return Err(invalid("presentation search names without a peer"));
+        }
+        // Localized fallback titles are chosen by the host, so only literal
+        // titles are searchable.
+        let title = match &value.presentation.title {
+            PresentationText::Literal(title) => Some(title.as_str()),
+            PresentationText::UnnamedGroup { .. } | PresentationText::UnavailableConversation => {
+                None
+            }
+        };
+        let search_text = crate::app::chat_list::search_text::chat_search_text(
+            title
+                .into_iter()
+                .chain([input.group_name.as_str(), input.group_description.as_str()])
+                .chain(input.search_peer_names.iter().map(String::as_str)),
+        );
         self.connection.with_transaction(|| {
             let checkpoint = self.chat_presentation_checkpoint()?;
             if !checkpoint.state.shared_epoch.is_empty()
@@ -282,9 +305,9 @@ impl SqliteAppStorage {
                 return Ok(ChatPresentationWrite::Stale);
             }
             let conn = self.lock()?;
-            let existing: Option<(Option<Vec<u8>>, i64)> = conn
+            let existing: Option<(Option<Vec<u8>>, i64, String)> = conn
                 .query_row(
-                    "SELECT r.presentation_json, r.presentation_applied_source_revision
+                    "SELECT r.presentation_json, r.presentation_applied_source_revision, r.search_text
                  FROM chat_list_rows r CROSS JOIN chat_presentation_meta m
                  WHERE r.group_id_hex = ?1 AND r.presentation_source_revision = ?2
                    AND m.id = 1 AND m.store_epoch = ?3 AND r.presentation_row_epoch = ?4",
@@ -294,11 +317,11 @@ impl SqliteAppStorage {
                         input.source_version.store_epoch,
                         input.row_epoch,
                     ],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .storage()?;
-            let Some((existing, applied_revision)) = existing else {
+            let Some((existing, applied_revision, old_search_text)) = existing else {
                 return Ok(ChatPresentationWrite::Stale);
             };
             if existing.as_ref() == Some(&bytes)
@@ -327,14 +350,18 @@ impl SqliteAppStorage {
                     return Ok(ChatPresentationWrite::Stale);
                 }
             }
+            // A search-only change still bumps the revision, so live windows
+            // filtering by text re-read.
             let changed = old
                 .as_ref()
-                .is_none_or(|old| old.value.presentation != value.presentation);
+                .is_none_or(|old| old.value.presentation != value.presentation)
+                || old_search_text != search_text;
             conn.execute_cached(
                 "UPDATE chat_list_rows SET presentation_json = ?2,
-                    presentation_applied_source_revision = presentation_source_revision
+                    presentation_applied_source_revision = presentation_source_revision,
+                    search_text = ?3
                  WHERE group_id_hex = ?1",
-                params![input.group_id_hex, bytes],
+                params![input.group_id_hex, bytes, search_text],
             )
             .storage()?;
             if changed {
@@ -358,16 +385,16 @@ impl SqliteAppStorage {
                 presentation.avatar_source,
                 PresentationSource::PeerProfile | PresentationSource::PeerFallback
             );
-            if let Some(peer) = &presentation.peer_id
-                && (title || avatar)
-            {
+            // Every eligible peer's profile names are searchable, so a peer
+            // always carries the search role (4), even under a group name.
+            if let Some(peer) = &presentation.peer_id {
                 conn.execute_cached(
                     "INSERT INTO chat_presentation_dependencies(group_id_hex, member_id_hex, roles)
                      VALUES (?1, ?2, ?3)",
                     params![
                         input.group_id_hex,
                         peer,
-                        i64::from(title) + 2 * i64::from(avatar)
+                        i64::from(title) + 2 * i64::from(avatar) + 4
                     ],
                 )
                 .storage()?;
@@ -618,7 +645,7 @@ pub(crate) fn presentation_input_tx(
                 a.image_media_type,
                 (SELECT component_data_hex FROM account_group_app_components c
                  WHERE c.group_id_hex = a.group_id_hex AND c.component_id = ?2),
-                r.presentation_row_epoch, a.self_membership
+                r.presentation_row_epoch, a.self_membership, a.profile_description
          FROM chat_list_rows r JOIN account_groups a ON a.group_id_hex = r.group_id_hex
          CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
             params![group, GROUP_AVATAR_URL_COMPONENT_ID],
@@ -653,6 +680,8 @@ pub(crate) fn presentation_input_tx(
                     members: Vec::new(),
                     avatar_url: crate::app::chat_list::decoded_avatar_url(component.as_deref()),
                     avatar,
+                    group_description: row.get(12)?,
+                    search_peer_names: Vec::new(),
                 })
             },
         )
