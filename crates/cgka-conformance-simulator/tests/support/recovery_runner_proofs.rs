@@ -5,8 +5,8 @@
 //! one store and publish the production NIP-11 document.
 //!
 //! The runner owns recovery with both native backward-paging entry points
-//! disabled. Gate-off control builds retain them. Assertions require positive
-//! runner work and wire evidence, exact visible timelines and bounded holds.
+//! disabled. Assertions require positive runner work and wire evidence, exact
+//! visible timelines and bounded holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -60,8 +60,6 @@ const OWED_BURSTS: usize = 4;
 /// Tail-drain allowance after backlog recovery and after sending stops.
 /// Earlier live messages may wait for the affected group's older backlog.
 const LIVE_HELD_AT_MOST: Duration = Duration::from_secs(60);
-const UPGRADE_MESSAGES: usize = 2_000;
-const BEFORE_UPGRADE: Duration = Duration::from_secs(60);
 /// Past every member's push join window: two minutes it could fetch, which
 /// the worker counts every 15 seconds, plus the 15 seconds it watches a
 /// catch-up settle. Each member announces once when its window ends.
@@ -75,13 +73,6 @@ const FENCE_RELEASE: Duration = Duration::from_secs(30);
 /// group is stranded: its live message waits for the runner's next attempt
 /// once history returns, 30 seconds after an unreachable one.
 const STRANDED_RELEASE: Duration = Duration::from_secs(60);
-
-/// The frozen comparison driver sets this only for the signed old-owner
-/// control. Missing runner evidence never selects control behavior by itself:
-/// default/new-owner runs must still obtain every positive runner verdict.
-fn old_owner_control() -> bool {
-    std::env::var("MDK_RECOVERY_PROOF_CONTROL").as_deref() == Ok("old-owner")
-}
 
 fn clients() -> Vec<String> {
     let named = ["alice", "bob"].into_iter().chain(SENDERS);
@@ -631,34 +622,6 @@ mod runner_trace {
     pub(super) fn now_ms() -> u64 {
         let started = STARTED.get_or_init(Instant::now);
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Conversion rows captured before the first attempt in this phase.
-    pub(super) fn conversion_before_first_attempt(from: u64) -> Vec<Value> {
-        let events = EVENTS.lock().expect("runner trace lock");
-        events
-            .iter()
-            .filter(|event| event["at_ms"].as_u64() >= Some(from))
-            .take_while(|event| {
-                !matches!(
-                    event["method"].as_str(),
-                    Some("attempt_started" | "quantum" | "recheck")
-                )
-            })
-            .filter(|event| event["method"] == "conversion")
-            .cloned()
-            .collect()
-    }
-
-    pub(super) fn first_attempt_started(from: u64) -> Option<Value> {
-        EVENTS
-            .lock()
-            .expect("runner trace lock")
-            .iter()
-            .find(|event| {
-                event["at_ms"].as_u64() >= Some(from) && event["method"] == "attempt_started"
-            })
-            .cloned()
     }
 
     /// Every captured event, admissions included, in `[from, to)` on the
@@ -1485,22 +1448,12 @@ async fn run_proof<J>(label: &str, journey: J) -> Value
 where
     J: AsyncFnOnce(&mut AppRuntimeHarness, &Path) -> TestResult<Value>,
 {
-    run_proof_with_owner_mode(label, true, journey).await
-}
-
-async fn run_proof_with_owner_mode<J>(label: &str, owns: bool, journey: J) -> Value
-where
-    J: AsyncFnOnce(&mut AppRuntimeHarness, &Path) -> TestResult<Value>,
-{
     let artifacts = journey_artifacts(label);
     let clients = clients();
     runner_trace::start().expect("capture the runner's trace");
-    let mut subject = if owns {
-        AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
-    } else {
-        AppRuntimeHarness::new_with_relay_pair_owner_mode(&clients, &clients[1..2], false).await
-    }
-    .expect("runner proof harness setup");
+    let mut subject = AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2])
+        .await
+        .expect("runner proof harness setup");
     let outcome = tokio::time::timeout(WATCHDOG, journey(&mut subject, artifacts.path()))
         .await
         .unwrap_or_else(|_| {
@@ -1857,7 +1810,6 @@ async fn stalled_relay_loop_case(case: LoopCase) {
 ///   the quiet group are never held behind it.
 pub(super) async fn owed_history() {
     let report = run_proof("runner-owed-history", async |subject, out| {
-        let control = old_owner_control();
         let started = Instant::now();
         let clients = clients();
         let pair = clients[..2].to_vec();
@@ -1910,7 +1862,7 @@ pub(super) async fn owed_history() {
         // finish; neither the initial empty status nor a prior survey proves it.
         let (mut drained, mut reported_caught_up) = (None, None);
         let mut drained_trace = None;
-        while drained.is_none() || (!control && reported_caught_up.is_none()) {
+        while drained.is_none() || reported_caught_up.is_none() {
             if t0.elapsed() >= RECOVERY_DEADLINE {
                 break;
             }
@@ -1973,7 +1925,7 @@ pub(super) async fn owed_history() {
             let history = history_since(subject, &reconnect_clocks).await?;
             resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
             Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route)
-                && (control || caught_up(&bob, trace_reconnect).await?))
+                && caught_up(&bob, trace_reconnect).await?)
         };
         let left = RESWEEP_DEADLINE.saturating_sub(reconnected.elapsed());
         let resweep_result = wait_for("the reconnect's re-sweep", left, resweeps).await;
@@ -1998,7 +1950,6 @@ pub(super) async fn owed_history() {
         let restart_bursts = per_endpoint(&after_restart, |requests| bursts(requests).len() as u64);
         let proof = json!({
             "owed_messages": OWED_MESSAGES,
-            "old_owner_control": control,
             "backlog_publish_seconds": backlog_seconds,
             "restart": {
                 "native_paging_requests_per_endpoint": native_pages(&after_restart),
@@ -2185,151 +2136,6 @@ pub(super) async fn ordered_backlog_regression() {
     })
     .await;
     assert_eq!(report["exact_after_reopen"], true);
-}
-
-/// Proof 4, the upgrade end to end: the earlier owner plans the debt and
-/// leaves its rows, then bob opens with the runner owning debt, 5g converts
-/// those rows before the runner's first start, and the runner alone finishes
-/// the debt.
-///
-/// 5d's fixtures are storage-only (synthetic routes and relays, no account or
-/// MLS state), so a runtime cannot open them; 5d's storage tests convert
-/// every row kind of both. Here the earlier owner writes its rows the way a
-/// nightly build does: bob restarts owing 2,000 events with the gate off
-/// while history goes unanswered, so the earlier owner plans the debt and
-/// cannot finish it.
-pub(super) async fn upgrade() {
-    let report = run_proof_with_owner_mode("runner-upgrade", false, async |subject, out| {
-        let control = old_owner_control();
-        let started = Instant::now();
-        let clients = clients();
-        let busy = create(subject, "busy", &clients).await?;
-        let created = Instant::now();
-        settle_maintenance(subject, &clients, std::slice::from_ref(&busy)).await?;
-        note(started, "group created and settled");
-
-        // Before the upgrade: the earlier owner plans the debt, against
-        // history no endpoint answers. Any group message that reaches it
-        // then is live input ahead of that history: once it opens one more
-        // than 100 generations past a sender's oldest owed message, that
-        // sender's older messages can never be opened, by any owner. The
-        // earlier owner takes such input after its page times out, so the
-        // fixture lets no group traffic reach it: every member's push
-        // announce goes out first, and the whole backlog is on the relay
-        // before bob opens.
-        tokio::time::sleep(JOIN_ANNOUNCES.saturating_sub(created.elapsed())).await;
-        wait_group_quiet(subject, SETTLEMENT).await?;
-        note(started, "every member announced");
-        subject.set_online("bob", false).await?;
-        let mut expected = payloads(&publish(subject, &busy, "owed-", UPGRADE_MESSAGES).await?);
-        wait_lanes_published(subject, &busy, "owed-", UPGRADE_MESSAGES, SETTLEMENT).await?;
-        let backlog = wait_group_quiet(subject, SETTLEMENT).await?;
-        for endpoint in 0..2 {
-            subject.stall_relay_history(endpoint, true).await?;
-        }
-        subject.set_online("bob", true).await?;
-        tokio::time::sleep(BEFORE_UPGRADE).await;
-        let bob = subject.probe("bob")?;
-        let (_, chat) = bob.chat_view(&busy, None).await?;
-        let owed_at_upgrade = UPGRADE_MESSAGES.saturating_sub(chat.iter().filter(|text| text.starts_with("owed-")).count());
-        subject.set_online("bob", false).await?;
-        let reached_earlier_owner = group_messages(subject).await?.saturating_sub(backlog);
-        if reached_earlier_owner > 0 {
-            return Err(format!(
-                "{reached_earlier_owner} group messages reached the earlier owner ahead of its unanswered history"
-            )
-            .into());
-        }
-        for endpoint in 0..2 {
-            subject.stall_relay_history(endpoint, false).await?;
-        }
-        note(started, "the earlier owner left its rows");
-
-        // The upgrade: the runner owns the debt from this open on.
-        subject.set_runner_owns_debt(true);
-        let clocks = relay_clocks(subject).await?;
-        let (t0, trace_from) = (Instant::now(), runner_trace::now_ms());
-        subject.set_online("bob", true).await?;
-        let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
-        let live = Live::start(alice, bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
-        let (mut drained, mut reported_caught_up) = (None, None);
-        while (drained.is_none() || (!control && reported_caught_up.is_none())) && t0.elapsed() < RECOVERY_DEADLINE {
-            if drained.is_none() {
-                let (_, chat) = bob.chat_view(&busy, None).await?;
-                if chat.iter().filter(|text| text.starts_with("owed-")).count() == UPGRADE_MESSAGES {
-                    drained = Some(t0.elapsed().as_secs_f64());
-                }
-            }
-            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob, trace_from).await? {
-                reported_caught_up = Some(t0.elapsed().as_secs_f64());
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-        let (live_sent, live_visibility) = live.finish().await?;
-        expected.extend(live_sent);
-        let exact = holds_exactly(&bob, &busy, &expected).await?;
-        let (_, chat) = bob.chat_view(&busy, None).await?;
-        let owed_visible_at_end = chat.iter().filter(|text| text.starts_with("owed-")).count();
-        let history = history_since(subject, &clocks).await?;
-        let trace = runner_trace::since(trace_from);
-        let capture_pages = native_pages(&history);
-        let conversion = runner_trace::conversion_before_first_attempt(trace_from);
-        let first_attempt_started = runner_trace::first_attempt_started(trace_from);
-
-        let converted_rows = conversion.iter().map(|row| ["pending", "parked", "dismissed", "settled"]
-            .iter().filter_map(|field| row[*field].as_u64()).sum::<u64>()).sum::<u64>();
-        let status = bob.account_recovery_status().await?;
-        let proof = json!({
-            "first_attempt_started": first_attempt_started,
-            "conversion_before_first_attempt": conversion,
-            "converted_obligations": converted_rows,
-            "owed_messages": UPGRADE_MESSAGES,
-            "old_owner_control": control,
-            "owed_at_upgrade": owed_at_upgrade,
-            "owed_visible_seconds": drained,
-            "owed_visible_at_end": owed_visible_at_end,
-            "runner_caught_up_seconds": reported_caught_up,
-            "timeline_exact": exact,
-            "live_visibility_ms": live_visibility,
-            "native_paging_requests_per_endpoint": capture_pages,
-            "runner": runner_summary(&trace),
-            "history": history.iter().map(|requests| history_summary(requests, &BTreeMap::new())).collect::<Vec<_>>(),
-            "status_at_end": status,
-        });
-        let labels = BTreeMap::from([(bob.nostr_route(&busy).await?.ok_or("bob holds no busy route")?, "busy".to_owned())]);
-        save(out, "history.json", &labeled(&history, &labels))?;
-        save(out, "conversion.json", &conversion)?;
-        save(out, "runner-trace.json", &trace)?;
-        let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
-        if first_attempt_started.is_none() || converted_rows == 0 {
-            return failure("no nonzero conversion was recorded before the first runner attempt");
-        }
-        if owed_at_upgrade == 0 {
-            return failure("nothing was owed at the upgrade, so it proves nothing");
-        }
-        if drained.is_none() || !exact {
-            return failure("the owed group did not finish exactly after the upgrade");
-        }
-        if !live_complete(&live_visibility) {
-            return failure("live messages failed or were lost after the upgrade");
-        }
-        if reported_caught_up.is_none() {
-            return failure("the runner never reported the account caught up");
-        }
-        if advancing(&trace) == 0 {
-            return failure("the runner did not work the converted debt");
-        }
-        // The rest holds only once 5g converts the rows and turns capture off.
-        if capture_pages.iter().any(|pages| *pages > 0) {
-            return failure("a native backward pager still supplied history after the upgrade");
-        }
-        if !status.notices.is_empty() {
-            return failure("a converted notice outlived the debt it named");
-        }
-        Ok(json!({"proof": proof}))
-    })
-    .await;
-    assert_eq!(report["proof"]["timeline_exact"], true);
 }
 
 /// Observe the actual packed live reply on Bob's own connections before

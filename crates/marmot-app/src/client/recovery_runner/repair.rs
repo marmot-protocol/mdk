@@ -1,6 +1,6 @@
-//! Explicit repair through the runner (mdk#2660 phase 4, plan row 6), behind
-//! the internal `runner_owns_debt` gate: one request the account's runner
-//! owns from start to verdict, judged from the ledger with today's verdicts.
+//! Explicit repair through the runner (mdk#2660 phase 4, plan row 6): one
+//! request the account's runner owns from start to verdict, judged from the
+//! ledger with today's verdicts.
 //!
 //! - **The request.** The caller refreshes its routes, then hands the runner
 //!   one repair ([`RecoveryRunner::repair`]) under a [`PassBound`]: the
@@ -52,8 +52,7 @@ use crate::{
 
 impl AppClient {
     /// Whether explicit repair runs through a runner: `spawned`, the worker's,
-    /// or this client's in-place one. Only with the internal `runner_owns_debt`
-    /// gate on.
+    /// or this client's in-place one.
     pub(crate) fn repairs_through_runner(&self, spawned: Option<&SpawnedRunner>) -> bool {
         spawned.is_some() || self.has_in_place_recovery_runner()
     }

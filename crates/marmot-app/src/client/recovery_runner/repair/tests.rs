@@ -3,7 +3,7 @@
 //! a step boundary, then passes until the window is covered
 //! (`BelowRetentionWindow`), the runner can serve nothing (`CoverageUnproven`),
 //! the budget ends (`Deadline`) or the caller stops waiting (`Cancelled`).
-//! With the gate off the repair keeps today's path.
+//! A client with no runner proves nothing (`CoverageUnproven`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,10 +73,9 @@ impl QueryPolicy for Sweeps {
 }
 
 /// One account with one group on a local relay whose sweeps `sweeps`
-/// governs, its client opened directly with the gate as given.
+/// governs, its client opened directly.
 async fn client(
     sweeps: &Sweeps,
-    gate: bool,
 ) -> (
     tempfile::TempDir,
     LocalRelay,
@@ -97,9 +96,7 @@ async fn client(
     );
     // The quiet group's own empty live REQ would prove the history these
     // tests owe, so its replies are ones the wire tap cannot vouch for.
-    let app = app
-        .with_recovery_runner_ownership_for_test(gate)
-        .with_unvouched_relay_replies_for_test();
+    let app = app.with_unvouched_relay_replies_for_test();
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("repair", &[]).await.unwrap();
     let route = client
@@ -157,7 +154,7 @@ fn cover_inbox(client: &AppClient, storage: &SqliteAppStorage) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_re_arms_and_covers_the_window_then_ends_below_it() {
     let sweeps = Sweeps::default();
-    let (_dir, _relay, mut client, storage, route) = client(&sweeps, true).await;
+    let (_dir, _relay, mut client, storage, route) = client(&sweeps).await;
     assert!(client.repairs_through_runner(None));
     let relay = client
         .recovery_runner_routes()
@@ -212,7 +209,7 @@ async fn a_repair_re_arms_and_covers_the_window_then_ends_below_it() {
 /// repair re-arms it too, rather than ending unproven before it retries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_serves_a_unit_that_was_backing_off() {
-    let (_dir, _relay, mut client, storage, route) = client(&Sweeps::default(), true).await;
+    let (_dir, _relay, mut client, storage, route) = client(&Sweeps::default()).await;
     let relay = client
         .recovery_runner_routes()
         .into_iter()
@@ -246,7 +243,7 @@ async fn a_repair_serves_a_unit_that_was_backing_off() {
 /// as one that will not compare does, while the group is covered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_inbox_is_never_a_covered_window() {
-    let (_dir, _relay, client, storage, route) = client(&Sweeps::default(), true).await;
+    let (_dir, _relay, client, storage, route) = client(&Sweeps::default()).await;
     let now = unix_now_seconds();
     let routes = client.recovery_runner_routes();
     storage
@@ -310,7 +307,7 @@ async fn a_refused_inbox_is_never_a_covered_window() {
 /// certify a window with unadmitted work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unadmitted_staged_event_is_never_a_covered_window() {
-    let (_dir, _relay, client, storage, route) = client(&Sweeps::default(), true).await;
+    let (_dir, _relay, client, storage, route) = client(&Sweeps::default()).await;
     let now = unix_now_seconds();
     let routes = client.recovery_runner_routes();
     storage
@@ -410,7 +407,7 @@ fn unadmitted(route: &TransportReconciliationRoute, at: u64) -> cgka_traits::Tra
 /// the relay unreachable, and the next serves nothing while it cools down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_the_runner_cannot_serve_is_coverage_unproven() {
-    let (_dir, relay, mut client, _, _) = client(&Sweeps::default(), true).await;
+    let (_dir, relay, mut client, _, _) = client(&Sweeps::default()).await;
     relay.shutdown();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
@@ -430,7 +427,7 @@ async fn a_cancelled_repair_gives_its_open_attempt_back() {
         hold: true,
         ..Sweeps::default()
     };
-    let (_dir, _relay, mut client, storage, _) = client(&sweeps, true).await;
+    let (_dir, _relay, mut client, storage, _) = client(&sweeps).await;
     cover_inbox(&client, &storage);
     let before = charged(&storage);
     let stop = Arc::new(AtomicBool::new(false));
@@ -462,7 +459,7 @@ async fn a_repair_whose_budget_ends_mid_quantum_meets_its_deadline() {
         hold: true,
         ..Sweeps::default()
     };
-    let (_dir, _relay, mut client, storage, _) = client(&sweeps, true).await;
+    let (_dir, _relay, mut client, storage, _) = client(&sweeps).await;
     cover_inbox(&client, &storage);
     let result = client
         .repair_full_history_through_runner(&|| false, Duration::from_secs(2), None)
@@ -479,7 +476,7 @@ async fn a_repair_behind_a_step_waiting_on_a_credit_meets_its_deadline() {
     use crate::runtime::account_worker::recovery_credits::{
         hold_all_credits_for_test, private_recovery_credit_pool_for_test,
     };
-    let (_dir, _relay, mut client, storage, route) = client(&Sweeps::default(), true).await;
+    let (_dir, _relay, mut client, storage, route) = client(&Sweeps::default()).await;
     cover_inbox(&client, &storage);
     storage
         .widen_recovery_coverage_goals(std::slice::from_ref(&route), unix_now_seconds() - DAY)
@@ -532,7 +529,7 @@ async fn a_cancelled_worker_repair_settles_its_quantum_before_it_answers() {
         hold: true,
         ..Sweeps::default()
     };
-    let (_dir, _relay, mut client, storage, route) = client(&sweeps, true).await;
+    let (_dir, _relay, mut client, storage, route) = client(&sweeps).await;
     cover_inbox(&client, &storage);
     // A newly joined copy owes only its standing window before explicit
     // repair widens it to retention. Cover that window so this test's first
@@ -625,7 +622,7 @@ async fn a_worker_repair_re_arms_after_the_quantum_in_flight_settles() {
         refuse_first: true,
         ..Sweeps::default()
     };
-    let (_dir, _relay, mut client, storage, route) = client(&sweeps, true).await;
+    let (_dir, _relay, mut client, storage, route) = client(&sweeps).await;
     cover_inbox(&client, &storage);
     storage
         .widen_recovery_coverage_goals(std::slice::from_ref(&route), unix_now_seconds() - DAY)
@@ -720,20 +717,58 @@ fn a_cancel_wins_over_a_covered_window_and_a_covered_window_over_the_deadline() 
 /// A caller already cancelled re-arms nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_cancelled_before_it_starts_re_arms_nothing() {
-    let (_dir, _relay, mut client, storage, _) = client(&Sweeps::default(), true).await;
+    let (_dir, _relay, mut client, storage, _) = client(&Sweeps::default()).await;
     let units = storage.recovery_units().unwrap().len();
     let result = client.repair_full_history_cancellable(&|| true, None).await;
     assert_eq!(reason(result), Reason::Cancelled);
     assert_eq!(storage.recovery_units().unwrap().len(), units);
 }
 
-/// With the gate off a repair keeps today's path: no runner, no re-arm.
+/// A repair on a client that never built a runner, as a worker's before its
+/// ownership preparation succeeds, touches no unit: a parked unit stays
+/// parked behind its notice, and nothing can prove the repair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repair_with_the_gate_off_runs_no_runner() {
-    let (_dir, _relay, mut client, storage, _) = client(&Sweeps::default(), false).await;
-    assert!(!client.repairs_through_runner(None));
-    let _ = client
-        .repair_full_history_cancellable(&|| false, None)
-        .await;
-    assert!(storage.recovery_units().unwrap().is_empty());
+async fn a_repair_before_any_runner_re_arms_nothing() {
+    let (_dir, _relay, client, storage, route) = client(&Sweeps::default()).await;
+    let relay = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|candidate| candidate.route == route)
+        .unwrap()
+        .required
+        .remove(0);
+    let now = unix_now_seconds();
+    storage
+        .begin_recovery_unit_attempt(&route, &relay, None, now)
+        .unwrap();
+    storage
+        .settle_recovery_unit(
+            &route,
+            &relay,
+            RecoveryUnitOutcome::Refused,
+            &RecoveryRunnerPolicy::default().unit,
+            now,
+        )
+        .unwrap();
+    let app = client.app.clone();
+    app.relay_plane
+        .deactivate_account_context(client.adapter.account_id())
+        .await
+        .unwrap();
+    drop(client);
+    let mut local = app
+        .local_client_with_relay_plane("alice", &app.relay_plane, None)
+        .await
+        .unwrap();
+    assert!(!local.repairs_through_runner(None));
+    let units = storage.recovery_units().unwrap();
+    assert_eq!(local.history_notices().unwrap().len(), 1);
+
+    let result = local.repair_full_history_cancellable(&|| false, None).await;
+    assert_eq!(reason(result), Reason::CoverageUnproven);
+    assert!(
+        storage.recovery_units().unwrap() == units,
+        "no unit re-armed"
+    );
+    assert_eq!(local.history_notices().unwrap().len(), 1);
 }

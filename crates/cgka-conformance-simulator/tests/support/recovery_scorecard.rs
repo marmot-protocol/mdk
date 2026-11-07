@@ -834,15 +834,6 @@ fn print_table(report: &Value) {
 }
 
 pub(super) async fn run() {
-    run_with(false).await;
-}
-
-/// The same workload with bob's recovery runner owning history debt.
-pub(super) async fn run_runner_owning_debt() {
-    run_with(true).await;
-}
-
-async fn run_with(runner_owns_debt: bool) {
     // Opt-in tracing for the in-process subject, for example
     // `MDK_SCORECARD_TRACE=marmot_app::relay_plane=warn`. Other participants
     // run in their own processes and are not traced.
@@ -853,22 +844,11 @@ async fn run_with(runner_owns_debt: bool) {
             .with_writer(std::io::stderr)
             .try_init();
     }
-    let (label, owner) = if runner_owns_debt {
-        (
-            "scorecard-runner",
-            "recovery runner, both native backward pagers disabled",
-        )
-    } else {
-        ("scorecard", "earlier recovery owner")
-    };
-    let artifacts = journey_artifacts(label);
+    let artifacts = journey_artifacts("scorecard");
     let clients = clients();
-    let subject = if runner_owns_debt {
-        AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
-    } else {
-        AppRuntimeHarness::new_with_relay_pair_owner_mode(&clients, &clients[1..2], false).await
-    };
-    let mut subject = subject.expect("scorecard harness setup");
+    let mut subject = AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2])
+        .await
+        .expect("scorecard harness setup");
     save(
         artifacts.path(),
         "execution-layout.json",
@@ -884,7 +864,8 @@ async fn run_with(runner_owns_debt: bool) {
         report["workload"]["relays"] =
             json!("two endpoints of one relay process over one retained store");
         report["workload"]["source_commit"] = json!(std::env::var("GITHUB_SHA").ok());
-        report["workload"]["history_owner"] = json!(owner);
+        report["workload"]["history_owner"] =
+            json!("recovery runner, both native backward pagers disabled");
         let (before, after) = (
             &report["telemetry"]["before"],
             &report["telemetry"]["after"],
@@ -936,16 +917,14 @@ async fn run_with(runner_owns_debt: bool) {
         close_errors.is_empty(),
         "runtime close failed: {close_errors:?}"
     );
-    if runner_owns_debt {
-        assert!(
-            report["native_paging_requests_per_endpoint"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|count| count.as_u64() == Some(0)),
-            "a native backward pager supplied the runner-only scorecard"
-        );
-    }
+    assert!(
+        report["native_paging_requests_per_endpoint"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|count| count.as_u64() == Some(0)),
+        "a native backward pager supplied the scorecard"
+    );
     // Correctness assertions: within the deadline the missing commit is
     // applied and the later messages decrypt, and every gap chat message is
     // present exactly once. Performance targets are only recorded.

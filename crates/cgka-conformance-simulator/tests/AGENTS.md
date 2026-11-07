@@ -33,10 +33,11 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
     `support/recovery_scorecard.rs` holds the report-only large-account recovery scorecard: it asserts
     recovery correctness only and records latency, per-relay traffic and idle downloads in `scorecard.json`.
-    It runs with either history owner, and records bob's per-endpoint history requests too.
+    It measures the recovery runner, and records bob's per-endpoint history requests too.
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and 5,000 owed events through a restart, an idle window and a
-    reconnect, upgrade conversion before the first quantum, and counted/empty per-REQ fences across two restarts.
+    reconnect, and counted/empty per-REQ fences across two restarts. Upgrade conversion before the first quantum
+    is owned by marmot-app's host tests.
     The named 6,000-event ordered-backlog regression retains the captured three-sender failure, competing live
     input, exact visible history and full account reopen. Failed proofs preserve their stopped fixture privately.
     Bob runs in process with both native backward pagers disabled; zero unlimited history windows witnesses that

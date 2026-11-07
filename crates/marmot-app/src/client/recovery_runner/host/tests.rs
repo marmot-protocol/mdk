@@ -31,19 +31,15 @@ use crate::unix_now_seconds;
 const HOUR: u64 = 60 * 60;
 const DAY: u64 = 24 * HOUR;
 
-/// One account on a real relay, its client opened directly, with the
-/// internal gate as given.
-async fn direct_client(gate: bool) -> (tempfile::TempDir, MockRelay, crate::MarmotApp, AppClient) {
+/// One account on a real relay, its client opened directly.
+async fn direct_client() -> (tempfile::TempDir, MockRelay, crate::MarmotApp, AppClient) {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
-    let (dir, app, client) = direct_client_on(url, gate).await;
+    let (dir, app, client) = direct_client_on(url).await;
     (dir, relay, app, client)
 }
 
-async fn direct_client_on(
-    url: String,
-    gate: bool,
-) -> (tempfile::TempDir, crate::MarmotApp, AppClient) {
+async fn direct_client_on(url: String) -> (tempfile::TempDir, crate::MarmotApp, AppClient) {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
@@ -53,7 +49,6 @@ async fn direct_client_on(
         url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
-    let app = app.with_recovery_runner_ownership_for_test(gate);
     let client = app.client("alice").await.unwrap();
     (dir, app, client)
 }
@@ -139,17 +134,6 @@ fn woken(wake: &mut watch::Receiver<u64>) -> bool {
     changed
 }
 
-/// With the gate off, a directly owned client runs no runner and its sync
-/// passes nothing to one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_direct_client_runs_no_runner_with_the_gate_off() {
-    let (_dir, _relay, _app, mut client) = direct_client(false).await;
-    assert!(!client.has_in_place_recovery_runner());
-    client.sync().await.unwrap();
-    assert!(client.run_recovery_runner_pass().await.is_none());
-    assert!(matches!(client.recovery_runner, RunnerSeat::Absent));
-}
-
 /// Read through the real account host's debt turn, then publish the production
 /// survey to the same status watch the runner uses. No relay work is scripted.
 async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Survey {
@@ -221,7 +205,6 @@ async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
         ..
     } = fixture_on(
         vec!["wss://a.example".into()],
-        true,
         None,
         Some(Duration::from_secs(120)),
     )
@@ -277,7 +260,6 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
         relay: _relay,
     } = fixture_on(
         vec!["wss://a.example".into(), "wss://b.example".into()],
-        false,
         None,
         Some(Duration::from_secs(120)),
     )
@@ -328,7 +310,7 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
 
     // Open on the existing plane, without network maintenance: the goal must
     // exist before transport activation or any epoch-gap demand can supply it.
-    let reopened = app
+    let mut reopened = app
         .local_client_with_relay_plane("alice", &app.relay_plane, None)
         .await
         .unwrap();
@@ -351,24 +333,12 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
             .all(|demand| demand.cause != RecoveryCause::IncrementalHistory),
         "ledger widening must not start the old owner's history job"
     );
-    let off = reopened.account_recovery_status().unwrap();
-    assert!(off.catching_up_group_ids_hex.is_empty());
-    assert!(!off.inbox_catching_up);
-    assert!(off.notices.is_empty());
+    // Nothing is surveyed before the runner's first turn.
+    let opened = reopened.account_recovery_status().unwrap();
+    assert!(opened.catching_up_group_ids_hex.is_empty());
+    assert!(!opened.inbox_catching_up);
+    assert!(opened.notices.is_empty());
 
-    // A real takeover stops the old account context before installing the
-    // new policy; switching an already active adapter is deliberately refused.
-    let enabled_app = reopened.app.clone().with_recovery_runner_owning_debt();
-    enabled_app
-        .relay_plane
-        .deactivate_account_context(reopened.adapter.account_id())
-        .await
-        .unwrap();
-    drop(reopened);
-    let mut reopened = enabled_app
-        .local_client_with_relay_plane("alice", &enabled_app.relay_plane, None)
-        .await
-        .unwrap();
     reactivate_client(&mut reopened).await;
     let counts = reopened.recovery_runner_live_counts().await.counts;
     let group_counts = counts
@@ -442,7 +412,6 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
         relay: _relay,
     } = fixture_on(
         vec!["wss://a.example".into()],
-        true,
         None,
         Some(Duration::from_secs(120)),
     )
@@ -502,7 +471,7 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
 /// are each swept once over the account's own relay pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_direct_clients_pass_serves_each_due_unit_once() {
-    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let (_dir, _relay, app, mut client) = direct_client().await;
     assert!(client.has_in_place_recovery_runner());
     client.sync().await.unwrap();
     assert_eq!(passes(&client), 1, "an explicit sync runs one pass");
@@ -575,7 +544,7 @@ async fn a_crash_before_the_inventory_write_readmits_the_held_message() {
     client.sync().await.unwrap();
     drop(client);
     app.relay_plane.shutdown().await;
-    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone(), true).await;
+    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone()).await;
     let group = alice
         .create_group_with_options(
             "crash",
@@ -693,7 +662,6 @@ fn process_app(dir: &std::path::Path, url: &str) -> crate::MarmotApp {
         url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
-    .with_recovery_runner_ownership_for_test(true)
 }
 
 /// One `wn sync` process: a fresh direct client syncs once and exits.
@@ -731,7 +699,7 @@ async fn one_shot_syncs_read_what_their_pass_released() {
     drop(client);
     app.relay_plane.shutdown().await;
 
-    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone(), true).await;
+    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone()).await;
     let group = alice
         .create_group_with_options(
             "one shot",
@@ -798,7 +766,6 @@ async fn failed_route_goal_writes(failed_steps: usize) {
         ..
     } = fixture_on(
         vec!["wss://a.example".into()],
-        true,
         None,
         Some(Duration::from_secs(120)),
     )
@@ -918,7 +885,6 @@ async fn unreadable_welcome_metadata_never_widens_the_goal() {
         relay: _relay,
     } = fixture_on(
         vec!["wss://a.example".into()],
-        true,
         None,
         Some(Duration::from_secs(120)),
     )
@@ -975,7 +941,7 @@ async fn unreadable_welcome_metadata_never_widens_the_goal() {
 /// in place when it meets delivery loss, after the recovery it already runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_direct_clients_next_event_runs_a_pass_on_delivery_loss() {
-    let (_dir, _relay, _app, mut client) = direct_client(true).await;
+    let (_dir, _relay, _app, mut client) = direct_client().await;
     client.sync().await.unwrap();
     assert_eq!(passes(&client), 1);
     client.discard_spilled_deliveries(&[]).unwrap();
@@ -992,7 +958,7 @@ async fn held_client(
 ) -> (tempfile::TempDir, LocalRelay, AppClient, SqliteAppStorage) {
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(hold.clone()));
     relay.run().await.unwrap();
-    let (dir, app, mut client) = direct_client_on(relay.url().await.to_string(), true).await;
+    let (dir, app, mut client) = direct_client_on(relay.url().await.to_string()).await;
     client.create_group("held", &[]).await.unwrap();
     let storage = app.account_storage("alice").unwrap().app_storage();
     // A loss owes the last hour: the quiet group's live REQ, which its relay
@@ -1045,7 +1011,7 @@ async fn a_stopped_runner_settles_the_quantum_it_preempted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_epoch_gap_reopens_covered_history_once_and_atomically() {
     use crate::client::recovery_coverage::scenario_tests::{fixture_on, relay, routes};
-    let fixture = fixture_on(vec![relay()], true, Some(1), None).await;
+    let fixture = fixture_on(vec![relay()], Some(1), None).await;
     let client = &fixture.client;
     let app = fixture.storage.app_storage();
     let routes = routes(client);
@@ -1245,8 +1211,7 @@ async fn a_runner_turn_records_into_the_accounts_audit() {
         dir.path(),
         relay.url().await.to_string(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    )
-    .with_recovery_runner_owning_debt();
+    );
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
     let mut client = app.client("alice").await.unwrap();
@@ -1292,7 +1257,7 @@ fn passed() -> tokio::time::Instant {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_whose_settle_never_comes_refunds_the_attempt() {
     const RELAY: &str = "wss://slow.example";
-    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let (_dir, _relay, app, mut client) = direct_client().await;
     let storage = app.account_storage("alice").unwrap().app_storage();
     let route = TransportReconciliationRoute::Group([9; 32]);
     let key = UnitKey {
@@ -1314,7 +1279,7 @@ async fn a_stop_whose_settle_never_comes_refunds_the_attempt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settle_sent_by_the_stops_deadline_beats_the_refund() {
     const RELAY: &str = "wss://settled.example";
-    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let (_dir, _relay, app, mut client) = direct_client().await;
     let storage = app.account_storage("alice").unwrap().app_storage();
     let route = TransportReconciliationRoute::Group([9; 32]);
     let key = UnitKey {
@@ -1518,6 +1483,37 @@ async fn each_chokepoint_wakes_the_runner() {
     assert!(woken(&mut wake), "a dismissal");
 }
 
+/// Until the account's runner is built, nothing keeps route changes: a
+/// worker builds its runner only once ownership preparation succeeds, and a
+/// directly owned client seats one only after its open. A group given no
+/// route before then leaves nothing for a later settle to retire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_route_changes_are_kept_before_the_runner_is_built() {
+    let (_dir, _relay, app, mut client) = direct_client().await;
+    let group = client.create_group("untracked", &[]).await.unwrap();
+    app.relay_plane
+        .deactivate_account_context(client.adapter.account_id())
+        .await
+        .unwrap();
+    drop(client);
+    let local = app
+        .local_client_with_relay_plane("alice", &app.relay_plane, None)
+        .await
+        .unwrap();
+    assert!(!local.has_in_place_recovery_runner());
+    assert!(
+        local
+            .routing
+            .snapshot()
+            .group_routes
+            .iter()
+            .any(|route| route.group_id == group),
+        "the reopened client holds the group's route"
+    );
+    local.routing.replace_group_routes(&group, Vec::new());
+    assert!(local.routing.take_route_changes().is_none());
+}
+
 /// A relay a group's own route replacement drops retires as route gone at
 /// the runner's next debt turn, once the turn confirms it: the group still
 /// has a route that no longer lists the relay. A group emptied for a while,
@@ -1527,7 +1523,7 @@ async fn each_chokepoint_wakes_the_runner() {
 async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
     use cgka_traits::TransportEndpoint;
     use storage_sqlite::{RecoverySpanRetirement, RecoveryUnitState};
-    let (_dir, _relay, app, mut client) = direct_client(true).await;
+    let (_dir, _relay, app, mut client) = direct_client().await;
     let group = client.create_group("gone", &[]).await.unwrap();
     let storage = app.account_storage("alice").unwrap().app_storage();
     let installed = client
@@ -1629,21 +1625,12 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
     );
 }
 
-/// With the gate off no runner tracks route changes, so nothing is kept.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_route_changes_are_kept_with_the_gate_off() {
-    let (_dir, _relay, _app, mut client) = direct_client(false).await;
-    let group = client.create_group("untracked", &[]).await.unwrap();
-    client.routing.replace_group_routes(&group, Vec::new());
-    assert!(client.routing.take_route_changes().is_none());
-}
-
 /// A repair whose request settles well past its deadline, as an interrupted
 /// one may for its grace, ends on the deadline: its caller never trips the
 /// stop that only a cancel may, so it is not `Cancelled`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repair_past_its_deadline_is_never_cancelled_by_its_caller() {
-    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let (_dir, _relay, _app, mut client) = direct_client().await;
     let bound = PassBound::within(Duration::from_millis(100));
     let (_sender, mut turns) = tokio::sync::mpsc::channel::<RunnerTurn>(1);
     let ends = bound.clone();
@@ -1667,7 +1654,7 @@ async fn a_repair_past_its_deadline_is_never_cancelled_by_its_caller() {
 /// does, over the covered window the runner answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_during_the_verdict_beats_the_covered_window_the_runner_answered() {
-    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let (_dir, _relay, _app, mut client) = direct_client().await;
     let bound = PassBound::within(Duration::from_secs(60));
     let (_sender, mut turns) = tokio::sync::mpsc::channel::<RunnerTurn>(1);
     let cancelled = std::sync::atomic::AtomicBool::new(false);
@@ -1689,7 +1676,7 @@ async fn a_cancel_during_the_verdict_beats_the_covered_window_the_runner_answere
 /// the repair is `Cancelled`, not the `Deadline` the runner would answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_after_the_deadline_armed_the_backstop_still_preempts() {
-    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let (_dir, _relay, _app, mut client) = direct_client().await;
     let bound = PassBound::within(Duration::ZERO);
     let (_sender, mut turns) = tokio::sync::mpsc::channel::<RunnerTurn>(1);
     let ends = bound.clone();
@@ -1716,7 +1703,7 @@ async fn a_cancel_after_the_deadline_armed_the_backstop_still_preempts() {
 /// seen, and the runner ends on the stop it trips.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_run_of_turns_never_starves_a_repairs_cancel() {
-    let (_dir, _relay, _app, mut client) = direct_client(false).await;
+    let (_dir, _relay, _app, mut client) = direct_client().await;
     let bound = PassBound::within(Duration::from_secs(60));
     let (sender, mut turns) = tokio::sync::mpsc::channel(1);
     let stop = bound.stop.clone();
@@ -1766,7 +1753,6 @@ async fn runner_loss_handoff_restores_the_guard_after_reclaim_failure() {
         ..
     } = fixture_on(
         vec!["wss://a.example".into()],
-        true,
         None,
         Some(Duration::from_secs(120)),
     )
@@ -1866,4 +1852,135 @@ async fn runner_loss_handoff_restores_the_guard_after_reclaim_failure() {
             .is_empty(),
         "handoff is debt, never recovered coverage"
     );
+}
+
+/// The upgrade from a build before the runner owned history: the old owner's
+/// pending queue loss converts into its routes' debt before the runner takes
+/// any step, and the runner alone covers that debt with real sweeps, leaving
+/// no notice behind. The relay's replies are ones the wire tap cannot vouch
+/// for, so no live REQ proves the debt in the runner's place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_accounts_old_loss_converts_before_the_runner_covers_it() {
+    // The earliest second the account owes: each route's debt on each
+    // required relay up to that relay's live tail, as a debt turn reads it.
+    // The live subscription proves the tail itself.
+    async fn owed_from(client: &AppClient, storage: &SqliteAppStorage) -> Option<u64> {
+        let now = unix_now_seconds();
+        let tails = client.recovery_runner_live_tails(storage, now).await;
+        let mut earliest = None::<u64>;
+        for route in client.recovery_runner_routes() {
+            for relay in &route.required {
+                let until = tails.owed_until(&route.route, relay, now);
+                for range in storage
+                    .recovery_unit_debt(&route.route, relay, until)
+                    .unwrap()
+                {
+                    earliest = Some(
+                        earliest.map_or(range.since_seconds, |at: u64| at.min(range.since_seconds)),
+                    );
+                }
+            }
+        }
+        earliest
+    }
+    async fn cover(client: &mut AppClient, storage: &SqliteAppStorage) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while owed_from(client, storage).await.is_some() {
+                client
+                    .run_recovery_runner_pass()
+                    .await
+                    .expect("an in-place runner");
+            }
+        })
+        .await
+        .expect("the runner covers what the account owes");
+    }
+    let queue_loss = |storage: &SqliteAppStorage| {
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|demand| demand.cause == RecoveryCause::QueueLoss)
+    };
+
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        relay.url().await.to_string(),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_unvouched_relay_replies_for_test();
+    let mut client = app.client("alice").await.unwrap();
+    client.create_group("upgrade", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    // The new group's own history first, so what the reopen owes is the
+    // conversion's.
+    cover(&mut client, &storage).await;
+
+    // What a build from before the conversion leaves: the old owner's
+    // pending queue loss, its evidence not yet charged to the ledger, and a
+    // conversion it never ran. This build's writer charges a loss as it
+    // records it, so the runner covers that charge first and the evidence
+    // goes back to uncharged; the open above converted before the loss
+    // existed, so its marker is rewound. The loss starts inside retention,
+    // so the runner can prove all of it.
+    let bound = unix_now_seconds() - HOUR;
+    storage
+        .mark_account_delivery_recovery_bounded("alice", 42, 1, Some(bound))
+        .unwrap();
+    cover(&mut client, &storage).await;
+    let faults = fault_connection(&client);
+    faults
+        .execute(
+            "UPDATE account_delivery_loss_evidence SET imported_count = NULL",
+            [],
+        )
+        .unwrap();
+    assert!(queue_loss(&storage));
+    assert_eq!(
+        owed_from(&client, &storage).await,
+        None,
+        "nothing is owed before the open converts"
+    );
+    app.relay_plane
+        .deactivate_account_context(client.adapter.account_id())
+        .await
+        .unwrap();
+    faults
+        .execute(
+            "UPDATE account_recovery_conversion SET step = 0 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    drop(client);
+    assert!(storage.recovery_conversion_pending().unwrap());
+    let before = charged(&storage);
+
+    // The open converts before it seats the runner: the loss is every
+    // route's debt from its bound, and no runner attempt has run since.
+    let mut client = app.client("alice").await.unwrap();
+    assert!(client.has_in_place_recovery_runner());
+    assert!(!storage.recovery_conversion_pending().unwrap());
+    assert!(
+        storage.recovery_conversion_report().unwrap().is_none(),
+        "the conversion's report was taken before the runner was seated"
+    );
+    assert!(!queue_loss(&storage));
+    assert_eq!(charged(&storage), before);
+    assert!(
+        owed_from(&client, &storage)
+            .await
+            .is_some_and(|since| since <= bound),
+        "the converted loss is owed from its bound"
+    );
+
+    // The runner alone covers it, over the relay's real replies.
+    cover(&mut client, &storage).await;
+    assert!(charged(&storage) > before);
+    assert!(client.history_notices().unwrap().is_empty());
 }

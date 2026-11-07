@@ -184,8 +184,6 @@ pub struct SupersededGroupChange {
 struct Topology {
     relay_pair: bool,
     in_process: BTreeSet<String>,
-    /// Optional owner override; absent means the app production default.
-    runner_owns_debt: Option<bool>,
 }
 
 /// Queued intents a participant's engine refused at drain and retired
@@ -464,8 +462,6 @@ pub struct AppRuntimeHarness {
     extra_relay_urls: Vec<String>,
     // Participants whose runtime lives in this process so probes can overlap.
     in_process: BTreeSet<String>,
-    // Whether the in-process participants' recovery runner owns history debt.
-    runner_owns_debt: Option<bool>,
     participants: BTreeMap<String, Participant>,
     scenario_groups: BTreeMap<String, GroupId>,
     active_scenario_group: Option<String>,
@@ -535,38 +531,6 @@ impl AppRuntimeHarness {
         let topology = Topology {
             relay_pair: true,
             in_process: in_process.iter().cloned().collect(),
-            runner_owns_debt: None,
-        };
-        Self::new_with_execution(clients, None, None, true, topology).await
-    }
-
-    /// Set the existing internal owner for in-process seats from their next
-    /// open, so an upgrade can reopen the same account under the new owner.
-    pub fn set_runner_owns_debt(&mut self, owns: bool) {
-        self.runner_owns_debt = Some(owns);
-    }
-
-    /// [`Self::new_with_relay_pair`] with the in-process participants' history
-    /// recovery explicitly owned by their account's recovery runner.
-    /// Other participants follow the app production default.
-    pub async fn new_with_relay_pair_owning_debt(
-        clients: &[String],
-        in_process: &[String],
-    ) -> Result<Self, SubjectError> {
-        Self::new_with_relay_pair_owner_mode(clients, in_process, true).await
-    }
-
-    /// Pin the internal recovery owner for controlled comparisons; the ordinary
-    /// relay-pair constructor follows the production default.
-    pub async fn new_with_relay_pair_owner_mode(
-        clients: &[String],
-        in_process: &[String],
-        owns: bool,
-    ) -> Result<Self, SubjectError> {
-        let topology = Topology {
-            relay_pair: true,
-            in_process: in_process.iter().cloned().collect(),
-            runner_owns_debt: Some(owns),
         };
         Self::new_with_execution(clients, None, None, true, topology).await
     }
@@ -609,7 +573,7 @@ impl AppRuntimeHarness {
                 &relay_urls,
                 settlement_quiescence_ms,
                 maintenance_timing,
-                Seat::new(in_process, topology.runner_owns_debt),
+                Seat::new(in_process),
                 true,
             )
             .await
@@ -646,7 +610,6 @@ impl AppRuntimeHarness {
             extra_relay_urls: relay_urls.split_off(1),
             relay_url,
             in_process: topology.in_process,
-            runner_owns_debt: topology.runner_owns_debt,
             participants,
             scenario_groups: BTreeMap::new(),
             active_scenario_group: None,
@@ -1184,7 +1147,7 @@ impl AppRuntimeHarness {
         let settlement_quiescence_ms = self.settlement_quiescence_ms;
         let maintenance_timing = self.maintenance_timing;
         let in_process = !self.participant_processes || self.in_process.contains(client);
-        let seat = Seat::new(in_process, self.runner_owns_debt);
+        let seat = Seat::new(in_process);
         let participant = self.participant_mut(client)?;
         if participant.online
             && let Some(runtime) = participant.runtime.take()
@@ -2826,7 +2789,6 @@ fn app_for_root(
     relay_urls: &[String],
     settlement_quiescence_ms: Option<u64>,
     maintenance_timing: Option<MaintenanceTiming>,
-    runner_owns_debt: Option<bool>,
 ) -> MarmotApp {
     let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(ms) = settlement_quiescence_ms {
@@ -2835,11 +2797,7 @@ fn app_for_root(
     if let Some(timing) = maintenance_timing {
         config = config.with_dev_maintenance_timing(timing);
     }
-    let app = MarmotApp::with_relays_and_config(root, relay_urls.to_vec(), config);
-    match runner_owns_debt {
-        Some(owns) => app.with_recovery_runner_ownership_for_test(owns),
-        None => app,
-    }
+    MarmotApp::with_relays_and_config(root, relay_urls.to_vec(), config)
 }
 
 pub(crate) fn public_protocol_projection(
@@ -3282,13 +3240,13 @@ enum Seat {
     /// Its own process, with today's recovery.
     Process,
     /// This process, so probes can overlap.
-    InProcess { runner_owns_debt: Option<bool> },
+    InProcess,
 }
 
 impl Seat {
-    fn new(in_process: bool, runner_owns_debt: Option<bool>) -> Self {
+    fn new(in_process: bool) -> Self {
         if in_process {
-            Self::InProcess { runner_owns_debt }
+            Self::InProcess
         } else {
             Self::Process
         }
@@ -3311,8 +3269,8 @@ async fn make_participant(
     ),
     AppError,
 > {
-    let runner_owns_debt = match seat {
-        Seat::InProcess { runner_owns_debt } => runner_owns_debt,
+    match seat {
+        Seat::InProcess => {}
         Seat::Process => {
             let (app, runtime, account) =
                 process_backend::remote_participant(process_backend::Init {
@@ -3326,14 +3284,8 @@ async fn make_participant(
                 .await?;
             return Ok((app, runtime, None, account));
         }
-    };
-    let app = app_for_root(
-        root,
-        relay_urls,
-        settlement_ms,
-        maintenance,
-        runner_owns_debt,
-    );
+    }
+    let app = app_for_root(root, relay_urls, settlement_ms, maintenance);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.start().await?;
     let account = if create_identity {
