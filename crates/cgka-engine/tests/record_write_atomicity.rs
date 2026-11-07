@@ -4961,3 +4961,664 @@ async fn late_member_projection_failure(invite: bool) {
         if invite { 3 } else { 1 }
     );
 }
+
+/// Backend failure while materializing an authentic branch must retain that
+/// branch, rather than use the Replay verdict for invalid peer input (mdk#3081).
+#[tokio::test]
+async fn native_replay_storage_failure_retains_the_authenticated_commit_for_retry() {
+    use cgka_engine::{ConvergenceClock, ManualConvergenceClock};
+    use cgka_traits::message::StoredMessagePayload;
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory
+        .path()
+        .join("native-replay-storage-failure.sqlite");
+    let key = SqlCipherKey::raw([0x81; 32]);
+    let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .convergence_clock(Arc::new(clock.clone()))
+            .build()
+            .unwrap()
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut carol = build(b"native-replay-carol", storage.clone());
+    let mut alice = build(
+        b"native-replay-alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut bob = build(
+        b"native-replay-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "native replay backend".into(),
+            description: String::new(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current founding result")
+    };
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    let added = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        mut welcomes,
+    } = added
+    else {
+        panic!("actual peer invite")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let content_id = MessageId::new(hex::decode(content_hex(&commit)).unwrap());
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let observer = open_observer();
+    let original_context: Vec<u8> = observer
+        .query_row(
+            "SELECT value FROM openmls_values WHERE CAST(label AS TEXT) = 'GroupContext'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Public context rows use the current binary storage encoding. Compare
+    // exact baseline bytes so restoration of epoch 1 remains fault-free.
+    observer
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_native_replay_context BEFORE INSERT ON openmls_values
+         WHEN CAST(NEW.label AS TEXT) = 'GroupContext' AND NEW.value <> X'{}'
+         BEGIN SELECT RAISE(ABORT, 'native-replay-context-fault'); END;",
+            hex::encode(original_context)
+        ))
+        .unwrap();
+    // This real projection call proves the conditional fault fires on these
+    // exact signed bytes and that probe restoration itself remains usable.
+    let direct_failure = cgka_engine::openmls_projection::replay_openmls_messages(
+        &storage,
+        &group_id,
+        std::slice::from_ref(&commit),
+    );
+    assert!(
+        matches!(&direct_failure,
+        Err(OpenMlsProjectionError::Replay(detail) | OpenMlsProjectionError::Storage(detail))
+            if detail.contains("native-replay-context-fault")),
+        "native merge must reach the actual fault: {direct_failure:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let retained = storage.get_message(&content_id).unwrap();
+    assert_eq!(retained.state, MessageState::Created);
+    assert_eq!(
+        StoredMessagePayload::decode(&retained.payload)
+            .unwrap()
+            .as_openmls_wire()
+            .unwrap()
+            .payload,
+        commit.payload
+    );
+    carol.drain_events();
+    clock.advance_ms(10_000);
+    let failed = carol.converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms);
+    assert!(
+        matches!(&failed, Err(OpenMlsProjectionError::Storage(detail)) if detail.starts_with("merge_staged_commit:") && detail.contains("native-replay-context-fault")),
+        "native storage failure must reach the caller without rejecting the real branch: {failed:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained);
+    assert!(carol.drain_events().is_empty());
+    let pass = storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(
+        pass.retry.as_ref().unwrap().failed_step,
+        cgka_traits::ConvergencePassStep::Select
+    );
+    assert_eq!(pass.retry.as_ref().unwrap().failed_attempts, 1);
+
+    drop(carol);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained);
+    assert_eq!(storage.get_group(&group_id).unwrap().epoch, EpochId(1));
+    let observer = open_observer();
+    observer
+        .execute_batch("DROP TRIGGER fail_native_replay_context")
+        .unwrap();
+    let mut carol = build(b"native-replay-carol", storage.clone());
+    carol.hydrate_all_stored_groups().unwrap();
+    clock.advance_ms(10_000);
+    carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+    assert_eq!(
+        storage.get_message(&content_id).unwrap().state,
+        MessageState::Processed
+    );
+    let application = send_chat(
+        &mut alice,
+        &group_id,
+        "after native replay storage recovery",
+    )
+    .await;
+    assert!(matches!(
+        carol.ingest(application).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
+
+/// Real native proposal persistence is infrastructure, not a verdict on its
+/// authenticated sender or the peer commit replaying that source epoch.
+#[tokio::test]
+async fn native_proposal_store_failure_retains_the_authenticated_branch_for_retry() {
+    use cgka_engine::{ConvergenceClock, ManualConvergenceClock};
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory
+        .path()
+        .join("native-proposal-storage-failure.sqlite");
+    let key = SqlCipherKey::raw([0x82; 32]);
+    let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .convergence_clock(Arc::new(clock.clone()))
+            .build()
+            .unwrap()
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut carol = build(b"native-proposal-carol", storage.clone());
+    let mut alice = build(
+        b"native-proposal-alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut bob = build(
+        b"native-proposal-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "native proposal storage".into(),
+            description: String::new(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current founding result")
+    };
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    let SendResult::GroupEvolution {
+        msg: add_commit,
+        pending,
+        mut welcomes,
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("real peer invite")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let add_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..add_commit
+    };
+    carol.ingest(add_commit).await.unwrap();
+    clock.advance_ms(10_000);
+    carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    let SendResult::Proposal { msg: proposal } = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("actual SelfRemove proposal")
+    };
+    let proposal = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..proposal
+    };
+    assert!(matches!(
+        carol.ingest(proposal.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let proposal_id = MessageId::new(hex::decode(content_hex(&proposal)).unwrap());
+    let retained_proposal = storage.get_message(&proposal_id).unwrap();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("real peer self update")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let content_id = MessageId::new(hex::decode(content_hex(&commit)).unwrap());
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    let native_rows = |connection: &rusqlite::Connection| {
+        let mut query = connection
+            .prepare("SELECT * FROM openmls_values ORDER BY provider_version, storage_key")
+            .unwrap();
+        let columns = query.column_count();
+        query
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let native_before = native_rows(&observer);
+    observer.execute_batch("CREATE TRIGGER fail_native_proposal_store BEFORE INSERT ON openmls_values WHEN CAST(NEW.label AS TEXT) = 'QueuedProposal' BEGIN SELECT RAISE(ABORT, 'native-proposal-store-fault'); END;").unwrap();
+    let direct = cgka_engine::openmls_projection::replay_openmls_messages(
+        &storage,
+        &group_id,
+        &[proposal.clone(), commit.clone()],
+    );
+    assert!(
+        matches!(&direct, Err(OpenMlsProjectionError::Replay(detail) | OpenMlsProjectionError::Storage(detail)) if detail.contains("native-proposal-store-fault")),
+        "real proposal replay must reach native fault: {direct:?}"
+    );
+    assert_eq!(
+        native_rows(&observer),
+        native_before,
+        "native proposal probe failed to restore all columns"
+    );
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let retained_commit = storage.get_message(&content_id).unwrap();
+    assert_eq!(retained_commit.state, MessageState::Created);
+    carol.drain_events();
+    clock.advance_ms(10_000);
+    let failure = carol.converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms);
+    assert!(
+        matches!(&failure, Err(OpenMlsProjectionError::Storage(detail)) if detail.starts_with("store_pending_proposal:") && detail.contains("native-proposal-store-fault")),
+        "native proposal storage failure must retain the real branch: {failure:?}"
+    );
+    assert_eq!(native_rows(&observer), native_before);
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained_commit);
+    assert_eq!(
+        storage.get_message(&proposal_id).unwrap(),
+        retained_proposal
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(carol.drain_events().is_empty());
+    let pass = storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(
+        pass.retry.as_ref().unwrap().failed_step,
+        cgka_traits::ConvergencePassStep::Select
+    );
+    assert_eq!(pass.retry.as_ref().unwrap().failed_attempts, 1);
+    drop(carol);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained_commit);
+    assert_eq!(
+        storage.get_message(&proposal_id).unwrap(),
+        retained_proposal
+    );
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    assert_eq!(native_rows(&observer), native_before);
+    observer
+        .execute_batch("DROP TRIGGER fail_native_proposal_store")
+        .unwrap();
+    let mut carol = build(b"native-proposal-carol", storage.clone());
+    carol.hydrate_all_stored_groups().unwrap();
+    clock.advance_ms(10_000);
+    carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        storage.get_message(&content_id).unwrap().state,
+        MessageState::Processed
+    );
+    let application = send_chat(&mut alice, &group_id, "after native proposal retry").await;
+    assert!(matches!(
+        carol.ingest(application).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
+
+/// Native private-message persistence must preserve its infrastructure error
+/// class, retained bytes, and actual application delivery after retry.
+#[tokio::test]
+async fn native_private_message_storage_failure_retains_the_authenticated_branch_for_retry() {
+    use cgka_engine::{ConvergenceClock, ManualConvergenceClock};
+    use cgka_traits::message::StoredMessagePayload;
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory
+        .path()
+        .join("native-private-storage-failure.sqlite");
+    let key = SqlCipherKey::raw([0x83; 32]);
+    let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .convergence_clock(Arc::new(clock.clone()))
+            .build()
+            .unwrap()
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut carol = build(b"native-private-carol", storage.clone());
+    let mut alice = build(
+        b"native-private-alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut bob = build(
+        b"native-private-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "native replay backend".into(),
+            description: String::new(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current founding result")
+    };
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    let added = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        mut welcomes,
+    } = added
+    else {
+        panic!("actual peer invite")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let expected_private_payload = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(alice.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "private ratchet replay",
+    )
+    .encode()
+    .unwrap();
+    let private_application = send_chat(&mut alice, &group_id, "private ratchet replay").await;
+    let application_id = MessageId::new(hex::decode(content_hex(&private_application)).unwrap());
+    let commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let content_id = MessageId::new(hex::decode(content_hex(&commit)).unwrap());
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let observer = open_observer();
+    let native_rows = |connection: &rusqlite::Connection| {
+        let mut query = connection
+            .prepare("SELECT * FROM openmls_values ORDER BY provider_version, storage_key")
+            .unwrap();
+        let columns = query.column_count();
+        query
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let native_before = native_rows(&observer);
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert!(matches!(
+        carol.ingest(private_application.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let retained_application = storage.get_message(&application_id).unwrap();
+    let pending_before = storage.list_pending_application_events().unwrap();
+    let original_epoch_key: Vec<u8> = observer
+        .query_row(
+            "SELECT storage_key FROM openmls_values WHERE CAST(label AS TEXT) = 'EpochKeyPairs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Merge persists MessageSecrets before installing the next epoch key row.
+    // Fail only the later private-message ratchet write, after that real handoff;
+    // restoring the original epoch-key row remains fault-free.
+    observer
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_native_private_secrets BEFORE INSERT ON openmls_values
+         WHEN CAST(NEW.label AS TEXT) = 'MessageSecrets' AND EXISTS (SELECT 1 FROM openmls_values WHERE CAST(label AS TEXT) = 'EpochKeyPairs' AND storage_key <> X'{}')
+         BEGIN SELECT RAISE(ABORT, 'native-private-secrets-fault'); END;",
+            hex::encode(original_epoch_key)
+        ))
+        .unwrap();
+    // This real projection call proves the conditional fault fires on these
+    // exact signed bytes and that probe restoration itself remains usable.
+    let direct_failure = cgka_engine::openmls_projection::replay_openmls_messages(
+        &storage,
+        &group_id,
+        &[commit.clone(), private_application.clone()],
+    );
+    assert!(
+        matches!(&direct_failure,
+        Err(OpenMlsProjectionError::Replay(detail) | OpenMlsProjectionError::Storage(detail))
+            if detail.starts_with("process_message") && detail.contains("native-private-secrets-fault")),
+        "native private processing must reach the actual fault: {direct_failure:?}"
+    );
+    assert_eq!(native_rows(&observer), native_before);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let retained = storage.get_message(&content_id).unwrap();
+    assert_eq!(retained.state, MessageState::Created);
+    assert_eq!(
+        StoredMessagePayload::decode(&retained.payload)
+            .unwrap()
+            .as_openmls_wire()
+            .unwrap()
+            .payload,
+        commit.payload
+    );
+    carol.drain_events();
+    clock.advance_ms(10_000);
+    let failed = carol.converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms);
+    assert!(
+        matches!(&failed, Err(OpenMlsProjectionError::Storage(detail)) if detail.starts_with("process_message") && detail.contains("native-private-secrets-fault")),
+        "native storage failure must reach the caller without rejecting the real branch: {failed:?}"
+    );
+    assert_eq!(native_rows(&observer), native_before);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained);
+    assert_eq!(
+        storage.get_message(&application_id).unwrap(),
+        retained_application
+    );
+    assert!(carol.drain_events().is_empty());
+    assert_eq!(
+        storage.list_pending_application_events().unwrap(),
+        pending_before
+    );
+    let pass = storage.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(
+        pass.retry.as_ref().unwrap().failed_step,
+        cgka_traits::ConvergencePassStep::Select
+    );
+    assert_eq!(pass.retry.as_ref().unwrap().failed_attempts, 1);
+
+    drop(carol);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(storage.get_message(&content_id).unwrap(), retained);
+    assert_eq!(
+        storage.get_message(&application_id).unwrap(),
+        retained_application
+    );
+    assert_eq!(storage.get_group(&group_id).unwrap().epoch, EpochId(1));
+    assert_eq!(
+        storage.list_pending_application_events().unwrap(),
+        pending_before
+    );
+    let observer = open_observer();
+    assert_eq!(native_rows(&observer), native_before);
+    observer
+        .execute_batch("DROP TRIGGER fail_native_private_secrets")
+        .unwrap();
+    let mut carol = build(b"native-private-carol", storage.clone());
+    carol.hydrate_all_stored_groups().unwrap();
+    clock.advance_ms(10_000);
+    carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        storage.get_message(&application_id).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+    assert_eq!(
+        storage.get_message(&content_id).unwrap().state,
+        MessageState::Processed
+    );
+    let events = carol.drain_events();
+    let pending_outputs = storage.list_pending_application_events().unwrap();
+    for observed in [&events, &pending_outputs] {
+        let delivered: Vec<_> = observed
+            .iter()
+            .filter(|event| {
+                matches!(event,
+                    GroupEvent::MessageReceived { message_id, .. } if message_id == &application_id
+                )
+            })
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the retained private application must recover once"
+        );
+        let GroupEvent::MessageReceived {
+            group_id: id,
+            sender,
+            payload,
+            ..
+        } = delivered[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(id, &group_id);
+        assert_eq!(sender, &alice.self_id());
+        assert_eq!(payload, &expected_private_payload);
+    }
+    assert!(matches!(
+        carol.ingest(private_application).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    ));
+    assert!(carol.drain_events().is_empty());
+    assert_eq!(
+        storage.list_pending_application_events().unwrap(),
+        pending_outputs
+    );
+    let application = send_chat(
+        &mut alice,
+        &group_id,
+        "after native replay storage recovery",
+    )
+    .await;
+    assert!(matches!(
+        carol.ingest(application).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
