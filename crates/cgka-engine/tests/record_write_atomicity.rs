@@ -91,6 +91,16 @@ struct MockPeeler;
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -164,6 +174,14 @@ struct ContentIdPeeler;
 
 #[async_trait]
 impl TransportPeeler for ContentIdPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -2811,6 +2829,14 @@ struct OpaquePeeler;
 
 #[async_trait]
 impl TransportPeeler for OpaquePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         _msg: &TransportMessage,
@@ -3611,6 +3637,14 @@ struct MarkerOpaquePeeler {
 #[cfg(feature = "test-policy-overrides")]
 #[async_trait]
 impl TransportPeeler for MarkerOpaquePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,

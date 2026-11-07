@@ -1,5 +1,10 @@
 # Scenario IR and authoring semantics
 
+Recovery controls use the same opaque NIP-59 carrier as Welcomes. Relay fault
+selectors cannot distinguish the encrypted contents; the packet bus applies
+its Welcome delivery policy to both. After authentication, recovery control
+is not MLS projection input.
+
 The simulator has two deliberately separate inputs:
 
 - `ScenarioSpec` v2 and v3 are canonical adapter-neutral JSON IRs. Both contain only a linear sequence of executable

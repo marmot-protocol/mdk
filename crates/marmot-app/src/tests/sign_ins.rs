@@ -1149,7 +1149,7 @@ async fn welcomes_ordered(
             .peel_welcome_with_provenance(&event.to_transport_message().unwrap())
             .await
         {
-            Ok((_, provenance)) => {
+            Ok((_, Some(provenance))) => {
                 let names_own = provenance.key_package_event_id.as_slice() == own.as_slice();
                 if names_own {
                     own_rumors += 1;
@@ -1158,7 +1158,7 @@ async fn welcomes_ordered(
                 }
                 names_own
             }
-            Err(_) => false,
+            Ok((_, None)) | Err(_) => false,
         };
         named.push((names_own != own_first, event));
     }

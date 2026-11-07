@@ -452,6 +452,16 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -532,6 +542,16 @@ struct BlockingWelcomePeeler {
 
 #[async_trait]
 impl TransportPeeler for BlockingWelcomePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -1903,6 +1923,14 @@ async fn legacy_create_whose_welcome_cannot_be_wrapped_writes_no_group() {
     struct RefusingWelcomes(MockPeeler);
     #[async_trait]
     impl TransportPeeler for RefusingWelcomes {
+        async fn wrap_group_recovery(
+            &self,
+            message: &cgka_traits::GroupRecoveryMessage,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            self.0.wrap_group_recovery(message, recipient).await
+        }
+
         async fn peel_group_message(
             &self,
             msg: &TransportMessage,

@@ -458,6 +458,7 @@ async fn open_extended_length_welcome(receiver: &Keys, gift_wrap: &Event) -> Nos
         .peel_welcome_with_provenance(&message)
         .await
         .expect("the Welcome peeler unwraps the gift wrap");
+    let provenance = provenance.expect("Welcome has authenticated provenance");
     let PeeledContent::Welcome { bytes: welcome, .. } = peeled.content else {
         panic!("the peeler returns a Welcome");
     };

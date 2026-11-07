@@ -400,9 +400,12 @@ Emitted after `do_ingest()` returns `Ok(outcome)`.
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex `MessageId` of the inbound message. |
-| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, or `rejected`. |
+| `outcome_kind` | `processed`, `account_control`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, or `rejected`. |
 | `stale_reason` | Legacy optional category field used by non-processed outcomes. |
 | `epoch` | Present for buffered outcomes and `already_at_epoch` stale outcomes. |
+
+`account_control` identifies an authenticated account-inbox recovery control.
+The engine returns it to its caller without applying it or persisting a seen marker.
 
 `stale_reason` values:
 
@@ -1393,7 +1396,7 @@ metadata keys for indexing.
 | Category | Values |
 | --- | --- |
 | `envelope_kind` | `welcome`, `group_message` |
-| `outcome_kind` | `processed`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, `rejected` |
+| `outcome_kind` | `processed`, `account_control`, `buffered`, `ignored`, `local_state`, `transport_deferred`, `resource_refused`, `stale`, `rejected` |
 | `stale_reason` | `duplicate`, `already_at_epoch`, `wrong_recipient`, `unknown_group`, `own_echo`, `invalid_encoding`, `invalid_signature`, `unsupported_required_feature`, `authorization_failed`, `transport_deferred`, `resource_refused_deferred_capacity`, `resource_refused_retry_budget`, `pre_membership`, `beyond_anchor`, `beyond_rollback_horizon`, `beyond_app_retention`, `losing_branch`, `invalid_against_canonical_state`, `removed`, `quarantined` |
 | `engine error_kind` | `unknown_group`, `unknown_pending`, `not_a_member`, `not_group_admin`, `unknown_member`, `invalid_credential_identity`, `admin_cannot_self_remove`, `admin_depletion`, `missing_required_capabilities`, `unsupported_ciphersuite`, `invalid_app_message_payload`, `invalid_account_identity_proof`, `forked_epoch`, `invalid_transition`, `storage`, `peeler`, `serialize`, `backend`, `other` |
 | `peeler error_kind` | `malformed`, `decrypt_failed`, `stale_epoch`, `missing_context`, `wrap_failed`, `backend` |

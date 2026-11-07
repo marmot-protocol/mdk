@@ -23,12 +23,16 @@ peel-slot selection, the checkpoint fault injection and the in-memory capture
 mode stay `#[cfg(test)]`. The scenarios check that every row in the accounts'
 audit files carries the v5 schema version.
 
+Authenticated recovery and pairing controls produce neither Welcome evidence
+nor Welcome product analytics. A dismissed or duplicate delivery that never
+reaches the peeler also produces no Welcome evidence.
+
 ## Evidence boundaries
 
 | Record | Actual observation | What it does not establish |
 | --- | --- | --- |
 | `welcome_prepared` | On the sender's current-profile founding path, the runtime preparation call returns after the engine atomically retained the canonical group and exact outbound Welcome as `Sent`. The probe matches the returned artifact to the selected, relay-validated public KeyPackage event by recipient identity and checks the outer event hash. | A relay send, ACK, recipient observation, engine join, or app/UI availability. Failure before the returned artifact has no terminal row in this subset. |
-| `welcome_observed` | The app admits a Welcome envelope to its ingest path, after checking its NIP-01 event hash for reference derivation. | Signature/unwrap validity, engine join, endpoint provenance, live versus history acquisition. Acquisition is explicitly `unknown`. |
+| `welcome_observed` | After checking the envelope's NIP-01 event hash, the app's normal peeler returns a Welcome or a peel failure rather than an authenticated private control. The row is emitted with the matching unwrap result. | Signature/unwrap validity, engine join, endpoint provenance, live versus history acquisition. Acquisition is explicitly `unknown`. Deliveries rejected or deduplicated before peeling have no observation row. |
 | `welcome_unwrapped` | The same engine-invoked Nostr peeler either validates the authenticated rumor and strict inner `e` KeyPackage event ID, or returns a typed transport error. The row shares the receive ID and outer reference with `welcome_observed`. | MLS KeyPackage secret availability, engine join, app checkpoint, or sender publication. SDK NIP-59 extraction errors are coarsely `failed/unwrap_failed`, not a specific bad-key diagnosis. |
 | `welcome_join_finished`, `joined` | This exact observed Welcome returns `Processed` with its own `GroupJoined` event, which the engine journaled in the successful join transaction. The row uses the group's durable local-copy install epoch, written by that transaction; it precedes any fallible app checkpoint. | App persistence or acceptance, UI display, recipient history completeness, or another delivery's join. This subset omits other join dispositions and ambiguous initial/replacement cases. |
 | `app_group_update_finished`, `welcome_join` | A dirty group projection from an observed engine Welcome event reaches the account checkpoint. | The entire engine transaction history, every projection row, UI rendering or notification delivery. |
