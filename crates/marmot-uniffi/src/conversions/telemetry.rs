@@ -700,7 +700,7 @@ mod tests {
             marmot_app::HostPerformanceOutcome::Success,
         );
         telemetry.record_host_performance(
-            marmot_app::HostPerformanceOperation::ForegroundLocalReady,
+            HostPerformanceOperationFfi::ForegroundLocalReady.into(),
             Duration::from_millis(7_500),
             marmot_app::HostPerformanceOutcome::Failure,
         );
