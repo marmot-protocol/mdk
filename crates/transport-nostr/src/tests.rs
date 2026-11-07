@@ -3913,9 +3913,10 @@ async fn fence_held_frame_caps_cursor() {
     })
     .await
     .expect("the second account must admit its own counted boundary");
-    assert_ne!(other_ticket, ticket);
     // Both accounts have the same MLS group id, separate routing ids and
-    // their own genuine counted boundaries. Answer only the second owner.
+    // their own genuine counted boundaries. The adapter-wide ticket clock
+    // makes B's plan capable of answering A's older hold if it is misrouted.
+    // Answer only the second owner.
     other
         .fence_replay(&ReplayFencePlan {
             ticket: other_ticket,
