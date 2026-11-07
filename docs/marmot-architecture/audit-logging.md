@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-11-06
+updated: 2026-11-07
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -672,10 +672,12 @@ Current `reason` values found in production call sites:
 - `begin_pending`
 - `publish_confirmed`
 - `publish_failed`
-- `auto_commit_stage_failed`
-- `update_group_data_stage_failed`
 - `missing_retained_anchor`
 - `missing_own_commit_checkpoint`
+
+Historical `auto_commit_stage_failed` and `update_group_data_stage_failed` reasons remain accepted by the forensic
+reader for older logs. Current staging writes the group projection and sent artifacts atomically before entering
+pending state, so failed staging no longer emits either rollback reason.
 
 Metadata notes:
 
@@ -1406,7 +1408,8 @@ metadata keys for indexing.
 | `human_action.fields` | `name`, `description`, `admins`, `members`, `membership`, `avatar_url`, `avatar`, `image`, `message_retention`, `encrypted_media` |
 | `pending_kind` | `create_group`, `group_evolution` |
 | `epoch_state.new_state` | `seeded`, `stable`, `pending_publish`, `recovering`, `unrecoverable` |
-| `epoch_state.reason` | `auto_commit_stage_failed`, `begin_pending`, `founding_create`, `hydrate_durable_group_evolution`, `hydrate_removed_group`, `hydrate_seed_group`, `hydrate_stable_group`, `hydrate_unrecoverable_group`, `join_welcome`, `join_welcome_repair`, `missing_own_commit_checkpoint`, `missing_retained_anchor`, `publish_confirmed`, `publish_failed`, `recipient_confirmed_rejoin`, `update_group_data_stage_failed` |
+| `epoch_state.reason` | `begin_pending`, `founding_create`, `hydrate_durable_group_evolution`, `hydrate_removed_group`, `hydrate_seed_group`, `hydrate_stable_group`, `hydrate_unrecoverable_group`, `join_welcome`, `join_welcome_repair`, `missing_own_commit_checkpoint`, `missing_retained_anchor`, `publish_confirmed`, `publish_failed`, `recipient_confirmed_rejoin` |
+| `epoch_state.reason` (historical) | `auto_commit_stage_failed`, `update_group_data_stage_failed` |
 | `group_state.change_kind` | `member_added`, `member_removed`, `member_left`, `admin_added`, `admin_removed`, `group_renamed`, `group_avatar_changed`, `message_retention_changed` |
 | `group_state.fields` | `members`, `membership`, `admins`, `name`, `avatar`, `message_retention` |
 | `convergence error_kinds` | `unsupported_policy`, `missing_retained_anchor`, `candidate_state_unavailable`, `mls_validation_failed`, `outbound_intent_stale`, `storage_unavailable` |
