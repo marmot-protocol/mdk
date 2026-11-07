@@ -7636,11 +7636,16 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
 async fn group_state_subscription_observes_rename_applied_during_failed_send() {
     let dir = tempfile::tempdir().unwrap();
     let reject_armed = Arc::new(AtomicBool::new(false));
-    let relay = LocalRelay::new(
+    // Publish the enforced cap, like the interleaved-send sibling's relay. A
+    // relay with no NIP-11 page leaves bob's post-join group REQ unprovable
+    // when it is answered after alice's rename is stored: the unknown-cap
+    // replay fence then holds the rename for longer than the retention wait,
+    // which is a different contract with its own tests.
+    let (_relay, url) = limited_relay::relay_publishing_with(
         RelayBuilder::default().write_policy(RejectGroupMessagesWhileArmed(reject_armed.clone())),
-    );
-    relay.run().await.unwrap();
-    let url = relay.url().await.to_string();
+        Some(500),
+    )
+    .await;
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
