@@ -347,6 +347,10 @@ async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
     assert!(eose.complete());
     consumer.abort();
     let _ = consumer.await;
+    assert!(
+        fx.sdk.notification_loss().unwrap().borrow().is_none(),
+        "the burst must not lose notifications"
+    );
     fx.shutdown().await;
 }
 
