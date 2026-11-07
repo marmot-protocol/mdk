@@ -190,6 +190,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   consumed keys, processed Welcome, dedup, pending GroupJoined and maintenance writes: independent encrypted rows,
   failure/success reopens, exact same-Welcome retry and durable output all remain atomic.
 
+  `auto_commit_record_write_failure_leaves_no_torn_group_record` also owns the due peer-SelfRemove wakeup and
+  fresh pending-work notification after a returned staging error, followed by same-proposal automatic retry;
+  do not replace that retry with a new explicit removal command.
+
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
     release with `--ignored --nocapture`; it reports timings and never asserts a threshold

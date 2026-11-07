@@ -1744,7 +1744,7 @@ async fn welcome_record_failure_restores_key_package_for_retry() {
 /// A `put_group` failure during auto-commit staging must leave no torn group
 /// record (mdk#333): the record stays at the pre-stage epoch with all members,
 /// no orphaned pending publish or leaked snapshot survives, and the group
-/// remains usable for a fresh commit.
+/// keeps the original departure scheduled for an automatic retry (#3185).
 #[tokio::test]
 async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     let fault = PutGroupFault::default();

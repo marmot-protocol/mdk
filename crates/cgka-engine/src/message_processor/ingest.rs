@@ -1886,15 +1886,24 @@ impl<S: StorageProvider> Engine<S> {
 
             self.scheduled_self_remove_auto_commits
                 .remove(&schedule.proposal_id);
-            match self
-                .replay_scheduled_self_remove_auto_commit(schedule)
-                .await?
-            {
-                ScheduledAutoCommitReplay::Staged => {
+            let replayed = self
+                .replay_scheduled_self_remove_auto_commit(schedule.clone())
+                .await;
+            match replayed {
+                Err(error) => {
+                    // A failed preparation has not consumed the retained
+                    // proposal. Keep its original deadline so a transient
+                    // failure cannot make the host forget this departure.
+                    self.scheduled_self_remove_auto_commits
+                        .insert(schedule.proposal_id.clone(), schedule);
+                    self.schedule_pending_convergence_group(group_id);
+                    return Err(error);
+                }
+                Ok(ScheduledAutoCommitReplay::Staged) => {
                     self.drop_self_remove_auto_commit_schedules_for_group(group_id);
                     return Ok(true);
                 }
-                ScheduledAutoCommitReplay::NotApplicable => continue,
+                Ok(ScheduledAutoCommitReplay::NotApplicable) => continue,
             }
         }
     }
