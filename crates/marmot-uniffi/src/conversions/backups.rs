@@ -127,3 +127,32 @@ impl From<BackupHistoryAvailability> for BackupHistoryAvailabilityFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn produced_restore_progress_and_results_keep_their_host_choices() {
+        // Existing live command owners retain Idle/Discovering/Cancelled and
+        // both background outcomes. These current writers require device groups;
+        // this conversion owner does not claim experimental runtime execution.
+        for (native, expected) in [
+            (
+                BackupRestorePhase::Restoring,
+                BackupRestorePhaseFfi::Restoring,
+            ),
+            (
+                BackupRestorePhase::Complete,
+                BackupRestorePhaseFfi::Complete,
+            ),
+            (BackupRestorePhase::Partial, BackupRestorePhaseFfi::Partial),
+            (
+                BackupRestorePhase::Unavailable,
+                BackupRestorePhaseFfi::Unavailable,
+            ),
+        ] {
+            assert_eq!(BackupRestorePhaseFfi::from(native), expected);
+        }
+    }
+}

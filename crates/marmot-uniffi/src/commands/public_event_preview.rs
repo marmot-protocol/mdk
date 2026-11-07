@@ -97,6 +97,7 @@ impl Marmot {
 mod tests {
     use marmot_account::AccountHome;
     use marmot_app::MarmotApp;
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Timestamp};
 
     use super::*;
 
@@ -140,16 +141,31 @@ mod tests {
             Err(MarmotKitError::InvalidPublicEventReferences { max_references: 16 })
         ));
 
+        // Preserve the original Present/metadata assertions with an actual
+        // signed-event JSON and canonical reference, without a fetch replay.
+        let event = EventBuilder::new(Kind::TextNote, "cached preview")
+            .custom_created_at(Timestamp::from(5))
+            .finalize(&Keys::generate())
+            .unwrap();
+        let reference = event.id.to_hex();
+        let event_json = event.as_json();
         let present = PublicEventPreviewFfi::from(marmot_app::PublicEventPreviewRead {
-            reference: "r".into(),
+            reference: reference.clone(),
             preview: marmot_app::PublicEventPreview::Present {
-                event_json: "{}".into(),
+                event_json: event_json.clone(),
                 fetched_at: 7,
             },
         });
         assert_eq!(present.state, PublicEventPreviewStateFfi::Present);
-        assert_eq!(present.event_json.as_deref(), Some("{}"));
+        assert_eq!(present.event_json.as_deref(), Some(event_json.as_str()));
         assert_eq!(present.fetched_at, Some(7));
+        let deleted = PublicEventPreviewFfi::from(marmot_app::PublicEventPreviewRead {
+            reference,
+            preview: marmot_app::PublicEventPreview::Deleted,
+        });
+        assert_eq!(deleted.state, PublicEventPreviewStateFfi::Deleted);
+        assert_eq!(deleted.event_json, None);
+        assert_eq!(deleted.fetched_at, None);
         marmot.runtime.shutdown_and_close().await.unwrap();
     }
 }
