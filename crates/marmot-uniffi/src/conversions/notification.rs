@@ -208,3 +208,92 @@ impl From<marmot_app::BackgroundNotificationCollection> for BackgroundNotificati
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::discriminant;
+
+    #[test]
+    fn host_wake_source_choices_preserve_native_variants() {
+        for (ffi, expected) in [
+            (
+                NotificationWakeSourceFfi::ApnsNse,
+                NotificationWakeSource::ApnsNse,
+            ),
+            (
+                NotificationWakeSourceFfi::FcmDataMessage,
+                NotificationWakeSource::FcmDataMessage,
+            ),
+            (
+                NotificationWakeSourceFfi::AndroidForegroundService,
+                NotificationWakeSource::AndroidForegroundService,
+            ),
+            (
+                NotificationWakeSourceFfi::ManualCatchUp,
+                NotificationWakeSource::ManualCatchUp,
+            ),
+        ] {
+            assert_eq!(NotificationWakeSource::from(ffi), expected);
+        }
+    }
+
+    #[test]
+    fn native_collection_status_trigger_and_traffic_choices_stay_distinct() {
+        for (native, expected) in [
+            (
+                NotificationCollectionStatus::NewData,
+                NotificationCollectionStatusFfi::NewData,
+            ),
+            (
+                NotificationCollectionStatus::NoData,
+                NotificationCollectionStatusFfi::NoData,
+            ),
+            (
+                NotificationCollectionStatus::Failed,
+                NotificationCollectionStatusFfi::Failed,
+            ),
+        ] {
+            let actual: NotificationCollectionStatusFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+        for (native, expected) in [
+            (
+                NotificationTrigger::NewMessage,
+                NotificationTriggerFfi::NewMessage,
+            ),
+            (
+                NotificationTrigger::GroupInvite,
+                NotificationTriggerFfi::GroupInvite,
+            ),
+            (
+                NotificationTrigger::RemovedFromGroup,
+                NotificationTriggerFfi::RemovedFromGroup,
+            ),
+            (
+                NotificationTrigger::MadeAdmin,
+                NotificationTriggerFfi::MadeAdmin,
+            ),
+            (
+                NotificationTrigger::RemovedAsAdmin,
+                NotificationTriggerFfi::RemovedAsAdmin,
+            ),
+        ] {
+            let actual: NotificationTriggerFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+        for (native, expected) in [
+            (
+                NotificationTrafficClass::Standard,
+                NotificationTrafficClassFfi::Standard,
+            ),
+            (
+                NotificationTrafficClass::AgentActivity,
+                NotificationTrafficClassFfi::AgentActivity,
+            ),
+        ] {
+            let actual: NotificationTrafficClassFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+    }
+}

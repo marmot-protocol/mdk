@@ -165,3 +165,89 @@ impl From<UserSearchUpdate> for UserSearchUpdateFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::discriminant;
+
+    #[test]
+    fn match_quality_and_field_attribution_keep_their_typed_choices() {
+        for (native, expected) in [
+            (MatchQuality::Exact, MatchQualityFfi::Exact),
+            (MatchQuality::Prefix, MatchQualityFfi::Prefix),
+            (MatchQuality::Contains, MatchQualityFfi::Contains),
+        ] {
+            let actual: MatchQualityFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+        for (native, expected) in [
+            (MatchedField::Name, MatchedFieldFfi::Name),
+            (MatchedField::Nip05, MatchedFieldFfi::Nip05),
+            (MatchedField::DisplayName, MatchedFieldFfi::DisplayName),
+            (MatchedField::About, MatchedFieldFfi::About),
+            (MatchedField::Npub, MatchedFieldFfi::Npub),
+            (MatchedField::Pubkey, MatchedFieldFfi::Pubkey),
+        ] {
+            let actual: MatchedFieldFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+    }
+
+    #[test]
+    fn search_progress_preserves_trigger_and_its_radius_or_error() {
+        type TriggerCheck = fn(SearchUpdateTriggerFfi) -> bool;
+        // Fallback seeds report an unknown social distance (255), even though
+        // their traversal hop remains bounded by MAX_SUPPORTED_SEARCH_RADIUS.
+        let cases: [(SearchUpdateTrigger, TriggerCheck); 14] = [
+            (SearchUpdateTrigger::RadiusStarted { radius: 0 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusStarted { radius: 0 })
+            }),
+            (SearchUpdateTrigger::ResultsFound { radius: 2 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::ResultsFound { radius: 2 })
+            }),
+            (SearchUpdateTrigger::DiscoveryResultsFound, |v| {
+                matches!(v, SearchUpdateTriggerFfi::DiscoveryResultsFound)
+            }),
+            (SearchUpdateTrigger::CachedResultsFound, |v| {
+                matches!(v, SearchUpdateTriggerFfi::CachedResultsFound)
+            }),
+            (SearchUpdateTrigger::RadiusCompleted { radius: 1 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusCompleted { radius: 1 })
+            }),
+            (SearchUpdateTrigger::RadiusTimeout { radius: 2 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTimeout { radius: 2 })
+            }),
+            (SearchUpdateTrigger::RadiusTruncated { radius: 1 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTruncated { radius: 1 })
+            }),
+            (SearchUpdateTrigger::RadiusStarted { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusStarted { radius: 255 })
+            }),
+            (SearchUpdateTrigger::ResultsFound { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::ResultsFound { radius: 255 })
+            }),
+            (SearchUpdateTrigger::RadiusCompleted { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusCompleted { radius: 255 })
+            }),
+            (SearchUpdateTrigger::RadiusTimeout { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTimeout { radius: 255 })
+            }),
+            (SearchUpdateTrigger::RadiusTruncated { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTruncated { radius: 255 })
+            }),
+            (SearchUpdateTrigger::SearchCompleted, |v| {
+                matches!(v, SearchUpdateTriggerFfi::SearchCompleted)
+            }),
+            (
+                SearchUpdateTrigger::Error {
+                    message: "relay directory fetch failed: fixture fetch failure".into(),
+                },
+                |v| matches!(v, SearchUpdateTriggerFfi::Error { message } if message == "relay directory fetch failed: fixture fetch failure"),
+            ),
+        ];
+        for (index, (native, accepts)) in cases.into_iter().enumerate() {
+            assert!(accepts(native.into()), "search progress case {index}");
+        }
+    }
+}
