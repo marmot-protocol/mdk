@@ -1,9 +1,9 @@
 //! Account-private NIP-51 state. Never stored in the shared directory database.
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::{SqliteAppStorage, SqliteResultExt};
+use crate::{SqliteAppStorage, SqliteResultExt, base::connection::retry_on_busy};
 use cgka_traits::storage::StorageResult;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +112,12 @@ impl SqliteAppStorage {
 
     /// NIP-01: newest timestamp wins; lowest event id breaks equal-time ties.
     /// Entries and accepted version become visible in one transaction.
+    ///
+    /// The transaction reads the accepted version and then writes, so it takes
+    /// the write lock up front. A deferred read-then-write transaction fails
+    /// with `SQLITE_BUSY` at its first write, without waiting, when another
+    /// connection to this file (the account engine's) commits after the read;
+    /// an immediate one waits on `busy_timeout` and retries as a whole.
     pub fn adopt_block_list(
         &self,
         list: &StoredBlockList,
@@ -120,37 +126,42 @@ impl SqliteAppStorage {
         local_account_id: &str,
         mention_classifier: &crate::app::chat_list::MentionClassifier<'_>,
     ) -> StorageResult<bool> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let (id, at): (String, i64) = tx
-            .query_row(
-                "SELECT event_id,event_created_at FROM user_block_list",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .storage()?;
-        let at = crate::i64_to_u64(at)?;
-        if !id.is_empty()
-            && (list.event_created_at < at || (list.event_created_at == at && list.event_id >= id))
-        {
-            return Ok(false);
-        }
-        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS incoming_user_blocks(public_key TEXT PRIMARY KEY, is_private INTEGER NOT NULL); DELETE FROM incoming_user_blocks;").storage()?;
-        for (key, private) in entries {
-            tx.execute("INSERT INTO incoming_user_blocks VALUES (?1,?2) ON CONFLICT(public_key) DO UPDATE SET is_private=min(is_private,excluded.is_private)",params![key,private]).storage()?;
-        }
-        tx.execute("DELETE FROM user_blocks WHERE public_key NOT IN (SELECT public_key FROM incoming_user_blocks)", []).storage()?;
-        tx.execute("INSERT INTO user_blocks SELECT public_key,is_private,?1 FROM incoming_user_blocks WHERE true ON CONFLICT(public_key) DO UPDATE SET is_private=excluded.is_private", [now_ms]).storage()?;
-        tx.execute("UPDATE user_block_list SET event_id=?1,event_created_at=?2,public_tags=?3,private_tags=?4,revision=revision+1",params![list.event_id,crate::u64_to_i64(list.event_created_at)?,serde_json::to_string(&list.public_tags).map_err(json_error)?,serde_json::to_string(&list.private_tags).map_err(json_error)?]).storage()?;
-        tx.execute("DELETE FROM chat_list_unread_ready_groups", [])
-            .storage()?;
-        crate::app::chat_list::rebuild_all_chat_list_rows_tx(
-            &tx,
-            local_account_id,
-            mention_classifier,
-        )?;
-        tx.commit().storage()?;
-        Ok(true)
+        retry_on_busy(|| {
+            let mut conn = self.lock()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
+            let (id, at): (String, i64) = tx
+                .query_row(
+                    "SELECT event_id,event_created_at FROM user_block_list",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .storage()?;
+            let at = crate::i64_to_u64(at)?;
+            if !id.is_empty()
+                && (list.event_created_at < at
+                    || (list.event_created_at == at && list.event_id >= id))
+            {
+                return Ok(false);
+            }
+            tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS incoming_user_blocks(public_key TEXT PRIMARY KEY, is_private INTEGER NOT NULL); DELETE FROM incoming_user_blocks;").storage()?;
+            for (key, private) in entries {
+                tx.execute("INSERT INTO incoming_user_blocks VALUES (?1,?2) ON CONFLICT(public_key) DO UPDATE SET is_private=min(is_private,excluded.is_private)",params![key,private]).storage()?;
+            }
+            tx.execute("DELETE FROM user_blocks WHERE public_key NOT IN (SELECT public_key FROM incoming_user_blocks)", []).storage()?;
+            tx.execute("INSERT INTO user_blocks SELECT public_key,is_private,?1 FROM incoming_user_blocks WHERE true ON CONFLICT(public_key) DO UPDATE SET is_private=excluded.is_private", [now_ms]).storage()?;
+            tx.execute("UPDATE user_block_list SET event_id=?1,event_created_at=?2,public_tags=?3,private_tags=?4,revision=revision+1",params![list.event_id,crate::u64_to_i64(list.event_created_at)?,serde_json::to_string(&list.public_tags).map_err(json_error)?,serde_json::to_string(&list.private_tags).map_err(json_error)?]).storage()?;
+            tx.execute("DELETE FROM chat_list_unread_ready_groups", [])
+                .storage()?;
+            crate::app::chat_list::rebuild_all_chat_list_rows_tx(
+                &tx,
+                local_account_id,
+                mention_classifier,
+            )?;
+            tx.commit().storage()?;
+            Ok(true)
+        })
     }
 
     /// An authenticated but unreadable replacement must not be overwritten even
@@ -322,6 +333,75 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(store.app_storage().block_list_snapshot().unwrap(), before);
+    }
+    /// mdk#3046: the account engine writes to the same file through its own
+    /// connection. Adopting a block list while that connection holds the write
+    /// lock must wait for it, not fail at its first write.
+    #[test]
+    fn user_blocks_adoption_waits_for_another_connections_writer() {
+        use std::cell::Cell;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        thread_local! {
+            static BUSY_OBSERVED: Cell<Option<mpsc::Sender<()>>> = const { Cell::new(None) };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.sqlite");
+        let key = crate::SqlCipherKey::raw([7; 32]);
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        adopt(&store, "b", 1, &[("alice", true)]);
+        let engine = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        engine
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO blocked_welcome_dismissals VALUES ('engine');",
+            )
+            .unwrap();
+        let (busy_tx, busy_rx) = mpsc::channel();
+        let writer = store.clone();
+        let worker = std::thread::spawn(move || {
+            BUSY_OBSERVED.set(Some(busy_tx));
+            writer
+                .lock()
+                .unwrap()
+                .busy_handler(Some(|attempt| {
+                    BUSY_OBSERVED.with(|signal| {
+                        if let Some(signal) = signal.take() {
+                            let _ = signal.send(());
+                        }
+                    });
+                    std::thread::sleep(Duration::from_millis(5));
+                    attempt < 1_000
+                }))
+                .unwrap();
+            writer.app_storage().adopt_block_list(
+                &StoredBlockList {
+                    event_id: "a".into(),
+                    event_created_at: 2,
+                    ..Default::default()
+                },
+                &[("bob".into(), true)],
+                200,
+                "local",
+                &|_, _| false,
+            )
+        });
+        // Commit the other connection's write only once adoption is waiting on
+        // it. A deferred adoption never waits: it fails before this times out.
+        let observed = busy_rx.recv_timeout(Duration::from_secs(5));
+        let committed = engine.lock().unwrap().execute_batch("COMMIT");
+        let adopted = worker.join().unwrap();
+        committed.unwrap();
+        assert!(matches!(adopted, Ok(true)), "{adopted:?}");
+        observed.unwrap();
+        let app = store.app_storage();
+        assert!(app.is_user_blocked("bob").unwrap());
+        assert!(!app.is_user_blocked("alice").unwrap());
+        assert!(app.is_blocked_welcome_dismissed("engine").unwrap());
+        store.close().unwrap();
+        engine.close().unwrap();
     }
     #[test]
     fn user_blocks_pending_and_dismissal_survive_reopen() {
