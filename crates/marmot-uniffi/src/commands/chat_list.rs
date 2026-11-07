@@ -229,6 +229,8 @@ impl Marmot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use cgka_traits::TransportEndpoint;
     use marmot_app::{AccountSetupReadiness, AccountSetupRequest, MarmotApp, MarmotAppRuntime};
     use nostr_relay_builder::MockRelay;
@@ -553,6 +555,121 @@ mod tests {
                         && row.pinned_position == Some(0)
                 })
         ));
+
+        // Observe the real receiver's wake before polling the inline receive.
+        // Disabling cooperative self-wakes leaves channel/shutdown as wake
+        // sources; runtime shutdown is deliberately later than both contrasts.
+        struct ReceiveWake(tokio::sync::Notify);
+        impl std::task::Wake for ReceiveWake {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+        fn stays_pending<F: std::future::Future>(
+            next: std::pin::Pin<&mut F>,
+            wake: &Arc<ReceiveWake>,
+            reason: &str,
+        ) {
+            let waker = std::task::Waker::from(wake.clone());
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(next.poll(&mut context).is_pending(), "{reason}");
+        }
+        let empty_legacy = kit
+            .subscribe_chat_list(account_ref.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(empty_legacy.snapshot().len(), 1);
+        let empty_typed = kit
+            .subscribe_chat_list(account_ref.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(empty_typed.snapshot().len(), 1);
+        let wake = Arc::new(ReceiveWake(tokio::sync::Notify::new()));
+        let next = tokio::task::unconstrained(empty_legacy.next());
+        tokio::pin!(next);
+        stays_pending(next.as_mut(), &wake, "the legacy receiver starts idle");
+        kit.set_group_archived(account_ref.clone(), second.clone(), true)
+            .await
+            .unwrap();
+        let empty =
+            tokio::time::timeout(std::time::Duration::from_secs(5), empty_typed.next_update())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(empty, ChatListSubscriptionUpdateFfi::Snapshot { rows, .. } if rows.is_empty())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.0.notified())
+            .await
+            .expect("native empty snapshot must wake the inline legacy receiver");
+        stays_pending(
+            next.as_mut(),
+            &wake,
+            "an empty replacement must not terminate the legacy stream",
+        );
+        kit.set_group_archived(account_ref.clone(), second.clone(), false)
+            .await
+            .unwrap();
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.group_id_hex, second);
+        assert!(!row.archived);
+
+        kit.set_group_archived(account_ref.clone(), first.clone(), false)
+            .await
+            .unwrap();
+        let removal_legacy = kit
+            .subscribe_chat_list(account_ref.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(removal_legacy.snapshot().len(), 2);
+        let removal_typed = kit
+            .subscribe_chat_list(account_ref.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(removal_typed.snapshot().len(), 2);
+        let wake = Arc::new(ReceiveWake(tokio::sync::Notify::new()));
+        let next = tokio::task::unconstrained(removal_legacy.next());
+        tokio::pin!(next);
+        stays_pending(
+            next.as_mut(),
+            &wake,
+            "the removal legacy receiver starts idle",
+        );
+        assert!(
+            kit.forget_group_local(account_ref.clone(), first.clone())
+                .await
+                .unwrap()
+        );
+        let removed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            removal_typed.next_update(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(removed, ChatListSubscriptionUpdateFfi::RemoveRow { group_id_hex, .. } if group_id_hex == first)
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.0.notified())
+            .await
+            .expect("native removal must wake the inline legacy receiver");
+        stays_pending(
+            next.as_mut(),
+            &wake,
+            "a removal-only update must not terminate the legacy stream",
+        );
+        kit.set_chat_manually_unread(account_ref.clone(), second.clone(), true)
+            .unwrap()
+            .unwrap();
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.group_id_hex, second);
+        assert!(row.manually_marked_unread);
 
         kit.runtime.shutdown().await;
     }

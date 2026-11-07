@@ -827,10 +827,10 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
 
 #[tokio::test]
 async fn frozen_cursor_persistence_constructor_opens_and_collects() {
-    // Exercise the public Frozen constructor, empty wake, shutdown and reopen.
-    // Effective cursor persistence is owned by marmot-app's
-    // tests/cursor_persistence.rs; an empty wake cannot distinguish a
-    // constructor that ignores the requested policy.
+    // Frozen's actual constructor posture suppresses diagnostics even before
+    // consent. Contrast explicit Advance and the default on this same store.
+    // The native cursor_persistence owner retains persisted-cursor behavior;
+    // this binding keeper observes policy forwarding without replaying it.
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit = Marmot::new_with_cursor_persistence(
@@ -840,6 +840,10 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
         marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open frozen marmot kit");
+    assert_eq!(
+        kit.usage_diagnostics_status().unwrap().product_analytics,
+        marmot_uniffi::DiagnosticsExporterStatusFfi::Disabled
+    );
     let collected = kit
         .collect_notifications_after_wake(1, NotificationWakeSourceFfi::ApnsNse)
         .await
@@ -847,6 +851,23 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
     assert!(collected.notifications.is_empty());
     kit.shutdown().await;
     drop(kit);
+
+    let advancing = Marmot::new_with_cursor_persistence(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".into()],
+        CursorPersistenceFfi::Advance,
+        marmot_uniffi::marmot_deployment_white_noise(),
+    )
+    .unwrap();
+    assert_eq!(
+        advancing
+            .usage_diagnostics_status()
+            .unwrap()
+            .product_analytics,
+        marmot_uniffi::DiagnosticsExporterStatusFfi::ConsentRequired
+    );
+    advancing.shutdown().await;
+    drop(advancing);
 
     // The same store reopens under the default constructor (Advance): the
     // policy is a per-construction posture, not persisted store state. The
@@ -859,6 +880,13 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
     )
     .expect("reopen marmot kit with the default Advance policy");
     assert!(!reopened.is_stopping());
+    assert_eq!(
+        reopened
+            .usage_diagnostics_status()
+            .unwrap()
+            .product_analytics,
+        marmot_uniffi::DiagnosticsExporterStatusFfi::ConsentRequired
+    );
 }
 
 #[tokio::test]
@@ -1194,6 +1222,44 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
         )
         .expect_err("invalid cursor hex should fail before account lookup");
     assert!(matches!(invalid_cursor, MarmotKitError::InvalidHex { .. }));
+
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .unwrap()
+    .create_nostr_account()
+    .unwrap()
+    .account_id_hex;
+    let group = "ab".repeat(16);
+    let target = "cd".repeat(32);
+    for (at, id) in [(None, None), (Some(1), Some("ef".repeat(32)))] {
+        let edits = kit
+            .message_edit_history(
+                account.clone(),
+                group.clone(),
+                target.clone(),
+                at,
+                id.clone(),
+                25,
+            )
+            .unwrap();
+        assert!(edits.versions.is_empty() && !edits.has_more_before);
+        let votes = kit
+            .poll_votes(account.clone(), group.clone(), target.clone(), at, id, 25)
+            .unwrap();
+        assert!(votes.votes.is_empty() && !votes.has_more_after);
+    }
+    for (at, id) in [(Some(1), None), (None, Some("ef".repeat(32)))] {
+        assert!(
+            matches!(kit.message_edit_history(account.clone(), group.clone(), target.clone(), at, id.clone(), 25),
+            Err(MarmotKitError::Runtime { details }) if details == "edit cursor requires timestamp and id")
+        );
+        assert!(
+            matches!(kit.poll_votes(account.clone(), group.clone(), target.clone(), at, id, 25),
+            Err(MarmotKitError::Runtime { details }) if details == "poll vote cursor requires timestamp and voter")
+        );
+    }
 
     let subscribe_error = match kit
         .subscribe_timeline_messages("missing".into(), None, Some(25))
