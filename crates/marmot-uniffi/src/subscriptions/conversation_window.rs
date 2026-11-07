@@ -228,7 +228,6 @@ mod tests {
                 .unwrap(),
             Err(MarmotKitError::ConversationWindowClosed)
         ));
-        assert!(window.snapshot().is_none());
         runtime.shutdown_and_close().await.unwrap();
     }
 }

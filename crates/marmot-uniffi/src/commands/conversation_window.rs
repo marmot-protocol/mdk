@@ -512,7 +512,10 @@ mod tests {
             }
         }
         let close = window.cancel();
-        let (closed, ()) = tokio::join!(next, close);
+        // Poll the real close first: it sends the closed watch before waiting
+        // for the receiver lock, so this same pending receive cannot win with
+        // a replacement if the runtime scheduling policy changes.
+        let ((), closed) = tokio::join!(biased; close, next);
         assert!(closed.unwrap().is_none());
         window.cancel().await;
         assert!(matches!(
