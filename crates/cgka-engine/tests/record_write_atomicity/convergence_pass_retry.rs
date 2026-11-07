@@ -46,6 +46,7 @@ fn retry_storage(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     }
 }
 
