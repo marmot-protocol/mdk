@@ -4828,7 +4828,7 @@ async fn native_private_message_storage_failure_retains_the_authenticated_branch
     clock.advance_ms(10_000);
     let failed = carol.converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms);
     assert!(
-        matches!(&failed, Err(OpenMlsProjectionError::Storage(detail)) if detail.contains("native-private-secrets-fault")),
+        matches!(&failed, Err(OpenMlsProjectionError::Storage(detail)) if detail.starts_with("process_message") && detail.contains("native-private-secrets-fault")),
         "native storage failure must reach the caller without rejecting the real branch: {failed:?}"
     );
     assert_eq!(native_rows(&observer), native_before);
