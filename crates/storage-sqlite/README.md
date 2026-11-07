@@ -249,56 +249,25 @@ durable acquisition intent; selected presentation and source demand commit toget
 
 ## Account recovery ledger
 
-`account_recovery.rs` and `account_recovery/` own the durable account recovery ledger, evidence import, and retry
-reservations. The app-side owner supplies validated facts and owns execution policy. Design:
+`account_recovery.rs` and `account_recovery/` keep the old recovery owner's account-private tables for the
+account-open conversion and the epoch-gap obligations the recovery runner serves (mdk#2660 phase 4). The app-side
+runner supplies validated facts and owns execution policy. Design:
 [account recovery](../../docs/marmot-architecture/further-context/account-recovery.md); ownership history: the
 [#1946 ownership design](https://github.com/marmot-protocol/mdk/blob/9489bb091/docs/marmot-architecture/further-context/account-recovery-ownership.md).
 
-- **Loss evidence.** The overflow marker task writes loss evidence only; the owner imports it transactionally. A NULL
-  imported count means not yet imported, including a valid zero-count loss marker. Zero-count loss is evidence.
-- **Reservations.** Attempt reservations fence selected demand and imported loss, survive reopen, and refuse unknown
-  scope versions. They do not certify coverage. Repeated serialized callers reuse the explicit-history row without
-  resetting retry, and a stale detach cannot clear the current caller's urgency.
-- **Frozen scopes (`account_recovery/plan.rs`).** Versioned frozen scopes accept owner-validated endpoint/admission
-  checkpoints. History requires all designated scopes/endpoints; exclusions, EOSE, and SDK seen state are insufficient.
-  Known-event retention and the limited first maintenance boundary use separate predicates. A stale scope token
-  rejects a multi-scope checkpoint before any progress is written. Domain updates may share one `with_transaction`.
-- **Native replay.** `SubscriptionReplay` preserves original query floors across source changes and reopen. Its
-  `ReplayAdmission` predicate proves only current native input admission, never exhaustive history or loss recovery.
-  Request-scoped placement facts preserve qualified, unchanged sources independently of unrelated pending groups.
-  Same-group waiting peers still withhold that group's proof. `checkpoint_replay_admission` requires the separate
-  `RecoveryReplayPlacement::Placed` account-wide fence before final completion, even when every scoped proof exists.
-  Authoritative terminal-group retirement is revision-fenced and preserves unrelated floors. A wanted range with
-  no serving source parks as `NeedsDeepRepair` without retry charges or loss evidence; unchanged observations leave
-  it parked. A new source generation can rearm the original range. Retirement and source updates reject stale route
-  or scope tokens atomically. Public notice dismissal retires the occurrence; it does not mark the range satisfied.
-- **Loss acknowledgment (`account_recovery/loss.rs`).** Qualified loss completion is separate from external plane
-  acknowledgment. Capture exact token/count watermarks before execution; after qualified completion, acknowledge the
-  matching live generation and finish its writers before calling `acknowledge_recovery_loss`. The runtime uses
-  `recovery_loss_snapshot` / `acknowledge_recovery_loss_snapshot`: a constant-size SHA-256 commitment to the complete
-  ordered token/count set, streamed under the connection lock, so unbounded unresolved evidence is never copied into
-  active grants, capped, or deleted. Both forms share the same transaction and revision/qualification checks. SQL
-  cannot establish the external acknowledgment prerequisite. New evidence or a persistence failure prevents
-  reclamation; the owner must compensate the live acknowledgment and call `restore_unacknowledged_recovery_loss`
-  before new work, and also when constructing an owner.
-- **Legacy adapters.** Legacy clear methods are caller-directed retirement adapters, not completion proofs; retained
-  legacy watermarks do not recreate explicitly retired demand. Token-only overflow retirement records a per-token
-  retired watermark separately from import: clearing one token restores other joined generations and returns `false`
-  while loss remains, preserving the runtime's pending flag across reopen. Late duplicate writers cannot resurrect a
-  retired generation; increased counts can.
-- **Comparison plans.** Format-1 plans still accept the retired optional `live_since_seconds` field from older
-  databases, but recovery ignores it and new writes omit it. A normal settlement rewrites a legacy plan without
-  changing its fence, route scopes, retry cost, or uncovered demand. Other unknown fields and malformed legacy values
-  remain errors; no schema migration or plan-format change is required.
-- **Inventory revision.** Inventory expiration, compaction, message release, and route/group deletion bump the account
-  inventory revision in the same transaction; reservations and plan installation check it. Installed proof is
-  invalidated only for overlapping route/window scopes (and the exact event for known-event predicates), so unrelated or
-  out-of-window retention churn cannot invalidate bounded completion or loss acknowledgment. Removing the last
-  qualified proof reopens satisfied demand in the same transaction without forgiving account retry cost; an
-  alternative known-event copy or independent maintenance boundary remains valid. Receipt release records scoped
-  invalidation before deleting inventory; consumption falls back to conservative invalidation only if neither
-  inventory bounds nor that durable flag exist (including journal rows migrated from older schemas). No-op admission
-  never scans recovery scopes, and idempotent deletes do not invalidate proof.
+- **Loss evidence.** The overflow marker task, the notification-lag writer and a discarded spill row write loss
+  evidence only; the worker imports it into ledger debt transactionally. A NULL imported count means not yet
+  imported, including a valid zero-count loss marker. Zero-count loss is evidence.
+- **Frozen scopes (`account_recovery/plan.rs`).** The old owner's versioned scope payloads. Nothing writes a new one;
+  conversion reads their checkpoints. Inventory expiration, compaction, message release and route or group deletion
+  void the checkpoints of the scopes they overlap (the exact event for known-event scopes) in the same transaction,
+  so conversion never counts removed input as coverage. Receipt release records scoped invalidation before deleting
+  inventory; consumption falls back to conservative invalidation only if neither inventory bounds nor that durable
+  flag exist. No-op admission never scans recovery scopes, and idempotent deletes void nothing.
+- **Demand and notices (`account_recovery/demand.rs`, `notice.rs`).** Epoch-gap demand the runner arms and serves,
+  capacity-wait eligibility, and terminal-group retirement, which deletes the group's epoch-gap, maintenance and
+  known-event rows atomically with its failure report. A parked occurrence is one "history may be incomplete"
+  notice; dismissal retires exactly that revision (`state = 2`, never coverage).
 - **Retention.** `retained_recovery_event` checks exact route, event, and frozen window membership after the caller
   synchronizes release receipts; it does not certify successful decryption or engine readiness. Completed known-event
   rows need owner-managed reclamation once no ticket or grant can reference them. An unbounded `since = None` includes
@@ -315,20 +284,15 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   point for a covered `(route, relay, since, until, proof)` slice; it merges overlapping or touching ranges of the same
   route, relay and proof and keeps the oldest proof time. Coverage on a route is what every given relay covers, merged
   across proofs. Debt is the goal floor up to a caller-given time minus that coverage; a route without a goal owes
-  nothing. Each delivery or notification loss import, and a legacy clear that re-arms an older generation, un-covers in
-  its own transaction what the generations it newly charged lost. A generation recorded through
+  nothing. Each delivery or notification loss import un-covers in its own transaction what the generations it newly
+  charged lost. A generation recorded through
   `record_account_recovery_loss_routed` with its routes (migration 0128, at most `MAX_LOSS_ROUTES`) un-covers only
   those routes, each from its own bound, and widens their goals; any other generation un-covers every route the ledger
   holds from its floor upward (all of it when a floor is unknown) and widens their goals to it. Imports stay
   count-driven, since the relay plane gives an adopted marker's new drops a fresh token. A worker observation past the
-  durable count (`mark_account_delivery_recovery_observed`) merges the relay plane's routes for its generation as a
-  marker write would, lowering the generation's floor to the lowest bound they list, and makes the generation
-  account-wide when it passes none. Each import stamps every generation it charges with the loss
-  revision its join left (`import_revision`, migration 0132). `recovery_loss_reach` reads where one cause's unresolved loss
-  may have lost events, by route, and `recovery_loss_reach_after` reads the same for loss imported after a loss
-  revision: what a checkpoint captured at that revision has not seen. Acknowledgment deletes the generations it
-  reclaims and keeps the highest stamp it deleted (`acknowledged_import_revision`), so below it the read answers
-  `None`: where that loss reached is no longer known.
+  durable count records the relay plane's routes for its generation through `record_account_recovery_loss_routed`,
+  merged as a marker write's are, and makes the generation account-wide when it passes none. `recovery_loss_reach`
+  reads where one cause's unresolved loss may have lost events, by route.
   `uncover_recovery_coverage` does the same for the given routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
   placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
   deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
@@ -342,8 +306,8 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   certifying relays joins the route's parked remainder (migration 0130): one range per route under a park revision,
   never coverage, cleared only by dismissal. The prune then marks every route settled below its floor, and a later
   prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
-  floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
-  shadow mode: no obligation, retry, fence or schedule reads it.
+  floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The recovery
+  runner schedules on it.
 - **Epoch-gap return visits (`recovery_epoch_gap.rs`, migration 0150).** An unresolved missing epoch has a durable
   visit count, active-visit marker, exhaustion state and next retry time. Beginning a visit and reopening its
   retained goals commit together. Restart resumes ledger progress; observations and revised tickets at the same
@@ -364,8 +328,8 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   unit's retry state, and records its pass's progress only under the revision it began on (migration 0134): every
   request that makes the pass due, a long relay cooldown ending among them, bumps it in the same write.
   `staged_recovery_routes` and `recovery_unit_fences` tell the runner which groups to read, and
-  `reclaim_staged_recovery_routes` gives back what a route it no longer lists staged. Nothing schedules on
-  this state yet.
+  `reclaim_staged_recovery_routes` gives back what a route it no longer lists staged. The recovery runner
+  schedules on this state.
 - **Upgrade conversion (`account_recovery/convert.rs`, migration 0136, mdk#2660 phase 4).**
   `convert_recovery_obligations` turns the old owner's queue-loss, notification-loss, explicit, incremental and
   native-replay obligations into ledger debt and runner retry state, once, before the runner first starts.
@@ -378,8 +342,7 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   every current route's standing goal starts; dismissed rows retire their uncertified scopes' windows on the relays
   they recorded, below where live loss reaches that route; live loss un-covers what it reached once, as an import
   charges it (a generation that named its routes reaches only those, from their bounds; any other reaches every route
-  from its floor), parks what lies below the window, and counts as imported, generations no import charged yet under
-  a new loss revision they are stamped with; parked rows break their routes' required relays that still owe history,
+  from its floor), parks what lies below the window, and counts as imported; parked rows break their routes' required relays that still owe history,
   under one revision per route (one notice), keeping the earliest park time; a pending explicit repair re-arms every
   unit; satisfied rows go. Converted rows are deleted with their scopes, with no third state, and nothing becomes
   coverage. `recovery_conversion_report` keeps the counts by cause and disposition until
@@ -389,8 +352,8 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
   (newer or grown loss stays for the import). After conversion, `import_recovery_loss_to_ledger` imports only
   new or grown evidence into ledger debt, without creating old-owner obligations. It uses the same route and
-  retention inputs, stamps loss revisions, un-covers the generations' reach and keeps below-window debt parked,
-  atomically with the imported counts and exact acknowledgment set. Duplicate observations leave subsequent fetch
+  retention inputs, un-covers the generations' reach and keeps below-window debt parked, atomically with the
+  imported counts and the converted-loss set. Duplicate observations leave subsequent fetch
   proof intact. The existing `converted_recovery_loss` and reclaim handoff also own these later generations.
 
 ## Tests and benchmarks

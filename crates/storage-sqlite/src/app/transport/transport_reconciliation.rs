@@ -475,6 +475,63 @@ impl SqliteAppStorage {
 mod tests {
     use super::*;
 
+    /// A frozen scope the old recovery owner left over `route` from `since`
+    /// to `until`, with one covered checkpoint, for the account-open
+    /// conversion to read. Removing inventory it overlaps voids it.
+    fn seed_frozen_scope(
+        store: &SqliteAccountStorage,
+        route: &TransportReconciliationRoute,
+        since: u64,
+        until: u64,
+    ) {
+        let (kind, id) = route.storage_key();
+        let payload = serde_json::json!({
+            "required_endpoints": ["a"], "admitted_endpoints": ["a"],
+            "checkpoints": [{
+                "endpoint": "a", "outcome": "covered", "exhaustive": true,
+                "admission_complete": true, "first_boundary": true,
+            }],
+            "retained_known_event": false, "attempt_serial": 1, "obligation_revision": 1,
+            "loss_revision": 0, "route_revision": 0, "inventory_revision": 0,
+        })
+        .to_string();
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_recovery_obligations
+                 (id, demand_key, cause, predicate, created_at_ms, updated_at_ms)
+             VALUES (x'07070707070707070707070707070707', 'replay:frozen', 7, 3, 0, 0);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_recovery_scopes (obligation_id, scope_id, route_kind,
+                 route_role, transport_group_id, since_seconds, until_seconds, snapshot_state,
+                 scope_format, scope_payload)
+             VALUES (x'07070707070707070707070707070707', 0, ?1, 0, ?2, ?3, ?4, 1, 1,
+                 CAST(?5 AS BLOB))",
+            params![
+                kind,
+                (!id.is_empty()).then_some(id),
+                i64::try_from(since).unwrap(),
+                i64::try_from(until).unwrap(),
+                payload
+            ],
+        )
+        .unwrap();
+    }
+
+    /// The seeded frozen scope's revision: each voiding raises it.
+    fn frozen_scope_revision(store: &SqliteAccountStorage) -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT scope_revision FROM account_recovery_scopes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     /// The operation failed on the trigger the test injected, not elsewhere.
     fn assert_injected<T: std::fmt::Debug>(result: StorageResult<T>, context: &str) {
         assert!(
@@ -665,7 +722,8 @@ mod tests {
             };
             app.record_reconciliation_items(std::iter::once((&route, &item)))
                 .unwrap();
-            let before = app.recovery_revision_fence().unwrap();
+            seed_frozen_scope(&store, &route, 0, now);
+            let before = frozen_scope_revision(&store);
             let retire = || match path {
                 0 => store.release_message_for_replay(&message),
                 1 => store.delete_group(&group.id),
@@ -673,12 +731,12 @@ mod tests {
                 3 => store.delete_transport_group_routes_below_epoch(&group.id, EpochId(2)),
                 _ => store.delete_transport_group_routes_for_group(&group.id),
             };
-            store.lock().unwrap().execute_batch("CREATE TRIGGER reject_recovery_fence BEFORE UPDATE ON account_recovery_state BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+            store.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_void BEFORE UPDATE ON account_recovery_scopes BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
             assert_injected(
                 retire(),
                 &format!("path {path} must include the invalidation write"),
             );
-            assert_eq!(app.recovery_revision_fence().unwrap(), before);
+            assert_eq!(frozen_scope_revision(&store), before);
             assert!(
                 app.retained_recovery_event(&route, &item.event_id, None, now)
                     .unwrap()
@@ -689,22 +747,19 @@ mod tests {
             store
                 .lock()
                 .unwrap()
-                .execute_batch("DROP TRIGGER reject_recovery_fence")
+                .execute_batch("DROP TRIGGER reject_scope_void")
                 .unwrap();
             retire().unwrap();
             assert!(
                 !app.retained_recovery_event(&route, &item.event_id, None, now)
                     .unwrap()
             );
-            assert_eq!(
-                app.recovery_revision_fence().unwrap().inventory_revision,
-                before.inventory_revision + 1
-            );
+            assert_eq!(frozen_scope_revision(&store), before + 1);
             if path != 1 {
                 retire().unwrap();
                 assert_eq!(
-                    app.recovery_revision_fence().unwrap().inventory_revision,
-                    before.inventory_revision + 1,
+                    frozen_scope_revision(&store),
+                    before + 1,
                     "idempotent deletion must not invalidate proof again"
                 );
             }
@@ -886,7 +941,8 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        let before_revision = app.recovery_revision_fence().unwrap().inventory_revision;
+        seed_frozen_scope(&store, &route, start, start);
+        let before_revision = frozen_scope_revision(&store);
         let inventory = app.transport_reconciliation_inventory(&route, now).unwrap();
         assert_eq!(
             inventory.items.len(),
@@ -903,8 +959,9 @@ mod tests {
         let reopened = app.transport_reconciliation_inventory(&route, now).unwrap();
         assert_eq!(reopened, inventory);
         assert_eq!(
-            app.recovery_revision_fence().unwrap().inventory_revision,
-            before_revision + 1
+            frozen_scope_revision(&store),
+            before_revision + 1,
+            "compaction voids the scope over what it dropped, once"
         );
     }
 
@@ -949,17 +1006,18 @@ mod tests {
             event_id: [7; 32],
             created_at: now,
         };
-        let before = app.recovery_revision_fence().unwrap();
+        seed_frozen_scope(&store, &route, 0, now);
+        let before = frozen_scope_revision(&store);
         app.record_reconciliation_items(std::iter::once((&route, &item)))
             .unwrap();
         app.record_reconciliation_items(std::iter::once((&route, &item)))
             .unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap(), before);
+        assert_eq!(frozen_scope_revision(&store), before);
         store
             .lock()
             .unwrap()
             .execute_batch(
-                "CREATE TRIGGER reject_inventory_fence BEFORE UPDATE ON account_recovery_state
+                "CREATE TRIGGER reject_inventory_fence BEFORE UPDATE ON account_recovery_scopes
             BEGIN SELECT RAISE(ABORT,'injected'); END;",
             )
             .unwrap();
@@ -980,17 +1038,14 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(app.recovery_revision_fence().unwrap(), before);
+        assert_eq!(frozen_scope_revision(&store), before);
         assert!(
             app.transport_reconciliation_inventory(&route, expired_at)
                 .unwrap()
                 .items
                 .is_empty()
         );
-        assert_eq!(
-            app.recovery_revision_fence().unwrap().inventory_revision,
-            before.inventory_revision + 1
-        );
+        assert_eq!(frozen_scope_revision(&store), before + 1);
     }
 
     /// A deferred writer records only what the account still holds on a

@@ -1318,7 +1318,7 @@ async fn run_app_runtime_account_worker(
                 .activate_live_transport(Some(&startup_stage_telemetry))
                 .await?;
             client
-                .prepare_startup_recovery(Some(&startup_stage_telemetry))
+                .prepare_startup_recovery()
                 .await
                 .map_err(state_persist)?;
             let summary = client
@@ -8315,8 +8315,7 @@ mod tests {
             "wss://relay.example",
             crate::MarmotAppConfig::white_noise()
                 .with_dev_settlement_quiescence_ms(100)
-                .with_dev_scheduled_convergence_delay_ms(60_000)
-                .with_dev_epoch_backfill_retry_backoff_ms(300_000),
+                .with_dev_scheduled_convergence_delay_ms(60_000),
         )
         .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
@@ -8380,8 +8379,14 @@ mod tests {
             .shutdown()
             .await;
         // Lost history remains independent of the runnable local passes.
-        app.record_account_delivery_loss("bob", 771, 1, crate::unix_now_seconds())
-            .unwrap();
+        app.record_account_recovery_loss(
+            "bob",
+            storage_sqlite::RecoveryLossCause::Queue,
+            771,
+            1,
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
         let first_pass = Arc::new(tokio::sync::Barrier::new(2));
         runtime
             .shared_services()

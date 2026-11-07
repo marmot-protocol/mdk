@@ -3,33 +3,11 @@
 //! flushes the recovery observations each seam owes the ledger, and keeps the
 //! logical clock the ledger's deadlines are read against.
 use std::time::{Duration, Instant};
-use storage_sqlite::SqliteAppStorage;
 
 use super::AppClient;
 use crate::{AppError, unix_now_seconds};
 
 use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
-use storage_sqlite::RecoveryScopePlan;
-
-#[derive(Clone, Copy)]
-pub(crate) struct RecoveryRetryPolicy {
-    pub(crate) base: Duration,
-    pub(crate) cap: Duration,
-}
-
-impl RecoveryRetryPolicy {
-    fn delay_ms(self, ordinal: u64) -> StorageResult<u64> {
-        if self.base.is_zero() || self.base > self.cap {
-            return Err(StorageError::Serialization(
-                "invalid recovery retry policy".into(),
-            ));
-        }
-        let factor = 1_u32
-            .checked_shl(ordinal.min(31) as u32)
-            .unwrap_or(u32::MAX);
-        duration_ms(self.base.saturating_mul(factor).min(self.cap))
-    }
-}
 
 pub(crate) struct AccountRecoveryOwner {
     pub(super) native_batch: Option<transport_nostr_adapter::ReplayBatch>,
@@ -47,8 +25,7 @@ pub(crate) struct AccountRecoveryOwner {
     replay_complete: bool,
 }
 
-/// Use the same precision as persisted retry deadlines. Truncating to seconds
-/// can make an ordinary reopen look like a backward wall-clock correction.
+/// Wall-clock milliseconds, the precision recovery timestamps are stored at.
 pub(crate) fn wall_now_ms() -> StorageResult<u64> {
     duration_ms(
         std::time::SystemTime::now()
@@ -68,17 +45,8 @@ impl AccountRecoveryOwner {
         self.replay_generation == Some(generation) && self.replay_complete
     }
 
-    pub(crate) fn open(
-        storage: &SqliteAppStorage,
-        wall_now_ms: u64,
-        monotonic_now: Instant,
-        policy: RecoveryRetryPolicy,
-    ) -> StorageResult<Self> {
-        policy.delay_ms(0)?;
-        storage.restore_recovery_waiters()?;
-        storage.reclaim_completed_recovery_events()?;
-        storage.restore_recovery_retry(wall_now_ms, duration_ms(policy.cap)?)?;
-        Ok(Self {
+    pub(crate) fn open(wall_now_ms: u64, monotonic_now: Instant) -> Self {
+        Self {
             native_batch: None,
             native_ingress: None,
             retained_spill: std::collections::HashMap::new(),
@@ -89,7 +57,7 @@ impl AccountRecoveryOwner {
             replay_generation: None,
             replay_observed_generation: None,
             replay_complete: false,
-        })
+        }
     }
 
     #[cfg(all(test, feature = "test-policy-overrides"))]
@@ -230,76 +198,6 @@ impl AppClient {
         result
     }
 
-    pub(super) fn comparison_route_goals(
-        &self,
-        until: u64,
-    ) -> Result<Vec<RecoveryScopePlan>, AppError> {
-        let routing = self.routing.snapshot();
-        let mut goals = Vec::new();
-        let mut push = |group_id: Option<Vec<u8>>,
-                        transport_group_id: Option<[u8; 32]>,
-                        endpoints: &[cgka_traits::TransportEndpoint]| {
-            let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
-            let required = transport_nostr::recovery_required_endpoints(
-                &admitted,
-                &self.app.config.deployment.recovery_operated_relays,
-            );
-            goals.push(RecoveryScopePlan {
-                scope_id: goals.len() as u64,
-                route_kind: u8::from(group_id.is_some()),
-                route_role: 0,
-                group_id,
-                transport_group_id,
-                // This is the inventory window, distinct from the newer live
-                // subscription cutoff. Compaction can raise the actual floor.
-                since_seconds: Some(
-                    until.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS),
-                ),
-                until_seconds: until,
-                known_event_id: None,
-                inventory_floor: None,
-                required_endpoints: required,
-                admitted_endpoints: admitted,
-            });
-        };
-        push(None, None, &routing.local_inbox_endpoints);
-        let mut routes = routing.group_routes.iter().collect::<Vec<_>>();
-        routes.sort_by(|a, b| {
-            a.group_id
-                .as_slice()
-                .cmp(b.group_id.as_slice())
-                .then(a.transport_group_id.cmp(&b.transport_group_id))
-        });
-        for route in routes {
-            let id = route
-                .transport_group_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| StorageError::Serialization("invalid comparison route".into()))?;
-            push(
-                Some(route.group_id.as_slice().to_vec()),
-                Some(id),
-                &route.endpoints,
-            );
-        }
-        Ok(goals)
-    }
-
-    pub(crate) fn request_bounded_comparison(&mut self) -> Result<(), AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        let app = storage.app_storage();
-        self.synchronize_recovery_loss(&app)?;
-        drop(self.transport_receipts()?);
-        self.observe_recovery_route_policy()?;
-        let now = wall_now_ms()?;
-        let goals = self.comparison_route_goals(now / 1000)?;
-        app.observe_recovery_comparison_capability(
-            self.adapter.recovery_comparison_capability_key(),
-        )?;
-        app.join_recovery_comparison(&rand::random(), now, &goals)?;
-        Ok(())
-    }
-
     /// Floor of a joined group's post-join maintenance REQ: the creation of the
     /// Welcome that installed this copy, less the clock-skew allowance.
     ///
@@ -369,49 +267,6 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .app_storage()
             .observe_recovery_route_snapshot(Sha256::digest(canonical).into())?;
-        Ok(())
-    }
-
-    pub(super) fn observe_qualified_local_stagnation(
-        &mut self,
-        group: &cgka_traits::GroupId,
-    ) -> Result<(), AppError> {
-        let Some(stall) = self.epoch_stall.wedge_evidence(group) else {
-            return Ok(());
-        };
-        let record = self.runtime.group_record(group)?;
-        if record.is_terminal() || record.epoch.0 != stall.stalled_epoch {
-            return Ok(());
-        }
-        drop(self.transport_receipts()?);
-        self.observe_recovery_route_policy()?;
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let observation = storage.next_recovery_engine_observation()?;
-        let threshold = self.epoch_stall.fruitless_completion_threshold();
-        let sample = storage.sample_qualified_recovery_stall(
-            group.as_slice(),
-            record.epoch.0,
-            observation,
-            self.recovery_owner.logical_now_ms(Instant::now())?,
-            self.epoch_stall.qualified_observation_interval_ms(),
-            threshold,
-        )?;
-        if let Some(sample) = sample {
-            let count = sample.evidence.fruitless_completions;
-            self.restore_persisted_epoch_stall_evidence(vec![sample.evidence]);
-            if sample.warning_changed {
-                self.mark_recovery_status_changed(group);
-            }
-            if sample.escalated {
-                self.report_epoch_stall_escalation(
-                    group,
-                    record.epoch.0,
-                    count,
-                    threshold,
-                    "observe_qualified_local_stagnation",
-                );
-            }
-        }
         Ok(())
     }
 
@@ -488,41 +343,6 @@ impl AppClient {
         self.delivery_overflow_recovery_pending = pending.is_some();
         self.delivery_overflow_recovery_marker_token = pending.map(|pending| pending.marker_token);
         Ok(!self.delivery_overflow_recovery_pending)
-    }
-
-    /// The other ending for loss debt: the user retired it as "history may be
-    /// incomplete". Mirrors [`Self::finish_qualified_recovery_loss`] without
-    /// acknowledging coverage or recording success. The fence stays while any
-    /// loss obligation is still pending, and the plane clears only the exact
-    /// generation `observed` before retirement, so an omission that is not yet
-    /// durable keeps the fence until it rearms recovery as new loss. Retired
-    /// evidence keeps its watermark; only a later qualified acknowledgment of
-    /// that cause reclaims it. Returns whether the fence was released.
-    pub(super) fn release_retired_delivery_loss(
-        &mut self,
-        observed: Option<transport_nostr::AccountDeliveryOverflow>,
-    ) -> Result<bool, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        if storage
-            .app_storage()
-            .pending_recovery_demands()?
-            .iter()
-            .any(|demand| {
-                matches!(
-                    demand.cause,
-                    storage_sqlite::RecoveryCause::QueueLoss
-                        | storage_sqlite::RecoveryCause::NotificationLoss
-                )
-            })
-        {
-            return Ok(false);
-        }
-        if !self.adapter.retire_delivery_overflow(observed) {
-            return Ok(false);
-        }
-        self.delivery_overflow_recovery_pending = false;
-        self.delivery_overflow_recovery_marker_token = None;
-        Ok(true)
     }
 
     /// Whether recovery may contact any relay of the account's routes. With
@@ -638,41 +458,25 @@ mod tests {
         // beside a still-unadmitted native inbox scope with no floor.
         let ledger = app.account_storage("alice").unwrap().app_storage();
         let cursor = unix_now_seconds().saturating_sub(60);
-        let (ticket, _) = ledger
-            .request_recovery_observed(
-                storage_sqlite::RecoveryRequest::SubscriptionReplay { snapshot: &[7; 32] },
-                0,
-            )
-            .unwrap();
+        let payload = serde_json::json!({
+            "required_endpoints": ["wss://relay.example"],
+            "admitted_endpoints": ["wss://relay.example"],
+            "checkpoints": [], "retained_known_event": false, "attempt_serial": 1,
+            "obligation_revision": 1, "loss_revision": 0, "route_revision": 0,
+            "inventory_revision": 0,
+        });
         ledger
-            .install_recovery_scope_plan(
-                &ledger.recovery_revision_fence().unwrap(),
-                0,
-                ticket.id,
-                &[RecoveryScopePlan {
-                    scope_id: 1,
-                    route_kind: 0,
-                    route_role: 0,
-                    group_id: None,
-                    transport_group_id: None,
-                    since_seconds: None,
-                    until_seconds: cursor,
-                    known_event_id: None,
-                    inventory_floor: None,
-                    required_endpoints: vec!["wss://relay.example".into()],
-                    admitted_endpoints: vec!["wss://relay.example".into()],
-                }],
-            )
-            .unwrap()
-            .expect("the native inbox scope installs");
-        assert!(
-            ledger
-                .recovery_scope_snapshots(ticket.id)
-                .unwrap()
-                .iter()
-                .all(|scope| !scope.replay_admitted && scope.plan.since_seconds.is_none()),
-            "an unresolved unfloored inbox scope"
-        );
+            .execute_batch_for_test(&format!(
+                "INSERT INTO account_recovery_obligations (id, demand_key, cause, predicate,
+                     created_at_ms, updated_at_ms)
+                 VALUES (x'{id}', 'replay:{snapshot}', 7, 3, 0, 0);
+                 INSERT INTO account_recovery_scopes (obligation_id, scope_id, route_kind,
+                     route_role, until_seconds, snapshot_state, scope_format, scope_payload)
+                 VALUES (x'{id}', 1, 0, 0, {cursor}, 1, 1, CAST('{payload}' AS BLOB));",
+                id = "07".repeat(16),
+                snapshot = "07".repeat(32),
+            ))
+            .unwrap();
         let mut state = app.load_state("alice").unwrap();
         state.last_transport_timestamp = Some(cursor);
         app.save_state(&state).unwrap();
@@ -825,39 +629,5 @@ mod tests {
         let before = changed();
         client.synchronize_native_replay().await.unwrap();
         assert_eq!(changed(), before + 1, "the second generation's first pass");
-    }
-
-    fn policy() -> RecoveryRetryPolicy {
-        RecoveryRetryPolicy {
-            base: Duration::from_secs(15),
-            cap: Duration::from_secs(300),
-        }
-    }
-
-    #[test]
-    fn owner_retry_policy_caps_extreme_ordinals_and_validates_bounds() {
-        assert_eq!(policy().delay_ms(u64::MAX).unwrap(), 300_000);
-        let oversized = RecoveryRetryPolicy {
-            base: Duration::from_secs(600),
-            cap: Duration::from_secs(600),
-        };
-        assert_eq!(oversized.delay_ms(0).unwrap(), 600_000);
-        assert_eq!(oversized.delay_ms(u64::MAX).unwrap(), 600_000);
-        assert!(
-            RecoveryRetryPolicy {
-                base: Duration::ZERO,
-                ..policy()
-            }
-            .delay_ms(0)
-            .is_err()
-        );
-        assert!(
-            RecoveryRetryPolicy {
-                base: Duration::from_secs(301),
-                ..policy()
-            }
-            .delay_ms(0)
-            .is_err()
-        );
     }
 }

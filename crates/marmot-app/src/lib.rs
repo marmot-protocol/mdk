@@ -470,18 +470,6 @@ const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-/// How long a recovery attempt waits before the automatic seams may start
-/// another, doubling per attempt up to [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
-///
-/// Without pacing, the receive seam would start a recovery job after *every*
-/// inbound ingest. Progress (new coverage or admitted history) resets it to
-/// this floor, which matches the maintenance tick cadence.
-pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
-/// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
-/// that outlasts this is not going to be resolved by trying harder, and the
-/// intent is durable, so a five-minute floor between attempts costs nothing but
-/// leaves recovery responsive when the relay returns.
-pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 /// Local worker operations include SQLite's bounded busy retry but no relay or
 /// blob transfer. A missing response beyond this point indicates a wedged
@@ -2113,25 +2101,10 @@ impl MarmotApp {
             crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
-        let recovery_policy = if cfg!(feature = "test-policy-overrides")
-            && let Some(ms) = self.config.dev_epoch_backfill_retry_backoff_ms
-        {
-            client::recovery::RecoveryRetryPolicy {
-                base: Duration::from_millis(ms.max(1)),
-                cap: Duration::from_millis(ms.max(1).saturating_mul(20)),
-            }
-        } else {
-            client::recovery::RecoveryRetryPolicy {
-                base: EPOCH_BACKFILL_RETRY_BACKOFF,
-                cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
-            }
-        };
         let recovery_owner = client::recovery::AccountRecoveryOwner::open(
-            &self.account_storage(&open.state.label)?.app_storage(),
             client::recovery::wall_now_ms()?,
             Instant::now(),
-            recovery_policy,
-        )?;
+        );
         // Before the client activates any REQ; a failed read trusts none.
         let live_coverage = client::LiveCoverage::open(
             self.account_storage(&open.state.label)?
@@ -2163,7 +2136,6 @@ impl MarmotApp {
             #[cfg(test)]
             recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
             recovery_runner: Default::default(),
-            comparison_startup_requested: false,
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,

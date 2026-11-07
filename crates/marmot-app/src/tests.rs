@@ -1759,13 +1759,6 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     }
 }
 
-/// Cut the recovery retry backoff to zero where `test-policy-overrides`
-/// honors it, so a paced retry costs milliseconds instead of the production
-/// 15 s cooldown.
-pub(crate) fn bounded_epoch_backfill_config() -> MarmotAppConfig {
-    MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(0)
-}
-
 /// Open a client on the app's *own* relay plane.
 ///
 /// [`MarmotApp::client`] mints a fresh plane per client, so a test that drives
@@ -12043,9 +12036,10 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         let storage = app.account_storage("alice").unwrap().app_storage();
         assert!(
             storage
-                .account_delivery_recovery("alice")
+                .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                 .unwrap()
-                .is_none()
+                .is_empty(),
+            "a spill records no loss"
         );
         assert_eq!(
             storage
@@ -12140,8 +12134,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                 }
                 storage
                     .app_storage()
-                    .record_account_delivery_loss(
+                    .record_account_recovery_loss(
                         "alice",
+                        storage_sqlite::RecoveryLossCause::Queue,
                         marker_token,
                         dropped,
                         unix_now_seconds(),
@@ -12241,9 +12236,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             app.account_storage("alice")
                 .unwrap()
                 .app_storage()
-                .account_delivery_recovery("alice")
+                .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "the regression must inspect the pre-marker crash window"
         );
         assert!(
@@ -12272,21 +12267,22 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         .await
         .expect("the single marker worker must persist after the retry clears");
         let storage = app.account_storage("alice").unwrap().app_storage();
-        assert!(
+        let queue_loss_demand = || {
             storage
-                .account_delivery_recovery("alice")
+                .pending_recovery_demands()
                 .unwrap()
-                .is_none(),
+                .iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+        };
+        assert!(
+            !queue_loss_demand(),
             "the loss writer persists evidence only; it cannot create owner demand"
         );
         // The serialized recovery seam imports the evidence. No acquisition
         // is needed to prove cursor safety across this handoff and reopen.
         client.refresh_account_recovery().await.unwrap();
         assert!(
-            storage
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_none(),
+            !queue_loss_demand(),
             "the runner keeps no legacy recovery-demand pointer"
         );
         let owes_omission = || {
@@ -24409,7 +24405,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     let dir = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let (app, mut client, route) =
-        undecryptable_probe_route(&dir, &relay, bounded_epoch_backfill_config()).await;
+        undecryptable_probe_route(&dir, &relay, MarmotAppConfig::white_noise()).await;
 
     // Model a welcome-installed copy: the route's group is created locally, and
     // a copy this device created has no Welcome time to compare against.

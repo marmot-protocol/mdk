@@ -1,7 +1,6 @@
 //! Worker-owned "history may be incomplete" notices and their explicit,
 //! user-authorized retirement. Retirement is recorded as its own outcome,
-//! never as coverage, and releases a retired loss's cursor fence without
-//! recording recovery success.
+//! never as coverage.
 //!
 //! Routes the coverage ledger parks raise notices too ([`LedgerNotice`]), and
 //! the account's recovery status reads what the recovery runner is catching up
@@ -225,15 +224,13 @@ impl AppClient {
     /// Retire exactly the dismissed occurrence as "history may be incomplete".
     /// Returns false, changing nothing, when the notice is stale: new evidence
     /// re-armed recovery (it is then pending again or a new occurrence) or it
-    /// was already dismissed. A retired loss obligation also releases the
-    /// transport-cursor fence once no loss obligation remains pending, so the
-    /// cursor can advance past the loss the user accepted.
+    /// was already dismissed.
     pub(crate) fn dismiss_history_notice(&mut self, notice_id: &str) -> Result<bool, AppError> {
         let ticket = decode_notice_id(notice_id)?;
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
-        // Newer loss joins first. It re-arms the obligation under a new
-        // revision, so a dismissal of the older occurrence becomes stale.
+        // Newer loss joins the ledger first, and an unconverted account
+        // converts, so a dismissal reads the notices hosts are shown.
         self.synchronize_recovery_loss(&app)?;
         let Some((cause, group)) = app
             .parked_recovery_obligations()?
@@ -243,9 +240,6 @@ impl AppClient {
         else {
             return self.dismiss_ledger_notice(&app, ticket);
         };
-        // The plane's pending generation before retirement. Releasing the
-        // fence requires it to be unchanged afterwards.
-        let observed = self.adapter.pending_delivery_overflow_generation();
         if !app.retire_parked_recovery_obligation(
             ticket.id,
             ticket.revision,
@@ -258,8 +252,6 @@ impl AppClient {
             );
             return Ok(false);
         }
-        // The retirement is durable from here on; the dismissal succeeded
-        // even if the in-memory fence cannot be released right now.
         self.wake_recovery_runner();
         self.record_need_changed(
             group.map(GroupId::new).as_ref(),
@@ -270,51 +262,10 @@ impl AppClient {
             None,
             None,
         );
-        let loss = matches!(
-            cause,
-            storage_sqlite::RecoveryCause::QueueLoss
-                | storage_sqlite::RecoveryCause::NotificationLoss
-        );
-        let fence_released = loss
-            && self
-                .release_retired_delivery_loss(observed)
-                .unwrap_or_else(|_| {
-                    tracing::warn!(
-                        target: "marmot_app::recovery",
-                        method = "dismiss_history_notice",
-                        error_kind = "loss_fence_release_failed",
-                        "retired loss keeps its cursor fence until the next loss observation",
-                    );
-                    false
-                });
-        if fence_released && !self.delivery_loss_blocks_cursor() {
-            // Every prefix drained while the fence held stayed on the old
-            // cursor. The user accepted the loss, so promote the candidate as
-            // qualified completion would, without recording coverage.
-            let sealed = self.seal_transport_cursor();
-            if self
-                .save_state_with_pending_local_group_deletion_frontier_clears()
-                .is_err()
-            {
-                self.abandon_transport_cursor(sealed);
-                tracing::warn!(
-                    target: "marmot_app::recovery",
-                    method = "dismiss_history_notice",
-                    error_kind = "cursor_checkpoint_failed",
-                    "cursor advances at the next checkpoint instead",
-                );
-            } else {
-                self.settle_transport_cursor(
-                    sealed,
-                    marmot_forensics::TransportCursorTrigger::NoticeRetired,
-                );
-            }
-        }
         tracing::info!(
             target: "marmot_app::recovery",
             method = "dismiss_history_notice",
             cause = HistoryNoticeCause::from_recovery(cause).as_str(),
-            loss_fence_released = fence_released,
             remaining_notices = app.parked_recovery_obligations()
                 .map_or(0, |parked| parked.len()),
             "retired a parked recovery occurrence; its history may be incomplete",
@@ -464,10 +415,9 @@ impl AppClient {
 
 impl AppClient {
     /// Audit the notice set's transitions: each newly parked occurrence, an
-    /// obligation's or a ledger route's, is a shown notice, and a withdrawn
-    /// one whose obligation is now satisfied was closed with qualified
-    /// coverage. Other withdrawals are recorded where they happen: a
-    /// dismissal, or new evidence resuming the demand.
+    /// obligation's or a ledger route's, is a shown notice. Withdrawals are
+    /// recorded where they happen: a dismissal, or new evidence resuming the
+    /// demand.
     fn record_history_notice_changes(
         &self,
         previous: &HistoryNoticeBaseline,
@@ -496,115 +446,49 @@ impl AppClient {
                 None,
             );
         }
-        let Ok(storage) = self.app.account_storage(&self.state.label) else {
-            return;
-        };
-        for (id, revision, group) in previous.iter().filter(|entry| !current.contains(entry)) {
-            let Ok(Some(status)) = storage.app_storage().recovery_obligation_status(*id) else {
-                continue;
-            };
-            if status.state != storage_sqlite::RecoveryObligationState::Satisfied {
-                continue;
-            }
-            self.record_need_changed(
-                group.clone().map(GroupId::new).as_ref(),
-                super::audit_recovery::obligation_cause(status.cause),
-                marmot_forensics::RecoveryNeedChange::Closed,
-                storage_sqlite::RecoveryDemandTicket {
-                    id: *id,
-                    revision: status.revision.max(*revision),
-                },
-                None,
-                None,
-                None,
-            );
-        }
     }
 }
 
-/// Park one obligation the way the owner does after its fruitless budget:
-/// one reserved attempt whose checkpoint certifies nothing.
+/// Park one pending epoch gap the way the recovery runner does after its
+/// last fruitless return visit: a begun visit over the group's routes,
+/// finished exhausted.
 #[cfg(test)]
 pub(crate) fn park_recovery_for_test(storage: &storage_sqlite::SqliteAccountStorage, id: [u8; 16]) {
-    assert!(!settle_recovery_for_test(storage, id, false));
-}
-
-/// One reserved attempt for exactly `id`, checkpointed with synthetic finite
-/// endpoint evidence: qualified coverage when `covered`, otherwise nothing,
-/// which parks it. Returns whether the obligation is now satisfied.
-/// The synthetic goal stays fixed across attempts of the same revision.
-#[cfg(test)]
-pub(crate) fn settle_recovery_for_test(
-    storage: &storage_sqlite::SqliteAccountStorage,
-    id: [u8; 16],
-    covered: bool,
-) -> bool {
-    use storage_sqlite::{
-        RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint,
-        RecoveryScopeOutcome, RecoveryScopePlan,
-    };
-    let mut fence = storage.app_storage().recovery_revision_fence().unwrap();
-    fence.obligations.retain(|(candidate, _)| *candidate == id);
-    let now = super::recovery::wall_now_ms().unwrap();
-    let attempt = storage
-        .app_storage()
-        .reserve_recovery_attempt(&fence, now, 1, true)
+    use cgka_traits::storage::GroupStorage;
+    let app = storage.app_storage();
+    let demand = app
+        .pending_recovery_demands()
         .unwrap()
-        .expect("explicit reservation")
-        .attempt_serial;
-    let endpoint = "wss://relay.example".to_owned();
-    let token = storage
-        .app_storage()
-        .install_recovery_scope_plan(
-            &fence,
-            attempt,
-            id,
-            &[RecoveryScopePlan {
-                scope_id: 0,
-                route_kind: 0,
-                route_role: 0,
-                group_id: None,
-                transport_group_id: None,
-                since_seconds: Some(1),
-                until_seconds: 1,
-                known_event_id: None,
-                inventory_floor: Some(1),
-                required_endpoints: vec![endpoint.clone()],
-                admitted_endpoints: vec![endpoint.clone()],
-            }],
-        )
+        .into_iter()
+        .find(|demand| demand.ticket.id == id)
+        .expect("a pending obligation");
+    assert_eq!(demand.cause, storage_sqlite::RecoveryCause::EpochGap);
+    let group = demand.group_id.expect("an epoch gap names its group");
+    let now = crate::unix_now_seconds();
+    let floor = now.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    let floors = storage
+        .list_transport_group_routes()
         .unwrap()
-        .expect("fresh plan")
-        .remove(0);
-    storage
-        .app_storage()
-        .checkpoint_recovery_obligation(
-            &fence,
-            attempt,
-            id,
-            &[RecoveryScopeCheckpoint {
-                token,
-                endpoints: vec![RecoveryEndpointCheckpoint {
-                    endpoint,
-                    outcome: if covered {
-                        RecoveryScopeOutcome::Covered
-                    } else {
-                        RecoveryScopeOutcome::Unknown
-                    },
-                    exhaustive: covered,
-                    admission_complete: covered,
-                    first_boundary: false,
-                }],
-                retained_known_event: false,
-                replay_admitted: false,
-            }],
-            if covered {
-                RecoveryEligibility::Retry
-            } else {
-                RecoveryEligibility::NeedsDeepRepair
-            },
-        )
+        .into_iter()
+        .filter(|route| route.group_id.as_slice() == group.as_slice())
+        .map(|route| {
+            let id = route.transport_group_id.as_slice().try_into().unwrap();
+            (TransportReconciliationRoute::Group(id), floor)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, now)
+            .unwrap()
+    );
+    let visits = app
+        .recovery_epoch_gap_retry(demand.ticket)
         .unwrap()
+        .unwrap()
+        .visits;
+    assert!(
+        app.finish_recovery_epoch_gap_retry(demand.ticket, visits, now, 0, true)
+            .unwrap()
+    );
 }
 
 #[cfg(test)]
@@ -630,70 +514,57 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
     }
 
-    fn pending(storage: &storage_sqlite::SqliteAccountStorage, cause: RecoveryCause) -> [u8; 16] {
-        storage
-            .app_storage()
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == cause)
-            .unwrap()
-            .ticket
-            .id
-    }
-
-    /// Durable loss plus the plane generation a finished, uncertified attempt
-    /// leaves behind: the cursor stays fenced on both.
-    fn fence_loss(client: &mut crate::AppClient, token: u64) {
-        let storage = client.app.account_storage("alice").unwrap();
-        storage
-            .app_storage()
-            .mark_account_delivery_recovery("alice", token, 1)
-            .unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(token);
-        client.adapter.start_delivery_overflow_recovery(token);
-        client.adapter.fail_delivery_overflow_recovery();
-        assert!(client.delivery_loss_blocks_cursor());
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parked_history_surfaces_and_dismissal_retires_exactly_one_occurrence() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(&dir);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("history notices", &[]).await.unwrap();
-        let epoch = client.group_mls_state(&group).unwrap().epoch;
+        let other = client.create_group("still parked", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
+        let intents = [&group, &other]
+            .into_iter()
+            .map(|id| StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(id.as_slice()),
+                stalled_epoch: client.group_mls_state(id).unwrap().epoch,
+            })
+            .collect::<Vec<_>>();
         storage
             .app_storage()
-            .arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group.as_slice()),
-                stalled_epoch: epoch,
-            }])
+            .arm_epoch_backfill_intents(&intents)
             .unwrap();
-        fence_loss(&mut client, 42);
         assert!(client.history_notices().unwrap().is_empty());
-        let loss = pending(&storage, RecoveryCause::QueueLoss);
-        let gap = pending(&storage, RecoveryCause::EpochGap);
-        park_recovery_for_test(&storage, loss);
-        park_recovery_for_test(&storage, gap);
+        let gaps = storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .filter(|demand| demand.cause == RecoveryCause::EpochGap)
+            .map(|demand| (demand.group_id.unwrap(), demand.ticket.id))
+            .collect::<Vec<_>>();
+        assert_eq!(gaps.len(), 2);
+        for (_, gap) in &gaps {
+            park_recovery_for_test(&storage, *gap);
+        }
 
         let notices = client.history_notices().unwrap();
         assert_eq!(notices.len(), 2);
-        let loss_notice = notices
-            .iter()
-            .find(|notice| notice.cause == HistoryNoticeCause::DeliveryLoss)
-            .unwrap()
-            .clone();
+        assert!(
+            notices
+                .iter()
+                .all(|notice| notice.cause == HistoryNoticeCause::EpochGap
+                    && notice.parked_at_ms.is_some())
+        );
         let gap_notice = notices
             .iter()
-            .find(|notice| notice.cause == HistoryNoticeCause::EpochGap)
+            .find(|notice| notice.group_id_hex == Some(hex::encode(group.as_slice())))
             .unwrap()
             .clone();
-        assert_eq!(loss_notice.group_id_hex, None);
-        assert_eq!(gap_notice.group_id_hex, Some(hex::encode(group.as_slice())));
-        assert!(loss_notice.parked_at_ms.is_some() && gap_notice.parked_at_ms.is_some());
+        let other_notice = notices
+            .iter()
+            .find(|notice| notice.group_id_hex == Some(hex::encode(other.as_slice())))
+            .unwrap()
+            .clone();
         let status = client.group_recovery_status(&group).unwrap();
         assert!(status.history_may_be_incomplete);
         assert_eq!(
@@ -701,43 +572,48 @@ mod tests {
             vec![gap_notice.notice_id.clone()]
         );
         // The open recorded the empty baseline; parking is one announced change.
-        assert_eq!(
-            client.take_history_notice_changes(),
-            Some(vec![group.clone()])
-        );
+        let mut changed = client.take_history_notice_changes().unwrap();
+        changed.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        let mut both = vec![group.clone(), other.clone()];
+        both.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        assert_eq!(changed, both);
         assert_eq!(client.take_history_notice_changes(), None);
 
-        // Only the group's occurrence retires. It is its own outcome, not
-        // coverage, and the account's loss keeps the cursor fenced.
+        // Only the dismissed occurrence retires. It is its own outcome, not
+        // coverage: the gap is neither pending nor parked any more.
         assert!(
             client
                 .dismiss_history_notice(&gap_notice.notice_id)
                 .unwrap()
         );
-        assert_eq!(client.history_notices().unwrap(), vec![loss_notice.clone()]);
+        assert_eq!(client.history_notices().unwrap(), vec![other_notice]);
         let status = client.group_recovery_status(&group).unwrap();
         assert!(!status.history_may_be_incomplete && status.history_notice_ids.is_empty());
         assert_eq!(
             client.take_history_notice_changes(),
             Some(vec![group.clone()])
         );
-        let gap_ticket = crate::history_notices::decode_notice_id(&gap_notice.notice_id).unwrap();
-        for revision in [gap_ticket.revision, gap_ticket.revision + 1] {
-            assert!(
-                !storage
-                    .app_storage()
-                    .recovery_obligation_is_satisfied(gap, revision)
-                    .unwrap()
-            );
-        }
+        let (_, gap) = gaps
+            .iter()
+            .find(|(id, _)| id.as_slice() == group.as_slice())
+            .unwrap();
         assert!(
+            storage
+                .app_storage()
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .all(|demand| demand.ticket.id != *gap)
+        );
+        assert_eq!(
             storage
                 .app_storage()
                 .pending_epoch_backfill_intents()
                 .unwrap()
-                .is_empty()
+                .len(),
+            1,
+            "only the other group's gap stays owed"
         );
-        assert!(client.delivery_loss_blocks_cursor());
         assert!(
             !client
                 .dismiss_history_notice(&gap_notice.notice_id)
@@ -745,53 +621,10 @@ mod tests {
             "a dismissed occurrence is stale"
         );
 
-        // Retiring the last loss releases the fence without recording success.
-        let before = app.relay_plane.relay_health().await;
-        assert!(
-            client
-                .dismiss_history_notice(&loss_notice.notice_id)
-                .unwrap()
-        );
-        assert!(client.history_notices().unwrap().is_empty());
-        assert!(!client.delivery_overflow_recovery_pending);
-        assert!(
-            client
-                .adapter
-                .pending_delivery_overflow_generation()
-                .is_none()
-        );
-        assert!(!client.delivery_loss_blocks_cursor());
-        assert_eq!(
-            client.checkpointed_transport_timestamp,
-            client.state.last_transport_timestamp
-        );
-        let after = app.relay_plane.relay_health().await;
-        assert_eq!(
-            after.account_delivery_recovery_successes,
-            before.account_delivery_recovery_successes
-        );
-        assert!(
-            storage
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            storage
-                .app_storage()
-                .restore_unacknowledged_recovery_loss()
-                .unwrap(),
-            0
-        );
-        assert_eq!(client.take_history_notice_changes(), Some(Vec::new()));
-
-        // The dismissal is durable: nothing reappears or re-fences on reopen.
+        // The dismissal is durable: nothing reappears on reopen.
         drop(client);
         let client = client_on_app_relay_plane(&app, "alice").await;
-        assert!(client.history_notices().unwrap().is_empty());
-        assert!(!client.delivery_overflow_recovery_pending);
-        assert!(!client.delivery_loss_blocks_cursor());
+        assert_eq!(client.history_notices().unwrap().len(), 1);
         assert!(
             !client
                 .group_recovery_status(&group)

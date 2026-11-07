@@ -30,10 +30,10 @@
 //! not no reset at all.
 //!
 //! At a frozen epoch, elapsed time can request reassessment but cannot buy
-//! another replay or count evidence. The account owner authorizes acquisition.
-//! Storage counts distinct paced local evaluations only under qualified scope
-//! coverage and durable admission. EOSE alone cannot provide that proof. The
-//! detector restores the resulting current certificate projection; reorgs do
+//! another replay or count evidence. The recovery runner owns acquisition.
+//! The old owner's storage counted distinct paced local evaluations under
+//! qualified scope coverage; those samples were deleted with it (mdk#2660), so
+//! the detector only restores counts a previous process persisted. Reorgs do
 //! not erase same-epoch evidence, and authenticated recovery retires it.
 //!
 //! Runs are bounded in wall-clock too. Nothing else ends a quiet group's run,
@@ -192,13 +192,10 @@ pub(crate) const EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_
 
 /// Distinct paced local evaluations under still-qualified historical scope
 /// coverage and durable admission before reporting a blocked/unknown engine.
-/// The historical symbol and stored counter names remain stable, but EOSE,
-/// timer ticks, unreadable ciphertext and repeated observation IDs do not count.
-/// Storage validates the current group epoch, loss/route/scope fences and sample
-/// interval in the same transaction as its one-shot warning. Three preserves the
-/// existing reporting threshold; it changes neither branch choice nor recovery
-/// authority. A later interval may count another actual local evaluation without
-/// requiring another blanket history replay.
+/// EOSE, timer ticks, unreadable ciphertext and repeated observation IDs do not
+/// count. The storage samples that counted them were deleted with the old
+/// recovery owner (mdk#2660), so only restored evidence reaches this threshold;
+/// it changes neither branch choice nor recovery authority.
 pub(crate) const EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD: u32 = 3;
 
 /// The invariant the two wall-clock constants above are chosen under, checked
@@ -304,8 +301,8 @@ struct GroupStall {
     /// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) and bounds a run in time
     /// ([`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`]).
     last_arm_at_ms: Option<u64>,
-    /// Current durable qualified local-observation count at this epoch. Only
-    /// storage produces these samples; the detector restores the projection.
+    /// Durable qualified local-observation count at this epoch, as a previous
+    /// process persisted it; nothing produces new samples (mdk#2660).
     fruitless_completions: u32,
 }
 
@@ -671,10 +668,6 @@ impl EpochStallDetector {
     /// reason [`Self::threshold`] is reported on the arm row.
     pub(crate) fn escalation_arm_threshold(&self) -> u32 {
         self.escalation_arm_threshold
-    }
-
-    pub(crate) fn qualified_observation_interval_ms(&self) -> u64 {
-        self.wedge_rearm_interval_ms
     }
 
     /// The confirmed-fruitless-completion count at which this detector reports a

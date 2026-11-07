@@ -645,8 +645,15 @@ async fn loss_during_a_generation_leaves_its_seconds_owed() {
     let mut fixture = fixture().await;
     let app = fixture.storage.app_storage();
     let floor = unix_now_seconds().saturating_sub(30);
-    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
-        .unwrap();
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        storage_sqlite::RecoveryLossCause::Queue,
+        41,
+        3,
+        unix_now_seconds(),
+        Some(floor),
+    )
+    .unwrap();
     fixture.client.synchronize_recovery_loss(&app).unwrap();
     let later = unix_now_seconds() + HOUR;
     for route in routes(&fixture.client) {

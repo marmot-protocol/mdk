@@ -647,7 +647,7 @@ fn a_v0_14_0_database_converts_every_row_kind() {
     );
 
     // Converting the incremental history settled the comparison slot it held.
-    assert!(!app.recovery_comparison().unwrap().pending());
+    assert!(comparison_settled(&store));
 
     let report = app.recovery_conversion_report().unwrap().unwrap();
     assert_eq!(
@@ -824,7 +824,7 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
             ],
         ]
     );
-    assert!(!app.recovery_comparison().unwrap().pending());
+    assert!(comparison_settled(&store));
 
     let report = app.recovery_conversion_report().unwrap().unwrap();
     assert_eq!(
@@ -907,8 +907,15 @@ fn a_crash_at_each_step_resumes_to_the_same_result(version: i64, rows: &str) {
         let app = store.app_storage();
         app.acknowledge_recovery_conversion_report().unwrap();
         app.acknowledge_recovery_conversion_notices().unwrap();
-        app.request_recovery(RecoveryRequest::IncrementalHistory, NOW * 1000)
-            .unwrap();
+        // A converted cause written after the conversion finished is not
+        // converted again.
+        app.execute_batch_for_test(&format!(
+            "INSERT INTO account_recovery_obligations (id, demand_key, cause, created_at_ms, updated_at_ms)
+             VALUES (x'{}', 'incremental', 5, {ms}, {ms});",
+            "5a".repeat(16),
+            ms = NOW * 1000,
+        ))
+        .unwrap();
         let acknowledged = dump(&store);
         convert(&store).unwrap();
         assert_eq!(
@@ -1306,59 +1313,6 @@ fn converted_loss_is_reclaimed_only_as_converted() {
     assert!(!app.reclaim_converted_recovery_loss(&queue).unwrap());
 }
 
-/// A generation no import charged yet is charged by the conversion as an
-/// import would: under a new loss revision it is stamped with, so a reclaim
-/// keeps how recent it was. Already imported generations keep their stamp.
-#[test]
-fn unimported_loss_is_stamped_with_a_new_loss_revision() {
-    let rows = format!(
-        "{}UPDATE account_delivery_loss_evidence SET imported_count = NULL
-             WHERE cause = 0 AND marker_token = 7;",
-        v0_14_0_rows()
-    );
-    let store = at_v0_14_0(&rows);
-    let app = store.app_storage();
-    let read = |store: &SqliteAccountStorage| {
-        let conn = store.lock().unwrap();
-        let state: (i64, i64) = conn
-            .query_row(
-                "SELECT loss_revision, acknowledged_import_revision FROM account_recovery_state",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let stamp = |token: i64| -> Option<i64> {
-            use rusqlite::OptionalExtension;
-            conn.query_row(
-                "SELECT import_revision FROM account_delivery_loss_evidence
-                 WHERE marker_token = ?1",
-                [token],
-                |row| row.get(0),
-            )
-            .optional()
-            .unwrap()
-            .flatten()
-        };
-        (state, stamp(7), stamp(9))
-    };
-    let ((revision, _), _, notification) = read(&store);
-    convert(&store).unwrap();
-    let ((after, _), queue, notification_after) = read(&store);
-    assert_eq!(after, revision + 1);
-    assert_eq!(queue, Some(after));
-    assert_eq!(notification_after, notification);
-
-    let queue = app
-        .converted_recovery_loss()
-        .unwrap()
-        .into_iter()
-        .find(|loss| loss.cause == RecoveryLossCause::Queue)
-        .unwrap();
-    assert!(app.reclaim_converted_recovery_loss(&queue).unwrap());
-    let ((_, acknowledged), ..) = read(&store);
-    assert_eq!(acknowledged, after);
-}
-
 /// Loss that named its routes reaches only them, as an import charges it: a
 /// dismissed window on another route retires whole, and other routes keep
 /// their coverage.
@@ -1741,7 +1695,6 @@ fn post_conversion_loss_is_atomic_and_requires_completed_conversion() {
         )
         .unwrap();
     let before = dump(&store);
-    let revision = app.recovery_revision_fence().unwrap();
     match app.import_recovery_loss_to_ledger("alice", &input(&routes)) {
         Err(StorageError::Backend(message)) => {
             assert!(message.contains("injected ledger loss commit"))
@@ -1749,7 +1702,6 @@ fn post_conversion_loss_is_atomic_and_requires_completed_conversion() {
         other => panic!("expected injected ledger loss failure, got {other:?}"),
     }
     assert_eq!(dump(&store), before);
-    assert_eq!(app.recovery_revision_fence().unwrap(), revision);
     store
         .lock()
         .unwrap()
@@ -1760,9 +1712,18 @@ fn post_conversion_loss_is_atomic_and_requires_completed_conversion() {
             .unwrap()
     );
     assert_eq!(app.converted_recovery_loss().unwrap().len(), 2);
-    assert_eq!(
-        app.recovery_revision_fence().unwrap().loss_revision,
-        revision.loss_revision + 1
-    );
     assert!(causes(&store).is_empty());
+}
+
+/// Whether the old owner's comparison slot holds no unsettled request.
+fn comparison_settled(store: &SqliteAccountStorage) -> bool {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT revision = settled_revision FROM account_recovery_comparison",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }

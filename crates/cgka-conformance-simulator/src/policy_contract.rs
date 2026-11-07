@@ -241,8 +241,9 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
-    // Parking stops automatic reacquisition and certifies nothing, so it
-    // changes which history arrives, never what counts as covered.
+    // Only the old owner's attempt cap remains, keeping a capped park through
+    // a route change; parking certifies nothing, so it changes which history
+    // arrives, never what counts as covered.
     decision(
         "A18",
         ConstantInfluence::InputAcquisition,

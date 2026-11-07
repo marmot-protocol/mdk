@@ -285,8 +285,9 @@ impl AppClient {
         *next = (*next).min(at);
     }
 
-    /// Remove rows and turn them into a queue-loss obligation in one
-    /// transaction, then fence the cursor until recovery settles that loss.
+    /// Remove rows and record them as queue-loss evidence in one transaction,
+    /// then fence the cursor until the runner's loss import has turned that
+    /// evidence into ledger debt, as overflow observation does.
     pub(super) fn discard_spilled_deliveries(&mut self, seqs: &[i64]) -> Result<(), AppError> {
         use rand::RngCore;
         #[cfg(test)]
@@ -307,6 +308,8 @@ impl AppClient {
         self.delivery_overflow_recovery_marker_token
             .get_or_insert(token);
         self.delivery_spill.loss_recorded = true;
+        self.synchronize_recovery_loss(&storage.app_storage())?;
+        self.finish_runner_loss_import()?;
         Ok(())
     }
 
@@ -657,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unadmitted_row_becomes_queue_loss_after_its_last_retry() {
+    async fn unadmitted_row_becomes_ledger_debt_after_its_last_retry() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -669,29 +672,52 @@ mod tests {
             MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
+        let now = unix_now_seconds();
+        let lost_at = now - 600;
+        let mut lost = delivery(9);
+        lost.message.timestamp = Timestamp(lost_at);
         storage
             .app_storage()
-            .spill_account_deliveries(
-                &[delivery(9)],
-                ACCOUNT_DELIVERY_SPILL_LIMITS,
-                unix_now_seconds(),
-            )
+            .spill_account_deliveries(&[lost], ACCOUNT_DELIVERY_SPILL_LIMITS, now)
             .unwrap();
+        // Prove the inbox's whole window first, so only the discarded row's
+        // loss can owe its second again.
+        let inbox = client
+            .recovery_runner_routes()
+            .into_iter()
+            .find(|route| route.route == storage_sqlite::TransportReconciliationRoute::Inbox)
+            .unwrap();
+        for relay in &inbox.required {
+            storage
+                .app_storage()
+                .record_recovery_coverage(
+                    &[storage_sqlite::RecoveryCoverageSlice {
+                        route: &inbox.route,
+                        relay,
+                        since_seconds: now - 30 * 24 * 60 * 60,
+                        until_seconds: now,
+                        proof: storage_sqlite::RecoveryCoverageProof::Comparison,
+                    }],
+                    now,
+                )
+                .unwrap();
+        }
+        let owes_lost_second = |storage: &storage_sqlite::SqliteAccountStorage| {
+            storage
+                .app_storage()
+                .recovery_coverage_debt(&inbox.route, &inbox.required, now)
+                .unwrap()
+                .iter()
+                .any(|range| range.since_seconds <= lost_at && lost_at <= range.until_seconds)
+        };
+        assert!(!inbox.required.is_empty());
+        assert!(!owes_lost_second(&storage));
         let seq = storage
             .app_storage()
             .spilled_account_deliveries(10, unix_now_seconds())
             .unwrap()
             .deliveries[0]
             .seq;
-        let queue_loss = |storage: &storage_sqlite::SqliteAccountStorage| {
-            storage
-                .app_storage()
-                .pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
-        };
-        assert!(!queue_loss(&storage));
 
         for attempt in 1..=SPILL_MAX_ATTEMPTS {
             client.delivery_spill.in_flight = Some((seq, hex::encode([9_u8; 32])));
@@ -705,12 +731,20 @@ mod tests {
             assert_eq!(kept, attempt < SPILL_MAX_ATTEMPTS, "attempt {attempt}");
         }
         assert!(
-            queue_loss(&storage),
-            "the discarded row leaves a recovery obligation"
+            storage
+                .app_storage()
+                .pending_recovery_demands()
+                .unwrap()
+                .is_empty(),
+            "the discarded row leaves no old-owner obligation"
         );
         assert!(
-            client.delivery_overflow_recovery_pending,
-            "the cursor stays fenced until recovery settles the loss"
+            owes_lost_second(&storage),
+            "the discarded row's loss is ledger debt at its own second"
+        );
+        assert!(
+            !client.delivery_overflow_recovery_pending,
+            "imported ledger debt replaces the cursor's loss fence"
         );
         // A directly owned client has no worker to select that loss. Its next
         // receive must start recovery without further relay traffic.
@@ -732,6 +766,14 @@ mod tests {
                 .iter()
                 .any(|unit| unit.last_served_at_seconds.is_some()),
             "next_event starts ledger recovery for the new queue loss"
+        );
+        assert!(
+            storage
+                .app_storage()
+                .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
+                .unwrap()
+                .is_empty(),
+            "the import reclaimed the discarded row's evidence"
         );
     }
 }
