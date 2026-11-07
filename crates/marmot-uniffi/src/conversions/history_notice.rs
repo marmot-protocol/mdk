@@ -3,10 +3,11 @@
 
 use marmot_app::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 
-/// Why recovery parked; choose the host's wording from it. `KnownEvent` and
-/// `MaintenanceBoundary` remain reserved for later parking policy, so exhaustive
-/// switches stay source-compatible. `UnprovenHistory` identifies a parked recovery
-/// route without attributing the original reason its history was owed.
+/// Why recovery parked; choose the host's wording from it. Current epoch-gap
+/// exhaustion emits `EpochGap`; the coverage ledger emits `UnprovenHistory`
+/// without attributing the original reason its route's history was owed. Other
+/// labels preserve compatibility; `KnownEvent` and `MaintenanceBoundary` remain
+/// reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HistoryNoticeCauseFfi {
     /// Deliveries were dropped from a full account queue, or spilled rows
@@ -104,29 +105,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn produced_recovery_notice_causes_remain_distinct_at_the_host_boundary() {
-        // Current recovery producers include UnprovenHistory. KnownEvent and
-        // MaintenanceBoundary remain reserved policy cases, not live-journey proof.
+    fn current_recovery_notice_causes_keep_their_host_choices() {
+        // Own the epoch-gap exhaustion and coverage-ledger writer outputs.
+        // Compatibility readers and reserved labels retain their mappings,
+        // without a current-writer or migration-runtime claim here.
         for (native, expected) in [
-            (
-                HistoryNoticeCause::DeliveryLoss,
-                HistoryNoticeCauseFfi::DeliveryLoss,
-            ),
-            (
-                HistoryNoticeCause::NotificationLoss,
-                HistoryNoticeCauseFfi::NotificationLoss,
-            ),
             (
                 HistoryNoticeCause::EpochGap,
                 HistoryNoticeCauseFfi::EpochGap,
-            ),
-            (
-                HistoryNoticeCause::IncrementalHistory,
-                HistoryNoticeCauseFfi::IncrementalHistory,
-            ),
-            (
-                HistoryNoticeCause::ExplicitRepair,
-                HistoryNoticeCauseFfi::ExplicitRepair,
             ),
             (
                 HistoryNoticeCause::UnprovenHistory,
