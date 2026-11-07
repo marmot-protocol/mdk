@@ -136,8 +136,10 @@ The simulator comes first; Jeff validates on a phone.
 > **Superseded in part.** The owner grant, its native capture and the comparison job this section
 > describes are deleted; the recovery runner (section 9) owns every history fetch, and native
 > replay now only records its REQ windows as ledger debt. Ordered native admission, its turn bound
-> and the cursor seal below remain. Row 8 of mdk#2660 deletes the `SubscriptionReplay` remnants
-> and the adapter's pager.
+> and the cursor seal below remain. Conversion deletes every `SubscriptionReplay` obligation
+> before the first subscription, and nothing makes new ones, so rebuilt REQs ask from the
+> transport cursor less the rebuild lookback alone (#2793). Row 8 of mdk#2660 deletes the
+> remaining `SubscriptionReplay` storage and the adapter's pager.
 
 `SubscriptionReplay` records the original live inbox and group query windows. It is not a loss charge.
 Unresolved floors survive cancellation, source replacement and reopen; an unfloored query stays unfloored.
@@ -1053,6 +1055,7 @@ Deleted when the inline executor retired, after step 2:
 Deleted once the recovery runner owned all debt (#2660 phase 4; 5c2a846b4 is the last commit with
 the old owner):
 
+- The rebuilt REQ floor's lowering to an unadmitted `SubscriptionReplay` scope's floor (#2793).
 - The owner grant (`AttemptGrant`, `authorize_account_recovery`), its capture tokens, plan and
   outcome, and the capture outcome in settlement.
 - `client/sync/comparison_job.rs`: the comparison job, its startup and maintenance passes, the
