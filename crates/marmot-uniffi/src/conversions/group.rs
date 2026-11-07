@@ -1115,10 +1115,10 @@ mod group_state_tests {
                 (true, true, true)
             );
             details.group.self_membership = marmot_app::SelfMembership::DeviceRemoved.into();
-            assert_eq!(
+            assert!(matches!(
                 details.group.self_membership,
                 SelfMembershipFfi::DeviceRemoved
-            );
+            ));
             let removed = group_management_state_ffi(self_id, &details);
             assert_eq!(
                 (
