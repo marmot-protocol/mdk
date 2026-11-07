@@ -1762,8 +1762,8 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     let messages_before = handle.list_messages(&group_id, EpochId(0)).unwrap();
 
     // The due auto-commit stages on the convergence tick; fail exactly the
-    // record projection's `put_group` (every staging step before it has
-    // succeeded by then, including `begin_pending`).
+    // record projection's `put_group` after its sent artifacts are written
+    // in the same transaction, before `begin_pending`.
     fault.arm(1);
     let staged = alice.advance_convergence(&group_id).await;
     assert!(
@@ -1799,7 +1799,7 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
         "failed automatic staging left unowned signed Commit or content marker"
     );
 
-    // The group stays fully usable: the state machine rewound to Stable, the
+    // The group stays fully usable: the state machine remained Stable, the
     // staged OpenMLS commit was cleared, AND the stored SelfRemove proposal
     // was removed from the proposal store (left behind, OpenMLS 0.8.1 panics
     // when this remove_members filters it against the Remove for bob's

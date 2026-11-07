@@ -339,10 +339,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
 - **The durable `Group::epoch` mirrors the epoch manager, and hydration seeds the epoch manager from it.** Every mirror
   write belongs to the same durable unit as the MLS change it projects, and every mirror failure propagates. Write the
   record inside the merging transaction (`publish::do_confirm_published`, the inbound apply in
-  `message_processor/ingest.rs`) or compensate the in-memory transition explicitly
-  (`stage_auto_commit_for_queued_proposals`). A swallowed mirror error resurfaces as a wrong epoch on the next open. A
-  failed inbound apply must also hand the retained commit back via `schedule_pending_convergence_group`, or the group
-  parks one epoch behind a commit nothing will apply.
+  `message_processor/ingest.rs`) or write the projection and its sent artifacts in one storage unit before
+  `begin_pending` (`record_sent_openmls_message_with_group`). A swallowed mirror error resurfaces as a wrong epoch on
+  the next open. A failed inbound apply must also hand the retained commit back via
+  `schedule_pending_convergence_group`, or the group parks one epoch behind a commit nothing will apply.
 - **Stored-message audit rows describe work in a committed storage unit.** Route every `MessageStateChanged` through
   `audit_with_context`, which captures context at the transition and appends through `StorageProvider::after_commit`.
   Inner helper success is not an outer commit; rollback and abandoned savepoints emit no positive state row. A backend
