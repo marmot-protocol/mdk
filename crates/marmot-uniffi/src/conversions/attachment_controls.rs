@@ -207,3 +207,145 @@ impl From<app::AutomaticAttachmentRequest> for AutomaticAttachmentRequestFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCATOR: &str = "1:00112233445566778899aabbccddeeff:ffeeddccbbaa99887766554433221100";
+
+    #[test]
+    fn transfer_states_remain_distinct_from_an_unavailable_source() {
+        type IsState = fn(AttachmentTransferStateFfi) -> bool;
+        let missing = AttachmentTransferStatusFfi::from(None);
+        assert!(matches!(
+            missing.state,
+            AttachmentTransferStateFfi::Unavailable
+        ));
+        assert!(missing.reference.is_none());
+        assert_eq!(
+            (
+                missing.attempt,
+                missing.received,
+                missing.total,
+                missing.retry_at
+            ),
+            (0, 0, None, None)
+        );
+        let cases: [(app::AttachmentTransferState, IsState); 18] = [
+            (app::AttachmentTransferState::NotRequested, |v| {
+                matches!(v, AttachmentTransferStateFfi::NotRequested)
+            }),
+            (app::AttachmentTransferState::Queued, |v| {
+                matches!(v, AttachmentTransferStateFfi::Queued)
+            }),
+            (app::AttachmentTransferState::Downloading, |v| {
+                matches!(v, AttachmentTransferStateFfi::Downloading)
+            }),
+            (app::AttachmentTransferState::VerifyingCiphertext, |v| {
+                matches!(v, AttachmentTransferStateFfi::VerifyingCiphertext)
+            }),
+            (app::AttachmentTransferState::Decrypting, |v| {
+                matches!(v, AttachmentTransferStateFfi::Decrypting)
+            }),
+            (app::AttachmentTransferState::VerifyingPlaintext, |v| {
+                matches!(v, AttachmentTransferStateFfi::VerifyingPlaintext)
+            }),
+            (app::AttachmentTransferState::Ready, |v| {
+                matches!(v, AttachmentTransferStateFfi::Ready)
+            }),
+            (app::AttachmentTransferState::RetryScheduled, |v| {
+                matches!(v, AttachmentTransferStateFfi::RetryScheduled)
+            }),
+            (app::AttachmentTransferState::Failed, |v| {
+                matches!(v, AttachmentTransferStateFfi::Failed)
+            }),
+            (app::AttachmentTransferState::Cancelled, |v| {
+                matches!(v, AttachmentTransferStateFfi::Cancelled)
+            }),
+            (app::AttachmentTransferState::Paused, |v| {
+                matches!(v, AttachmentTransferStateFfi::Paused)
+            }),
+            (app::AttachmentTransferState::Removed, |v| {
+                matches!(v, AttachmentTransferStateFfi::Removed)
+            }),
+            (app::AttachmentTransferState::PolicyBlocked, |v| {
+                matches!(v, AttachmentTransferStateFfi::PolicyBlocked)
+            }),
+            (
+                app::AttachmentTransferState::PreviouslyAcquiredUnavailable,
+                |v| matches!(v, AttachmentTransferStateFfi::PreviouslyAcquiredUnavailable),
+            ),
+            (app::AttachmentTransferState::CompletedUnretained, |v| {
+                matches!(v, AttachmentTransferStateFfi::CompletedUnretained)
+            }),
+            (app::AttachmentTransferState::RetryExhausted, |v| {
+                matches!(v, AttachmentTransferStateFfi::RetryExhausted)
+            }),
+            (app::AttachmentTransferState::StorageBlocked, |v| {
+                matches!(v, AttachmentTransferStateFfi::StorageBlocked)
+            }),
+            (app::AttachmentTransferState::CleanedBySetting, |v| {
+                matches!(v, AttachmentTransferStateFfi::CleanedBySetting)
+            }),
+        ];
+        for (state, expected) in cases {
+            // These three source-visible states have no acquisition row/locator.
+            let no_job = matches!(
+                state,
+                app::AttachmentTransferState::NotRequested
+                    | app::AttachmentTransferState::Removed
+                    | app::AttachmentTransferState::CleanedBySetting
+            );
+            let value = AttachmentTransferStatusFfi::from(Some(app::AttachmentTransferStatus {
+                reference: (!no_job)
+                    .then(|| app::AttachmentAssetRef::from_opaque(LOCATOR).unwrap()),
+                automatic_media_type: no_job.then(|| "image/png".into()),
+                state,
+                attempt: 0,
+                received: 0,
+                total: None,
+                retry_at: None,
+            }));
+            assert!(expected(value.state), "wrong host state for {state:?}");
+        }
+    }
+
+    #[test]
+    fn retry_status_keeps_its_locator_and_progress_context() {
+        let value = AttachmentTransferStatusFfi::from(Some(app::AttachmentTransferStatus {
+            reference: Some(app::AttachmentAssetRef::from_opaque(LOCATOR).unwrap()),
+            automatic_media_type: None,
+            state: app::AttachmentTransferState::RetryScheduled,
+            attempt: 3,
+            received: 23,
+            total: Some(47),
+            retry_at: Some(71),
+        }));
+        assert_eq!(value.reference.as_deref(), Some(LOCATOR));
+        assert!(matches!(
+            value.state,
+            AttachmentTransferStateFfi::RetryScheduled
+        ));
+        assert_eq!(
+            (value.attempt, value.received, value.total, value.retry_at),
+            (3, 23, Some(47), Some(71))
+        );
+    }
+
+    #[test]
+    fn transfer_controls_select_the_native_action() {
+        assert!(matches!(
+            app::AttachmentControl::from(AttachmentControlFfi::Cancel),
+            app::AttachmentControl::Cancel
+        ));
+        assert!(matches!(
+            app::AttachmentControl::from(AttachmentControlFfi::Retry),
+            app::AttachmentControl::Retry
+        ));
+        assert!(matches!(
+            app::AttachmentControl::from(AttachmentControlFfi::Remove),
+            app::AttachmentControl::Remove
+        ));
+    }
+}
