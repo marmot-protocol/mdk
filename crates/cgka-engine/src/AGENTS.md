@@ -12,7 +12,9 @@ Source-local rules. The full module map, invariants, and design notes are in [`.
   semantics span the entire search. Capture replay fingerprints only to validate or retain a continuation, after cheap
   uncontested checks.
 - `openmls_projection/tests/candidate_replay.rs` keeps the `candidate_branch_peel_halt_tests` module name so existing
-  test filters work. Encrypted-database process-kill checks stay in `../tests/crash_recovery_sqlite.rs`.
+  test filters work. Its missing-own-checkpoint halt owner also preserves exact authenticated stale-commit drops below
+  the retained anchor through both Syncing and Blocked sliced results. Encrypted-database process-kill checks stay in
+  `../tests/crash_recovery_sqlite.rs`.
 - `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan measurement and a
   test-only visited-row counter; keep aggregate measurements separate from app acceptance.
 - `mls_group_cache.rs::tests` proves cache coherence with public context epochs and real local rollback / independent
