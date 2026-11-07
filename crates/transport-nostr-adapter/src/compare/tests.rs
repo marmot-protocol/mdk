@@ -91,6 +91,7 @@ struct ModelRelay {
     /// Every fetch by id reads `read_until_cut` bytes and waits to be
     /// interrupted before it answers.
     hold_fetches: bool,
+    fetch_waiting: tokio::sync::Notify,
     read_until_cut: u64,
     /// What [`CompareRelay::interrupt`] answers.
     interruptible: bool,
@@ -184,6 +185,7 @@ impl CompareRelay for ModelRelay {
             return reply;
         }
         if self.hold_fetches {
+            self.fetch_waiting.notify_one();
             self.interrupted.cancelled().await;
             self.metered
                 .fetch_add(self.read_until_cut, Ordering::SeqCst);
@@ -612,13 +614,24 @@ async fn a_cut_fetch_reports_what_it_read() {
 
 #[tokio::test(start_paused = true)]
 async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
-    for stop in ["bytes", "restricted", "disconnected", "rate_limited"] {
+    for stop in [
+        "bytes",
+        "restricted",
+        "disconnected",
+        "rate_limited",
+        "cancelled",
+    ] {
         let events = signed_spread(day(), 6);
         let mut by_id = events.clone();
         by_id.sort_by_key(|event| event.id);
         let first = by_id[..2].to_vec();
         let first_bytes: u64 = first.iter().map(|event| event.as_json().len() as u64).sum();
-        let relay = ModelRelay::holding(events);
+        let relay = ModelRelay {
+            hold_fetches: stop == "cancelled",
+            interruptible: true,
+            read_until_cut: 4_096,
+            ..ModelRelay::holding(events)
+        };
         relay
             .fetch_replies
             .lock()
@@ -661,11 +674,39 @@ async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
                 }
                 CompareEnd::RateLimited
             }
+            "cancelled" => CompareEnd::Cancelled,
             _ => unreachable!(),
         };
 
         let started = Instant::now();
-        let (report, sink) = compare(&relay, day(), &[], limits).await;
+        let (report, sink) = if stop == "cancelled" {
+            let cancel = CancellationToken::new();
+            let mut sink = RecordingSink::default();
+            let report = {
+                let comparison = run_comparison(
+                    CompareRequest {
+                        route: route(),
+                        range: day(),
+                        local: &[],
+                        deadline: Some(started + Duration::from_secs(2)),
+                        policy: limits,
+                    },
+                    &relay,
+                    &mut sink,
+                    &cancel,
+                );
+                tokio::pin!(comparison);
+                tokio::select! {
+                    biased;
+                    () = relay.fetch_waiting.notified() => cancel.cancel(),
+                    _ = &mut comparison => panic!("comparison ended before the second fetch waited"),
+                }
+                comparison.await
+            };
+            (report, sink)
+        } else {
+            compare(&relay, day(), &[], limits).await
+        };
 
         assert_eq!(report.end, expected, "{stop}");
         assert_eq!(report.rate_limited, stop == "rate_limited");
@@ -678,7 +719,9 @@ async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
         expected.sort_by_key(|event| (event.created_at, event.id));
         assert_eq!(batch.events, expected, "{stop}");
         assert_eq!(report.stats.events, 2, "{stop}");
-        assert_eq!(sink.bytes + report.unadmitted_bytes, first_bytes, "{stop}");
+        let interrupted_bytes = if stop == "cancelled" { 4_096 } else { 0 };
+        assert_eq!(sink.bytes, first_bytes, "{stop}");
+        assert_eq!(report.unadmitted_bytes, interrupted_bytes, "{stop}");
         let chunks = relay.fetch_chunks.lock().unwrap();
         assert_eq!(
             chunks.len(),
