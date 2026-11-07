@@ -43,6 +43,8 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+nostr-sdk.workspace = true
+nostr-relay-builder.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 transport-nostr = { workspace = true, features = ["test-support"] }

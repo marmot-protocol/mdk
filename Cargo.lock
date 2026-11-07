@@ -3725,6 +3725,8 @@ dependencies = [
  "httpdate",
  "jsonschema",
  "marmot-forensics",
+ "nostr-relay-builder",
+ "nostr-sdk",
  "opentelemetry-proto",
  "prost",
  "rand 0.8.6",
