@@ -572,3 +572,396 @@ impl From<marmot_app::OnboardingSingleDeviceNotice> for OnboardingSingleDeviceNo
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onboarding_choices_and_step_outcomes_keep_their_host_meaning() {
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingStep::Profile,
+                OnboardingStepFfi::Profile,
+            ),
+            (
+                marmot_app::OnboardingStep::Follows,
+                OnboardingStepFfi::Follows,
+            ),
+            (
+                marmot_app::OnboardingStep::Relays,
+                OnboardingStepFfi::Relays,
+            ),
+            (
+                marmot_app::OnboardingStep::InboxRelays,
+                OnboardingStepFfi::InboxRelays,
+            ),
+            (
+                marmot_app::OnboardingStep::SingleDevice,
+                OnboardingStepFfi::SingleDevice,
+            ),
+            (
+                marmot_app::OnboardingStep::KeyPackage,
+                OnboardingStepFfi::KeyPackage,
+            ),
+        ] {
+            assert_eq!(OnboardingStepFfi::from(native), foreign);
+            assert_eq!(marmot_app::OnboardingStep::from(foreign), native);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingStatus::Pending,
+                OnboardingStatusFfi::Pending,
+            ),
+            (
+                marmot_app::OnboardingStatus::Checking,
+                OnboardingStatusFfi::Checking,
+            ),
+            (
+                marmot_app::OnboardingStatus::Passed,
+                OnboardingStatusFfi::Passed,
+            ),
+            (
+                marmot_app::OnboardingStatus::NeedsInput,
+                OnboardingStatusFfi::NeedsInput,
+            ),
+            (
+                marmot_app::OnboardingStatus::RetryableFailure,
+                OnboardingStatusFfi::RetryableFailure,
+            ),
+            (
+                marmot_app::OnboardingStatus::WaitingForSigner,
+                OnboardingStatusFfi::WaitingForSigner,
+            ),
+            (
+                marmot_app::OnboardingStatus::Skipped,
+                OnboardingStatusFfi::Skipped,
+            ),
+        ] {
+            assert_eq!(OnboardingStatusFfi::from(native), foreign);
+            assert_eq!(marmot_app::OnboardingStatus::from(foreign), native);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingAction::Retry,
+                OnboardingActionFfi::Retry,
+            ),
+            (
+                marmot_app::OnboardingAction::ContinueWithout,
+                OnboardingActionFfi::ContinueWithout,
+            ),
+            (
+                marmot_app::OnboardingAction::UseRecommendedRelays,
+                OnboardingActionFfi::UseRecommendedRelays,
+            ),
+            (
+                marmot_app::OnboardingAction::EditRelays,
+                OnboardingActionFfi::EditRelays,
+            ),
+            (
+                marmot_app::OnboardingAction::EditProfile,
+                OnboardingActionFfi::EditProfile,
+            ),
+            (
+                marmot_app::OnboardingAction::EditFollows,
+                OnboardingActionFfi::EditFollows,
+            ),
+            (
+                marmot_app::OnboardingAction::ApproveRepair,
+                OnboardingActionFfi::ApproveRepair,
+            ),
+            (
+                marmot_app::OnboardingAction::CancelRepair,
+                OnboardingActionFfi::CancelRepair,
+            ),
+            (
+                marmot_app::OnboardingAction::ReconnectSigner,
+                OnboardingActionFfi::ReconnectSigner,
+            ),
+            (
+                marmot_app::OnboardingAction::EditDiscoveryRelays,
+                OnboardingActionFfi::EditDiscoveryRelays,
+            ),
+            (
+                marmot_app::OnboardingAction::ContinueAnyway,
+                OnboardingActionFfi::ContinueAnyway,
+            ),
+            (
+                marmot_app::OnboardingAction::CancelOnboarding,
+                OnboardingActionFfi::CancelOnboarding,
+            ),
+        ] {
+            assert_eq!(OnboardingActionFfi::from(native), foreign);
+            assert_eq!(marmot_app::OnboardingAction::from(foreign), native);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingIssue::Missing,
+                OnboardingIssueFfi::Missing,
+            ),
+            (
+                marmot_app::OnboardingIssue::Malformed,
+                OnboardingIssueFfi::Malformed,
+            ),
+            (
+                marmot_app::OnboardingIssue::FutureDated,
+                OnboardingIssueFfi::FutureDated,
+            ),
+            (
+                marmot_app::OnboardingIssue::InvalidRelay,
+                OnboardingIssueFfi::InvalidRelay,
+            ),
+            (
+                marmot_app::OnboardingIssue::RetiredRelay,
+                OnboardingIssueFfi::RetiredRelay,
+            ),
+            (
+                marmot_app::OnboardingIssue::UnsafeRelay,
+                OnboardingIssueFfi::UnsafeRelay,
+            ),
+            (
+                marmot_app::OnboardingIssue::Unreachable,
+                OnboardingIssueFfi::Unreachable,
+            ),
+            (
+                marmot_app::OnboardingIssue::TimedOut,
+                OnboardingIssueFfi::TimedOut,
+            ),
+            (
+                marmot_app::OnboardingIssue::AuthenticationRequired,
+                OnboardingIssueFfi::AuthenticationRequired,
+            ),
+            (
+                marmot_app::OnboardingIssue::PaymentRequired,
+                OnboardingIssueFfi::PaymentRequired,
+            ),
+            (
+                marmot_app::OnboardingIssue::AccessRestricted,
+                OnboardingIssueFfi::AccessRestricted,
+            ),
+            (
+                marmot_app::OnboardingIssue::NoUsableRoute,
+                OnboardingIssueFfi::NoUsableRoute,
+            ),
+            (
+                marmot_app::OnboardingIssue::PublicationFailed,
+                OnboardingIssueFfi::PublicationFailed,
+            ),
+            (
+                marmot_app::OnboardingIssue::SignerUnavailable,
+                OnboardingIssueFfi::SignerUnavailable,
+            ),
+            (
+                marmot_app::OnboardingIssue::SignerRejected,
+                OnboardingIssueFfi::SignerRejected,
+            ),
+            (
+                marmot_app::OnboardingIssue::RecordChanged,
+                OnboardingIssueFfi::RecordChanged,
+            ),
+            (
+                marmot_app::OnboardingIssue::Interrupted,
+                OnboardingIssueFfi::Interrupted,
+            ),
+            (
+                marmot_app::OnboardingIssue::TooManyRelays,
+                OnboardingIssueFfi::TooManyRelays,
+            ),
+            (
+                marmot_app::OnboardingIssue::MultiDeviceUnsupported,
+                OnboardingIssueFfi::MultiDeviceUnsupported,
+            ),
+            (
+                marmot_app::OnboardingIssue::OtherInstallationPossible,
+                OnboardingIssueFfi::OtherInstallationPossible,
+            ),
+            (
+                marmot_app::OnboardingIssue::DiscoveryIncomplete,
+                OnboardingIssueFfi::DiscoveryIncomplete,
+            ),
+            (
+                marmot_app::OnboardingIssue::InspectionCompleted,
+                OnboardingIssueFfi::InspectionCompleted,
+            ),
+        ] {
+            assert_eq!(OnboardingIssueFfi::from(native), foreign);
+            assert_eq!(marmot_app::OnboardingIssue::from(foreign), native);
+        }
+    }
+
+    #[test]
+    fn onboarding_findings_keep_context_and_relay_remediation_distinct() {
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingFindingContext::Unknown,
+                OnboardingFindingContextFfi::Unknown,
+            ),
+            (
+                marmot_app::OnboardingFindingContext::RecordDiscovery,
+                OnboardingFindingContextFfi::RecordDiscovery,
+            ),
+            (
+                marmot_app::OnboardingFindingContext::PublishedDeclaration,
+                OnboardingFindingContextFfi::PublishedDeclaration,
+            ),
+            (
+                marmot_app::OnboardingFindingContext::DeclaredRoute,
+                OnboardingFindingContextFfi::DeclaredRoute,
+            ),
+            (
+                marmot_app::OnboardingFindingContext::RepairApproval,
+                OnboardingFindingContextFfi::RepairApproval,
+            ),
+            (
+                marmot_app::OnboardingFindingContext::RepairPublication,
+                OnboardingFindingContextFfi::RepairPublication,
+            ),
+        ] {
+            assert_eq!(OnboardingFindingContextFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingCheckPurpose::Unknown,
+                OnboardingCheckPurposeFfi::Unknown,
+            ),
+            (
+                marmot_app::OnboardingCheckPurpose::RecordLookup,
+                OnboardingCheckPurposeFfi::RecordLookup,
+            ),
+            (
+                marmot_app::OnboardingCheckPurpose::DeclarationValidation,
+                OnboardingCheckPurposeFfi::DeclarationValidation,
+            ),
+            (
+                marmot_app::OnboardingCheckPurpose::DirectoryQuery,
+                OnboardingCheckPurposeFfi::DirectoryQuery,
+            ),
+            (
+                marmot_app::OnboardingCheckPurpose::SourceFreshness,
+                OnboardingCheckPurposeFfi::SourceFreshness,
+            ),
+            (
+                marmot_app::OnboardingCheckPurpose::EventPublication,
+                OnboardingCheckPurposeFfi::EventPublication,
+            ),
+        ] {
+            assert_eq!(OnboardingCheckPurposeFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingCheckOutcome::Unknown,
+                OnboardingCheckOutcomeFfi::Unknown,
+            ),
+            (
+                marmot_app::OnboardingCheckOutcome::Success,
+                OnboardingCheckOutcomeFfi::Success,
+            ),
+            (
+                marmot_app::OnboardingCheckOutcome::Failure,
+                OnboardingCheckOutcomeFfi::Failure,
+            ),
+        ] {
+            assert_eq!(OnboardingCheckOutcomeFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingRelayTagRole::Other,
+                OnboardingRelayTagRoleFfi::Other,
+            ),
+            (
+                marmot_app::OnboardingRelayTagRole::Unmarked,
+                OnboardingRelayTagRoleFfi::Unmarked,
+            ),
+            (
+                marmot_app::OnboardingRelayTagRole::Read,
+                OnboardingRelayTagRoleFfi::Read,
+            ),
+            (
+                marmot_app::OnboardingRelayTagRole::Write,
+                OnboardingRelayTagRoleFfi::Write,
+            ),
+            (
+                marmot_app::OnboardingRelayTagRole::Inbox,
+                OnboardingRelayTagRoleFfi::Inbox,
+            ),
+        ] {
+            assert_eq!(OnboardingRelayTagRoleFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingRelayTagDisposition::Retained,
+                OnboardingRelayTagDispositionFfi::Retained,
+            ),
+            (
+                marmot_app::OnboardingRelayTagDisposition::Removed,
+                OnboardingRelayTagDispositionFfi::Removed,
+            ),
+            (
+                marmot_app::OnboardingRelayTagDisposition::Added,
+                OnboardingRelayTagDispositionFfi::Added,
+            ),
+        ] {
+            assert_eq!(OnboardingRelayTagDispositionFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingRelayCapability::None,
+                OnboardingRelayCapabilityFfi::None,
+            ),
+            (
+                marmot_app::OnboardingRelayCapability::Read,
+                OnboardingRelayCapabilityFfi::Read,
+            ),
+            (
+                marmot_app::OnboardingRelayCapability::Write,
+                OnboardingRelayCapabilityFfi::Write,
+            ),
+            (
+                marmot_app::OnboardingRelayCapability::ReadAndWrite,
+                OnboardingRelayCapabilityFfi::ReadAndWrite,
+            ),
+            (
+                marmot_app::OnboardingRelayCapability::Inbox,
+                OnboardingRelayCapabilityFfi::Inbox,
+            ),
+        ] {
+            assert_eq!(OnboardingRelayCapabilityFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingRelayRepairMode::ManualReview,
+                OnboardingRelayRepairModeFfi::ManualReview,
+            ),
+            (
+                marmot_app::OnboardingRelayRepairMode::RemovalOnly,
+                OnboardingRelayRepairModeFfi::RemovalOnly,
+            ),
+            (
+                marmot_app::OnboardingRelayRepairMode::Additive,
+                OnboardingRelayRepairModeFfi::Additive,
+            ),
+            (
+                marmot_app::OnboardingRelayRepairMode::RemovalAndAdditive,
+                OnboardingRelayRepairModeFfi::RemovalAndAdditive,
+            ),
+        ] {
+            assert_eq!(OnboardingRelayRepairModeFfi::from(native), foreign);
+        }
+        for (native, foreign) in [
+            (
+                marmot_app::OnboardingDeviceDiscovery::NoneFound,
+                OnboardingDeviceDiscoveryFfi::NoneFound,
+            ),
+            (
+                marmot_app::OnboardingDeviceDiscovery::OtherInstallationPossible,
+                OnboardingDeviceDiscoveryFfi::OtherInstallationPossible,
+            ),
+            (
+                marmot_app::OnboardingDeviceDiscovery::Unknown,
+                OnboardingDeviceDiscoveryFfi::Unknown,
+            ),
+        ] {
+            assert_eq!(OnboardingDeviceDiscoveryFfi::from(native), foreign);
+        }
+    }
+}

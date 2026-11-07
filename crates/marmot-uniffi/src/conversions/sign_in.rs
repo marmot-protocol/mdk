@@ -98,3 +98,71 @@ impl From<SignInResponseFfi> for SignInResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_in_states_keep_conditional_linker_context() {
+        let linker = "33".repeat(32);
+        for (native, expected, expected_linker) in [
+            (
+                UnrecognizedSignInState::Prompt,
+                UnrecognizedSignInStateFfi::Prompt,
+                None,
+            ),
+            (
+                UnrecognizedSignInState::NotNow,
+                UnrecognizedSignInStateFfi::NotNow,
+                None,
+            ),
+            (
+                UnrecognizedSignInState::LinkedElsewhere {
+                    linked_by_slot_id_hex: None,
+                },
+                UnrecognizedSignInStateFfi::LinkedElsewhere,
+                None,
+            ),
+            (
+                UnrecognizedSignInState::LinkedElsewhere {
+                    linked_by_slot_id_hex: Some(linker.clone()),
+                },
+                UnrecognizedSignInStateFfi::LinkedElsewhere,
+                Some(linker.as_str()),
+            ),
+            (
+                UnrecognizedSignInState::RejectedElsewhere,
+                UnrecognizedSignInStateFfi::RejectedElsewhere,
+                None,
+            ),
+        ] {
+            let ffi = UnrecognizedSignInFfi::from(UnrecognizedSignIn {
+                slot_id_hex: "11".repeat(32),
+                client: "Phone".into(),
+                appeared_at: 17,
+                last_seen_at: 29,
+                before_this_device: false,
+                signed_in: false,
+                state: native,
+                previously_linked_here: false,
+            });
+            assert_eq!(ffi.state, expected);
+            assert_eq!(ffi.linked_by_slot_id_hex.as_deref(), expected_linker);
+            assert_eq!(ffi.slot_id_hex, "11".repeat(32));
+            assert_eq!((ffi.appeared_at, ffi.last_seen_at), (17, 29));
+            assert!(!ffi.before_this_device && !ffi.previously_linked_here && !ffi.signed_in);
+        }
+    }
+
+    #[test]
+    fn sign_in_response_selects_the_native_action() {
+        for (ffi, expected) in [
+            (SignInResponseFfi::NotNow, SignInResponse::NotNow),
+            (SignInResponseFfi::Reject, SignInResponse::Reject),
+            (SignInResponseFfi::Dismiss, SignInResponse::Dismiss),
+        ] {
+            assert_eq!(SignInResponse::from(ffi), expected);
+        }
+    }
+}
