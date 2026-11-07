@@ -737,6 +737,7 @@ impl TuiApp {
         }
         let result = self.client.run_json(Some(&account_id), &args)?;
         let stream_id = value_string(&result, "stream_id").unwrap_or_else(|| "unknown".to_owned());
+        self.adopt_message_account(&account_id);
         self.streaming = Some(StreamComposer {
             stream_id: stream_id.clone(),
             group_id: preview_group_id.clone(),
@@ -2252,27 +2253,7 @@ impl TuiApp {
     pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
         // Any explicit or fired load supersedes a pending flick-through preview.
         self.flick_countdown = None;
-        let previous_account = self
-            .messages_account_id
-            .as_deref()
-            .or_else(|| {
-                self.message_subscription
-                    .as_ref()
-                    .map(|subscription| subscription.account_id.as_str())
-            })
-            .or_else(|| {
-                self.loading_chat
-                    .as_ref()
-                    .map(|(account, _)| account.as_str())
-            });
-        let account_changed = previous_account != Some(account_id.as_str());
-        if account_changed {
-            // The plain feed and its previews are account-wide. Keep them on
-            // same-account chat changes, and disconnect the old owner before
-            // it can append previews while the new account's page loads.
-            self.message_subscription = None;
-            self.live_stream_previews.clear();
-        }
+        self.adopt_message_account(&account_id);
         if self.messages_account_id.as_deref() != Some(account_id.as_str())
             || self.messages_group_id.as_deref() != Some(group_id.as_str())
         {
@@ -2605,7 +2586,25 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Move the account-wide feed and preview buffer together. Pane loads and
+    /// empty-list refreshes both cross this boundary; reconnecting the same
+    /// account or navigating its groups keeps already observed preview text.
+    fn adopt_message_account(&mut self, account_id: &str) {
+        if self
+            .message_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.account_id != account_id)
+        {
+            self.message_subscription = None;
+        }
+        if self.stream_previews_account_id.as_deref() != Some(account_id) {
+            self.live_stream_previews.clear();
+            self.stream_previews_account_id = Some(account_id.to_owned());
+        }
+    }
+
     pub(crate) fn ensure_message_subscription(&mut self, account_id: &str) -> TuiResult<()> {
+        self.adopt_message_account(account_id);
         if !self.daemon.running {
             self.message_subscription = None;
             return Ok(());
@@ -2944,6 +2943,7 @@ impl TuiApp {
         let Some(subscription) = self.message_subscription.as_ref() else {
             return false;
         };
+        let account_id = subscription.account_id.clone();
         let mut events = Vec::new();
         loop {
             match subscription.rx.try_recv() {
@@ -2958,6 +2958,7 @@ impl TuiApp {
         if events.is_empty() {
             return false;
         }
+        self.adopt_message_account(&account_id);
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {

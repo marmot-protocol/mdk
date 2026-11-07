@@ -47,6 +47,8 @@ pub(crate) struct TuiApp {
     pub(crate) timeline: Vec<TimelineRow>,
     pub(crate) timeline_scroll: TimelineScroll,
     pub(crate) live_stream_previews: Vec<LiveStreamPreview>,
+    /// Owner of the account-wide preview buffer, retained across feed reconnects.
+    pub(crate) stream_previews_account_id: Option<String>,
     pub(crate) chat_subscription: Option<ChatSubscription>,
     pub(crate) message_subscription: Option<MessageSubscription>,
     pub(crate) timeline_subscription: Option<TimelineSubscription>,
@@ -180,6 +182,7 @@ impl TuiApp {
             timeline: Vec::new(),
             timeline_scroll: TimelineScroll::default(),
             live_stream_previews: Vec::new(),
+            stream_previews_account_id: None,
             chat_subscription: None,
             message_subscription: None,
             timeline_subscription: None,

@@ -2390,6 +2390,8 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         timeline: Vec::new(),
         timeline_scroll: TimelineScroll::default(),
         live_stream_previews: Vec::new(),
+        // The empty account fixture already owns its account-wide resources.
+        stream_previews_account_id: Some(account_id.to_owned()),
         chat_subscription: None,
         message_subscription: None,
         timeline_subscription: None,
@@ -14167,6 +14169,118 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
             ),
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(16);
+    let dir = tempfile::tempdir().unwrap();
+    let mut gate = TestCommandGate::new(dir.path());
+    let chat = serde_json::json!({"ok":true,"result":{"type":"chat","chat":{
+        "group_id":group,"profile":{"name":"B joined room"}
+    }}})
+    .to_string();
+    let incoming =
+        serde_json::json!({"ok":true,"result":{"type":"agent_stream_delta","agent_stream_delta":{
+            "group_id":group,"stream_id":"dd".repeat(32),"text":"incoming account preview"
+        }}})
+        .to_string();
+    let exe = dir.path().join("wn-refresh");
+    write_fake_wn(
+        &exe,
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n*'chats subscribe'*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60\n;;\n*'messages subscribe'*) printf '%s\\n' '{incoming}'; exec sleep 60;;\n*subscribe*) exec sleep 60;;\n*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[],\"messages\":[]}}}}';;\nesac\n",
+            gate.script()
+        ),
+    );
+    let mut app = test_tui_app(
+        WnClient {
+            exe,
+            ..test_unused_client()
+        },
+        &account_a,
+    );
+    app.accounts.push(AccountRow {
+        account_id: account_b.clone(),
+        npub: "npub1bob".into(),
+        display_name: None,
+        local_signing: true,
+    });
+    app.chats = vec![flick_chat(&group, "A room")];
+    app.chats_account_id = Some(account_a.clone());
+    app.messages_account_id = Some(account_a.clone());
+    app.messages_group_id = Some(group.clone());
+    app.timeline = vec![timeline_row("A row", 1)];
+    let (tx, rx) = mpsc::channel();
+    app.message_subscription = Some(MessageSubscription {
+        account_id: account_a.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Result(
+        serde_json::json!({"type":"agent_stream_delta","agent_stream_delta":{
+            "group_id":group,"stream_id":"dd".repeat(32),"text":"outgoing account preview"
+        }}),
+    ))
+    .unwrap();
+    app.drain_message_subscription();
+    assert!(rendered_buffer(&mut app).contains("outgoing account preview"));
+    tx.send(SubscriptionEvent::Ended).unwrap();
+    app.drain_message_subscription();
+    assert!(app.message_subscription.is_none());
+    app.daemon.running = true;
+    app.ensure_message_subscription(&account_a)
+        .expect("reconnect A's feed");
+    assert_eq!(
+        app.message_subscription.as_ref().unwrap().account_id,
+        account_a
+    );
+    assert!(
+        rendered_buffer(&mut app).contains("outgoing account preview"),
+        "same-account reconnect preserves observed previews"
+    );
+    app.selected_account = 1;
+    app.refresh_chats().expect("refresh B's empty list");
+    gate.wait_until_entered();
+    assert!(app.chats.is_empty());
+    assert_eq!(app.messages_account_id.as_deref(), Some(account_b.as_str()));
+    assert!(
+        tx.send(SubscriptionEvent::Ended).is_err(),
+        "A's feed has been replaced"
+    );
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.chats.is_empty() {
+        app.drain_chat_subscription();
+        assert!(
+            Instant::now() < deadline,
+            "B's real chat child did not deliver its row"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(app.chats[0].name, "B joined room");
+    app.refresh_messages().unwrap();
+    app.apply_effect_done(EffectDone {effect:Effect::LoadTimeline {account:account_b.clone(), group}, result:Ok(vec![serde_json::json!({"messages":[{
+        "message_id":"B row","direction":"received","from":"peer","plaintext":"B timeline","timeline_at":2,"received_at":2
+    }]})])});
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rendered_buffer(&mut app).contains("incoming account preview") {
+        app.drain_message_subscription();
+        assert!(
+            Instant::now() < deadline,
+            "B's real message child did not deliver its preview"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(app.messages_account_id, Some(account_b));
+    assert_eq!(timeline_ids(&app.timeline), vec!["B row"]);
+    assert!(
+        !rendered_buffer(&mut app).contains("outgoing account preview"),
+        "A's preview must not survive B's empty-list account transition"
+    );
 }
 
 #[test]
