@@ -3380,7 +3380,7 @@ impl AppClient {
         } else {
             None
         };
-        let observation = client.app.product_analytics.begin(
+        let observation = client.app.product_analytics.operation(
             if inbox {
                 crate::ProductFamily::Welcome
             } else {
@@ -3475,6 +3475,7 @@ impl AppClient {
         }
         if let Some(observation) = observation {
             let outcome = match &ingest {
+                _ if recovery_control => None,
                 Ok(effects) => match &effects.outcome {
                     IngestOutcome::Processed => Some("success"),
                     // Authenticated control is neither an invitation metric nor
@@ -3496,7 +3497,6 @@ impl AppClient {
                     | IngestOutcome::Stale { .. }
                     | IngestOutcome::Rejected { .. } => Some("rejected"),
                 },
-                Err(_) if recovery_control => None,
                 Err(_) => Some("failure"),
             };
             if let Some(outcome) = outcome {

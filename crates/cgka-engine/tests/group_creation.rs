@@ -1923,6 +1923,14 @@ async fn legacy_create_whose_welcome_cannot_be_wrapped_writes_no_group() {
     struct RefusingWelcomes(MockPeeler);
     #[async_trait]
     impl TransportPeeler for RefusingWelcomes {
+        async fn wrap_group_recovery(
+            &self,
+            message: &cgka_traits::GroupRecoveryMessage,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            self.0.wrap_group_recovery(message, recipient).await
+        }
+
         async fn peel_group_message(
             &self,
             msg: &TransportMessage,

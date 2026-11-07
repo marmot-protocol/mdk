@@ -244,6 +244,14 @@ struct PublishedWelcomesOnly(MockPeeler);
 
 #[async_trait]
 impl TransportPeeler for PublishedWelcomesOnly {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,

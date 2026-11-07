@@ -373,7 +373,7 @@ async fn welcome_policy_single_unseal() {
         #[cfg(feature = "product-analytics-export")]
         let bob_app = {
             let mut bob_app = bob_app;
-            bob_app.product_analytics = crate::product_analytics::test_product_collector();
+            bob_app.product_analytics = marmot_observability::test_product_collector();
             bob_app.set_usage_diagnostics_consent(true).unwrap();
             bob_app
         };
@@ -1218,7 +1218,7 @@ async fn pairing_inbox_audit_metrics() {
             #[cfg(feature = "product-analytics-export")]
             {
                 scenario.alice.app.product_analytics =
-                    crate::product_analytics::test_product_collector();
+                    marmot_observability::test_product_collector();
                 scenario
                     .alice
                     .app

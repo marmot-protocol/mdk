@@ -95,6 +95,14 @@ struct ParkGroupWrapPeeler {
 
 #[async_trait]
 impl TransportPeeler for ParkGroupWrapPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
