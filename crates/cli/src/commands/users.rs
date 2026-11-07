@@ -221,15 +221,152 @@ mod tests {
     /// signed-out account is a category error, and the runtime refuses it --
     /// so a search for one of those accounts must not ask, or the enhancement
     /// would turn into a failed search for people who can still search fine
-    /// today.
+    /// today. A radius-0 window also skips co-members: cached Bob remains at
+    /// radius 255, whereas a radius-1 seed would move him into the window.
     #[tokio::test]
     async fn an_account_that_cannot_sign_is_never_asked_for_co_members() {
-        for summary in [account(false, false), account(true, true)] {
-            let seeds = radius_one_seeds(None, &summary, 1)
-                .await
-                .expect("no MLS session means no co-members, not an error");
-            assert!(seeds.is_empty());
-        }
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let alice_home = AccountHome::open(alice_dir.path());
+        let alice = alice_home.create_nostr_account().unwrap();
+        let bob = AccountHome::open(bob_dir.path())
+            .create_nostr_account()
+            .unwrap();
+        let config = marmot_app::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new());
+        let bob_app = MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config.clone());
+        bob_app
+            .client(&bob.account_id_hex)
+            .await
+            .unwrap()
+            .publish_key_package()
+            .await
+            .unwrap();
+        bob_app
+            .publish_user_profile(
+                &bob.account_id_hex,
+                marmot_app::UserProfileMetadata {
+                    about: Some("co-member-needle".into()),
+                    ..Default::default()
+                },
+                marmot_app::AccountRelayListBootstrap::new(vec![url.clone().into()], Vec::new()),
+            )
+            .await
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config);
+        let runtime = app.runtime();
+        runtime.start().await.unwrap();
+        runtime
+            .key_package_maintenance_status(&alice.account_id_hex)
+            .await
+            .unwrap();
+        runtime
+            .create_group(
+                &alice.account_id_hex,
+                "search peers",
+                std::slice::from_ref(&bob.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        // Explicitly fetch and persist the real published profile. Search's
+        // ephemeral tier and the background directory sync are not a fence for
+        // a later signed-out read of the shared directory.
+        let profile = app
+            .directory()
+            .fetch_current_user_profile_for_account_id(&bob.account_id_hex, vec![url.into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.about.as_deref(), Some("co-member-needle"));
+        let found = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (1, 1),
+            },
+            Some(alice.account_id_hex.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.json["users"].as_array().unwrap().len(), 1);
+        assert_eq!(found.json["users"][0]["account_id_hex"], bob.account_id_hex);
+        assert_eq!(found.json["users"][0]["radius"], 1);
+        assert_eq!(found.json["users"][0]["matched_field"], "about");
+        let radius_zero = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (0, 0),
+            },
+            Some(alice.account_id_hex.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(radius_zero.json["users"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            radius_zero.json["users"][0]["account_id_hex"],
+            bob.account_id_hex
+        );
+        assert_eq!(radius_zero.json["users"][0]["radius"], 255);
+        alice_home
+            .set_account_signed_out(&alice.account_id_hex, true)
+            .unwrap();
+        runtime.reconcile_accounts().await.unwrap();
+        let shared_bob = app
+            .directory()
+            .directory_entry_for_account_id(&bob.account_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shared_bob
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.about.as_deref()),
+            Some("co-member-needle")
+        );
+        let signed_out = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (1, 1),
+            },
+            Some(alice.account_id_hex.clone()),
+        )
+        .await
+        .expect("signed-out searches do not require an MLS worker");
+        assert_eq!(signed_out.json["users"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            signed_out.json["users"][0]["account_id_hex"],
+            bob.account_id_hex
+        );
+        assert_eq!(signed_out.json["users"][0]["radius"], 255);
+        alice_home.add_public_account(&bob.account_id_hex).unwrap();
+        runtime.reconcile_accounts().await.unwrap();
+        let public_only = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (1, 1),
+            },
+            Some(bob.account_id_hex.clone()),
+        )
+        .await
+        .expect("public-only searches do not require an MLS worker");
+        assert_eq!(public_only.json["account_id"], bob.account_id_hex);
+        runtime.shutdown().await;
+        relay.shutdown();
     }
 
     #[tokio::test]
@@ -237,16 +374,6 @@ mod tests {
         let seeds = radius_one_seeds(None, &account(true, false), 1)
             .await
             .expect("no runtime yields no seeds rather than failing");
-        assert!(seeds.is_empty());
-    }
-
-    /// Radius-1 seeds cannot affect a window that stops at radius 0, so the
-    /// per-group membership read is skipped rather than paid for nothing.
-    #[tokio::test]
-    async fn a_radius_zero_window_asks_for_no_co_members() {
-        let seeds = radius_one_seeds(None, &account(true, false), 0)
-            .await
-            .expect("a radius-0 window needs no seeds");
         assert!(seeds.is_empty());
     }
 

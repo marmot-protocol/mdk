@@ -9315,6 +9315,8 @@ fn groups_retention_is_inspectable_settable_and_founding() {
             "create",
             "ephemeral",
             &bob,
+            "--description",
+            "founding options description",
             "--retention",
             "1h",
         ],
@@ -9323,6 +9325,10 @@ fn groups_retention_is_inspectable_settable_and_founding() {
     assert_eq!(
         created["message_retention"]["disappearing_message_secs"],
         3600
+    );
+    assert_eq!(
+        created["profile"]["description"],
+        "founding options description"
     );
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
 
