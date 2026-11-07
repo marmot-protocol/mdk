@@ -101,3 +101,59 @@ impl From<marmot_app::HistoryImportProvenance> for HistoryImportProvenanceFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiving_and_imported_history_preserve_their_distinct_contexts() {
+        for retrying in [false, true] {
+            let value = ChatHistoryImportFfi::from(ChatHistoryImport {
+                group_id_hex: "ab".repeat(16),
+                state: ChatHistoryImportState::Receiving { retrying },
+            });
+            assert_eq!(value.group_id_hex, "ab".repeat(16));
+            assert_eq!(
+                value.state,
+                ChatHistoryImportStateFfi::Receiving { retrying }
+            );
+        }
+        let value = ChatHistoryImportFfi::from(ChatHistoryImport {
+            group_id_hex: "cd".repeat(16),
+            state: ChatHistoryImportState::Imported {
+                from: HistoryImportSource {
+                    device_slot_id_hex: "11".repeat(32),
+                    device_label: "Desk device".into(),
+                },
+                at: 71,
+            },
+        });
+        assert_eq!(value.group_id_hex, "cd".repeat(16));
+        assert_eq!(
+            value.state,
+            ChatHistoryImportStateFfi::Imported {
+                from: HistoryImportSourceFfi {
+                    device_slot_id_hex: "11".repeat(32),
+                    device_label: "Desk device".into()
+                },
+                at: 71,
+            }
+        );
+    }
+
+    #[test]
+    fn device_history_provenance_keeps_its_slot_identity() {
+        let device = HistoryImportProvenanceFfi::from(marmot_app::HistoryImportProvenance::Device(
+            [0x12; 32],
+        ));
+        assert_eq!(
+            device,
+            HistoryImportProvenanceFfi::Device {
+                device_slot_id_hex: "12".repeat(32)
+            }
+        );
+        // The cached-conversion keeper already owns literal Backup provenance
+        // and its archive fields; this owner supplies only the Device contrast.
+    }
+}

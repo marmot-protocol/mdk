@@ -178,8 +178,7 @@ pub enum MarmotEventFfi {
         account_label: String,
     },
     /// The account's recovery status may have changed: re-read
-    /// `account_recovery_status`. Carries no group identities. Not raised
-    /// until the recovery runner owns history (mdk#2660).
+    /// `account_recovery_status`. Carries no group identities.
     RecoveryStatusChanged {
         account_id_hex: String,
         account_label: String,

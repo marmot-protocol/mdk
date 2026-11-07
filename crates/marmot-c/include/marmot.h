@@ -634,10 +634,10 @@ typedef enum MarmotEventSizeClass {
 } MarmotEventSizeClass;
 
 /**
- * Why recovery parked. Current policy parks only the first five;
- * `KnownEvent` and `MaintenanceBoundary` are reserved, and
- * `UnprovenHistory` is not raised until the recovery runner owns
- * history (mdk#2660).
+ * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
+ * coverage-ledger parks emit `UnprovenHistory`. Other labels preserve
+ * compatibility; `KnownEvent` and `MaintenanceBoundary` remain reserved
+ * for parking policy.
  */
 typedef enum MarmotHistoryNoticeCause {
   /**
@@ -3074,8 +3074,8 @@ typedef struct MarmotHistoryNoticeList {
  * The account's recovery: `catching_up_group_ids_hex` lists the groups
  * whose history is still being fetched (lowercase hex, sorted),
  * `inbox_catching_up` whether the inbox's is, and `notices` every
- * current notice. Nothing is catching up until the recovery runner owns
- * history (mdk#2660).
+ * current notice. The recovery runner supplies the groups and inbox whose
+ * history it is still fetching.
  */
 typedef struct MarmotAccountRecoveryStatus {
   char **catching_up_group_ids_hex;

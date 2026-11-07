@@ -2494,7 +2494,7 @@ List the account's "history may be incomplete" notices, oldest first. Each is on
 pub async fn account_recovery_status( &self, account_ref: String, ) -> Result<AccountRecoveryStatusFfi, MarmotKitError>
 ```
 
-Read the account's recovery in one call: `catching_up_group_ids_hex` lists the groups whose history is still being fetched (lowercase hex, sorted), `inbox_catching_up` says whether the inbox's is, and `notices` holds every notice exactly as `history_notices` lists them. Show the first two as "catching up" and the notices as "history may be incomplete". It reads local state on the account worker, needs no network, and is cheap to re-read: refresh it on `MarmotEventFfi::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing is ever catching up and that event never fires, so the record holds only the notices.
+Read the account's recovery in one call: `catching_up_group_ids_hex` lists the groups whose history is still being fetched (lowercase hex, sorted), `inbox_catching_up` says whether the inbox's is, and `notices` holds every notice exactly as `history_notices` lists them. Show the first two as "catching up" and the notices as "history may be incomplete". It reads local state on the account worker, needs no network, and is cheap to re-read: refresh it on `MarmotEventFfi::RecoveryStatusChanged`. The recovery runner supplies the catching-up fields.
 
 [Source](src/commands/history_notice.rs#L31)
 
