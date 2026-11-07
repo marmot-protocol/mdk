@@ -235,6 +235,175 @@ async fn graph_seed_keeps_stale_commits() {
     );
 }
 
+#[tokio::test]
+async fn genuine_non_protocol_bodies_keep_their_projection_choices() {
+    let (mut alice, storage) = build_client(b"projection-parser-alice");
+    let (mut bob, _) = build_client(b"projection-parser-bob");
+    let package = bob.fresh_key_package().await.unwrap();
+    let package_bytes = package.bytes.clone();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "projection body choices".into(),
+            description: String::new(),
+            members: vec![package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("legacy compatibility creation returns its real Welcome");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(welcomes.len(), 1);
+    let welcome = welcomes.remove(0);
+    let (projection, protocol) = super::project_protocol_message(&welcome.payload)
+        .expect("a genuine Welcome must remain a projected non-protocol body");
+    assert_eq!(projection.kind, super::OpenMlsContentKind::Welcome);
+    assert_eq!(projection.source_epoch, None);
+    assert!(
+        protocol.is_none(),
+        "a genuine Welcome is not a protocol message"
+    );
+    bob.join_welcome(welcome).await.unwrap();
+
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = storage
+        .account_device_signer(&alice.self_id())
+        .unwrap()
+        .unwrap();
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let group_info = group
+        .export_group_info(provider.crypto(), &signer, false)
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+    for bytes in [package_bytes, group_info] {
+        assert!(
+            matches!(
+                super::project_protocol_message(&bytes),
+                Err(super::OpenMlsProjectionError::UnsupportedMessageKind(
+                    super::OpenMlsContentKind::Other
+                ))
+            ),
+            "foreign non-message MLS bodies must keep the typed Other refusal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn candidate_probe_preserves_a_real_proposal_rejection() {
+    let (_root, storage, group_id, commits) = encrypted_replay_graph_fixture(2, 1, 1).await;
+    assert_eq!(commits.len(), 1);
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let credential = openmls::prelude::BasicCredential::try_from(
+        group.own_leaf_node().unwrap().credential().clone(),
+    )
+    .unwrap();
+    let sender = MemberId::new(credential.identity().to_vec());
+    assert!(
+        !crate::app_components::admins_of_group(&group)
+            .unwrap()
+            .iter()
+            .any(|admin| admin.as_slice() == sender.as_slice())
+    );
+    let binding = storage.account_device_signer(&sender).unwrap().unwrap();
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    // Restore group-scoped proposal/own-leaf state after authoring genuine bytes.
+    // The unreferenced global leaf key is not part of the probe's inputs.
+    let before = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    assert!(before.is_some());
+    let proposal = {
+        let authoring = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+            &storage,
+            group_id.clone(),
+            crate::snapshot_guard::RewindSite::Replay,
+            "projection-proposal-authoring",
+        )
+        .unwrap();
+        let (proposal, _) = group
+            .propose_self_update(
+                &provider,
+                &signer,
+                openmls::prelude::LeafNodeParameters::default(),
+            )
+            .unwrap();
+        let bytes = proposal.tls_serialize_detached().unwrap();
+        authoring.commit().unwrap();
+        bytes
+    };
+    drop(group);
+    assert_eq!(
+        storage.group_replay_state_fingerprint(&group_id).unwrap(),
+        before
+    );
+    let proposal = transport_message(
+        &proposal,
+        TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    );
+    let digests = [super::project_mls_message(&commits[0].payload)
+        .unwrap()
+        .message_digest];
+    let mut budget = super::ReplayBudget::for_pass(1, V1_MAX_REWIND_COMMITS);
+    let result = super::probe_candidate_path(
+        &storage,
+        &group_id,
+        commits,
+        &digests,
+        std::slice::from_ref(&proposal),
+        &super::PrevalidatedOwnCommits::default(),
+        &mut budget,
+        ReplayProfilePolicy::default(),
+    )
+    .unwrap();
+    match result {
+        super::CandidatePathProbeResult::RejectedProposal {
+            message_id,
+            category,
+        } => {
+            assert_eq!(message_id, hex::encode(proposal.id.as_slice()));
+            assert_eq!(
+                category,
+                cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed
+            );
+        }
+        other => panic!("a real proposal rejection must remain typed: {other:?}"),
+    }
+}
+
 // --- Graph fixtures ------------------------------------------------------
 
 /// Grind one more valid commit out of a device's live state without
