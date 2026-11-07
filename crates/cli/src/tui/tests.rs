@@ -5840,6 +5840,130 @@ fn media_drain_folds_duplicate_decoded_events_idempotently() {
     assert!(!media.drain(), "an empty drain does not dirty the frame");
 }
 
+#[cfg(unix)]
+#[test]
+fn media_scheduler_uses_the_loaded_owner_and_real_worker_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let hashes = [
+        "11".repeat(32),
+        "22".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+    ];
+    let account = "aa".repeat(32);
+    let group = "bb".repeat(16);
+    let args = dir.path().join("args");
+    let png = dir.path().join("source.png");
+    seed_decodable_image(&png);
+    let mut gates = Vec::new();
+    for index in 0..4 {
+        let gate_dir = dir.path().join(format!("gate-{index}"));
+        std::fs::create_dir(&gate_dir).unwrap();
+        gates.push(TestCommandGate::new(&gate_dir));
+    }
+    let exe = dir.path().join("wn-media");
+    let mut script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n",
+        args.display()
+    );
+    for (hash, gate) in hashes.iter().zip(&gates) {
+        // A duplicate-worker fault must not leave two readers waiting on one
+        // release. Only its first child enters the explicit gate.
+        script.push_str(&format!(
+            "*{hash}*)\nif mkdir '{}' 2>/dev/null; then\n{}fi\n;;\n",
+            dir.path().join(format!("gated-{hash}")).display(),
+            gate.script()
+        ));
+    }
+    script.push_str(&format!("esac\nwhile [ \"$1\" != --output ]; do shift; done\nshift\ncp '{}' \"$1\"\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}'\n", png.display()));
+    write_fake_wn(&exe, &script);
+    let mut app = test_tui_app(
+        WnClient {
+            exe,
+            home: Some(dir.path().join("home")),
+            secret_store: Some(SecretStoreKind::File),
+            ..test_unused_client()
+        },
+        &"cc".repeat(32),
+    );
+    app.daemon.running = false;
+    app.chats = vec![flick_chat(&"dd".repeat(16), "Selected other room")];
+    app.messages_account_id = Some(account.clone());
+    app.messages_group_id = Some(group.clone());
+    let mut row = timeline_row("image-row", 1);
+    row.attachments = vec![
+        image_attachment(&hashes[0]),
+        image_attachment(&hashes[0]),
+        image_attachment(&hashes[1]),
+        image_attachment(&hashes[2]),
+        image_attachment(&hashes[3]),
+        TimelineAttachment {
+            mime: Some("application/pdf".into()),
+            filename: Some("file.pdf".into()),
+            plaintext_hash: Some("55".repeat(32)),
+        },
+    ];
+    app.timeline = vec![row];
+    assert!(
+        !app.ensure_media_downloads(),
+        "a terminal without image support does not schedule children"
+    );
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    assert!(app.ensure_media_downloads());
+    for gate in &gates[..3] {
+        gate.wait_until_entered();
+    }
+    assert_eq!(app.media.in_flight(), 3);
+    assert!(
+        !app.ensure_media_downloads(),
+        "a repeated tick cannot exceed the occupied slots"
+    );
+    let recorded = std::fs::read_to_string(&args).unwrap();
+    assert_eq!(recorded.lines().count(), 3);
+    for (index, gate) in gates[..3].iter_mut().enumerate() {
+        assert!(recorded.lines().any(|line| line.contains(&hashes[index])));
+        gate.release();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !hashes[..3].iter().all(|hash| app.media.is_ready(hash)) {
+        app.media.drain();
+        assert!(
+            Instant::now() < deadline,
+            "first three produced image results never settled"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        app.ensure_media_downloads(),
+        "a completed worker admits the remaining image"
+    );
+    gates[3].wait_until_entered();
+    gates[3].release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !app.media.is_ready(&hashes[3]) {
+        app.media.drain();
+        assert!(
+            Instant::now() < deadline,
+            "fourth produced image result never settled"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!app.ensure_media_downloads());
+    let recorded = std::fs::read_to_string(args).unwrap();
+    let cache = dir.path().join("home/tui-media-cache");
+    let mut actual = recorded.lines().map(str::to_owned).collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = hashes.iter().map(|hash| format!("--json --home {} --secret-store file --account {account} media download {group} {hash} --output {}", dir.path().join("home").display(), cache.join(hash).display())).collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(app.media.in_flight(), 0);
+    assert_eq!(
+        std::fs::read_dir(cache).unwrap().count(),
+        0,
+        "decoded plaintext artifacts are removed before results settle"
+    );
+}
+
 #[test]
 fn media_downloads_are_capped_at_three_in_flight() {
     // Ten images all want to download. The cap keeps at most three workers in
