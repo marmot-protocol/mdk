@@ -2074,6 +2074,7 @@ async fn the_media_sweep_runs_again_only_once_a_media_row_was_deleted() {
     };
     spawn_media_sweep(
         &mut admission,
+        &client.housekeeping_gate(),
         &app_storage,
         media.clone(),
         true,
@@ -2084,6 +2085,7 @@ async fn the_media_sweep_runs_again_only_once_a_media_row_was_deleted() {
     for _ in 0..3 {
         spawn_media_sweep(
             &mut admission,
+            &client.housekeeping_gate(),
             &app_storage,
             media.clone(),
             false,
@@ -2112,6 +2114,7 @@ async fn the_media_sweep_runs_again_only_once_a_media_row_was_deleted() {
         let before = sweeps();
         spawn_media_sweep(
             &mut admission,
+            &client.housekeeping_gate(),
             &app_storage,
             media.clone(),
             false,
@@ -2274,6 +2277,7 @@ async fn a_failed_sweep_row_is_revisited_by_the_hourly_rescan_not_every_tick() {
     let sweep = async |admission: &mut Admission, until_complete: bool| {
         spawn_media_sweep(
             admission,
+            &client.housekeeping_gate(),
             &app_storage,
             media.clone(),
             until_complete,
@@ -2386,6 +2390,7 @@ async fn starting_a_sweep_never_waits_for_the_store_sweep_lock() {
     // An ownership sweep restarts the cursor from the start.
     spawn_media_sweep(
         &mut admission,
+        &client.housekeeping_gate(),
         &app_storage,
         media.clone(),
         true,
@@ -2415,6 +2420,7 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
     let sweep = async |admission: &mut Admission, until_complete: bool| {
         spawn_media_sweep(
             admission,
+            &client.housekeeping_gate(),
             &app_storage,
             media.clone(),
             until_complete,
@@ -2480,4 +2486,207 @@ async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
         !media.path(&left).exists(),
         "the restarted pass reached the file behind the old cursor"
     );
+}
+
+/// Background housekeeping mode holds each attachment-side housekeeping job
+/// at its entry, with an effect the job would otherwise have: expired work
+/// is not pruned, neither the ownership media sweep nor the housekeeping
+/// batch starts, and due compaction stays due. Normal then runs each
+/// (mdk#2923 PR P).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_mode_holds_pruning_the_sweep_the_batch_and_compaction() {
+    use std::sync::atomic::Ordering;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let app_storage = storage.app_storage();
+    let runtime = crate::MarmotAppRuntime::new(client.app.clone());
+    let shared = runtime.shared_services();
+    let telemetry = shared.observer.performance().clone();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let now = crate::unix_now_seconds();
+    admit_demands(&app_storage, now, false).unwrap();
+    retention_fault_connection(&client.app)
+        .execute("UPDATE attachment_acquisition SET expires_at=1", [])
+        .unwrap();
+    let gate = client.housekeeping_gate();
+    let mut admission = Admission::default();
+
+    client
+        .app
+        .set_housekeeping_mode("alice", crate::HousekeepingMode::Background);
+    assert_eq!(
+        prune_expired_work(&app_storage, now, &gate).unwrap(),
+        (0, 0, 0)
+    );
+    let acquisitions = || -> i64 {
+        retention_fault_connection(&client.app)
+            .query_row("SELECT count(*) FROM attachment_acquisition", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    assert!(acquisitions() > 0, "expired work is kept while held");
+    spawn_media_sweep(
+        &mut admission,
+        &gate,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    assert!(
+        admission.media_sweep.is_none(),
+        "the ownership sweep is held"
+    );
+    spawn_legacy_migration(&client, &shared, &mut admission);
+    assert!(admission.legacy_migration.is_none(), "the batch is held");
+    admission.compaction_due.store(true, Ordering::Release);
+    compact_if_due(&client, &shared, &mut admission).await;
+    assert!(
+        admission.compaction_due.load(Ordering::Acquire),
+        "held compaction stays due"
+    );
+
+    client
+        .app
+        .set_housekeeping_mode("alice", crate::HousekeepingMode::Normal);
+    assert!(prune_expired_work(&app_storage, now, &gate).unwrap().2 > 0);
+    assert_eq!(acquisitions(), 0, "Normal prunes it");
+    spawn_media_sweep(
+        &mut admission,
+        &gate,
+        &app_storage,
+        media,
+        false,
+        &telemetry,
+    );
+    assert!(admission.media_sweep.is_some(), "the sweep runs");
+    finish_media_sweep(&mut admission).await;
+    spawn_legacy_migration(&client, &shared, &mut admission);
+    admission
+        .legacy_migration
+        .take()
+        .expect("the batch runs")
+        .await
+        .unwrap();
+    compact_if_due(&client, &shared, &mut admission).await;
+    assert!(
+        !admission.compaction_due.load(Ordering::Acquire),
+        "compaction runs"
+    );
+    runtime.shutdown().await;
+}
+
+/// A download admitted in Background housekeeping mode still downloads and
+/// is retained; the attachment pass its completion sets due prunes and
+/// sweeps nothing (mdk#2923 PR P). Download admission and readmission are
+/// never held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_completes_in_background_mode_and_its_pass_stays_held() {
+    use crate::housekeeping_mode::HousekeepingJob as Job;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut reference, ciphertext) =
+        crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ciphertext.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+            allow_loopback_blob_endpoints: true,
+            ..MarmotAppConfig::white_noise()
+        },
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    app.set_housekeeping_mode("alice", crate::HousekeepingMode::Background);
+    let mut client = app.client("alice").await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    seed_direction(&storage.app_storage(), &reference, false, "received");
+    client.state.groups.push(projection(&reference));
+    storage
+        .app_storage()
+        .remember_encrypted_media_epoch_secret(
+            GROUP,
+            crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            3,
+            &[7; 32],
+        )
+        .unwrap();
+    assert!(
+        client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024
+            )
+            .unwrap()
+            .is_some()
+    );
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    assert!(admission.is_waiting(), "download admission is never held");
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(5), completions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let asset = match &done.completion {
+        MediaHttpCompletion::Attachment { job, .. } => job.reference.clone(),
+        _ => panic!("attachment"),
+    };
+    complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
+    // The pass a media completion sets due.
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    assert_eq!(
+        &*read_retained(
+            &storage,
+            &client.app,
+            &client.state.label,
+            &asset,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap(),
+        b"retained worker bytes"
+    );
+    let modes = &app.housekeeping_modes;
+    for job in [Job::PruneSweeps, Job::MediaSweep] {
+        assert_eq!(modes.decisions("alice", job, Admit::Hold), 3, "{job:?}");
+        assert_eq!(modes.decisions("alice", job, Admit::Run), 0, "{job:?}");
+        assert_eq!(modes.decisions("alice", job, Admit::RunOnce), 0, "{job:?}");
+    }
+    assert!(admission.media_sweep.is_none());
+    server.await.unwrap();
 }

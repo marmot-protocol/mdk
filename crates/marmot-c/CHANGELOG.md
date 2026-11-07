@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_set_housekeeping_mode` and `marmot_housekeeping_mode` with `MarmotHousekeepingMode` (`Normal` 0,
+  `Background` 1) discriminants (mdk#2923 PR P). Additive; use the matching header/library.
+
 - Emoji set changes (breaking; the emoji set ABI has not shipped). `marmot_install_emoji_set` takes
   `expected_event_id_hex` and a `MarmotEmojiSetInstallControl` (`marmot_emoji_set_install_control_new`, `_cancel`,
   `_is_cancelled`, `_progress` writing a `MarmotEmojiSetInstallProgress`, `_free`); `marmot_fetch_emoji_set_asset`

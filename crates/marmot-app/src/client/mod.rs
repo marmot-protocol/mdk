@@ -1503,6 +1503,13 @@ impl AppClient {
             .map(|telemetry| telemetry.observe(operation))
     }
 
+    /// The entry check this account's held housekeeping jobs make (mdk#2923
+    /// PR P), counting holds in this client's runtime telemetry.
+    pub(crate) fn housekeeping_gate(&self) -> crate::housekeeping_mode::HousekeepingGate {
+        self.app
+            .housekeeping_gate(&self.state.label, self.runtime_telemetry.clone())
+    }
+
     pub fn pause_maintenance(&mut self) {
         self.runtime.pause_maintenance();
     }

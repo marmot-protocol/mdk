@@ -321,3 +321,34 @@ impl From<KeyPackageLifecycleState> for KeyPackageMaintenanceStatusFfi {
         }
     }
 }
+
+/// Whether an account's housekeeping runs (mdk#2923). `Background` holds
+/// cleanup of finished and expired work while the app is in the background;
+/// messaging is unaffected. See `Marmot::set_housekeeping_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum HousekeepingModeFfi {
+    /// Housekeeping runs as maintenance finds it due. The default, and what
+    /// a cold start uses.
+    Normal,
+    /// The app is in the background: housekeeping is held, apart from a run
+    /// every 12 hours.
+    Background,
+}
+
+impl From<HousekeepingModeFfi> for marmot_app::HousekeepingMode {
+    fn from(value: HousekeepingModeFfi) -> Self {
+        match value {
+            HousekeepingModeFfi::Normal => Self::Normal,
+            HousekeepingModeFfi::Background => Self::Background,
+        }
+    }
+}
+
+impl From<marmot_app::HousekeepingMode> for HousekeepingModeFfi {
+    fn from(value: marmot_app::HousekeepingMode) -> Self {
+        match value {
+            marmot_app::HousekeepingMode::Normal => Self::Normal,
+            marmot_app::HousekeepingMode::Background => Self::Background,
+        }
+    }
+}

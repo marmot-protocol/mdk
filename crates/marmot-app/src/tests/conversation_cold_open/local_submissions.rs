@@ -1416,3 +1416,59 @@ async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
     );
     h.app.close_storage().unwrap();
 }
+
+/// A prepared publication retained before the worker starts still publishes
+/// while the account is in Background housekeeping mode: prepared-publication
+/// recovery and delivery are never held (mdk#2923 PR P).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prepared_publication_completes_in_background_housekeeping_mode() {
+    let h = History::new(0).await;
+    let (accepted, _) = h
+        .app
+        .admit_local_message(
+            "alice",
+            &h.group,
+            "background-token".into(),
+            LocalMessageRequest {
+                content: "prepared before the background".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+        )
+        .unwrap();
+    h.app.close_storage().unwrap();
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    runtime
+        .set_housekeeping_mode("alice", crate::HousekeepingMode::Background)
+        .unwrap();
+    let retried = runtime
+        .submit_text(
+            "alice",
+            &h.group,
+            "prepared before the background".into(),
+            "background-token".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted, retried);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            runtime
+                .local_send_status("alice", &h.group, "background-token")
+                .unwrap(),
+            Some(crate::LocalSendStatus::Completed(_))
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the prepared publication completes in Background");
+    assert_eq!(
+        runtime.housekeeping_mode("alice").unwrap(),
+        crate::HousekeepingMode::Background
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}

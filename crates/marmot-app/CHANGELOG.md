@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `MarmotAppRuntime::set_housekeeping_mode` and `housekeeping_mode` (mdk#2923 PR P). A host sets an account to
+  `HousekeepingMode::Background` while it is backgrounded: the prune sweeps, the media sweep, the housekeeping batch
+  and compaction, the avatar passes, content backfill and legacy promotion are held, while receives, sends, downloads,
+  the KeyPackage lifecycle, prepared-publication recovery, the recovery runner and push windows keep running. Held work
+  still runs once every 12 hours, and each job runs once on returning to `Normal`. The mode is process-local, survives
+  a worker reopen and starts `Normal`. `pause_maintenance` is unchanged. Holds count as `housekeeping_held`. Additive.
+
 - Emoji set image downloads are bound to the version the user was shown (breaking; the emoji set API has not
   shipped). `install_emoji_set` takes `expected_event_id_hex` and an `&EmojiSetInstallControl`;
   `fetch_emoji_set_asset` takes `expected_event_id_hex`. Another stored version fails with the new

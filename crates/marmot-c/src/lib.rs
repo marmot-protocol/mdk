@@ -30,6 +30,7 @@ pub mod commands;
 pub mod deployment;
 pub mod emoji_set_install;
 pub mod file_media;
+pub mod housekeeping;
 pub(crate) mod macros;
 pub mod memory;
 pub mod nip46;
