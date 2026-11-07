@@ -167,12 +167,24 @@ async fn failing_catch_up(label: &str) -> FailingCatchUp {
 }
 
 async fn failing_catch_up_with(label: &str, frank_leaves: Option<FrankLeaves>) -> FailingCatchUp {
+    failing_catch_up_on_storage(
+        label,
+        frank_leaves,
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    )
+    .await
+}
+
+async fn failing_catch_up_on_storage(
+    label: &str,
+    frank_leaves: Option<FrankLeaves>,
+    handle: SqliteAccountStorage,
+) -> FailingCatchUp {
     let audit_dir = tempfile::tempdir().unwrap();
     let audit_path = audit_dir.path().join("carol.jsonl");
     let fault = PutGroupFault::default();
     let preparation = PreparationDelay::default();
     let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
-    let handle = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol = build_carol(
         label,
         handle.clone(),
@@ -931,5 +943,166 @@ async fn structural_progress_waits_out_a_failed_pass_and_idles_a_parked_one() {
         (parked.runnable_work, parked.earliest_next_wake_monotonic_ms),
         (0, None),
         "a parked batch waits for new input, not for time: {parked:?}"
+    );
+}
+
+/// The final Completed write shares the transaction that applies its selected
+/// branch and dispositions. A genuine late backend failure must restore them
+/// together, and leave the same batch retryable (mdk#3068).
+#[tokio::test]
+async fn late_completed_pass_write_failure_restores_canonical_rows_and_retries() {
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    fn canonical_rows(connection: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        [
+            "openmls_values",
+            "cgka_groups",
+            "cgka_messages",
+            "cgka_queued_outbound",
+            "pending_application_events",
+            "cgka_group_snapshots",
+            "cgka_group_state_checkpoints",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut query = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                .unwrap();
+            let columns = query.column_count();
+            query
+                .query_map([], |row| {
+                    (0..columns).map(|column| row.get(column)).collect()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("late-completion.sqlite");
+    let key = SqlCipherKey::raw([0x68; 32]);
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let mut case = failing_catch_up_on_storage(
+        "late-completion",
+        None,
+        SqliteAccountStorage::open_encrypted(&database, &key).unwrap(),
+    )
+    .await;
+    let observer = open_observer();
+    let before = canonical_rows(&observer);
+    let record_before = case.handle.get_group(&case.group_id).unwrap();
+    assert_eq!(record_before.epoch, EpochId(1));
+    let input_id = MessageId::new(hex::decode(content_hex(&case.invite_david)).unwrap());
+    let input_before = case.handle.get_message(&input_id).unwrap();
+    case.carol.drain_events();
+    observer
+        .execute_batch(
+            "CREATE TRIGGER fail_completed_pass BEFORE UPDATE ON cgka_convergence_passes
+         WHEN json_extract(NEW.record, '$.phase') = 'completed'
+          AND (SELECT epoch FROM cgka_groups WHERE id = NEW.group_id) = 2
+         BEGIN SELECT RAISE(ABORT, 'late-pass-completion-fault'); END;",
+        )
+        .unwrap();
+
+    let failed = case.attempt();
+    assert!(
+        matches!(&failed, Err(OpenMlsProjectionError::Storage(detail))
+            if detail.contains("late-pass-completion-fault")),
+        "the final Completed write must fail after the epoch advanced: {failed:?}"
+    );
+    assert!(
+        canonical_rows(&observer) == before,
+        "late completion failure must roll back all canonical durable state"
+    );
+    assert_eq!(
+        case.handle.get_group(&case.group_id).unwrap(),
+        record_before
+    );
+    assert_eq!(case.handle.get_message(&input_id).unwrap(), input_before);
+    assert_eq!(case.carol.epoch(&case.group_id).unwrap(), EpochId(1));
+    assert!(case.carol.drain_events().is_empty());
+    let pass = case
+        .handle
+        .convergence_pass(&case.group_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pass.phase, ConvergencePassPhase::Resolving);
+    let retry = pass.retry.as_ref().unwrap();
+    assert_eq!(retry.failed_attempts, 1);
+    assert_eq!(retry.failed_step, ConvergencePassStep::Apply);
+    assert!(
+        pass.members
+            .iter()
+            .any(|member| member.message_id == input_id)
+    );
+
+    // A physical encrypted reopen must see the rolled-back state before
+    // hydration can repair or retry anything.
+    let FailingCatchUp {
+        carol,
+        handle,
+        clock,
+        audit_path,
+        label,
+        fault,
+        preparation,
+        group_id,
+        _audit_dir,
+        ..
+    } = case;
+    drop(carol);
+    drop(observer);
+    handle.close().unwrap();
+    drop(handle);
+    let observer = open_observer();
+    assert!(canonical_rows(&observer) == before);
+    observer
+        .execute_batch("DROP TRIGGER fail_completed_pass")
+        .unwrap();
+    let handle = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut carol = build_carol(
+        &label,
+        handle.clone(),
+        fault,
+        preparation,
+        clock.clone(),
+        &audit_path,
+    );
+    carol.hydrate_all_stored_groups().unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    clock.advance_ms(CONVERGENCE_PASS_RETRY_BASE_MS);
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
+        .unwrap();
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+    assert_eq!(
+        handle.get_message(&input_id).unwrap().state,
+        MessageState::Processed
+    );
+    let completed = handle.convergence_pass(&group_id).unwrap().unwrap();
+    assert_eq!(completed.generation, pass.generation);
+    assert_eq!(completed.phase, ConvergencePassPhase::Completed);
+    assert_eq!(completed.retry, None);
+    drop(carol);
+    drop(observer);
+    handle.close().unwrap();
+    drop(handle);
+    let reopened = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(reopened.get_group(&group_id).unwrap().epoch, EpochId(2));
+    assert_eq!(
+        reopened.get_message(&input_id).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(
+        reopened.convergence_pass(&group_id).unwrap(),
+        Some(completed)
     );
 }
