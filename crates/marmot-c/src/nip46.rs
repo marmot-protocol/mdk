@@ -1138,15 +1138,18 @@ mod tests {
         Keys::new(SecretKey::from_hex(&format!("{byte:02x}").repeat(32)).unwrap())
     }
     fn response(author: &Keys, client: &Keys, payload: Value) -> Event {
+        response_to(author, client.public_key(), payload)
+    }
+    fn response_to(author: &Keys, client: PublicKey, payload: Value) -> Event {
         let encrypted = nip44::encrypt(
             author.secret_key(),
-            &client.public_key(),
+            &client,
             payload.to_string(),
             nip44::Version::V2,
         )
         .unwrap();
         EventBuilder::new(Kind::NostrConnect, encrypted)
-            .tag(client.public_key())
+            .tag(client)
             .finalize(author)
             .unwrap()
     }
@@ -1307,5 +1310,623 @@ mod tests {
             matching_response(&json!({"id":"a","result":"ack"}), "b"),
             Response::Ignore
         ));
+    }
+    #[derive(Default)]
+    struct Store(Mutex<Vec<(String, String, String)>>);
+    impl Store {
+        unsafe fn input(value: *const c_char) -> String {
+            unsafe { std::ffi::CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned()
+        }
+        unsafe extern "C" fn has(
+            data: *mut std::ffi::c_void,
+            key: *const c_char,
+            out: *mut u8,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let key = unsafe { Self::input(key) };
+            let Ok(entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            unsafe {
+                out.write(u8::from(
+                    entries
+                        .iter()
+                        .any(|(label, account, _)| label == &key || account == &key),
+                ))
+            };
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
+        }
+        unsafe extern "C" fn write(
+            data: *mut std::ffi::c_void,
+            label: *const c_char,
+            account: *const c_char,
+            secret: *const c_char,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let (label, account, secret) = unsafe {
+                (
+                    Self::input(label),
+                    Self::input(account),
+                    Self::input(secret),
+                )
+            };
+            let Ok(mut entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            entries.retain(|(old_label, old_account, _)| {
+                old_label != &label && old_account != &account
+            });
+            entries.push((label, account, secret));
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
+        }
+        unsafe extern "C" fn load(
+            data: *mut std::ffi::c_void,
+            label: *const c_char,
+            account: *const c_char,
+            out: *mut *mut c_char,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let (label, account) = unsafe { (Self::input(label), Self::input(account)) };
+            let Ok(entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            let Some((_, _, secret)) = entries
+                .iter()
+                .find(|(l, a, _)| l == &label || a == &account)
+            else {
+                return crate::secret_store::MarmotSecretStoreStatus::NotFound as u32;
+            };
+            let Ok(secret) = std::ffi::CString::new(secret.as_str()) else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            unsafe { out.write(secret.into_raw()) };
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
+        }
+        unsafe extern "C" fn remove(
+            data: *mut std::ffi::c_void,
+            label: *const c_char,
+            account: *const c_char,
+        ) -> u32 {
+            let store = unsafe { &*data.cast::<Store>() };
+            let (label, account) = unsafe { (Self::input(label), Self::input(account)) };
+            let Ok(mut entries) = store.0.lock() else {
+                return crate::secret_store::MarmotSecretStoreStatus::Failed as u32;
+            };
+            entries.retain(|(l, a, _)| l != &label && a != &account);
+            crate::secret_store::MarmotSecretStoreStatus::Ok as u32
+        }
+        unsafe extern "C" fn free(_: *mut std::ffi::c_void, value: *mut c_char) {
+            drop(unsafe { std::ffi::CString::from_raw(value) });
+        }
+        unsafe extern "C" fn destroy(data: *mut std::ffi::c_void) {
+            drop(unsafe { Arc::from_raw(data.cast::<Store>()) });
+        }
+    }
+
+    struct OwnedClient(*mut MarmotClient);
+    impl OwnedClient {
+        fn open(root: &std::path::Path, relay: &str, store: Arc<Store>) -> Self {
+            let root = std::ffi::CString::new(root.to_str().unwrap()).unwrap();
+            let relay = std::ffi::CString::new(relay).unwrap();
+            let relays = [relay.as_ptr()];
+            let data = Arc::into_raw(store).cast_mut().cast();
+            let store = crate::secret_store::MarmotSecretStore {
+                user_data: data,
+                has_secret_for_label: Some(Store::has),
+                has_secret_for_account_id: Some(Store::has),
+                write_secret: Some(Store::write),
+                load_secret: Some(Store::load),
+                remove_secret: Some(Store::remove),
+                free_secret: Some(Store::free),
+                destroy: Some(Store::destroy),
+            };
+            let mut deployment = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { crate::deployment::marmot_deployment_neutral(&mut deployment) },
+                MarmotStatus::Ok
+            );
+            let mut client = std::ptr::null_mut();
+            let status = unsafe {
+                crate::marmot_client_new_with_options(
+                    root.as_ptr(),
+                    relays.as_ptr(),
+                    1,
+                    crate::MarmotRelayPolicy::AllowLoopback as u32,
+                    &store,
+                    deployment,
+                    &mut client,
+                )
+            };
+            unsafe { crate::deployment::marmot_deployment_free(deployment) };
+            if status != MarmotStatus::Ok {
+                // The public constructor takes no host-context ownership on failure.
+                unsafe { Store::destroy(data) };
+            }
+            assert_eq!(status, MarmotStatus::Ok);
+            assert!(!client.is_null());
+            Self(client)
+        }
+    }
+    impl Drop for OwnedClient {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = crate::commands::marmot_client_shutdown_and_close(self.0);
+                crate::marmot_client_free(self.0);
+            }
+        }
+    }
+    type PeerSessions = Arc<Mutex<Vec<Weak<Session>>>>;
+    struct CancelOnPeerFailure(PeerSessions);
+    impl Drop for CancelOnPeerFailure {
+        fn drop(&mut self) {
+            // A failed fixture task must interrupt real blocking callers rather
+            // than leave them waiting for the production 90-second RPC timeout.
+            for session in self.0.lock().unwrap().iter().filter_map(Weak::upgrade) {
+                session.cancel();
+            }
+        }
+    }
+    struct OwnedSession(*mut MarmotNip46Session);
+    impl OwnedSession {
+        fn open(client: &OwnedClient, config: &Value, peers: &PeerSessions) -> Self {
+            let config = std::ffi::CString::new(config.to_string()).unwrap();
+            let mut session = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { marmot_nip46_new(client.0, config.as_ptr(), &mut session) },
+                MarmotStatus::Ok
+            );
+            assert!(!session.is_null());
+            peers
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(&unsafe { &*session }.inner));
+            Self(session)
+        }
+        fn connect(&self) -> String {
+            let mut output = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { marmot_nip46_connect(self.0, &mut output) },
+                MarmotStatus::Ok
+            );
+            unsafe { take_string(output) }
+        }
+    }
+    impl Drop for OwnedSession {
+        fn drop(&mut self) {
+            unsafe { marmot_nip46_free(self.0) };
+        }
+    }
+    unsafe fn take_string(value: *mut c_char) -> String {
+        assert!(!value.is_null());
+        let result = unsafe { std::ffi::CStr::from_ptr(value) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { crate::marmot_string_free(value) };
+        result
+    }
+    unsafe fn account_snapshot(client: &OwnedClient) -> (String, bool, bool) {
+        let mut output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { crate::commands::marmot_list_accounts(client.0, &mut output) },
+            MarmotStatus::Ok
+        );
+        let list = unsafe { &*output };
+        assert_eq!(list.len, 1);
+        let account = unsafe { &*list.items };
+        let result = (
+            unsafe { std::ffi::CStr::from_ptr(account.account_id_hex) }
+                .to_str()
+                .unwrap()
+                .into(),
+            account.running,
+            account.signed_out,
+        );
+        assert!(account.external_signing);
+        assert!(!account.local_signing);
+        unsafe { crate::types::account::marmot_account_summary_list_free(output) };
+        result
+    }
+
+    #[test]
+    fn remote_signer_c_login_restore_and_logout_use_the_independent_transport() {
+        let _audit = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let peer_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let relay = nostr_relay_builder::LocalRelay::new(
+            nostr_relay_builder::RelayBuilder::default().rate_limit(
+                nostr_relay_builder::builder::RateLimit {
+                    notes_per_minute: 1_000,
+                    ..Default::default()
+                },
+            ),
+        );
+        peer_runtime.block_on(relay.run()).unwrap();
+        let url = peer_runtime.block_on(relay.url()).to_string();
+        let remote = keys(2);
+        let user = keys(3);
+        let client_a = keys(1);
+        let client_b = keys(4);
+        let peer = process_proxy::nostr_builder(Ok(None)).build();
+        let mut notifications = peer.notifications();
+        peer_runtime.block_on(async {
+            peer.add_relay(url.as_str()).await.unwrap();
+            peer.connect().and_wait(Duration::from_secs(5)).await;
+            // This existing Nostr identity advertises both relay lists before
+            // MDK logs it in; no directory/mock shortcut supplies them.
+            for (kind, tag) in [(Kind::from(10_002), "r"), (Kind::from(10_050), "relay")] {
+                let declaration = EventBuilder::new(kind, "")
+                    .tag(Tag::parse([tag, url.as_str()]).unwrap())
+                    .finalize(&user)
+                    .unwrap();
+                assert!(
+                    !peer
+                        .send_event(&declaration)
+                        .await
+                        .unwrap()
+                        .success
+                        .is_empty()
+                );
+            }
+            peer.subscribe(
+                Filter::new()
+                    .kind(Kind::NostrConnect)
+                    .pubkey(remote.public_key()),
+            )
+            .await
+            .unwrap();
+        });
+        let observed = Arc::new(Mutex::new(Vec::<(PublicKey, String, Option<Kind>)>::new()));
+        let peers = PeerSessions::default();
+        let (held_request, entered_request) = std::sync::mpsc::channel();
+        let (release_request, mut released_request) = tokio::sync::oneshot::channel();
+        let peer_task = {
+            let peer = peer.clone();
+            let remote = remote.clone();
+            let user = user.clone();
+            let observed = observed.clone();
+            let url = url.clone();
+            let peers = peers.clone();
+            peer_runtime.spawn(async move {
+                let _cancel_on_failure = CancelOnPeerFailure(peers);
+                let mut connected = std::collections::HashMap::<PublicKey, std::collections::HashSet<String>>::new();
+                let mut used_secrets = std::collections::HashSet::new();
+                while let Some(notification) = notifications.next().await {
+                    let ClientNotification::Event { event, .. } = notification else { continue };
+                    event.verify().unwrap();
+                    let receiver = event.pubkey;
+                    let plaintext = nip44::decrypt(remote.secret_key(), &receiver, &event.content).unwrap();
+                    let request: Value = serde_json::from_str(&plaintext).unwrap();
+                    let id = request["id"].as_str().unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let params = request["params"].as_array().unwrap();
+                    let kind = if method == "sign_event" {
+                        let unsigned: Value = serde_json::from_str(params[0].as_str().unwrap()).unwrap();
+                        Some(serde_json::from_value::<Kind>(unsigned["kind"].clone()).unwrap())
+                    } else { None };
+                    observed.lock().unwrap().push((receiver, method.into(), kind));
+                    let permission = match method {
+                        "sign_event" => Some(format!("sign_event:{}", kind.unwrap().as_u16())),
+                        "nip44_encrypt" | "nip44_decrypt" => Some(method.into()),
+                        _ => None,
+                    };
+                    let authorized = if method == "connect" {
+                        let secret = params.get(1).and_then(Value::as_str);
+                        let permissions = params.get(2).and_then(Value::as_str);
+                        if let (Some(secret), Some(permissions)) = (secret, permissions)
+                            && params.first().and_then(Value::as_str) == Some(remote.public_key().to_hex().as_str())
+                            && matches!(secret, "fixture-a" | "fixture-b")
+                            && !connected.contains_key(&receiver)
+                            && used_secrets.insert(secret.to_owned())
+                        {
+                            connected.insert(receiver, permissions.split(',').map(str::to_owned).collect());
+                            true
+                        } else { false }
+                    } else {
+                        connected.get(&receiver).is_some_and(|permissions| permission.as_ref().is_none_or(|permission| permissions.contains(permission)))
+                    };
+                    if !authorized {
+                        let denied = response_to(&remote, receiver, json!({"id":id,"error":"unauthorized"}));
+                        assert!(!peer.send_event(&denied).await.unwrap().success.is_empty());
+                        continue;
+                    }
+                    let result = match method {
+                        "connect" => json!("ack"),
+                        "get_public_key" => {
+                            // A genuine encrypted but unrelated response must be
+                            // ignored by the live RPC loop, not pinned as the user.
+                            let unrelated = response_to(&remote, receiver, json!({"id":"unrelated-request", "result":keys(9).public_key().to_hex()}));
+                            assert!(!peer.send_event(&unrelated).await.unwrap().success.is_empty());
+                            json!(user.public_key().to_hex())
+                        }
+                        "switch_relays" => json!(json!([url]).to_string()),
+                        "sign_event" => {
+                            let value: Value = serde_json::from_str(params[0].as_str().unwrap()).unwrap();
+                            if value["content"] == "held for cancellation" {
+                                held_request.send(()).unwrap();
+                                (&mut released_request).await.unwrap();
+                            }
+                            let kind = serde_json::from_value::<Kind>(value["kind"].clone()).unwrap();
+                            let tags = serde_json::from_value::<Tags>(value["tags"].clone()).unwrap();
+                            let at = serde_json::from_value::<Timestamp>(value["created_at"].clone()).unwrap();
+                            let signed = EventBuilder::new(kind, value["content"].as_str().unwrap()).tags(tags).custom_created_at(at).finalize(&user).unwrap();
+                            json!(signed.as_json())
+                        }
+                        "nip44_encrypt" => {
+                            let to = PublicKey::from_hex(params[0].as_str().unwrap()).unwrap();
+                            json!(nip44::encrypt(user.secret_key(), &to, params[1].as_str().unwrap(), nip44::Version::V2).unwrap())
+                        }
+                        "nip44_decrypt" => {
+                            let from = PublicKey::from_hex(params[0].as_str().unwrap()).unwrap();
+                            json!(nip44::decrypt(user.secret_key(), &from, params[1].as_str().unwrap()).unwrap())
+                        }
+                        "logout" => { connected.remove(&receiver); json!("ack") },
+                        other => panic!("unimplemented fixture RPC: {other}"),
+                    };
+                    let response = response_to(&remote, receiver, json!({"id":id,"result":result}));
+                    assert!(!peer.send_event(&response).await.unwrap().success.is_empty());
+                }
+            })
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::default());
+        let client = OwnedClient::open(root.path(), &url, store.clone());
+        let uri = |secret: &str| {
+            NostrConnectUri::Bunker {
+                remote_signer_public_key: remote.public_key(),
+                relays: vec![RelayUrl::parse(&url).unwrap()],
+                secret: Some(secret.into()),
+            }
+            .to_string()
+        };
+        let session = OwnedSession::open(
+            &client,
+            &json!({"uri":uri("fixture-a"),"client_secret":client_a.secret_key().to_secret_hex()}),
+            &peers,
+        );
+        let independent = OwnedSession::open(
+            &client,
+            &json!({"uri":uri("fixture-b"),"client_secret":client_b.secret_key().to_secret_hex()}),
+            &peers,
+        );
+        assert_eq!(session.connect(), user.public_key().to_hex());
+        assert_eq!(independent.connect(), user.public_key().to_hex());
+        let unsigned_a = EventBuilder::new(Kind::from(13), "client-a payload")
+            .custom_created_at(Timestamp::from(1_700_000_001))
+            .finalize_unsigned(user.public_key());
+        let unsigned_b = EventBuilder::new(Kind::from(13), "client-b payload")
+            .custom_created_at(Timestamp::from(1_700_000_002))
+            .finalize_unsigned(user.public_key());
+        let signer_a = unsafe { &*session.0 }.inner.clone();
+        let signer_b = unsafe { &*independent.0 }.inner.clone();
+        let (signed_a, signed_b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| signer_a.sign_event(unsigned_a.as_json()).unwrap());
+            let b = scope.spawn(|| signer_b.sign_event(unsigned_b.as_json()).unwrap());
+            (
+                Event::from_json(a.join().unwrap()).unwrap(),
+                Event::from_json(b.join().unwrap()).unwrap(),
+            )
+        });
+        signed_a.verify().unwrap();
+        signed_b.verify().unwrap();
+        assert_eq!(
+            (
+                signed_a.pubkey,
+                signed_a.content.as_str(),
+                signed_a.created_at.as_secs()
+            ),
+            (user.public_key(), "client-a payload", 1_700_000_001)
+        );
+        assert_eq!(
+            (
+                signed_b.pubkey,
+                signed_b.content.as_str(),
+                signed_b.created_at.as_secs()
+            ),
+            (user.public_key(), "client-b payload", 1_700_000_002)
+        );
+        drop(signer_a);
+        drop(signer_b);
+        let held_signer = unsafe { &*independent.0 }.inner.clone();
+        let unsigned = EventBuilder::new(Kind::from(13), "held for cancellation")
+            .custom_created_at(Timestamp::from(1_700_000_003))
+            .finalize_unsigned(user.public_key());
+        let (completed, completion) = std::sync::mpsc::channel();
+        let pending = std::thread::spawn(move || {
+            let result = held_signer.sign_event(unsigned.as_json());
+            completed.send(()).unwrap();
+            result
+        });
+        let entered = entered_request.recv_timeout(Duration::from_secs(5));
+        // Always unblock the peer and join the caller before asserting. If
+        // cancellation is lost, the valid reply exposes it without an RPC timeout.
+        unsafe { marmot_nip46_cancel(independent.0) };
+        let completed_before_reply = completion.recv_timeout(Duration::from_secs(2));
+        let released = release_request.send(());
+        let cancelled = pending.join().unwrap();
+        assert!(
+            entered.is_ok(),
+            "the peer never received the pending request"
+        );
+        assert!(released.is_ok());
+        assert!(
+            completed_before_reply.is_ok(),
+            "cancellation waited for the remote reply"
+        );
+        assert!(matches!(
+            cancelled,
+            Err(MarmotKitError::ExternalSignerRejected)
+        ));
+        let relay_text = std::ffi::CString::new(url.as_str()).unwrap();
+        let relays = [relay_text.as_ptr()];
+        let mut summary = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                marmot_nip46_login(
+                    client.0,
+                    session.0,
+                    relays.as_ptr(),
+                    1,
+                    relays.as_ptr(),
+                    1,
+                    relays.as_ptr(),
+                    1,
+                    &mut summary,
+                )
+            },
+            MarmotStatus::Ok,
+            "{:?}",
+            crate::status::take_last_error()
+        );
+        let account = unsafe { &*summary };
+        let account_ref =
+            std::ffi::CString::new(unsafe { std::ffi::CStr::from_ptr(account.label) }.to_bytes())
+                .unwrap();
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(account.account_id_hex) }
+                .to_str()
+                .unwrap(),
+            user.public_key().to_hex()
+        );
+        assert_eq!(
+            (
+                account.external_signing,
+                account.local_signing,
+                account.signed_out
+            ),
+            (true, false, false)
+        );
+        unsafe { crate::types::account::marmot_account_summary_free(summary) };
+        assert_eq!(
+            unsafe { account_snapshot(&client) },
+            (user.public_key().to_hex(), true, false)
+        );
+        for expected in [450, 30_443] {
+            assert!(
+                observed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(sender, method, kind)| *sender == client_a.public_key()
+                        && method == "sign_event"
+                        && kind.is_some_and(|kind| kind.as_u16() == expected)),
+                "login did not request signed kind {expected}"
+            );
+        }
+        let mut export = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { marmot_nip46_export(session.0, &mut export) },
+            MarmotStatus::Ok
+        );
+        let export = unsafe { take_string(export) };
+        let saved: Value = serde_json::from_str(&export).unwrap();
+        assert_eq!(
+            saved["client_secret"],
+            client_a.secret_key().to_secret_hex()
+        );
+        assert_eq!(saved["user_public_key"], user.public_key().to_hex());
+        assert_eq!(
+            saved["remote_signer_public_key"],
+            remote.public_key().to_hex()
+        );
+        assert!(
+            saved.get("uri").is_none()
+                && !export.contains("fixture-a")
+                && !export.contains("fixture-b")
+        );
+        drop(independent);
+        drop(session);
+        drop(client);
+        assert!(
+            !observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, method, _)| method == "logout")
+        );
+        let client = OwnedClient::open(root.path(), &url, store);
+        let session = OwnedSession::open(&client, &saved, &peers);
+        assert_eq!(
+            unsafe { crate::marmot_client_start(client.0) },
+            MarmotStatus::Ok
+        );
+        assert_eq!(session.connect(), user.public_key().to_hex());
+        assert_eq!(
+            unsafe { marmot_nip46_register(client.0, account_ref.as_ptr(), session.0) },
+            MarmotStatus::Ok
+        );
+        assert_eq!(
+            unsafe { account_snapshot(&client) },
+            (user.public_key().to_hex(), true, false)
+        );
+        let mut signed_out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                crate::commands::marmot_sign_out(client.0, account_ref.as_ptr(), 0, &mut signed_out)
+            },
+            MarmotStatus::Ok
+        );
+        unsafe { crate::types::account::marmot_sign_out_outcome_free(signed_out) };
+        assert_eq!(
+            unsafe { account_snapshot(&client) },
+            (user.public_key().to_hex(), false, true)
+        );
+        assert_eq!(unsafe { marmot_nip46_logout(session.0) }, MarmotStatus::Ok);
+        let mut erased = std::ptr::dangling_mut();
+        assert_eq!(
+            unsafe { marmot_nip46_export(session.0, &mut erased) },
+            MarmotStatus::ExternalSignerUnavailable
+        );
+        assert!(erased.is_null());
+        let mut state = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { marmot_nip46_state(session.0, &mut state) },
+            MarmotStatus::Ok
+        );
+        let state: Value = serde_json::from_str(&unsafe { take_string(state) }).unwrap();
+        assert_eq!(state["state"], "logged_out");
+        drop(session);
+        drop(client);
+        let history = observed.lock().unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|(sender, method, _)| *sender == client_a.public_key()
+                    && method == "sign_event")
+        );
+        assert!(
+            history
+                .iter()
+                .any(|(sender, method, _)| *sender == client_b.public_key()
+                    && method == "sign_event")
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|(_, method, _)| method == "connect")
+                .count(),
+            2
+        );
+        let logout_senders = history
+            .iter()
+            .filter(|(_, method, _)| method == "logout")
+            .map(|(sender, _, _)| *sender)
+            .collect::<Vec<_>>();
+        assert_eq!(logout_senders, vec![client_a.public_key()]);
+        drop(history);
+        peer_task.abort();
+        peer_runtime.block_on(async {
+            assert!(peer_task.await.unwrap_err().is_cancelled());
+            peer.disconnect().await;
+        });
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
     }
 }
