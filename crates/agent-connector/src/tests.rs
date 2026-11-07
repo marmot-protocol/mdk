@@ -33,7 +33,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep, timeout};
 
-use crate::account::ProfileUpdateFields;
+use crate::account::{GroupAdminChange, ProfileUpdateFields};
 use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
@@ -9001,4 +9001,163 @@ async fn connector_restarts_keep_an_imported_read_only_relay_list() {
     assert_eq!(on_relay.nip65.read_relays, vec![read_url]);
     assert!(on_relay.nip65.write_relays.is_empty());
     assert_eq!(on_relay.inbox.created_at, published.inbox.created_at);
+}
+
+#[tokio::test]
+async fn group_admin_checks_authority_changes_membership_and_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev/admin.sock"),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // First opens of encrypted account databases stay sequential so the
+    // fixture does not compete for the startup budget.
+    let mut accounts = Vec::new();
+    for label in ["admin-agent", "admin-peer", "admin-new"] {
+        let account = connector.account_home.create_account(label).unwrap();
+        connector
+            .runtime
+            .publish_key_package(&account.label)
+            .await
+            .unwrap();
+        accounts.push(account);
+    }
+    let [agent, peer, newcomer] = accounts.try_into().ok().unwrap();
+    let id = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "Admin test",
+            std::slice::from_ref(&peer.label),
+            None,
+        )
+        .await
+        .unwrap();
+    let group = hex::encode(id.as_slice());
+    let change = |promote, add, remove| GroupAdminChange {
+        promote,
+        add,
+        remove,
+    };
+    let status = |actor: &str, member: &str, change| {
+        let connector = &connector;
+        let group = &group;
+        let (actor, member) = (actor.to_owned(), member.to_owned());
+        async move {
+            match connector
+                .group_admin_response(&actor, group, &member, change)
+                .await?
+            {
+                AgentControlResponse::GroupAdminStatus {
+                    is_member,
+                    is_admin,
+                    message_ids_hex,
+                    accept_disposition,
+                } => {
+                    // The mock relay acknowledges at once, so every sent change
+                    // is published and a request that sends nothing has no
+                    // disposition.
+                    assert_eq!(
+                        accept_disposition,
+                        (!message_ids_hex.is_empty())
+                            .then_some(agent_control::AgentControlSendAcceptDisposition::Published)
+                    );
+                    Ok::<_, crate::ConnectorError>((is_member, is_admin, message_ids_hex.len()))
+                }
+                other => panic!("unexpected response {other:?}"),
+            }
+        }
+    };
+    let (agent_id, peer_id, new_id) = (
+        agent.account_id_hex.as_str(),
+        peer.account_id_hex.as_str(),
+        newcomer.account_id_hex.as_str(),
+    );
+
+    // The peer joins, then as a non-admin cannot promote itself, invite or remove.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while connector
+            .runtime
+            .accept_group_invite(&peer.label, &id)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer joins the group");
+    for (member, change) in [
+        (peer_id, change(true, false, false)),
+        (new_id, change(false, true, false)),
+        (agent_id, change(false, false, true)),
+    ] {
+        let error = status(peer_id, member, change).await.unwrap_err();
+        assert_eq!(error.code(), "not_group_admin", "{error}");
+    }
+    let short_id = &agent_id[2..];
+    let error = status(agent_id, short_id, change(false, false, false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_hex");
+    // Read-only query, promotion, and an idempotent repeat.
+    assert_eq!(
+        status(agent_id, peer_id, change(false, false, false))
+            .await
+            .unwrap(),
+        (true, false, 0)
+    );
+    let (member, admin, commits) = status(agent_id, peer_id, change(true, false, false))
+        .await
+        .unwrap();
+    assert!(member && admin && commits > 0);
+    assert_eq!(
+        status(agent_id, peer_id, change(true, false, false))
+            .await
+            .unwrap(),
+        (true, true, 0)
+    );
+    // Promote alone never invites a non-member.
+    assert_eq!(
+        status(agent_id, new_id, change(true, false, false))
+            .await
+            .unwrap(),
+        (false, false, 0)
+    );
+    // Add with promote invites as an initial admin, once.
+    let (member, admin, commits) = status(agent_id, new_id, change(true, true, false))
+        .await
+        .unwrap();
+    assert!(member && admin && commits > 0);
+    assert_eq!(
+        status(agent_id, new_id, change(true, true, false))
+            .await
+            .unwrap(),
+        (true, true, 0)
+    );
+    // Removing an admin publishes one commit that also drops its admin key;
+    // remove wins over add and promote and is idempotent.
+    assert_eq!(
+        status(agent_id, new_id, change(true, true, true))
+            .await
+            .unwrap(),
+        (false, false, 1)
+    );
+    assert_eq!(
+        status(agent_id, new_id, change(false, false, true))
+            .await
+            .unwrap(),
+        (false, false, 0)
+    );
+    // Add alone invites a plain member.
+    let (member, admin, commits) = status(agent_id, new_id, change(false, true, false))
+        .await
+        .unwrap();
+    assert!(member && !admin && commits > 0);
+    connector.runtime.shutdown().await;
 }

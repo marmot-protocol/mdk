@@ -171,6 +171,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::GroupCreateCapabilities => "group_create_capabilities",
         AgentControlRequest::GroupCreateWithAdmins { .. } => "group_create_with_admins",
         AgentControlRequest::GroupInfo { .. } => "group_info",
+        AgentControlRequest::GroupAdmin { .. } => "group_admin",
         AgentControlRequest::GroupProfileUpdate { .. } => "group_profile_update",
         AgentControlRequest::GroupLeave { .. } => "group_leave",
         AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
