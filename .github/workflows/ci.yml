@@ -661,7 +661,7 @@ jobs:
       - name: Prepare runner disk
         env:
           MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        run: python3 scripts/ci_runner.py prepare
+        run: python3 scripts/ci_runner.py prepare-archive
 
       - name: Install Rust toolchain
         run: |
