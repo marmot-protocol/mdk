@@ -17,6 +17,9 @@ Source-local rules. The full module map, invariants, and design notes are in [`.
   `../tests/crash_recovery_sqlite.rs`.
   Its `candidate_replay/read_faults.rs` child owns the initial/checkpoint/post-replay native reads and added-profile lookup
   categories with exact backend faults (#3171); direct wrapper owners do not imply public candidate-retention proof.
+  `own_checkpoint_apply_parity` also owns preservation of the actual Sent signed carrier through native confirmation
+  and its generated checkpoint stamp; `replay_transaction_preserves_results_and_restores_after_error_and_panic`
+  owns the exported materializer's empty-path argument rejection without changing its encrypted native fixture (mdk#3190).
 - `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan measurement and a
   test-only visited-row counter; keep aggregate measurements separate from app acceptance.
 - `mls_group_cache.rs::tests` proves cache coherence with public context epochs and real local rollback / independent

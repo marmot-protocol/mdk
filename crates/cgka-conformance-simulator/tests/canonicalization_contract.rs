@@ -258,6 +258,9 @@ fn commit_edges_materialize_candidate_branches_before_selection() {
             child_commit_edge("live-2", "live-tip", "live-mid", 1, 2, 3, 0xff),
             commit_edge("withheld-1", "withheld-tip", None, 1, 2, 0x00),
             commit_edge("live-1", "live-mid", None, 1, 2, 0xff),
+            // The parent exists at epoch 2; this child's source is epoch 1.
+            // Its higher tip would win if parent/source validation vanished.
+            child_commit_edge("wrong-source-child", "wrong-tip", "live-mid", 1, 1, 4, 0x00),
         ],
         vec![],
     ));
@@ -270,11 +273,18 @@ fn commit_edges_materialize_candidate_branches_before_selection() {
     );
     assert_eq!(
         result.deferred_messages,
-        vec![DeferredMessage {
-            message_id: "withheld-1".into(),
-            kind: MessageKind::Commit,
-            reason: DeferredMessageReason::NonSelectedEligibleBranch,
-        }]
+        vec![
+            DeferredMessage {
+                message_id: "withheld-1".into(),
+                kind: MessageKind::Commit,
+                reason: DeferredMessageReason::NonSelectedEligibleBranch,
+            },
+            DeferredMessage {
+                message_id: "wrong-source-child".into(),
+                kind: MessageKind::Commit,
+                reason: DeferredMessageReason::MissingCandidateParent,
+            },
+        ]
     );
     assert!(result.dropped_messages.is_empty());
 }
@@ -604,7 +614,7 @@ fn proposal_consumed_only_by_permanently_ineligible_branch_is_dropped() {
                 },
                 MaterializedCandidate {
                     branch: branch("stale", 4, 7, 0xff),
-                    commit_message_ids: vec![],
+                    commit_message_ids: vec!["stale-commit".into()],
                     consumed_proposal_ids: vec!["stale-proposal".into()],
                 },
             ],
@@ -613,12 +623,20 @@ fn proposal_consumed_only_by_permanently_ineligible_branch_is_dropped() {
         assert_eq!(result.selected_branch_id.as_deref(), Some("live"), "{case}");
         assert_eq!(
             result.dropped_messages,
-            vec![DroppedMessage {
-                message_id: "stale-proposal".into(),
-                kind: MessageKind::Proposal,
-                reason: expected_reason,
-                rejection_category: None,
-            }],
+            vec![
+                DroppedMessage {
+                    message_id: "stale-commit".into(),
+                    kind: MessageKind::Commit,
+                    reason: expected_reason,
+                    rejection_category: None,
+                },
+                DroppedMessage {
+                    message_id: "stale-proposal".into(),
+                    kind: MessageKind::Proposal,
+                    reason: expected_reason,
+                    rejection_category: None,
+                },
+            ],
             "{case}"
         );
         assert!(result.deferred_messages.is_empty(), "{case}");
