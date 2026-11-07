@@ -91,3 +91,50 @@ impl From<app::LocalAvatarRead> for AvatarBytesFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatar_availability_and_acquisition_keep_independent_meanings() {
+        for (native, expected) in [
+            (
+                app::AvatarAvailability::Missing,
+                AvatarAvailabilityFfi::Missing,
+            ),
+            (app::AvatarAvailability::Ready, AvatarAvailabilityFfi::Ready),
+            (app::AvatarAvailability::Stale, AvatarAvailabilityFfi::Stale),
+            (
+                app::AvatarAvailability::Invalidated,
+                AvatarAvailabilityFfi::Invalidated,
+            ),
+        ] {
+            assert_eq!(AvatarAvailabilityFfi::from(native), expected);
+        }
+        for (native, expected) in [
+            (
+                app::AvatarAcquisitionState::Idle,
+                AvatarAcquisitionStateFfi::Idle,
+            ),
+            (
+                app::AvatarAcquisitionState::Queued,
+                AvatarAcquisitionStateFfi::Queued,
+            ),
+            (
+                app::AvatarAcquisitionState::Fetching,
+                AvatarAcquisitionStateFfi::Fetching,
+            ),
+            (
+                app::AvatarAcquisitionState::RetryScheduled,
+                AvatarAcquisitionStateFfi::RetryScheduled,
+            ),
+            (
+                app::AvatarAcquisitionState::Blocked,
+                AvatarAcquisitionStateFfi::Blocked,
+            ),
+        ] {
+            assert_eq!(AvatarAcquisitionStateFfi::from(native), expected);
+        }
+    }
+}
