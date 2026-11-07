@@ -271,6 +271,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_previews_keep_drafts_and_localization_choices_distinct() {
+        for (native, expected) in [
+            (
+                app::SelectedChatPreview::Message,
+                SelectedChatPreviewFfi::Message,
+            ),
+            (
+                app::SelectedChatPreview::Invitation,
+                SelectedChatPreviewFfi::Invitation,
+            ),
+            (
+                app::SelectedChatPreview::Empty,
+                SelectedChatPreviewFfi::Empty,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&SelectedChatPreviewFfi::from(native)),
+                std::mem::discriminant(&expected)
+            );
+        }
+        let draft = SelectedChatPreviewFfi::from(app::SelectedChatPreview::Draft(
+            app::ChatListDraftPreview {
+                text: "draft text".into(),
+                text_truncated: false,
+                attachment_count: 0,
+                attachment_kind: None,
+            },
+        ));
+        assert!(
+            matches!(draft, SelectedChatPreviewFfi::Draft { draft } if draft.text == "draft text" && !draft.text_truncated && draft.attachment_count == 0 && draft.attachment_kind.is_none())
+        );
+        // Native list previews truncate by characters to1024, leaving composer text intact.
+        let draft = SelectedChatPreviewFfi::from(app::SelectedChatPreview::Draft(
+            app::ChatListDraftPreview {
+                text: "é".repeat(1024),
+                text_truncated: true,
+                attachment_count: 1,
+                attachment_kind: Some(app::ChatListAttachmentKind::File),
+            },
+        ));
+        assert!(
+            matches!(draft, SelectedChatPreviewFfi::Draft { draft } if draft.text == "é".repeat(1024) && draft.text_truncated && draft.attachment_count == 1 && matches!(draft.attachment_kind, Some(super::super::ChatListAttachmentKindFfi::File)))
+        );
+    }
+
+    #[test]
+    fn unavailable_and_retained_presentations_keep_their_host_choices() {
+        assert!(matches!(
+            PresentationTextFfi::from(app::PresentationText::UnavailableConversation),
+            PresentationTextFfi::UnavailableConversation
+        ));
+        for (native, expected) in [
+            (
+                app::PresentationSource::PeerFallback,
+                PresentationSourceFfi::PeerFallback,
+            ),
+            (
+                app::PresentationSource::UnknownFallback,
+                PresentationSourceFfi::UnknownFallback,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&PresentationSourceFfi::from(native)),
+                std::mem::discriminant(&expected)
+            );
+        }
+        assert!(matches!(
+            PresentationResolutionFfi::from(app::PresentationResolution::LastKnown),
+            PresentationResolutionFfi::LastKnown
+        ));
+        // The real cached peer/group/fallback choices remain with commands/presentation.
+    }
+
+    #[test]
+    fn encrypted_group_avatar_keeps_its_tag_and_material() {
+        // Native selection requires32-byte hash/keys,12-byte nonce and a SHA256-sized
+        // cache key. This owns the DTO tag/payload, not image acquisition or key framing.
+        let avatar = SelectedAvatarFfi::from(app::SelectedAvatar::EncryptedGroupImage {
+            image: app::ChatListAvatar {
+                image_hash_hex: "11".repeat(32),
+                image_key_hex: "22".repeat(32),
+                image_nonce_hex: "33".repeat(12),
+                image_upload_key_hex: "44".repeat(32),
+                media_type: Some("image/png".into()),
+            },
+            cache_key: "55".repeat(32),
+        });
+        let SelectedAvatarFfi::EncryptedGroupImage { image, cache_key } = avatar else {
+            panic!("encrypted group avatar lost its host tag")
+        };
+        assert_eq!(
+            (
+                image.image_hash_hex,
+                image.image_key_hex,
+                image.image_nonce_hex,
+                image.image_upload_key_hex,
+                image.media_type.as_deref(),
+                cache_key
+            ),
+            (
+                "11".repeat(32),
+                "22".repeat(32),
+                "33".repeat(12),
+                "44".repeat(32),
+                Some("image/png"),
+                "55".repeat(32)
+            )
+        );
+    }
+
+    #[test]
     fn selected_presentations_redact_text_and_references() {
         let text = PresentationTextFfi::Literal {
             text: "PRIVATE_TITLE".into(),

@@ -232,10 +232,62 @@ mod tests {
             assert_eq!(handle.snapshot().unwrap().rows.len(), expected);
         }
         let window = kit
-            .open_chat_list_window(account, ChatListViewFfi::Chats, None)
+            .open_chat_list_window(account.clone(), ChatListViewFfi::Chats, None)
             .await
             .unwrap();
-        let last = window.snapshot().unwrap();
+        let initial = window.snapshot().unwrap();
+        let anchor_id = initial.rows[1].row.group_id_hex.clone();
+        window
+            .set_visible_anchor(initial.sequence, anchor_id.clone())
+            .await
+            .unwrap();
+        kit.set_group_archived(account.clone(), anchor_id.clone(), true)
+            .await
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let update = window.next().await.unwrap().unwrap();
+                if matches!(update.anchor, ChatListAnchorOutcomeFfi::Recovered { .. }) {
+                    break update;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let ChatListAnchorOutcomeFfi::Recovered {
+            group_id_hex,
+            index,
+        } = &recovered.anchor
+        else {
+            unreachable!()
+        };
+        assert_ne!(group_id_hex, &anchor_id);
+        assert_eq!(
+            &recovered.rows[*index as usize].row.group_id_hex,
+            group_id_hex
+        );
+        assert!(
+            !recovered
+                .rows
+                .iter()
+                .any(|row| row.row.group_id_hex == anchor_id)
+        );
+        for row in &recovered.rows {
+            kit.set_group_archived(account.clone(), row.row.group_id_hex.clone(), true)
+                .await
+                .unwrap();
+        }
+        let last = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let update = window.next().await.unwrap().unwrap();
+                if matches!(update.anchor, ChatListAnchorOutcomeFfi::Reset) {
+                    break update;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(last.rows.is_empty());
         kit.runtime.shutdown_and_close().await.unwrap();
         assert!(window.next().await.unwrap().is_none());
         assert!(attention.next().await.unwrap().is_none());
