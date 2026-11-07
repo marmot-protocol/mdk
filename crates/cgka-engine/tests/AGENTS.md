@@ -167,6 +167,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     and retries the same generation; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
     a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
+  `late_welcome_anchor_failure_restores_complete_join_across_reopen` owns the final joined-anchor write after
+  consumed keys, processed Welcome, dedup, pending GroupJoined and maintenance writes: independent encrypted rows,
+  failure/success reopens, exact same-Welcome retry and durable output all remain atomic.
+
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
     release with `--ignored --nocapture`; it reports timings and never asserts a threshold
