@@ -164,6 +164,14 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
                 serde_json::to_string(&control.tags).unwrap()
             };
             insert_legacy(&conn, &control, &tags);
+            if i == 3 {
+                conn.execute(
+                    "UPDATE app_events SET retention_seconds=10,retention_expires_at=43
+                     WHERE group_id_hex=?1 AND message_id_hex=?2",
+                    params![GROUP, control.message_id_hex],
+                )
+                .unwrap();
+            }
             if absent {
                 conn.execute("UPDATE app_events SET authority_state=1,moderation_grant=0 WHERE group_id_hex=?1 AND message_id_hex=?2",params![GROUP,control.message_id_hex]).unwrap();
             }
@@ -177,6 +185,22 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
             fixtures.push((target, control));
         }
     }
+    let assert_expired_hold = |app: &SqliteAppStorage| {
+        let (body,tags,seconds,expires,pruned): (String,String,Option<i64>,Option<i64>,bool) = app.lock().unwrap().query_row(
+            "SELECT plaintext,tags_json,retention_seconds,retention_expires_at,
+             EXISTS(SELECT 1 FROM content_pruned_controls p WHERE p.group_id_hex=e.group_id_hex AND p.message_id_hex=e.message_id_hex)
+             FROM app_events e WHERE group_id_hex=?1 AND message_id_hex=?2",
+            params![GROUP,fixtures[3].1.message_id_hex],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).unwrap();
+        assert_eq!(body, "");
+        assert_eq!(
+            tags,
+            serde_json::to_string(&vec![vec!["e", fixtures[3].0.message_id_hex.as_str()]]).unwrap()
+        );
+        assert_eq!((seconds, expires, pruned), (None, None, true));
+        assert_deleted(app, &fixtures[3].0, true);
+    };
     {
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = store.app_storage();
@@ -227,10 +251,17 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
             .unwrap();
         app.rebuild_message_timeline_for_group(GROUP).unwrap();
         assert_deleted(&app, &fixtures[3].0, true);
+        // Expiring the UNKNOWN control itself must retain its exact hold and
+        // scrub the original body and optional tags while the target remains.
+        app.secure_prune_expired_app_events(GROUP, 43, "local", &|_, _| false)
+            .unwrap();
+        app.rebuild_message_timeline_for_group(GROUP).unwrap();
+        assert_expired_hold(&app);
     }
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     app.rebuild_message_timeline_for_group(GROUP).unwrap();
+    assert_expired_hold(&app);
     for (i, (target, _)) in fixtures.iter().enumerate() {
         assert_deleted(&app, target, [0, 3, 4, 7, 8].contains(&i));
     }
@@ -240,7 +271,27 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
     // Expiry of a visible UNKNOWN target must not acquire a replay fence.
     app.secure_prune_app_events_before(GROUP, 29, "local", &|_, _| false)
         .unwrap();
+    // The held target's expiry fence must reject redelivery; the visible
+    // UNKNOWN target beside it remains eligible for ordinary redelivery.
+    let replay = app.record_app_event(&fixtures[4].0).unwrap();
+    assert!(replay.messages.is_empty() && replay.changes.is_empty());
+    assert!(
+        app.timeline_message(GROUP, &fixtures[4].0.message_id_hex)
+            .unwrap()
+            .is_none()
+    );
     app.record_app_event(&fixtures[5].0).unwrap();
+    assert_deleted(&app, &fixtures[5].0, false);
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    app.record_app_event(&fixtures[4].0).unwrap();
+    app.rebuild_message_timeline_for_group(GROUP).unwrap();
+    assert!(
+        app.timeline_message(GROUP, &fixtures[4].0.message_id_hex)
+            .unwrap()
+            .is_none()
+    );
     assert_deleted(&app, &fixtures[5].0, false);
 }
 
