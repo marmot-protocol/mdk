@@ -4876,3 +4876,183 @@ async fn advancing_live_epoch_spends_the_retry_budget_once_per_epoch() {
         "the refusal must name the retry budget, not residence or capacity"
     );
 }
+
+/// A completed sweep's generation remains the retry owner if deleting its
+/// barrier fails after recovered content was durably retained (mdk#3074).
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn generation_close_failure_keeps_recovered_content_retryable_after_reopen() {
+    use cgka_traits::message::StoredMessagePayload;
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("generation-close.sqlite");
+    let key = SqlCipherKey::raw([0x74; 32]);
+    let clock = ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let client = build_counting_client_with_storage_and_clock(b"carol", storage, clock.clone());
+    let (mut alice, mut carol, storage, _, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(client).await;
+    let application = send_app(
+        &mut alice,
+        &group_id,
+        "retained through generation close failure",
+    )
+    .await;
+    let expected_payload = app_payload_for(&alice, "retained through generation close failure");
+    let application_id = content_id(&application);
+    let recovered_id = content_id(&commit3);
+    let pending_before = storage.list_pending_application_events().unwrap();
+    for input in [&commit3, &application] {
+        assert!(matches!(
+            carol.ingest(input.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let observer = open_observer();
+    observer
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_generation_close BEFORE DELETE ON cgka_deferred_peel_generations
+         WHEN (SELECT epoch FROM cgka_groups WHERE id = OLD.group_id) = 2
+          AND EXISTS(SELECT 1 FROM cgka_messages WHERE id = X'{}' AND deferred_peel IS NULL)
+         BEGIN SELECT RAISE(ABORT, 'generation-close-fault'); END;",
+            hex::encode(recovered_id.as_slice()),
+        ))
+        .unwrap();
+    carol.ingest(commit2).await.unwrap();
+    // Model a host consuming the existing wake before driving this quantum.
+    carol.drain_pending_convergence_groups();
+    let failed = carol.advance_convergence(&group_id).await;
+    assert!(
+        matches!(&failed, Err(cgka_traits::EngineError::Storage(StorageError::Backend(detail)))
+            if detail.contains("generation-close-fault")),
+        "the completed sweep must surface the actual delete failure: {failed:?}"
+    );
+    assert!(carol.drain_pending_convergence_groups().contains(&group_id));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    let generation = storage
+        .deferred_peel_generation(&group_id)
+        .unwrap()
+        .unwrap();
+    let recovered = storage.get_message(&recovered_id).unwrap();
+    assert_eq!(recovered.state, MessageState::Created);
+    assert_eq!(
+        StoredMessagePayload::decode(&recovered.payload)
+            .unwrap()
+            .as_openmls_wire(),
+        Some(&TransportMessage {
+            id: recovered_id.clone(),
+            ..commit3.clone()
+        })
+    );
+    let held = storage.get_message(&application.id).unwrap();
+    assert_eq!(held.state, MessageState::PeelDeferred);
+    assert_eq!(
+        StoredMessagePayload::decode(&held.payload)
+            .unwrap()
+            .as_raw_transport(),
+        Some(&application)
+    );
+    assert_eq!(
+        storage.list_pending_application_events().unwrap(),
+        pending_before
+    );
+    let mut events = carol.drain_events();
+    assert!(!events.iter().any(|event| matches!(event, GroupEvent::MessageReceived { message_id, .. } if message_id == &application_id)));
+
+    drop(carol);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(
+        storage.deferred_peel_generation(&group_id).unwrap(),
+        Some(generation.clone())
+    );
+    assert_eq!(storage.get_message(&recovered_id).unwrap(), recovered);
+    assert_eq!(storage.get_message(&application.id).unwrap(), held);
+    let (mut carol, storage, _) =
+        build_counting_client_with_storage_and_clock(b"carol", storage, clock);
+    carol.hydrate_all_stored_groups().unwrap();
+    assert!(carol.drain_pending_convergence_groups().contains(&group_id));
+    let failed_again = carol.retry_deferred_peels(&group_id).await;
+    assert!(
+        matches!(&failed_again, Err(cgka_traits::EngineError::Storage(StorageError::Backend(detail)))
+            if detail.contains("generation-close-fault")),
+        "restart must preserve the failed close as retryable: {failed_again:?}"
+    );
+    assert_eq!(
+        storage.deferred_peel_generation(&group_id).unwrap(),
+        Some(generation)
+    );
+    assert_eq!(storage.get_message(&recovered_id).unwrap(), recovered);
+    // With this frozen manual clock, rebasing rewrites the residence deadline
+    // and high-water to the same values; only the incarnation id differs.
+    // The existing residence/restart owner separately covers a moving clock.
+    let rebound = storage.get_message(&application.id).unwrap();
+    let mut expected_held = held.clone();
+    let old_clock = expected_held
+        .deferred_peel
+        .as_ref()
+        .unwrap()
+        .clock_instance_id;
+    let new_clock = rebound.deferred_peel.as_ref().unwrap().clock_instance_id;
+    assert_ne!(new_clock, old_clock);
+    expected_held
+        .deferred_peel
+        .as_mut()
+        .unwrap()
+        .clock_instance_id = new_clock;
+    assert_eq!(rebound, expected_held);
+    let observer = open_observer();
+    observer
+        .execute_batch("DROP TRIGGER fail_generation_close")
+        .unwrap();
+    for _ in 0..8 {
+        carol.advance_convergence(&group_id).await.unwrap();
+        events.extend(carol.drain_events());
+        if carol.epoch(&group_id).unwrap() == EpochId(3)
+            && storage.get_message(&application.id).unwrap().state == MessageState::Processed
+        {
+            break;
+        }
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(storage.deferred_peel_generation(&group_id).unwrap(), None);
+    assert_eq!(
+        storage.get_message(&recovered_id).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(
+        storage.get_message(&application.id).unwrap().state,
+        MessageState::Processed
+    );
+    let durable_events = storage.list_pending_application_events().unwrap();
+    for observed in [&events, &durable_events] {
+        let actual = observed
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived {
+                    message_id,
+                    sender,
+                    payload,
+                    ..
+                } if message_id == &application_id => Some((sender, payload)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![(&alice.self_id(), &expected_payload)]);
+    }
+    assert!(matches!(
+        carol.ingest(application).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+        }
+    ));
+    assert!(carol.drain_events().is_empty());
+}
