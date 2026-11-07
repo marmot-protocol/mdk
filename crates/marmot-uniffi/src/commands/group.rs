@@ -2098,4 +2098,73 @@ mod tests {
         validate_group_image_plaintext(&[0x89, b'P', b'N', b'G'])
             .expect("nonempty image bytes should reach the runtime");
     }
+    #[test]
+    fn initial_group_image_debug_hides_image_bytes_and_source_url() {
+        // A complete 1x1 RGBA8 PNG, matching the native image keeper's format.
+        let image = InitialGroupImageFfi {
+            plaintext: hex::decode("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082").unwrap(),
+            media_type: "image/png".into(),
+            source_url: Some("https://private-source-3049.example/private-source-3049.png".into()),
+            dim: Some("1x1".into()),
+            thumbhash: None,
+        };
+        let debug = format!("{image:?}");
+        for forbidden in ["137, 80, 78, 71", "89504e470d0a1a0a", "private-source-3049"] {
+            assert!(
+                !debug.contains(forbidden),
+                "private image data leaked: {forbidden}"
+            );
+        }
+        assert!(debug.contains("plaintext_len: 70"));
+        assert!(debug.contains("has_source_url: true"));
+        assert!(debug.contains("image/png"));
+        assert!(debug.contains("1x1"));
+    }
+
+    #[test]
+    fn prepared_group_image_host_states_keep_labels_and_group_privacy() {
+        use super::PreparedGroupImageUploadStateFfi as FfiState;
+        use marmot_app::AppPreparedGroupImageUploadState as NativeState;
+
+        // Each row is an independent current snapshot. First-attempt Uploading
+        // retains staged count 0; success or failure gives count 1 and Consumed
+        // retains the successful count. IDs match the current 16-byte hex shape.
+        for (state, expected, attempt_count, error_kind, group_id) in [
+            (NativeState::Staged, FfiState::Staged, 0, None, None),
+            (NativeState::Uploading, FfiState::Uploading, 0, None, None),
+            (NativeState::Uploaded, FfiState::Uploaded, 1, None, None),
+            (
+                NativeState::Failed,
+                FfiState::Failed,
+                1,
+                Some("blob_store"),
+                None,
+            ),
+            (
+                NativeState::Consumed,
+                FfiState::Consumed,
+                1,
+                None,
+                Some("a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"),
+            ),
+        ] {
+            let ffi = PreparedGroupImageUploadFfi::from(marmot_app::AppPreparedGroupImageUpload {
+                upload_id: "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9".into(),
+                state,
+                attempt_count,
+                last_error_kind: error_kind.map(str::to_owned),
+                group_id_hex: group_id.map(str::to_owned),
+            });
+            assert_eq!(ffi.state, expected);
+            if expected == FfiState::Consumed {
+                let debug = format!("{ffi:?}");
+                assert!(!debug.contains("a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"));
+                assert!(debug.contains("has_group_id: true"));
+                // Artifact id and aggregate status are intentionally visible.
+                assert!(debug.contains("b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9"));
+                assert!(debug.contains("Consumed"));
+                assert!(debug.contains("attempt_count: 1"));
+            }
+        }
+    }
 }
