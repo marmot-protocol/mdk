@@ -1609,3 +1609,6 @@ async fn a_superseded_account_entry_replacement_the_winner_changed_is_a_conflict
         roster_of(&winner, &gid).account
     );
 }
+
+#[path = "device_roster/replay_backend.rs"]
+mod replay_backend;

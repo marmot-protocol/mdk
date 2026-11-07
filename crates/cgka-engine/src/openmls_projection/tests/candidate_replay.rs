@@ -2608,3 +2608,6 @@ async fn uncontested_peel_skips_replay_state_fingerprint() {
         0
     );
 }
+
+#[path = "candidate_replay/read_faults.rs"]
+mod read_faults;

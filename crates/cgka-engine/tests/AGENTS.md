@@ -265,6 +265,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     the same rules for the account entry (`AccountEntryChanged`), and a send of one is refused rather than queued
     while the group settles or behind a queued intent (`AccountEntryUnsettled`). The
     `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
+    Its `device_roster/replay_backend.rs` child owns apply-only departure-record backend classification, complete native/protocol
+    rollback with explicit pass retry progress, and encrypted reopen with the same retained Commit (#3171).
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)
   - **Owns:** The link Commit (mdk#2628 item 3.3b), `LinkDevice`: one privileged admin Commit that adds the linked

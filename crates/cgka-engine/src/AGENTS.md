@@ -15,6 +15,8 @@ Source-local rules. The full module map, invariants, and design notes are in [`.
   test filters work. Its missing-own-checkpoint halt owner also preserves exact authenticated stale-commit drops below
   the retained anchor through both Syncing and Blocked sliced results. Encrypted-database process-kill checks stay in
   `../tests/crash_recovery_sqlite.rs`.
+  Its `candidate_replay/read_faults.rs` child owns the initial/checkpoint/post-replay native reads and added-profile lookup
+  categories with exact backend faults (#3171); direct wrapper owners do not imply public candidate-retention proof.
 - `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan measurement and a
   test-only visited-row counter; keep aggregate measurements separate from app acceptance.
 - `mls_group_cache.rs::tests` proves cache coherence with public context epochs and real local rollback / independent
