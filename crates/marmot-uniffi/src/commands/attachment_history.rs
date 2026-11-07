@@ -475,6 +475,30 @@ mod tests {
         );
         let full = RetainedAttachmentsPageFfi::new(captured[..2].to_vec(), 2);
         assert_eq!(full.attachments.len(), 2);
+        let expected_targets: Vec<_> = captured[..2]
+            .iter()
+            .map(|entry| {
+                (
+                    entry.target.message_id_hex.clone(),
+                    entry.target.source_message_id_hex.clone(),
+                    entry.target.attachment_index,
+                )
+            })
+            .collect();
+        assert_ne!(expected_targets[0], expected_targets[1]);
+        assert_eq!(
+            full.attachments
+                .iter()
+                .map(|entry| (
+                    entry.target.message_id_hex.clone(),
+                    entry.target.source_message_id_hex.clone(),
+                    entry.target.attachment_index,
+                ))
+                .collect::<Vec<_>>(),
+            expected_targets,
+            "retained summary order and original source slots must survive the bridge"
+        );
+        assert!(full.attachments.iter().all(|entry| entry.byte_count == 18));
         let cursor = full
             .next_cursor
             .expect("a full retained page must continue");
@@ -482,6 +506,14 @@ mod tests {
         assert_ne!(cursor.inner, captured[0].cursor);
         let short = RetainedAttachmentsPageFfi::new(vec![captured[1].clone()], 2);
         assert_eq!(short.attachments.len(), 1);
+        assert_eq!(
+            (
+                short.attachments[0].target.message_id_hex.clone(),
+                short.attachments[0].target.source_message_id_hex.clone(),
+                short.attachments[0].target.attachment_index
+            ),
+            expected_targets[1]
+        );
         assert!(short.next_cursor.is_none());
         assert!(matches!(
             kit.attachment_history_page(
