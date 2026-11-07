@@ -2680,6 +2680,299 @@ fn test_chat_subscription(account_id: &str, include_archived: bool) -> ChatSubsc
     }
 }
 
+#[cfg(unix)]
+fn stream_recording_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+    let exe = dir.join("wn-stream");
+    let calls = dir.join("calls");
+    std::fs::create_dir(&calls).unwrap();
+    write_fake_wn(
+        &exe,
+        &format!(
+            "#!/bin/sh\nset -e\nn=0\nwhile ! mkdir '{}/'$n 2>/dev/null; do [ -d '{}' ] || exit 1; n=$((n + 1)); done\nprintf '%s\\n' \"$@\" > '{}/'$n/args.tmp\nmv '{}/'$n/args.tmp '{}/'$n/args\ncat <<'JSON'\n{response}\nJSON\n",
+            calls.display(),
+            calls.display(),
+            calls.display(),
+            calls.display(),
+            calls.display(),
+        ),
+    );
+    (exe, calls)
+}
+
+#[cfg(unix)]
+fn stream_recorded_calls(dir: &std::path::Path) -> Vec<Vec<String>> {
+    let mut calls = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let order = entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let args = std::fs::read_to_string(entry.path().join("args"))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            (order, args)
+        })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(order, _)| *order);
+    calls.into_iter().map(|(_, args)| args).collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_slash_controls_forward_options_and_report_the_command_reply() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let stream = "bb".repeat(32);
+    let digest = "ee".repeat(32);
+    for (input, command, selected_owner, status) in [
+        (
+            format!("/stream start --stream-id {stream} --quic-candidate quic://127.0.0.1:4451"),
+            vec![
+                "stream".into(),
+                "start".into(),
+                group.clone(),
+                "--stream-id".into(),
+                stream.clone(),
+                "--quic-candidate".into(),
+                "quic://127.0.0.1:4451".into(),
+            ],
+            true,
+            "started stream ddddddd...dddddddd; published=2",
+        ),
+        (
+            format!("/stream watch --stream-id {stream} --insecure-local"),
+            vec![
+                "stream".into(),
+                "watch".into(),
+                group.clone(),
+                "--background".into(),
+                "--stream-id".into(),
+                stream.clone(),
+                "--insecure-local".into(),
+            ],
+            true,
+            "watching stream returned-watch",
+        ),
+        (
+            format!("/stream finish {stream} {digest} 2 finished text"),
+            vec![
+                "stream".into(),
+                "finish".into(),
+                group.clone(),
+                "--stream-id".into(),
+                stream.clone(),
+                "--transcript-hash".into(),
+                digest.clone(),
+                "--chunk-count".into(),
+                "2".into(),
+                "finished text".into(),
+            ],
+            true,
+            "finished stream bbbbbbb...bbbbbbbb; published=2",
+        ),
+        (
+            format!("/stream verify {stream} {digest} 2"),
+            vec![
+                "stream".into(),
+                "verify".into(),
+                group.clone(),
+                "--stream-id".into(),
+                stream.clone(),
+                "--transcript-hash".into(),
+                digest.clone(),
+                "--chunk-count".into(),
+                "2".into(),
+            ],
+            true,
+            "stream bbbbbbb...bbbbbbbb verified=true",
+        ),
+        (
+            format!("/stream verify {stream} {digest}"),
+            vec![
+                "stream".into(),
+                "verify".into(),
+                group.clone(),
+                "--stream-id".into(),
+                stream.clone(),
+                "--transcript-hash".into(),
+                digest.clone(),
+            ],
+            true,
+            "stream bbbbbbb...bbbbbbbb verified=true",
+        ),
+        (
+            "/stream status".to_owned(),
+            vec!["daemon".into(), "status".into()],
+            false,
+            "streams: running=1 completed=0 failed=0 latest=bbbbbbb...bbbbbbbb",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({"ok":true,"result":{
+            "stream_id":"dd".repeat(32),"published":2,"watch_id":"returned-watch",
+            "verified":true,"running":!selected_owner,"messages":[],"has_more_before":false,
+            "stream_watches":if selected_owner {serde_json::json!([])} else {serde_json::json!([
+                {"watch_id":"returned-watch","group_id":group,"stream_id":stream,"status":"running"}
+            ])}
+        }})
+        .to_string();
+        let (exe, args) = stream_recording_executable(dir.path(), &response);
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &account,
+        );
+        app.daemon.running = false;
+        app.chats = vec![flick_chat(&group, "Selected room")];
+        app.messages_account_id = Some("ff".repeat(32));
+        app.messages_group_id = Some("ff".repeat(16));
+        if !selected_owner {
+            // Global daemon status is also available to a public-only account
+            // with no chat; it must not acquire account-specific subscriptions.
+            app.accounts[0].local_signing = false;
+            app.chats.clear();
+            app.messages_account_id = None;
+            app.messages_group_id = None;
+        }
+        app.input.set_value(&input);
+        app.submit_input().expect("dispatch stream control");
+        assert_eq!(app.status, status, "{input}");
+        assert!(app.input.is_empty());
+        finish_queued_effects(&mut app);
+        // Timeline folding queues diagnostics and mark-read behind the first
+        // marker. Fence those children before reading or removing their files.
+        finish_queued_effects(&mut app);
+        let recorded = stream_recorded_calls(&args);
+        let mut expected: Vec<String> = vec!["--json".into()];
+        if selected_owner {
+            expected.extend(["--account".into(), account.clone()]);
+        }
+        expected.extend(command);
+        assert_eq!(recorded[0], expected, "{input}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_composition_adopts_the_returned_id_and_finishes_or_cancels_typed_text() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let requested_stream = "bb".repeat(32);
+    let returned_stream = "dd".repeat(32);
+    for finish in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({"ok":true,"result":{
+            "stream_id":returned_stream,"chunk_count":7,"running":false,
+            "messages":[],"has_more_before":false
+        }})
+        .to_string();
+        let (exe, args) = stream_recording_executable(dir.path(), &response);
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &account,
+        );
+        app.daemon.running = false;
+        app.chats = vec![flick_chat(&group, "Selected room")];
+        app.input.set_value(format!("/stream --stream-id {requested_stream} --quic-candidate quic://127.0.0.1:4451 --quic-candidate quic://192.0.2.1:4451"));
+        app.submit_input().expect("open stream composer");
+        assert_eq!(
+            app.status,
+            "now streaming ddddddd...dddddddd; type text and press Enter to finish"
+        );
+        assert!(app.input.is_empty());
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        for ch in "hello world".chars() {
+            app.handle_key(char_key(ch)).unwrap();
+        }
+        let pending = app.streaming.as_ref().unwrap();
+        assert_eq!(
+            (
+                &pending.stream_id,
+                &pending.group_id,
+                pending.pending_text.as_str()
+            ),
+            (&returned_stream, &group, "hello world")
+        );
+        assert_eq!(app.live_stream_previews[0].text, "hello world");
+        let due = pending.last_flush + STREAM_APPEND_FLUSH_INTERVAL + Duration::from_millis(1);
+        assert!(app.flush_stream_append_if_due(due).expect("flush text"));
+        assert_eq!(app.streaming.as_ref().unwrap().pending_text, "");
+        assert_eq!(app.streaming.as_ref().unwrap().flushed_bytes, 11);
+        assert_eq!(app.status, "streaming 11 bytes on ddddddd...dddddddd");
+        app.handle_key(KeyEvent::new(
+            if finish { KeyCode::Enter } else { KeyCode::Esc },
+            KeyModifiers::NONE,
+        ))
+        .unwrap();
+        assert!(app.streaming.is_none());
+        assert!(app.input.is_empty());
+        assert!(app.live_stream_previews.is_empty());
+        assert_eq!(
+            app.status,
+            if finish {
+                "finished stream ddddddd...dddddddd chunks=7"
+            } else {
+                "cancelled stream ddddddd...dddddddd"
+            }
+        );
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        let calls = stream_recorded_calls(&args)
+            .into_iter()
+            .filter(|args| args.iter().any(|arg| arg == "stream"))
+            .collect::<Vec<_>>();
+        let prefix = vec!["--json".to_owned(), "--account".to_owned(), account.clone()];
+        let mut expected = vec![
+            vec![
+                "stream".into(),
+                "compose-open".into(),
+                group.clone(),
+                "--insecure-local".into(),
+                "--stream-id".into(),
+                requested_stream.clone(),
+                "--quic-candidate".into(),
+                "quic://127.0.0.1:4451".into(),
+                "--quic-candidate".into(),
+                "quic://192.0.2.1:4451".into(),
+            ],
+            vec![
+                "stream".into(),
+                "compose-append".into(),
+                "--stream-id".into(),
+                returned_stream.clone(),
+                "hello world".into(),
+            ],
+            vec![
+                "stream".into(),
+                if finish {
+                    "compose-finish"
+                } else {
+                    "compose-cancel"
+                }
+                .into(),
+                "--stream-id".into(),
+                returned_stream.clone(),
+            ],
+        ];
+        for call in &mut expected {
+            call.splice(0..0, prefix.clone());
+        }
+        assert_eq!(calls, expected);
+    }
+}
+
 #[test]
 fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
     // Regression for mdk#197: automatic stream-append retries come from
@@ -2717,6 +3010,25 @@ fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
     let streaming = app.streaming.as_ref().expect("composer remains active");
     assert_eq!(streaming.pending_text, "queued");
     assert_eq!(streaming.last_flush, retry_gate);
+
+    #[cfg(unix)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (exe, args) = test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+        app.client.exe = exe;
+        assert!(
+            app.flush_stream_append_if_due(retry_gate + STREAM_APPEND_FLUSH_INTERVAL)
+                .unwrap()
+        );
+        let streaming = app.streaming.as_ref().unwrap();
+        assert_eq!(streaming.pending_text, "");
+        assert_eq!(streaming.flushed_bytes, 6);
+        assert_eq!(app.status, "streaming 6 bytes on stream-197");
+        let recorded = std::fs::read_to_string(args).unwrap();
+        let requested = recorded.lines().next().unwrap();
+        assert!(requested.ends_with("stream compose-append --stream-id stream-197 queued"));
+        assert!(requested.contains(&format!("--account {account_id}")));
+    }
 }
 
 #[test]
