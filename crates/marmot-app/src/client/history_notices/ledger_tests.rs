@@ -11,11 +11,10 @@ use std::sync::Arc;
 
 use cgka_traits::GroupId;
 use storage_sqlite::{
-    RecoveryCause, RecoveryDemandTicket, RecoveryUnitOutcome, RecoveryUnitState, SqliteAppStorage,
+    RecoveryDemandTicket, RecoveryUnitOutcome, RecoveryUnitState, SqliteAppStorage,
     TransportReconciliationRoute,
 };
 
-use super::park_recovery_for_test;
 use crate::client::recovery_runner::{RecoveryRunnerPolicy, UnitKey};
 use crate::history_notices::{decode_notice_id, encode_notice_id, ledger_route_tag};
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
@@ -585,16 +584,21 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     let (mut client, app, group, route) = fixture(&dir).await;
     client.take_history_notice_changes();
     park(&app, &route);
-    app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
-    let loss = app
-        .pending_recovery_demands()
-        .unwrap()
-        .into_iter()
-        .find(|demand| demand.cause == RecoveryCause::QueueLoss)
-        .unwrap()
-        .ticket
-        .id;
-    park_recovery_for_test(&client.app.account_storage("alice").unwrap(), loss);
+    // The old owner's parked account-wide queue loss, imported evidence and
+    // all, as a build from before the conversion leaves it.
+    let now = crate::unix_now_seconds();
+    app.execute_batch_for_test(&format!(
+        "INSERT INTO account_delivery_loss_evidence (account_label, cause, marker_token,
+             pending_since, dropped_count, imported_count, bound_state, route_state)
+         VALUES ('alice', 0, 42, {now}, 1, 1, 2, 0);
+         INSERT INTO account_recovery_obligations (id, demand_key, cause, account_label,
+             marker_token, pending_since, dropped_count, created_at_ms, updated_at_ms,
+             eligibility, parked_at_ms)
+         VALUES (x'{id}', 'overflow:alice', 0, 'alice', 42, {now}, 1, {ms}, {ms}, 4, {ms});",
+        id = "42".repeat(16),
+        ms = now * 1000,
+    ))
+    .unwrap();
     assert_eq!(
         client.take_history_notice_changes(),
         Some(vec![group.clone()]),

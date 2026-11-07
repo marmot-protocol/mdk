@@ -1359,20 +1359,15 @@ impl AppClient {
         let state_persist = |summary: SyncSummary, error| {
             ClassifiedSyncFailure::at_stage(summary, error, SyncFailureStage::StatePersist)
         };
-        // A startup or explicit sync records its comparison request and, with
-        // recovery debt some relay can serve, flushes recovery observations.
-        // The recovery runner owns the fetch (mdk#2660 phase 4).
-        if self.app.cursor_persistence() == CursorPersistence::Advance && (explicit || startup) {
-            if let Err(error) = self.request_sync_comparison(telemetry, explicit) {
-                return Err(state_persist(summary, error));
-            }
-            let pending = match self.recovery_pending() {
-                Ok(pending) => pending && self.recovery_endpoints_admitted(),
-                Err(error) => return Err(state_persist(summary, error)),
-            };
-            if pending && let Err(error) = self.refresh_account_recovery().await {
-                return Err(state_persist(summary, error));
-            }
+        // A startup or explicit sync, with some relay recovery may contact,
+        // flushes recovery observations. The recovery runner owns the fetch
+        // (mdk#2660 phase 4).
+        if self.app.cursor_persistence() == CursorPersistence::Advance
+            && (explicit || startup)
+            && self.recovery_endpoints_admitted()
+            && let Err(error) = self.refresh_account_recovery().await
+        {
+            return Err(state_persist(summary, error));
         }
         // A directly owned client also runs its recovery runner in place for
         // one pass (mdk#2660).
@@ -1451,31 +1446,10 @@ impl AppClient {
         Ok(refresh.routing_changed)
     }
 
-    /// Record a startup comparison request, then flush recovery observations
-    /// (see [`Self::refresh_account_recovery`]).
-    pub(crate) async fn prepare_startup_recovery(
-        &mut self,
-        telemetry: Option<&PerformanceRecorder>,
-    ) -> Result<(), AppError> {
-        self.request_sync_comparison(telemetry, false)?;
+    /// Flush recovery observations before the worker's first sync (see
+    /// [`Self::refresh_account_recovery`]).
+    pub(crate) async fn prepare_startup_recovery(&mut self) -> Result<(), AppError> {
         self.refresh_account_recovery().await
-    }
-
-    /// Record a startup or explicit caller's comparison request.
-    fn request_sync_comparison(
-        &mut self,
-        telemetry: Option<&PerformanceRecorder>,
-        explicit: bool,
-    ) -> Result<(), AppError> {
-        if self.app.cursor_persistence() == CursorPersistence::Advance
-            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
-        {
-            self.request_bounded_comparison()?;
-            if !explicit {
-                self.comparison_startup_requested = true;
-            }
-        }
-        Ok(())
     }
 
     /// Install the session's live subscriptions, floored at the cursor. This
@@ -2484,9 +2458,9 @@ impl AppClient {
                     return Ok(transport_nostr::AccountDeliveryReceive::Overflow(loss));
                 }
             }
-            // Spilled rows that became queue loss are already durable and
-            // fence the cursor. Report them as an overflow, so every caller
-            // starts the same recovery it runs for a router omission.
+            // Spilled rows that became queue loss are already ledger debt.
+            // Report them as an overflow, so every caller starts the same
+            // recovery it runs for a router omission.
             if self.delivery_spill.take_recorded_loss() {
                 return Ok(transport_nostr::AccountDeliveryReceive::Overflow(
                     transport_nostr::AccountDeliveryOverflow {
@@ -4491,27 +4465,28 @@ impl AppClient {
     }
 
     /// Whether recovery debt or a buffered recovery observation is pending.
-    pub(crate) fn recovery_pending(&self) -> Result<bool, AppError> {
+    fn recovery_pending(&self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         Ok(!self.pending_recovery_arm_writes.is_empty()
             || !self.pending_recovery_capacity_writes.is_empty()
-            || !storage.pending_recovery_demands()?.is_empty()
-            || storage.recovery_comparison()?.pending())
+            || !storage.pending_recovery_demands()?.is_empty())
     }
 
-    /// The recovery seam of the receive path and the worker: with recovery
-    /// debt pending, flush recovery observations (see
-    /// [`Self::refresh_account_recovery`]) and report it `Deferred` to the
-    /// recovery runner, which owns every history fetch (mdk#2660 phase 4).
+    /// The recovery seam of the receive path and the worker: flush recovery
+    /// observations (see [`Self::refresh_account_recovery`]), and report
+    /// pending recovery debt `Deferred` to the recovery runner, which owns
+    /// every history fetch (mdk#2660 phase 4). The flush runs at every seam,
+    /// debt or not: it imports new loss into the ledger and wakes the runner.
     pub(crate) async fn refresh_pending_recovery(
         &mut self,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         self.drop_settled_epoch_backfill_intents();
-        if !self.recovery_pending()? {
-            return Ok(EpochBackfillRunOutcome::NotPending);
-        }
         self.refresh_account_recovery().await?;
-        Ok(EpochBackfillRunOutcome::Deferred)
+        Ok(if self.recovery_pending()? {
+            EpochBackfillRunOutcome::Deferred
+        } else {
+            EpochBackfillRunOutcome::NotPending
+        })
     }
 
     /// Explicit account-wide repair for a host that has independent evidence
@@ -4673,12 +4648,6 @@ impl AppClient {
         let mut summary = self
             .finish_scheduled_convergence_effects(group_id, &effects)
             .await?;
-        // This seam follows an actual engine evaluation. Projection-only
-        // replays of an effects batch must not allocate observation identities.
-        if let Err(error) = self.observe_qualified_local_stagnation(group_id) {
-            tracing::warn!(target: "marmot_app::recovery", method = "observe_qualified_local_stagnation",
-                error_kind=error.privacy_safe_kind(), "qualified local observation remains uncounted");
-        }
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -7449,8 +7418,7 @@ pub(crate) fn epoch_stall_now_ms() -> u64 {
 mod tests {
     use super::{incomplete_full_history_repair, transport_reconciliation_record};
     use crate::tests::{
-        ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
-        client_on_app_relay_plane, make_group_terminal,
+        ScriptedPushRelayClient, armed_group_ids, client_on_app_relay_plane, make_group_terminal,
     };
     use crate::{MarmotApp, SyncFailureStage, SyncSummary};
     use marmot_account::AccountHome;
@@ -7589,7 +7557,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example",
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
+            crate::MarmotAppConfig::white_noise(),
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7914,7 +7882,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://backfill.example",
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
+            crate::MarmotAppConfig::white_noise(),
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -8301,7 +8269,7 @@ mod tests {
             let (app, mut client, route) = crate::tests::undecryptable_probe_route(
                 &dir,
                 &relay,
-                bounded_epoch_backfill_config(),
+                crate::MarmotAppConfig::white_noise(),
             )
             .await;
             let group = route.group_id.clone();

@@ -213,8 +213,15 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
     let fixture = fixture().await;
     let app = fixture.storage.app_storage();
     let floor = unix_now_seconds().saturating_sub(30);
-    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
-        .unwrap();
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        storage_sqlite::RecoveryLossCause::Queue,
+        41,
+        3,
+        unix_now_seconds(),
+        Some(floor),
+    )
+    .unwrap();
     fixture.client.synchronize_recovery_loss(&app).unwrap();
     for route in routes(&fixture.client) {
         assert!(

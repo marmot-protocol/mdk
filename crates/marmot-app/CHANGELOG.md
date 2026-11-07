@@ -129,6 +129,9 @@
 
 ### Breaking changes
 
+- Remove `MarmotAppConfig::dev_epoch_backfill_retry_backoff_ms` and its builder, which paced the deleted old
+  recovery owner's retries (mdk#2660). No binding exposed it.
+
 - Remove the `first`/`last` storage cursor fields from `ChatListWindowSnapshot` (mdk#2983). No binding exposed them and
   no command consumed them; a window keeps its place by anchor chat ID.
 

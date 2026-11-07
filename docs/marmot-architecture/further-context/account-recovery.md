@@ -105,6 +105,11 @@ The simulator comes first; Jeff validates on a phone.
      open and a route-policy change keep both the count and a goal this cap parked; new
      loss or epoch evidence gets it one more attempt. Hitting the cap is logged as its own
      `park_capped_recovery` warning.
+   - **Superseded (mdk#2660 rows 9–10).** The quiet and unserved budgets, the attempt cap and
+     the retry pacing above were the old owner's park rules and are deleted with it. The
+     recovery runner breaks a (route, relay) unit after six answers without progress and parks
+     its debt behind a notice (A19), and parks an epoch gap after six unsuccessful return
+     visits (design section 9). Conversion still reads the parks the old rules left.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotDeployment::recovery_operated_relays`
@@ -118,10 +123,10 @@ The simulator comes first; Jeff validates on a phone.
    the route policy, so changing it rebuilds every pending scope. An empty required set
    never certifies a scope. A required relay that does not support NIP-77 cannot certify its
    scope, so the scope never completes on the relays that do.
-   Acquisition keeps admitting what the supporting relays still hold. The decision 1
-   budget applies unchanged: the obligation parks after three completed attempts in a row
-   that admit nothing new and certify nothing, and an attempt that admits a batch resets
-   that streak. It neither waits indefinitely nor completes vacuously. Nothing
+   Acquisition keeps admitting what the supporting relays still hold. The runner's unit
+   budget applies (decision 1 records the old owner's, now deleted): a unit breaks after six
+   answers in a row that cover nothing new, and an answer that covers new seconds starts the
+   count over. It neither waits indefinitely nor completes vacuously. Nothing
    closes a parked scope without qualified coverage and durable admission. EOSE from an
    unfloored replay is not enough, because the SDK can suppress an event it saw but the
    account never admitted, and an unreachable required relay proves nothing. The only
@@ -139,8 +144,7 @@ The simulator comes first; Jeff validates on a phone.
 > and the cursor seal below remain. Conversion deletes every `SubscriptionReplay` obligation
 > before the first subscription, and nothing makes new ones, so rebuilt REQs ask from the
 > transport cursor less the rebuild lookback alone (#2793). Row 8 of mdk#2660 deleted the
-> adapter's own capture and pager; the remaining `SubscriptionReplay` storage has no production
-> writer and goes with the other data-dead leftovers.
+> adapter's own capture and pager, and rows 9–10 the `SubscriptionReplay` storage.
 
 `SubscriptionReplay` records the original live inbox and group query windows. It is not a loss charge.
 Unresolved floors survive cancellation, source replacement and reopen; an unfloored query stays unfloored.
@@ -372,6 +376,13 @@ window is cheap once we are caught up.
 
 ### 4. Parked history is a notice the user can dismiss
 
+> **Superseded in part (mdk#2660 rows 9–10).** Conversion turns loss, incremental and explicit
+> obligations into ledger debt, so only epoch gaps the runner's visit budget exhausted, and
+> maintenance or known-event parks an upgrade kept, still park as obligations. Their notices
+> and dismissal work as below. The loss and incremental-history notices, the cursor-fence
+> release on dismissal and the remembered incremental dismissal are deleted; the ledger's
+> `UnprovenHistory` notices (section 9) replace them.
+
 Decided with Jeff: parked history is shown to the user as "history may be incomplete",
 and the user can dismiss a particular occurrence durably. That dismissal is decision 3's
 explicit user-authorized retirement, recorded as its own outcome, never as coverage.
@@ -521,10 +532,16 @@ is usually right after the save it arrived during, because both use the account 
 No design with a router that never blocks can close it: a delivery can arrive at the
 instant a raised cursor commits, and making it durable takes its own write. It is the same
 hand-off window the overflow tier has. The fence holds every later commit until the write
-settles, and the startup comparison over the retained window still finds what a stop there
-would lose.
+settles. No live boundary is written while a spill hand-off is pending, so the runner's
+standing goal still owes what a stop there would lose.
 
 ### 7. Coverage ledger (shadow mode)
+
+> **Superseded in part.** The recovery runner owns this ledger (section 9). The shadow report
+> below is deleted (mdk#2660 5g), and so are the account-wide loss revision and import stamps
+> that let it compare scopes, loss acknowledgment and the legacy clear's restore (rows 9–10).
+> A loss import un-covers a routed generation on its routes and any other generation on every
+> route, as the table says; nothing reads a loss revision any more.
 
 mdk#2660 replaces the obligations with a coverage ledger. Phase 2 adds the ledger beside
 them without changing behavior. Storage keeps, per route (the inbox or a group's transport
@@ -538,7 +555,7 @@ in `marmot-app` fills it from facts the owner already has:
 | A route becomes current, including a group join or route addition | At the runner's routing-change settlement, before its next debt read, current routes' goals widen to their standing floors. Existing wider goals and durable coverage stay intact |
 | A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing, unless the wire showed its relay sent no EVENT frame before EOSE, and then it proves from the REQ's `since`. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
-| A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
+| A loss import charged a generation, including a notification lag that charges no count | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
 | A receipt was released for replay | In the release's transaction, its event's second is un-covered on each route its inventory row placed it on, and that route's goal widens to it. A second below the retained window is owed nowhere, so that release changes nothing in the ledger: its coverage stays until pruning drops it. The REQ that delivered the event will not deliver it again, so only a comparison on a relay covers that second there again; live boundaries never cover it, until retention pruning passes it. A release with no inventory row changes nothing here; the epoch gap it arms keeps that debt |
 | A pending queue or notification loss | Each scope's route goal widens to the scope's floor, restoring a goal the best-effort write lost |
 | A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
@@ -573,8 +590,7 @@ same counter as unit parks. It is never fetched and never coverage, and only a d
 it. A route's notice revision is the newest among its broken units' parks and its remainder, so
 dismissing the notice clears both. Each prune also settles every route below its floor: a later
 prune parks only from there up, because it no longer holds the coverage below. Widening a goal
-back below that floor, as the shadow report does each time for pending loss, therefore parks
-nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
+back below that floor therefore parks nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
 to its own. Pre-conversion shadow mode performed no sweeps, so routes could accumulate
 remainders without an acquisition attempt. Ownership conversion discards that shadow evidence
 and rebuilds authoritative debt from retained obligations and current route floors.
@@ -621,7 +637,7 @@ was down stays owed. It starts past the oldest event returned when that is newer
 at the relay's limit may have left out what it stored after the request), and past the newest
 second released on its route. Debt that drives work reads the ledger only up to the
 second before a route's tail on a relay (`LiveTails::owed_until`, refreshed by
-`AppClient::live_tails` on every call), and so does the shadow report.
+`AppClient::live_tails` on every call).
 
 A tail stands only on positive evidence read when it is asked for: the account's relay client
 must report the relay connected, on the same connection the generation's serial started on.
@@ -686,6 +702,10 @@ grant reads that generation when it is selected, before anything is frozen or fe
 certificates leave out every range un-covered on their routes since, so a loss or release that
 lands mid-pass keeps its debt while the rest of the window stays proved. The log keeps an hour
 and at most 4,096 rows; a pass from before the oldest pruned row records nothing.
+
+> **Deleted.** The shadow report this paragraph and the list after it describe went in mdk#2660
+> 5g, and its loss stamps and acknowledgment in rows 9–10. Kept as the record of what phase 2
+> measured.
 
 At settlement the recorder compares the ledger with every pending obligation's scopes and logs
 aggregate counts: scopes owed or proved by both, scopes the obligation still owes that the
@@ -1078,15 +1098,33 @@ the old owner):
   old-owner build (623500b48). Conversion stays owned by the storage tests over released
   fixtures and by a marmot-app reopen over a rewound conversion marker, which converts an old
   queue loss before the runner's first attempt and has the runner cover it.
+- The old owner's execution storage (rows 9–10): the startup comparison slot
+  (`request_bounded_comparison`, its waiters and `RecoveryRequest`), qualified-stagnation
+  escalation and its stall samples, account-wide retry pacing and reservations with
+  `dev_epoch_backfill_retry_backoff_ms`, the scope plans, checkpoints and streaks and the
+  attempt cap that parked on them (A18's quiet and unserved budgets), the global loss revision
+  and its import stamps, loss acknowledgment and reach-after, the legacy delivery-loss APIs,
+  the obligation status and transition reads, and the loss and incremental notice branches.
+  A discarded spill row now records loss evidence only, and the worker imports it into the
+  ledger as it does overflow. The recovery seams refresh on every call, which is what the
+  slot, never settled by anything, already made them do.
 
 Still to delete:
 
-- Old-owner paths no current data reaches: the comparison slot `request_bounded_comparison`
-  still joins, qualified-stagnation escalation, capacity-wait eligibility, legacy obligation
-  notices, and the storage and adapter APIs only the old owner called.
-- Data-dead APIs no production code calls since row 8: the storage `SubscriptionReplay` APIs
-  and their test-only writer, the maintenance REQ API (`install_group_maintenance_*`), and the
-  window acquisition scopes (`AccountInboxWindow`, `GroupWindow`, `GroupsWindow`).
+- Capacity-wait eligibility (`record_recovery_capacity_pressure`,
+  `release_due_recovery_capacity_probes`) and the route-policy snapshot that is all that
+  releases it, with the attempt cap's guard (A18) that keeps a capped park through a route
+  change. Under the runner a capacity-pressured epoch gap waits for a route change, a released
+  receipt or a higher epoch; this waits on a decision.
+- The epoch-stall detector's fruitless-completion count and its threshold (A10): nothing has
+  produced a count since the stall samples went, so only evidence a 0.14.0 process persisted
+  can restore one.
+- An epoch gap the old owner certified (state 1) while the engine stayed stalled: the runner
+  reads only pending rows, so it never revisits one, and a same-epoch re-arm does not reopen
+  it.
+- Data-dead APIs no production code calls since row 8: the maintenance REQ API
+  (`install_group_maintenance_*`) and the window acquisition scopes (`AccountInboxWindow`,
+  `GroupWindow`, `GroupsWindow`). The storage `SubscriptionReplay` APIs went in rows 9–10.
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -1094,8 +1132,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 
 ## Kept
 
-- The durable owner, obligations, retry pacing across restarts, and revision checks
-  (simplified where they become unnecessary).
+- The epoch-gap obligations the runner serves, the old rows conversion still reads, and
+  their revision checks. Retry state is the runner's, per (route, relay) unit (section 8).
 - The process credit pool.
 - Serialized admission on the worker.
 - Per-account SDK clients (#2009) and directory isolation (#2005).
@@ -1200,7 +1238,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   separate loss evidence. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
-  startup comparison. Routing is by content, so the router cannot tell an unfloored
+  runner sweeps the standing goal. Routing is by content, so the router cannot tell an unfloored
   maintenance or prior-route replay from a floored REQ: such a replay's events above the
   settled floor go to the spill too, which costs spill writes (seen events are discarded
   before they use capacity) but loses nothing. Source generations include newly issued

@@ -755,7 +755,6 @@ pub struct AppClient {
     /// A worker account's runner is the worker's own task, so its client's
     /// seat stays empty.
     pub(crate) recovery_runner: recovery_runner::host::RunnerSeat,
-    pub(super) comparison_startup_requested: bool,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<PerformanceRecorder>,
     pub(crate) send_telemetry: Option<PerformanceRecorder>,

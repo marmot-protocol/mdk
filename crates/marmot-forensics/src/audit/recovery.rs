@@ -103,8 +103,8 @@ pub enum RecoveryAttemptScope {
     Mixed,
 }
 
-/// How one finished pass ended, from the owner's settlement. The first three
-/// are `storage_sqlite::RecoveryPassProgress` aggregated over every compared
+/// How one finished pass ended, from the old recovery owner's settlement. The
+/// first three are its per-scope progress aggregated over every compared
 /// scope; the rest are how the pass stopped short of a full settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,8 +130,8 @@ pub enum RecoveryPassOutcome {
     Failed,
 }
 
-/// One compared scope's progress in a pass, the owner's
-/// `storage_sqlite::RecoveryPassProgress`.
+/// One compared scope's progress in a pass, as the old recovery owner
+/// settled it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryScopeProgress {

@@ -1,8 +1,11 @@
-//! Account-private recovery demand. The worker owns demand and completion;
-//! the narrow loss writer may only append monotonically increasing evidence.
-mod comparison;
-pub use comparison::{RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan};
+//! The old recovery owner's account-private tables (mdk#2660 phase 4). The
+//! account-open conversion reads them, the recovery runner serves the
+//! epoch-gap obligations that stay, and the narrow loss writer appends
+//! monotonically increasing evidence that the runner imports into the
+//! coverage ledger.
 mod convert;
+#[cfg(test)]
+pub(crate) use convert::{finish_conversion_for_test, import_loss_for_test};
 #[cfg(test)]
 mod convert_tests;
 pub use convert::{
@@ -10,31 +13,17 @@ pub use convert::{
     RecoveryConvertedLoss, RecoveryConvertedObligations,
 };
 mod demand;
-pub use demand::{
-    RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
-};
+pub use demand::{RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate};
 mod loss;
 mod notice;
-mod observe;
 mod plan;
-#[cfg(test)]
-mod replay_tests;
-mod stall;
 pub use loss::{
     MAX_LOSS_ROUTES, RecoveryLossCause, RecoveryLossReach, RecoveryLossSnapshot,
     RecoveryLossWatermark,
 };
 pub use notice::ParkedRecoveryObligation;
-pub use observe::{
-    RecoveryDemandTransition, RecoveryLossImport, RecoveryObligationState, RecoveryObligationStatus,
-};
-pub use plan::{
-    RECOVERY_PARK_AFTER_ATTEMPTS, RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility,
-    RecoveryEndpointCheckpoint, RecoveryPassProgress, RecoveryReplayPlacement,
-    RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken,
-    StoredRecoveryScope,
-};
-pub use stall::QualifiedRecoveryStallSample;
+use plan::RECOVERY_PARK_AFTER_ATTEMPTS;
+pub use plan::RecoveryEligibility;
 
 #[cfg(test)]
 use crate::SqliteAccountStorage;
@@ -43,99 +32,16 @@ use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Durable account-wide pacing, independent of any process's monotonic clock.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveryRetryState {
-    pub attempt_serial: u64,
-    pub ordinal: u64,
-    pub recorded_at_ms: u64,
-    pub delay_ms: u64,
-    pub not_before_ms: u64,
-}
-
-/// Immutable revision snapshot. Positive completion also requires qualified
-/// scope/admission evidence from the account owner; this is only the CAS fence.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryRevisionFence {
-    pub loss_revision: u64,
-    pub route_revision: u64,
-    pub inventory_revision: u64,
-    pub obligations: Vec<([u8; 16], u64)>,
-}
-
 fn sqlite_integer(value: u64) -> StorageResult<i64> {
     i64::try_from(value)
         .map_err(|_| StorageError::Serialization("recovery value outside supported range".into()))
 }
 
-fn retry_state(conn: &Connection) -> StorageResult<RecoveryRetryState> {
-    let (serial, ordinal, recorded, delay, due): (i64, i64, i64, i64, i64) = conn
-        .query_row_cached(
-            "SELECT next_attempt, retry_ordinal, retry_recorded_at_ms, retry_delay_ms,
-         retry_not_before_ms FROM account_recovery_state WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .storage()?;
-    Ok(RecoveryRetryState {
-        attempt_serial: i64_to_u64(serial)?,
-        ordinal: i64_to_u64(ordinal)?,
-        recorded_at_ms: i64_to_u64(recorded)?,
-        delay_ms: i64_to_u64(delay)?,
-        not_before_ms: i64_to_u64(due)?,
-    })
-}
-
-fn revision_fence(conn: &Connection) -> StorageResult<RecoveryRevisionFence> {
-    let (loss, route, inventory): (i64, i64, i64) = conn
-        .query_row_cached(
-            "SELECT loss_revision, route_revision, inventory_revision
-         FROM account_recovery_state WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .storage()?;
-    let rows = conn
-        .prepare_cached(
-            "SELECT id, revision FROM account_recovery_obligations WHERE state = 0 ORDER BY id",
-        )
-        .storage()?
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
-    let obligations = rows
-        .into_iter()
-        .map(|(id, revision)| {
-            let id = id.try_into().map_err(|_| {
-                StorageError::Serialization("invalid recovery obligation id".into())
-            })?;
-            Ok((id, i64_to_u64(revision)?))
-        })
-        .collect::<StorageResult<_>>()?;
-    Ok(RecoveryRevisionFence {
-        loss_revision: i64_to_u64(loss)?,
-        route_revision: i64_to_u64(route)?,
-        inventory_revision: i64_to_u64(inventory)?,
-        obligations,
-    })
-}
-
-/// Delete inventory and invalidate only frozen scopes whose route/window (and,
-/// for a known-event predicate, exact event) overlap the removed input. The
-/// account revision still fences reservations and plan installation. Callers
-/// must already own the surrounding transaction. Predicates are internal SQL.
+/// Delete inventory and void only the old owner's frozen scopes whose
+/// route/window (and, for a known-event predicate, exact event) overlap the
+/// removed input, so the account-open conversion never counts removed input
+/// as coverage. Callers must already own the surrounding transaction.
+/// Predicates are internal SQL.
 pub(crate) fn delete_inventory_tx(
     conn: &Connection,
     predicate: &str,
@@ -180,7 +86,6 @@ pub(crate) fn delete_inventory_tx(
     for items in routes.values_mut() {
         items.sort_unstable();
     }
-    conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
     let rows=conn.prepare_cached("SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload,
         s.route_kind,COALESCE(s.transport_group_id,x''),COALESCE(s.since_seconds,0),s.until_seconds,s.known_event_id,o.predicate
         FROM account_recovery_scopes s JOIN account_recovery_obligations o ON o.id=s.obligation_id
@@ -245,7 +150,6 @@ pub(crate) fn invalidate_inventory_tx(conn: &Connection) -> StorageResult<()> {
     ).storage()?.query_map([], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,
         row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?))).storage()?
         .collect::<Result<Vec<_>,_>>().storage()?;
-    conn.execute_cached("UPDATE account_recovery_state SET inventory_revision=inventory_revision+1 WHERE singleton=1",[]).storage()?;
     let mut affected = std::collections::BTreeSet::new();
     for (id, scope, format, payload) in rows {
         conn.execute_cached(
@@ -316,104 +220,6 @@ fn join_epoch_tx(
     Ok(())
 }
 
-/// A serialized worker observation chooses the current live plane token.
-/// Imports also replace the compatibility pointer to fence an older clear;
-/// random tokens do not order generations and each retains its own watermark.
-pub(crate) fn arm_overflow_tx(
-    conn: &Connection,
-    label: &str,
-    token: i64,
-    dropped: i64,
-    now: i64,
-    earliest_created_at: Option<u64>,
-    routes: Option<&[(crate::TransportReconciliationRoute, u64)]>,
-) -> StorageResult<()> {
-    // Import may have joined this generation before its queued control record
-    // reaches the worker. Changing the represented identity must fence old
-    // grants even though it grants no permission to reset quiescence. A
-    // retired obligation already covers every imported generation, so a late
-    // observation of one cannot reopen it; newer loss reopens it on import.
-    let adopted = conn.execute_cached(
-        "UPDATE account_recovery_obligations SET marker_token = ?2, revision = revision + 1, state = 0,
-             dropped_count = (SELECT imported_count FROM account_delivery_loss_evidence
-                 WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2),
-             pending_since = (SELECT pending_since FROM account_delivery_loss_evidence
-                 WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2)
-         WHERE demand_key = ?1 AND marker_token != ?2 AND state != 2 AND EXISTS(
-             SELECT 1 FROM account_delivery_loss_evidence
-             WHERE account_label = ?4 AND cause = 0 AND marker_token = ?2 AND imported_count >= ?3)",
-        params![format!("overflow:{label}"), token, dropped, label],
-    ).storage()?;
-    if adopted == 0 {
-        join_loss_tx(conn, label, 0, token, dropped, now, true)?;
-    } else {
-        conn.execute_cached(
-            "UPDATE account_recovery_state SET loss_revision=loss_revision+1 WHERE singleton=1",
-            [],
-        )
-        .storage()?;
-    }
-    // Preserve what the worker already observed, even when this token's marker
-    // callback has not committed yet. A delayed duplicate cannot rearm debt.
-    // Drops past the durable count have no marker write naming their routes
-    // yet, and the import below covers their count, so the relay plane's
-    // routes for what the worker saw merge in as a marker write's would.
-    // Without them every route lost coverage; an absent row starts from them.
-    let durable: Option<i64> = conn
-        .query_row_cached(
-            "SELECT dropped_count FROM account_delivery_loss_evidence
-             WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
-            params![label, token],
-            |row| row.get(0),
-        )
-        .optional()
-        .storage()?;
-    let past_durable = durable.is_none_or(|durable| durable < dropped);
-    let routes = loss::listed_routes(routes);
-    // A marker write reads its floor and routes together, but the worker
-    // reads the routes after its snapshot, so they can name an older drop
-    // the snapshot missed. Recovery fetches from the floor, so it reaches
-    // down to every bound listed, as the marker's next write would.
-    let earliest_created_at = match routes {
-        Some(routes) if past_durable => earliest_created_at.map(|earliest| {
-            routes
-                .iter()
-                .fold(earliest, |lowest, (_, at)| lowest.min(*at))
-        }),
-        _ => earliest_created_at,
-    };
-    let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
-    conn.execute_cached(
-        &format!(
-            "INSERT INTO account_delivery_loss_evidence
-             (account_label, cause, marker_token, pending_since, dropped_count, imported_count,
-              bound_state, bound_seconds, route_state)
-             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6, ?7)
-             ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
-                 dropped_count = MAX(dropped_count, excluded.dropped_count),
-                 imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count),
-                 route_state = CASE WHEN ?8 THEN MIN(route_state, excluded.route_state)
-                     ELSE route_state END,
-                 {LOSS_BOUND_MERGE}"
-        ),
-        params![
-            label,
-            token,
-            now,
-            dropped,
-            bound_state,
-            bound_seconds,
-            i64::from(routes.is_some()),
-            past_durable
-        ],
-    )
-    .storage()?;
-    if past_durable {
-        loss::merge_routes_tx(conn, label, 0, token, routes)?;
-    }
-    Ok(())
-}
-
 /// Merges one charge into a generation's `created_at` bound: a running
 /// minimum while every charge is known, and unknown for good once one is not.
 /// SQLite evaluates each assignment against the row before the update.
@@ -431,240 +237,14 @@ pub(crate) fn loss_bound_values(
     })
 }
 
-/// What the generations one import charged lost: every route from the lowest
-/// floor among those that named no routes, and each named route from its own
-/// lowest bound. An import may charge any number of generations, so the named
-/// routes it holds are un-covered early once they pass [`MAX_LOSS_ROUTES`].
-#[derive(Default)]
-struct ChargedLoss {
-    every_route: Option<u64>,
-    routes: std::collections::BTreeMap<crate::TransportReconciliationRoute, u64>,
-}
-
-impl ChargedLoss {
-    /// Charge what the generation lost, and stamp it with the loss revision
-    /// its join just left: above every revision a checkpoint captured before
-    /// this import holds, and at most the one the import ends at. Call after
-    /// the generation's join; the caller un-covers it in the same
-    /// transaction.
-    fn charge(
-        &mut self,
-        conn: &Connection,
-        label: &str,
-        cause: i64,
-        token: i64,
-    ) -> StorageResult<()> {
-        conn.execute_cached(
-            "UPDATE account_delivery_loss_evidence SET import_revision =
-                 (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
-             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
-            params![label, cause, token],
-        )
-        .storage()?;
-        match loss::evidence_routes(conn, label, cause, token)? {
-            Some(routes) => {
-                for (route, bound) in routes {
-                    let lowest = self.routes.entry(route).or_insert(bound);
-                    *lowest = (*lowest).min(bound);
-                }
-                if self.routes.len() > MAX_LOSS_ROUTES {
-                    let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
-                    for (route, bound) in std::mem::take(&mut self.routes) {
-                        crate::app::recovery_coverage::uncover_route_loss_tx(
-                            conn, &route, bound, now,
-                        )?;
-                    }
-                }
-            }
-            None => {
-                let floor = loss::evidence_floor(conn, label, cause, token)?;
-                self.every_route = Some(self.every_route.map_or(floor, |lowest| lowest.min(floor)));
-            }
-        }
-        Ok(())
-    }
-
-    /// Un-cover what was lost, in the import's transaction. Returns whether
-    /// every route lost coverage.
-    fn uncover(self, conn: &Connection) -> StorageResult<bool> {
-        let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
-        if let Some(floor) = self.every_route {
-            crate::app::recovery_coverage::uncover_loss_tx(conn, floor, now)?;
-        }
-        for (route, bound) in self.routes {
-            match self.every_route {
-                Some(floor) if bound >= floor => {
-                    // Its coverage went with the account-wide floor, but that
-                    // widens only goals the ledger already holds, and this
-                    // route may have left current routing.
-                    crate::app::recovery_coverage::reopen_goal(conn, &route, floor)?
-                }
-                _ => {
-                    crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?
-                }
-            }
-        }
-        Ok(self.every_route.is_some())
-    }
-}
-
-/// The one obligation every generation of a loss cause joins.
-fn loss_demand_key(cause: i64, label: &str) -> StorageResult<String> {
-    let prefix = match cause {
-        0 => "overflow",
-        1 => "notification",
-        _ => {
-            return Err(StorageError::Serialization(
-                "unsupported recovery loss cause".into(),
-            ));
-        }
-    };
-    Ok(format!("{prefix}:{label}"))
-}
-
-fn join_loss_tx(
-    conn: &Connection,
-    label: &str,
-    cause: i64,
-    token: i64,
-    dropped: i64,
-    now: i64,
-    adopt_token: bool,
-) -> StorageResult<()> {
-    let demand_cause = match cause {
-        0 => 0,
-        1 => 6,
-        _ => {
-            return Err(StorageError::Serialization(
-                "unsupported recovery loss cause".into(),
-            ));
-        }
-    };
-    let key = loss_demand_key(cause, label)?;
-    // A retired obligation reopens only for loss its retirement did not
-    // cover: a generation it never saw, or a count above that generation's
-    // retired watermark. A delayed duplicate of retired loss changes nothing.
-    let changed = conn.execute_cached(
-        "INSERT INTO account_recovery_obligations
-         (demand_key, cause, account_label, marker_token, pending_since, dropped_count, created_at_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-         ON CONFLICT(demand_key) DO UPDATE SET
-             revision = revision + 1, state = 0, eligibility = 0, incomplete_reason = NULL,
-             pending_since = CASE WHEN ?8 AND marker_token != excluded.marker_token
-                 THEN excluded.pending_since ELSE MIN(pending_since, excluded.pending_since) END,
-             dropped_count = CASE WHEN marker_token = excluded.marker_token THEN MAX(dropped_count, excluded.dropped_count)
-                 WHEN ?8 THEN excluded.dropped_count ELSE dropped_count END,
-             marker_token = CASE WHEN ?8 THEN excluded.marker_token ELSE marker_token END,
-             updated_at_ms = excluded.updated_at_ms
-         WHERE (marker_token != excluded.marker_token OR dropped_count < excluded.dropped_count)
-             AND (state != 2 OR NOT EXISTS(SELECT 1 FROM account_delivery_loss_evidence AS e
-                 WHERE e.account_label = ?3 AND e.cause = ?9 AND e.marker_token = ?4
-                     AND e.retired_count >= ?6))",
-        params![key, demand_cause, label, token, now, dropped, milliseconds(now)?, adopt_token, cause],
-    ).storage()?;
-    conn.execute_cached(
-        "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id, scope_id)
-         SELECT id, 0 FROM account_recovery_obligations WHERE demand_key = ?1",
-        [key],
-    )
-    .storage()?;
-    if changed > 0 {
-        conn.execute_cached(
-            "UPDATE account_recovery_state SET loss_revision = loss_revision + 1 WHERE singleton = 1", [],
-        ).storage()?;
-    }
-    Ok(())
-}
-
-/// Token-only legacy retirement cannot certify other generations joined into
-/// the same account demand. Reconstitute those generations in this transaction;
-/// their imported watermark remains distinct from low-level retirement. Loss
-/// the user already retired carries no debt and is not reconstituted. Each
-/// restored generation un-covers as an import does.
-pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageResult<bool> {
-    let rows = conn
-        .prepare_cached(
-            "SELECT marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
-         WHERE account_label=?1 AND cause=0
-           AND (legacy_retired_count IS NULL OR dropped_count>legacy_retired_count)
-           AND (retired_count IS NULL OR dropped_count>retired_count)
-         ORDER BY marker_token",
-        )
-        .storage()?
-        .query_map([label], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
-    let mut lost = ChargedLoss::default();
-    for (token, since, dropped) in &rows {
-        join_loss_tx(conn, label, 0, *token, *dropped, *since, true)?;
-        conn.execute_cached(
-            "UPDATE account_delivery_loss_evidence SET imported_count=dropped_count
-            WHERE account_label=?1 AND cause=0 AND marker_token=?2",
-            params![label, token],
-        )
-        .storage()?;
-        lost.charge(conn, label, 0, *token)?;
-    }
-    lost.uncover(conn)?;
-    Ok(!rows.is_empty())
-}
-
-/// Selection may cover a subset. Additional unrelated obligations do not
-/// invalidate it; account-wide loss/route/inventory fences remain conservative.
-fn selected_fence_matches(
-    current: &RecoveryRevisionFence,
-    selected: &RecoveryRevisionFence,
-) -> bool {
-    current.inventory_revision == selected.inventory_revision
-        && selected_completion_fence_matches(current, selected)
-}
-
-// Installed scopes carry their own inventory invalidation tokens. Global
-// inventory churn still fences installing a plan, but not unrelated completion.
-fn selected_completion_fence_matches(
-    current: &RecoveryRevisionFence,
-    selected: &RecoveryRevisionFence,
-) -> bool {
-    current.loss_revision == selected.loss_revision
-        && current.route_revision == selected.route_revision
-        && !selected.obligations.is_empty()
-        && selected
-            .obligations
-            .windows(2)
-            .all(|pair| pair[0].0 < pair[1].0)
-        && selected.obligations.iter().all(|(id, revision)| {
-            current
-                .obligations
-                .binary_search_by_key(id, |(candidate, _)| *candidate)
-                .is_ok_and(|index| current.obligations[index].1 == *revision)
-        })
-}
-
 impl SqliteAppStorage {
-    pub fn recovery_retry_state(&self) -> StorageResult<RecoveryRetryState> {
-        let conn = self.lock()?;
-        retry_state(&conn)
-    }
-
-    pub fn recovery_revision_fence(&self) -> StorageResult<RecoveryRevisionFence> {
-        let conn = self.lock()?;
-        revision_fence(&conn)
-    }
-
     /// Observe current desired route/capability policy, not a historical goal.
     /// Reconnect/open with an identical snapshot is a read-equivalent no-op.
-    /// Changed policy invalidates in-flight results (the route revision is part
-    /// of every work fence) and rechecks pending demand, but never forgives its
-    /// durable retry reservation. It is not new evidence about history, so it
-    /// leaves obligation revisions alone: a scope whose own route and required
-    /// relays are unchanged keeps its certificates and quiet streak (mdk#2110).
+    /// A changed policy bumps the route revision and makes every pending
+    /// obligation Ready again, which releases a capacity wait, except a park
+    /// the old owner's attempt cap left. It is not new evidence about history,
+    /// so it leaves obligation revisions alone (mdk#2110). Deleted with
+    /// capacity-wait eligibility (mdk#2660).
     pub fn observe_recovery_route_snapshot(&self, snapshot: [u8; 32]) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -689,413 +269,15 @@ impl SqliteAppStorage {
             Ok(changed)
         })
     }
-
-    /// Automatic plans omit quiescent demand even when unrelated eligible work
-    /// is present. Explicit selection may investigate that demand once.
-    pub fn recovery_eligible_revision_fence(
-        &self,
-        explicit: bool,
-    ) -> StorageResult<RecoveryRevisionFence> {
-        let conn = self.lock()?;
-        let mut fence = revision_fence(&conn)?;
-        let mut selected = Vec::new();
-        for (id, revision) in fence.obligations {
-            let eligible: bool = conn.query_row_cached(
-                "SELECT eligibility IN (0,1) OR ?2 FROM account_recovery_obligations WHERE id=?1",
-                params![id.as_slice(), explicit], |row| row.get(0),
-            ).storage()?;
-            if eligible {
-                selected.push((id, revision));
-            }
-        }
-        fence.obligations = selected;
-        Ok(fence)
-    }
-
-    /// Reserve pacing before an executor can have external effects. No policy
-    /// constant lives in storage: the owner supplies the already-selected delay.
-    /// A cancelled caller leaves both demand and this reservation durable.
-    pub fn reserve_recovery_attempt(
-        &self,
-        expected: &RecoveryRevisionFence,
-        now_ms: u64,
-        delay_ms: u64,
-        explicit_override: bool,
-    ) -> StorageResult<Option<RecoveryRetryState>> {
-        self.reserve_recovery_work(expected, None, now_ms, delay_ms, explicit_override)
-    }
-
-    /// One account reservation for coverage, bounded comparison, or both.
-    pub fn reserve_recovery_work(
-        &self,
-        expected: &RecoveryRevisionFence,
-        comparison_revision: Option<u64>,
-        now_ms: u64,
-        delay_ms: u64,
-        explicit_override: bool,
-    ) -> StorageResult<Option<RecoveryRetryState>> {
-        let now = sqlite_integer(now_ms)?;
-        let delay = sqlite_integer(delay_ms)?;
-        let due = now.checked_add(delay).ok_or_else(|| {
-            StorageError::Serialization("recovery deadline outside supported range".into())
-        })?;
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let state = retry_state(&conn)?;
-            let unimported: bool = conn.query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_delivery_loss_evidence WHERE (imported_count IS NULL OR dropped_count > imported_count))",
-                [], |row| row.get(0),
-            ).storage()?;
-            // One account-device identity per database: all loss causes must
-            // be imported by that account owner before any scoped reservation.
-            if unimported || !comparison::work_fence_matches(&revision_fence(&conn)?, expected, comparison_revision.is_some())
-                || !comparison::selection_matches(&conn, comparison_revision, explicit_override)?
-                || (!explicit_override && now_ms < state.not_before_ms)
-            {
-                return Ok(None);
-            }
-            let mut eligible = true;
-            for (id, _) in &expected.obligations {
-                let unknown_format: bool = conn.query_row_cached(
-                    "SELECT EXISTS(SELECT 1 FROM account_recovery_scopes
-                     WHERE obligation_id = ?1 AND scope_format != 1)",
-                    [id.as_slice()], |row| row.get(0),
-                ).storage()?;
-                if unknown_format {
-                    return Err(StorageError::Serialization("unsupported recovery scope format".into()));
-                }
-                eligible &= conn.query_row_cached(
-                    "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
-                     WHERE id = ?1 AND state = 0 AND (eligibility IN (0, 1) OR ?2))",
-                    params![id.as_slice(), explicit_override], |row| row.get::<_, bool>(0),
-                ).storage()?;
-            }
-            if !eligible { return Ok(None); }
-            conn.execute_cached(
-                "UPDATE account_recovery_state SET next_attempt = next_attempt + 1,
-                 retry_ordinal = retry_ordinal + 1, retry_recorded_at_ms = ?1,
-                 retry_delay_ms = ?2, retry_not_before_ms = ?3 WHERE singleton = 1",
-                params![now, delay, due],
-            ).storage()?;
-            Ok(Some(retry_state(&conn)?))
-        })
-    }
-
-    /// The worker calls this only for newly and durably retained input inside
-    /// the grant's scope. Engine progress, duplicate delivery and SDK counters
-    /// are not admission. Reset backoff without allowing a new activation less
-    /// than the minimum delay after this progress checkpoint.
-    pub fn checkpoint_recovery_progress(
-        &self,
-        expected: &RecoveryRevisionFence,
-        attempt_serial: u64,
-        now_ms: u64,
-        minimum_delay_ms: u64,
-    ) -> StorageResult<bool> {
-        let due = now_ms.checked_add(minimum_delay_ms).ok_or_else(|| {
-            StorageError::Serialization("recovery deadline outside supported range".into())
-        })?;
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let prior = retry_state(&conn)?;
-            if attempt_serial == 0
-                || prior.attempt_serial != attempt_serial
-                || prior.ordinal <= 1
-                || expected.obligations.is_empty()
-                || !comparison::completed_work_fence_matches(
-                    &conn,
-                    &revision_fence(&conn)?,
-                    expected,
-                )?
-                || !plan::no_unimported_loss(&conn)?
-            {
-                return Ok(false);
-            }
-            conn.execute_cached(
-                "UPDATE account_recovery_state SET retry_ordinal=1,retry_recorded_at_ms=?1,
-                 retry_delay_ms=?2,retry_not_before_ms=?3 WHERE singleton=1",
-                params![
-                    sqlite_integer(now_ms)?,
-                    sqlite_integer(minimum_delay_ms)?,
-                    sqlite_integer(due)?
-                ],
-            )
-            .storage()?;
-            Ok(true)
-        })
-    }
-
-    /// Reconstruct one process-local deadline at open. A backward clock rebases
-    /// once; forward movement permits at most one subsequent reservation.
-    pub fn restore_recovery_retry(
-        &self,
-        now_ms: u64,
-        maximum_delay_ms: u64,
-    ) -> StorageResult<RecoveryRetryState> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let state = retry_state(&conn)?;
-            if now_ms < state.recorded_at_ms || state.delay_ms > maximum_delay_ms {
-                let delay = state.delay_ms.min(maximum_delay_ms);
-                let due = now_ms.checked_add(delay).ok_or_else(|| {
-                    StorageError::Serialization("recovery deadline outside supported range".into())
-                })?;
-                conn.execute_cached(
-                    "UPDATE account_recovery_state SET retry_recorded_at_ms = ?1,
-                     retry_delay_ms = ?2, retry_not_before_ms = ?3 WHERE singleton = 1",
-                    params![
-                        sqlite_integer(now_ms)?,
-                        sqlite_integer(delay)?,
-                        sqlite_integer(due)?
-                    ],
-                )
-                .storage()?;
-            }
-            retry_state(&conn)
-        })
-    }
-
-    /// Called only at the account mutation boundary. Evidence acknowledgment and
-    /// demand creation share a transaction, so cancellation cannot lose either.
-    ///
-    /// Returns what the import charged, at most one entry per loss cause, so
-    /// the owner can record the change. A cause whose import changed no
-    /// obligation revision reports only when it un-covered every route.
-    pub fn synchronize_account_delivery_loss(
-        &self,
-        label: &str,
-    ) -> StorageResult<Vec<RecoveryLossImport>> {
-        let pending: bool = self
-            .lock()?
-            .query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_delivery_loss_evidence
-             WHERE account_label = ?1 AND (imported_count IS NULL OR dropped_count > imported_count))",
-                [label],
-                |row| row.get(0),
-            )
-            .storage()?;
-        if !pending {
-            return Ok(Vec::new());
-        }
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            // Import one row at a time in this transaction. The unresolved
-            // evidence set is deliberately not disk-capped; do not mirror it
-            // into an unbounded temporary Vec on reopen. The audit summary is
-            // constant-size: one accumulator per cause.
-            // Per cause: the demand before, the count charged, and what the
-            // generations this import charged lost.
-            let mut imports: [Option<(Option<observe::DemandRow>, u64, ChargedLoss)>; 2] =
-                [None, None];
-            let mut cursor = (-1_i64, -1_i64);
-            loop {
-                let row = conn
-                    .query_row_cached(
-                        "SELECT cause,marker_token,pending_since,dropped_count,imported_count
-                     FROM account_delivery_loss_evidence
-                     WHERE account_label=?1 AND (cause,marker_token)>(?2,?3)
-                     AND (imported_count IS NULL OR dropped_count>imported_count)
-                     ORDER BY cause,marker_token LIMIT 1",
-                        params![label, cursor.0, cursor.1],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, Option<i64>>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .storage()?;
-                let Some((cause, token, observed_at, dropped, imported)) = row else {
-                    break;
-                };
-                cursor = (cause, token);
-                if let Some(slot) = usize::try_from(cause)
-                    .ok()
-                    .and_then(|cause| imports.get_mut(cause))
-                {
-                    let charged = i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?;
-                    if slot.is_none() {
-                        let before = observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
-                        *slot = Some((before, 0, ChargedLoss::default()));
-                    }
-                    if let Some((_, total, _)) = slot {
-                        *total = total.saturating_add(charged);
-                    }
-                }
-                join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
-                conn.execute_cached(
-                    "UPDATE account_delivery_loss_evidence SET imported_count = ?3
-                     WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
-                    params![label, token, dropped, cause],
-                )
-                .storage()?;
-                if let Some(Some((_, _, lost))) = usize::try_from(cause)
-                    .ok()
-                    .and_then(|cause| imports.get_mut(cause))
-                {
-                    lost.charge(&conn, label, cause, token)?;
-                }
-            }
-            let mut changes = Vec::new();
-            for (cause, slot) in imports.into_iter().enumerate() {
-                let Some((before, charged, lost)) = slot else {
-                    continue;
-                };
-                let cause_value = i64::try_from(cause).map_err(|_| {
-                    StorageError::Serialization("unsupported recovery loss cause".into())
-                })?;
-                let every_route = lost.uncover(&conn)?;
-                let Some(after) =
-                    observe::demand_row(&conn, &loss_demand_key(cause_value, label)?)?
-                else {
-                    continue;
-                };
-                let transition = observe::transition(before.as_ref(), &after);
-                if transition == RecoveryDemandTransition::Unchanged && !every_route {
-                    continue;
-                }
-                let cause = if cause == 0 {
-                    RecoveryLossCause::Queue
-                } else {
-                    RecoveryLossCause::NotificationConsumer
-                };
-                let goal_floor = loss::goal_floor(&conn, label, cause)?;
-                changes.push(RecoveryLossImport {
-                    cause,
-                    obligation: observe::ticket(&after)?,
-                    transition,
-                    charged,
-                    goal_floor,
-                    every_route,
-                });
-            }
-            Ok(changes)
-        })
-    }
-
-    /// [`Self::mark_account_delivery_recovery_bounded`], also reporting how the
-    /// worker's observation changed the queue-loss obligation, when it did or
-    /// when it un-covered every route. The marker writer usually imported the
-    /// generation first, so this is most often `None`. It un-covers the
-    /// generation when it imported count. An observation past the durable
-    /// count merges `routes` into its generation as
-    /// [`Self::record_account_recovery_loss_routed`] would: the relay plane's
-    /// route map for every drop it counted, or `None` to un-cover every route.
-    /// The generation's floor drops to the lowest bound they list.
-    pub fn mark_account_delivery_recovery_observed(
-        &self,
-        label: &str,
-        marker_token: u64,
-        dropped_count: u64,
-        earliest_created_at: Option<u64>,
-        routes: Option<&[(crate::TransportReconciliationRoute, u64)]>,
-    ) -> StorageResult<Option<RecoveryLossImport>> {
-        let token = i64::try_from(marker_token).unwrap_or(i64::MAX);
-        let dropped = i64::try_from(dropped_count).unwrap_or(i64::MAX);
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let key = loss_demand_key(0, label)?;
-            let before = observe::demand_row(&conn, &key)?;
-            let imported: Option<i64> = conn
-                .query_row_cached(
-                    "SELECT imported_count FROM account_delivery_loss_evidence
-                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
-                    params![label, token],
-                    |row| row.get(0),
-                )
-                .optional()
-                .storage()?
-                .flatten();
-            arm_overflow_tx(
-                &conn,
-                label,
-                token,
-                dropped,
-                crate::base::codec::unix_now_seconds_i64(),
-                earliest_created_at,
-                routes,
-            )?;
-            let charged: bool = conn
-                .query_row_cached(
-                    "SELECT ?3 IS NULL OR imported_count > ?3 FROM account_delivery_loss_evidence
-                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
-                    params![label, token, imported],
-                    |row| row.get(0),
-                )
-                .optional()
-                .storage()?
-                .unwrap_or(false);
-            let mut lost = ChargedLoss::default();
-            if charged {
-                lost.charge(&conn, label, 0, token)?;
-            }
-            let every_route = lost.uncover(&conn)?;
-            let Some(after) = observe::demand_row(&conn, &key)? else {
-                return Ok(None);
-            };
-            let transition = observe::transition(before.as_ref(), &after);
-            if transition == RecoveryDemandTransition::Unchanged && !every_route {
-                return Ok(None);
-            }
-            let goal_floor = loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?;
-            Ok(Some(RecoveryLossImport {
-                cause: RecoveryLossCause::Queue,
-                obligation: observe::ticket(&after)?,
-                transition,
-                charged: i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?,
-                goal_floor,
-                every_route,
-            }))
-        })
-    }
-
-    /// Evidence-only write for the approved account-local overflow marker task.
-    /// Distinct generations cannot overwrite each other; count growth is monotonic.
-    pub fn record_account_delivery_loss(
-        &self,
-        label: &str,
-        marker_token: u64,
-        dropped_count: u64,
-        observed_at_seconds: u64,
-    ) -> StorageResult<()> {
-        self.record_account_delivery_loss_bounded(
-            label,
-            marker_token,
-            dropped_count,
-            observed_at_seconds,
-            None,
-        )
-    }
-
-    /// Like [`Self::record_account_delivery_loss`], also charging the earliest
-    /// wire `created_at` among the dropped deliveries, or an unknown time.
-    pub fn record_account_delivery_loss_bounded(
-        &self,
-        label: &str,
-        marker_token: u64,
-        dropped_count: u64,
-        observed_at_seconds: u64,
-        earliest_created_at: Option<u64>,
-    ) -> StorageResult<()> {
-        self.record_account_recovery_loss_bounded(
-            label,
-            RecoveryLossCause::Queue,
-            marker_token,
-            dropped_count,
-            observed_at_seconds,
-            earliest_created_at,
-        )
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqlCipherKey;
+    use crate::{
+        TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationItem,
+        TransportReconciliationRoute,
+    };
 
     fn fixture() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -1126,171 +308,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn review_legacy_clear_preserves_each_generation_across_reopen() {
-        for (old, newer) in [(10, 90), (90, 10)] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("loss.sqlite");
-            let key = SqlCipherKey::raw([0x31; 32]);
-            {
-                let store = SqliteAccountStorage::open_encrypted(&path, &key)
-                    .unwrap()
-                    .app_storage();
-                store.ensure_account_projection("alice").unwrap();
-                store
-                    .mark_account_delivery_recovery("alice", old, 2)
-                    .unwrap();
-                store
-                    .record_account_delivery_loss("alice", newer, 15, 10)
-                    .unwrap();
-                store.synchronize_account_delivery_loss("alice").unwrap();
-                assert!(!store.clear_account_delivery_recovery("alice", old).unwrap());
-            }
-            let store = SqliteAccountStorage::open_encrypted(&path, &key)
-                .unwrap()
-                .app_storage();
-            store.synchronize_account_delivery_loss("alice").unwrap();
-            let pending = store.account_delivery_recovery("alice").unwrap().unwrap();
-            assert_eq!((pending.marker_token, pending.dropped_count), (newer, 15));
-            // A low-level retirement covers only its token, never all joined loss.
-            assert!(
-                !store
-                    .clear_account_delivery_recovery("alice", newer)
-                    .unwrap()
-            );
-            assert_eq!(
-                store
-                    .account_delivery_recovery("alice")
-                    .unwrap()
-                    .unwrap()
-                    .marker_token,
-                old
-            );
-            assert!(store.clear_account_delivery_recovery("alice", old).unwrap());
-            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
-            // The cleared generations keep their evidence watermarks: a late
-            // duplicate write neither rearms nor bumps the loss revision.
-            let before = store.recovery_revision_fence().unwrap();
-            store
-                .record_account_delivery_loss("alice", newer, 15, 11)
-                .unwrap();
-            store.synchronize_account_delivery_loss("alice").unwrap();
-            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
-            assert_eq!(store.recovery_revision_fence().unwrap(), before);
-            store
-                .record_account_delivery_loss("alice", newer, 16, 12)
-                .unwrap();
-            store.synchronize_account_delivery_loss("alice").unwrap();
-            assert_eq!(
-                store
-                    .account_delivery_recovery("alice")
-                    .unwrap()
-                    .unwrap()
-                    .dropped_count,
-                16
-            );
-        }
-    }
-
-    #[test]
-    fn review_legacy_clear_rollback_preserves_retirement_and_pending_loss() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 10, 2).unwrap();
-        app.record_account_delivery_loss("alice", 90, 15, 10)
-            .unwrap();
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        let before = app.recovery_revision_fence().unwrap();
-        store.lock().unwrap().execute_batch("CREATE TRIGGER reject_rejoin BEFORE INSERT ON account_recovery_obligations BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-        assert_backend(app.clear_account_delivery_recovery("alice", 90), "injected");
-        assert_eq!(app.recovery_revision_fence().unwrap(), before);
-        assert_eq!(
-            app.account_delivery_recovery("alice")
-                .unwrap()
-                .unwrap()
-                .marker_token,
-            90
-        );
-        assert!(store.lock().unwrap().query_row("SELECT legacy_retired_count IS NULL FROM account_delivery_loss_evidence WHERE marker_token=90",[],|r|r.get::<_,bool>(0)).unwrap());
+    /// Every obligation's (cause, state, eligibility, revision), in id order.
+    fn obligations(store: &SqliteAccountStorage) -> Vec<(i64, i64, i64, i64)> {
         store
             .lock()
             .unwrap()
-            .execute_batch("DROP TRIGGER reject_rejoin")
-            .unwrap();
-        assert!(!app.clear_account_delivery_recovery("alice", 90).unwrap());
-        assert!(app.clear_account_delivery_recovery("alice", 10).unwrap());
-    }
-
-    #[test]
-    fn review_adoption_fences_prior_generation_without_resetting_quiescence() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 20, 4).unwrap();
-        app.mark_account_delivery_recovery("alice", 10, 6).unwrap();
-        app.mark_account_delivery_recovery("alice", 20, 4).unwrap();
-        store
-            .lock()
+            .prepare("SELECT cause, state, eligibility, revision FROM account_recovery_obligations ORDER BY id")
             .unwrap()
-            .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
-            .unwrap();
-        let before = app.recovery_revision_fence().unwrap();
-        let retry = app.recovery_retry_state().unwrap();
-        app.mark_account_delivery_recovery("alice", 10, 6).unwrap();
-        let after = app.recovery_revision_fence().unwrap();
-        assert!(after.loss_revision > before.loss_revision);
-        assert!(after.obligations[0].1 > before.obligations[0].1);
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT eligibility FROM account_recovery_obligations",
-                    [],
-                    |r| r.get::<_, i64>(0)
-                )
-                .unwrap(),
-            3
-        );
-        assert!(
-            app.reserve_recovery_attempt(&before, 1000, 15000, true)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn review_mixed_selection_cannot_reserve_for_quiescent_demand() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 1, 4).unwrap();
-        store
-            .lock()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
             .unwrap()
-            .execute_batch(
-                "UPDATE account_recovery_obligations SET eligibility=3;
-            INSERT INTO cgka_groups(id,epoch,record) VALUES(x'01',7,x'00')",
-            )
-            .unwrap();
-        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-            group_id_hex: "01".into(),
-            stalled_epoch: 7,
-        }])
-        .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        let retry = app.recovery_retry_state().unwrap();
-        assert_eq!(fence.obligations.len(), 2);
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000, 15000, false)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000, 15000, true)
-                .unwrap()
-                .is_some()
-        );
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     #[test]
@@ -1315,181 +343,30 @@ mod tests {
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3")
             .unwrap();
-        let before = app.recovery_revision_fence().unwrap();
+        let before = obligations(&store);
         arm(7);
         arm(6);
-        assert_eq!(app.recovery_revision_fence().unwrap(), before);
-        assert!(
-            app.reserve_recovery_attempt(&before, 1000, 15000, false)
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(obligations(&store), before, "nothing new to recover");
         arm(8);
-        assert!(
-            app.reserve_recovery_attempt(
-                &app.recovery_revision_fence().unwrap(),
-                1000,
-                15000,
-                false
-            )
-            .unwrap()
-            .is_some()
-        );
+        let (_, state, eligibility, revision) = obligations(&store)[0];
+        assert_eq!(state, 0);
+        assert!(matches!(eligibility, 0 | 1), "a higher epoch rearms");
+        assert!(revision > before[0].3);
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET state = 1")
             .unwrap();
         arm(8);
-        assert!(
-            app.recovery_revision_fence()
-                .unwrap()
-                .obligations
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn notification_loss_imports_independent_demand_without_blocking_forever() {
-        let store = fixture();
-        let app = store.app_storage();
-        store.lock().unwrap().execute_batch(
-            "INSERT INTO account_delivery_loss_evidence(account_label,cause,marker_token,pending_since,dropped_count)
-             VALUES ('alice',1,7,10,0)"
-        ).unwrap();
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        assert_eq!(fence.obligations.len(), 1);
-        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000, 15000, false)
-                .unwrap()
-                .is_some()
-        );
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
-    }
-
-    #[test]
-    fn late_old_marker_does_not_replace_current_token_or_duplicate_loss_revision() {
-        let store = fixture().app_storage();
-        store
-            .mark_account_delivery_recovery("alice", 90, 4)
-            .unwrap();
-        let first = store.recovery_revision_fence().unwrap();
-        store
-            .record_account_delivery_loss("alice", 90, 4, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), first);
-        store
-            .mark_account_delivery_recovery("alice", 10, 6)
-            .unwrap();
-        let current = store.recovery_revision_fence().unwrap();
-        store
-            .record_account_delivery_loss("alice", 90, 4, 20)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
         assert_eq!(
-            store
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .unwrap()
-                .marker_token,
-            10
-        );
-        assert_eq!(store.recovery_revision_fence().unwrap(), current);
-        // A newly imported token must replace the compatibility pointer so an
-        // older token-only clear fails. Its numerical value is not an ordering;
-        // all generations retain separate evidence and retirement watermarks.
-        store
-            .record_account_delivery_loss("alice", 80, 3, 30)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(
-            store
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .unwrap()
-                .marker_token,
-            80
-        );
-        assert!(store.recovery_revision_fence().unwrap().loss_revision > current.loss_revision);
-    }
-
-    #[test]
-    fn worker_adopts_already_imported_generation_without_rearming_it() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 20, 4).unwrap();
-        app.record_account_delivery_loss("alice", 10, 6, 10)
-            .unwrap();
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3")
-            .unwrap();
-        let before = app.recovery_revision_fence().unwrap();
-        app.mark_account_delivery_recovery("alice", 10, 6).unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap(), before);
-        assert_eq!(
-            app.account_delivery_recovery("alice")
-                .unwrap()
-                .unwrap()
-                .marker_token,
-            10
-        );
-        assert!(
-            app.reserve_recovery_attempt(&before, 1000, 15000, false)
-                .unwrap()
-                .is_none()
+            obligations(&store)[0].1,
+            1,
+            "the same epoch reopens nothing"
         );
     }
 
     #[test]
-    fn reservation_fences_selected_demand_without_blocking_on_unrelated_joins() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-        let selected = app.recovery_revision_fence().unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("INSERT INTO cgka_groups(id, epoch, record) VALUES (x'01', 7, x'00')")
-            .unwrap();
-        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-            group_id_hex: "01".into(),
-            stalled_epoch: 7,
-        }])
-        .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "UPDATE account_recovery_obligations SET eligibility = 3 WHERE cause = 0",
-            )
-            .unwrap();
-        assert!(
-            app.reserve_recovery_attempt(&selected, 1000, 15000, false)
-                .unwrap()
-                .is_none(),
-            "unselected eligible demand cannot authorize the selected quiescent scope"
-        );
-        // Only the explicit override reserves it, and reserving fences
-        // nothing.
-        let joined = app.recovery_revision_fence().unwrap();
-        assert!(
-            app.reserve_recovery_attempt(&selected, 1000, 15000, true)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(app.recovery_revision_fence().unwrap(), joined);
-        assert_eq!(joined.obligations.len(), 2);
-    }
-
-    #[test]
-    fn same_epoch_release_fences_old_plans_and_rolls_back_as_one_unit() {
+    fn same_epoch_release_rearms_its_gap_and_rolls_back_as_one_unit() {
         let store = fixture();
         let app = store.app_storage();
         store
@@ -1502,7 +379,7 @@ mod tests {
             stalled_epoch: 7,
         }])
         .unwrap();
-        let before = app.recovery_revision_fence().unwrap();
+        let before = obligations(&store);
         store
             .lock()
             .unwrap()
@@ -1513,7 +390,7 @@ mod tests {
             )
             .unwrap();
         assert_backend(store.consume_released_transport_receipts(), "injected");
-        assert_eq!(app.recovery_revision_fence().unwrap(), before);
+        assert_eq!(obligations(&store), before);
         store
             .lock()
             .unwrap()
@@ -1523,239 +400,193 @@ mod tests {
             store.consume_released_transport_receipts().unwrap().len(),
             1
         );
-        let after = app.recovery_revision_fence().unwrap();
-        assert_eq!(after.inventory_revision, before.inventory_revision + 1);
-        assert_eq!(after.obligations[0].1, before.obligations[0].1 + 1);
-        assert!(
-            app.reserve_recovery_attempt(&before, 1000, 15000, true)
-                .unwrap()
-                .is_none()
-        );
+        let after = obligations(&store);
+        assert_eq!(after[0].3, before[0].3 + 1, "the release rearms the gap");
         assert!(
             store
                 .consume_released_transport_receipts()
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(app.recovery_revision_fence().unwrap(), after);
+        assert_eq!(obligations(&store), after);
     }
 
-    #[test]
-    fn zero_count_loss_is_still_imported_as_pending_evidence() {
-        let store = fixture().app_storage();
+    /// A frozen scope payload as the old owner wrote it: relays `a` and `b`
+    /// required and admitted, each checkpointed covered, exhaustive and past
+    /// the maintenance boundary.
+    fn certified() -> String {
+        let checkpoint = |endpoint: &str| {
+            serde_json::json!({
+                "endpoint": endpoint, "outcome": "covered", "exhaustive": true,
+                "admission_complete": true, "first_boundary": true,
+            })
+        };
+        let payload = serde_json::json!({
+            "required_endpoints": ["a", "b"], "admitted_endpoints": ["a", "b"],
+            "checkpoints": [checkpoint("a"), checkpoint("b")],
+            "retained_known_event": false, "attempt_serial": 1, "obligation_revision": 1,
+            "loss_revision": 0, "route_revision": 0, "inventory_revision": 0,
+        });
+        format!("CAST('{payload}' AS BLOB)")
+    }
+
+    /// Obligation `n` of `cause` and `predicate`, satisfied, with `scopes`
+    /// certified inbox scopes over `since..=until`, as a build from before
+    /// the recovery runner left it for the conversion to read.
+    fn seed_satisfied(
+        store: &SqliteAccountStorage,
+        n: u8,
+        (cause, predicate): (i64, i64),
+        (since, until): (u64, u64),
+        scopes: u64,
+    ) {
+        let group = if cause == 2 { "x'0a'" } else { "NULL" };
+        let conn = store.lock().unwrap();
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO cgka_groups (id, epoch, record) VALUES (x'0a', 1, x'00');
+             INSERT INTO account_recovery_obligations (id, demand_key, cause, group_id,
+                 predicate, created_at_ms, updated_at_ms, state)
+             VALUES (x'{n:032x}', 'seed:{n}', {cause}, {group}, {predicate}, 0, 0, 1);"
+        ))
+        .unwrap();
+        conn.execute(
+            &format!(
+                "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM n WHERE x + 1 < ?1)
+                 INSERT INTO account_recovery_scopes (obligation_id, scope_id, route_kind,
+                     route_role, since_seconds, until_seconds, snapshot_state, scope_format,
+                     scope_payload)
+                 SELECT x'{n:032x}', x, 0, 0, {since}, {until}, 1, 1, {} FROM n",
+                certified()
+            ),
+            [scopes as i64],
+        )
+        .unwrap();
+    }
+
+    /// Each seeded obligation's state and revision, with whether every one
+    /// of its scopes still holds its checkpoints, in id order.
+    fn standing(store: &SqliteAccountStorage) -> Vec<(i64, i64, bool)> {
         store
-            .record_account_delivery_loss("alice", 9, 0, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(
-            store.recovery_revision_fence().unwrap().obligations.len(),
-            1
-        );
-        assert_eq!(store.recovery_revision_fence().unwrap().loss_revision, 1);
-    }
-
-    #[test]
-    fn unknown_scope_format_cannot_authorize_an_attempt() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("UPDATE account_recovery_scopes SET scope_format = 2")
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        assert_serialization(
-            app.reserve_recovery_attempt(&fence, 1000, 15000, true),
-            "unsupported recovery scope format",
-        );
-        assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
-    }
-
-    #[test]
-    fn loss_writer_is_evidence_only_and_cannot_overwrite_another_generation() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.record_account_delivery_loss("alice", 1, 4, 10).unwrap();
-        app.record_account_delivery_loss("alice", 2, 7, 11).unwrap();
-        app.record_account_delivery_loss("alice", 1, 2, 12).unwrap();
-        // The legacy read is not an import: it reports nothing and creates
-        // no demand before the worker imports.
-        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
-        let before = app.recovery_revision_fence().unwrap();
-        assert!(before.obligations.is_empty());
-        assert!(
-            app.reserve_recovery_attempt(&before, 1000, 15000, true)
-                .unwrap()
-                .is_none()
-        );
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(app.account_delivery_recovery("alice").unwrap().is_some());
-        let joined = app.recovery_revision_fence().unwrap();
-        assert_eq!(joined.obligations.len(), 1);
-        assert_eq!(joined.loss_revision, 2);
-        let counts: Vec<i64> = store
             .lock()
             .unwrap()
             .prepare(
-                "SELECT dropped_count FROM account_delivery_loss_evidence ORDER BY marker_token",
+                "SELECT o.state, o.revision, MIN(COALESCE(json_array_length(
+                     CAST(s.scope_payload AS TEXT), '$.checkpoints'), 0) > 0)
+                 FROM account_recovery_obligations o
+                 JOIN account_recovery_scopes s ON s.obligation_id = o.id
+                 WHERE o.demand_key LIKE 'seed:%'
+                 GROUP BY o.id ORDER BY o.id",
             )
             .unwrap()
-            .query_map([], |r| r.get(0))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn admit(store: &SqliteAccountStorage, created_at: u64) -> StorageResult<()> {
+        store
+            .app_storage()
+            .record_reconciliation_items(std::iter::once((
+                &TransportReconciliationRoute::Inbox,
+                &TransportReconciliationItem {
+                    event_id: [9; 32],
+                    created_at,
+                },
+            )))
+    }
+
+    /// Retention removing inventory voids the frozen scopes whose window
+    /// held it, so the conversion never reads removed input as coverage, and
+    /// reopens the completion those scopes proved. A scope whose window it
+    /// missed, and a maintenance boundary, which no inventory proves, keep
+    /// their checkpoints. A failure rolls the removal back whole.
+    #[test]
+    fn removing_inventory_voids_the_frozen_scopes_it_overlaps() {
+        let now = crate::unix_now_seconds();
+        let store = fixture();
+        seed_satisfied(&store, 1, (3, 0), (0, now), 1);
+        seed_satisfied(&store, 2, (5, 0), (now - 5, now), 1);
+        seed_satisfied(&store, 3, (2, 2), (0, now), 1);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO transport_reconciliation_items VALUES (0,x'',zeroblob(32),?1)",
+                [(now - TRANSPORT_RECONCILIATION_RETENTION_SECS - 1) as i64],
+            )
             .unwrap();
-        assert_eq!(counts, vec![4, 7]);
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap(), joined);
-        app.record_account_delivery_loss("alice", 2, 8, 13).unwrap();
+        let before = standing(&store);
+        assert_eq!(before, vec![(1, 1, true); 3]);
+        store.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_invalidation BEFORE UPDATE ON account_recovery_scopes BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert_backend(admit(&store, now + 1), "injected");
+        assert_eq!(standing(&store), before);
         assert!(
-            app.reserve_recovery_attempt(&joined, 1000, 15000, true)
-                .unwrap()
-                .is_none()
+            store
+                .app_storage()
+                .retained_recovery_event(&TransportReconciliationRoute::Inbox, &[0; 32], None, now)
+                .unwrap(),
+            "the failed removal kept its inventory"
         );
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap().loss_revision, 3);
-        assert!(
-            app.reserve_recovery_attempt(&joined, 1000, 15000, true)
-                .unwrap()
-                .is_none()
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_scope_invalidation")
+            .unwrap();
+        admit(&store, now + 1).unwrap();
+        assert_eq!(
+            standing(&store),
+            vec![(0, 2, false), (1, 1, true), (1, 1, true)]
         );
     }
 
+    /// A released receipt names no trustworthy route or time, so it voids
+    /// every frozen history scope; a maintenance boundary keeps its own.
     #[test]
-    fn evidence_import_failure_rolls_back_demand_and_acknowledgment() {
+    fn a_released_receipt_voids_every_frozen_history_scope() {
+        let now = crate::unix_now_seconds();
         let store = fixture();
-        let app = store.app_storage();
-        app.record_account_delivery_loss("alice", 3, 9, 10).unwrap();
+        seed_satisfied(&store, 1, (3, 0), (0, now), 1);
+        seed_satisfied(&store, 2, (5, 0), (now - 5, now), 1);
+        seed_satisfied(&store, 3, (2, 2), (0, now), 1);
         store
             .lock()
             .unwrap()
             .execute_batch(
-                "CREATE TRIGGER fail_loss_import BEFORE UPDATE ON account_delivery_loss_evidence
-             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+                "INSERT INTO cgka_released_transport_receipts(id,group_id,epoch)
+                 VALUES (zeroblob(32),x'0a',1)",
             )
             .unwrap();
-        assert_backend(app.synchronize_account_delivery_loss("alice"), "injected");
-        assert!(
-            app.recovery_revision_fence()
-                .unwrap()
-                .obligations
-                .is_empty()
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap().len(),
+            1
         );
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT imported_count FROM account_delivery_loss_evidence",
-                    [],
-                    |r| r.get::<_, Option<i64>>(0),
-                )
-                .unwrap(),
-            None
+            standing(&store),
+            vec![(0, 2, false), (0, 2, false), (1, 1, true)]
         );
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER fail_loss_import")
-            .unwrap();
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap().obligations.len(), 1);
     }
 
+    /// Admitting live input costs the same however many frozen scopes the
+    /// account still holds: the removal probe never reads them.
     #[test]
-    fn reservation_survives_reopen_and_clock_changes_without_free_attempts() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("owner.sqlite");
-        let key = SqlCipherKey::raw([0x32; 32]);
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key)
-                .unwrap()
-                .app_storage();
-            store.ensure_account_projection("alice").unwrap();
-            store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-            let fence = store.recovery_revision_fence().unwrap();
-            let reservation = store
-                .reserve_recovery_attempt(&fence, 100000, 15000, false)
-                .unwrap()
-                .unwrap();
-            assert_eq!(reservation.attempt_serial, 1);
-            assert_eq!(reservation.not_before_ms, 115000);
+    fn live_admission_work_is_independent_of_retained_scope_count() {
+        use crate::base::query_work_test_support::{QUERY_MEASUREMENT, measure};
+        let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+        let now = crate::unix_now_seconds();
+        let mut previous = None;
+        for count in [1, 1024] {
+            let store = fixture();
+            seed_satisfied(&store, 1, (3, 0), (0, now), count);
+            admit(&store, now).unwrap();
+            let (_, steps) = measure(&store, || admit(&store, now).unwrap());
+            if let Some(old) = previous {
+                assert_eq!(
+                    steps, old,
+                    "live admission must not scan retained recovery scopes"
+                );
+            }
+            previous = Some(steps);
         }
-        let store = SqliteAccountStorage::open_encrypted(&path, &key)
-            .unwrap()
-            .app_storage();
-        let fence = store.recovery_revision_fence().unwrap();
-        assert_eq!(
-            store
-                .restore_recovery_retry(105000, 300000)
-                .unwrap()
-                .not_before_ms,
-            115000
-        );
-        assert!(
-            store
-                .reserve_recovery_attempt(&fence, 105000, 30000, false)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .restore_recovery_retry(90000, 300000)
-                .unwrap()
-                .not_before_ms,
-            105000
-        );
-        assert_eq!(
-            store
-                .restore_recovery_retry(91000, 300000)
-                .unwrap()
-                .not_before_ms,
-            105000
-        );
-        assert!(
-            store
-                .reserve_recovery_attempt(&fence, 104999, 30000, false)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000000, 30000, false)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000000, 30000, false)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(store.recovery_retry_state().unwrap().ordinal, 2);
-        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
-    }
-
-    #[test]
-    fn duplicate_joins_do_not_move_retry_but_new_count_fences_old_plans() {
-        let store = fixture().app_storage();
-        store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        let reserved = store
-            .reserve_recovery_attempt(&fence, 100000, 15000, false)
-            .unwrap()
-            .unwrap();
-        store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
-        assert_eq!(store.recovery_retry_state().unwrap(), reserved);
-        store.mark_account_delivery_recovery("alice", 1, 5).unwrap();
-        assert_ne!(store.recovery_revision_fence().unwrap(), fence);
-        assert_eq!(store.recovery_retry_state().unwrap(), reserved);
-        assert!(
-            store
-                .reserve_recovery_attempt(&fence, 115000, 15000, false)
-                .unwrap()
-                .is_none()
-        );
     }
 }

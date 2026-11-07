@@ -1,4 +1,6 @@
-//! Completion handoff between the account worker and the evidence-only writer.
+//! The evidence-only loss writer and the reads over its generations: the
+//! goal floor and reach the account-open conversion un-covers, and the
+//! constant-size snapshot the app opens an account's overflow guard from.
 use std::collections::BTreeMap;
 
 use super::*;
@@ -216,31 +218,16 @@ impl RecoveryLossReach {
     }
 }
 
-/// Which generations a reach read counts.
-#[derive(Clone, Copy)]
-pub(super) enum ReachOf {
-    /// One cause's generations that still carry debt.
-    Cause(RecoveryLossCause),
-    /// Every generation an import charged after this loss revision, retired
-    /// or not: retiring loss proves nothing about what it reached.
-    ImportedAfter(i64),
-}
-
+/// Where one cause's generations that still carry debt may have lost events.
 pub(super) fn reach(
     conn: &Connection,
     label: &str,
-    of: ReachOf,
+    cause: RecoveryLossCause,
 ) -> StorageResult<RecoveryLossReach> {
-    let (filter, value) = match of {
-        ReachOf::Cause(cause) => (
-            "cause = ?2
+    let counted = "account_label = ?1 AND cause = ?2
                AND (legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)
-               AND (retired_count IS NULL OR retired_count < dropped_count)",
-            cause as i64,
-        ),
-        ReachOf::ImportedAfter(revision) => ("import_revision > ?2", revision),
-    };
-    let counted = format!("account_label = ?1 AND {filter}");
+               AND (retired_count IS NULL OR retired_count < dropped_count)";
+    let value = cause as i64;
     let every_route_from: Option<i64> = conn
         .query_row_cached(
             &format!(
@@ -482,35 +469,7 @@ impl SqliteAppStorage {
         cause: RecoveryLossCause,
     ) -> StorageResult<RecoveryLossReach> {
         let conn = self.lock()?;
-        reach(&conn, label, ReachOf::Cause(cause))
-    }
-
-    /// Where loss of every cause that an import charged after `loss_revision`
-    /// may have lost events, by route: what a checkpoint captured at that
-    /// revision has not seen. Retired loss still counts, since retiring it
-    /// proves nothing. Loss no import has charged yet is left out; its import
-    /// raises the revision first. `None` when an acknowledgment has since
-    /// deleted loss charged after `loss_revision`: where that loss reached is
-    /// no longer known.
-    pub fn recovery_loss_reach_after(
-        &self,
-        label: &str,
-        loss_revision: u64,
-    ) -> StorageResult<Option<RecoveryLossReach>> {
-        let loss_revision = sqlite_integer(loss_revision)?;
-        let conn = self.lock()?;
-        let acknowledged: i64 = conn
-            .query_row_cached(
-                "SELECT acknowledged_import_revision FROM account_recovery_state
-                 WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .storage()?;
-        if acknowledged > loss_revision {
-            return Ok(None);
-        }
-        reach(&conn, label, ReachOf::ImportedAfter(loss_revision)).map(Some)
+        reach(&conn, label, cause)
     }
 
     pub fn recovery_loss_watermarks(
@@ -523,7 +482,7 @@ impl SqliteAppStorage {
     }
 
     /// Read all durable generations with constant Rust memory, retaining only
-    /// a commitment for the later guarded acknowledgment transaction.
+    /// a commitment to them.
     pub fn recovery_loss_snapshot(
         &self,
         label: &str,
@@ -531,128 +490,6 @@ impl SqliteAppStorage {
     ) -> StorageResult<RecoveryLossSnapshot> {
         let conn = self.lock()?;
         snapshot(&conn, label, cause)
-    }
-
-    /// Same guarded handoff as `acknowledge_recovery_loss`, using a constant-size
-    /// snapshot rather than copying every unresolved watermark into the owner.
-    pub fn acknowledge_recovery_loss_snapshot(
-        &self,
-        expected: &RecoveryRevisionFence,
-        obligation_id: [u8; 16],
-        captured: &RecoveryLossSnapshot,
-    ) -> StorageResult<bool> {
-        if captured.is_empty() {
-            return Ok(false);
-        }
-        self.acknowledge_recovery_loss_matching(expected, obligation_id, |conn, label, cause| {
-            Ok(snapshot(conn, label, cause)? == *captured)
-        })
-    }
-
-    /// Run once when constructing the owner, before selecting work. A satisfied
-    /// row with unreclaimed evidence means the prior process could have stopped
-    /// before plane acknowledgment. Rearm conservatively without changing pacing.
-    /// An absent row is a supported low-level retirement, not an interrupted
-    /// owner completion; retaining its watermark does not recreate that demand.
-    pub fn restore_unacknowledged_recovery_loss(&self) -> StorageResult<usize> {
-        self.lock()?
-            .execute_cached(
-                "UPDATE account_recovery_obligations AS o SET state=0, eligibility=1, revision=revision+1
-             WHERE state=1 AND cause IN (0,6) AND EXISTS(
-                 SELECT 1 FROM account_delivery_loss_evidence AS e
-                 WHERE e.account_label=o.account_label
-                 AND e.cause=CASE o.cause WHEN 0 THEN 0 ELSE 1 END)",
-                [],
-            )
-            .storage()
-    }
-
-    /// Call only after the matching plane generation/count is acknowledged and
-    /// every writer for captured tokens has finished. SQL cannot prove that
-    /// external prerequisite. Reclaim the exact captured set after checking the
-    /// satisfied obligation and all invalidation fences; new evidence refuses
-    /// reclamation. Do not publish completion if this returns false or errors.
-    pub fn acknowledge_recovery_loss(
-        &self,
-        expected: &RecoveryRevisionFence,
-        obligation_id: [u8; 16],
-        captured: &[RecoveryLossWatermark],
-    ) -> StorageResult<bool> {
-        if captured.is_empty()
-            || captured
-                .windows(2)
-                .any(|pair| pair[0].marker_token >= pair[1].marker_token)
-        {
-            return Ok(false);
-        }
-        self.acknowledge_recovery_loss_matching(expected, obligation_id, |conn, label, cause| {
-            Ok(watermarks(conn, label, cause)? == captured)
-        })
-    }
-
-    fn acknowledge_recovery_loss_matching(
-        &self,
-        expected: &RecoveryRevisionFence,
-        obligation_id: [u8; 16],
-        matches: impl FnOnce(&Connection, &str, RecoveryLossCause) -> StorageResult<bool>,
-    ) -> StorageResult<bool> {
-        let Some((_, revision)) = expected
-            .obligations
-            .iter()
-            .find(|(id, _)| *id == obligation_id)
-        else {
-            return Ok(false);
-        };
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let current = revision_fence(&conn)?;
-            if current.loss_revision != expected.loss_revision
-                || current.route_revision != expected.route_revision
-                || !plan::no_unimported_loss(&conn)?
-            {
-                return Ok(false);
-            }
-            use rusqlite::OptionalExtension;
-            let row: Option<(String, i64)> = conn
-                .query_row_cached(
-                    "SELECT account_label,cause FROM account_recovery_obligations
-                 WHERE id=?1 AND revision=?2 AND state=1 AND cause IN (0,6)",
-                    params![obligation_id.as_slice(), sqlite_integer(*revision)?],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .storage()?;
-            let Some((label, cause)) = row else {
-                return Ok(false);
-            };
-            let cause = if cause == 0 {
-                RecoveryLossCause::Queue
-            } else {
-                RecoveryLossCause::NotificationConsumer
-            };
-            if !plan::scopes_qualify(&conn, expected, None, obligation_id, 0)? {
-                return Ok(false);
-            }
-            if !matches(&conn, &label, cause)? {
-                return Ok(false);
-            }
-            // The rows say where this loss reached; keep how recent it was.
-            conn.execute_cached(
-                "UPDATE account_recovery_state SET acknowledged_import_revision =
-                    MAX(acknowledged_import_revision, COALESCE(
-                        (SELECT MAX(import_revision) FROM account_delivery_loss_evidence
-                         WHERE account_label=?1 AND cause=?2), 0))
-                 WHERE singleton=1",
-                params![label, cause as i64],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "DELETE FROM account_delivery_loss_evidence WHERE account_label=?1 AND cause=?2",
-                params![label, cause as i64],
-            )
-            .storage()?;
-            Ok(true)
-        })
     }
 }
 
@@ -676,17 +513,38 @@ mod tests {
         assert_eq!(floor(&store), None, "no loss has no bound to certify");
         store
             .app_storage()
-            .mark_account_delivery_recovery_bounded("alice", 7, 1, Some(500))
+            .record_account_recovery_loss_bounded(
+                "alice",
+                RecoveryLossCause::Queue,
+                7,
+                1,
+                1,
+                Some(500),
+            )
             .unwrap();
         assert_eq!(floor(&store), Some(500));
         // A later drop can carry an earlier timestamp, as NIP-59 wraps do.
         store
             .app_storage()
-            .mark_account_delivery_recovery_bounded("alice", 7, 2, Some(300))
+            .record_account_recovery_loss_bounded(
+                "alice",
+                RecoveryLossCause::Queue,
+                7,
+                2,
+                1,
+                Some(300),
+            )
             .unwrap();
         store
             .app_storage()
-            .mark_account_delivery_recovery_bounded("alice", 7, 3, Some(900))
+            .record_account_recovery_loss_bounded(
+                "alice",
+                RecoveryLossCause::Queue,
+                7,
+                3,
+                1,
+                Some(900),
+            )
             .unwrap();
         assert_eq!(floor(&store), Some(300));
         store
@@ -782,12 +640,12 @@ mod tests {
         assert_eq!(reach(NotificationConsumer).floor(&group(9)), Some(0));
 
         // Retired loss reaches nothing.
-        app.synchronize_account_delivery_loss("alice").unwrap();
         store
             .lock()
             .unwrap()
             .execute_batch(
-                "UPDATE account_delivery_loss_evidence SET retired_count = imported_count
+                "UPDATE account_delivery_loss_evidence
+                 SET imported_count = dropped_count, retired_count = dropped_count
                  WHERE cause = 0 AND marker_token IN (8, 9)",
             )
             .unwrap();
@@ -795,96 +653,6 @@ mod tests {
         assert_eq!(left.every_route_from, None);
         assert_eq!(left.floor(&group(1)), Some(500));
         assert_eq!(left.floor(&group(2)), None);
-    }
-
-    /// Each import stamps the generations it charged with the loss revision
-    /// it left, so a checkpoint's revision separates the loss it saw from loss
-    /// imported after it.
-    #[test]
-    fn loss_reach_after_a_revision_is_what_later_imports_charged() {
-        use RecoveryLossCause::{NotificationConsumer, Queue};
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        app.ensure_account_projection("alice").unwrap();
-        let group = |byte| TransportReconciliationRoute::Group([byte; 32]);
-        let after = |revision| {
-            app.recovery_loss_reach_after("alice", revision)
-                .unwrap()
-                .expect("nothing acknowledged")
-        };
-        let import = || {
-            app.synchronize_account_delivery_loss("alice").unwrap();
-            app.recovery_revision_fence().unwrap().loss_revision
-        };
-        app.record_account_recovery_loss_routed(
-            "alice",
-            Queue,
-            7,
-            1,
-            1,
-            Some(500),
-            Some(&[(group(1), 500)]),
-        )
-        .unwrap();
-        assert_eq!(
-            after(0),
-            RecoveryLossReach::default(),
-            "no import charged it"
-        );
-        let first = import();
-        assert_eq!(after(first - 1).floor(&group(1)), Some(500));
-        assert_eq!(after(first), RecoveryLossReach::default());
-
-        app.record_account_recovery_loss_routed(
-            "alice",
-            NotificationConsumer,
-            3,
-            0,
-            1,
-            Some(800),
-            None,
-        )
-        .unwrap();
-        let second = import();
-        assert!(second > first);
-        let newer = after(first);
-        assert_eq!(newer.every_route_from, Some(800));
-        assert_eq!(newer.floor(&group(1)), Some(800), "only the newer loss");
-        assert_eq!(after(second), RecoveryLossReach::default());
-
-        // A newer charge to an older generation stamps all of it again.
-        app.record_account_recovery_loss_routed(
-            "alice",
-            Queue,
-            7,
-            2,
-            1,
-            Some(900),
-            Some(&[(group(2), 900)]),
-        )
-        .unwrap();
-        let third = import();
-        let recharged = after(second);
-        assert_eq!(recharged.every_route_from, None);
-        assert_eq!(recharged.floor(&group(1)), Some(500));
-        assert_eq!(recharged.floor(&group(2)), Some(900));
-        assert_eq!(after(third), RecoveryLossReach::default());
-
-        // Retiring loss carries no debt, but proves nothing about what it
-        // reached.
-        store
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "UPDATE account_delivery_loss_evidence SET retired_count = imported_count",
-            )
-            .unwrap();
-        assert_eq!(
-            app.recovery_loss_reach("alice", Queue).unwrap(),
-            RecoveryLossReach::default()
-        );
-        assert_eq!(after(first).every_route_from, Some(800));
-        assert_eq!(after(first).floor(&group(1)), Some(500));
     }
 
     #[test]
@@ -900,9 +668,6 @@ mod tests {
             .unwrap();
         assert_eq!(before.rows, 512);
         assert_eq!(std::mem::size_of_val(&before), 40);
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        assert_eq!(fence.obligations.len(), 2);
         assert!(
             app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap()
@@ -914,31 +679,81 @@ mod tests {
                 .len(),
             512
         );
-        app.record_account_delivery_loss("alice", 0, 1, 2).unwrap();
+        app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 0, 1, 2)
+            .unwrap();
         assert!(
             app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 != before,
             "the earliest generation is still part of the commitment"
         );
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(app.recovery_revision_fence().unwrap().loss_revision > fence.loss_revision);
         let changed = app
             .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
             .unwrap();
-        app.record_account_delivery_loss("alice", 0, 1, 3).unwrap();
-        app.synchronize_account_delivery_loss("alice").unwrap();
+        app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 0, 1, 3)
+            .unwrap();
         assert!(
             app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 == changed,
-            "duplicate observations cannot create another generation or rearm debt"
+            "a duplicate observation creates no other generation"
         );
         assert_eq!(
             app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 .len(),
             512
+        );
+    }
+
+    /// A generation's evidence survives reopen, and re-observing it raises
+    /// its count monotonically without moving its detection time.
+    #[test]
+    fn loss_evidence_survives_reopen_and_merges_monotonically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loss-evidence.sqlite");
+        let key = crate::SqlCipherKey::raw([0x11; 32]);
+        let generations = |app: &SqliteAppStorage| {
+            let conn = app.lock().unwrap();
+            conn.prepare(
+                "SELECT marker_token, pending_since, dropped_count
+                 FROM account_delivery_loss_evidence WHERE account_label = 'alice'
+                 ORDER BY marker_token",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<(i64, i64, i64)>, _>>()
+            .unwrap()
+        };
+        {
+            let app = SqliteAccountStorage::open_encrypted(&path, &key)
+                .unwrap()
+                .app_storage();
+            app.ensure_account_projection("alice").unwrap();
+            app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 11, 3, 5)
+                .unwrap();
+            app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 11, 7, 9)
+                .unwrap();
+            app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 11, 2, 10)
+                .unwrap();
+            app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 12, 1, 11)
+                .unwrap();
+            assert_eq!(generations(&app), vec![(11, 5, 7), (12, 11, 1)]);
+        }
+        let app = SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
+        assert_eq!(
+            generations(&app),
+            vec![(11, 5, 7), (12, 11, 1)],
+            "restart must retain unresolved loss"
+        );
+        assert_eq!(
+            app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

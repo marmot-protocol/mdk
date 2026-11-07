@@ -1426,8 +1426,15 @@ async fn each_chokepoint_wakes_the_runner() {
     let mut wake = wake(&client);
 
     let floor = unix_now_seconds().saturating_sub(30);
-    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
-        .unwrap();
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        storage_sqlite::RecoveryLossCause::Queue,
+        41,
+        3,
+        unix_now_seconds(),
+        Some(floor),
+    )
+    .unwrap();
     client.synchronize_recovery_loss(&app).unwrap();
     assert!(woken(&mut wake), "loss import");
 
@@ -1961,22 +1968,23 @@ async fn an_upgraded_accounts_old_loss_converts_before_the_runner_covers_it() {
 
     // What a build from before the conversion leaves: the old owner's
     // pending queue loss, its evidence not yet charged to the ledger, and a
-    // conversion it never ran. This build's writer charges a loss as it
-    // records it, so the runner covers that charge first and the evidence
-    // goes back to uncharged; the open above converted before the loss
+    // conversion it never ran. The open above converted before the loss
     // existed, so its marker is rewound. The loss starts inside retention,
     // so the runner can prove all of it.
-    let bound = unix_now_seconds() - HOUR;
-    storage
-        .mark_account_delivery_recovery_bounded("alice", 42, 1, Some(bound))
-        .unwrap();
-    cover(&mut client, &storage).await;
+    let now = unix_now_seconds();
+    let bound = now - HOUR;
     let faults = fault_connection(&client);
     faults
-        .execute(
-            "UPDATE account_delivery_loss_evidence SET imported_count = NULL",
-            [],
-        )
+        .execute_batch(&format!(
+            "INSERT INTO account_delivery_loss_evidence (account_label, cause, marker_token,
+                 pending_since, dropped_count, bound_state, bound_seconds, route_state)
+             VALUES ('alice', 0, 42, {now}, 1, 1, {bound}, 0);
+             INSERT INTO account_recovery_obligations (id, demand_key, cause, account_label,
+                 marker_token, pending_since, dropped_count, created_at_ms, updated_at_ms)
+             VALUES (x'{id}', 'overflow:alice', 0, 'alice', 42, {now}, 1, {ms}, {ms});",
+            id = "42".repeat(16),
+            ms = now * 1000,
+        ))
         .unwrap();
     assert!(queue_loss(&storage));
     assert_eq!(

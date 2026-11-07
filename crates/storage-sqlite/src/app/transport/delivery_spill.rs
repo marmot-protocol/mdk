@@ -258,9 +258,10 @@ impl SqliteAppStorage {
         }))
     }
 
-    /// Remove rows the account cannot admit, record them as queue loss and
-    /// import that loss into a recovery obligation, all in one transaction.
-    /// Any failure leaves the rows in place.
+    /// Remove rows the account cannot admit and record them as queue loss
+    /// evidence, in one transaction. Any failure leaves the rows in place.
+    /// The caller imports the evidence into ledger debt, as it does any other
+    /// loss the writer records.
     pub fn discard_spilled_account_deliveries(
         &self,
         seqs: &[i64],
@@ -305,7 +306,6 @@ impl SqliteAppStorage {
                         now_secs,
                         earliest_created_at,
                     )?;
-                    self.synchronize_account_delivery_loss(account_label)?;
                 }
                 Ok(())
             })
@@ -588,11 +588,8 @@ mod tests {
             .unwrap();
         assert!(due(&app, u64::MAX >> 2).deliveries.is_empty());
         assert!(
-            app.pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|demand| demand.cause == crate::RecoveryCause::QueueLoss),
-            "the loss is already an obligation when the row goes"
+            app.pending_recovery_demands().unwrap().is_empty(),
+            "the discard records evidence only; the runner imports it as ledger debt"
         );
         assert_eq!(
             loss_evidence(&store),
