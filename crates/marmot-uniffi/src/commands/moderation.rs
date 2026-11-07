@@ -293,3 +293,62 @@ impl Marmot {
             .into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moderation_maps_preserve_reason_origin_and_acceptance() {
+        macro_rules! reason {
+            ($ffi:path, $native:path) => {
+                assert_eq!(marmot_app::ReportReason::from($ffi), $native);
+                assert!(matches!(ReportReasonFfi::from($native), $ffi));
+            };
+        }
+        reason!(ReportReasonFfi::Nudity, marmot_app::ReportReason::Nudity);
+        reason!(ReportReasonFfi::Malware, marmot_app::ReportReason::Malware);
+        reason!(
+            ReportReasonFfi::Profanity,
+            marmot_app::ReportReason::Profanity
+        );
+        reason!(ReportReasonFfi::Illegal, marmot_app::ReportReason::Illegal);
+        reason!(ReportReasonFfi::Spam, marmot_app::ReportReason::Spam);
+        reason!(
+            ReportReasonFfi::Impersonation,
+            marmot_app::ReportReason::Impersonation
+        );
+        reason!(ReportReasonFfi::Other, marmot_app::ReportReason::Other);
+        assert_eq!(
+            marmot_app::ModerationReportOrigin::from(ModerationReportOriginFfi::Report),
+            marmot_app::ModerationReportOrigin::Report
+        );
+        assert_eq!(
+            marmot_app::ModerationReportOrigin::from(ModerationReportOriginFfi::BlockAndReport),
+            marmot_app::ModerationReportOrigin::BlockAndReport
+        );
+        macro_rules! outcome {
+            ($native:path, $ffi:path) => {
+                let outcome =
+                    ModerationReportOutcomeFfi::from(marmot_app::ModerationReportOutcome {
+                        report_id: "ab".repeat(16),
+                        status: $native,
+                    });
+                assert_eq!(outcome.report_id, "ab".repeat(16));
+                assert!(matches!(outcome.accept_disposition, $ffi));
+            };
+        }
+        outcome!(
+            marmot_app::ModerationReportStatus::Published,
+            SendAcceptDispositionFfi::Published
+        );
+        outcome!(
+            marmot_app::ModerationReportStatus::AcceptedPending,
+            SendAcceptDispositionFfi::AcceptedPending
+        );
+        outcome!(
+            marmot_app::ModerationReportStatus::CompletionUnknown,
+            SendAcceptDispositionFfi::CompletionUnknown
+        );
+    }
+}
