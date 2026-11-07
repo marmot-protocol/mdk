@@ -446,6 +446,34 @@ fn publish(
 }
 
 #[test]
+fn superseded_slot_refuses_a_present_existing_twin_without_changing_it() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let bytes = b"existing retained twin";
+    let twin = publish(&harness, &store, 0, bytes);
+    let target = harness.target(1);
+    harness.supersede(1);
+    let present = |id, length| {
+        assert_eq!(id, twin);
+        assert_eq!(length, bytes.len() as u64);
+        Ok(FilePresence::Present)
+    };
+    assert_eq!(
+        target
+            .commit_existing(Category::Retained, &Sha256::digest(bytes).into(), &present)
+            .unwrap(),
+        ExistingOutcome::Superseded
+    );
+    assert!(harness.catalog().ready_file(twin).unwrap().is_some());
+    let mut recovered = vec![0; bytes.len()];
+    assert_eq!(
+        store.read_at(&twin, 0, &mut recovered).unwrap(),
+        Some(bytes.len())
+    );
+    assert_eq!(recovered, bytes);
+}
+
+#[test]
 fn references_require_ready_files_and_repointing_releases_the_old_file() {
     let harness = SqliteHarness::memory();
     let store = MediaStore::new(harness.root(), harness.catalog());
