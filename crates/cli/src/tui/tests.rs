@@ -9515,10 +9515,13 @@ fn start_with_explicit_account_enters_main_with_that_accounts_chats() {
         r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{a}","npub":"npub1a","local_signing":true}},{{"account_id":"{b}","npub":"npub1b","local_signing":true}}],"chats":[]}}}}"#
     );
     let (_tempdir, client) = test_json_client(&response);
-    let mut app = test_tui_app(client, &a);
-    app.daemon = DaemonView::default();
-    app.initial_account = Some(b.clone());
-    app.entered_main = false;
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["wn", "--account", b.as_str(), "tui"])
+        .expect("parse explicit startup account");
+    let mut app = TuiApp::new(cli).expect("construct TUI");
+    // Keep constructor-owned startup choices; replace only the child boundary.
+    app.client.exe = client.exe;
+    app.effects = EffectRunner::spawn(app.client.clone());
 
     app.start().expect("start");
 
@@ -14158,11 +14161,18 @@ fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
         tempdir.path(),
         r#"{"ok":true,"result":{"running":true,"pid":4242}}"#,
     );
-    let client = WnClient {
-        exe,
-        discovery_relays: vec!["wss://d.example".to_owned()],
-        ..test_unused_client()
-    };
+    use clap::Parser;
+    let cli = Cli::try_parse_from([
+        "wn",
+        "tui",
+        "--discovery-relays",
+        "wss://d.example,wss://d2.example",
+        "--default-account-relays",
+        "wss://a.example",
+    ])
+    .expect("parse first-run TUI relays");
+    let mut client = WnClient::from_cli(&cli).expect("construct first-run TUI client");
+    client.exe = exe;
     let mut app = test_tui_app(client, &account_id);
     app.daemon = DaemonView::default();
 
@@ -14186,14 +14196,18 @@ fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
     let result = app.recv_daemon_autostart();
     let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
     let args: Vec<&str> = recorded.lines().collect();
-    assert!(
-        args.windows(2).any(|pair| pair == ["daemon", "start"]),
-        "auto-start spawns `daemon start`; got {args:?}"
-    );
-    assert!(
-        args.windows(2)
-            .any(|pair| pair == ["--discovery-relays", "wss://d.example"]),
-        "the TUI relay passthrough reaches the daemon-start child; got {args:?}"
+    assert_eq!(
+        args,
+        [
+            "--json",
+            "daemon",
+            "start",
+            "--discovery-relays",
+            "wss://d.example,wss://d2.example",
+            "--default-account-relays",
+            "wss://a.example",
+        ],
+        "both parsed first-run relay lists reach the daemon-start child"
     );
 
     app.fold_daemon_start(result);
@@ -14654,15 +14668,24 @@ fn wn_client_pipes_secret_stdin_and_forwards_global_options() {
             stdin_file.display()
         ),
     );
-    let client = WnClient {
-        exe,
-        home: Some(PathBuf::from("selected-home")),
-        socket: Some(PathBuf::from("selected-socket")),
-        relay: Some("wss://global.example".to_owned()),
-        secret_store: Some(SecretStoreKind::File),
-        keychain_service: Some("selected-service".to_owned()),
-        ..test_unused_client()
-    };
+    use clap::Parser;
+    let cli = Cli::try_parse_from([
+        "wn",
+        "--home",
+        "selected-home",
+        "--socket",
+        "selected-socket",
+        "--relay",
+        "wss://global.example",
+        "--secret-store",
+        "file",
+        "--keychain-service",
+        "selected-service",
+        "tui",
+    ])
+    .expect("parse TUI settings");
+    let mut client = WnClient::from_cli(&cli).expect("construct TUI command client");
+    client.exe = exe;
     let invocation = account_setup_invocation(Some("nsec1synthetic".to_owned()), None);
     let result = client
         .run_json_with_stdin(
