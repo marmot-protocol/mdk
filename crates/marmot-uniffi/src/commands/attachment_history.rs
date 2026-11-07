@@ -314,14 +314,17 @@ mod tests {
             kit.account_attachment_history_page(
                 account.clone(),
                 excluded_query,
-                1,
+                59,
                 filtered.next_cursor.clone(),
             )
             .await
             .unwrap(),
         );
         assert!(filtered_next.entries.is_empty());
-        assert!(filtered_next.next_cursor.is_some());
+        assert!(
+            filtered_next.next_cursor.is_none(),
+            "a real resume must consume the remaining 59 candidates"
+        );
         assert!(matches!(
             kit.account_attachment_history_page(
                 account.clone(),
@@ -515,6 +518,18 @@ mod tests {
             expected_targets[1]
         );
         assert!(short.next_cursor.is_none());
+        // Exercise the actual exported wrapper's limit, separately from the
+        // frozen constructor snapshot above. No collection-stability claim.
+        let exported = kit
+            .largest_retained_attachments(account.clone(), Some(group.clone()), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(exported.attachments.len(), 1);
+        assert!(
+            exported.next_cursor.is_some(),
+            "a full retained export must preserve the requested limit"
+        );
+
         assert!(matches!(
             kit.attachment_history_page(
                 account.clone(),
