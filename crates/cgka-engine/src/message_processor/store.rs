@@ -434,7 +434,7 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Persist both sent records without advancing the hot cache, so a caller
     /// can include the pair in a larger atomic staging unit.
-    pub(super) fn persist_sent_openmls_message_with_application_stamp(
+    pub(crate) fn persist_sent_openmls_message_with_application_stamp(
         &self,
         msg: &TransportMessage,
         mls_bytes: &[u8],
