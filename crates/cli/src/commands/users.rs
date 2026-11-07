@@ -224,12 +224,6 @@ mod tests {
     /// today.
     #[tokio::test]
     async fn an_account_that_cannot_sign_is_never_asked_for_co_members() {
-        for summary in [account(false, false), account(true, true)] {
-            let seeds = radius_one_seeds(None, &summary, 1)
-                .await
-                .expect("no MLS session means no co-members, not an error");
-            assert!(seeds.is_empty());
-        }
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let url = relay.url().await.to_string();
         let alice_dir = tempfile::tempdir().unwrap();
@@ -239,8 +233,9 @@ mod tests {
         let bob = AccountHome::open(bob_dir.path())
             .create_nostr_account()
             .unwrap();
-        let config =
-            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+        let config = marmot_app::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new());
         let bob_app = MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config.clone());
         bob_app
             .client(&bob.account_id_hex)
@@ -292,10 +287,24 @@ mod tests {
         assert_eq!(found.json["users"][0]["account_id_hex"], bob.account_id_hex);
         assert_eq!(found.json["users"][0]["radius"], 1);
         assert_eq!(found.json["users"][0]["matched_field"], "about");
+        let radius_zero = users_command_with_runtime(
+            &alice_home,
+            &app,
+            &runtime,
+            UsersCommand::Search {
+                query: "co-member-needle".into(),
+                radius: (0, 0),
+            },
+            Some(alice.account_id_hex.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(radius_zero.json["users"].as_array().unwrap().len(), 1);
         assert_eq!(
-            radius_one_seeds(Some(&runtime), &alice, 0).await.unwrap(),
-            Vec::<String>::new(),
+            radius_zero.json["users"][0]["account_id_hex"],
+            bob.account_id_hex
         );
+        assert_eq!(radius_zero.json["users"][0]["radius"], 255);
         alice_home
             .set_account_signed_out(&alice.account_id_hex, true)
             .unwrap();
@@ -347,13 +356,6 @@ mod tests {
 
     /// Radius-1 seeds cannot affect a window that stops at radius 0, so the
     /// per-group membership read is skipped rather than paid for nothing.
-    #[tokio::test]
-    async fn a_radius_zero_window_asks_for_no_co_members() {
-        let seeds = radius_one_seeds(None, &account(true, false), 0)
-            .await
-            .expect("a radius-0 window needs no seeds");
-        assert!(seeds.is_empty());
-    }
 
     #[test]
     fn a_clean_traversal_reports_complete() {
