@@ -541,6 +541,141 @@ impl From<MdNostrHrp> for MarkdownNostrHrpFfi {
 mod tests {
     use super::*;
 
+    fn text(content: &str) -> MarkdownInlineFfi {
+        MarkdownInlineFfi::Text {
+            content: content.into(),
+        }
+    }
+
+    fn paragraph(content: &str) -> MarkdownBlockFfi {
+        MarkdownBlockFfi::Paragraph {
+            inlines: vec![text(content)],
+        }
+    }
+
+    #[test]
+    fn bridges_timestamp_seconds_and_each_display_style() {
+        for (suffix, style) in [
+            ("t", MarkdownTimestampStyleFfi::ShortTime),
+            ("T", MarkdownTimestampStyleFfi::LongTime),
+            ("d", MarkdownTimestampStyleFfi::ShortDate),
+            ("D", MarkdownTimestampStyleFfi::LongDate),
+            ("f", MarkdownTimestampStyleFfi::ShortDateTime),
+            ("F", MarkdownTimestampStyleFfi::LongDateTime),
+            ("s", MarkdownTimestampStyleFfi::CompactDateTime),
+            ("S", MarkdownTimestampStyleFfi::CompactDateTimeSeconds),
+            ("R", MarkdownTimestampStyleFfi::Relative),
+        ] {
+            assert_eq!(
+                parse_markdown_document(&format!("<t:-42:{suffix}>")).blocks,
+                vec![MarkdownBlockFfi::Paragraph {
+                    inlines: vec![MarkdownInlineFfi::Timestamp {
+                        unix_seconds: -42,
+                        style
+                    }]
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn bridges_remaining_block_payloads_and_nested_quote() {
+        for (input, expected) in [
+            (
+                "### title",
+                MarkdownBlockFfi::Heading {
+                    level: 3,
+                    inlines: vec![text("title")],
+                },
+            ),
+            ("---", MarkdownBlockFfi::ThematicBreak),
+            (
+                "    code",
+                MarkdownBlockFfi::CodeBlock {
+                    kind: MarkdownCodeBlockKindFfi::Indented,
+                    info: String::new(),
+                    content: "code\n".into(),
+                },
+            ),
+            (
+                "```rust\nlet x = 1;\n```",
+                MarkdownBlockFfi::CodeBlock {
+                    kind: MarkdownCodeBlockKindFfi::Fenced,
+                    info: "rust".into(),
+                    content: "let x = 1;\n".into(),
+                },
+            ),
+            (
+                "$$\nx+y\n$$",
+                MarkdownBlockFfi::MathBlock {
+                    content: "x+y\n".into(),
+                },
+            ),
+            (
+                "> ## nested",
+                MarkdownBlockFfi::BlockQuote {
+                    blocks: vec![MarkdownBlockFfi::Heading {
+                        level: 2,
+                        inlines: vec![text("nested")],
+                    }],
+                    blank_lines_before: vec![0],
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_markdown_document(input).blocks,
+                vec![expected],
+                "input {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridges_inline_payloads_breaks_and_email_autolink() {
+        for (input, inlines) in [
+            (
+                "a\nb",
+                vec![text("a"), MarkdownInlineFfi::SoftBreak, text("b")],
+            ),
+            (
+                "a  \nb",
+                vec![text("a"), MarkdownInlineFfi::HardBreak, text("b")],
+            ),
+            (
+                "`code`",
+                vec![MarkdownInlineFfi::Code {
+                    content: "code".into(),
+                }],
+            ),
+            (
+                "*em*",
+                vec![MarkdownInlineFfi::Emph {
+                    children: vec![text("em")],
+                }],
+            ),
+            (
+                "$x+y$",
+                vec![MarkdownInlineFfi::Math {
+                    content: "x+y".into(),
+                }],
+            ),
+            (
+                "<a@example.com>",
+                vec![MarkdownInlineFfi::Autolink {
+                    url: "a@example.com".into(),
+                    kind: MarkdownAutolinkKindFfi::Email,
+                    classification: MarkdownLinkDestinationKindFfi::Contact,
+                }],
+            ),
+        ] {
+            assert_eq!(
+                parse_markdown_document(input).blocks,
+                vec![MarkdownBlockFfi::Paragraph { inlines }],
+                "input {input}"
+            );
+        }
+    }
+
     #[test]
     fn parses_empty_document() {
         assert_eq!(parse_markdown_document(""), MarkdownDocumentFfi::default());
@@ -571,74 +706,114 @@ mod tests {
     #[test]
     fn bridges_emphasis_strike_and_link() {
         let document = parse_markdown_document("**bold** ~~gone~~ [site](https://example.com)");
-        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
-            panic!("expected paragraph");
-        };
-        assert!(matches!(inlines[0], MarkdownInlineFfi::Strong { .. }));
-        assert!(matches!(
-            inlines[2],
-            MarkdownInlineFfi::Strikethrough { .. }
-        ));
-        assert!(matches!(
-            inlines[4],
-            MarkdownInlineFfi::Link {
-                ref dest,
-                classification: MarkdownLinkDestinationKindFfi::Web,
-                ..
-            } if dest == "https://example.com"
-        ));
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownBlockFfi::Paragraph {
+                inlines: vec![
+                    MarkdownInlineFfi::Strong {
+                        children: vec![text("bold")]
+                    },
+                    text(" "),
+                    MarkdownInlineFfi::Strikethrough {
+                        children: vec![text("gone")]
+                    },
+                    text(" "),
+                    MarkdownInlineFfi::Link {
+                        dest: "https://example.com".into(),
+                        title: None,
+                        children: vec![text("site")],
+                        classification: MarkdownLinkDestinationKindFfi::Web
+                    },
+                ]
+            }]
+        );
     }
 
     #[test]
     fn bridges_explicit_destination_classification_without_dropping_targets() {
-        let document =
-            parse_markdown_document("[verify](javascript:alert(1)) ![key](nostr:ncryptsec1qqqqqq)");
-        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
-            panic!("expected paragraph");
-        };
-        assert!(matches!(
-            inlines[0],
-            MarkdownInlineFfi::Link {
-                ref dest,
-                classification: MarkdownLinkDestinationKindFfi::Dangerous,
-                ..
-            } if dest == "javascript:alert(1)"
-        ));
-        assert!(matches!(
-            inlines[2],
-            MarkdownInlineFfi::Image {
-                ref dest,
-                classification: MarkdownLinkDestinationKindFfi::Sensitive,
-                ..
-            } if dest == "nostr:ncryptsec1qqqqqq"
-        ));
+        for (destination, classification) in [
+            ("https://example.com", MarkdownLinkDestinationKindFfi::Web),
+            (
+                "mailto:a@example.com",
+                MarkdownLinkDestinationKindFfi::Contact,
+            ),
+            ("marmot://group/abc", MarkdownLinkDestinationKindFfi::App),
+            ("nostr:npub1qqqqqq", MarkdownLinkDestinationKindFfi::Nostr),
+            ("/relative/path", MarkdownLinkDestinationKindFfi::Relative),
+            ("custom:payload", MarkdownLinkDestinationKindFfi::Unknown),
+            (
+                "javascript:alert(1)",
+                MarkdownLinkDestinationKindFfi::Dangerous,
+            ),
+            (
+                "nostr:ncryptsec1qqqqqq",
+                MarkdownLinkDestinationKindFfi::Sensitive,
+            ),
+        ] {
+            let document = parse_markdown_document(&format!(
+                "[**label**]({destination} \"title\") ![*alt*]({destination} \"image\")"
+            ));
+            assert_eq!(
+                document.blocks,
+                vec![MarkdownBlockFfi::Paragraph {
+                    inlines: vec![
+                        MarkdownInlineFfi::Link {
+                            dest: destination.into(),
+                            title: Some("title".into()),
+                            children: vec![MarkdownInlineFfi::Strong {
+                                children: vec![text("label")]
+                            }],
+                            classification
+                        },
+                        text(" "),
+                        MarkdownInlineFfi::Image {
+                            dest: destination.into(),
+                            title: Some("image".into()),
+                            alt: vec![MarkdownInlineFfi::Emph {
+                                children: vec![text("alt")]
+                            }],
+                            classification
+                        },
+                    ]
+                }],
+                "destination {destination}"
+            );
+        }
     }
 
     #[test]
     fn bridges_nostr_entities() {
         let body = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
-        let document = parse_markdown_document(&format!("@npub1{body} nostr:npub1{body}"));
-        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
-            panic!("expected paragraph");
-        };
-        assert!(matches!(
-            inlines[0],
-            MarkdownInlineFfi::NostrMention {
-                entity: MarkdownNostrEntityFfi {
-                    hrp: MarkdownNostrHrpFfi::Npub,
-                    ..
-                }
-            }
-        ));
-        assert!(matches!(
-            inlines[2],
-            MarkdownInlineFfi::NostrUri {
-                entity: MarkdownNostrEntityFfi {
-                    hrp: MarkdownNostrHrpFfi::Npub,
-                    ..
-                }
-            }
-        ));
+        let npub = format!("npub1{body}");
+        assert_eq!(
+            parse_markdown_document(&format!("@{npub}")).blocks,
+            vec![MarkdownBlockFfi::Paragraph {
+                inlines: vec![MarkdownInlineFfi::NostrMention {
+                    entity: MarkdownNostrEntityFfi {
+                        hrp: MarkdownNostrHrpFfi::Npub,
+                        bech32: npub
+                    },
+                }]
+            }]
+        );
+        for (prefix, hrp) in [
+            ("npub", MarkdownNostrHrpFfi::Npub),
+            ("note", MarkdownNostrHrpFfi::Note),
+            ("nevent", MarkdownNostrHrpFfi::Nevent),
+            ("nprofile", MarkdownNostrHrpFfi::Nprofile),
+            ("naddr", MarkdownNostrHrpFfi::Naddr),
+            ("nrelay", MarkdownNostrHrpFfi::Nrelay),
+        ] {
+            let bech32 = format!("{prefix}1{body}");
+            assert_eq!(
+                parse_markdown_document(&format!("nostr:{bech32}")).blocks,
+                vec![MarkdownBlockFfi::Paragraph {
+                    inlines: vec![MarkdownInlineFfi::NostrUri {
+                        entity: MarkdownNostrEntityFfi { hrp, bech32 },
+                    }]
+                }]
+            );
+        }
     }
 
     #[test]
@@ -652,7 +827,7 @@ mod tests {
             MarkdownInlineFfi::Autolink {
                 ref url,
                 classification: MarkdownLinkDestinationKindFfi::App,
-                ..
+                kind: MarkdownAutolinkKindFfi::Uri,
             } if url == "marmot://profile/npub1abc"
         ));
     }
@@ -699,30 +874,95 @@ mod tests {
 
     #[test]
     fn bridges_table() {
-        let document = parse_markdown_document("| a | b |\n| :- | -: |\n| 1 | 2 |");
-        assert!(matches!(
-            document.blocks[0],
-            MarkdownBlockFfi::Table {
-                ref alignments,
-                ref header,
-                ref rows,
-            } if alignments == &[MarkdownAlignmentFfi::Left, MarkdownAlignmentFfi::Right]
-                && header.len() == 2
-                && rows.len() == 1
-        ));
+        let document = parse_markdown_document(
+            "| **a** | b | c | d |\n| :- | :-: | -: | -- |\n| 1 | `2` | 3 | 4 |",
+        );
+        let cell = |inlines| MarkdownTableCellFfi { inlines };
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownBlockFfi::Table {
+                alignments: vec![
+                    MarkdownAlignmentFfi::Left,
+                    MarkdownAlignmentFfi::Center,
+                    MarkdownAlignmentFfi::Right,
+                    MarkdownAlignmentFfi::None
+                ],
+                header: vec![
+                    cell(vec![MarkdownInlineFfi::Strong {
+                        children: vec![text("a")]
+                    }]),
+                    cell(vec![text("b")]),
+                    cell(vec![text("c")]),
+                    cell(vec![text("d")])
+                ],
+                rows: vec![vec![
+                    cell(vec![text("1")]),
+                    cell(vec![MarkdownInlineFfi::Code {
+                        content: "2".into()
+                    }]),
+                    cell(vec![text("3")]),
+                    cell(vec![text("4")])
+                ]],
+            }]
+        );
     }
 
     #[test]
     fn bridges_bullet_list() {
-        let document = parse_markdown_document("- a\n- b");
-        assert!(matches!(
-            document.blocks[0],
-            MarkdownBlockFfi::ListBlock {
-                kind: MarkdownListKindFfi::Bullet { ref marker },
-                ref items,
-                ..
-            } if marker == "-" && items.len() == 2
-        ));
+        for marker in ["-", "*", "+"] {
+            let document = parse_markdown_document(&format!("{marker} [ ] a\n{marker} [x] b"));
+            assert_eq!(
+                document.blocks,
+                vec![MarkdownBlockFfi::ListBlock {
+                    kind: MarkdownListKindFfi::Bullet {
+                        marker: marker.into()
+                    },
+                    tight: true,
+                    items: vec![
+                        MarkdownListItemFfi {
+                            blocks: vec![paragraph("a")],
+                            checked: Some(false),
+                            blank_lines_before: vec![0]
+                        },
+                        MarkdownListItemFfi {
+                            blocks: vec![paragraph("b")],
+                            checked: Some(true),
+                            blank_lines_before: vec![0]
+                        }
+                    ],
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn bridges_ordered_list_start_delimiter_and_loose_items() {
+        for delimiter in [".", ")"] {
+            let document =
+                parse_markdown_document(&format!("7{delimiter} alpha\n\n8{delimiter} beta"));
+            assert_eq!(
+                document.blocks,
+                vec![MarkdownBlockFfi::ListBlock {
+                    kind: MarkdownListKindFfi::Ordered {
+                        start: 7,
+                        delimiter: delimiter.into()
+                    },
+                    tight: false,
+                    items: vec![
+                        MarkdownListItemFfi {
+                            blocks: vec![paragraph("alpha")],
+                            checked: None,
+                            blank_lines_before: vec![0]
+                        },
+                        MarkdownListItemFfi {
+                            blocks: vec![paragraph("beta")],
+                            checked: None,
+                            blank_lines_before: vec![0]
+                        }
+                    ],
+                }]
+            );
+        }
     }
 
     #[test]
@@ -746,28 +986,27 @@ mod tests {
 
     #[test]
     fn bridges_details_block() {
-        let document = parse_markdown_document(
-            "<details>\n<summary>Tap to expand</summary>\nHidden body **bold**\n</details>",
-        );
-        let MarkdownBlockFfi::Details {
-            summary,
-            open,
-            body,
-            blank_lines_before,
-        } = &document.blocks[0]
-        else {
-            panic!("expected details");
-        };
-        assert!(!open);
-        assert!(matches!(
-            &summary[0],
-            MarkdownInlineFfi::Text { content } if content == "Tap to expand"
-        ));
-        assert_eq!(blank_lines_before, &[0]);
-        let MarkdownBlockFfi::Paragraph { inlines } = &body[0] else {
-            panic!("expected body paragraph");
-        };
-        assert!(matches!(inlines[1], MarkdownInlineFfi::Strong { .. }));
+        for (attribute, open) in [("", false), (" open", true)] {
+            let document = parse_markdown_document(&format!(
+                "<details{attribute}>\n<summary>Tap to expand</summary>\nHidden body **bold**\n</details>"
+            ));
+            assert_eq!(
+                document.blocks,
+                vec![MarkdownBlockFfi::Details {
+                    summary: vec![text("Tap to expand")],
+                    open,
+                    body: vec![MarkdownBlockFfi::Paragraph {
+                        inlines: vec![
+                            text("Hidden body "),
+                            MarkdownInlineFfi::Strong {
+                                children: vec![text("bold")]
+                            }
+                        ]
+                    }],
+                    blank_lines_before: vec![0],
+                }]
+            );
+        }
     }
 
     #[test]
