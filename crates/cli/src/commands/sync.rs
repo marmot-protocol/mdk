@@ -173,6 +173,23 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let failure = SyncFailure::new(
             SyncSummary {
+                joined_groups: vec![GroupId::new(vec![3; 16])],
+                events: vec![
+                    cgka_traits::GroupEvent::GroupCreated {
+                        group_id: GroupId::new(vec![3; 16])
+                    };
+                    2
+                ],
+                projection_updates: vec![
+                    marmot_app::AppProjectionUpdate {
+                        group_id_hex: "03".repeat(16),
+                        timeline_messages: Vec::new(),
+                        timeline_changes: Vec::new(),
+                        chat_list_row: None,
+                        chat_list_trigger: Default::default(),
+                    };
+                    3
+                ],
                 messages: vec![ReceivedMessage {
                     authority: None,
                     message_id_hex: "11".repeat(32),
@@ -193,7 +210,6 @@ mod tests {
                     stalled_epoch: 7,
                     arms: 3,
                 }],
-                ..Default::default()
             },
             AppError::BlockingTask("injected sync failure".to_owned()),
         );
@@ -207,11 +223,24 @@ mod tests {
             rendered["partial"]["messages"][0]["plaintext"],
             "durable before sync failure"
         );
+        assert_eq!(
+            rendered["partial"]["joined_groups"],
+            json!(["03".repeat(16)])
+        );
+        assert_eq!(rendered["partial"]["events"], 2);
+        assert_eq!(rendered["partial"]["projection_updates"], 3);
         assert_eq!(rendered["partial"]["epoch_stall_escalations"], 1);
         assert_eq!(error.to_string(), "sync failed");
         assert!(!format!("{error:?}").contains("durable before sync failure"));
         let plain = crate::command_output_result(false, Err(error));
         assert!(plain.stderr.contains("durable before sync failure"));
+        assert!(
+            plain
+                .stderr
+                .contains(&format!("joined group {}", "03".repeat(16)))
+        );
+        assert!(plain.stderr.contains("processed 2 event(s)"));
+        assert!(plain.stderr.contains("processed 3 projection update(s)"));
         assert!(
             plain
                 .stderr
