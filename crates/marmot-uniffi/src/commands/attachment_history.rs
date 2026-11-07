@@ -71,8 +71,10 @@ impl Marmot {
 mod tests {
     use super::*;
     use crate::conversions::{
-        AttachmentCategoryFfi, AttachmentHistoryChangeFfi, AttachmentPageFfi,
-        MediaAttachmentOutcomeFfi, MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi,
+        AccountAttachmentPageFfi, AccountAttachmentPageReadFfi, AccountAttachmentQueryFfi,
+        AttachmentCategoryFfi, AttachmentHistoryChangeFfi, AttachmentLocalTargetFfi,
+        AttachmentPageFfi, AttachmentTransferStateFfi, MediaAttachmentOutcomeFfi,
+        MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, RetainedAttachmentsPageFfi,
     };
     use cgka_traits::TransportEndpoint;
     use marmot_app::{AccountSetupRequest, MarmotApp};
@@ -85,10 +87,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let base = url.clone();
+        let blobs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Vec<u8>,
+        >::new()));
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let base = base.clone();
+                let blobs = blobs.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -101,6 +108,29 @@ mod tests {
                         }
                     };
                     let headers = String::from_utf8_lossy(&request[..end]);
+                    if headers.starts_with("GET /") {
+                        let hash = headers
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap()
+                            .trim_start_matches('/');
+                        let body = blobs
+                            .lock()
+                            .unwrap()
+                            .get(hash)
+                            .expect("GET must address a real uploaded ciphertext")
+                            .clone();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        socket.write_all(&body).await.unwrap();
+                        return;
+                    }
                     assert!(headers.starts_with("PUT /upload "));
                     let header = |name: &str| {
                         headers
@@ -119,6 +149,10 @@ mod tests {
                         assert_ne!(n, 0);
                         request.extend_from_slice(&buf[..n]);
                     }
+                    blobs
+                        .lock()
+                        .unwrap()
+                        .insert(hash.clone(), request[end..end + len].to_vec());
                     let body = serde_json::json!({"url": format!("{base}/{hash}"), "sha256": hash,
                         "size": len, "type": "application/octet-stream", "uploaded": 1})
                     .to_string();
@@ -135,6 +169,12 @@ mod tests {
     fn page(value: AttachmentPageReadFfi) -> AttachmentPageFfi {
         let AttachmentPageReadFfi::Page { page } = value else {
             panic!("expected page: {value:?}")
+        };
+        page
+    }
+    fn account_page(value: AccountAttachmentPageReadFfi) -> AccountAttachmentPageFfi {
+        let AccountAttachmentPageReadFfi::Page { page } = value else {
+            panic!("expected account page: {value:?}")
         };
         page
     }
@@ -197,7 +237,7 @@ mod tests {
                         .collect(),
                     caption: None,
                     send: false,
-                    blossom_server: Some(server),
+                    blossom_server: Some(server.clone()),
                     message_tags: Vec::new(),
                 },
             )
@@ -231,6 +271,98 @@ mod tests {
                 .unwrap(),
         );
         assert!(first.has_more);
+        let account_first = account_page(
+            kit.account_attachment_history_page(
+                account.clone(),
+                AccountAttachmentQueryFfi::default(),
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(account_first.entries.len(), 1);
+        assert_eq!(account_first.entries[0].group_id_hex, group);
+        assert_eq!(
+            account_first.entries[0].entry.message_id_hex,
+            first.entries[0].message_id_hex
+        );
+        assert!(account_first.next_cursor.is_some());
+        let account_baseline = account_first.version.clone();
+        assert_eq!(
+            kit.account_attachment_history_version(account.clone())
+                .await
+                .unwrap()
+                .change_since(account_baseline.clone()),
+            AttachmentHistoryChangeFfi::Unchanged
+        );
+        let excluded_query = AccountAttachmentQueryFfi {
+            groups: vec!["ab".repeat(16)],
+            ..Default::default()
+        };
+        let filtered = account_page(
+            kit.account_attachment_history_page(account.clone(), excluded_query.clone(), 1, None)
+                .await
+                .unwrap(),
+        );
+        assert!(filtered.entries.is_empty());
+        assert!(
+            filtered.next_cursor.is_some(),
+            "a filtered empty page still has an authoritative continuation"
+        );
+        let filtered_next = account_page(
+            kit.account_attachment_history_page(
+                account.clone(),
+                excluded_query,
+                59,
+                filtered.next_cursor.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(filtered_next.entries.is_empty());
+        assert!(
+            filtered_next.next_cursor.is_none(),
+            "a real resume must consume the remaining 59 candidates"
+        );
+        assert!(matches!(
+            kit.account_attachment_history_page(
+                account.clone(),
+                AccountAttachmentQueryFfi::default(),
+                1,
+                filtered.next_cursor
+            )
+            .await
+            .unwrap(),
+            AccountAttachmentPageReadFfi::CursorMismatch
+        ));
+        assert!(matches!(
+            kit.account_attachment_history_page(
+                account.clone(),
+                AccountAttachmentQueryFfi {
+                    groups: vec!["invalid!".into()],
+                    ..Default::default()
+                },
+                1,
+                None
+            )
+            .await
+            .unwrap(),
+            AccountAttachmentPageReadFfi::InvalidQuery
+        ));
+        for limit in [0, 101] {
+            assert!(matches!(
+                kit.account_attachment_history_page(
+                    account.clone(),
+                    AccountAttachmentQueryFfi::default(),
+                    limit,
+                    None
+                )
+                .await
+                .unwrap(),
+                AccountAttachmentPageReadFfi::InvalidLimit
+            ));
+        }
         let baseline = first.version.clone();
         assert_eq!(
             kit.attachment_history_version(account.clone(), group.clone())
@@ -241,6 +373,7 @@ mod tests {
         );
         let mut current = first.clone();
         let mut seen = HashSet::new();
+        let mut retained_targets = Vec::new();
         loop {
             assert_eq!(current.entries.len(), 1);
             let entry = &current.entries[0];
@@ -259,6 +392,13 @@ mod tests {
                     AttachmentCategoryFfi::Audio
                 }
             );
+            if retained_targets.len() < 2 {
+                retained_targets.push(AttachmentLocalTargetFfi {
+                    message_id_hex: entry.message_id_hex.clone(),
+                    source_message_id_hex: entry.source_message_id_hex.clone(),
+                    attachment_index: *attachment_index,
+                });
+            }
             assert_eq!(Some(reference.source_epoch), entry.source_epoch);
             assert!(seen.insert((entry.message_id_hex.clone(), *attachment_index)));
             assert_eq!(current.has_more, current.next_cursor.is_some());
@@ -273,6 +413,123 @@ mod tests {
             assert!(seen.len() < 61);
         }
         assert_eq!(seen.len(), 60);
+        // Acquire two actual source slots before reading their native summaries.
+        // Outgoing retention is optional and may not have finished at this point.
+        // The peer serves the exact encrypted bytes received by the real upload.
+        for target in &retained_targets {
+            kit.request_explicit_attachment(account.clone(), group.clone(), target.clone())
+                .await
+                .unwrap()
+                .expect("an accepted source slot admits explicit demand");
+        }
+        let transfers = kit
+            .subscribe_attachment_transfers(
+                account.clone(),
+                group.clone(),
+                retained_targets.clone(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let snapshot = transfers
+                    .next()
+                    .await
+                    .unwrap()
+                    .expect("live acquisition observation");
+                assert_eq!(snapshot.items.len(), 2);
+                if snapshot
+                    .items
+                    .iter()
+                    .all(|item| matches!(item.state, AttachmentTransferStateFfi::Ready))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("two real attachment slots must become ready");
+        transfers.cancel();
+        let assets = kit
+            .attachment_local_assets(account.clone(), group.clone(), retained_targets)
+            .await
+            .unwrap();
+        assert_eq!(assets.len(), 2);
+        assert!(
+            assets
+                .iter()
+                .all(|asset| asset.reference.is_some() && asset.byte_count == 18)
+        );
+        // Freeze one actual native snapshot for the manual full/short constructor;
+        // this does not assert completeness of the background retained collection.
+        let captured = kit
+            .runtime
+            .largest_retained_attachments(
+                &account,
+                Some(&cgka_traits::GroupId::new(hex::decode(&group).unwrap())),
+                None,
+                64,
+            )
+            .await
+            .unwrap();
+        assert!(
+            captured.len() >= 2,
+            "the two acquired slots must produce actual retained summaries"
+        );
+        let full = RetainedAttachmentsPageFfi::new(captured[..2].to_vec(), 2);
+        assert_eq!(full.attachments.len(), 2);
+        let expected_targets: Vec<_> = captured[..2]
+            .iter()
+            .map(|entry| {
+                (
+                    entry.target.message_id_hex.clone(),
+                    entry.target.source_message_id_hex.clone(),
+                    entry.target.attachment_index,
+                )
+            })
+            .collect();
+        assert_ne!(expected_targets[0], expected_targets[1]);
+        assert_eq!(
+            full.attachments
+                .iter()
+                .map(|entry| (
+                    entry.target.message_id_hex.clone(),
+                    entry.target.source_message_id_hex.clone(),
+                    entry.target.attachment_index,
+                ))
+                .collect::<Vec<_>>(),
+            expected_targets,
+            "retained summary order and original source slots must survive the bridge"
+        );
+        assert!(full.attachments.iter().all(|entry| entry.byte_count == 18));
+        let cursor = full
+            .next_cursor
+            .expect("a full retained page must continue");
+        assert_eq!(cursor.inner, captured[1].cursor);
+        assert_ne!(cursor.inner, captured[0].cursor);
+        let short = RetainedAttachmentsPageFfi::new(vec![captured[1].clone()], 2);
+        assert_eq!(short.attachments.len(), 1);
+        assert_eq!(
+            (
+                short.attachments[0].target.message_id_hex.clone(),
+                short.attachments[0].target.source_message_id_hex.clone(),
+                short.attachments[0].target.attachment_index
+            ),
+            expected_targets[1]
+        );
+        assert!(short.next_cursor.is_none());
+        // Exercise the actual exported wrapper's limit, separately from the
+        // frozen constructor snapshot above. No collection-stability claim.
+        let exported = kit
+            .largest_retained_attachments(account.clone(), Some(group.clone()), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(exported.attachments.len(), 1);
+        assert!(
+            exported.next_cursor.is_some(),
+            "a full retained export must preserve the requested limit"
+        );
+
         assert!(matches!(
             kit.attachment_history_page(
                 account.clone(),
@@ -297,6 +554,17 @@ mod tests {
             .entries
             .is_empty()
         );
+        assert!(matches!(
+            kit.account_attachment_history_page(
+                other.clone(),
+                AccountAttachmentQueryFfi::default(),
+                1,
+                account_first.next_cursor.clone()
+            )
+            .await
+            .unwrap(),
+            AccountAttachmentPageReadFfi::CursorMismatch
+        ));
         assert!(matches!(
             kit.attachment_history_page(other, group.clone(), 1, first.next_cursor.clone())
                 .await
@@ -331,6 +599,24 @@ mod tests {
                 .change_since(baseline.clone()),
             AttachmentHistoryChangeFfi::Additions
         );
+        assert_eq!(
+            kit.account_attachment_history_version(account.clone())
+                .await
+                .unwrap()
+                .change_since(account_baseline.clone()),
+            AttachmentHistoryChangeFfi::Additions
+        );
+        assert!(matches!(
+            kit.account_attachment_history_page(
+                account.clone(),
+                AccountAttachmentQueryFfi::default(),
+                1,
+                account_first.next_cursor.clone()
+            )
+            .await
+            .unwrap(),
+            AccountAttachmentPageReadFfi::Page { .. }
+        ));
         assert!(matches!(
             kit.attachment_history_page(
                 account.clone(),
@@ -353,6 +639,24 @@ mod tests {
                 .change_since(baseline),
             AttachmentHistoryChangeFfi::RestartRequired
         );
+        assert_eq!(
+            kit.account_attachment_history_version(account.clone())
+                .await
+                .unwrap()
+                .change_since(account_baseline),
+            AttachmentHistoryChangeFfi::RestartRequired
+        );
+        assert!(matches!(
+            kit.account_attachment_history_page(
+                account.clone(),
+                AccountAttachmentQueryFfi::default(),
+                1,
+                account_first.next_cursor
+            )
+            .await
+            .unwrap(),
+            AccountAttachmentPageReadFfi::RestartRequired
+        ));
         assert!(matches!(
             kit.attachment_history_page(account.clone(), group.clone(), 1, first.next_cursor)
                 .await
@@ -366,7 +670,50 @@ mod tests {
         );
         assert_eq!(fresh.entries.len(), 59);
         assert!(fresh.entries.iter().all(|e| e.message_id_hex != deleted));
+        // A real retention-bearing send produces the otherwise opaque expiry
+        // token; this checks only that the account-page wrapper exposes it.
+        kit.update_message_retention(account.clone(), group.clone(), 3600)
+            .await
+            .unwrap();
+        kit.upload_media(
+            account.clone(),
+            group.clone(),
+            MediaUploadRequestFfi {
+                attachments: vec![MediaUploadAttachmentRequestFfi {
+                    file_name: "expiring.pdf".into(),
+                    media_type: "application/pdf".into(),
+                    plaintext: b"expiring attachment fixture".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: Some("expiring attachment".into()),
+                send: true,
+                blossom_server: Some(server),
+                message_tags: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let native_expiry = kit
+            .runtime
+            .account_attachment_history_version(&account)
+            .await
+            .unwrap()
+            .next_expiry
+            .expect("the actual expiring send must produce an expiry token");
+        let expiring = account_page(
+            kit.account_attachment_history_page(
+                account.clone(),
+                AccountAttachmentQueryFfi::default(),
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(expiring.next_expiry, Some(native_expiry));
         upload_task.abort();
+        let _ = upload_task.await;
         kit.shutdown_and_close().await.unwrap();
         assert!(matches!(
             kit.attachment_history_page(account, group, 1, None).await,
