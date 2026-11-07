@@ -1014,7 +1014,12 @@ mod group_state_tests {
         let self_id = &accounts[0];
         let other_id = &accounts[1];
         let group = runtime
-            .create_group(self_id, "conversion producer", &[other_id.clone()], None)
+            .create_group(
+                self_id,
+                "conversion producer",
+                std::slice::from_ref(other_id),
+                None,
+            )
             .await
             .unwrap();
         runtime
