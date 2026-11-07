@@ -981,7 +981,7 @@ mod group_state_tests {
 
     async fn group_details_from_public_snapshot() {
         use cgka_traits::TransportEndpoint;
-        use marmot_app::{AccountSetupRequest, MarmotApp, MarmotAppConfig};
+        use marmot_app::{AccountSetupRequest, AppCreateGroupOptions, MarmotApp, MarmotAppConfig};
 
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
@@ -993,7 +993,7 @@ mod group_state_tests {
         );
         let runtime = app.runtime();
         let mut accounts = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             accounts.push(
                 runtime
                     .create_identity(AccountSetupRequest {
@@ -1011,12 +1011,16 @@ mod group_state_tests {
         }
         let self_id = &accounts[0];
         let other_id = &accounts[1];
+        let ordinary_id = &accounts[2];
         let group = runtime
-            .create_group(
+            .create_group_with_options(
                 self_id,
                 "conversion producer",
-                std::slice::from_ref(other_id),
-                None,
+                &[other_id.clone(), ordinary_id.clone()],
+                AppCreateGroupOptions {
+                    initial_admins: vec![other_id.clone()],
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -1046,7 +1050,10 @@ mod group_state_tests {
         );
         // Optional directory data is independent of canonical roster roles.
         // This contrast supplies only that cache result, not group/MLS fields.
-        snapshot.display_names = HashMap::from([(self_id.clone(), "Alice".into())]);
+        snapshot.display_names = HashMap::from([
+            (self_id.clone(), "Alice".into()),
+            (other_id.clone(), "Bob".into()),
+        ]);
         let mut details = group_details_from_conversation_snapshot_ffi(snapshot).unwrap();
         let own = details
             .members
@@ -1058,12 +1065,20 @@ mod group_state_tests {
             .iter()
             .find(|m| m.member_id_hex == *other_id)
             .unwrap();
+        let ordinary = details
+            .members
+            .iter()
+            .find(|m| m.member_id_hex == *ordinary_id)
+            .unwrap();
         assert!(own.is_admin);
         assert!(own.is_self);
         assert_eq!(own.display_name.as_deref(), Some("Alice"));
-        assert!(!other.is_admin);
+        assert!(other.is_admin);
         assert!(!other.is_self);
-        assert_eq!(other.display_name, None);
+        assert_eq!(other.display_name.as_deref(), Some("Bob"));
+        assert!(!ordinary.is_admin);
+        assert!(!ordinary.is_self);
+        assert_eq!(ordinary.display_name, None);
         assert_eq!(
             details.mls_state.lifecycle_state,
             GroupLifecycleStateFfi::Stable
@@ -1079,7 +1094,14 @@ mod group_state_tests {
             pending.lifecycle_state,
             GroupLifecycleStateFfi::PendingPublish
         );
-        assert!(!pending.can_disband);
+        assert_eq!(
+            (
+                pending.can_invite,
+                pending.is_self_admin,
+                pending.can_disband
+            ),
+            (true, true, false)
+        );
         details.mls_state.lifecycle_state = GroupLifecycleStateFfi::Stable;
 
         {
@@ -1093,6 +1115,10 @@ mod group_state_tests {
                 (true, true, true)
             );
             details.group.self_membership = marmot_app::SelfMembership::DeviceRemoved.into();
+            assert_eq!(
+                details.group.self_membership,
+                SelfMembershipFfi::DeviceRemoved
+            );
             let removed = group_management_state_ffi(self_id, &details);
             assert_eq!(
                 (
