@@ -273,3 +273,194 @@ impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_terminal_reasons_preserve_both_host_views() {
+        for (native, expected) in [
+            (
+                DeviceLinkEndReason::Cancelled,
+                DeviceLinkEndReasonFfi::Cancelled,
+            ),
+            (
+                DeviceLinkEndReason::CancelledElsewhere,
+                DeviceLinkEndReasonFfi::CancelledElsewhere,
+            ),
+            (
+                DeviceLinkEndReason::CodesDiffer,
+                DeviceLinkEndReasonFfi::CodesDiffer,
+            ),
+            (
+                DeviceLinkEndReason::VerificationFailed,
+                DeviceLinkEndReasonFfi::VerificationFailed,
+            ),
+            (
+                DeviceLinkEndReason::TimedOut,
+                DeviceLinkEndReasonFfi::TimedOut,
+            ),
+            (
+                DeviceLinkEndReason::AnsweredElsewhere,
+                DeviceLinkEndReasonFfi::AnsweredElsewhere,
+            ),
+            (
+                DeviceLinkEndReason::CannotLink,
+                DeviceLinkEndReasonFfi::CannotLink,
+            ),
+            (
+                DeviceLinkEndReason::Rejected,
+                DeviceLinkEndReasonFfi::Rejected,
+            ),
+            (
+                DeviceLinkEndReason::LinkFailed,
+                DeviceLinkEndReasonFfi::LinkFailed,
+            ),
+        ] {
+            assert_eq!(
+                NewDeviceLinkStateFfi::from(NewDeviceLinkState::Ended { reason: native }),
+                NewDeviceLinkStateFfi::Ended { reason: expected }
+            );
+            assert_eq!(
+                DeviceLinkPromptStateFfi::from(DeviceLinkPromptState::Ended { reason: native }),
+                DeviceLinkPromptStateFfi::Ended { reason: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_progress_states_remain_distinct() {
+        for (native, expected) in [
+            (
+                NewDeviceLinkState::WaitingForAnswer,
+                NewDeviceLinkStateFfi::WaitingForAnswer,
+            ),
+            (
+                NewDeviceLinkState::WaitingForOtherDevice,
+                NewDeviceLinkStateFfi::WaitingForOtherDevice,
+            ),
+            (NewDeviceLinkState::Joining, NewDeviceLinkStateFfi::Joining),
+            (NewDeviceLinkState::Linked, NewDeviceLinkStateFfi::Linked),
+        ] {
+            assert_eq!(NewDeviceLinkStateFfi::from(native), expected);
+        }
+        for (native, expected) in [
+            (
+                DeviceLinkPromptState::Preparing,
+                DeviceLinkPromptStateFfi::Preparing,
+            ),
+            (
+                DeviceLinkPromptState::CompetingRequests,
+                DeviceLinkPromptStateFfi::CompetingRequests,
+            ),
+            (
+                DeviceLinkPromptState::TooManyDevices,
+                DeviceLinkPromptStateFfi::TooManyDevices,
+            ),
+            (
+                DeviceLinkPromptState::Linking,
+                DeviceLinkPromptStateFfi::Linking,
+            ),
+            (
+                DeviceLinkPromptState::Linked,
+                DeviceLinkPromptStateFfi::Linked,
+            ),
+        ] {
+            assert_eq!(DeviceLinkPromptStateFfi::from(native), expected);
+        }
+    }
+
+    fn code() -> Vec<DeviceLinkEmoji> {
+        // Seven standard SAS symbols exercise order and screen-reader labels.
+        [
+            ("🐶", "Dog"),
+            ("🐱", "Cat"),
+            ("🦁", "Lion"),
+            ("🐎", "Horse"),
+            ("🦄", "Unicorn"),
+            ("🐷", "Pig"),
+            ("🐘", "Elephant"),
+        ]
+        .into_iter()
+        .map(|(emoji, description)| DeviceLinkEmoji {
+            emoji: emoji.into(),
+            description: description.into(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn pairing_prompt_payloads_preserve_codes_order_and_context() {
+        let NewDeviceLinkStateFfi::Comparing { code: new_code } =
+            NewDeviceLinkStateFfi::from(NewDeviceLinkState::Comparing { code: code() })
+        else {
+            panic!("expected comparison on the new device")
+        };
+        let DeviceLinkPromptStateFfi::Comparing { code: prompt_code } =
+            DeviceLinkPromptStateFfi::from(DeviceLinkPromptState::Comparing { code: code() })
+        else {
+            panic!("expected comparison on the answering device")
+        };
+        for projected in [new_code, prompt_code] {
+            assert_eq!(
+                projected
+                    .iter()
+                    .map(|item| (item.emoji.as_str(), item.description.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("🐶", "Dog"),
+                    ("🐱", "Cat"),
+                    ("🦁", "Lion"),
+                    ("🐎", "Horse"),
+                    ("🦄", "Unicorn"),
+                    ("🐷", "Pig"),
+                    ("🐘", "Elephant")
+                ]
+            );
+        }
+        assert_eq!(
+            DeviceLinkPromptStateFfi::from(DeviceLinkPromptState::RateLimited { retry_at: 135 }),
+            DeviceLinkPromptStateFfi::RateLimited { retry_at: 135 }
+        );
+        assert_eq!(
+            DeviceLinkPromptStateFfi::from(DeviceLinkPromptState::CannotLink {
+                missing: vec!["app_component:0x8004".into(), "app_component:0x800e".into()]
+            }),
+            DeviceLinkPromptStateFfi::CannotLink {
+                missing: vec!["app_component:0x8004".into(), "app_component:0x800e".into()]
+            }
+        );
+        assert_eq!(
+            DeviceLinkPromptStateFfi::from(DeviceLinkPromptState::AddedElsewhere {
+                device_label: "Tablet".into(),
+                added_by_label: "Laptop".into()
+            }),
+            DeviceLinkPromptStateFfi::AddedElsewhere {
+                device_label: "Tablet".into(),
+                added_by_label: "Laptop".into()
+            }
+        );
+    }
+
+    #[test]
+    fn device_group_move_stages_keep_admission_and_completion_distinct() {
+        for (native, expected) in [
+            (
+                DeviceGroupMoveState::WaitingForWelcome,
+                DeviceGroupMoveStateFfi::WaitingForWelcome,
+            ),
+            (
+                DeviceGroupMoveState::Joining,
+                DeviceGroupMoveStateFfi::Joining,
+            ),
+            (DeviceGroupMoveState::Made, DeviceGroupMoveStateFfi::Made),
+            (
+                DeviceGroupMoveState::Failed,
+                DeviceGroupMoveStateFfi::Failed,
+            ),
+        ] {
+            assert_eq!(DeviceGroupMoveStateFfi::from(native), expected);
+        }
+    }
+}

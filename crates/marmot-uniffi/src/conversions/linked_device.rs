@@ -85,3 +85,23 @@ impl From<LinkedDevice> for LinkedDeviceFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linked_device_statuses_preserve_roster_outcomes() {
+        for (native, expected) in [
+            (LinkedDeviceStatus::Active, LinkedDeviceStatusFfi::Active),
+            (
+                LinkedDeviceStatus::Inactive,
+                LinkedDeviceStatusFfi::Inactive,
+            ),
+            (LinkedDeviceStatus::Leaving, LinkedDeviceStatusFfi::Leaving),
+            (LinkedDeviceStatus::Moved, LinkedDeviceStatusFfi::Moved),
+        ] {
+            assert_eq!(LinkedDeviceStatusFfi::from(native), expected);
+        }
+    }
+}
