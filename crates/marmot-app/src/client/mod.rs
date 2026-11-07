@@ -7407,16 +7407,13 @@ impl AppClient {
                 // The canonical group already populated routing. Its REQs and
                 // founding Welcome publication can progress independently.
                 let adapter = self.adapter.clone();
-                let sync = self
-                    .subscription_rebuild_since()
-                    .map(|since| TransportGroupSync {
-                        account_id: adapter.account_id().clone(),
-                        group_subscriptions: self.routing.group_subscriptions(),
-                        since,
-                    });
+                let sync = TransportGroupSync {
+                    account_id: adapter.account_id().clone(),
+                    group_subscriptions: self.routing.group_subscriptions(),
+                    since: self.subscription_rebuild_since(),
+                };
                 self.pending_runtime_group_subscription_refresh = true;
                 let register = async {
-                    let sync = sync?;
                     let started = Instant::now();
                     let result = adapter
                         .sync_account_groups(sync)

@@ -909,7 +909,7 @@ impl AppClient {
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
         self.pending_runtime_group_subscription_refresh = true;
         self.prepare_runner_ownership().await?;
-        let rebuild_since = self.subscription_rebuild_since()?;
+        let rebuild_since = self.subscription_rebuild_since();
         let result = self.sync_runtime_groups_since(rebuild_since).await;
         if result.is_ok() {
             self.pending_runtime_group_subscription_refresh = false;
@@ -972,40 +972,13 @@ impl AppClient {
         Ok(())
     }
 
-    pub(crate) fn subscription_rebuild_since(
-        &self,
-    ) -> Result<Option<cgka_traits::transport::Timestamp>, AppError> {
-        let since = self
-            .relay_plane
-            .subscription_rebuild_since(self.checkpointed_transport_timestamp);
-        let storage = self.app.account_storage(&self.state.label)?;
-        for demand in storage
-            .app_storage()
-            .pending_recovery_demands()?
-            .into_iter()
-            .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
-        {
-            let scopes = storage
-                .app_storage()
-                .recovery_scope_snapshots(demand.ticket.id)?
-                .into_iter()
-                .filter(|scope| !scope.replay_admitted)
-                .collect::<Vec<_>>();
-            if scopes
-                .iter()
-                .any(|scope| scope.plan.since_seconds.is_none())
-            {
-                return Ok(None);
-            }
-            if let Some(floor) = scopes
-                .iter()
-                .filter_map(|scope| scope.plan.since_seconds)
-                .min()
-            {
-                return Ok(since.map(|since| cgka_traits::transport::Timestamp(since.0.min(floor))));
-            }
-        }
-        Ok(since)
+    /// The floor every rebuilt REQ asks from: the transport cursor less the
+    /// rebuild lookback, as the relay plane reads it. History an earlier
+    /// owner still owed below it converts to the runner's debt before any
+    /// subscription goes out, so it never lowers another route's REQ (#2793).
+    pub(crate) fn subscription_rebuild_since(&self) -> Option<cgka_traits::transport::Timestamp> {
+        self.relay_plane
+            .subscription_rebuild_since(self.checkpointed_transport_timestamp)
     }
 
     pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
@@ -1257,9 +1230,7 @@ impl AppClient {
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
             .await
             .map_err(|error| (SyncFailureStage::TransportActivation, error.into()))?;
-        let rebuild_since = self
-            .subscription_rebuild_since()
-            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
+        let rebuild_since = self.subscription_rebuild_since();
         let activation = self.runtime.activate_transport(rebuild_since).await;
         if let Some(telemetry) = telemetry {
             telemetry.record(
@@ -1522,13 +1493,7 @@ impl AppClient {
             .map_err(|(stage, error)| {
                 ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
             })?;
-        let since = self.subscription_rebuild_since().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::TransportActivation,
-            )
-        })?;
+        let since = self.subscription_rebuild_since();
         self.record_subscription_rebuild(since.map(|timestamp| timestamp.0))
             .await;
         Ok(())
@@ -6126,7 +6091,6 @@ mod live_cursor_checkpoint_tests {
             fixture
                 .client
                 .subscription_rebuild_since()
-                .unwrap()
                 .is_some_and(|since| since.0 <= failed.created_at),
             "the restart's subscriptions start at or below it"
         );
