@@ -197,9 +197,11 @@ mod tests {
     #[test]
     fn search_progress_preserves_trigger_and_its_radius_or_error() {
         type TriggerCheck = fn(SearchUpdateTriggerFfi) -> bool;
-        let cases: [(SearchUpdateTrigger, TriggerCheck); 9] = [
-            (SearchUpdateTrigger::RadiusStarted { radius: 2 }, |v| {
-                matches!(v, SearchUpdateTriggerFfi::RadiusStarted { radius: 2 })
+        // Fallback seeds report an unknown social distance (255), even though
+        // their traversal hop remains bounded by MAX_SUPPORTED_SEARCH_RADIUS.
+        let cases: [(SearchUpdateTrigger, TriggerCheck); 14] = [
+            (SearchUpdateTrigger::RadiusStarted { radius: 0 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusStarted { radius: 0 })
             }),
             (SearchUpdateTrigger::ResultsFound { radius: 2 }, |v| {
                 matches!(v, SearchUpdateTriggerFfi::ResultsFound { radius: 2 })
@@ -216,18 +218,30 @@ mod tests {
             (SearchUpdateTrigger::RadiusTimeout { radius: 2 }, |v| {
                 matches!(v, SearchUpdateTriggerFfi::RadiusTimeout { radius: 2 })
             }),
-            (SearchUpdateTrigger::RadiusTruncated { radius: 2 }, |v| {
-                matches!(v, SearchUpdateTriggerFfi::RadiusTruncated { radius: 2 })
+            (SearchUpdateTrigger::RadiusTruncated { radius: 1 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTruncated { radius: 1 })
+            }),
+            (SearchUpdateTrigger::RadiusStarted { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusStarted { radius: 255 })
+            }),
+            (SearchUpdateTrigger::ResultsFound { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::ResultsFound { radius: 255 })
+            }),
+            (SearchUpdateTrigger::RadiusCompleted { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusCompleted { radius: 255 })
+            }),
+            (SearchUpdateTrigger::RadiusTimeout { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTimeout { radius: 255 })
+            }),
+            (SearchUpdateTrigger::RadiusTruncated { radius: 255 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTruncated { radius: 255 })
             }),
             (SearchUpdateTrigger::SearchCompleted, |v| {
                 matches!(v, SearchUpdateTriggerFfi::SearchCompleted)
             }),
             (
                 SearchUpdateTrigger::Error {
-                    message: marmot_app::DirectoryError::RelayDirectory(
-                        "fixture fetch failure".into(),
-                    )
-                    .to_string(),
+                    message: "relay directory fetch failed: fixture fetch failure".into(),
                 },
                 |v| matches!(v, SearchUpdateTriggerFfi::Error { message } if message == "relay directory fetch failed: fixture fetch failure"),
             ),
