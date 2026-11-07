@@ -5869,7 +5869,11 @@ fn media_scheduler_uses_the_loaded_owner_and_real_worker_slots() {
     for (hash, gate) in hashes.iter().zip(&gates) {
         // A duplicate-worker fault must not leave two readers waiting on one
         // release. Only its first child enters the explicit gate.
-        script.push_str(&format!("*{hash}*)\nif mkdir '{}' 2>/dev/null; then\n{}fi\n;;\n", dir.path().join(format!("gated-{hash}")).display(), gate.script()));
+        script.push_str(&format!(
+            "*{hash}*)\nif mkdir '{}' 2>/dev/null; then\n{}fi\n;;\n",
+            dir.path().join(format!("gated-{hash}")).display(),
+            gate.script()
+        ));
     }
     script.push_str(&format!("esac\nwhile [ \"$1\" != --output ]; do shift; done\nshift\ncp '{}' \"$1\"\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}'\n", png.display()));
     write_fake_wn(&exe, &script);
