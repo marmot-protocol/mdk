@@ -604,20 +604,32 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(error.into());
             }
         }
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
-        let welcomes = self.record_staged_welcomes(
-            welcomes,
-            &group_id,
-            &commit_msg.id,
-            pre_commit_epoch,
-            None,
-        )?;
-        self.storage.put_group(&group_record)?;
+        // These artifacts have no publication owner until staging returns.
+        // A late Welcome or group-projection failure must roll them back as
+        // one durable unit; the pending-commit guard separately clears MLS.
+        let (welcomes, content_id) = self.storage.with_transaction(|storage| {
+            let content_id = self.persist_sent_openmls_message_with_application_stamp(
+                &commit_msg,
+                commit_bytes.as_slice(),
+                &group_id,
+                pre_commit_epoch,
+                None,
+            )?;
+            let welcomes = self.persist_staged_welcomes(
+                welcomes,
+                &group_id,
+                &commit_msg.id,
+                pre_commit_epoch,
+                None,
+            )?;
+            storage.put_group(&group_record)?;
+            Ok::<_, EngineError>((welcomes, content_id))
+        })?;
+        self.sent_message_ids.insert(commit_msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        for welcome in &welcomes {
+            self.sent_message_ids.insert(welcome.id.clone());
+        }
 
         if recovery_evolution.is_some() {
             crate::test_crash_hooks::pause_if_requested("recovery_after_staging");
@@ -747,10 +759,31 @@ impl<S: StorageProvider> Engine<S> {
         source_epoch: EpochId,
         deliver_until: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<Vec<TransportMessage>, EngineError> {
+        let welcomes = self.persist_staged_welcomes(
+            welcomes,
+            group_id,
+            commit_id,
+            source_epoch,
+            deliver_until,
+        )?;
+        for welcome in &welcomes {
+            self.sent_message_ids.insert(welcome.id.clone());
+        }
+        Ok(welcomes)
+    }
+
+    fn persist_staged_welcomes(
+        &self,
+        welcomes: Vec<WrappedWelcome>,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+        source_epoch: EpochId,
+        deliver_until: Option<cgka_traits::transport::Timestamp>,
+    ) -> Result<Vec<TransportMessage>, EngineError> {
         welcomes
             .into_iter()
             .map(|welcome| {
-                self.record_staged_invite_welcome(
+                self.persist_staged_invite_welcome(
                     &welcome.message,
                     commit_id,
                     welcome.key_package_ref,
