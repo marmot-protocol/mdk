@@ -13,7 +13,6 @@ use crate::capabilities::{
 };
 use crate::device_tag::{OwnDeviceTag, own_device_slot};
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::{
     PURE_PLAINTEXT_WIRE_FORMAT_POLICY, default_sender_ratchet_configuration, join_config,
@@ -249,13 +248,13 @@ pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
 pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 
-/// Deletes a not-yet-canonical current-profile group if creation returns early
+/// Deletes a not-yet-owned group if creation returns early
 /// or the async future is cancelled after OpenMLS first persists it.
 ///
-/// The final creation transaction disarms this immediately after atomically
-/// merging the optional founding Add, writing the Marmot group record, and
-/// retaining every wrapped Welcome. Until then no caller has received the
-/// group id and no transport work has escaped.
+/// Current-profile creation disarms this after its canonical transaction;
+/// legacy creation disarms it after handing the staged group to its pending
+/// publish lifecycle. Until then no caller has received the group id and no
+/// transport work has escaped.
 struct NewGroupCleanupGuard<S: StorageProvider> {
     storage: *const S,
     group_id: GroupId,
@@ -307,7 +306,7 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
             tracing::warn!(
                 target: "cgka_engine::group_lifecycle",
                 method = "new_group_cleanup",
-                "could not remove incomplete current-profile group"
+                "could not remove incomplete group"
             );
         }
     }
@@ -680,8 +679,7 @@ impl<S: StorageProvider> Engine<S> {
         })?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
-        let mut new_group_guard = (self.new_protocol_profile == ProtocolProfile::Current)
-            .then(|| NewGroupCleanupGuard::arm(&self.storage, group_id.clone()));
+        let new_group_guard = NewGroupCleanupGuard::arm(&self.storage, group_id.clone());
 
         let mut siblings = Vec::new();
         let mut sibling_plan = None;
@@ -732,7 +730,6 @@ impl<S: StorageProvider> Engine<S> {
         //    attached to `mls_group`; merge happens in `do_confirm_published`.
         //    Welcome bytes are independently serializable from the OpenMLS
         //    return value; they do not require a merged group.
-        let mut pending_commit_guard = None;
         let welcome_bytes: Option<Vec<u8>> = if parsed_kps.is_empty() {
             None
         } else {
@@ -774,13 +771,6 @@ impl<S: StorageProvider> Engine<S> {
                     welcome_out
                 }
             };
-            if self.new_protocol_profile == ProtocolProfile::Legacy {
-                pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
-                    &self.storage,
-                    &provider,
-                    group_id.clone(),
-                ));
-            }
             let own_leaf_index = mls_group.own_leaf_index();
             let staged = mls_group.pending_commit().ok_or_else(|| {
                 EngineError::Backend("founding add produced no pending commit".into())
@@ -1064,13 +1054,7 @@ impl<S: StorageProvider> Engine<S> {
 
             // The durable creation transaction is complete. From here on,
             // failure must not delete or roll back the canonical group.
-            new_group_guard
-                .take()
-                .expect("current creation arms cleanup")
-                .disarm();
-            if let Some(guard) = pending_commit_guard.take() {
-                guard.disarm();
-            }
+            new_group_guard.disarm();
 
             for welcome in &welcomes {
                 // `Sent` deliberately means "durable outbound obligation",
@@ -1161,9 +1145,9 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
 
-        if let Some(guard) = pending_commit_guard {
-            guard.disarm();
-        }
+        // The caller now owns the legacy creation through its pending ref;
+        // normal confirmation or publish failure owns the staged MLS state.
+        new_group_guard.disarm();
 
         Ok((
             group_id,

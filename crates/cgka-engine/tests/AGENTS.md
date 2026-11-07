@@ -42,7 +42,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `group_creation.rs`
   - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
-    writes no group; creator component admission, exact-length and staged-source exporter assembly, and snapshot-name privacy.
+    writes no group or orphaned OpenMLS state (encrypted reopen and successful retry); creator component admission,
+    exact-length and staged-source exporter assembly, and snapshot-name privacy.
     Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
