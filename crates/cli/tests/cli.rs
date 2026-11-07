@@ -1739,21 +1739,54 @@ fn sync_until_admins<const N: usize>(
     account: &str,
     group_id: &str,
     expected: [&str; N],
+    phase: &'static str,
 ) -> Value {
     let expected = sorted_accounts(expected);
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
+    let mut last_sync_counts = Value::Null;
+    let mut cumulative_sync_counts = [0_u64; 5];
+    let mut observed_admins = 0;
+    let mut polls = 0;
     while Instant::now() < deadline {
-        let _ = run_json(home, &["--account", account, "sync"]);
+        let sync = run_json(home, &["--account", account, "sync"]);
+        polls += 1;
+        let sync_counts = [
+            sync["joined_groups"].as_array().map_or(0, Vec::len) as u64,
+            sync["messages"].as_array().map_or(0, Vec::len) as u64,
+            sync["events"].as_u64().unwrap_or(0),
+            sync["projection_updates"].as_u64().unwrap_or(0),
+            sync["epoch_stall_escalations"].as_u64().unwrap_or(0),
+        ];
+        for (total, count) in cumulative_sync_counts.iter_mut().zip(sync_counts) {
+            *total = total.saturating_add(count);
+        }
+        last_sync_counts = serde_json::json!({
+            "joined": sync_counts[0],
+            "messages": sync_counts[1],
+            "events": sync_counts[2],
+            "projection_updates": sync_counts[3],
+            "epoch_escalations": sync_counts[4],
+        });
         let admins = run_json(home, &["--account", account, "groups", "admins", group_id]);
-        if admin_accounts(&admins) == expected {
+        let observed = admin_accounts(&admins);
+        if observed == expected {
             return admins;
         }
+        observed_admins = observed.len();
         last = admins;
         std::thread::sleep(POLL_INTERVAL);
     }
+    let cumulative_sync_counts = serde_json::json!({
+        "joined": cumulative_sync_counts[0],
+        "messages": cumulative_sync_counts[1],
+        "events": cumulative_sync_counts[2],
+        "projection_updates": cumulative_sync_counts[3],
+        "epoch_escalations": cumulative_sync_counts[4],
+    });
     panic!(
-        "account <REDACTED_ACCOUNT> did not see expected admins in <REDACTED_GROUP>; {}",
+        "account <REDACTED_ACCOUNT> did not see expected admins in <REDACTED_GROUP>; phase={phase} polls={polls} expected_admins={} observed_admins={observed_admins} last_sync_counts={last_sync_counts} cumulative_sync_counts={cumulative_sync_counts} {}",
+        expected.len(),
         json_value_summary("last_admins", &last)
     );
 }
@@ -8247,7 +8280,13 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
     );
 
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
-    sync_until_admins(home.path(), &bob, group_id, [&alice, &bob]);
+    sync_until_admins(
+        home.path(),
+        &bob,
+        group_id,
+        [&alice, &bob],
+        "first-promotion",
+    );
     let bob_rename = run_json(
         home.path(),
         &["--account", &bob, "groups", "rename", group_id, "bob-led"],
@@ -8276,7 +8315,7 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
         &["--account", &alice, "groups", "create", "demotions", &bob],
     );
     let demote_group_id = demote_group["group_id"].as_str().expect("group id");
-    run_json(
+    let second_promoted = run_json(
         home.path(),
         &[
             "--account",
@@ -8288,7 +8327,27 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
         ],
     );
     sync_until_joined(home.path(), test_relay_url(), &bob, demote_group_id);
-    sync_until_admins(home.path(), &bob, demote_group_id, [&alice, &bob]);
+    let observed = std::panic::catch_unwind(|| {
+        sync_until_admins(
+            home.path(),
+            &bob,
+            demote_group_id,
+            [&alice, &bob],
+            "second-promotion",
+        );
+    });
+    if let Err(failure) = observed {
+        // Returned counts describe this send pass and local projection only.
+        eprintln!(
+            "second_promotion_observation published={:?} message_count={:?} sender_admin_count={:?}",
+            second_promoted["published"].as_u64(),
+            second_promoted["message_ids"].as_array().map(Vec::len),
+            second_promoted["group"]["admin_policy"]["admins"]
+                .as_array()
+                .map(Vec::len),
+        );
+        std::panic::resume_unwind(failure);
+    }
 
     let demoted = run_json(
         home.path(),
@@ -8307,7 +8366,13 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
         serde_json::json!(sorted_accounts([&alice]))
     );
 
-    sync_until_admins(home.path(), &bob, demote_group_id, [&alice]);
+    sync_until_admins(
+        home.path(),
+        &bob,
+        demote_group_id,
+        [&alice],
+        "second-demotion",
+    );
     let demoted_error = run_json_error(
         home.path(),
         &[
