@@ -2165,7 +2165,44 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     let (mut bob, bob_storage) = build_client(b"peel-halt-bob");
     let group_id = group_with(&mut alice, &mut [&mut bob]).await;
 
-    // Alice commits at epoch 1 and advances; Bob forks from the same epoch.
+    // Keep an authentic unresolved epoch-1 rival below the retained anchor.
+    // Losing a later own checkpoint must not discard this independent verdict.
+    let stale = rival_commit(&bob_storage, &member_id(b"peel-halt-bob"), &group_id);
+    let first = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    adopt_branch(&bob_storage, &group_id, &first);
+    // Move far enough that epoch 1 is below the actual pinned horizon,
+    // while both devices still share the source state of the later fork.
+    let fork_epoch = V1_MAX_REWIND_COMMITS + 1;
+    for _ in 2..fork_epoch {
+        let SendResult::GroupEvolution { msg, pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected GroupEvolution")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        adopt_branch(&bob_storage, &group_id, &msg);
+    }
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(fork_epoch));
+    let tip_epoch = fork_epoch + 1;
+    assert_eq!(tip_epoch - V1_MAX_REWIND_COMMITS, 2);
+
+    // Alice advances from the shared source; Bob forks from that same epoch.
     let own_commit = match alice
         .send(SendIntent::SelfUpdate {
             group_id: group_id.clone(),
@@ -2179,24 +2216,35 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
         }
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
-    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(tip_epoch));
     let rival = rival_commit(&bob_storage, &member_id(b"peel-halt-bob"), &group_id);
-    admit_rival(&alice_storage, &group_id, &rival, 1);
+    admit_rival(&alice_storage, &group_id, &rival, fork_epoch);
+    admit_rival(&alice_storage, &group_id, &stale, 1);
 
     // Control: with the checkpoint in place both branches materialize, so
     // the halt below is what empties the contexts — not a graph that never
     // had two branches to enumerate.
     let enumerated = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
     assert!(enumerated.contested);
+    assert_eq!(
+        enumerated.contexts.len(),
+        2,
+        "the in-horizon fork offers both branch contexts"
+    );
     assert!(
-        enumerated.contexts.len() > 1,
-        "a two-way epoch-1 fork offers a context per branch"
+        enumerated
+            .contexts
+            .iter()
+            .all(|context| context.tip_epoch == tip_epoch)
     );
 
     let mut selected = super::canonicalize_stored_openmls_messages(
         &alice_storage,
         &group_id,
-        reconstruction_state(2),
+        super::CanonicalizationState {
+            retained_anchor_epoch: 2,
+            ..reconstruction_state(tip_epoch)
+        },
         vec![],
         super::CanonicalizationPolicy::default(),
         100_000,
@@ -2205,8 +2253,8 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     // Selection may prefer either sibling. Exercise applying the own branch
     // after its checkpoint disappears between selection and application.
     selected.accepted_commits = vec![hex::encode(own_commit.id.as_slice())];
-    selected.selected_tip = Some(2);
-    selected.selected_fork_epoch = Some(1);
+    selected.selected_tip = Some(tip_epoch);
+    selected.selected_fork_epoch = Some(fork_epoch);
     alice_storage
         .update_message_state(&own_commit.id, MessageState::ConvergenceDeferred)
         .unwrap();
@@ -2243,7 +2291,10 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
                 let result = super::canonicalize_stored_slice(
                     &alice_storage,
                     &group_id,
-                    reconstruction_state(2),
+                    super::CanonicalizationState {
+                        retained_anchor_epoch: 2,
+                        ..reconstruction_state(tip_epoch)
+                    },
                     vec![],
                     super::CanonicalizationPolicy::default(),
                     now_ms,
@@ -2266,6 +2317,21 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
             vec![super::CanonicalizationError::MissingOwnCommitCheckpoint]
         );
         assert_eq!(result.convergence_status, status);
+        assert_eq!(
+            result
+                .dropped_messages
+                .iter()
+                .filter(|drop| drop.message_id == hex::encode(stale.id.as_slice()))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![super::DroppedMessage {
+                message_id: hex::encode(stale.id.as_slice()),
+                kind: super::MessageKind::Commit,
+                reason: super::DroppedMessageReason::BeyondAnchor,
+                rejection_category: None,
+            }],
+            "missing-checkpoint halt lost the authenticated stale commit verdict"
+        );
         assert!(result.selected_branch_id.is_none() && result.accepted_commits.is_empty());
         assert!(slot.is_none());
     }
