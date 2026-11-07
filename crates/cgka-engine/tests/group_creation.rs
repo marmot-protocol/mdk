@@ -5019,3 +5019,171 @@ async fn encrypted_engine_reopen_reuses_identity_proof_in_fresh_key_packages() {
     );
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
 }
+
+/// Failed founding must not steal an existing group's transport route, even
+/// when the failed request names that already-used, valid routing handle.
+#[tokio::test]
+async fn failed_legacy_founding_preserves_an_existing_live_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("founding-route-rollback.sqlite");
+    let key = SqlCipherKey::raw([0x86; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let supported = default_group_components()
+        .into_iter()
+        .chain([NOSTR_ROUTING_COMPONENT_ID])
+        .collect::<Vec<_>>();
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .supported_app_components(supported.clone())
+            .protocol_profile(ProtocolProfile::Legacy)
+            .legacy_compatibility_profile()
+            .peeler(Box::<MockPeeler>::default())
+            .build()
+            .unwrap()
+    };
+    let mut alice = build(b"route-rollback-alice", storage.clone());
+    let mut bob = build(
+        b"route-rollback-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut carol = build(
+        b"route-rollback-carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut dave = build(
+        b"route-rollback-dave",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let route = [0x86; 32];
+    let component = AppComponentData {
+        component_id: NOSTR_ROUTING_COMPONENT_ID,
+        data: encode_nostr_routing_v1(
+            &NostrRoutingV1::new(route, vec!["wss://relay.example".into()]).unwrap(),
+        )
+        .unwrap(),
+    };
+    let (existing_group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "existing routed group".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![component.clone()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("expected legacy group")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+        existing_group
+    );
+    alice.drain_events();
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &observer,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    let routes = || {
+        observer.prepare("SELECT transport_group_id, group_id, source_epoch FROM cgka_transport_group_routes ORDER BY transport_group_id").unwrap()
+            .query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let routes_before = routes();
+    assert_eq!(routes_before.len(), 1);
+    assert_eq!(routes_before[0].0, route);
+    assert_eq!(routes_before[0].1, existing_group.as_slice());
+    observer.execute_batch(
+        "CREATE TRIGGER fail_second_route_welcome BEFORE INSERT ON cgka_messages
+         WHEN (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.group_id) = 1
+          AND (SELECT json_array_length(json_extract(record, '$.members')) FROM cgka_groups WHERE id = NEW.group_id) = 3
+         BEGIN SELECT RAISE(ABORT, 'founding-route-welcome-fault'); END;"
+    ).unwrap();
+    let failed = alice
+        .create_group(CreateGroupRequest {
+            name: "failed routed group".into(),
+            description: String::new(),
+            members: vec![
+                carol.fresh_key_package().await.unwrap(),
+                dave.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![component],
+            initial_admins: vec![],
+        })
+        .await;
+    assert!(
+        matches!(&failed, Err(EngineError::Storage(cgka_traits::storage::StorageError::Backend(detail)))
+        if detail.contains("founding-route-welcome-fault")),
+        "wrong failure: {failed:?}"
+    );
+    assert_eq!(
+        alice.live_group_ids().unwrap(),
+        vec![existing_group.clone()]
+    );
+    assert_eq!(storage.list_groups().unwrap().len(), 1);
+    assert!(alice.drain_events().is_empty());
+    // This input is real peer traffic from the surviving group. No failed
+    // operation's unreturned Welcome or private cache contents are fabricated.
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: existing_group.clone(),
+            payload: app_payload_for(&bob, b"live route after failed creation"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = sent else {
+        panic!("expected application")
+    };
+    assert!(
+        matches!(&msg.envelope, TransportEnvelope::GroupMessage {transport_group_id} if transport_group_id == &route)
+    );
+    assert_eq!(
+        alice.ingest(msg).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Processed,
+        "failed creation displaced a live group's route"
+    );
+    assert_eq!(
+        routes(),
+        routes_before,
+        "failed creation replaced the existing durable route"
+    );
+    drop(alice);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut reopened = build(b"route-rollback-alice", storage);
+    reopened.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        reopened.live_group_ids().unwrap(),
+        vec![existing_group.clone()]
+    );
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: existing_group,
+            payload: app_payload_for(&bob, b"live route after encrypted reopen"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = sent else {
+        panic!("expected application")
+    };
+    assert_eq!(
+        reopened.ingest(msg).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Processed
+    );
+}

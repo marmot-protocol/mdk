@@ -48,6 +48,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     exact-length and staged-source exporter assembly, and snapshot-name privacy.
     Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
+  `failed_legacy_founding_preserves_an_existing_live_route` owns failed creation with an already-live routing handle:
+  a real second-Welcome write fault preserves the original durable mapping and genuine peer traffic, including after
+  encrypted reopen.
+
 - **File:** `ingest.rs`
   - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip, exact buffered-malformed retirement, and
     encrypted own-echo persistence. The pure canonical-disposition/public-outcome mapper is pinned in
