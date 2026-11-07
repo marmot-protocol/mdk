@@ -1773,7 +1773,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
         .expect("outbound OpenMLS send must persist a content-derived Sent marker");
     assert_eq!(marker.state, MessageState::Sent);
 
-    let mut alice = build_client_with_storage(reopened_store, b"alice-own-restart");
+    let mut alice = build_client_with_storage(reopened_store.clone(), b"alice-own-restart");
     alice.hydrate_all_stored_groups().unwrap();
     let rewrapped = TransportMessage {
         id: MessageId::new(b"fresh-own-echo-transport-id".to_vec()),
@@ -1784,7 +1784,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
         ..app_msg
     };
 
-    let outcome = alice.ingest(rewrapped).await.unwrap();
+    let outcome = alice.ingest(rewrapped.clone()).await.unwrap();
     assert!(
         matches!(
             outcome,
@@ -1793,6 +1793,40 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
             }
         ),
         "re-wrapped own OpenMLS echo after restart must be OwnEcho, got {outcome:?}"
+    );
+    assert!(
+        reopened_store
+            .has_processed_transport_id(&rewrapped.id)
+            .unwrap(),
+        "a new wrapper whose content is already durable must retain its own alias"
+    );
+    drop(alice);
+    drop(reopened_store);
+
+    let twice_reopened = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+    assert!(
+        twice_reopened
+            .has_processed_transport_id(&rewrapped.id)
+            .unwrap(),
+        "the new wrapper alias must survive a physical encrypted reopen"
+    );
+    assert_eq!(
+        twice_reopened.get_message(&sent_content_id).unwrap(),
+        marker
+    );
+    let mut alice = build_client_with_storage(twice_reopened, b"alice-own-restart");
+    alice.hydrate_all_stored_groups().unwrap();
+    assert!(matches!(
+        alice.ingest(rewrapped).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    ));
+    assert!(
+        alice
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. }))
     );
 }
 

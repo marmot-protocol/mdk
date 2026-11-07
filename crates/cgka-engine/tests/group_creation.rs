@@ -3973,6 +3973,14 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
 
 #[tokio::test]
 async fn join_welcome_rejected_when_client_no_longer_supports_required_capability() {
+    // Direct refusal marks its content terminal, so each route needs its own
+    // genuine Welcome and KeyPackage rather than replaying the other refusal.
+    for through_ingest in [false, true] {
+        assert_required_capability_welcome_refusal(through_ingest).await;
+    }
+}
+
+async fn assert_required_capability_welcome_refusal(through_ingest: bool) {
     // joining.md:65 / convergence.md:19 — a client MUST reject a Welcome whose
     // resulting group has active required capabilities it cannot apply.
     //
@@ -4011,24 +4019,46 @@ async fn join_welcome_rejected_when_client_no_longer_supports_required_capabilit
     // Welcome) but an empty registry (no SelfRemove support).
     let mut downgraded_carol =
         build_client_on_storage(b"carol", FeatureRegistry::new(), carol_storage.clone());
-    let err = downgraded_carol
-        .join_welcome(welcome)
-        .await
-        .expect_err("join must be rejected for an unsupported required capability");
-    match err {
-        EngineError::MissingRequiredCapabilities { required, had } => {
-            // The group requires the SelfRemove proposal (0x000a = 10)...
-            assert!(
-                required.proposals.contains(&10),
-                "group should require SelfRemove; got {required:?}"
-            );
-            // ...which downgraded carol no longer advertises.
-            assert!(
-                !had.proposals.contains(&10),
-                "downgraded carol must not advertise SelfRemove; got {had:?}"
-            );
+    if through_ingest {
+        assert!(matches!(
+            downgraded_carol.ingest(welcome.clone()).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Ignored {
+                category: cgka_traits::ingest::InputRejectionCategory::UnsupportedRequiredFeature
+            }
+        ));
+        assert!(carol_storage.has_ingress_dedup_marker(&welcome.id).unwrap());
+        assert!(matches!(
+            downgraded_carol.ingest(welcome).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Ignored {
+                category: cgka_traits::ingest::InputRejectionCategory::Duplicate
+            }
+        ));
+        assert!(
+            downgraded_carol
+                .drain_events()
+                .iter()
+                .all(|event| !matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }))
+        );
+    } else {
+        let err = downgraded_carol
+            .join_welcome(welcome)
+            .await
+            .expect_err("join must be rejected for an unsupported required capability");
+        match err {
+            EngineError::MissingRequiredCapabilities { required, had } => {
+                // The group requires the SelfRemove proposal (0x000a = 10)...
+                assert!(
+                    required.proposals.contains(&10),
+                    "group should require SelfRemove; got {required:?}"
+                );
+                // ...which downgraded carol no longer advertises.
+                assert!(
+                    !had.proposals.contains(&10),
+                    "downgraded carol must not advertise SelfRemove; got {had:?}"
+                );
+            }
+            other => panic!("expected MissingRequiredCapabilities, got {other:?}"),
         }
-        other => panic!("expected MissingRequiredCapabilities, got {other:?}"),
     }
 
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
