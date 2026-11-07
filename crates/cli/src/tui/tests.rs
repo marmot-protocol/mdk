@@ -2688,9 +2688,12 @@ fn stream_recording_executable(dir: &std::path::Path, response: &str) -> (PathBu
     write_fake_wn(
         &exe,
         &format!(
-            "#!/bin/sh\nn=0\nwhile ! mkdir '{}/'$n 2>/dev/null; do n=$((n + 1)); done\nprintf '%s\\n' \"$@\" > '{}/'$n/args\ncat <<'JSON'\n{response}\nJSON\n",
+            "#!/bin/sh\nset -e\nn=0\nwhile ! mkdir '{}/'$n 2>/dev/null; do [ -d '{}' ] || exit 1; n=$((n + 1)); done\nprintf '%s\\n' \"$@\" > '{}/'$n/args.tmp\nmv '{}/'$n/args.tmp '{}/'$n/args\ncat <<'JSON'\n{response}\nJSON\n",
             calls.display(),
-            calls.display()
+            calls.display(),
+            calls.display(),
+            calls.display(),
+            calls.display(),
         ),
     );
     (exe, calls)
@@ -2722,7 +2725,7 @@ fn stream_recorded_calls(dir: &std::path::Path) -> Vec<Vec<String>> {
 
 #[cfg(unix)]
 #[test]
-fn stream_slash_controls_forward_options_and_fold_the_returned_status() {
+fn stream_slash_controls_forward_options_and_report_the_command_reply() {
     let account = "aa".repeat(32);
     let group = "cc".repeat(16);
     let stream = "bb".repeat(32);
@@ -2787,7 +2790,7 @@ fn stream_slash_controls_forward_options_and_fold_the_returned_status() {
                 "2".into(),
             ],
             true,
-            "stream bbbbbbb...bbbbbbbb verified=false",
+            "stream bbbbbbb...bbbbbbbb verified=true",
         ),
         (
             format!("/stream verify {stream} {digest}"),
@@ -2801,19 +2804,22 @@ fn stream_slash_controls_forward_options_and_fold_the_returned_status() {
                 digest.clone(),
             ],
             true,
-            "stream bbbbbbb...bbbbbbbb verified=false",
+            "stream bbbbbbb...bbbbbbbb verified=true",
         ),
         (
             "/stream status".to_owned(),
             vec!["daemon".into(), "status".into()],
             false,
-            "streams: none",
+            "streams: running=1 completed=0 failed=0 latest=bbbbbbb...bbbbbbbb",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let response = serde_json::json!({"ok":true,"result":{
             "stream_id":"dd".repeat(32),"published":2,"watch_id":"returned-watch",
-            "verified":false,"running":false,"messages":[],"has_more_before":false
+            "verified":true,"running":!selected_owner,"messages":[],"has_more_before":false,
+            "stream_watches":if selected_owner {serde_json::json!([])} else {serde_json::json!([
+                {"watch_id":"returned-watch","group_id":group,"stream_id":stream,"status":"running"}
+            ])}
         }})
         .to_string();
         let (exe, args) = stream_recording_executable(dir.path(), &response);
@@ -2828,10 +2834,21 @@ fn stream_slash_controls_forward_options_and_fold_the_returned_status() {
         app.chats = vec![flick_chat(&group, "Selected room")];
         app.messages_account_id = Some("ff".repeat(32));
         app.messages_group_id = Some("ff".repeat(16));
+        if !selected_owner {
+            // Global daemon status is also available to a public-only account
+            // with no chat; it must not acquire account-specific subscriptions.
+            app.accounts[0].local_signing = false;
+            app.chats.clear();
+            app.messages_account_id = None;
+            app.messages_group_id = None;
+        }
         app.input.set_value(&input);
         app.submit_input().expect("dispatch stream control");
         assert_eq!(app.status, status, "{input}");
         assert!(app.input.is_empty());
+        finish_queued_effects(&mut app);
+        // Timeline folding queues diagnostics and mark-read behind the first
+        // marker. Fence those children before reading or removing their files.
         finish_queued_effects(&mut app);
         let recorded = stream_recorded_calls(&args);
         let mut expected: Vec<String> = vec!["--json".into()];
@@ -2875,6 +2892,7 @@ fn stream_composition_adopts_the_returned_id_and_finishes_or_cancels_typed_text(
         );
         assert!(app.input.is_empty());
         finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
         for ch in "hello world".chars() {
             app.handle_key(char_key(ch)).unwrap();
         }
@@ -2909,6 +2927,7 @@ fn stream_composition_adopts_the_returned_id_and_finishes_or_cancels_typed_text(
                 "cancelled stream ddddddd...dddddddd"
             }
         );
+        finish_queued_effects(&mut app);
         finish_queued_effects(&mut app);
         let calls = stream_recorded_calls(&args)
             .into_iter()
