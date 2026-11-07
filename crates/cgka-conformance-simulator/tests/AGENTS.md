@@ -81,7 +81,10 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
   - **Owns:** Scripted scenarios, vector fixtures, generated family checks, reports.
 
 - **File:** `canonicalization_contract.rs`
-  - **Owns:** Executable canonicalization contract behavior, including sync-state edge cases.
+  - **Owns:** Executable canonicalization contract behavior, including sync-state edge cases, exact materialized
+    Commit/Proposal drops for permanently ineligible pure-policy branches, and a resolved parent's source-epoch
+    mismatch while valid siblings remain selectable. These are public pure-algorithm arguments, not native MLS
+    producers or NORMAL anchor/horizon configurations (mdk#3190).
 
 - **File:** `failure_capsules.rs`
   - **Owns:** Capsule round trip (schedule, policy, resources) and exact commit replay from a sensitive checkpoint.

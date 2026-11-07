@@ -1223,6 +1223,21 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
             "queued work changed"
         );
     };
+    // The exported materializer also accepts direct Rust callers; engine
+    // graph construction itself never emits an empty candidate path.
+    assert!(matches!(
+        super::materialize_openmls_candidate_paths(
+            &storage,
+            &group_id,
+            &[super::OpenMlsCandidatePath {
+                branch_id: "empty-public-candidate".into(),
+                messages: vec![],
+            }],
+        ),
+        Err(super::OpenMlsProjectionError::EmptyCandidatePath(id))
+            if id == "empty-public-candidate"
+    ));
+    check();
     for rival in &rivals {
         let messages = std::slice::from_ref(rival);
         let previous = super::replay_openmls_messages_probe(
@@ -1385,7 +1400,78 @@ async fn own_checkpoint_apply_parity() {
     let (mut alice, storage) = build_client(b"checkpoint-parity-alice");
     let (mut bob, peer) = build_client(b"checkpoint-parity-bob");
     let group_id = group_with(&mut alice, &mut [&mut bob]).await;
-    let first = confirmed_update(&mut alice, &group_id).await;
+    let SendResult::GroupEvolution {
+        msg: first,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected self-update")
+    };
+    let sent = storage.get_message(&first.id).unwrap();
+    assert_eq!(sent.state, MessageState::Sent);
+    let StoredMessagePayload::SignedOpenMlsWire {
+        exact_message: sent_exact,
+        openmls_message: sent_wire,
+        stamp: None,
+        own_application_stamp: None,
+    } = StoredMessagePayload::decode(&sent.payload).unwrap()
+    else {
+        panic!("a new self-update must retain its signed carrier before confirm")
+    };
+    assert_eq!(sent_exact, first);
+    let expected_checkpoint = format!(
+        "openmls-own-commit-v1-{}",
+        hex::encode(Sha256::digest(&sent_wire.payload))
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let (resulting_epoch, expected_authenticator) = {
+        let native = MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        (
+            EpochId(native.epoch().as_u64()),
+            hex::encode(native.epoch_authenticator().as_slice()),
+        )
+    };
+    let confirmed = storage.get_message(&first.id).unwrap();
+    assert_eq!(confirmed.state, MessageState::Processed);
+    let StoredMessagePayload::SignedOpenMlsWire {
+        exact_message,
+        openmls_message,
+        stamp: Some(stamp),
+        own_application_stamp: None,
+    } = StoredMessagePayload::decode(&confirmed.payload).unwrap()
+    else {
+        panic!("confirm must preserve SignedOpenMlsWire and add the native checkpoint stamp")
+    };
+    assert_eq!(exact_message, sent_exact);
+    assert_eq!(openmls_message, sent_wire);
+    assert_eq!(
+        stamp.checkpoint_id.as_deref(),
+        Some(expected_checkpoint.as_str())
+    );
+    assert_eq!(
+        stamp.resulting_epoch_authenticator.as_deref(),
+        Some(expected_authenticator.as_str())
+    );
+    assert!(
+        storage
+            .list_group_state_checkpoints(&group_id)
+            .unwrap()
+            .contains(&cgka_traits::storage::GroupStateCheckpointRef {
+                id: expected_checkpoint,
+                resulting_epoch
+            })
+    );
     adopt_branch(&peer, &group_id, &first);
     let payload = cgka_traits::app_event::MarmotAppEvent::new(
         hex::encode(bob.self_id().as_slice()),
