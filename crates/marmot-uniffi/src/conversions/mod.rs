@@ -94,6 +94,39 @@ mod tests {
             total: Some(3),
             retry_at: None,
         };
+        let account_entry = AccountAttachmentEntryFfi {
+            metadata_limited: false,
+            group_id_hex: "PRIVATE_ACCOUNT_GROUP".into(),
+            entry: AttachmentEntryFfi {
+                message_id_hex: "PRIVATE_ATTACHMENT_MESSAGE".into(),
+                source_message_id_hex: "PRIVATE_ATTACHMENT_SOURCE".into(),
+                sender: "PRIVATE_ATTACHMENT_SENDER".into(),
+                timeline_at: 1,
+                received_at: 2,
+                source_epoch: Some(3),
+                category: AttachmentCategoryFfi::Image,
+                role: AttachmentRoleFfi::Shared,
+                attachment: MediaAttachmentOutcomeFfi::Accepted {
+                    attachment_index: 0,
+                    reference: MediaAttachmentReferenceFfi {
+                        locators: vec![MediaLocatorFfi {
+                            kind: "url".into(),
+                            value: "https://PRIVATE_ATTACHMENT_HOST/image".into(),
+                        }],
+                        ciphertext_sha256: "PRIVATE_CIPHERTEXT_HASH".into(),
+                        plaintext_sha256: "PRIVATE_PLAINTEXT_HASH".into(),
+                        nonce_hex: "PRIVATE_NONCE".into(),
+                        file_name: "PRIVATE_FILE_NAME".into(),
+                        media_type: "image/PRIVATE_TYPE".into(),
+                        version: EncryptedMediaVersionFfi::V2,
+                        source_epoch: 3,
+                        source_epoch_identity: Some("PRIVATE_EPOCH_IDENTITY".into()),
+                        dim: Some("PRIVATE_DIM".into()),
+                        thumbhash: Some("PRIVATE_THUMBHASH".into()),
+                    },
+                },
+            },
+        };
         let values: Vec<Box<dyn std::fmt::Debug>> = vec![
             Box::new(AttachmentHandoffFfi {
                 lease: "PRIVATE_LEASE".into(),
@@ -134,6 +167,8 @@ mod tests {
                 width: 1,
                 height: 1,
             }),
+            Box::new(account_entry.entry.clone()),
+            Box::new(account_entry),
             Box::new(status.clone()),
             Box::new(AttachmentTransferSnapshotFfi {
                 items: vec![status],

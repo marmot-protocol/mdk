@@ -70,6 +70,10 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
     let s_app = s.app_storage();
     seed(&s, "aa", 1, 3, 10);
     seed(&s, "bb", 2, 2, 9);
+    // Pin incarnation bytes so privacy checks use independent literal markers.
+    s.lock().unwrap().execute_batch(
+        "UPDATE chat_presentation_meta SET store_epoch=x'89d3fdf189d3fdf189d3fdf189d3fdf1' WHERE id=1"
+    ).unwrap();
     let query = AccountAttachmentQuery {
         groups: vec!["BB".into(), "bb".into()],
         senders: vec!["11".repeat(32)],
@@ -80,6 +84,29 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
         .account_attachment_history_page(&query, 3, None)
         .unwrap();
     assert!(first.entries.is_empty());
+    let cursor = first.next_cursor.as_ref().expect("nonempty continuation");
+    for debug in [
+        format!("{:?}", first.version),
+        format!("{cursor:?}"),
+        format!("{query:?}"),
+    ] {
+        for private in [
+            "aa",
+            "bb",
+            "BB",
+            "11111111",
+            "0000000000000001",
+            "137",
+            "211",
+            "253",
+        ] {
+            assert!(
+                !debug.contains(private),
+                "account attachment debug leaked {private}: {debug}"
+            );
+        }
+    }
+
     let next = s_app
         .account_attachment_history_page(&query, 3, first.next_cursor.as_ref())
         .unwrap();

@@ -72,6 +72,7 @@ async fn prepared_cache_keeps_snapshot_metadata_fresh_and_prunes_paged_rows() {
     snapshot.draft = app
         .save_message_draft_if_revision("alice", &selected.revision, "draft changed", None, vec![])
         .unwrap();
+    assert_conversation_debug_redacts(snapshot.draft.clone().into());
     equivalent(cache.convert(&snapshot), (&snapshot).into());
     assert_eq!((cache.conversions, cache.parses), (3, 3));
     let small = runtime
@@ -659,4 +660,173 @@ fn legacy_deleted_record_defaults_to_unknown_provenance() {
         converted.deletion_source,
         super::super::timeline::DeletionSourceFfi::Unknown
     );
+}
+
+// Reuse the cache owner's real opaque revision and account/group fixture.
+// Every formatter below is still observed directly, including nested records.
+fn assert_conversation_debug_redacts(mut draft: SelectedMessageDraftFfi) {
+    let attachment = SelectedMessageDraftAttachmentFfi {
+        id: "PRIVATE_ATTACHMENT_ID".into(),
+        file_name: "PRIVATE_FILE_NAME".into(),
+        media_type: "audio/PRIVATE_MEDIA_TYPE".into(),
+        plaintext_size: 719,
+        dim: Some("PRIVATE_DIM".into()),
+        thumbhash: Some("PRIVATE_THUMBHASH".into()),
+        duration_seconds: Some(719.5),
+        waveform_samples: vec![0.719],
+    };
+    let content = SelectedMessageDraftContentFfi {
+        group_id_hex: "PRIVATE_DRAFT_GROUP".into(),
+        content: "PRIVATE_DRAFT_CONTENT".into(),
+        reply_to_message_id_hex: Some("PRIVATE_DRAFT_REPLY".into()),
+        media_attachments: vec![attachment.clone()],
+        created_at_ms: 719,
+        updated_at_ms: 719,
+    };
+    draft.draft = Some(content.clone());
+    let capabilities = ConversationCapabilitiesFfi {
+        participation: ConversationParticipationFfi::Active,
+        is_self_admin: true,
+        is_last_admin: false,
+        can_send: true,
+        can_invite: true,
+        can_edit_group: true,
+        can_leave: true,
+        requires_self_demote_before_leave: false,
+        can_enable_disbanding: true,
+        can_disband: true,
+    };
+    let avatar = SelectedAvatarFfi::RemoteImage {
+        url: "https://PRIVATE_AVATAR_HOST/image".into(),
+        cache_key: "PRIVATE_AVATAR_CACHE_KEY".into(),
+    };
+    let header = ConversationHeaderFfi {
+        selected: ConversationPresentationFfi {
+            title: PresentationTextFfi::Literal {
+                text: "PRIVATE_TITLE".into(),
+            },
+            avatar: avatar.clone(),
+            title_source: PresentationSourceFfi::Group,
+            avatar_source: PresentationSourceFfi::Group,
+            peer_id: Some("PRIVATE_PEER_ID".into()),
+            resolution: PresentationResolutionFfi::Cached,
+        },
+        member_count: Some(719),
+        archived: true,
+        epoch: Some(719),
+        lifecycle: GroupLifecycleStateFfi::Stable,
+        disbanding: false,
+        unrecoverable: false,
+        capabilities: capabilities.clone(),
+        avatar_asset: None,
+    };
+    let identity = ConversationIdentityFfi {
+        account_id_hex: "PRIVATE_ACCOUNT_ID".into(),
+        display_name: "PRIVATE_DISPLAY_NAME".into(),
+        avatar,
+        has_cached_profile: true,
+        avatar_asset: None,
+    };
+    let system = ConversationSystemReferencesFfi {
+        system_type: "PRIVATE_SYSTEM_TYPE".into(),
+        actor: Some("PRIVATE_ACTOR".into()),
+        subject: Some("PRIVATE_SUBJECT".into()),
+    };
+    let reaction = ConversationReactionFfi {
+        emoji: "PRIVATE_EMOJI".into(),
+        count: 719,
+        reactors: vec!["PRIVATE_REACTOR".into()],
+        viewer_reacted: true,
+        reaction_message_id_hex: Some("PRIVATE_REACTION_ID".into()),
+    };
+    let reactions = ConversationReactionsFfi {
+        total_count: 719,
+        total_kinds: 719,
+        items: vec![reaction.clone()],
+        omitted_kinds: 719,
+    };
+    let references = ConversationMessageReferencesFfi {
+        message_id_hex: "PRIVATE_MESSAGE_ID".into(),
+        sender: Some("PRIVATE_SENDER".into()),
+        reply_author: Some("PRIVATE_REPLY_AUTHOR".into()),
+        mentions: vec!["PRIVATE_MENTION".into()],
+        mentions_truncated: true,
+        reply_mentions: vec!["PRIVATE_REPLY_MENTION".into()],
+        reply_mentions_truncated: true,
+        system: Some(system.clone()),
+        reactions: reactions.clone(),
+    };
+    let read_state = ConversationOpenReadStateFfi {
+        initialized: true,
+        last_read_message_id_hex: Some("PRIVATE_LAST_READ".into()),
+        last_read_timeline_at: Some(719),
+        manually_marked_unread: true,
+        unread_count: 719,
+        unread_mention_count: 719,
+        first_unread_message_id_hex: Some("PRIVATE_FIRST_UNREAD".into()),
+    };
+    let revision = ConversationWindowRevisionFfi {
+        generation: "PRIVATE_GENERATION".into(),
+        sequence: 719,
+    };
+    let anchor = ConversationAnchorOutcomeFfi {
+        kind: ConversationAnchorKindFfi::RecoveredNext,
+        index: Some(719),
+    };
+    let mut timeline = record(0);
+    timeline.message_id_hex = "PRIVATE_TIMELINE_ID".into();
+    timeline.group_id_hex = "PRIVATE_TIMELINE_GROUP".into();
+    timeline.sender = "PRIVATE_TIMELINE_SENDER".into();
+    timeline.plaintext = "PRIVATE_MESSAGE_CONTENT".into();
+    timeline.client_token = Some("PRIVATE_CLIENT_TOKEN".into());
+    let message = ConversationMessageFfi {
+        timeline: timeline.into(),
+        references: references.clone(),
+    };
+    let snapshot = ConversationWindowSnapshotFfi {
+        revision: revision.clone(),
+        header: header.clone(),
+        messages: vec![message.clone()],
+        identities: vec![identity.clone()],
+        read_state: read_state.clone(),
+        draft: draft.clone(),
+        pending_confirmation: true,
+        anchor: anchor.clone(),
+        has_more_before: true,
+        has_more_after: false,
+    };
+    let values: [&dyn std::fmt::Debug; 15] = [
+        &capabilities,
+        &header,
+        &identity,
+        &system,
+        &reaction,
+        &reactions,
+        &references,
+        &read_state,
+        &attachment,
+        &content,
+        &revision,
+        &anchor,
+        &draft,
+        &message,
+        &snapshot,
+    ];
+    for value in values {
+        for formatted in [format!("{value:?}"), format!("{value:#?}")] {
+            for private in [
+                "PRIVATE_",
+                "719",
+                "Active",
+                "RecoveredNext",
+                "true",
+                "false",
+            ] {
+                assert!(
+                    !formatted.contains(private),
+                    "conversation debug leaked {private}: {formatted}"
+                );
+            }
+        }
+    }
 }
