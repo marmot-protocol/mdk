@@ -1039,13 +1039,13 @@ mod tests {
         let cases: [(AppError, Expected); 8] = [
             (
                 AppError::AccountHome(AccountHomeError::AccountUnlinked("alice".into())),
-                |e| matches!(e, MarmotKitError::AccountUnlinked { .. }),
+                |e| matches!(e, MarmotKitError::AccountUnlinked { account_ref } if account_ref == "alice"),
             ),
             (
                 AppError::ExternalSignerUnavailable(
                     "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
                 ),
-                |e| matches!(e, MarmotKitError::ExternalSignerUnavailable { .. }),
+                |e| matches!(e, MarmotKitError::ExternalSignerUnavailable { account } if account == "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),
             ),
             (AppError::ExternalSignerMismatch, |e| {
                 matches!(e, MarmotKitError::ExternalSignerMismatch)
@@ -1159,18 +1159,18 @@ mod tests {
     #[test]
     fn remaining_size_classes_preserve_their_host_bucket() {
         use super::EventSizeClassFfi as Size;
-        // The supported lower Rust factory supplies valid enum inputs. This
-        // does not assert every bounded App publisher emits every bucket.
+        use marmot_app::EventSizeClass as Class;
+        // These public enum variants own the binding mapping, not the byte
+        // thresholds or which buckets a bounded App publisher emits.
         // Under64Kib is owned above; From2To4Mib by Welcome diagnosis.
-        for (bytes, expected) in [
-            (64 * 1024, Size::From64To128Kib),
-            (128 * 1024, Size::From128To256Kib),
-            (256 * 1024, Size::From256To512Kib),
-            (512 * 1024, Size::From512KibTo1Mib),
-            (1024 * 1024, Size::From1To2Mib),
-            (4 * 1024 * 1024 + 1, Size::Over4Mib),
+        for (native, expected) in [
+            (Class::From64To128Kib, Size::From64To128Kib),
+            (Class::From128To256Kib, Size::From128To256Kib),
+            (Class::From256To512Kib, Size::From256To512Kib),
+            (Class::From512KibTo1Mib, Size::From512KibTo1Mib),
+            (Class::From1To2Mib, Size::From1To2Mib),
+            (Class::Over4Mib, Size::Over4Mib),
         ] {
-            let native = marmot_app::EventSizeClass::of_bytes(bytes);
             assert_eq!(Size::from(native), expected, "coarse host size bucket");
         }
     }
