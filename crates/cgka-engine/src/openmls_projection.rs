@@ -4033,7 +4033,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 mls_group
                     .store_pending_proposal(provider.storage(), *queued)
                     .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!("store_pending_proposal: {e:?}"))
+                        OpenMlsProjectionError::Storage(format!("store_pending_proposal: {e:?}"))
                     })?;
                 observations.push(OpenMlsReplayObservation::ProposalStored {
                     message_id,
@@ -4239,8 +4239,17 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 }
                 mls_group
                     .merge_staged_commit(&provider, *staged)
-                    .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
+                    .map_err(|error| match error {
+                        // A candidate cannot be judged invalid when its
+                        // authenticated merge was interrupted by persistence.
+                        openmls::group::MergeCommitError::StorageError(error) => {
+                            OpenMlsProjectionError::Storage(format!(
+                                "merge_staged_commit: {error:?}"
+                            ))
+                        }
+                        other => OpenMlsProjectionError::Replay(format!(
+                            "merge_staged_commit: {other:?}"
+                        )),
                     })?;
                 if retain_replayed_anchors.is_some() {
                     crate::device_roster_departures::record(
@@ -4478,8 +4487,16 @@ fn kind_from_content_type(content_type: ContentType) -> OpenMlsContentKind {
     }
 }
 
-fn replay_error(context: &str, error: impl std::fmt::Debug) -> OpenMlsProjectionError {
-    OpenMlsProjectionError::Replay(format!("{context}: {error:?}"))
+fn replay_error<E: std::fmt::Debug>(
+    context: &str,
+    error: ProcessMessageError<E>,
+) -> OpenMlsProjectionError {
+    match error {
+        ProcessMessageError::StorageError(error) => {
+            OpenMlsProjectionError::Storage(format!("{context}: {error:?}"))
+        }
+        other => OpenMlsProjectionError::Replay(format!("{context}: {other:?}")),
+    }
 }
 
 /// Process a commit, validating and applying any `AppDataUpdate` proposals it
