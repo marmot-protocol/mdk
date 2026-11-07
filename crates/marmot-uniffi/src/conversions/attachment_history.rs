@@ -181,4 +181,18 @@ mod tests {
             assert!(!format!("{entry:?}").contains("private"));
         }
     }
+
+    #[test]
+    fn file_video_and_rejected_slots_keep_their_categories() {
+        for (native, expected) in [
+            (app::AttachmentCategory::File, AttachmentCategoryFfi::File),
+            (app::AttachmentCategory::Video, AttachmentCategoryFfi::Video),
+            (
+                app::AttachmentCategory::Rejected,
+                AttachmentCategoryFfi::Rejected,
+            ),
+        ] {
+            assert_eq!(AttachmentCategoryFfi::from(native), expected);
+        }
+    }
 }
