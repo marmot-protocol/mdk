@@ -1008,6 +1008,171 @@ mod tests {
     use marmot_app::{AccountError, AppError};
 
     #[test]
+    fn block_and_follow_refusals_keep_distinct_host_choices() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: [(AppError, Expected); 4] = [
+            (AppError::UserBlocked, |e| {
+                matches!(e, MarmotKitError::UserBlocked)
+            }),
+            (AppError::BlockListUnavailable, |e| {
+                matches!(e, MarmotKitError::BlockListUnavailable)
+            }),
+            (AppError::BlockPublicationUncertain, |e| {
+                matches!(e, MarmotKitError::BlockPublicationUncertain)
+            }),
+            (AppError::FollowListTooLarge, |e| {
+                matches!(e, MarmotKitError::FollowListTooLarge)
+            }),
+        ];
+        for (native, expected) in cases {
+            let ffi = MarmotKitError::from(native);
+            assert!(
+                expected(&ffi),
+                "block/follow refusal lost its host choice: {ffi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_and_runtime_refusals_keep_distinct_host_actions() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: [(AppError, Expected); 8] = [
+            (
+                AppError::AccountHome(AccountHomeError::AccountUnlinked("alice".into())),
+                |e| matches!(e, MarmotKitError::AccountUnlinked { .. }),
+            ),
+            (AppError::ExternalSignerUnavailable("alice".into()), |e| {
+                matches!(e, MarmotKitError::ExternalSignerUnavailable { .. })
+            }),
+            (AppError::ExternalSignerMismatch, |e| {
+                matches!(e, MarmotKitError::ExternalSignerMismatch)
+            }),
+            (AppError::OnboardingActionUnavailable, |e| {
+                matches!(e, MarmotKitError::OnboardingActionUnavailable)
+            }),
+            (AppError::OnboardingRequired, |e| {
+                matches!(e, MarmotKitError::OnboardingRequired)
+            }),
+            (AppError::TransportClosed, |e| {
+                matches!(e, MarmotKitError::TransportClosed)
+            }),
+            (AppError::ChatPresentationNotReady, |e| {
+                matches!(e, MarmotKitError::ChatPresentationNotReady)
+            }),
+            (
+                AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::InvalidConfiguration),
+                |e| matches!(e, MarmotKitError::InvalidProductAnalyticsConfiguration),
+            ),
+        ];
+        for (native, expected) in cases {
+            let ffi = MarmotKitError::from(native);
+            assert!(
+                expected(&ffi),
+                "account/runtime refusal lost its host action: {ffi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_identity_and_hex_refusals_remain_typed() {
+        // These native AppError arms are distinct from the FFI reference
+        // parser's direct InvalidIdentity construction. Wording remains Display.
+        for native in [
+            AppError::InvalidPublicKey,
+            AppError::UnexpectedPrivateKey,
+            AppError::IdentityKeyMismatch,
+        ] {
+            assert!(
+                matches!(
+                    MarmotKitError::from(native),
+                    MarmotKitError::InvalidIdentity { .. }
+                ),
+                "native identity refusal lost its typed host category"
+            );
+        }
+        // dismiss_history_notice forwards the real native notice-id parser's
+        // Hex failure; this is separate from the FFI group's direct parser.
+        let malformed = hex::decode("not-hex").unwrap_err();
+        assert!(matches!(
+            MarmotKitError::from(AppError::Hex(malformed)),
+            MarmotKitError::InvalidHex { .. }
+        ));
+    }
+
+    #[test]
+    fn media_and_publication_refusals_keep_distinct_host_choices() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: [(AppError, Expected); 3] = [
+            (
+                AppError::MediaUnfetchable("no usable file media locator".into()),
+                |e| matches!(e, MarmotKitError::MediaUnfetchable { .. }),
+            ),
+            (
+                AppError::MediaDownloadFailed("media ciphertext hash mismatch".into()),
+                |e| matches!(e, MarmotKitError::MediaDownloadFailed { .. }),
+            ),
+            (
+                AppError::Publish("primary publication failure".into()),
+                |e| matches!(e, MarmotKitError::Publish { .. }),
+            ),
+        ];
+        for (native, expected) in cases {
+            let ffi = MarmotKitError::from(native);
+            assert!(
+                expected(&ffi),
+                "media/publication refusal lost its host choice: {ffi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_causes_preserve_the_artifact_and_coarse_size() {
+        use super::{EventSizeClassFfi as Size, OversizedArtifactFfi as Artifact};
+        use marmot_app::OversizedArtifact as Native;
+        // The real early cause classifier is shared with wrapped transport
+        // errors. No receipt, relay limit or complete publication is invented.
+        for (artifact, expected) in [
+            (Native::Commit, Artifact::Commit),
+            (Native::Welcome, Artifact::Welcome),
+            (Native::ApplicationMessage, Artifact::ApplicationMessage),
+            (Native::Other, Artifact::Other),
+        ] {
+            let native = AppError::EventTooLarge {
+                artifact,
+                size_class: marmot_app::EventSizeClass::of_bytes(1024),
+            };
+            let MarmotKitError::EventTooLarge {
+                artifact,
+                size_class,
+            } = MarmotKitError::from(native)
+            else {
+                panic!("oversized cause lost its typed host category");
+            };
+            assert_eq!(artifact, expected, "oversized artifact kind");
+            assert_eq!(size_class, Size::Under64Kib);
+        }
+    }
+
+    #[test]
+    fn remaining_size_classes_preserve_their_host_bucket() {
+        use super::EventSizeClassFfi as Size;
+        // The supported lower Rust factory supplies valid enum inputs. This
+        // does not assert every bounded App publisher emits every bucket.
+        // Under64Kib is owned above; From2To4Mib by Welcome diagnosis.
+        for (bytes, expected) in [
+            (64 * 1024, Size::From64To128Kib),
+            (128 * 1024, Size::From128To256Kib),
+            (256 * 1024, Size::From256To512Kib),
+            (512 * 1024, Size::From512KibTo1Mib),
+            (1024 * 1024, Size::From1To2Mib),
+            (4 * 1024 * 1024 + 1, Size::Over4Mib),
+        ] {
+            let native = marmot_app::EventSizeClass::of_bytes(bytes);
+            assert_eq!(Size::from(native), expected, "coarse host size bucket");
+        }
+    }
+
+    #[test]
     fn attachment_configuration_and_account_errors_stay_typed() {
         assert!(matches!(
             MarmotKitError::from(AppError::AttachmentModeRequired),
