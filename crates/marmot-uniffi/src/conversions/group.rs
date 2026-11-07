@@ -914,3 +914,325 @@ impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod group_state_tests {
+    use super::*;
+
+    #[test]
+    fn account_devices_activation_ffi_preserves_eligible_answer() {
+        // The error owner already reaches this same converter for every refusal.
+        assert_eq!(
+            AccountDevicesActivationFfi::from(AppAccountDevicesActivation::Eligible),
+            AccountDevicesActivationFfi::Eligible,
+        );
+    }
+
+    #[test]
+    fn group_ffi_preserves_resident_lifecycle_and_protocol_profile() {
+        // EpochManager never retains Merging or Recovering in its state map;
+        // those transient native steps are not positive query fixtures here.
+        for (native, expected) in [
+            (
+                AppGroupLifecycleState::Stable,
+                GroupLifecycleStateFfi::Stable,
+            ),
+            (
+                AppGroupLifecycleState::PendingPublish,
+                GroupLifecycleStateFfi::PendingPublish,
+            ),
+            (
+                AppGroupLifecycleState::Unrecoverable,
+                GroupLifecycleStateFfi::Unrecoverable,
+            ),
+            (
+                AppGroupLifecycleState::Disbanded,
+                GroupLifecycleStateFfi::Disbanded,
+            ),
+        ] {
+            assert_eq!(GroupLifecycleStateFfi::from(native), expected);
+        }
+        assert!(matches!(
+            AppProtocolProfileFfi::from(AppProtocolProfile::Current),
+            AppProtocolProfileFfi::Current
+        ));
+        assert!(matches!(
+            AppProtocolProfileFfi::from(AppProtocolProfile::Legacy),
+            AppProtocolProfileFfi::Legacy
+        ));
+    }
+
+    #[test]
+    fn group_details_ffi_enriches_canonical_admin_self_and_cached_names() {
+        std::thread::Builder::new()
+            .name("ffi-group-conversion-producer".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(group_details_from_public_snapshot());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn group_details_from_public_snapshot() {
+        use cgka_traits::TransportEndpoint;
+        use marmot_app::{AccountSetupRequest, AppCreateGroupOptions, MarmotApp, MarmotAppConfig};
+
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            root.path(),
+            endpoint.0.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        );
+        let runtime = app.runtime();
+        let mut accounts = Vec::new();
+        for _ in 0..3 {
+            accounts.push(
+                runtime
+                    .create_identity(AccountSetupRequest {
+                        default_relays: vec![endpoint.clone()],
+                        bootstrap_relays: vec![endpoint.clone()],
+                        publish_missing_relay_lists: true,
+                        publish_initial_key_package: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .account
+                    .account_id_hex,
+            );
+        }
+        let self_id = &accounts[0];
+        let other_id = &accounts[1];
+        let ordinary_id = &accounts[2];
+        let group = runtime
+            .create_group_with_options(
+                self_id,
+                "conversion producer",
+                &[other_id.clone(), ordinary_id.clone()],
+                AppCreateGroupOptions {
+                    initial_admins: vec![other_id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .enable_group_disbanding(self_id, &group)
+            .await
+            .unwrap();
+        // These ordinary app accounts advertise account-devices in every build.
+        // Founding creation negotiates it from their actual leaves; a second
+        // enable command would correctly refuse AlreadyRequired.
+        assert_eq!(
+            runtime
+                .account_devices_activation(self_id, &group)
+                .await
+                .unwrap(),
+            AppAccountDevicesActivation::AlreadyEnabled,
+        );
+        let mut snapshot = runtime
+            .group_conversation_snapshot(self_id, &group)
+            .await
+            .unwrap();
+        assert!(
+            snapshot
+                .mls_state
+                .required_app_components
+                .contains(&cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID,)
+        );
+        // Optional directory data is independent of canonical roster roles.
+        // This contrast supplies only that cache result, not group/MLS fields.
+        snapshot.display_names = HashMap::from([
+            (self_id.clone(), "Alice".into()),
+            (other_id.clone(), "Bob".into()),
+        ]);
+        let mut details = group_details_from_conversation_snapshot_ffi(snapshot).unwrap();
+        let own = details
+            .members
+            .iter()
+            .find(|m| m.member_id_hex == *self_id)
+            .unwrap();
+        let other = details
+            .members
+            .iter()
+            .find(|m| m.member_id_hex == *other_id)
+            .unwrap();
+        let ordinary = details
+            .members
+            .iter()
+            .find(|m| m.member_id_hex == *ordinary_id)
+            .unwrap();
+        assert!(own.is_admin);
+        assert!(own.is_self);
+        assert_eq!(own.display_name.as_deref(), Some("Alice"));
+        assert!(other.is_admin);
+        assert!(!other.is_self);
+        assert_eq!(other.display_name.as_deref(), Some("Bob"));
+        assert!(!ordinary.is_admin);
+        assert!(!ordinary.is_self);
+        assert_eq!(ordinary.display_name, None);
+        assert_eq!(
+            details.mls_state.lifecycle_state,
+            GroupLifecycleStateFfi::Stable
+        );
+        assert!(group_management_state_ffi(self_id, &details).can_disband);
+
+        // Only lifecycle is overlaid: staging can leave this same active
+        // roster/requirements at PendingPublish. This tests the reverse FFI
+        // choice, not an emitted pending-publication transition.
+        details.mls_state.lifecycle_state = GroupLifecycleStateFfi::PendingPublish;
+        let pending = group_management_state_ffi(self_id, &details);
+        assert_eq!(
+            pending.lifecycle_state,
+            GroupLifecycleStateFfi::PendingPublish
+        );
+        assert_eq!(
+            (
+                pending.can_invite,
+                pending.is_self_admin,
+                pending.can_disband
+            ),
+            (true, true, false)
+        );
+        details.mls_state.lifecycle_state = GroupLifecycleStateFfi::Stable;
+
+        {
+            // Native removal owns the transition. This binding contrast changes
+            // only the always-compiled membership reader on the emitted chat
+            // snapshot. A remaining device keeps this account row/admin role;
+            // this does not perform the native roster-based removal journey.
+            let active = group_management_state_ffi(self_id, &details);
+            assert_eq!(
+                (active.can_invite, active.is_self_admin, active.can_disband),
+                (true, true, true)
+            );
+            details.group.self_membership = marmot_app::SelfMembership::DeviceRemoved.into();
+            assert!(matches!(
+                details.group.self_membership,
+                SelfMembershipFfi::DeviceRemoved
+            ));
+            let removed = group_management_state_ffi(self_id, &details);
+            assert_eq!(
+                (
+                    removed.can_invite,
+                    removed.is_self_admin,
+                    removed.can_disband
+                ),
+                (false, false, false)
+            );
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[test]
+    fn hydration_ffi_preserves_each_produced_quarantine_category() {
+        use AppGroupHydrationQuarantineReason as Native;
+        use AppGroupHydrationQuarantineReasonFfi as Ffi;
+        for (native, expected) in [
+            (Native::OpenMlsLoadFailed, Ffi::OpenMlsLoadFailed),
+            (Native::OpenMlsGroupMissing, Ffi::OpenMlsGroupMissing),
+            (Native::MemberValidationFailed, Ffi::MemberValidationFailed),
+            (Native::GroupRecordLoadFailed, Ffi::GroupRecordLoadFailed),
+            (
+                Native::PendingCommitRecoveryFailed,
+                Ffi::PendingCommitRecoveryFailed,
+            ),
+        ] {
+            let ffi = Ffi::from(native);
+            assert_eq!(
+                std::mem::discriminant(&ffi),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_media_ffi_exposes_only_required_supported_versions() {
+        use cgka_traits::app_components::{
+            EncryptedMediaPolicyV1, EncryptedMediaPolicyV2, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, encode_encrypted_media_policy_v1,
+            encode_encrypted_media_policy_v2,
+        };
+        let v1 = EncryptedMediaPolicyV1::blossom_default(["https://media.example".into()], false)
+            .expect("valid V1 policy");
+        let v2 = EncryptedMediaPolicyV2::blossom_default(["https://media.example".into()])
+            .expect("valid V2 policy");
+        // App's from_policy_v1/v2 and disabled_for_profile emit these cases.
+        // The unknown-id fallback has no current producer.
+        for (component_id, component, media_format, data, expected) in [
+            (
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                "marmot.group.encrypted-media.v1",
+                v1.media_format.clone(),
+                encode_encrypted_media_policy_v1(&v1).expect("encode V1"),
+                EncryptedMediaVersionFfi::V1,
+            ),
+            (
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                "marmot.group.encrypted-media.v2",
+                v2.media_format.clone(),
+                encode_encrypted_media_policy_v2(&v2).expect("encode V2"),
+                EncryptedMediaVersionFfi::V2,
+            ),
+        ] {
+            let mut native = AppGroupEncryptedMediaComponent {
+                component_id,
+                component: component.into(),
+                required: true,
+                media_format,
+                allowed_locator_kinds: vec!["blossom-v1".into()],
+                default_blob_endpoints: vec![AppBlobEndpoint {
+                    locator_kind: "blossom-v1".into(),
+                    base_url: "https://media.example/".into(),
+                }],
+                data_hex: hex::encode(data),
+            };
+            let ffi = AppGroupEncryptedMediaComponentFfi::from(native.clone());
+            assert_eq!(ffi.version, Some(expected));
+            native.required = false;
+            native.media_format.clear();
+            native.allowed_locator_kinds.clear();
+            native.default_blob_endpoints.clear();
+            native.data_hex.clear();
+            assert_eq!(
+                AppGroupEncryptedMediaComponentFfi::from(native).version,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn failed_disband_ffi_preserves_loss_of_admin_or_membership() {
+        // Pending already has a native-to-FFI chat-list owner.
+        for (native, expected) in [
+            (
+                AppDisbandFailureReason::NoLongerAdmin,
+                DisbandFailureReasonFfi::NoLongerAdmin,
+            ),
+            (
+                AppDisbandFailureReason::NoLongerMember,
+                DisbandFailureReasonFfi::NoLongerMember,
+            ),
+        ] {
+            let ffi = DisbandRequestFfi::from(AppDisbandRequest::Failed {
+                requested_at_ms: 1_700_000_000_456,
+                reason: native,
+            });
+            assert_eq!(
+                ffi,
+                DisbandRequestFfi::Failed {
+                    requested_at_ms: 1_700_000_000_456,
+                    reason: expected
+                }
+            );
+        }
+    }
+}
