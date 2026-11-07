@@ -10,7 +10,8 @@
   stopped by runtime shutdown or storage close, fails with the new `AppError::EmojiSetInstallCancelled` and stores
   nothing. Add `fetch_emoji_set_cover` for a set's cover image. Any `image/*` response type is now accepted and the
   bytes decide the format; only non-image types (`MimeMismatch`) are refused. `emoji_sets`, `emoji_set`,
-  `installed_custom_emoji` and `read_installed_custom_emoji` are now async and read on the blocking pool.
+  `installed_custom_emoji` and `read_installed_custom_emoji` are now async and read on the blocking pool, as do the
+  account and storage reads before and after install, preview and cover downloads.
 
 - A due-backup caller waits through account startup catch-up instead of timing out at the local command-response
   bound (mdk#3013). Its existing completion, cancellation and worker-stop outcomes are unchanged; the host still

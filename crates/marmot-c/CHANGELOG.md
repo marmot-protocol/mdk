@@ -14,7 +14,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_emoji_set_cover_free`. Append `MARMOT_STATUS_EMOJI_SET_CHANGED` (127) and
   `MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED` (128). `marmot_emoji_sets`, `marmot_emoji_set`,
   `marmot_installed_custom_emoji` and `marmot_read_installed_custom_emoji` now read off the runtime's workers while
-  blocking. Use the matching header and library.
+  blocking. A NULL control records a `marmot_last_error_message` detail. Use the matching header and library.
 
 - Add the `Text` filter node kind (5), read from the new trailing `MarmotChatListFilterNode.text` field (borrowed,
   NUL-terminated UTF-8, required for that kind), and append `TextTooLong` (7) to `MarmotChatListQueryError`
