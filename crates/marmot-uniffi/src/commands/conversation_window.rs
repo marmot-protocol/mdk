@@ -318,12 +318,121 @@ mod tests {
             received.unwrap().unwrap().revision.sequence,
             jumped.revision.sequence
         );
+        assert!(matches!(
+            jumped.anchor.kind,
+            ConversationAnchorKindFfi::Message
+        ));
         assert_eq!(
             jumped.messages[jumped.anchor.index.unwrap() as usize]
                 .timeline
                 .message_id_hex,
             target
         );
+        // Exercise the remaining target choices against the same retained rows.
+        let explicit = kit
+            .open_conversation_window(
+                account.clone(),
+                group.clone(),
+                ConversationOpenModeFfi::Message,
+                Some(target.clone()),
+                Some(2),
+                0,
+            )
+            .await
+            .unwrap();
+        let opened = explicit.snapshot().unwrap();
+        assert!(matches!(
+            opened.anchor.kind,
+            ConversationAnchorKindFfi::Message
+        ));
+        assert_eq!(
+            opened.messages[opened.anchor.index.unwrap() as usize]
+                .timeline
+                .message_id_hex,
+            target
+        );
+        explicit.cancel().await;
+        let automatic = kit
+            .open_conversation_window(
+                account.clone(),
+                group.clone(),
+                ConversationOpenModeFfi::Automatic,
+                None,
+                Some(2),
+                0,
+            )
+            .await
+            .unwrap();
+        // Cancel before taking its genuine initial snapshot: no snapshot survives.
+        automatic.cancel().await;
+        assert!(automatic.snapshot().is_none());
+        assert!(automatic.next().await.unwrap().is_none());
+        automatic.cancel().await;
+        for mode in [
+            ConversationOpenModeFfi::Automatic,
+            ConversationOpenModeFfi::Latest,
+        ] {
+            assert!(matches!(
+                kit.open_conversation_window(
+                    account.clone(),
+                    group.clone(),
+                    mode,
+                    Some(target.clone()),
+                    Some(2),
+                    0,
+                )
+                .await,
+                Err(MarmotKitError::ConversationWindowInvalidTarget)
+            ));
+        }
+        assert!(matches!(
+            kit.open_conversation_window(
+                account.clone(),
+                group.clone(),
+                ConversationOpenModeFfi::Message,
+                Some(" ".into()),
+                Some(2),
+                0,
+            )
+            .await,
+            Err(MarmotKitError::ConversationWindowInvalidTarget)
+        ));
+        assert!(matches!(
+            kit.open_conversation_window(
+                account.clone(),
+                group.clone(),
+                ConversationOpenModeFfi::Message,
+                Some("zz".into()),
+                Some(2),
+                0,
+            )
+            .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
+        assert!(matches!(
+            kit.open_conversation_window(
+                account.clone(),
+                group.clone(),
+                ConversationOpenModeFfi::Latest,
+                None,
+                Some(0),
+                0,
+            )
+            .await,
+            Err(MarmotKitError::ConversationWindowInvalidLimit)
+        ));
+        assert!(matches!(
+            window
+                .set_visible_anchor(jumped.revision.clone(), " ".into(), 0)
+                .await,
+            Err(MarmotKitError::ConversationWindowInvalidTarget)
+        ));
+        assert!(matches!(
+            window
+                .jump_to_message(jumped.revision.clone(), "zz".into(), 0)
+                .await,
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
         // Cancellation of next must not swallow a subsequent draft replacement.
         {
             // The original Rust method polls the real receiver inline; dropping
@@ -392,13 +501,41 @@ mod tests {
                 .is_none()
         );
         let _ = window.next().await.unwrap();
-        let next = window.next();
+        let mut next = Box::pin(window.next());
+        // Drain only actual additional replacements; observe this exact wait
+        // Pending before cancel, without assuming a spawned task entered I/O.
+        loop {
+            match futures::poll!(&mut next) {
+                std::task::Poll::Ready(Ok(Some(_))) => next = Box::pin(window.next()),
+                std::task::Poll::Pending => break,
+                other => panic!("expected a live pending receiver, got {other:?}"),
+            }
+        }
         let close = window.cancel();
-        let (closed, ()) = tokio::join!(next, close);
+        // Poll the real close first: it sends the closed watch before waiting
+        // for the receiver lock, so this same pending receive cannot win with
+        // a replacement if the runtime scheduling policy changes.
+        let ((), closed) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(biased; close, next)
+        })
+        .await
+        .unwrap();
         assert!(closed.unwrap().is_none());
         window.cancel().await;
         assert!(matches!(
-            window.return_to_latest(paged.revision, 0).await,
+            window.return_to_latest(paged.revision.clone(), 0).await,
+            Err(MarmotKitError::ConversationWindowClosed)
+        ));
+        let mut wrong_closed = paged.revision.clone();
+        wrong_closed.generation.push('x');
+        assert!(matches!(
+            window
+                .set_visible_anchor(wrong_closed.clone(), "zz".into(), 0)
+                .await,
+            Err(MarmotKitError::ConversationWindowClosed)
+        ));
+        assert!(matches!(
+            window.jump_to_message(wrong_closed, "zz".into(), 0).await,
             Err(MarmotKitError::ConversationWindowClosed)
         ));
         assert!(matches!(

@@ -181,3 +181,53 @@ impl ConversationWindowSubscription {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancel_closes_an_observed_pending_generic_command() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = marmot_app::MarmotApp::with_relay(dir.path(), relay.url().await.as_str());
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("command cancellation", &[])
+            .await
+            .unwrap();
+        drop(client);
+        let runtime = app.runtime();
+        let inner = runtime
+            .open_conversation_window(
+                "alice",
+                &group,
+                marmot_app::ConversationOpenQuery {
+                    target: marmot_app::ConversationOpenTarget::Latest,
+                    limit: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            inner.snapshot.anchor,
+            marmot_app::ConversationOpenAnchorOutcome::Empty
+        ));
+        let window = ConversationWindowSubscription::new(inner);
+        // This existing private generic wrapper is also used by real commands.
+        // Only the supplied operation is Pending: native actor/I/O entry is not claimed.
+        let mut command = Box::pin(window.command(0, std::future::pending()));
+        assert!(futures::poll!(&mut command).is_pending());
+        window.cancel().await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), command)
+                .await
+                .unwrap(),
+            Err(MarmotKitError::ConversationWindowClosed)
+        ));
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
