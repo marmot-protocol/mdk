@@ -1041,9 +1041,12 @@ mod tests {
                 AppError::AccountHome(AccountHomeError::AccountUnlinked("alice".into())),
                 |e| matches!(e, MarmotKitError::AccountUnlinked { .. }),
             ),
-            (AppError::ExternalSignerUnavailable("alice".into()), |e| {
-                matches!(e, MarmotKitError::ExternalSignerUnavailable { .. })
-            }),
+            (
+                AppError::ExternalSignerUnavailable(
+                    "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+                ),
+                |e| matches!(e, MarmotKitError::ExternalSignerUnavailable { .. }),
+            ),
             (AppError::ExternalSignerMismatch, |e| {
                 matches!(e, MarmotKitError::ExternalSignerMismatch)
             }),
