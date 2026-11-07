@@ -14155,67 +14155,83 @@ fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
 #[cfg(unix)]
 #[test]
 fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
-    let account_id = "aa".repeat(32);
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let (exe, args_file) = test_arg_recording_executable(
-        tempdir.path(),
-        r#"{"ok":true,"result":{"running":true,"pid":4242}}"#,
-    );
-    use clap::Parser;
-    let cli = Cli::try_parse_from([
-        "wn",
-        "tui",
-        "--discovery-relays",
-        "wss://d.example,wss://d2.example",
-        "--default-account-relays",
-        "wss://a.example",
-    ])
-    .expect("parse first-run TUI relays");
-    let mut client = WnClient::from_cli(&cli).expect("construct first-run TUI client");
-    client.exe = exe;
-    let mut app = test_tui_app(client, &account_id);
-    app.daemon = DaemonView::default();
+    // Keep the original discovery-only admission edge as well as both-list forwarding.
+    for (arguments, expected) in [
+        (
+            vec!["wn", "tui", "--discovery-relays", "wss://d.example"],
+            vec![
+                "--json",
+                "daemon",
+                "start",
+                "--discovery-relays",
+                "wss://d.example",
+            ],
+        ),
+        (
+            vec![
+                "wn",
+                "tui",
+                "--discovery-relays",
+                "wss://d.example,wss://d2.example",
+                "--default-account-relays",
+                "wss://a.example",
+            ],
+            vec![
+                "--json",
+                "daemon",
+                "start",
+                "--discovery-relays",
+                "wss://d.example,wss://d2.example",
+                "--default-account-relays",
+                "wss://a.example",
+            ],
+        ),
+    ] {
+        let account_id = "aa".repeat(32);
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (exe, args_file) = test_arg_recording_executable(
+            tempdir.path(),
+            r#"{"ok":true,"result":{"running":true,"pid":4242}}"#,
+        );
+        use clap::Parser;
+        let cli = Cli::try_parse_from(arguments).expect("parse first-run TUI relays");
+        let mut client = WnClient::from_cli(&cli).expect("construct first-run TUI client");
+        client.exe = exe;
+        let mut app = test_tui_app(client, &account_id);
+        app.daemon = DaemonView::default();
 
-    app.autostart_daemon_if_needed(None);
-    assert_eq!(
-        app.status, STARTING_DAEMON_STATUS,
-        "the in-flight status shows before the outcome lands"
-    );
-    assert!(
-        app.daemon_autostart.is_some(),
-        "auto-start runs on its own one-shot thread, not the shared effect worker"
-    );
+        app.autostart_daemon_if_needed(None);
+        assert_eq!(
+            app.status, STARTING_DAEMON_STATUS,
+            "the in-flight status shows before the outcome lands"
+        );
+        assert!(
+            app.daemon_autostart.is_some(),
+            "auto-start runs on its own one-shot thread, not the shared effect worker"
+        );
 
-    // Read the recorded argv after the result lands but before folding it: the
-    // received result proves the `daemon start` child ran to completion, and
-    // the fold below is what re-ensures the daemon-backed subscriptions —
-    // spawning further `wn` children against this same fake, each of which
-    // rewrites the truncating argv recorder. A read placed after the fold
-    // races those children (on a loaded CI box they win: the recorder held
-    // `messages subscribe` argv instead).
-    let result = app.recv_daemon_autostart();
-    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
-    let args: Vec<&str> = recorded.lines().collect();
-    assert_eq!(
-        args,
-        [
-            "--json",
-            "daemon",
-            "start",
-            "--discovery-relays",
-            "wss://d.example,wss://d2.example",
-            "--default-account-relays",
-            "wss://a.example",
-        ],
-        "both parsed first-run relay lists reach the daemon-start child"
-    );
+        // Read the recorded argv after the result lands but before folding it: the
+        // received result proves the `daemon start` child ran to completion, and
+        // the fold below is what re-ensures the daemon-backed subscriptions —
+        // spawning further `wn` children against this same fake, each of which
+        // rewrites the truncating argv recorder. A read placed after the fold
+        // races those children (on a loaded CI box they win: the recorder held
+        // `messages subscribe` argv instead).
+        let result = app.recv_daemon_autostart();
+        let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+        let args: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            args, expected,
+            "both parsed first-run relay lists reach the daemon-start child"
+        );
 
-    app.fold_daemon_start(result);
-    assert!(
-        app.daemon.running,
-        "the fold adopts the started daemon, flipping the status-bar dot's data source"
-    );
-    assert_eq!(app.status, "daemon running");
+        app.fold_daemon_start(result);
+        assert!(
+            app.daemon.running,
+            "the fold adopts the started daemon, flipping the status-bar dot's data source"
+        );
+        assert_eq!(app.status, "daemon running");
+    }
 }
 
 #[cfg(unix)]
