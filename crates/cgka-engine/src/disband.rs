@@ -362,8 +362,6 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let wrapped = crate::message_processor::route_wrapped_group_message(wrapped, &context);
-        self.record_sent_openmls_message(&wrapped, &commit_bytes, group_id, source_epoch)?;
-
         let former_members = deduplicated_roster(&self.storage.get_group(group_id)?.members);
         let candidate = DisbandCandidate {
             group_id: group_id.clone(),
@@ -376,14 +374,23 @@ impl<S: StorageProvider> Engine<S> {
             former_members,
         };
         request.last_prepared_epoch = Some(source_epoch);
-        self.storage.with_transaction(|storage| {
+        let pending = self.epoch_manager.next_pending_ref()?;
+        // Keep the earlier irreversible Pending request on failure, while
+        // publishing no candidate or sent artifact from this failed attempt.
+        let content_id = self.storage.with_transaction(|storage| {
+            let content_id = self.persist_sent_openmls_message_with_application_stamp(
+                &wrapped,
+                &commit_bytes,
+                group_id,
+                source_epoch,
+                None,
+            )?;
             storage.put_disband_candidate(&candidate)?;
             storage.put_disband_request(&request)?;
-            Ok::<(), StorageError>(())
+            Ok::<_, EngineError>(content_id)
         })?;
 
         let target_epoch = EpochId(source_epoch.0.saturating_add(1));
-        let pending = self.epoch_manager.next_pending_ref()?;
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
@@ -395,6 +402,8 @@ impl<S: StorageProvider> Engine<S> {
             self.current_audit_context.clone(),
         )?;
         self.track_pending_origin_commit(pending, wrapped.id.clone());
+        self.sent_message_ids.insert(wrapped.id.clone());
+        self.sent_message_ids.insert(content_id);
         guard.disarm();
         Ok(Some(SendResult::GroupEvolution {
             msg: wrapped,

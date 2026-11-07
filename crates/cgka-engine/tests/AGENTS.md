@@ -154,6 +154,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
+    Its `late_descriptor` module owns failed SelfUpdate Prepared and final Disband request writes: complete sent/native/protocol rollback, encrypted reopen, and real preparation/confirmation retry (mdk#3170).
 
 - **File:** `pending_commit_recovery.rs`
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving

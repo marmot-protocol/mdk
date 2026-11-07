@@ -52,6 +52,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "publish_lifecycle/late_descriptor.rs"]
+mod late_descriptor;
+
 mod support;
 use support::proof_signer;
 
