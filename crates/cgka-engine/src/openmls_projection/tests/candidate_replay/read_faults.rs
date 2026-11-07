@@ -165,6 +165,13 @@ async fn read_wrapper(site: ReadSite) {
                 source_epoch.0 + 1
             );
             assert_eq!(storage.get_group(&group).unwrap().members.len(), 3);
+            let native = MlsGroup::load(
+                storage.mls_storage(),
+                &openmls::group::GroupId::from_slice(group.as_slice()),
+            )
+            .unwrap()
+            .expect("the healthy post-replay native group must exist");
+            assert_eq!(native.epoch().as_u64(), source_epoch.0 + 1);
         }
         ReadSite::AddedProfile => {
             let bytes: Vec<u8> = sql
