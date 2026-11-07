@@ -20,6 +20,9 @@ import uuid
 
 
 RESERVE_BYTES = 2 * 1024**3
+# The measured workspace archive needs 16 GiB compressed plus expanded; leave
+# another 16 GiB for the toolchain and test writes before skipping SDK cleanup.
+ARCHIVE_FREE_BYTES = 32 * 1024**3
 TAIL_BYTES = 1024**2
 # Only unused SDKs on disposable GitHub-hosted Linux runners. Keep Rust,
 # Java, Docker and its images, system libraries, and all repository artifacts.
@@ -54,11 +57,14 @@ def require_space(expanded_bytes: int) -> None:
                          f"{RESERVE_BYTES} reserve, have {available}")
 
 
-def prepare() -> None:
+def prepare(minimum_free_bytes: int | None = None) -> None:
     if (sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true"
             or os.environ.get("MDK_RUNNER_ENVIRONMENT") != "github-hosted"):
         raise ValueError("SDK cleanup is only for GitHub-hosted Linux CI runners")
     snapshot("before-sdk-cleanup")
+    if minimum_free_bytes is not None and shutil.disk_usage(Path.cwd()).free >= minimum_free_bytes:
+        snapshot("sdk-cleanup-not-needed")
+        return
     subprocess.run(["sudo", "rm", "-rf", "--", *UNUSED_SDKS], check=True)
     snapshot("after-sdk-cleanup")
     require_space(0)
@@ -221,6 +227,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("prepare")
+    commands.add_parser("prepare-archive")
     for action in ("manifest", "extract"):
         commands.add_parser(action).add_argument("archive", type=Path)
     child = commands.add_parser("run")
@@ -230,6 +237,8 @@ def main() -> int:
     try:
         if args.action == "prepare":
             prepare()
+        elif args.action == "prepare-archive":
+            prepare(ARCHIVE_FREE_BYTES)
         elif args.action == "manifest":
             manifest(args.archive)
         elif args.action == "extract":

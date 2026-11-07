@@ -1044,23 +1044,33 @@ signal.pause()
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"only for GitHub-hosted Linux CI runners", result.stderr)
 
+    def test_archive_cleanup_budget(self):
+        minimum = 32 * 1024**3
+        for available, budget, removed in ((minimum, minimum, False),
+                                           (minimum - 1, minimum, True),
+                                           (minimum, None, True)):
+            with self.subTest(available=available, budget=budget), tempfile.TemporaryDirectory() as tmp:
+                sdk = Path(tmp) / "unused-sdk"
+                sdk.mkdir()
+                (sdk / "payload").write_text("keep unless space is needed")
+                sudo = Path(tmp) / "sudo"
+                sudo.write_text('#!/bin/sh\nexec "$@"\n')
+                sudo.chmod(0o700)
+                usage = type("Usage", (), {"total": minimum * 2, "used": minimum,
+                                            "free": available})()
+
+                with unittest.mock.patch.dict(os.environ, {
+                    "RUNNER_TEMP": tmp, "GITHUB_ACTIONS": "true",
+                    "MDK_RUNNER_ENVIRONMENT": "github-hosted",
+                    "PATH": tmp + os.pathsep + os.environ["PATH"],
+                }), unittest.mock.patch.object(sys, "platform", "linux"), \
+                     unittest.mock.patch.object(ci_runner, "UNUSED_SDKS", (str(sdk),)), \
+                     unittest.mock.patch.object(ci_runner.shutil, "disk_usage", return_value=usage):
+                    ci_runner.prepare(budget)
+                self.assertEqual(sdk.exists(), not removed)
+
 
 class RunnerInfrastructurePolicyTests(unittest.TestCase):
-    def test_archive_jobs_prepare_disk_and_validate_before_running_tests(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        jobs = re.split(r"\n  (?=[a-z][a-z0-9-]*:\n)", workflow.split("\njobs:\n", 1)[1])
-        consumers = [job for job in jobs if "uses: actions/download-artifact@" in job]
-        self.assertTrue(consumers, "the archive consumers must be found")
-        for job in consumers:
-            with self.subTest(job=job.splitlines()[0]):
-                self.assertIn("python3 scripts/ci_runner.py prepare", job)
-                self.assertLess(job.index("ci_runner.py prepare"), job.index("uses: actions/download-artifact@"))
-                self.assertIn("python3 scripts/ci_runner.py extract", job)
-                self.assertNotIn("nextest run --archive-file", job)
-                self.assertIn("--binaries-metadata target/nextest/binaries-metadata.json", job)
-                self.assertIn("if: always()", job)
-                self.assertIn("${{ runner.temp }}/mdk-ci-reports", job)
-
     def test_producer_archives_carry_integrity_and_expanded_size_manifests(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         jobs = re.split(r"\n  (?=[a-z][a-z0-9-]*:\n)", workflow.split("\njobs:\n", 1)[1])

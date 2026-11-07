@@ -204,6 +204,12 @@ run. Master pushes run CI only to refresh the Rust dependency caches that pull
 requests and merge groups restore, and only when `Cargo.lock`, a `Cargo.toml`,
 the toolchain pin, Cargo config or `ci.yml` changes.
 
+Workspace test shards keep the runner's unused SDKs when at least 32 GiB is
+free; below that budget they reclaim SDK space before downloading the test
+archive. Builders still reclaim it unconditionally. Archive consumers verify
+the checksum and require the manifest's expanded size plus a 2 GiB disk reserve
+before extraction, regardless of whether cleanup ran.
+
 Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
 along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS
 clippy lane and Apple packaging, and `ci:android` adds Android packaging; for
