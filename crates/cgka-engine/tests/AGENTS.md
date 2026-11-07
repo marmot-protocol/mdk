@@ -164,6 +164,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
     a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
+  `native_replay_storage_failure_retains_the_authenticated_commit_for_retry` owns actual native merge backend
+  propagation: a conditional public-context SQL write fault must retain a genuine peer Commit and charge retry,
+  instead of classifying it invalid; encrypted reopen and healing apply that same input and restore real delivery.
+
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
     release with `--ignored --nocapture`; it reports timings and never asserts a threshold

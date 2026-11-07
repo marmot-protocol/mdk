@@ -4234,8 +4234,17 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 }
                 mls_group
                     .merge_staged_commit(&provider, *staged)
-                    .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
+                    .map_err(|error| match error {
+                        // A candidate cannot be judged invalid when its
+                        // authenticated merge was interrupted by persistence.
+                        openmls::group::MergeCommitError::StorageError(error) => {
+                            OpenMlsProjectionError::Storage(format!(
+                                "merge_staged_commit: {error:?}"
+                            ))
+                        }
+                        other => OpenMlsProjectionError::Replay(format!(
+                            "merge_staged_commit: {other:?}"
+                        )),
                     })?;
                 if retain_replayed_anchors.is_some() {
                     crate::device_roster_departures::record(
