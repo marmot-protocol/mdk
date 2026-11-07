@@ -436,3 +436,118 @@ impl From<SignOutOutcome> for SignOutOutcomeFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod account_state_tests {
+    use super::*;
+
+    #[test]
+    fn account_readiness_ffi_preserves_non_local_ready_answers() {
+        // The create/import command owners already cover LocalReady. These
+        // other answers come from onboarding admission and durable setup phases.
+        for (native, expected) in [
+            (
+                AccountSetupReadiness::Initializing,
+                AccountSetupReadinessFfi::Initializing,
+            ),
+            (
+                AccountSetupReadiness::Publishing,
+                AccountSetupReadinessFfi::Publishing,
+            ),
+            (
+                AccountSetupReadiness::NetworkReady,
+                AccountSetupReadinessFfi::NetworkReady,
+            ),
+            (
+                AccountSetupReadiness::RecoveryRequired,
+                AccountSetupReadinessFfi::RecoveryRequired,
+            ),
+        ] {
+            assert_eq!(AccountSetupReadinessFfi::from(native), expected);
+        }
+    }
+
+    #[test]
+    fn key_package_ffi_preserves_non_current_ownership_states() {
+        // The inventory command owner already covers Current. Runtime inventory
+        // also contains relay-only, pending, retained and legacy-owned packages.
+        for (native, expected) in [
+            (
+                AccountKeyPackageLocalState::NotLocal,
+                AccountKeyPackageLocalStateFfi::NotLocal,
+            ),
+            (
+                AccountKeyPackageLocalState::PendingReplacement,
+                AccountKeyPackageLocalStateFfi::PendingReplacement,
+            ),
+            (
+                AccountKeyPackageLocalState::RetainedPrivateMaterial,
+                AccountKeyPackageLocalStateFfi::RetainedPrivateMaterial,
+            ),
+            (
+                AccountKeyPackageLocalState::OtherOwned,
+                AccountKeyPackageLocalStateFfi::OtherOwned,
+            ),
+        ] {
+            assert_eq!(AccountKeyPackageLocalStateFfi::from(native), expected);
+        }
+    }
+
+    fn native_send_summary(
+        accept_disposition: cgka_traits::SendAcceptDisposition,
+        maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
+    ) -> SendSummary {
+        SendSummary {
+            published: 0,
+            message_ids: vec![],
+            accept_disposition,
+            maintenance_disposition,
+        }
+    }
+
+    #[test]
+    fn send_summary_ffi_preserves_accepted_pending_and_unknown_completion() {
+        use cgka_traits::{SendAcceptDisposition as Native, SendMaintenanceDisposition};
+        for (native, expected) in [
+            (Native::Published, SendAcceptDispositionFfi::Published),
+            (
+                Native::AcceptedPending,
+                SendAcceptDispositionFfi::AcceptedPending,
+            ),
+            (
+                Native::CompletionUnknown,
+                SendAcceptDispositionFfi::CompletionUnknown,
+            ),
+        ] {
+            let ffi = SendSummaryFfi::from(native_send_summary(
+                native,
+                SendMaintenanceDisposition::Ready,
+            ));
+            assert_eq!(
+                std::mem::discriminant(&ffi.accept_disposition),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn send_summary_ffi_preserves_post_join_maintenance_retry() {
+        use cgka_traits::{SendAcceptDisposition, SendMaintenanceDisposition as Native};
+        for (native, expected) in [
+            (Native::Ready, SendMaintenanceDispositionFfi::Ready),
+            (
+                Native::PostJoinRotationPendingRetryable,
+                SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable,
+            ),
+        ] {
+            let ffi = SendSummaryFfi::from(native_send_summary(
+                SendAcceptDisposition::Published,
+                native,
+            ));
+            assert_eq!(
+                std::mem::discriminant(&ffi.maintenance_disposition),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+}
