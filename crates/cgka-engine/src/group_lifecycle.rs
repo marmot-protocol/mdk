@@ -891,29 +891,31 @@ impl<S: StorageProvider> Engine<S> {
                 self.identity.self_id(),
                 self.ciphersuite,
             )?;
-            // SQLite enforces message/group foreign keys, so the group row
-            // must exist before `record_sent_message` writes welcome records.
-            self.storage.put_group(&group_record)?;
-            // #740: index this group's transport routing id for O(1) inbound
-            // resolution (see `Engine::transport_group_id_index`). Best-effort:
-            // a routing-read failure only forfeits the fast path.
-            if let Ok(transport_group_id) =
-                crate::app_components::transport_group_id_of_group(&mls_group)
-            {
-                // Inlined `index_transport_group_route` (field-split borrows:
-                // `provider` above still holds `&self`); creation needs no
-                // retention prune yet.
-                self.transport_group_id_index
-                    .insert(transport_group_id.clone(), group_id.clone());
-                let _ = self.storage.put_transport_group_route(
-                    &transport_group_id,
-                    &group_id,
-                    EpochId(mls_group.epoch().as_u64()),
-                );
-            }
-            for welcome in &welcomes {
-                self.record_sent_message(welcome, &group_id, EpochId(0))?;
-            }
+            // The route may replace an existing group's mapping. Keep it
+            // with every founding artifact so any later Welcome error restores
+            // the previous owner. Hot indexes wait until the pending handoff.
+            self.storage.with_transaction(|storage| {
+                // Message/group foreign keys require this row first.
+                storage.put_group(&group_record)?;
+                if let Ok(transport_group_id) =
+                    crate::app_components::transport_group_id_of_group(&mls_group)
+                {
+                    let _ = storage.put_transport_group_route(
+                        &transport_group_id,
+                        &group_id,
+                        EpochId(mls_group.epoch().as_u64()),
+                    );
+                }
+                for welcome in &welcomes {
+                    self.persist_transport_message(
+                        welcome,
+                        &group_id,
+                        EpochId(0),
+                        MessageState::Sent,
+                    )?;
+                }
+                Ok::<_, EngineError>(())
+            })?;
         }
 
         if self.new_protocol_profile == ProtocolProfile::Current {
@@ -1144,6 +1146,18 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             ),
         );
+
+        // Every fallible staging step finished. Only now expose the durable
+        // route and outbound ids to this engine's in-memory resolver/dedup.
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
+        }
+        for welcome in &welcomes {
+            self.sent_message_ids.insert(welcome.id.clone());
+        }
 
         // The caller now owns the legacy creation through its pending ref;
         // normal confirmation or publish failure owns the staged MLS state.

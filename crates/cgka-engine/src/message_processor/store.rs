@@ -325,16 +325,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(row_state_is_awaiting_retry(self.stored_message_state(id)?))
     }
 
-    pub(crate) fn record_sent_message(
-        &mut self,
-        msg: &TransportMessage,
-        group_id: &GroupId,
-        epoch: EpochId,
-    ) -> Result<(), EngineError> {
-        self.sent_message_ids.insert(msg.id.clone());
-        self.persist_transport_message(msg, group_id, epoch, MessageState::Sent)
-    }
-
     pub(crate) fn record_staged_invite_welcome(
         &mut self,
         msg: &TransportMessage,
