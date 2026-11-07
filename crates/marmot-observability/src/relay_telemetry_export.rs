@@ -2383,6 +2383,63 @@ mod otlp {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn exhausted_export_window_does_not_start_the_next_collection_epoch() {
+            use tokio::sync::mpsc::error::TryRecvError;
+
+            let (endpoint, mut requests, server) = collector(&[200]).await;
+            let product = crate::ProductAnalytics::default();
+            crate::grant(&product);
+            let mut exporter = exporter(endpoint, product.permit().unwrap());
+            exporter.config = exporter.config.with_interval(std::time::Duration::ZERO);
+            let performance = crate::AppPerformanceTelemetry::default();
+            performance.record(
+                crate::AppPerformanceOperation::AppStart,
+                std::time::Duration::from_millis(40),
+                true,
+            );
+            assert!(matches!(
+                exporter
+                    .export_once_with_retries_and_app_performance(
+                        None,
+                        Some(performance.snapshot())
+                    )
+                    .await,
+                Err(RelayExportError::Request)
+            ));
+            assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+            for _ in 0..2 {
+                performance.record(
+                    crate::AppPerformanceOperation::AppStart,
+                    std::time::Duration::from_millis(40),
+                    true,
+                );
+            }
+            exporter.config = exporter
+                .config
+                .with_interval(std::time::Duration::from_secs(60));
+            assert!(
+                exporter
+                    .export_once_with_retries_and_app_performance(
+                        None,
+                        Some(performance.snapshot())
+                    )
+                    .await
+                    .unwrap()
+                    > 0
+            );
+            let request = requests
+                .try_recv()
+                .expect("the valid window completed its request");
+            assert_eq!(
+                app_start_attempts(&request),
+                0,
+                "the first valid collection must exclude all earlier work"
+            );
+            assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+            server.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn collector_statuses_bound_retries_and_suspend_only_rejected_telemetry() {
             use std::sync::atomic::Ordering;
             use tokio::sync::mpsc::error::TryRecvError;

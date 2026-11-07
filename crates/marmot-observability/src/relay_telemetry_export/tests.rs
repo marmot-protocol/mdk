@@ -10,6 +10,15 @@ use transport_nostr::{EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup
 
 use super::*;
 
+#[cfg(feature = "otlp-export")]
+#[test]
+fn submillisecond_export_intervals_preserve_the_configured_precision() {
+    for nanos in [0, 1, 500_000, 999_999, 1_000_000, 1_999_999] {
+        let interval = std::time::Duration::from_nanos(nanos);
+        assert_eq!(jittered_export_interval(interval), interval);
+    }
+}
+
 fn hist(count: u64) -> DurationHistogramSnapshot {
     DurationHistogramSnapshot {
         buckets: vec![HistogramBucket {
