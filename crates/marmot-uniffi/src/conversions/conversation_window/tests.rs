@@ -830,3 +830,47 @@ fn assert_conversation_debug_redacts(mut draft: SelectedMessageDraftFfi) {
         }
     }
 }
+
+#[test]
+fn produced_participation_states_keep_their_host_choices() {
+    use ConversationParticipationFfi as F;
+    use app::conversation_presentation::ConversationParticipation as N;
+    macro_rules! maps {
+        ($native:expr, $host:pat) => {
+            assert!(matches!(F::from($native), $host));
+        };
+    }
+    // Standalone selector outputs avoid inventing coupled capability flags.
+    maps!(N::PendingInvitation, F::PendingInvitation);
+    maps!(N::Active, F::Active);
+    maps!(N::Leaving, F::Leaving);
+    maps!(N::Left, F::Left);
+    maps!(N::Removed, F::Removed);
+    maps!(N::Disbanded, F::Disbanded);
+    maps!(N::Unavailable, F::Unavailable);
+    maps!(N::DeviceRemoved, F::DeviceRemoved);
+}
+
+#[test]
+fn missing_open_anchor_choices_keep_their_valid_indices() {
+    use ConversationAnchorKindFfi as F;
+    use app::ConversationOpenAnchorOutcome as N;
+    macro_rules! maps {
+        ($native:expr, $host:pat, $index:expr) => {
+            let actual = ConversationAnchorOutcomeFfi::from($native);
+            assert!(matches!(actual.kind, $host));
+            assert_eq!(actual.index, $index);
+        };
+    }
+    // Actual opening writers emit these enums. Nonempty indices stay below
+    // the native 200-row bound; no opaque anchor or complete page is fabricated.
+    // The existing native command owner retains Latest, Retained and Message.
+    maps!(N::Empty, F::Empty, None);
+    maps!(N::FirstUnread { index: 0 }, F::FirstUnread, Some(0));
+    maps!(N::RecoveredNext { index: 1 }, F::RecoveredNext, Some(1));
+    maps!(
+        N::RecoveredPrevious { index: 0 },
+        F::RecoveredPrevious,
+        Some(0)
+    );
+}
