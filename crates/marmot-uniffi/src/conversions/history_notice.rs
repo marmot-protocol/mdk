@@ -3,11 +3,10 @@
 
 use marmot_app::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 
-/// Why recovery parked; choose the host's wording from it. Current policy
-/// parks only the first five. `KnownEvent` and `MaintenanceBoundary` are
-/// reserved so exhaustive switches stay source-compatible if a later policy
-/// parks them, and `UnprovenHistory` is not raised until the recovery runner
-/// owns history (mdk#2660).
+/// Why recovery parked; choose the host's wording from it. `KnownEvent` and
+/// `MaintenanceBoundary` remain reserved for later parking policy, so exhaustive
+/// switches stay source-compatible. `UnprovenHistory` identifies a parked recovery
+/// route without attributing the original reason its history was owed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HistoryNoticeCauseFfi {
     /// Deliveries were dropped from a full account queue, or spilled rows

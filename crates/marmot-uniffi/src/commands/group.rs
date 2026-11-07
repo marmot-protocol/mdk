@@ -1622,14 +1622,14 @@ mod tests {
                     last_attempt_at: attempted.then_some(artifact.created_at),
                     failure_code: (state
                         == cgka_traits::TransportFanoutAttemptState::AttemptedFailed)
-                        .then(|| "transport_closed".into()),
+                        .then(|| "publish_failed".into()),
                 }
             })
         })
         .collect();
         let mut current = published.clone();
         current.phase = cgka_traits::MaintenancePhase::Fanout;
-        current.publication_targets = targets.clone();
+        current.publication_targets = targets;
         let summary = KeyPackageMaintenanceStatusFfi::from(current);
         assert_eq!(
             (
@@ -1660,25 +1660,20 @@ mod tests {
             not_after: published.current_not_after.unwrap(),
             refresh_at: published.refresh_at.unwrap(),
             signed_event: Some(artifact),
-            targets: targets
+            targets: published
+                .publication_targets
                 .into_iter()
                 .map(|mut target| {
-                    // A first acceptance promotes the package, so a still-pending
-                    // snapshot must contain no accepted target.
-                    if matches!(
-                        target.state,
-                        cgka_traits::TransportFanoutAttemptState::Accepted
-                            | cgka_traits::TransportFanoutAttemptState::AttemptedFailed
-                    ) {
-                        target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
-                        target.attempt_count = 5;
-                        target.failure_code = Some("transport_closed".into());
-                    }
+                    // Every configured endpoint was attempted; a still-pending
+                    // failed publication has no accepted or unattempted target.
+                    target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
+                    target.attempt_count = 1;
+                    target.failure_code = Some("publish_failed".into());
                     target
                 })
                 .collect(),
-            attempt_count: 5,
-            last_failure_code: Some("transport_closed".into()),
+            attempt_count: 1,
+            last_failure_code: Some("publish_failed".into()),
             consumed_at: None,
         });
         let summary = KeyPackageMaintenanceStatusFfi::from(pending.clone());
@@ -1688,12 +1683,13 @@ mod tests {
                 summary.pending_attempt_count,
                 summary.pending_last_failure_code
             ),
-            (Some(expected_event), 5, Some("transport_closed".into()))
+            (Some(expected_event), 1, Some("publish_failed".into()))
         );
+        pending.phase = cgka_traits::MaintenancePhase::PendingPublication;
         let unsigned = pending.pending_replacement.as_mut().unwrap();
         unsigned.signed_event = None;
         unsigned.attempt_count = 0;
-        unsigned.last_failure_code = Some("authoring_failed".into());
+        unsigned.last_failure_code = None;
         // Before signing, no transport target has been attempted.
         for target in &mut unsigned.targets {
             target.state = cgka_traits::TransportFanoutAttemptState::Unattempted;
@@ -1703,12 +1699,16 @@ mod tests {
         }
         let summary = KeyPackageMaintenanceStatusFfi::from(pending);
         assert_eq!(
+            summary.phase,
+            crate::conversions::MaintenancePhaseFfi::PendingPublication
+        );
+        assert_eq!(
             (
                 summary.pending_event_id_hex,
                 summary.pending_attempt_count,
                 summary.pending_last_failure_code
             ),
-            (None, 0, Some("authoring_failed".into()))
+            (None, 0, None)
         );
         let group = kit
             .create_group(account.clone(), "components".into(), vec![], None)

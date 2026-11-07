@@ -449,7 +449,7 @@ mod tests {
                     attempt_count: u32::from(attempted),
                     last_attempt_at: attempted.then_some(Timestamp(13)),
                     failure_code: (state == TransportFanoutAttemptState::AttemptedFailed)
-                        .then(|| "transport_closed".into()),
+                        .then(|| "publish_failed".into()),
                 }
             })
             .collect()
