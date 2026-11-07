@@ -686,6 +686,43 @@ mod tests {
                 MarmotStatus::NullPointer
             );
             assert!(list.is_null());
+            // A MESSAGE_TEXT node reads `text` too. Query IDs accept it; a
+            // window refuses it, naming the reason.
+            client
+                .block_on(client.marmot.send_text(
+                    account.to_str().unwrap().into(),
+                    groups[1].clone(),
+                    "Pizza on Friday".into(),
+                ))
+                .unwrap();
+            let message_search = CString::new(" PIZZA ").unwrap();
+            let mut message_node = [node(MarmotChatListFilterNodeKind::MessageText, 0, &[])];
+            message_node[0].text = message_search.as_ptr();
+            let message_query = MarmotChatListViewQuery {
+                filter: message_node.as_ptr(),
+                filter_len: message_node.len(),
+                ..query
+            };
+            assert_eq!(
+                marmot_chat_list_query_ids(&client, account.as_ptr(), &message_query, &mut list),
+                MarmotStatus::Ok
+            );
+            assert_eq!(strings(list), [groups[1].clone()]);
+            assert_eq!(
+                marmot_open_chat_list_query_window(
+                    &client,
+                    account.as_ptr(),
+                    &message_query,
+                    ptr::null(),
+                    &mut window
+                ),
+                MarmotStatus::InvalidChatListQuery
+            );
+            assert!(window.is_null());
+            assert!(
+                crate::status::take_last_error()
+                    .is_some_and(|detail| detail.contains("message_text_in_window"))
+            );
             assert_eq!(
                 marmot_chat_list_query_ids(&client, account.as_ptr(), ptr::null(), &mut list),
                 MarmotStatus::NullPointer

@@ -6,6 +6,18 @@
   an invalid removal into a valid one (#3016). Validated removals retain their effect through pruning. Uncertain legacy
   removals preserve only already-hidden targets and cannot hide new targets; verified repair remains tracked in #3017.
 
+- Add a `MessageText` chat-list filter leaf (mdk#2983): chats with a visible message whose text contains the query,
+  by the `Text` rule (trim, Unicode lowercase, literal substring). A visible message is a chat message or poll question
+  in `visible_message_timeline`, in its latest edit, not deleted, not invalidated (except an own send that reached
+  no one, which the row previews as failed), and not past its disappearing-message expiry at the read's `now_ms`. It scans each chat's history, so only `chat_list_ids` and
+  `revalidate_chat_list_ids` accept it: every window read refuses it with the new
+  `ChatListQueryError::MessageTextInWindow` before reading (`ChatListViewQuery::validate_for_window`). While the
+  content-report backfill is owed, a `MessageText` query returns `ProjectionNotReady`. Its text counts toward
+  `MAX_CHAT_LIST_FILTER_TEXT_BYTES`. No migration.
+- Timeline `search` now matches by the same rule: Unicode lowercasing instead of SQLite's ASCII-only `NOCASE`, so
+  `école` finds `ÉCOLE`. ASCII matches are unchanged. Account connections register a `marmot_search_contains` SQL
+  function for both. **Breaking:** `ChatListFilter`, `ChatListFilterNode` and `ChatListQueryError` gain variants.
+
 - Add a `Text` chat-list filter leaf (mdk#2983): a literal substring match, after trimming and Unicode lowercasing,
   against the title, group name, description and a direct chat's peer profile names. Migration 0200 adds
   `chat_list_rows.search_text`, written by `store_chat_presentation`; widens `chat_presentation_dependencies.roles`

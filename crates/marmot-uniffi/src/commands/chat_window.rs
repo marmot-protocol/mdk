@@ -21,7 +21,9 @@ impl Marmot {
     /// before paging, so chats beyond the window still count. A chat enters or
     /// leaves the window as soon as a fact its filter tests changes. None
     /// defaults to 50 rows; explicit sizes must be 1–100. An invalid query fails
-    /// with `InvalidChatListQuery`, a malformed group ID with `InvalidHex`.
+    /// with `InvalidChatListQuery`, a malformed group ID with `InvalidHex`. A
+    /// window does not accept a `MessageText` node (`MessageTextInWindow`);
+    /// use `chat_list_query_ids`.
     pub async fn open_chat_list_query_window(
         &self,
         account_ref: String,
@@ -46,8 +48,10 @@ impl Marmot {
     }
     /// Select all: every chat ID `query` matches, in display order, including
     /// chats beyond any open window; the count is the list length. Fails with
-    /// `ChatPresentationNotReady`, never a partial list, while base rows are
-    /// still being prepared; retry later.
+    /// `ChatPresentationNotReady`, never a partial list, while base rows, the
+    /// presentation a `Text` node reads, or the retained deletions and edits a
+    /// `MessageText` node reads are still being prepared; retry later. Unlike
+    /// a window, this accepts `MessageText`.
     pub async fn chat_list_query_ids(
         &self,
         account_ref: String,
@@ -402,6 +406,30 @@ mod tests {
         assert!(matches!(
             &rows[..],
             [row] if matches!(&row.presentation.title, PresentationTextFfi::Literal { text } if text == "Two")
+        ));
+        // A message-text node selects chats by what their messages say, but a
+        // window refuses it as a typed error.
+        kit.send_text(account.clone(), found[0].clone(), "Pizza on FRIDAY".into())
+            .await
+            .unwrap();
+        let messages = ChatListViewQueryFfi {
+            view: ChatListViewFfi::Chats,
+            filter: vec![ChatListFilterNodeFfi::MessageText {
+                text: " friday ".into(),
+            }],
+        };
+        assert_eq!(
+            kit.chat_list_query_ids(account.clone(), messages.clone())
+                .await
+                .unwrap(),
+            found
+        );
+        assert!(matches!(
+            kit.open_chat_list_query_window(account.clone(), messages, None)
+                .await,
+            Err(MarmotKitError::InvalidChatListQuery {
+                reason: ChatListQueryErrorFfi::MessageTextInWindow
+            })
         ));
         assert!(matches!(
             kit.chat_list_query_ids(account, search("x".repeat(1025)))

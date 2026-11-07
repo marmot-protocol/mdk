@@ -191,7 +191,9 @@ pub(super) fn read_page_tx(
     mut query: PageQuery,
     anchor: Option<&str>,
 ) -> Result<ChatListPage, ChatListPageError> {
-    let compiled = query.query.compile(query.now_ms)?;
+    let compiled = query
+        .query
+        .compile(query.now_ms, super::query::QueryScope::Window)?;
     if let Some(group) = anchor {
         let key = tx
                 .query_row_cached(

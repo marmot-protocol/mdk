@@ -3,8 +3,10 @@
 //!
 //! The live window, select-all IDs and revalidation all read through
 //! [`ChatListViewQuery::compile`], so list, count and selection cannot disagree.
-//! Every leaf reads a `chat_list_rows` column or an indexed per-chat lookup, so
-//! cost grows with the chats the view's index walks, never with message history.
+//! Every leaf but `MessageText` reads a `chat_list_rows` column or an indexed
+//! per-chat lookup, so cost grows with the chats the view's index walks, never
+//! with message history. `MessageText` scans each chat's history, so it compiles
+//! only for select-all IDs and revalidation; a window refuses it.
 //! Values (group IDs, search text, the draft whitespace set, the read's time)
 //! are bound parameters; the SQL text depends only on the filter's shape.
 use super::ChatListView;
@@ -17,8 +19,8 @@ pub const MAX_CHAT_LIST_FILTER_DEPTH: usize = 8;
 pub const MAX_CHAT_LIST_FILTER_NODES: usize = 64;
 /// Most group IDs across every `GroupIds` leaf in one query.
 pub const MAX_CHAT_LIST_FILTER_GROUP_IDS: usize = 500;
-/// Most bytes of search text across every `Text` leaf in one query, measured
-/// before normalization.
+/// Most bytes of search text across every `Text` and `MessageText` leaf in
+/// one query, measured before normalization.
 pub const MAX_CHAT_LIST_FILTER_TEXT_BYTES: usize = 1024;
 
 /// A native view as the base scope, narrowed by an optional filter. `filter: None`
@@ -55,6 +57,20 @@ pub enum ChatListFilter {
     /// the view still has presentation pending, a query with this leaf is not
     /// ready rather than partial.
     Text(String),
+    /// Chats with a visible message whose text contains this text, matched by
+    /// the same rule as `Text` and the timeline's `search`: trim and Unicode
+    /// lowercase, then a literal substring of the message's current text (an
+    /// edited message matches its latest edit). A visible message is a chat
+    /// message or poll question the timeline shows: not deleted, not
+    /// invalidated (an own send that reached no one still shows, as failed),
+    /// not past its disappearing-message expiry at the read's time, and not
+    /// from a blocked account. Text that is empty after trimming
+    /// matches no chat. This scans each chat's message history, so only
+    /// select-all IDs and revalidation accept it; a window refuses it with
+    /// [`ChatListQueryError::MessageTextInWindow`]. While retained deletions
+    /// and edits are still being backfilled, a query with this leaf is not
+    /// ready rather than partial.
+    MessageText(String),
 }
 
 impl fmt::Debug for ChatListFilter {
@@ -67,6 +83,7 @@ impl fmt::Debug for ChatListFilter {
             Self::Condition(condition) => condition.fmt(f),
             Self::GroupIds(ids) => write!(f, "GroupIds({})", ids.len()),
             Self::Text(_) => f.write_str("Text"),
+            Self::MessageText(_) => f.write_str("MessageText"),
         }
     }
 }
@@ -127,6 +144,7 @@ pub enum ChatListFilterNode {
     Condition(ChatListCondition),
     GroupIds(Vec<String>),
     Text(String),
+    MessageText(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -147,6 +165,11 @@ pub enum ChatListQueryError {
     SharedChild,
     #[error("chat-list filter node is not reachable from the root")]
     UnreachableNode,
+    /// Message text scans history, so a live window does not accept it until
+    /// a cost check on a large history allows it. Select-all IDs and
+    /// revalidation do.
+    #[error("chat-list window filters cannot test message text")]
+    MessageTextInWindow,
 }
 
 impl ChatListFilter {
@@ -220,6 +243,7 @@ impl ChatListFilter {
             ChatListFilterNode::Condition(condition) => Self::Condition(condition),
             ChatListFilterNode::GroupIds(ids) => Self::GroupIds(ids),
             ChatListFilterNode::Text(text) => Self::Text(text),
+            ChatListFilterNode::MessageText(text) => Self::MessageText(text),
         })
     }
 
@@ -232,7 +256,7 @@ impl ChatListFilter {
             }
             Self::Not(child) => child.references(condition),
             Self::Condition(leaf) => *leaf == condition,
-            Self::GroupIds(_) | Self::Text(_) => false,
+            Self::GroupIds(_) | Self::Text(_) | Self::MessageText(_) => false,
         }
     }
 
@@ -243,7 +267,20 @@ impl ChatListFilter {
             Self::All(children) | Self::Any(children) => children.iter().any(Self::references_text),
             Self::Not(child) => child.references_text(),
             Self::Text(_) => true,
-            Self::Condition(_) | Self::GroupIds(_) => false,
+            Self::Condition(_) | Self::GroupIds(_) | Self::MessageText(_) => false,
+        }
+    }
+
+    /// Whether any leaf is `MessageText`. Such a query is refused by windows
+    /// and waits for the retained deletion and edit backfill.
+    pub fn references_message_text(&self) -> bool {
+        match self {
+            Self::All(children) | Self::Any(children) => {
+                children.iter().any(Self::references_message_text)
+            }
+            Self::Not(child) => child.references_message_text(),
+            Self::MessageText(_) => true,
+            Self::Condition(_) | Self::GroupIds(_) | Self::Text(_) => false,
         }
     }
 
@@ -255,12 +292,22 @@ impl ChatListFilter {
             match node {
                 Self::All(children) | Self::Any(children) => stack.extend(children.iter_mut()),
                 Self::Not(child) => stack.push(child),
-                Self::Condition(_) | Self::Text(_) => {}
+                Self::Condition(_) | Self::Text(_) | Self::MessageText(_) => {}
                 Self::GroupIds(ids) => lists.push(ids),
             }
         }
         lists
     }
+}
+
+/// Which read a query compiles for. Only `Selection` accepts leaves whose
+/// cost grows with history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueryScope {
+    /// A live window page; refuses `MessageText`.
+    Window,
+    /// Select-all IDs and revalidation.
+    Selection,
 }
 
 /// SQL for one query: the view's condition and the filter, numbered `?1..?n`
@@ -282,6 +329,22 @@ impl ChatListViewQuery {
         self.filter
             .as_ref()
             .is_some_and(ChatListFilter::references_text)
+    }
+
+    pub fn references_message_text(&self) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(ChatListFilter::references_message_text)
+    }
+
+    /// [`Self::validate`], then refuse what a live window may not evaluate:
+    /// a `MessageText` leaf. Every window read checks this before reading.
+    pub fn validate_for_window(&self) -> Result<(), ChatListQueryError> {
+        self.validate()?;
+        if self.references_message_text() {
+            return Err(ChatListQueryError::MessageTextInWindow);
+        }
+        Ok(())
     }
 
     /// Check the size bounds. Every read validates; callers may check earlier.
@@ -311,7 +374,7 @@ impl ChatListViewQuery {
                         return Err(ChatListQueryError::TooManyGroupIds);
                     }
                 }
-                ChatListFilter::Text(value) => {
+                ChatListFilter::Text(value) | ChatListFilter::MessageText(value) => {
                     text += value.len();
                     if text > MAX_CHAT_LIST_FILTER_TEXT_BYTES {
                         return Err(ChatListQueryError::TextTooLong);
@@ -323,9 +386,17 @@ impl ChatListViewQuery {
     }
 
     /// Compile for a read at `now_ms` (Unix milliseconds), the time a `Muted`
-    /// leaf tests mute expiry against.
-    pub(super) fn compile(&self, now_ms: i64) -> Result<CompiledQuery, ChatListQueryError> {
-        self.validate()?;
+    /// leaf tests mute expiry and a `MessageText` leaf tests message expiry
+    /// against. A window scope refuses `MessageText` before writing any SQL.
+    pub(super) fn compile(
+        &self,
+        now_ms: i64,
+        scope: QueryScope,
+    ) -> Result<CompiledQuery, ChatListQueryError> {
+        match scope {
+            QueryScope::Window => self.validate_for_window()?,
+            QueryScope::Selection => self.validate()?,
+        }
         let mut compiled = CompiledQuery {
             view: self.view,
             predicate: self.view.predicate().to_owned(),
@@ -338,6 +409,7 @@ impl ChatListViewQuery {
                 params: &mut compiled.params,
                 now_ms,
                 now_param: None,
+                now_seconds_param: None,
             };
             writer.filter(filter);
         }
@@ -367,6 +439,19 @@ pub(super) fn pending_search_text(
         .collect()
 }
 
+/// Whether retained deletions, edits and moderation removals from before
+/// content reports existed are still being applied to the timeline. Until they
+/// are, a message the timeline will hide can still show its text, so a query
+/// with a `MessageText` leaf is not ready. One row read.
+pub(super) fn message_text_backfill_owed(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    use crate::base::connection::CachedSql;
+    conn.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM content_report_backfill WHERE after_order < through_order)",
+        [],
+        |row| row.get(0),
+    )
+}
+
 // Correlated subqueries name the outer table `chat_list_rows`, unaliased in every
 // statement that embeds a predicate. Every leaf is a non-NULL boolean, so `NOT`
 // is plain negation.
@@ -376,6 +461,8 @@ struct FilterWriter<'a> {
     now_ms: i64,
     /// The read's time is bound once, however many `Muted` leaves use it.
     now_param: Option<usize>,
+    /// The read's time in Unix seconds, the unit of message expiry, bound once.
+    now_seconds_param: Option<usize>,
 }
 
 impl FilterWriter<'_> {
@@ -433,6 +520,46 @@ impl FilterWriter<'_> {
                     self.sql
                         .push_str(&format!("instr(chat_list_rows.search_text, ?{index}) > 0"));
                 }
+            }
+            ChatListFilter::MessageText(text) => {
+                let needle = super::search_text::normalize_search_text(text);
+                if needle.is_empty() {
+                    self.sql.push('0');
+                    return;
+                }
+                let needle = self.bind(Value::Text(needle));
+                let now_seconds = match self.now_seconds_param {
+                    Some(index) => index,
+                    None => {
+                        let index = self.bind(Value::Integer(self.now_ms.div_euclid(1000)));
+                        self.now_seconds_param = Some(index);
+                        index
+                    }
+                };
+                // What the timeline shows as message text: chat messages and
+                // poll questions, from accounts not blocked, not deleted (whose
+                // text is cleared anyway), not invalidated except an own send
+                // that reached no one (shown as failed, as the row's preview
+                // does), and not past the expiry the retention sweep prunes at
+                // (`<=`, seconds).
+                self.sql.push_str(&format!(
+                    "EXISTS(SELECT 1 FROM visible_message_timeline AS message
+                        WHERE message.group_id_hex = chat_list_rows.group_id_hex
+                          AND message.kind IN ({chat}, {poll})
+                          AND message.deleted = 0
+                          AND (message.invalidation_status IS NULL
+                               OR (message.direction = 'sent'
+                                   AND message.invalidation_status = '{failed}'))
+                          AND {contains}(message.plaintext, ?{needle})
+                          AND NOT EXISTS(SELECT 1 FROM app_events AS source
+                              WHERE source.group_id_hex = message.group_id_hex
+                                AND source.message_id_hex = message.message_id_hex
+                                AND source.retention_expires_at <= ?{now_seconds}))",
+                    chat = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+                    poll = cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+                    contains = crate::base::text_search::SQL_CONTAINS_FUNCTION,
+                    failed = crate::app::timeline::LOCAL_PUBLISH_FAILED_REASON,
+                ));
             }
         }
     }

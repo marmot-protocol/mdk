@@ -137,6 +137,7 @@ c_enum! {
         SharedChild,
         UnreachableNode,
         TextTooLong,
+        MessageTextInWindow,
     }
 }
 c_enum! {
@@ -154,6 +155,9 @@ c_enum! {
         GroupIds,
         /// The chat's searchable text contains `text` (trimmed, lowercased).
         Text,
+        /// A visible message in the chat contains `text` (trimmed,
+        /// lowercased). Query IDs and revalidation only; a window refuses it.
+        MessageText,
     }
 }
 
@@ -171,7 +175,7 @@ pub struct MarmotChatListFilterNode {
     /// For GROUP_IDS: the listed group IDs.
     pub group_ids: *const *const c_char,
     pub group_ids_len: usize,
-    /// For TEXT: the search text, NUL-terminated UTF-8.
+    /// For TEXT and MESSAGE_TEXT: the search text, NUL-terminated UTF-8.
     pub text: *const c_char,
 }
 
@@ -236,6 +240,11 @@ impl MarmotChatListViewQuery {
                     MarmotChatListFilterNodeKind::Text => ChatListFilterNodeFfi::Text {
                         text: unsafe { crate::memory::required_str(node.text) }?,
                     },
+                    MarmotChatListFilterNodeKind::MessageText => {
+                        ChatListFilterNodeFfi::MessageText {
+                            text: unsafe { crate::memory::required_str(node.text) }?,
+                        }
+                    }
                 })
             })
             .collect::<Result<_, crate::MarmotStatus>>()?;

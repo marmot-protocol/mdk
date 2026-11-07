@@ -1,6 +1,6 @@
 //! Complete chat-list ID sets, independent of the live display window.
 use super::pages;
-use super::query::{ChatListQueryError, ChatListViewQuery};
+use super::query::{ChatListQueryError, ChatListViewQuery, QueryScope};
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
@@ -9,7 +9,8 @@ use std::collections::HashSet;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChatListSelectionError {
-    /// Base rows, or for a `Text` query the view's presentation, are still
+    /// Base rows, for a `Text` query the view's presentation, or for a
+    /// `MessageText` query the retained deletion and edit backfill, are still
     /// being prepared. Nothing partial was returned; retry later.
     #[error("chat-list base projection is not ready")]
     ProjectionNotReady,
@@ -23,10 +24,13 @@ impl SqliteAppStorage {
     /// Every ID matching `query`, in display order, read in one transaction with
     /// the same compiled condition the live window pages through, before any
     /// display paging. The count is the length. Work and memory grow with the
-    /// view's chats, never with profile or history size. Pending base-row work,
-    /// or for a query with a `Text` leaf pending presentation anywhere in the
-    /// view, returns `ProjectionNotReady`, never a partial set. `now_ms` (Unix ms) is
-    /// the time a `Muted` leaf tests mute expiry against.
+    /// view's chats, never with profile or history size, except that a
+    /// `MessageText` leaf scans each candidate chat's history. Pending base-row
+    /// work, for a query with a `Text` leaf pending presentation anywhere in
+    /// the view, or for a `MessageText` leaf an owed deletion and edit
+    /// backfill, returns `ProjectionNotReady`, never a partial set. `now_ms`
+    /// (Unix ms) is the time `Muted` and `MessageText` leaves test expiry
+    /// against.
     pub fn chat_list_ids(
         &self,
         query: impl Into<ChatListViewQuery>,
@@ -65,7 +69,7 @@ fn eligible_ids(
     query: &ChatListViewQuery,
     now_ms: i64,
 ) -> Result<Vec<String>, ChatListSelectionError> {
-    let compiled = query.compile(now_ms)?;
+    let compiled = query.compile(now_ms, QueryScope::Selection)?;
     let missing_base: bool = conn
         .query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)",
@@ -81,6 +85,13 @@ fn eligible_ids(
         && !super::query::pending_search_text(conn, query.view, 1)
             .storage()?
             .is_empty()
+    {
+        return Err(ChatListSelectionError::ProjectionNotReady);
+    }
+    // Message text is read from the timeline, which the backfill can still
+    // change by hiding a message or replacing its text with a later edit.
+    if query.references_message_text()
+        && super::query::message_text_backfill_owed(conn).storage()?
     {
         return Err(ChatListSelectionError::ProjectionNotReady);
     }

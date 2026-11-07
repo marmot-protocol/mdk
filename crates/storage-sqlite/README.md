@@ -107,6 +107,10 @@ lowercase; user directory search uses the same function) and matched as a litera
 `instr`, so `%` and `_` are literal. While any chat in the view has pending presentation, a `Text` query is not ready
 (`ProjectionNotReady` from the selection calls, `SearchTextNotReady` from a window read);
 `chat_list_pending_search_text(view, limit)` lists those chats so a caller can prepare a batch and retry.
+A `MessageText` leaf matches chats with a visible chat message or poll question containing the text, by the same rule,
+through the `marmot_search_contains` SQL function every account connection registers (timeline `search` uses it too).
+It scans each chat's history, so only the selection calls accept it; a window read refuses it with
+`ChatListQueryError::MessageTextInWindow`. While the content-report backfill is owed it is not ready.
 `ChatListFilter::from_nodes` builds the tree from the bindings' flat node list. A `ChatListView` converts into the
 unfiltered query.
 

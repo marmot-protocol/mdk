@@ -76,6 +76,17 @@ pub enum ChatListFilterNodeFfi {
     Text {
         text: String,
     },
+    /// Chats with a visible message whose text contains `text`, by the same
+    /// rule as `Text` and timeline search (trim, lowercase, literal
+    /// substring): a chat message or poll question the timeline shows, in its
+    /// latest edit, not deleted, expired or from a blocked account, and not
+    /// invalidated unless it is an own send shown as failed. It scans message history, so only `chat_list_query_ids` and
+    /// `revalidate_chat_list_query_ids` accept it; opening a window with it
+    /// fails with `MessageTextInWindow`. While retained deletions and edits
+    /// are still being backfilled, it fails with `ChatPresentationNotReady`.
+    MessageText {
+        text: String,
+    },
 }
 
 /// Chat facts a filter can test. Each matches what the presented row shows.
@@ -155,8 +166,11 @@ pub enum ChatListQueryErrorFfi {
     SharedChild,
     /// A node after the root is nobody's child.
     UnreachableNode,
-    /// More than 1024 bytes of text across all `Text` nodes.
+    /// More than 1024 bytes of text across all `Text` and `MessageText` nodes.
     TextTooLong,
+    /// A window was opened with a `MessageText` node; use
+    /// `chat_list_query_ids` instead.
+    MessageTextInWindow,
 }
 impl From<app::ChatListQueryError> for ChatListQueryErrorFfi {
     fn from(v: app::ChatListQueryError) -> Self {
@@ -170,6 +184,7 @@ impl From<app::ChatListQueryError> for ChatListQueryErrorFfi {
             E::ChildNotAfterParent => Self::ChildNotAfterParent,
             E::SharedChild => Self::SharedChild,
             E::UnreachableNode => Self::UnreachableNode,
+            E::MessageTextInWindow => Self::MessageTextInWindow,
         }
     }
 }
@@ -184,6 +199,7 @@ impl std::fmt::Display for ChatListQueryErrorFfi {
             Self::ChildNotAfterParent => "child_not_after_parent",
             Self::SharedChild => "shared_child",
             Self::UnreachableNode => "unreachable_node",
+            Self::MessageTextInWindow => "message_text_in_window",
         })
     }
 }
@@ -212,6 +228,9 @@ impl TryFrom<ChatListViewQueryFfi> for app::ChatListViewQuery {
                     app::ChatListFilterNode::GroupIds(group_ids)
                 }
                 ChatListFilterNodeFfi::Text { text } => app::ChatListFilterNode::Text(text),
+                ChatListFilterNodeFfi::MessageText { text } => {
+                    app::ChatListFilterNode::MessageText(text)
+                }
             })
             .collect();
         Ok(Self {

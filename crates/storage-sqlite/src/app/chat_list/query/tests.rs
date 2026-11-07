@@ -1118,7 +1118,7 @@ fn filtered_queries_walk_the_page_index_with_keyed_lookups() {
             view,
             filter: Some(every_leaf.clone()),
         }
-        .compile(NOW)
+        .compile(NOW, QueryScope::Window)
         .unwrap();
         let conn = store.lock().unwrap();
         let sql = format!(
@@ -1260,4 +1260,595 @@ fn windows_over_a_filtered_query_agree_with_its_complete_id_set() {
     reversed.sort();
     reversed.reverse();
     assert_eq!(kept, reversed);
+}
+
+/// One relay-accepted event in `group`.
+fn event(
+    app: &SqliteAppStorage,
+    group: &str,
+    id: &str,
+    sender: &str,
+    kind: u64,
+    plaintext: &str,
+    tags: Vec<Vec<String>>,
+) {
+    app.record_app_event(&StoredAppEvent {
+        group_id_hex: group.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: Some(1),
+        direction: "received".to_owned(),
+        sender: sender.to_owned(),
+        plaintext: plaintext.to_owned(),
+        kind,
+        tags,
+        recorded_at: 30,
+        received_at: 30,
+        origin_commit_id: None,
+        moderation_grant: false,
+    })
+    .unwrap();
+}
+
+fn message_text(query: &str) -> ChatListFilter {
+    F::MessageText(query.to_owned())
+}
+
+/// Select-all IDs at `now_ms`, checked against revalidation of every chat.
+/// A window refuses message text, so it is not compared here.
+fn selected_at(app: &SqliteAppStorage, filter: ChatListFilter, now_ms: i64) -> Vec<String> {
+    let query = ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(filter),
+    };
+    let ids = app.chat_list_ids(query.clone(), now_ms).unwrap();
+    let every_chat = app.chat_list_ids(ChatListView::Chats, now_ms).unwrap();
+    assert_eq!(
+        app.revalidate_chat_list_ids(query, &every_chat, now_ms)
+            .unwrap(),
+        ids,
+        "revalidation of every chat"
+    );
+    ids
+}
+
+/// A chat matches when a message the timeline shows contains the text, by the
+/// shared rule (trim, Unicode lowercase, literal substring). Deleted,
+/// invalidated, expired and blocked-sender messages, superseded edit text and
+/// group-system rows never match.
+#[test]
+fn message_text_leaf_matches_only_text_the_timeline_shows() {
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for id in [
+        "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b",
+    ] {
+        seed(&store, id, &[]);
+    }
+    let chat = MARMOT_APP_EVENT_KIND_CHAT;
+    let e = |target: &str| vec![vec!["e".to_owned(), target.to_owned()]];
+    event(
+        &app,
+        "01",
+        "m01",
+        "bb",
+        chat,
+        "Meet at the ÉCOLE, 100% sure",
+        vec![],
+    );
+    // Edited: the latest edit is the text; the original no longer matches.
+    event(&app, "02", "m02", "bb", chat, "original draft", vec![]);
+    event(
+        &app,
+        "02",
+        "m02e",
+        "bb",
+        MARMOT_APP_EVENT_KIND_EDIT,
+        "revised plan",
+        e("m02"),
+    );
+    // Deleted by its author.
+    event(&app, "03", "m03", "bb", chat, "deleted secret", vec![]);
+    event(
+        &app,
+        "03",
+        "m03d",
+        "bb",
+        MARMOT_APP_EVENT_KIND_DELETE,
+        "",
+        e("m03"),
+    );
+    // Invalidated by convergence: a tombstone, not message text.
+    event(&app, "04", "m04", "bb", chat, "losing branch", vec![]);
+    app.invalidate_app_event_by_source("source-m04", "LosingBranch")
+        .unwrap();
+    // A poll's question is message text.
+    let poll_tags = cgka_traits::poll_tags(
+        30,
+        "Lunch vote?",
+        &["Tea".to_owned(), "Soup".to_owned()],
+        cgka_traits::PollType::SingleChoice,
+        None,
+    )
+    .unwrap();
+    event(
+        &app,
+        "05",
+        "m05",
+        "bb",
+        MARMOT_APP_EVENT_KIND_POLL,
+        "Lunch vote?",
+        poll_tags,
+    );
+    // Group-system rows are generated, not message text.
+    event(
+        &app,
+        "06",
+        "m06",
+        "bb",
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        "lunch vote member",
+        vec![],
+    );
+    // From an account this account blocked.
+    event(&app, "07", "m07", "cc", chat, "blocked lunch vote", vec![]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO user_blocks(public_key, is_private, created_at_ms) VALUES ('cc', 0, 0)",
+            [],
+        )
+        .unwrap();
+    // Disappearing: shown until its expiry, gone from the expiry second on.
+    event(&app, "08", "m08", "bb", chat, "fleeting note", vec![]);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE app_events SET retention_seconds = 60, retention_expires_at = ?1
+             WHERE message_id_hex = 'm08'",
+            [NOW / 1000 + 5],
+        )
+        .unwrap();
+    // A reaction is not a timeline row of its own.
+    event(&app, "09", "m09", "bb", chat, "plain", vec![]);
+    event(
+        &app,
+        "09",
+        "m09r",
+        "bb",
+        MARMOT_APP_EVENT_KIND_REACTION,
+        "lunch",
+        e("m09"),
+    );
+    // An own send that reached no one still shows, as failed.
+    app.record_app_event(&StoredAppEvent {
+        group_id_hex: "0b".to_owned(),
+        message_id_hex: "m0b".to_owned(),
+        source_message_id_hex: None,
+        source_epoch: None,
+        direction: "sent".to_owned(),
+        sender: "aa".to_owned(),
+        plaintext: "meet at the dock".to_owned(),
+        kind: chat,
+        tags: Vec::new(),
+        recorded_at: 30,
+        received_at: 30,
+        origin_commit_id: None,
+        moderation_grant: false,
+    })
+    .unwrap();
+    app.invalidate_app_event_by_message_id(
+        "0b",
+        "m0b",
+        crate::app::timeline::LOCAL_PUBLISH_FAILED_REASON,
+    )
+    .unwrap();
+    // 0a has no messages.
+    ready(&store);
+    for (query, expected) in [
+        ("école", &["01"][..]),
+        ("  ÉCOLE ", &["01"]),
+        ("100%", &["01"]),
+        ("0% s", &["01"]),
+        ("10_%", &[]),
+        ("revised", &["02"]),
+        ("original", &[]),
+        ("secret", &[]),
+        ("losing", &[]),
+        ("dock", &["0b"]),
+        ("lunch vote", &["05"]),
+        ("tea", &[]),
+        ("fleeting", &["08"]),
+        ("", &[]),
+        ("   ", &[]),
+    ] {
+        assert_eq!(
+            selected_at(&app, message_text(query), NOW),
+            expected,
+            "{query:?}"
+        );
+    }
+    let expiry_ms = (NOW / 1000 + 5) * 1000;
+    assert_eq!(
+        selected_at(&app, message_text("fleeting"), expiry_ms - 1),
+        ["08"]
+    );
+    assert!(selected_at(&app, message_text("fleeting"), expiry_ms).is_empty());
+    // It composes like any leaf.
+    let mut negated = selected_at(&app, F::Not(Box::new(message_text("lunch"))), NOW);
+    negated.sort();
+    assert_eq!(
+        negated,
+        ["01", "02", "03", "04", "06", "07", "08", "09", "0a", "0b"]
+    );
+    assert_eq!(
+        selected_at(
+            &app,
+            F::Any(vec![
+                message_text("revised"),
+                cond(C::Pinned),
+                group_ids(&["0a"])
+            ]),
+            NOW
+        )
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        ["02".to_owned(), "0a".to_owned()].into()
+    );
+}
+
+/// A window never evaluates message text: every window read refuses it with a
+/// typed error before any readiness check, wherever it sits in the tree.
+/// Select-all IDs and revalidation accept the same query.
+#[test]
+fn a_window_refuses_message_text_before_reading() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "01", &[]);
+    let nested = ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(F::All(vec![
+            cond(C::Active),
+            F::Not(Box::new(F::Any(vec![message_text("x"), cond(C::Pinned)]))),
+        ])),
+    };
+    assert_eq!(nested.validate(), Ok(()));
+    assert_eq!(
+        nested.validate_for_window(),
+        Err(ChatListQueryError::MessageTextInWindow)
+    );
+    assert_eq!(
+        nested.compile(NOW, QueryScope::Window).err(),
+        Some(ChatListQueryError::MessageTextInWindow)
+    );
+    for pending in [true, false] {
+        if pending {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT OR IGNORE INTO chat_presentation_row_work VALUES ('01')",
+                    [],
+                )
+                .unwrap();
+        } else {
+            ready(&store);
+        }
+        assert!(matches!(
+            app.read_chat_list_window(crate::ChatListWindowQuery {
+                query: nested.clone(),
+                limit: 10,
+                anchors: Vec::new(),
+                before_anchor: 0,
+                now_ms: NOW,
+            }),
+            Err(ChatListPageError::InvalidQuery(
+                ChatListQueryError::MessageTextInWindow
+            ))
+        ));
+    }
+    assert_eq!(app.chat_list_ids(nested.clone(), NOW).unwrap(), ["01"]);
+    assert_eq!(
+        app.revalidate_chat_list_ids(nested, &["01".to_owned()], NOW)
+            .unwrap(),
+        ["01"]
+    );
+}
+
+/// The content-report backfill can still hide a message or replace its text
+/// with a later edit, so a message-text query is not ready, never partial,
+/// while it is owed. Queries without message text are unaffected.
+#[test]
+fn message_text_queries_are_not_ready_while_the_deletion_backfill_is_owed() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "01", &[]);
+    seed(&store, "02", &[]);
+    event(
+        &app,
+        "01",
+        "m01",
+        "bb",
+        MARMOT_APP_EVENT_KIND_CHAT,
+        "hello there",
+        vec![],
+    );
+    ready(&store);
+    let set_backfill = |after: i64, through: i64| {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE content_report_backfill SET after_order = ?1, through_order = ?2",
+                [after, through],
+            )
+            .unwrap();
+    };
+    let query = ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(F::Not(Box::new(message_text("hello")))),
+    };
+    set_backfill(0, 1);
+    assert!(matches!(
+        app.chat_list_ids(query.clone(), NOW),
+        Err(ChatListSelectionError::ProjectionNotReady)
+    ));
+    assert!(matches!(
+        app.revalidate_chat_list_ids(query.clone(), &["02".to_owned()], NOW),
+        Err(ChatListSelectionError::ProjectionNotReady)
+    ));
+    let mut active = app
+        .chat_list_ids(
+            ChatListViewQuery {
+                view: ChatListView::Chats,
+                filter: Some(cond(C::Active)),
+            },
+            NOW,
+        )
+        .unwrap();
+    active.sort();
+    assert_eq!(active, ["01", "02"]);
+    set_backfill(1, 1);
+    assert_eq!(app.chat_list_ids(query, NOW).unwrap(), ["02"]);
+}
+
+/// Message text reaches the timeline through a keyed search per candidate chat,
+/// never an account-wide scan of the timeline.
+#[test]
+fn message_text_searches_each_chats_history_by_key() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "01", &[]);
+    ready(&store);
+    let compiled = ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(message_text("plans")),
+    }
+    .compile(NOW, QueryScope::Selection)
+    .unwrap();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT group_id_hex FROM chat_list_rows INDEXED BY {} WHERE {} ORDER BY {}",
+        ChatListView::Chats.index(),
+        compiled.predicate,
+        super::super::pages::KEY_COLUMNS
+    );
+    let conn = store.lock().unwrap();
+    let plan = conn
+        .prepare(&sql)
+        .unwrap()
+        .query_map(rusqlite::params_from_iter(&compiled.params), |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    // The view `visible_message_timeline` flattens to its table.
+    assert!(!plan.contains("SCAN message_timeline"), "{plan}");
+    assert!(!plan.contains("SCAN source"), "{plan}");
+    assert!(
+        plan.contains("SEARCH message_timeline USING INDEX idx_message_timeline_group_kind_unread (group_id_hex=? AND kind=?"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("SEARCH source USING INDEX sqlite_autoindex_app_events_1"),
+        "{plan}"
+    );
+}
+
+/// Cost check for the message-text leaf (mdk#2983 slice 5): select-all IDs over
+/// a large file-backed SQLCipher history, which decides whether the leaf may
+/// later enter live windows. Run optimized:
+///
+/// `cargo test -p storage-sqlite --release --lib message_text_selection_cost -- --ignored --nocapture`
+///
+/// `MDK_MESSAGE_TEXT_CHATS` and `MDK_MESSAGE_TEXT_PER_CHAT` size the fixture
+/// (default 500 chats of 2,000 messages); one message in ten is non-ASCII.
+#[test]
+#[ignore = "operational file-backed SQLCipher benchmark"]
+fn message_text_selection_cost_on_a_large_history() {
+    crate::base::connection::use_production_storage_for_test_process();
+    let env = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let chats = env("MDK_MESSAGE_TEXT_CHATS", 500);
+    let per_chat = env("MDK_MESSAGE_TEXT_PER_CHAT", 2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let key = crate::SqlCipherKey::new("message-text-cost").unwrap();
+    let path = dir.path().join("account.sqlite3");
+    let built = std::time::Instant::now();
+    {
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = store.app_storage();
+        for chat in 0..chats {
+            let id = format!("{chat:064x}");
+            seed(&store, &id, &[]);
+            // One real event per chat is the template the bulk copy repeats.
+            event(
+                &app,
+                &id,
+                &format!("tmpl-{chat}"),
+                "bb",
+                MARMOT_APP_EVENT_KIND_CHAT,
+                "x",
+                vec![],
+            );
+        }
+        let conn = store.lock().unwrap();
+        let columns = |table: &str| -> Vec<String> {
+            conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let text = "CASE WHEN n.i % 10 = 0
+                THEN printf('Réunion %d à l''ÉCOLE, notes du thème %d', n.i, n.i % 97)
+                ELSE printf('message %d about topic %d with some ordinary filler text', n.i, n.i % 97) END";
+        conn.execute_batch("BEGIN").unwrap();
+        for table in ["app_events", "message_timeline"] {
+            let names = columns(table);
+            let values = names
+                .iter()
+                .map(|name| match name.as_str() {
+                    "message_id_hex" => "printf('%s-%06d', t.group_id_hex, n.i)".to_owned(),
+                    "source_message_id_hex" => {
+                        "printf('src-%s-%06d', t.group_id_hex, n.i)".to_owned()
+                    }
+                    "plaintext" => text.to_owned(),
+                    "insert_order" => "NULL".to_owned(),
+                    "recorded_at" | "received_at" | "timeline_at" => format!("t.{name} + n.i"),
+                    other => format!("t.{other}"),
+                })
+                .collect::<Vec<_>>();
+            conn.execute(
+                &format!(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                     INSERT INTO {table} ({}) SELECT {} FROM {table} AS t, n
+                     WHERE t.message_id_hex LIKE 'tmpl-%'",
+                    names.join(", "),
+                    values.join(", ")
+                ),
+                [per_chat as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "COMMIT; DELETE FROM chat_presentation_row_work;
+             UPDATE content_report_backfill SET after_order = through_order;",
+        )
+        .unwrap();
+    }
+    let messages = chats * (per_chat + 1);
+    let size_mib = std::fs::metadata(&path).unwrap().len() / (1024 * 1024);
+    eprintln!(
+        "fixture: {chats} chats, {messages} messages, {size_mib} MiB, built in {:?}",
+        built.elapsed()
+    );
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    let query = |text: &str| ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(message_text(text)),
+    };
+    for (label, needle, expected) in [
+        ("no match (full scan)", "zzqx", 0),
+        ("ASCII, every chat early", "message 1 ", chats),
+        ("non-ASCII, every chat early", "réunion 10 ", chats),
+        (
+            "ASCII, every chat late",
+            &*format!("message {} about", per_chat - 1),
+            chats,
+        ),
+    ] {
+        let mut samples = Vec::new();
+        let mut first = None;
+        for sample in 0..11 {
+            let started = std::time::Instant::now();
+            let ids = app.chat_list_ids(query(needle), NOW).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(ids.len(), expected, "{label}");
+            if sample == 0 {
+                first = Some(elapsed);
+            } else {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort();
+        let (_, steps) = crate::base::query_work_test_support::measure(&store, || {
+            app.chat_list_ids(query(needle), NOW).unwrap()
+        });
+        eprintln!(
+            "{label}: first {:?}, p50 {:?}, max {:?}, {steps} VM steps",
+            first.unwrap(),
+            samples[samples.len() / 2],
+            samples[samples.len() - 1],
+        );
+    }
+    let time = |run: &dyn Fn()| {
+        run();
+        let mut samples = (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                run();
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        samples.sort();
+        samples[2]
+    };
+    eprintln!(
+        "baseline, unfiltered IDs: p50 {:?}",
+        time(&|| {
+            app.chat_list_ids(ChatListView::Chats, NOW).unwrap();
+        })
+    );
+    // The match itself over every timeline row: the old ASCII `LIKE NOCASE`
+    // against the shared function, on the same rows.
+    for (label, predicate) in [
+        (
+            "raw scan, LIKE NOCASE",
+            "plaintext LIKE '%zzqx%' ESCAPE '\\' COLLATE NOCASE",
+        ),
+        (
+            "raw scan, marmot_search_contains",
+            "marmot_search_contains(plaintext, 'zzqx')",
+        ),
+    ] {
+        let sql = format!("SELECT count(*) FROM message_timeline WHERE {predicate}");
+        eprintln!(
+            "{label}: p50 {:?}",
+            time(&|| {
+                let _: i64 = store
+                    .lock()
+                    .unwrap()
+                    .query_row(&sql, [], |row| row.get(0))
+                    .unwrap();
+            })
+        );
+    }
+    // The account-wide timeline search this leaf builds on, for comparison:
+    // one page of 50, which stops early, and a miss, which scans everything.
+    for (label, needle) in [
+        ("timeline search, page of 50", "message"),
+        ("timeline search, miss", "zzqx"),
+    ] {
+        let started = std::time::Instant::now();
+        app.message_timeline(crate::TimelineMessageQuery {
+            group_id_hex: None,
+            search: Some(needle.to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        eprintln!("{label}: {:?}", started.elapsed());
+    }
 }

@@ -1376,10 +1376,84 @@ typedef enum MarmotAttachmentKeepMedia {
   MARMOT_ATTACHMENT_KEEP_MEDIA_THIRTY_DAYS,
 } MarmotAttachmentKeepMedia;
 
+/**
+ * A chat fact a filter node tests; see `ChatListConditionFfi` in the
+ * MarmotKit API reference for each one's meaning.
+ */
+typedef enum MarmotChatListCondition {
+  MARMOT_CHAT_LIST_CONDITION_ACTIVE,
+  MARMOT_CHAT_LIST_CONDITION_ARCHIVED,
+  MARMOT_CHAT_LIST_CONDITION_LEFT,
+  MARMOT_CHAT_LIST_CONDITION_PENDING_INVITE,
+  MARMOT_CHAT_LIST_CONDITION_UNREAD,
+  MARMOT_CHAT_LIST_CONDITION_MANUAL_UNREAD,
+  MARMOT_CHAT_LIST_CONDITION_MENTION,
+  MARMOT_CHAT_LIST_CONDITION_PINNED,
+  MARMOT_CHAT_LIST_CONDITION_PENDING_LEAVE,
+  MARMOT_CHAT_LIST_CONDITION_DISBANDING,
+  MARMOT_CHAT_LIST_CONDITION_HAS_DRAFT,
+  MARMOT_CHAT_LIST_CONDITION_PENDING_SEND,
+  MARMOT_CHAT_LIST_CONDITION_FAILED_SEND,
+  MARMOT_CHAT_LIST_CONDITION_DIRECT,
+  MARMOT_CHAT_LIST_CONDITION_GROUP,
+  MARMOT_CHAT_LIST_CONDITION_MUTED,
+} MarmotChatListCondition;
+
+/**
+ * Which fields of a `MarmotChatListFilterNode` are read.
+ */
+typedef enum MarmotChatListFilterNodeKind {
+  /**
+   * Every child matches; no children matches every chat.
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_ALL,
+  /**
+   * Some child matches; no children matches none.
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_ANY,
+  /**
+   * Exactly one child, which must not match.
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_NOT,
+  /**
+   * `condition` holds.
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_CONDITION,
+  /**
+   * The chat's group ID is in `group_ids` (hex, any case).
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_GROUP_IDS,
+  /**
+   * The chat's searchable text contains `text` (trimmed, lowercased).
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_TEXT,
+  /**
+   * A visible message in the chat contains `text` (trimmed,
+   * lowercased). Query IDs and revalidation only; a window refuses it.
+   */
+  MARMOT_CHAT_LIST_FILTER_NODE_KIND_MESSAGE_TEXT,
+} MarmotChatListFilterNodeKind;
+
 typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
   MARMOT_CHAT_LIST_PAGE_DIRECTION_BACKWARD,
 } MarmotChatListPageDirection;
+
+/**
+ * Why a chat-list query was refused (`MARMOT_STATUS_INVALID_CHAT_LIST_QUERY`);
+ * the last-error detail names it.
+ */
+typedef enum MarmotChatListQueryError {
+  MARMOT_CHAT_LIST_QUERY_ERROR_TOO_DEEP,
+  MARMOT_CHAT_LIST_QUERY_ERROR_TOO_MANY_NODES,
+  MARMOT_CHAT_LIST_QUERY_ERROR_TOO_MANY_GROUP_IDS,
+  MARMOT_CHAT_LIST_QUERY_ERROR_CHILD_OUT_OF_RANGE,
+  MARMOT_CHAT_LIST_QUERY_ERROR_CHILD_NOT_AFTER_PARENT,
+  MARMOT_CHAT_LIST_QUERY_ERROR_SHARED_CHILD,
+  MARMOT_CHAT_LIST_QUERY_ERROR_UNREACHABLE_NODE,
+  MARMOT_CHAT_LIST_QUERY_ERROR_TEXT_TOO_LONG,
+  MARMOT_CHAT_LIST_QUERY_ERROR_MESSAGE_TEXT_IN_WINDOW,
+} MarmotChatListQueryError;
 
 typedef enum MarmotConversationOpenMode {
   MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC,
@@ -6054,7 +6128,7 @@ typedef struct MarmotChatListFilterNode {
   const char *const *group_ids;
   uintptr_t group_ids_len;
   /**
-   * For TEXT: the search text, NUL-terminated UTF-8.
+   * For TEXT and MESSAGE_TEXT: the search text, NUL-terminated UTF-8.
    */
   const char *text;
 } MarmotChatListFilterNode;

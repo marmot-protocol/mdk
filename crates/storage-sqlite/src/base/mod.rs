@@ -12,3 +12,4 @@ pub(crate) mod query_work_test_support;
 pub(crate) mod table_owners;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod text_search;

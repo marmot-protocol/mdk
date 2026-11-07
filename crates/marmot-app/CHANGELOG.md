@@ -17,6 +17,12 @@
   bound (mdk#3013). Its existing completion, cancellation and worker-stop outcomes are unchanged; the host still
   bounds its OS execution opportunity.
 
+- Chat-list select-all can search message text with `ChatListFilter::MessageText` (mdk#2983): chats with a visible
+  chat message or poll question containing the text, by the chat-text rule. `chat_list_ids` and
+  `revalidate_chat_list_ids` accept it; `open_chat_list_window` refuses it with
+  `InvalidChatListQuery(MessageTextInWindow)`, since its cost grows with history. It is not ready
+  (`ChatPresentationNotReady`) while the account's content-report backfill is owed. Timeline search now lowercases
+  by Unicode rules too, so it finds the messages that made a chat match. Additive.
 - Chat-list queries can search chat text with `ChatListFilter::Text` (mdk#2983): title, group name, description and a
   direct chat's peer profile names, trimmed and lowercased like user directory search, as a literal substring.
   Localized fallback titles are not searchable. While any chat in the query's view has pending presentation, or the

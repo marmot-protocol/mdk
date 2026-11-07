@@ -1129,7 +1129,7 @@ pub async fn chat_list_ids( &self, account_ref: String, view: ChatListViewFfi, )
 
 Select all: every chat ID in the view, in display order, including chats beyond the open window. The count is the list length. Use it for "select all" and bulk-action counts instead of the window's rows, which are bounded. While base rows are still being prepared it fails with `ChatPresentationNotReady` rather than returning a partial list; keep the action disabled and retry. The list is a snapshot: keep it as host checkbox state and call `revalidate_chat_list_ids` before acting.
 
-[Source](src/commands/chat_window.rs#L40)
+[Source](src/commands/chat_window.rs#L42)
 
 ### `Marmot::revalidate_chat_list_ids`
 
@@ -1141,7 +1141,7 @@ pub async fn revalidate_chat_list_ids( &self, account_ref: String, view: ChatLis
 
 The subset of a host selection still in the view, in the caller's order with duplicates dropped. It only removes: chats that joined the view after the selection was read are never added. IDs are normalized to lowercase hex, and a malformed ID fails the call with `InvalidHex`. Call it right before a bulk action, then run the existing per-chat commands (archive, local delete, leave), which still check their own preconditions; this read does not lock the selection.
 
-[Source](src/commands/chat_window.rs#L61)
+[Source](src/commands/chat_window.rs#L65)
 
 ### `Marmot::open_chat_list_query_window`
 
@@ -1151,9 +1151,9 @@ The subset of a host selection still in the view, in the caller's order with dup
 pub async fn open_chat_list_query_window( &self, account_ref: String, query: ChatListViewQueryFfi, initial_rows: Option<u32>, ) -> Result<Arc<ChatListWindowSubscription>, MarmotKitError>
 ```
 
-`open_chat_list_window` narrowed by a filter: the same subscription, window policy and commands over the chats a `ChatListViewQueryFfi` matches. The query is a base `view` plus `filter`, a flat node list where node 0 is the root and every other node is the child of exactly one node listed before it; an empty list means no filter. `All`, `Any` and `Not` combine `Condition` leaves (scope, unread, manual unread, mention, pinned, pending leave, disbanding, has draft, pending or failed send, direct or group kind, muted), `GroupIds` and `Text`; an empty `All` matches every chat in the view and an empty `Any` none. A chat whose kind is still `Unknown` matches neither kind leaf. `Muted` is evaluated at each read, and a window testing it updates when a mute expires, even for a chat it does not show. `Text` matches the title, group name, description or a direct chat's peer profile name as a literal substring after trimming and lowercasing both, like user directory search; localized fallback titles are not searchable and blank text matches nothing. While any chat in the view still has presentation pending, a query with `Text` fails with `ChatPresentationNotReady` (an open window publishes it and retries) instead of returning part of the set. Folder include/exclude lists are ordinary nodes, for example `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`. A malformed node list or a query over 8 levels, 64 nodes, 500 group IDs or 1024 bytes of text fails with `InvalidChatListQuery` before any read; a malformed group ID fails with `InvalidHex`. Use the same query value for the window, `chat_list_query_ids` and `revalidate_chat_list_query_ids` so list, count and selection agree.
+`open_chat_list_window` narrowed by a filter: the same subscription, window policy and commands over the chats a `ChatListViewQueryFfi` matches. The query is a base `view` plus `filter`, a flat node list where node 0 is the root and every other node is the child of exactly one node listed before it; an empty list means no filter. `All`, `Any` and `Not` combine `Condition` leaves (scope, unread, manual unread, mention, pinned, pending leave, disbanding, has draft, pending or failed send, direct or group kind, muted), `GroupIds`, `Text` and `MessageText`; an empty `All` matches every chat in the view and an empty `Any` none. A chat whose kind is still `Unknown` matches neither kind leaf. `Muted` is evaluated at each read, and a window testing it updates when a mute expires, even for a chat it does not show. `Text` matches the title, group name, description or a direct chat's peer profile name as a literal substring after trimming and lowercasing both, like user directory search; localized fallback titles are not searchable and blank text matches nothing. While any chat in the view still has presentation pending, a query with `Text` fails with `ChatPresentationNotReady` (an open window publishes it and retries) instead of returning part of the set. `MessageText` matches chats with a visible message containing the text by the same rule: a chat message or poll question the timeline shows, in its latest edit, not deleted, expired or from a blocked account, and not invalidated unless it is an own send shown as failed. Timeline `search` uses the same rule. It scans message history, so a window refuses it: this call fails with `InvalidChatListQuery` (`MessageTextInWindow`) before any read, and only `chat_list_query_ids` and `revalidate_chat_list_query_ids` accept it. Folder include/exclude lists are ordinary nodes, for example `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`. A malformed node list or a query over 8 levels, 64 nodes, 500 group IDs or 1024 bytes of text fails with `InvalidChatListQuery` before any read; a malformed group ID fails with `InvalidHex`. Use the same query value for the window, `chat_list_query_ids` and `revalidate_chat_list_query_ids` so list, count and selection agree; a query with `MessageText` has no window.
 
-[Source](src/commands/chat_window.rs#L25)
+[Source](src/commands/chat_window.rs#L27)
 
 ### `Marmot::chat_list_query_ids`
 
@@ -1163,9 +1163,9 @@ pub async fn open_chat_list_query_window( &self, account_ref: String, query: Cha
 pub async fn chat_list_query_ids( &self, account_ref: String, query: ChatListViewQueryFfi, ) -> Result<Vec<String>, MarmotKitError>
 ```
 
-Select all for a filtered query: every chat ID the query matches, in display order, beyond the open window, from the same compiled condition the window pages through. Same readiness and snapshot rules as `chat_list_ids`, and the same query validation as `open_chat_list_query_window`.
+Select all for a filtered query: every chat ID the query matches, in display order, beyond the open window, from the same compiled condition the window pages through. Same readiness and snapshot rules as `chat_list_ids`, and the same query validation as `open_chat_list_query_window`, except that it accepts `MessageText`, whose cost grows with message history. A query with `MessageText` also fails with `ChatPresentationNotReady` while retained deletions and edits are still being backfilled into the timeline.
 
-[Source](src/commands/chat_window.rs#L51)
+[Source](src/commands/chat_window.rs#L55)
 
 ### `Marmot::revalidate_chat_list_query_ids`
 
@@ -1177,7 +1177,7 @@ pub async fn revalidate_chat_list_query_ids( &self, account_ref: String, query: 
 
 `revalidate_chat_list_ids` for a filtered query: the subset of a host selection that still matches, in the caller's order with duplicates dropped, never adding chats. Call it with the query the selection was read under, right before a bulk action.
 
-[Source](src/commands/chat_window.rs#L74)
+[Source](src/commands/chat_window.rs#L78)
 
 ### `Marmot::subscribe_account_attention`
 
@@ -1189,7 +1189,7 @@ pub async fn subscribe_account_attention( &self, ) -> Result<Arc<AccountAttentio
 
 Signed-in local/external accounts, independent of any list or active worker.
 
-[Source](src/commands/chat_window.rs#L87)
+[Source](src/commands/chat_window.rs#L91)
 
 </details>
 

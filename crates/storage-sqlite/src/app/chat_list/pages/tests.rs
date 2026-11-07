@@ -474,7 +474,9 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                     let sql = format!(
                         "EXPLAIN QUERY PLAN {}",
                         navigation_sql(
-                            &ChatListViewQuery::from(view).compile(0).unwrap(),
+                            &ChatListViewQuery::from(view)
+                                .compile(0, crate::app::chat_list::query::QueryScope::Window)
+                                .unwrap(),
                             relation,
                             direction,
                             false

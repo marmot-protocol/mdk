@@ -198,7 +198,10 @@ impl MarmotAppRuntime {
     /// A live window over `query`: a fixed view (`ChatListView`), or a view
     /// narrowed by a filter matched in SQL before paging. No legacy full-list
     /// subscription or account-wide selected-presentation preparation is used
-    /// on this path. An invalid query fails here with `InvalidChatListQuery`.
+    /// on this path. An invalid query fails here with `InvalidChatListQuery`,
+    /// as does one testing message text (`MessageTextInWindow`): its cost grows
+    /// with history, so only `chat_list_ids` and `revalidate_chat_list_ids`
+    /// accept it.
     pub async fn open_chat_list_window(
         &self,
         account_ref: &str,
@@ -211,6 +214,9 @@ impl MarmotAppRuntime {
             return Err(ChatListWindowError::InvalidLimit);
         }
         let query = super::chat_list_selection::prepare_query(query)?;
+        query
+            .validate_for_window()
+            .map_err(AppError::InvalidChatListQuery)?;
         let view = query.view;
         let account = self.accounts.resolve(account_ref)?;
         // All invalidations attach BEFORE the first local read.

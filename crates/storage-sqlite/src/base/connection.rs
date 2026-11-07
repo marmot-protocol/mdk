@@ -1330,6 +1330,7 @@ pub(crate) fn finish_account_open(
             .storage()?;
     }
     apply_operational_pragmas(&connection, &options)?;
+    crate::base::text_search::register_search_functions(&connection).storage()?;
     connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     let migration_started = std::time::Instant::now();
     let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;

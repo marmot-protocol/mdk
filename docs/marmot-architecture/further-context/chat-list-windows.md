@@ -126,11 +126,11 @@ non-blank text or an attachment; a last message showing a pending or failed send
 (an older unresolved send behind newer history does not count, as the row does
 not show it); conversation kind (direct or group, as the row's
 `conversation_kind` shows; a chat whose kind is still unknown matches neither);
-muted, as the row's `muted` shows at the time of the read; chat text; and a
-group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
+muted, as the row's `muted` shows at the time of the read; chat text; message
+text (select-all only, below); and a group ID list. Folder rules are ordinary filters: "excluded IDs always win" is
 `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`, and an included ID
 never adds a chat outside the base view. An empty `All` matches every chat in the
-view and an empty `Any` none. Message text and people are later slices of #2983.
+view and an empty `Any` none. People search is a later slice of #2983.
 
 A query has at most 8 levels, 64 nodes, 500 group IDs and 1024 bytes of search
 text in all. Over a bound, or
@@ -142,7 +142,7 @@ paging, with every value bound as a parameter. Reads still walk the view's page
 index in display order; each leaf is a `chat_list_rows` column or one keyed
 lookup per chat (account groups, engine leave and disband records, the draft
 tables and the mute settings). Cost grows with the chats in the view, never with
-history.
+history. Message text is the one exception, and windows do not accept it.
 
 Conversation kind is the `chat_list_rows.list_kind` column. Triggers keep it
 current from the classifier's inputs, the row's group name and the account
@@ -201,12 +201,60 @@ stored presentation change, including one that alters only the search text,
 advances the presentation revision every window re-reads on. So a profile or
 description change makes an off-screen chat enter or leave a text window.
 
+Message text matches a chat that has a visible message containing the query:
+a chat message or poll question (the kinds the row already treats as messages)
+that the timeline shows, in its latest edit, not deleted, not invalidated
+(except an own send that reached no one, which the row previews as failed), not
+from a blocked account, and not past its disappearing-message expiry at the
+read's time. The rule is chat text's: trim and Unicode lowercasing, then a
+literal substring, through a `marmot_search_contains` SQL function each account
+connection registers. Timeline `search` uses the same function, so the host's
+in-chat search finds the message that made a chat match; it previously folded
+case for ASCII only. The leaf reads the timeline per chat through the
+`(group_id_hex, kind, deleted, …)` index, so its cost grows with the history of
+the chats it tests. Until the [#1363](https://github.com/marmot-protocol/mdk/issues/1363)
+index replaces that scan, only `chat_list_ids` and `revalidate_chat_list_ids`
+accept it. Every window read refuses it with
+`InvalidChatListQuery(MessageTextInWindow)` before reading, and so does opening
+a window from Rust, UniFFI or C.
+
+Message text is not ready while the timeline still owes local work that could
+change it. Ordinary ingest, edits, deletions and invalidations update the
+timeline in the transaction that records them, and expiry and blocks are read at
+query time. That leaves the content-report backfill, which applies deletions and
+edits recorded before content reports existed: while its cursor is behind, a
+message-text query returns `ChatPresentationNotReady`, never a partial set. The
+account worker runs that backfill; it exists only for databases created before
+it and finishes once. History not yet received and moderation removals still
+awaiting an authority verdict are outside "not ready": the timeline shows the
+same thing the search sees.
+
+Windows re-read on almost every account change, so message text may enter them
+only when a select-all read that matches nothing, and so scans every message, takes
+at most 16 ms (one 60 Hz frame) on the cost fixture: 500 chats of 2,001 messages
+(1,000,500 in all, one in ten non-ASCII) in a file-backed SQLCipher account,
+measured by the ignored test `message_text_selection_cost_on_a_large_history` in
+an optimized build. Measured on an Apple M4 Max on 2026-11-07:
+
+| Read | p50 |
+| --- | --- |
+| Unfiltered select-all, for comparison | 38 µs |
+| Message text, no match (every message scanned) | 774 ms |
+| Message text, every chat matches on its last message | 780 ms |
+| Message text, every chat matches early | 18 ms (ASCII), 23 ms (non-ASCII) |
+
+The full scan is about 48 times the threshold, so windows keep refusing message
+text until the #1363 index. On the same rows the shared matcher costs about 15%
+more than the old `LIKE … COLLATE NOCASE` (248 ms against 216 ms for a bare scan),
+a small part of an account-wide timeline search that matches nothing (6.9 s).
+
 ## Select all
 
 A window holds at most 200 rows, so hosts must not derive "select all" or a bulk
 action's count from it. `chat_list_ids(account, query)` returns every ID the query
 matches in display order from one read, through the same compiled condition the
-window pages through; its cost grows with the view's chats, never with history.
+window pages through; its cost grows with the view's chats, never with history,
+except for message text.
 While base rows are pending it returns `ChatPresentationNotReady`, never a partial
 set, after repairing one bounded batch as a window read does.
 `revalidate_chat_list_ids(account, query, ids)` returns the still-matching subset
