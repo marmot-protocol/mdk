@@ -1005,6 +1005,43 @@ async fn a_stopped_runner_settles_the_quantum_it_preempted() {
     hold.release.notify_waiters();
 }
 
+/// `MarmotAppRuntime::shutdown` tears the relay plane down alongside the
+/// worker's runner stop, so the request in flight can fail before the stop
+/// reaches the runner. That cut is this process's teardown, not the relay's
+/// verdict: the quantum settles as preempted and leaves its unit due, rather
+/// than holding it back for the unreachable retry delay in the next process
+/// to serve the account (mdk#3161).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_plane_shutdown_settles_the_cut_quantum_as_preempted() {
+    let hold = HeldSweeps::default();
+    let (_dir, relay, mut client, storage) = held_client(&hold).await;
+    let relay_url = transport_nostr::canonical_relay(&relay.url().await.to_string());
+    let routes = group_routes(&client);
+    let [route] = routes.as_slice() else {
+        panic!("one group route");
+    };
+    let before = charged(&storage);
+    let mut runner = client.spawn_recovery_runner().await.unwrap();
+    serve_until_held(&mut runner, &mut client, &hold).await;
+    assert_eq!(charged(&storage), before + 1, "the quantum began");
+
+    client.relay_plane.shutdown().await;
+    // The cut quantum's settle, sent before any runner stop.
+    runner.next_turn().await.serve(&mut client).await;
+
+    let unit = storage
+        .recovery_unit(route, &relay_url)
+        .unwrap()
+        .expect("the swept unit");
+    assert!(
+        unit.next_attempt_at_seconds <= unix_now_seconds(),
+        "a teardown cut leaves the unit due"
+    );
+    assert_eq!(charged(&storage), before, "the preempted quantum settled");
+    runner.stop(&mut client).await;
+    hold.release.notify_waiters();
+}
+
 /// Fresh epoch-gap evidence must create durable work even if the route was
 /// already swept. A failed handoff retries as one transaction, and polling an
 /// unchanged obligation must not erase the replacement proof.
