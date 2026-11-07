@@ -222,6 +222,18 @@ archive. Builders still reclaim it unconditionally. Archive consumers verify
 the checksum and require the manifest's expanded size plus a 2 GiB disk reserve
 before extraction, regardless of whether cleanup ran.
 
+To compare archive layouts before merge, run
+`gh workflow run ci.yml --ref <branch> -f archive_layout_experiment=true` on a
+branch at the exact revision under investigation. This also runs the normal
+manual CI suite. After merge, you can dispatch [Archive layout experiment](.github/workflows/archive-layout-experiment.yml)
+directly. The experiment builds once and compares fourteen
+full-archive `slice:14` consumers with two binary-local groups of seven slices,
+balanced by selected test counts, not measured duration. Download the one-day
+diagnostics: compare archive bytes and creation time, download/extraction time,
+and test-duration skew within each layout. Compare paired runs; do not add
+medians from unrelated jobs. Main CI defaults stay unchanged until measurements show an
+improvement without worse tail latency or lost coverage.
+
 Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
 along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS
 clippy lane and Apple packaging, and `ci:android` adds Android packaging; for

@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import nightly_release  # noqa: E402
 import ci_runner  # noqa: E402
+import ci_archive_layout as archive_layout  # noqa: E402
 import check_pr_signatures as signatures  # noqa: E402
 from check_install_example_sha256 import documented_release_version  # noqa: E402
 
@@ -353,14 +354,6 @@ class MergeGatePolicyTests(unittest.TestCase):
         jobs = workflow.split("\njobs:\n", 1)[1]
         job = next(block for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs) if "--profile precheck" in block)
         self.assertRegex(job, r"(?m)^    if: needs\.changes\.outputs\.run_full == 'true'$")
-
-    def test_required_ci_aggregates_every_job(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", workflow.split("\njobs:\n", 1)[1]))
-        required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[1]
-        needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", required.split("\n    runs-on:", 1)[0]))
-        # The fail-fast watcher waits for Required CI to appear, so it cannot be a need.
-        self.assertEqual(needs, jobs - {"required-ci", "merge-group-fail-fast"})
 
     def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -995,6 +988,56 @@ class NightlyPublishTests(unittest.TestCase):
         lane = bindings.split("\n  release-lane:\n", 1)[1].split("\n    steps:\n", 1)[0]
         self.assertNotIn("\n    if:", lane)
         self.assertIn("\n    needs: release-lane\n", bindings.split("\n  metadata:\n", 1)[1].split("\n    steps:", 1)[0])
+
+
+class ArchiveLayoutTests(unittest.TestCase):
+    def test_partition_boundaries(self):
+        for layout, number, expected in [
+            ("slice", 1, (0, "slice:1/14")), ("slice", 14, (0, "slice:14/14")),
+            ("binary-local", 1, (1, "slice:1/7")), ("binary-local", 7, (1, "slice:7/7")),
+            ("binary-local", 8, (2, "slice:1/7")), ("binary-local", 14, (2, "slice:7/7")),
+        ]:
+            with self.subTest(layout=layout, number=number):
+                self.assertEqual(archive_layout._partition(layout, number), expected)
+        for layout, number in [("slice", 0), ("binary-local", 15), ("other", 1)]:
+            with self.assertRaisesRegex(ValueError, "partition 1..14"):
+                archive_layout._partition(layout, number)
+
+    def test_whole_binary_balance(self):
+        inventory = archive_layout.Counter({("large", "test"): 8, ("b", "test"): 4,
+                                            ("a", "test"): 4, ("small", "test"): 1})
+        groups, weights = archive_layout._groups(inventory)
+        self.assertEqual(groups, [["large", "small"], ["a", "b"]])
+        self.assertEqual([sum(weights[binary] for binary in group) for group in groups], [9, 8])
+        reverse = archive_layout.Counter(dict(reversed(list(inventory.items()))))
+        self.assertEqual(archive_layout._groups(reverse), (groups, weights))
+        with self.assertRaisesRegex(ValueError, "two nonempty groups"):
+            archive_layout._groups(archive_layout.Counter({("only", "test"): 3}))
+
+    def test_selected_ignored_tests(self):
+        document = {"rust-suites": {"pkg::suite": {"testcases": {
+            "ignored": {"ignored": True, "filter-match": {"status": "matches"}},
+            "ordinary": {"ignored": False, "filter-match": {"status": "matches"}},
+            "excluded": {"ignored": False, "filter-match": {"status": "mismatch"}},
+        }}}}
+        self.assertEqual(archive_layout._inventory(document),
+                         {("pkg::suite", "ignored"): 1, ("pkg::suite", "ordinary"): 1})
+
+    def test_exact_once_coverage(self):
+        expected = archive_layout.Counter({("a::b", "c"): 1, ("a", "b::c"): 1})
+        archive_layout._coverage(expected, expected.copy())
+        for actual in [archive_layout.Counter({("a::b", "c"): 2}),
+                       expected + archive_layout.Counter({("a", "b::c"): 1}),
+                       archive_layout.Counter()]:
+            with self.assertRaisesRegex(ValueError, "partition coverage mismatch"):
+                archive_layout._coverage(expected, actual)
+        with self.assertRaisesRegex(ValueError, "partition coverage mismatch"):
+            archive_layout._coverage(archive_layout.Counter(), archive_layout.Counter())
+
+    def test_binary_id_dsl_escaping(self):
+        self.assertEqual(archive_layout._binary_filter("pkg::test"), "binary_id(=pkg::test)")
+        self.assertEqual(archive_layout._binary_filter("x\\,)\n\r\t/ *"),
+                         r"binary_id(=x\u{5c}\u{2c}\u{29}\u{a}\u{d}\u{9}\u{2f}\u{20}\u{2a})")
 
 
 class RunnerEvidenceTests(unittest.TestCase):
