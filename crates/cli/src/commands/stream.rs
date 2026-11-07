@@ -916,11 +916,50 @@ mod tests {
             ));
             assert!(matches!(
                 stream_trust(server, Some(cert_hex.clone()), false),
-                Ok(ServerTrust::CertificateDer(_))
+                Ok(ServerTrust::CertificateDer(bytes)) if bytes == [0x11_u8; 8]
             ));
             assert!(matches!(
                 broker_trust(server, Some(cert_hex.clone()), false),
-                Ok(BrokerServerTrust::CertificateDer(_))
+                Ok(BrokerServerTrust::CertificateDer(bytes)) if bytes == [0x11_u8; 8]
+            ));
+        }
+    }
+
+    #[test]
+    fn named_broker_candidates_keep_verified_trust_with_local_opt_in() {
+        for raw in ["93.184.216.34:4450", "[2606:4700::1]:4450"] {
+            let server = addr(raw);
+            for local in [false, true] {
+                assert!(matches!(
+                    broker_trust_for_candidate("broker.example", server, None, local),
+                    Ok(BrokerServerTrust::Platform)
+                ));
+            }
+            assert!(matches!(
+                broker_trust_for_candidate("broker.example", server, Some("1122aaff".into()), false),
+                Ok(BrokerServerTrust::CertificateDer(bytes)) if bytes == [0x11,0x22,0xaa,0xff]
+            ));
+            assert!(matches!(
+                broker_trust_for_candidate("broker.example", server, Some("xx".into()), false),
+                Err(WnError::Hex(hex::FromHexError::InvalidHexCharacter { .. }))
+            ));
+            assert!(matches!(
+                broker_trust_for_candidate("broker.example", server, Some("1122".into()), true),
+                Err(WnError::ConflictingStreamTrust)
+            ));
+            assert!(matches!(
+                broker_trust_for_candidate("localhost", server, None, true),
+                Err(WnError::InsecureLocalRequiresLoopback(_))
+            ));
+        }
+        for raw in ["127.0.0.1:4450", "[::1]:4450"] {
+            assert!(matches!(
+                broker_trust_for_candidate("broker.example", addr(raw), None, true),
+                Err(WnError::UnsafeQuicEndpoint)
+            ));
+            assert!(matches!(
+                broker_trust_for_candidate("localhost", addr(raw), None, true),
+                Ok(BrokerServerTrust::InsecureLocal)
             ));
         }
     }
