@@ -577,6 +577,58 @@ mod tests {
 
     #[test]
     fn host_stages_cross_bindings() {
+        use HostPerformanceOperationFfi as Host;
+        use marmot_app::HostPerformanceOperation as Native;
+
+        // The command/snapshot and message-journey owners cover SplashReady,
+        // ForegroundLocalReady, ComposerReady, and both message-visible arms.
+        // The real recorder checks below retain MediaApply and LinuxVaultOpen.
+        for (host, expected) in [
+            (
+                Host::ConversationLocalVisible,
+                Native::ConversationLocalVisible,
+            ),
+            (
+                Host::LinuxStartupBeforeVault,
+                Native::LinuxStartupBeforeVault,
+            ),
+            (Host::LinuxStartupAfterVault, Native::LinuxStartupAfterVault),
+            (Host::WindowInit, Native::WindowInit),
+            (Host::FontsInit, Native::FontsInit),
+            (Host::RuntimeInit, Native::RuntimeInit),
+            (Host::AccountLoad, Native::AccountLoad),
+            (Host::AccountSwitch, Native::AccountSwitch),
+            (Host::FrameUpdate, Native::FrameUpdate),
+            (Host::FrameLayout, Native::FrameLayout),
+            (Host::FrameDraw, Native::FrameDraw),
+            (Host::FramePresent, Native::FramePresent),
+            (Host::LinuxFramePostPresent, Native::LinuxFramePostPresent),
+            (Host::LinuxFrameUntilPresent, Native::LinuxFrameUntilPresent),
+            (Host::LinuxFrameIdleWait, Native::LinuxFrameIdleWait),
+            (Host::ChatListLoad, Native::ChatListLoad),
+            (Host::ContactsLoad, Native::ContactsLoad),
+            (Host::ArchivedChatListLoad, Native::ArchivedChatListLoad),
+            (Host::ProfileLoad, Native::ProfileLoad),
+            (Host::ProfileRead, Native::ProfileRead),
+            (Host::TimelineOpen, Native::TimelineOpen),
+            (Host::TimelinePage, Native::TimelinePage),
+            (Host::TimelineHandoff, Native::TimelineHandoff),
+            (Host::TimelineApply, Native::TimelineApply),
+            (Host::MessageSend, Native::MessageSend),
+            (Host::MessageSearch, Native::MessageSearch),
+            (Host::ConversationSearch, Native::ConversationSearch),
+            (Host::MediaQueueWait, Native::MediaQueueWait),
+            (Host::MediaPrepare, Native::MediaPrepare),
+            (Host::MediaLoad, Native::MediaLoad),
+            (Host::MediaCacheRead, Native::MediaCacheRead),
+            (Host::MediaDecode, Native::MediaDecode),
+            (Host::LinuxVaultDeriveKey, Native::LinuxVaultDeriveKey),
+            (Host::LinuxVaultCreate, Native::LinuxVaultCreate),
+            (Host::LinuxVaultPersist, Native::LinuxVaultPersist),
+            (Host::SettingsSave, Native::SettingsSave),
+        ] {
+            assert_eq!(Native::from(host), expected);
+        }
         let telemetry = marmot_app::AppPerformanceTelemetry::default();
         let stages = [
             (HostPerformanceOperationFfi::MediaApply, "host_media_apply"),
