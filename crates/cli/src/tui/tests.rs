@@ -14233,11 +14233,17 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
             "group_id":group,"stream_id":"dd".repeat(32),"text":"incoming account preview"
         }}})
         .to_string();
+    let reconnected = serde_json::json!({"ok":true,"result":{
+        "type":"agent_stream_delta","agent_stream_delta":{
+            "group_id":group,"stream_id":"ee".repeat(32),"text":"reconnected account A preview"
+        }
+    }})
+    .to_string();
     let exe = dir.path().join("wn-refresh");
     write_fake_wn(
         &exe,
         &format!(
-            "#!/bin/sh\ncase \"$*\" in\n*'chats subscribe'*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60\n;;\n*'messages subscribe'*) printf '%s\\n' '{incoming}'; exec sleep 60;;\n*subscribe*) exec sleep 60;;\n*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[],\"messages\":[]}}}}';;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in\n*'chats subscribe'*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60\n;;\n*'--account {account_a} messages subscribe'*) printf '%s\\n' '{reconnected}'; exec sleep 60;;\n*'--account {account_b} messages subscribe'*) printf '%s\\n' '{incoming}'; exec sleep 60;;\n*subscribe*) exec sleep 60;;\n*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[],\"messages\":[]}}}}';;\nesac\n",
             gate.script()
         ),
     );
@@ -14287,14 +14293,34 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
         rendered_buffer(&mut app).contains("outgoing account preview"),
         "same-account reconnect preserves observed previews"
     );
+    let reconnected_a_child = app.message_subscription.as_ref().unwrap().child.id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rendered_buffer(&mut app).contains("reconnected account A preview") {
+        app.drain_message_subscription();
+        assert!(
+            Instant::now() < deadline,
+            "A's actual reconnected child did not deliver"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
     app.selected_account = 1;
     app.refresh_chats().expect("refresh B's empty list");
     gate.wait_until_entered();
     assert!(app.chats.is_empty());
     assert_eq!(app.messages_account_id.as_deref(), Some(account_b.as_str()));
+    let b_feed = app
+        .message_subscription
+        .as_ref()
+        .expect("B's empty-list feed");
+    assert_eq!(b_feed.account_id, account_b);
+    assert_ne!(b_feed.child.id(), reconnected_a_child);
+    assert_eq!(
+        app.stream_previews_account_id.as_deref(),
+        Some(account_b.as_str())
+    );
     assert!(
-        tx.send(SubscriptionEvent::Ended).is_err(),
-        "A's feed has been replaced"
+        app.live_stream_previews.is_empty(),
+        "the empty-list transition clears A before any later load"
     );
     gate.release();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -14322,10 +14348,12 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
     }
     assert_eq!(app.messages_account_id, Some(account_b));
     assert_eq!(timeline_ids(&app.timeline), vec!["B row"]);
-    assert!(
-        !rendered_buffer(&mut app).contains("outgoing account preview"),
-        "A's preview must not survive B's empty-list account transition"
-    );
+    for text in ["outgoing account preview", "reconnected account A preview"] {
+        assert!(
+            !rendered_buffer(&mut app).contains(text),
+            "A's preview must not survive B's empty-list account transition"
+        );
+    }
 }
 
 #[cfg(unix)]
