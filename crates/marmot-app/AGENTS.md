@@ -698,7 +698,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
   fetch for every account; there is no other owner and no switch back. `prepare_runner_ownership` converts and
-  imports loss, installs `delegate_replay_recovery` and enables live fences before any subscription activates. A
+  imports loss and enables live fences before any subscription activates. A
   counted live REQ is held until the runner answers it (`fence_live_frames`); test fixtures that need a caught-up
   account answer it the same way. The catching-up status stays empty until a runner surveys.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
@@ -770,9 +770,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   own `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a
   successful debt turn.
-  Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`
-  plus `enable_live_fences` before any native input or REQ. Both native backward-paging entry points are then off
-  for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
+  Runner-owned startup completes fallible conversion and `enable_live_fences` before any native input or REQ.
+  The adapter fetches no history of its own; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
   repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry
   armed; the worker seats it once a preparation succeeds, even if that refresh then fails (`recovery_runner_due`).
   Imported loss releases the plane cursor fence only at the exact

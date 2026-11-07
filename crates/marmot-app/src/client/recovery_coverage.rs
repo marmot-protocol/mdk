@@ -232,9 +232,9 @@ struct LiveCountFact {
 #[cfg_attr(not(test), allow(dead_code))]
 impl LiveCountFact {
     /// The count as the runner's fence reads it. Only a non-empty count
-    /// leaves capture debt below its oldest event. Once native paging is
-    /// delegated, a full admitted reply leaves that debt too; admission is
-    /// not proof that the original query was complete.
+    /// leaves capture debt below its oldest event. A full admitted reply
+    /// leaves that debt too; admission is not proof that the original query
+    /// was complete.
     fn live_count(&self) -> LiveCount {
         LiveCount {
             routes: self.routes.clone(),
@@ -358,9 +358,9 @@ impl AppClient {
     }
 
     /// Have the adapter hold each counted group's live frames until the
-    /// runner answers with [`Self::fence_live_frames`]. Delegated backlog holds
-    /// follow durable admission progress, independently of request deadlines. Nothing calls this until the switch-over (5g), so
-    /// owner capture keeps every behavior; no call undoes it.
+    /// runner answers with [`Self::fence_live_frames`]. Backlog holds follow
+    /// durable admission progress, independently of request deadlines. No
+    /// call undoes it.
     pub(crate) async fn enable_live_fences(&self) {
         self.adapter.enable_replay_fencing().await;
     }
@@ -587,7 +587,6 @@ impl AppClient {
         }
         let app = self.app.account_storage(&self.state.label)?.app_storage();
         self.synchronize_recovery_loss(&app)?;
-        self.adapter.delegate_replay_recovery().await?;
         self.enable_live_fences().await;
         Ok(())
     }

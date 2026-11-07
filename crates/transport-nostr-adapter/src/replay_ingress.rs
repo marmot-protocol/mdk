@@ -1009,7 +1009,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.record_eose(&id, RelayIndex(0));
         state
             .account_replay_coverage
             .insert(MemberId::new(vec![0xA1; 32]), coverage);
@@ -1203,7 +1203,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap()
-            .record_eose(&id, RelayIndex(0), 0);
+            .record_eose(&id, RelayIndex(0));
         let mut merged = ready(&mut ingress).await;
         for at in [5, 10, 15, 20] {
             assert_eq!(merged.delivery().unwrap().message.timestamp, Timestamp(at));
@@ -1337,7 +1337,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap()
-            .record_eose(&id, RelayIndex(0), 0);
+            .record_eose(&id, RelayIndex(0));
         let mut merged = ready(&mut ingress).await;
         assert_eq!(ingress.shared.held(), (4, 4));
         for at in [5, 10, 15, 20] {
@@ -1378,7 +1378,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap()
-            .record_eose(&id, RelayIndex(0), 0);
+            .record_eose(&id, RelayIndex(0));
         let mut merged = ready(&mut ingress).await;
         for at in [5, 10, 20] {
             assert_eq!(merged.delivery().unwrap().message.timestamp, Timestamp(at));
@@ -1427,7 +1427,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap()
-            .record_eose(&id, RelayIndex(0), 0);
+            .record_eose(&id, RelayIndex(0));
         let mut batch = ready(&mut ingress).await;
         for at in [10, 20] {
             assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(at));
@@ -1467,7 +1467,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap()
-            .record_eose(&id, RelayIndex(0), 0);
+            .record_eose(&id, RelayIndex(0));
         let mut merged = ready(&mut ingress).await;
         for at in [5, 10, 20] {
             assert_eq!(merged.delivery().unwrap().message.timestamp, Timestamp(at));
@@ -1503,7 +1503,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.record_eose(&id, RelayIndex(0));
         coverage.flushing = true;
         let cancellation = coverage.cancellation.clone();
         let wake = coverage.wake.clone();
@@ -1513,12 +1513,10 @@ mod tests {
         let state = Arc::new(RwLock::new(state));
         let supervisor = Arc::new(ReplaySupervisor {
             state: Arc::downgrade(&state),
-            relay_client: Arc::new(NoNetwork),
             delivery_tx: tx.clone(),
             account_id: account.clone(),
             cancellation,
             wake,
-            monotonic_start: Instant::now(),
         });
         let drain = supervisor.clone();
         let task = tokio::spawn(async move { drain.drain_deliveries().await });
@@ -1558,7 +1556,7 @@ mod tests {
             let mut guard = state.write().await;
             let coverage = guard.account_replay_coverage.get_mut(&account).unwrap();
             assert_eq!((coverage.buffered_items, coverage.releasing_items), (3, 0));
-            coverage.record_eose(&id, RelayIndex(0), 0);
+            coverage.record_eose(&id, RelayIndex(0));
         }
         let drain = supervisor.clone();
         let task = tokio::spawn(async move { drain.drain_deliveries().await });
@@ -1591,7 +1589,7 @@ mod tests {
             ingress.take_batch(Some(&group)).await,
             ReplayBatchTake::Pending
         ));
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         {
             let mut state = state.write().await;
             let coverage = state
@@ -1637,7 +1635,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap();
-        coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.record_eose(&id, RelayIndex(0));
         drop(guard);
         let mut batch = ready(&mut ingress).await;
         assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(20));
@@ -1720,7 +1718,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap()
-            .record_eose(&id, RelayIndex(0), 0);
+            .record_eose(&id, RelayIndex(0));
         let batch = ready(&mut ingress).await;
         assert_eq!(
             batch.delivery().unwrap().message.timestamp,
@@ -1781,7 +1779,7 @@ mod tests {
             state.account_replay_coverage.remove(&account);
             let (mut coverage, id) = coverage(&state, reopened.shared.clone());
             coverage.admit_retained();
-            coverage.record_eose(&id, RelayIndex(0), 0);
+            coverage.record_eose(&id, RelayIndex(0));
             state.account_replay_coverage.insert(account, coverage);
         }
         let mut batch = ready(&mut reopened).await;
@@ -1803,6 +1801,61 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "retained spill was not lost"
+        );
+    }
+
+    /// An executor failure records the issued floor as loss for the remote
+    /// bodies it discards, and keeps the retained durable supplement for
+    /// native ingress: only that supplement is offered afterwards, and the
+    /// source stays unadmitted for the recovery runner.
+    #[tokio::test]
+    async fn executor_failure_keeps_retained_input() {
+        let mut state = AdapterState::default();
+        let shared = Arc::new(ReplayIngressState::default());
+        shared.queue.lock().unwrap().consumer = Some(1);
+        let (mut coverage, id) = coverage(&state, shared.clone());
+        shared.retain(delivery(10, &id));
+        coverage.admit_retained();
+        let (tx, _rx) = mpsc::channel(1);
+        coverage.record_stored_event(&id, RelayIndex(0), 15);
+        coverage
+            .stage_delivery(
+                delivery(15, &id),
+                Some(RelayIndex(0)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.fail_execution();
+        let account = MemberId::new(vec![0xA1; 32]);
+        assert_eq!(
+            state.replay_losses.pending.lock().unwrap().get(&account),
+            Some(&NostrNotificationLossFloor::Unbounded),
+            "the discarded remote body is owed from the issued floor, which this REQ lacks"
+        );
+        assert!(!coverage.request_admitted(&id, Some(RelayIndex(0))));
+        state
+            .account_replay_coverage
+            .insert(account.clone(), coverage);
+        state
+            .replay_ingresses
+            .insert(account.clone(), shared.clone());
+        let state = Arc::new(RwLock::new(state));
+        let mut ingress = ReplayIngress {
+            consumer: Arc::new(ReplayConsumer {
+                shared: Arc::downgrade(&shared),
+                serial: 1,
+            }),
+            shared,
+            state: Arc::downgrade(&state),
+            account,
+        };
+        let mut batch = ready(&mut ingress).await;
+        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(10));
+        batch.acknowledge().await;
+        assert!(
+            batch.delivery().is_none(),
+            "the discarded remote body does not leak as a newer suffix"
         );
     }
 
@@ -1851,7 +1904,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.record_eose(&id, RelayIndex(0));
         let group = GroupId::new(vec![0; 16]);
         assert!(!coverage.owner_flushable(&group, &coverage.groups[&group]));
         let account = MemberId::new(vec![0xA1; 32]);
@@ -1934,7 +1987,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.record_eose(&id, RelayIndex(0));
         coverage.queue_owner_batches();
         let group = GroupId::new(vec![0; 16]);
         assert!(shared.queued(&group), "the batch left the buffer");

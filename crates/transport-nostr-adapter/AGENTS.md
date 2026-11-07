@@ -29,7 +29,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it and counts each live REQ's reply frames. Called by `marmot-app`'s recovery runner `quantum.rs`, which owns account history debt by default since PR 5g. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. Called by the same recovery runner's `compare.rs`; its `host.rs` builds `SdkSweepRelay` from the account's existing pool. |
-| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed delegated holds, legacy one-deadline expiry, and buffered live frames, held or waiting for admission, moving to the coverage a fresh activation installs. Enabled by the recovery runner from PR 5g. |
+| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed holds, and buffered live frames, held or waiting for admission, moving to the coverage a fresh activation installs. Enabled by the recovery runner from PR 5g. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
@@ -90,17 +90,12 @@ for reconnect/backoff and relay status mechanics.
     sync or maintenance REQ until that relay's EOSE, without materializing a DTO. Consumers must pass a relay's
     copies in order with its EOSE, and report unconvertible stored events through
     `observe_unconvertible_relay_event` instead of dropping them.
-  - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more moves to `RelayReplay::Paging`, which is neither complete nor
-    settled. `page_replay` then fetches the window backwards with `acquire_history` until a page comes back short;
-    only then does that relay's EOSE count.
-  - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
-    cannot move past its oldest second, because that second may hide more events and everything older.
-  - An account that delegates replay recovery before activation starts neither native paging entry point.
-    A full live reply becomes `Delegated`, not complete-query `Eose`: its received input can be admitted under
-    the owner's bounded fence, while the coverage gate stays incomplete. Raw live counts survive; the ledger
-    owner proves the missing range. Direct adapter callers retain native paging unless they delegate explicitly.
+  - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more ends `RelayReplay::Delegated`, not complete-query `Eose`: its
+    received input can be admitted under the owner's fence, while the coverage gate stays incomplete. Raw live counts
+    survive; the account's recovery runner owes and proves the missing range. The adapter fetches no history of its
+    own for any reply.
 - Keep each endpoint's `ReplayLiveCount` to its own physical EOSE in one source generation (the endpoint serial), for
-  the coverage ledger's live boundary (#2660). Backward paging keeps it. Its `requested_at` must be no later
+  the coverage ledger's live boundary (#2660). Its `requested_at` must be no later
   than when the relay ran the query: the endpoint's stamp taken before its REQ is issued, raised for a REQ the SDK
   re-sent on reconnecting to that connection's `connected_at`. The monitor reads that stamp only when the SDK's
   success count shows it belongs to a connection the monitor saw (`connection_stamp`); never stamp a count later
@@ -113,7 +108,7 @@ for reconnect/backoff and relay status mechanics.
   when the adapter issued the REQ in that serial; for a REQ the SDK sent (a reconnect, a kept `CLOSED`) it is the
   second the adapter recorded its EOSE (`ReplayEndpoint::sent_again`), because the SDK reports `Connected` before it
   counts the connection and records its time, so that stamp can be the previous connection's or missing. A reconnect
-  without a reported disconnect, receiver loss, a capture and a failed or cut capture drop it. Never carry a count
+  without a reported disconnect and receiver loss drop it. Never carry a count
   into the next serial.
 - A live count streams (`ReplayEndpointView::streaming`, which alone may hold a provisional tail) only while the relay
   client reports, when asked, the connection its serial started on (`NostrRelayClient::relay_connection`): the one
@@ -127,7 +122,7 @@ for reconnect/backoff and relay status mechanics.
   connection, not a REQ: it can stay true until the adapter processes notifications already queued for that relay
   (a `CLOSED` on a connection that stays open, or a boundary handled after the next connection opened, which records
   that newer connection). That delay is the accepted limit; anything it does not bound is a bug.
-- Stage each group's complete replay range before timestamp/id-ordered release, including backward pages. Keep
+- Stage each group's complete replay range before timestamp/id-ordered release. Keep
   live arrivals behind the draining batch. Every replacement REQ establishes its own current-peer boundary,
   including equivalent or narrower repacks; never inherit another REQ's ready floor. In-deadline peers fence
   payload release until EOSE or their finite lease settles. Verified raw SDK group copies feed admission;
@@ -136,40 +131,32 @@ for reconnect/backoff and relay status mechanics.
 - Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share
   ciphertext bodies with separate source claims; retiring or failing one source must not discard a healthy
   source's older history. Waiting starts again at an unfinished source's first connection boundary. Each
-  active route gets one `REPLAY_PAGE_LIMITS.max_duration` fetch interval when service starts; queueing, peer
-  waits and draining do not spend it. Arrivals and repeated loss never extend active leases. Empty expired
+  active route gets one `REPLAY_WAIT_LIMIT` waiting allowance when service starts; peer waits and draining do not
+  spend it. Arrivals and repeated loss never extend active leases. Empty expired
   streams become dormant; a first or newer connection can reopen waiting. Late history without that restart is
   explicit loss, never a raw-EOSE certificate. Discarded history retains its own floor. Fresh requests do not
   inherit failure.
 - Transport consumers use `NostrSdkRelayClient::notifications`, the ordered per-relay SDK frontier, and
-  `dispatch_sdk_replay`. Capture connection and receiver-loss boundaries with the payloads; never poll SDK
-  state to infer their generation. Authentication alone must not advance a connection epoch or restart a
-  capture. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss fences the
-  source without starting IO; AccountRecoveryOwner alone grants original-window recovery and retry. Real
-  SDK/frontend gaps enter the existing plane loss fence. Empty waiting or cancelled empty IO never fabricates
+  `dispatch_sdk_replay`. Carry connection and receiver-loss boundaries with the payloads; never poll SDK
+  state to infer their generation. Authentication alone must not advance a connection epoch. Reader epochs are
+  process-monotonic and survive queued frontend work. Receiver loss abandons the source's open streams without
+  starting IO: they end incomplete, their discarded bodies retain a loss floor, and the recovery runner alone
+  refetches the window. Real SDK/frontend gaps enter the existing plane loss fence. Empty waiting never fabricates
   discarded-input evidence. Only recorded transport REQ payloads enter the frontier; acquisition replies stay with their
-  collectors. Forced paging is not physical EOSE; late stored copies cannot become live by that transition.
+  collectors.
 - `NostrSdkRelayClient::relay_connections` publishes each monitored relay's latest connection generation from the
   same `Connected` branch that opens its replay boundary, so it never moves on AUTH alone. It is a wake signal for
-  the recovery runner, which diffs generations; it carries no capture boundary, and nothing may order payloads by it.
+  the recovery runner, which diffs generations; it carries no replay boundary, and nothing may order payloads by it.
 - Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional
-  draining batch; include inbox and ready-delivery backpressure. A per-account supervisor owns capture tickets
-  and draining tasks; atomically install tickets and ready-channel placements under the admission lock,
-  without a cancellation gap. Notification-worker cancellation must not orphan accepted work. Account
-  retirement cancels it and retains unresolved loss. Keep released live-copy dedup bounded by the item
-  allowance; historical refetch bypasses it. Retry one interrupted page at the same boundary within the page
-  bound. Discard partial cancelled, saturated or failed history instead of releasing its newer suffix, and
-  retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently
+  draining batch; include inbox and ready-delivery backpressure. A per-account supervisor owns draining tasks;
+  atomically install ready-channel placements under the admission lock, without a cancellation gap.
+  Notification-worker cancellation must not orphan accepted work. Account retirement cancels it and retains
+  unresolved loss. Keep released live-copy dedup bounded by the item allowance; historical refetch bypasses it.
+  Discard a source's partial interrupted or lost history instead of releasing its newer suffix, and retain its
+  floor as loss until `take_replay_status` imports it. Later live input must not stay permanently
   stalled. Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage
   into a certificate.
-  An empty wait must not mint loss. Keep late stored copies countable for backward paging; only actually
-  discarded ciphertext retains a loss floor. A cut owner capture (stopped, failed, its route expired, or fenced
-  by receiver loss) defers the loss of every body its source discards, including REQ copies held from before
-  the grant, on that endpoint's `loss_debt`: the source stays unadmitted and its pending obligation still owes
-  the window, and a loss would restart that obligation. Only a finished capture clears the debt; a reconnect,
-  refusal, removal or execution failure can admit or retire the source without the capture, so it records the
-  debt. Native clamp paging is not an owner capture: its cut keeps its loss, as does every other discard.
-  Same-epoch capture takeover preserves held bodies. Interrupted
+  An empty wait must not mint loss; only actually discarded ciphertext retains a loss floor. Interrupted
   multi-tag history discards the affected source's whole MLS-group unit, never releases its newer suffix.
 - Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous
   cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
@@ -178,14 +165,13 @@ for reconnect/backoff and relay status mechanics.
 - A fence (`src/replay_fence.rs`) holds one group's live frames from its point on, never the account: held frames count
   neither in `admission_pending` nor against request placement or stream admission, and every release path
   (`GroupReplay::release`, native ingress, both `stage_delivery` fast paths) lets out only what lies below the point.
-  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty and not being paged natively holds the REQ's
+  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty holds the REQ's
   groups from its `since` until a `fence_replay` plan whose ticket saw that count as admitted answers it. An arming
   belongs to its own count: `ReplayEndpoint::count_id` moves whenever a live count is installed or ends, and only an
   arming whose count is still current can be admitted or kept unanswered, so a count that ends or is replaced (an empty
-  or natively paged recount) before admission drops its arming. Delegated accounts also fence nonempty full replies,
-  without counting them as complete coverage. Only non-delegated fences expire after one `REPLAY_PAGE_LIMITS.max_duration`, releasing late input and
-  ignoring plans until a new count arms the group. Delegated holds have no request deadline: their owner advances or
-  releases them as durable backlog admission permits; no expired timer authorizes newer input. Unanswered armings
+  recount) before admission drops its arming. Full replies are fenced too, without counting as complete coverage.
+  Holds have no request deadline: the owner advances or releases them as durable backlog admission permits; no
+  expired timer authorizes newer input. Unanswered armings
   still retire with their unadmitted count. A plan older than the
   last applied is ignored, and a fence nothing holds ends at once. A fresh activation (`record_account_replay_start`)
   moves the buffered live frames native ingress does not own into the new coverage: those fences hold stay held from
@@ -194,7 +180,7 @@ for reconnect/backoff and relay status mechanics.
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin
   until its next hand-off; while a fence holds it there, that pin is exempt (`held_pins`), but a pin on a copy still out
-  never is. Held frames stay under the replay buffer bounds, so overflow is loss, and wait on no paging. `placed()`
+  never is. Held frames stay under the replay buffer bounds, so overflow is loss. `placed()`
   stays strict; only the recorder's `placed_apart_from_fences` passes held frames, and `fence_held_since` caps the
   plane's cursor seal at the oldest held frame its restart floor does not cover. With fencing off, every changed
   predicate reduces to its old form.
@@ -206,10 +192,8 @@ for reconnect/backoff and relay status mechanics.
   loss". Per-route floors are known only while every REQ the context ever issued had a floor and known routes,
   within `MAX_DELIVERY_LOSS_ROUTES`; otherwise the lag is loss on every route from the floor.
 - Expose allocation-free guarded source views and a coalescing change watch. Membership, query windows and
-  ordered epochs change a process-monotonic generation; paging/ACK progress does not. Generation identity
-  must survive activation replacement. Only an account-bound frozen ReplayCapturePlan grants recovery IO;
-  retain its Arc credit through queued work and actual IO cleanup after caller cancellation. Refetch its full
-  original query, not a truncated continuation. Mechanical native clamp paging remains automatic. No adapter
+  ordered epochs change a process-monotonic generation; ACK progress does not. Generation identity
+  must survive activation replacement. The adapter starts no recovery IO of its own, and there is no adapter
   or plane quiet-period retry controller. Keep live REQs and the SDK registry unchanged, never poll SDK EOSE
   to certify admission, and never revive terminal refusals with private fetches. Native admission is neither
   exhaustive coverage nor loss acknowledgment; the account owner alone persists/qualifies it.
@@ -315,14 +299,12 @@ for reconnect/backoff and relay status mechanics.
   coverage before their REQs go out (`stage_replay_batches`, as activation does, so an early EOSE or stored page
   counts), go out before the replaced ones close, and the replaced ones leave coverage on commit
   (`retire_replay_batches`); a failed or cancelled repack retires only its own uncommitted batches. A sync's
-  batches page like an activation's. Never append batches or leave a removed route in a live filter: that
+  batches replay like an activation's. Never append batches or leave a removed route in a live filter: that
   fragments batches back to the REQ limit, and a removed route's events still reach the relay client, which then
   suppresses the re-added route's replay of them. Batch numbers come from `AccountRoutes::next_batch`, which staging
   spends whether or not a repack commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
-  `account_subscription_ids` are per batch; clamped replay pages per route from the outset
-  (`NostrAcquisitionScope::GroupsWindow`), up to `REPLAY_PAGE_MAX_PAGES` per route. Finish every route of one MLS group
-  before releasing it, use canonical group order across REQs, and wait for its pooled history to drain before the
-  next group. A batch counts only once every route's history completes. Post-join maintenance
+  `account_subscription_ids` are per batch; a full batch reply delegates every route it carries to the recovery
+  runner. Use canonical group order across REQs. A batch counts only once every route's history completes. Post-join maintenance
   and one-shot fetches stay per route.
 - Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.

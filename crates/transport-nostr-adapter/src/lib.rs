@@ -120,9 +120,8 @@ pub use telemetry::{
 const DELIVERY_BUFFER: usize = 1024;
 
 pub use replay_admission::{
-    RelayConnection, ReplayCaptureOutcome, ReplayCapturePlan, ReplayCaptureToken, ReplayEndedCount,
-    ReplayEndpointView, ReplayFence, ReplayFencePlan, ReplayFenceTicket, ReplayLiveCount,
-    ReplayRequestView, ReplaySourceGeneration,
+    RelayConnection, ReplayEndedCount, ReplayEndpointView, ReplayFence, ReplayFencePlan,
+    ReplayFenceTicket, ReplayLiveCount, ReplayRequestView, ReplaySourceGeneration,
 };
 pub use replay_ingress::{ReplayBatch, ReplayBatchTake, ReplayIngress};
 
@@ -135,21 +134,14 @@ const SUBSCRIBE_STRAGGLER_WAIT: Duration = Duration::from_secs(2);
 /// strfry (and NIP-01 relays generally) silently clamp a REQ that carries no
 /// `limit` to a default page, 500 on strfry, and then send EOSE as if the
 /// stored history were exhausted. A replay that delivers this many events
-/// before EOSE may therefore have been cut short, and is paged backwards
-/// before its EOSE counts as coverage.
+/// before EOSE may therefore have been cut short: its EOSE delegates the
+/// rest to the recovery runner instead of counting as coverage.
 // Convergence ledger A17: page, admission and deadline bounds are one acquisition policy.
 pub const RELAY_REPLAY_PAGE_LIMIT: usize = 500;
 
-/// Upper bound on backward pages for one relay's replay of one group route,
-/// or of the inbox. A batched REQ pages up to this many per route it carries,
-/// so batching never shortens the history a route's replay reaches. A replay
-/// still truncated after its bound stays incomplete rather than paging
-/// without end; recovery owns history that deep.
-const REPLAY_PAGE_MAX_PAGES: usize = 64;
-
-// Hold ciphertext, not MLS state, until backward paging has reached its floor.
+// Hold ciphertext, not MLS state, until ordered admission releases it.
 // A budget exit withholds admission and coverage rather than losing old keys.
-const REPLAY_BUFFER_MAX_ITEMS: usize = RELAY_REPLAY_PAGE_LIMIT * REPLAY_PAGE_MAX_PAGES;
+const REPLAY_BUFFER_MAX_ITEMS: usize = 64 * RELAY_REPLAY_PAGE_LIMIT;
 const REPLAY_BUFFER_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// The most group routes one live REQ carries, as `#h` values of a single
@@ -159,21 +151,12 @@ const REPLAY_BUFFER_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// and floor holds 21 REQs there; the limit comes back only near 10,000
 /// routes, sooner where routes differ in relays or floor. A refused batch
 /// leaves every route it carries without that relay, and its routes share
-/// each 500-event replay page, which the page bound scales with.
+/// each 500-event replay reply; a full one delegates to the recovery runner.
 pub const GROUP_BATCH_ROUTES: usize = 50;
 
-/// Budget for one backward replay page. The item cap sits well above
-/// [`RELAY_REPLAY_PAGE_LIMIT`] so a relay that does not clamp still answers a
-/// page with EOSE instead of hitting the cap.
-/// Its duration also bounds initial waiting and each active route's fetch.
-/// Queueing, peer-release waits and delivery draining do not spend that allowance.
-const REPLAY_PAGE_LIMITS: NostrAcquisitionLimits = NostrAcquisitionLimits {
-    max_endpoints: 1,
-    max_requested_event_ids: 1,
-    max_received_items_per_endpoint: 8 * RELAY_REPLAY_PAGE_LIMIT,
-    max_serialized_event_bytes_per_endpoint: 32 * 1024 * 1024,
-    max_duration: Duration::from_secs(30),
-};
+/// How long a source may wait for its stored reply before expiry releases
+/// its peers without it. Delivery draining does not spend that allowance.
+const REPLAY_WAIT_LIMIT: Duration = Duration::from_secs(30);
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
@@ -1924,176 +1907,12 @@ impl NostrTransportAdapter {
         self.state.read().await.activation_attempt(account_id)
     }
 
-    /// Execute only the owner's frozen, current source capabilities. Accepted
-    /// tickets belong to the supervisor; dropping this waiter cancels its own
-    /// child IO without releasing its network credit before IO cleanup.
-    pub async fn capture_replay(
-        &self,
-        account_id: &MemberId,
-        mut plan: ReplayCapturePlan,
-        cancellation: NostrAcquisitionCancellation,
-    ) -> Result<ReplayCaptureOutcome, TransportAdapterError> {
-        if cancellation.is_cancelled() {
-            return Ok(ReplayCaptureOutcome::Cancelled);
-        }
-        plan.sources.sort_unstable_by(|a, b| {
-            a.request
-                .cmp(&b.request)
-                .then_with(|| a.relay.0.cmp(&b.relay.0))
-        });
-        plan.sources.dedup();
-        let Some(first) = plan.sources.first() else {
-            return Ok(ReplayCaptureOutcome::Complete);
-        };
-        if &first.account_id != account_id {
-            return Ok(ReplayCaptureOutcome::Stale);
-        }
-        let account = account_id.clone();
-        let (mut changes, attempt, wake) = {
-            let mut state = self.state.write().await;
-            if state.delegated_recovery.contains(&account) {
-                return Ok(ReplayCaptureOutcome::Stale);
-            }
-            let valid = state
-                .account_replay_coverage
-                .get(&account)
-                .is_some_and(|coverage| {
-                    plan.sources.iter().all(|token| {
-                        token.account_id == account
-                            && token.generation == coverage.wire_generation
-                            && !coverage.maintenance.contains(token.request.as_ref())
-                            && coverage.windows.contains_key(token.request.as_ref())
-                            && coverage
-                                .subscriptions
-                                .get(token.request.as_ref())
-                                .and_then(|relays| relays.get(&token.relay))
-                                .is_some_and(|replay| *replay != RelayReplay::Refused)
-                    })
-                });
-            if !valid {
-                return Ok(ReplayCaptureOutcome::Stale);
-            }
-            let high = state.capture_attempts.get(&account).copied();
-            if high.is_some_and(|high| plan.attempt_serial < high) {
-                return Ok(ReplayCaptureOutcome::Stale);
-            }
-            if high == Some(plan.attempt_serial) {
-                let coverage = &state.account_replay_coverage[&account];
-                let Some(attempt) = coverage.attempt.as_ref().filter(|attempt| {
-                    attempt.serial == plan.attempt_serial
-                        && attempt.sources.len() == plan.sources.len()
-                        && attempt
-                            .sources
-                            .iter()
-                            .zip(&plan.sources)
-                            .all(|(source, token)| source.token == *token)
-                }) else {
-                    return Ok(ReplayCaptureOutcome::Stale);
-                };
-                (
-                    coverage.changes.tx.subscribe(),
-                    attempt.clone(),
-                    coverage.wake.clone(),
-                )
-            } else {
-                state
-                    .capture_attempts
-                    .insert(account.clone(), plan.attempt_serial);
-                let AdapterState {
-                    relay_index,
-                    account_replay_coverage,
-                    ..
-                } = &mut *state;
-                let coverage = account_replay_coverage
-                    .get_mut(&account)
-                    .expect("validated current account");
-                let operation = cancellation.child_token();
-                let mut sources: Vec<ReplayCapture> = Vec::with_capacity(plan.sources.len());
-                for token in plan.sources {
-                    let endpoint = relay_index
-                        .resolve(token.relay)
-                        .expect("issued endpoint remains indexed")
-                        .clone();
-                    // Never join a mechanical truncated tail after actual loss:
-                    // an explicit owner operation always restores the full REQ.
-                    let (window, serial) = coverage
-                        .restart_request(token.request.as_ref(), token.relay, ReplayStart::Capture)
-                        .expect("validated current source");
-                    coverage
-                        .endpoint_deadlines
-                        .get_mut(token.request.as_ref())
-                        .expect("current request")
-                        .get_mut(&token.relay)
-                        .expect("current endpoint")
-                        .cancellation = operation.child_token();
-                    coverage.queue_capture(ReplayPaging {
-                        account_id: account.clone(),
-                        subscription_id: token.request.to_string(),
-                        endpoint,
-                        relay: token.relay,
-                        serial,
-                        window,
-                        until: REPLAY_OPEN_UNTIL,
-                        credit: Some(plan.credit.clone()),
-                    });
-                    sources.push(ReplayCapture { token, serial });
-                }
-                let attempt = Arc::new(ReplayAttempt {
-                    serial: plan.attempt_serial,
-                    sources,
-                    cancellation: operation.clone(),
-                });
-                coverage.attempt = Some(attempt.clone());
-                (
-                    coverage.changes.tx.subscribe(),
-                    attempt,
-                    coverage.wake.clone(),
-                )
-            }
-        };
-        let operation = attempt.cancellation.clone();
-        let mut waiter = ReplayWaiter {
-            cancellation: Some(operation.clone()),
-            wake,
-        };
-        loop {
-            let outcome = {
-                let state = self.state.read().await;
-                state
-                    .account_replay_coverage
-                    .get(&account)
-                    .map_or(Some(ReplayCaptureOutcome::Stale), |coverage| {
-                        coverage.capture_outcome(&attempt)
-                    })
-            };
-            if let Some(outcome) = outcome {
-                if matches!(
-                    outcome,
-                    ReplayCaptureOutcome::Complete | ReplayCaptureOutcome::Incomplete
-                ) {
-                    waiter.cancellation.take();
-                }
-                return Ok(outcome);
-            }
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Ok(ReplayCaptureOutcome::Cancelled),
-                _ = operation.cancelled() => return Ok(ReplayCaptureOutcome::Cancelled),
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        return Ok(ReplayCaptureOutcome::Stale);
-                    }
-                }
-            }
-        }
-    }
-
     /// Fence the account's groups' live frames from now on (mdk#2660): a live
     /// count that leaves part of its REQ's range unproven holds the groups its
-    /// REQ routes until the owner's [`Self::fence_replay`] answers it, or one
-    /// replay deadline passes for a non-delegated owner. Delegated holds last until
-    /// their owner releases the backlog. Call it before activating the account, so its
-    /// first counts are held too. It lasts the adapter's life.
+    /// REQ routes until the owner's [`Self::fence_replay`] answers it; a hold
+    /// lasts until the owner releases the backlog. Call it before activating
+    /// the account, so its first counts are held too. It lasts the adapter's
+    /// life.
     pub async fn enable_replay_fencing(&self, account_id: &MemberId) {
         let mut state = self.state.write().await;
         state.replay_fencing.insert(account_id.clone());
@@ -2102,36 +1921,12 @@ impl NostrTransportAdapter {
         }
     }
 
-    /// Delegate this account's history recovery to its ledger-driven owner.
-    /// Install before activation: neither owner-granted capture nor autonomous
-    /// clamp continuation may start for a delegated account. Subscription
-    /// ingress and raw live counts remain available to that owner.
-    #[doc(hidden)]
-    pub async fn delegate_replay_recovery(
-        &self,
-        account_id: &MemberId,
-    ) -> Result<(), TransportAdapterError> {
-        let mut state = self.state.write().await;
-        if state.delegated_recovery.contains(account_id) {
-            return Ok(());
-        }
-        if state.accounts.contains_key(account_id)
-            || state.account_replay_coverage.contains_key(account_id)
-        {
-            return Err(TransportAdapterError::Subscription(
-                "recovery ownership must be installed before activation".into(),
-            ));
-        }
-        state.delegated_recovery.insert(account_id.clone());
-        Ok(())
-    }
-
     /// Apply the account owner's fences: each group `plan` names releases its
     /// held live frames sent before the plan's point and keeps the rest, the
     /// counts its ticket covers are answered, and a group neither fences nor
-    /// an unanswered count holds goes free. Delegated recovery releases only by
-    /// this plan, independently of network request deadlines. A non-delegated
-    /// fence holds at most one replay deadline, then releases as late input. Enables fencing ([`Self::enable_replay_fencing`]).
+    /// an unanswered count holds goes free. A hold releases only by this plan,
+    /// independently of network request deadlines. Enables fencing
+    /// ([`Self::enable_replay_fencing`]).
     pub async fn fence_replay(&self, account_id: &MemberId, plan: &ReplayFencePlan) {
         let mut state = self.state.write().await;
         state.replay_fencing.insert(account_id.clone());
@@ -2781,8 +2576,9 @@ impl NostrTransportAdapter {
     ///
     /// When the relay sent a full page of stored events for an activation REQ
     /// first, it may have clamped the replay (see [`RELAY_REPLAY_PAGE_LIMIT`]).
-    /// That relay's coverage then waits while older pages are fetched in the
-    /// background and delivered like reconciled events.
+    /// That relay's input then ends delegated: what it sent may be admitted,
+    /// but the recovery runner owes the older history and the reply never
+    /// counts as complete coverage.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
         self.handle_relay_eose_reply(endpoint, subscription_id, false)
             .await;
@@ -2816,12 +2612,10 @@ impl NostrTransportAdapter {
 /// Owns work across frontend replacement without retaining the delivery receiver.
 struct ReplaySupervisor {
     state: std::sync::Weak<RwLock<AdapterState>>,
-    relay_client: Arc<dyn NostrRelayClient>,
     delivery_tx: mpsc::Sender<TransportDelivery>,
     account_id: MemberId,
     cancellation: NostrAcquisitionCancellation,
     wake: Arc<Notify>,
-    monotonic_start: Instant,
 }
 
 impl ReplaySupervisor {
@@ -2848,18 +2642,11 @@ impl ReplaySupervisor {
                 coverage.refresh_boundaries();
                 coverage.prune_fence_armings();
                 let mut deadline = coverage.deadlines.first_key_value().map(|(at, _)| *at);
-                if let Some(next) = coverage.next_fence_deadline() {
-                    deadline = Some(deadline.map_or(next, |at| at.min(next)));
-                }
                 for endpoint in coverage
                     .endpoint_deadlines
                     .values_mut()
                     .flat_map(HashMap::values_mut)
                 {
-                    if let Some(paging) = endpoint.queued.take() {
-                        let owner = self.clone();
-                        tasks.spawn(async move { owner.page_replay(paging).await });
-                    }
                     if let Some(next) = endpoint.deadline {
                         deadline = Some(deadline.map_or(next, |at| at.min(next)));
                     }
@@ -2966,300 +2753,6 @@ impl ReplaySupervisor {
             }
         }
     }
-
-    async fn wait_route_release(&self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
-        loop {
-            let notified = self.wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let (pending, cancellation) = {
-                let Some(state) = self.state.upgrade() else {
-                    return false;
-                };
-                let guard = state.read().await;
-                let Some(coverage) = guard.account_replay_coverage.get(&self.account_id) else {
-                    return false;
-                };
-                if !coverage.capture_current(paging) {
-                    return false;
-                }
-                (
-                    coverage.route_release_pending(paging, window),
-                    coverage.endpoint_deadlines[&paging.subscription_id][&paging.relay]
-                        .cancellation
-                        .clone(),
-                )
-            };
-            if !pending {
-                return true;
-            }
-            // Peer claims have their own finite service leases. They do not
-            // spend this source's network allowance or abandon its next group.
-            tokio::select! {
-                biased;
-                _ = self.cancellation.cancelled() => return false,
-                _ = cancellation.cancelled() => return false,
-                _ = &mut notified => {},
-            }
-        }
-    }
-
-    async fn page_replay(&self, paging: ReplayPaging) {
-        async {
-            let units = {
-                let Some(state) = self.state.upgrade() else {
-                    return;
-                };
-                let guard = state.read().await;
-                let Some(coverage) = guard.account_replay_coverage.get(&self.account_id) else {
-                    return;
-                };
-                if self.cancellation.is_cancelled() || !coverage.capture_current(&paging) {
-                    return;
-                }
-                coverage.page_units(&paging)
-            };
-            let mut pages = 0;
-            let mut delivered = 0;
-            let mut complete = true;
-            // Canonical group order prevents overlapping sources waiting in a cycle.
-            for unit in units {
-                for route in unit.per_route() {
-                    {
-                        let Some(state) = self.state.upgrade() else {
-                            return;
-                        };
-                        let mut guard = state.write().await;
-                        let Some(coverage) =
-                            guard.account_replay_coverage.get_mut(&self.account_id)
-                        else {
-                            return;
-                        };
-                        if self.cancellation.is_cancelled() || !coverage.capture_current(&paging) {
-                            return;
-                        }
-                        if !coverage.start_route(&paging, &route) {
-                            complete = false;
-                            continue;
-                        }
-                    }
-                    let outcome = self
-                        .page_window(
-                            &paging,
-                            &route,
-                            paging.until,
-                            route.max_pages(),
-                            &mut pages,
-                            &mut delivered,
-                        )
-                        .await;
-                    let Some(state) = self.state.upgrade() else {
-                        return;
-                    };
-                    let mut guard = state.write().await;
-                    let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
-                    else {
-                        return;
-                    };
-                    if self.cancellation.is_cancelled() || !coverage.capture_current(&paging) {
-                        return;
-                    }
-                    if outcome != PagedWindow::Complete || !coverage.finish_route(&paging, &route) {
-                        complete = false;
-                        coverage.fail_route(&paging, &route);
-                    }
-                }
-                if !self.wait_route_release(&paging, &unit).await {
-                    return;
-                }
-            }
-            {
-                let Some(state) = self.state.upgrade() else {
-                    return;
-                };
-                let mut guard = state.write().await;
-                if self.cancellation.is_cancelled() {
-                    return;
-                }
-                if complete {
-                    guard.finish_replay_paging(
-                        &paging,
-                        self.monotonic_start.elapsed().as_millis() as u64,
-                    );
-                } else if let Some(coverage) =
-                    guard.account_replay_coverage.get_mut(&self.account_id)
-                    && coverage.capture_current(&paging)
-                {
-                    coverage.stop_capture(&paging.subscription_id, paging.relay);
-                }
-            }
-            tracing::debug!(target: "transport_nostr_adapter::adapter",
-            method = "page_replay", pages, delivered, "paged a clamped relay replay");
-        }
-        .await;
-        if let Some(state) = self.state.upgrade() {
-            let mut guard = state.write().await;
-            if let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
-                && coverage.capture_current(&paging)
-            {
-                coverage.stop_capture(&paging.subscription_id, paging.relay);
-            }
-        }
-        // The borrowed network future and source cleanup have both ended.
-        // No IO scope can outlive its accepted owner's capacity.
-        drop(paging.credit);
-    }
-
-    async fn page_window(
-        &self,
-        paging: &ReplayPaging,
-        window: &ReplayWindow,
-        mut until: u64,
-        max_pages: usize,
-        pages: &mut usize,
-        delivered: &mut usize,
-    ) -> PagedWindow {
-        let mut window_pages = 0;
-        let mut retrying = false;
-        loop {
-            if until < window.since || until > REPLAY_OPEN_UNTIL {
-                return PagedWindow::Incomplete;
-            }
-            let (cancellation, deadline) = {
-                let Some(state) = self.state.upgrade() else {
-                    return PagedWindow::Closed;
-                };
-                let guard = state.read().await;
-                let Some(coverage) = guard.account_replay_coverage.get(&self.account_id) else {
-                    return PagedWindow::Closed;
-                };
-                if self.cancellation.is_cancelled() || !coverage.page_allowed(paging, window) {
-                    return PagedWindow::Closed;
-                }
-                let Some(deadline) = coverage.page_deadline(paging, window) else {
-                    return PagedWindow::Closed;
-                };
-                (
-                    coverage.endpoint_deadlines[&paging.subscription_id][&paging.relay]
-                        .cancellation
-                        .clone(),
-                    deadline,
-                )
-            };
-            if window_pages == max_pages {
-                return PagedWindow::Incomplete;
-            }
-            window_pages += 1;
-            *pages += 1;
-            let request = NostrAcquisitionRequest {
-                account_id: self.account_id.clone(),
-                scope: window.acquisition_scope(until),
-                endpoints: vec![paging.endpoint.clone()],
-                limits: NostrAcquisitionLimits {
-                    max_duration: deadline.saturating_duration_since(tokio::time::Instant::now()),
-                    ..REPLAY_PAGE_LIMITS
-                },
-            };
-            let result = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return PagedWindow::Closed,
-                result = tokio::time::timeout_at(deadline, self.relay_client.acquire_history(request, cancellation.clone())) => {
-                    match result {
-                        Ok(result) => result,
-                        Err(_) => return PagedWindow::Incomplete,
-                    }
-                }
-            };
-            let page = match result {
-                Ok(mut result) => match result.endpoints.pop() {
-                    Some(page) => page,
-                    None => return PagedWindow::Incomplete,
-                },
-                Err(NostrAcquisitionError::Unsupported | NostrAcquisitionError::InvalidRequest) => {
-                    return PagedWindow::Incomplete;
-                }
-            };
-            let received = page.events.len();
-            let oldest = page.events.iter().map(|event| event.created_at).min();
-            for event in page.events {
-                let relay_event = NostrRelayEvent {
-                    endpoint: paging.endpoint.clone(),
-                    subscription_id: Some(paging.subscription_id.clone()),
-                    event,
-                };
-                // Decode outside the state lock, once for all destinations.
-                let Ok(message) = relay_event.event.to_transport_message() else {
-                    continue;
-                };
-                if relay_event.event.to_verified_nostr_event().is_err() {
-                    continue;
-                }
-                let Some(state) = self.state.upgrade() else {
-                    return PagedWindow::Closed;
-                };
-                let mut guard = state.write().await;
-                if cancellation.is_cancelled()
-                    || !guard
-                        .account_replay_coverage
-                        .get(&self.account_id)
-                        .is_some_and(|coverage| coverage.page_allowed(paging, window))
-                {
-                    // This is a decoded acquired body being discarded, not
-                    // an empty cancellation or a missing metadata boundary.
-                    // An owner capture's body is still owed while its source
-                    // awaits the owner; its loss waits on the source.
-                    let owed = paging.credit.is_some()
-                        && guard
-                            .account_replay_coverage
-                            .get_mut(&self.account_id)
-                            .is_some_and(|coverage| coverage.defer_capture_loss(paging));
-                    if !owed {
-                        guard
-                            .replay_losses
-                            .record(&self.account_id, paging.window.since);
-                    }
-                    return PagedWindow::Closed;
-                }
-                let deliveries =
-                    guard.deliveries_for(&relay_event, message, Some(&self.account_id));
-                match guard.admit_deliveries(
-                    deliveries,
-                    RelayCopy::Page(paging.serial),
-                    &self.delivery_tx,
-                ) {
-                    Ok(count) => *delivered += count,
-                    Err(TransportAdapterError::Closed) => return PagedWindow::Closed,
-                    Err(_) => unreachable!("delivery admission only reports a closed channel"),
-                }
-            }
-            if page.end != NostrAcquisitionEnd::RequestPolicySatisfied {
-                if !retrying
-                    && matches!(
-                        page.end,
-                        NostrAcquisitionEnd::Deadline
-                            | NostrAcquisitionEnd::Disconnected
-                            | NostrAcquisitionEnd::RelayClosed
-                    )
-                {
-                    retrying = true;
-                    continue;
-                }
-                return PagedWindow::Incomplete;
-            }
-            retrying = false;
-            // Inclusive boundary copies share a body; a stuck full second is
-            // explicit incomplete coverage, never a reason to skip that second.
-            match oldest {
-                Some(oldest) if received >= RELAY_REPLAY_PAGE_LIMIT && oldest < until => {
-                    until = oldest
-                }
-                Some(_) if received >= RELAY_REPLAY_PAGE_LIMIT => {
-                    return PagedWindow::Saturated(until);
-                }
-                _ => return PagedWindow::Complete,
-            }
-        }
-    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -3353,12 +2846,10 @@ impl TransportAdapter for NostrTransportAdapter {
             let coverage = &state.account_replay_coverage[&account_id];
             let owner = Arc::new(ReplaySupervisor {
                 state: Arc::downgrade(&self.state),
-                relay_client: self.relay_client.clone(),
                 delivery_tx: self.delivery_tx.clone(),
                 account_id: account_id.clone(),
                 cancellation: coverage.cancellation.clone(),
                 wake: coverage.wake.clone(),
-                monotonic_start: self.monotonic_start,
             });
             tokio::spawn(owner.run());
         }
@@ -3883,10 +3374,9 @@ struct AccountRoutes {
 struct AccountReplayCoverage {
     wire_generation: u64,
     changes: ReplayChanges,
-    attempt: Option<Arc<ReplayAttempt>>,
     subscriptions: HashMap<String, HashMap<RelayIndex, RelayReplay>>,
-    /// The stored-history window each issued REQ asked for, so a replay a relay
-    /// cut short can be paged within it.
+    /// The stored-history window each issued REQ asked for: its floor bounds
+    /// what the adapter retains, and its scope tells group input from inbox.
     windows: HashMap<String, ReplayWindow>,
     /// Stored events each relay sent for each REQ before its EOSE.
     stored: HashMap<String, HashMap<RelayIndex, StoredReplay>>,
@@ -3918,15 +3408,10 @@ struct AccountReplayCoverage {
     /// The account owner fences groups' live frames (see `replay_fence`);
     /// until it does, no count arms a fence.
     fencing: bool,
-    /// The account's ledger-driven owner supplies history; native backward
-    /// paging must not run. Kept separate from fence mechanics.
-    recovery_delegated: bool,
     /// The last ticket at which a count that armed a fence became a fact.
     fence_ticket: u64,
     /// The ticket of the last owner plan applied: an older plan is stale.
     fence_plan_ticket: u64,
-    /// When each fence gives up, as `deadlines` does for peers.
-    fence_deadlines: std::collections::BTreeMap<tokio::time::Instant, Vec<GroupId>>,
 }
 
 impl Drop for AccountReplayCoverage {
@@ -3960,31 +3445,6 @@ impl Default for ReplayChanges {
         Self {
             tx: tokio::sync::watch::channel(0).0,
             clock: Arc::default(),
-        }
-    }
-}
-
-struct ReplayCapture {
-    token: ReplayCaptureToken,
-    serial: u64,
-}
-
-struct ReplayAttempt {
-    serial: u64,
-    sources: Vec<ReplayCapture>,
-    cancellation: NostrAcquisitionCancellation,
-}
-
-struct ReplayWaiter {
-    cancellation: Option<NostrAcquisitionCancellation>,
-    wake: Arc<Notify>,
-}
-
-impl Drop for ReplayWaiter {
-    fn drop(&mut self) {
-        if let Some(cancellation) = self.cancellation.take() {
-            cancellation.cancel();
-            self.wake.notify_waiters();
         }
     }
 }
@@ -4023,22 +3483,11 @@ struct HistoryReplay {
 }
 
 struct ReplayEndpoint {
-    /// Only the unit currently receiving service owns a paging deadline.
+    /// When this serial's initial waiting allowance ends, until it does.
     deadline: Option<tokio::time::Instant>,
     serial: u64,
-    /// One task owns this serial, including its queued and draining units.
-    capturing: bool,
     /// Complete original-range admission in this source's current wire epoch.
     boundary_admitted: bool,
-    /// The owner takes this ticket; frontend cancellation cannot orphan it.
-    queued: Option<ReplayPaging>,
-    /// The account owner's grant, not native clamp paging, owns this
-    /// source's current capture, or its last one the owner cut.
-    owner_capture: bool,
-    /// The oldest loss floor a cut owner capture left unrecorded because the
-    /// source still awaited the owner. Only a finished capture clears it;
-    /// any other way the source is readmitted or retired records it.
-    loss_debt: Option<u64>,
     /// A local wall-clock second no later than any query the relay can run
     /// for this REQ in the current serial (see
     /// [`ReplayLiveCount::requested_at`]).
@@ -4064,13 +3513,12 @@ struct ReplayEndpoint {
     /// The connection the relay client reported open when the adapter issued
     /// the REQ or saw the connection that restarted it; none when it reported
     /// none. The REQ streams only while the client still reports this one
-    /// ([`ReplayEndpointView::streaming`]). Receiver loss and captures keep
-    /// it: a reconnect they hid shows as a different connection.
+    /// ([`ReplayEndpointView::streaming`]). Receiver loss keeps it: a
+    /// reconnect it hid shows as a different connection.
     connection: Option<RelayConnection>,
     /// The last count that ended while its boundary was admitted, until the
     /// next one does.
     ended_count: Option<ReplayEndedCount>,
-    cancellation: NostrAcquisitionCancellation,
 }
 
 impl ReplayEndpoint {
@@ -4131,8 +3579,8 @@ impl ReplayEndpoint {
         }
     }
 
-    /// The source leaves its admitted boundary through loss, a failed or cut
-    /// capture, or a restart: its count proves nothing past here. A reconnect
+    /// The source leaves its admitted boundary through loss or a restart:
+    /// its count proves nothing past here. A reconnect
     /// whose disconnect the transport reported has already ended the count;
     /// one it did not report keeps none.
     fn drop_boundary(&mut self) {
@@ -4154,20 +3602,11 @@ impl AccountReplayCoverage {
     }
 }
 
-impl Drop for ReplayEndpoint {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplayAdmission {
     Waiting,
     /// Waiting expired without observing or discarding any history.
     Dormant,
-    /// This capture owns the route, but its service allowance has not begun.
-    Queued,
-    Paging,
     Complete,
     Abandoned,
 }
@@ -4176,12 +3615,6 @@ enum ReplayAdmission {
 enum ReplayAbandon {
     Unfinished,
     Interrupted,
-    /// A capture stopped, failed or was fenced by receiver loss. The source
-    /// stays unadmitted until the owner grants it again. When the owner's
-    /// capture is cut, the bodies it discards, whoever supplied them, are
-    /// still owed: their loss waits on the endpoint's debt rather than
-    /// restart the owner's obligation.
-    Cut,
     Lost,
 }
 
@@ -4194,9 +3627,9 @@ enum ReplayOrigin {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayStart {
     Connection,
+    /// Receiver loss: the source stops counting until the runner fetches its
+    /// window again.
     Gap,
-    /// Same wire epoch: replace IO ownership without discarding held bodies.
-    Capture,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4215,14 +3648,12 @@ struct BufferedReplay {
 enum RelayCopy {
     Deduplicated,
     RawGroup,
-    Page(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayInput {
     History,
     Live,
-    Page,
     /// Routed input with no tracked historical REQ attribution.
     Untracked,
 }
@@ -4277,55 +3708,6 @@ impl ReplayWindow {
             since: since.map_or(0, |since| since.0),
         })
     }
-
-    fn acquisition_scope(&self, until: u64) -> NostrAcquisitionScope {
-        let since = self.since;
-        match &self.scope {
-            ReplayScope::Inbox => NostrAcquisitionScope::AccountInboxWindow { since, until },
-            ReplayScope::Groups(transport_group_ids) => NostrAcquisitionScope::GroupsWindow {
-                transport_group_ids: transport_group_ids.clone(),
-                since,
-                until,
-            },
-        }
-    }
-
-    /// One window per route this window covers, with its floor.
-    fn per_route(&self) -> Vec<ReplayWindow> {
-        match &self.scope {
-            ReplayScope::Inbox => vec![self.clone()],
-            ReplayScope::Groups(ids) => ids
-                .iter()
-                .map(|id| ReplayWindow {
-                    scope: ReplayScope::Groups(vec![*id]),
-                    since: self.since,
-                })
-                .collect(),
-        }
-    }
-
-    /// The most backward pages a replay of this window may take: the
-    /// per-route bound for each route its REQ carries.
-    fn max_pages(&self) -> usize {
-        match &self.scope {
-            ReplayScope::Inbox => REPLAY_PAGE_MAX_PAGES,
-            ReplayScope::Groups(ids) => REPLAY_PAGE_MAX_PAGES.saturating_mul(ids.len().max(1)),
-        }
-    }
-}
-
-/// How one window's backward paging ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PagedWindow {
-    /// A page came back short: the window's history up to its floor is in.
-    Complete,
-    /// Paging stopped short of the floor: a failed page, an unsupported
-    /// backend, or the page bound.
-    Incomplete,
-    /// A full page could not move past this inclusive second.
-    Saturated(u64),
-    /// The delivery channel closed.
-    Closed,
 }
 
 /// How many stored events one relay sent for one REQ before EOSE, and the
@@ -4334,26 +3716,8 @@ enum PagedWindow {
 struct StoredReplay {
     events: usize,
     oldest: Option<u64>,
-    /// Physical EOSE, or a completed full-window acquisition before a refetch.
-    /// Forced paging alone must not reclassify a partial stored page as live.
+    /// Physical EOSE in this serial, or in the one receiver loss cut.
     ended: bool,
-}
-
-/// One relay's replay of one activation REQ that must be paged backwards
-/// before its EOSE counts.
-struct ReplayPaging {
-    account_id: MemberId,
-    subscription_id: String,
-    endpoint: TransportEndpoint,
-    relay: RelayIndex,
-    serial: u64,
-    window: ReplayWindow,
-    /// Inclusive upper bound of the first page: the oldest event the live
-    /// replay delivered.
-    until: u64,
-    /// Accepted owner work keeps capacity through queued and active IO cleanup.
-    /// Mechanical native clamp continuation needs no owner credit.
-    credit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 /// One relay's answer to one REQ of an activation's replay.
@@ -4372,19 +3736,16 @@ enum RelayReplay {
     Delegated,
     /// The relay ended the REQ with a dropped refusal before EOSE.
     Refused,
-    /// The relay sent EOSE after a full page of stored events, so it may have
-    /// clamped the replay; older pages are being fetched. Neither complete nor
-    /// settled. Failed captures become Incomplete; the account owner decides
-    /// whether and when another original-window capture is authorized.
-    Paging,
-    /// Paging ended without proving coverage. Only actually discarded bodies
-    /// enter the loss fence; later live input must not remain stuck.
+    /// Input ended without proving coverage: receiver loss, or EOSE after
+    /// the adapter discarded part of the reply. The recovery runner owes the
+    /// window. Only actually discarded bodies enter the loss fence; later
+    /// live input must not remain stuck.
     Incomplete,
 }
 
 impl RelayReplay {
     /// Physical input ended; unlike complete-query coverage this includes a
-    /// full reply whose missing history is delegated to the account owner.
+    /// full reply whose missing history is delegated to the recovery runner.
     fn input_ended(self) -> bool {
         matches!(self, Self::Eose | Self::Delegated)
     }
@@ -4465,55 +3826,13 @@ impl AccountReplayCoverage {
         self.admit_fence_armings(&admitted);
     }
 
-    fn capture_outcome(&self, attempt: &ReplayAttempt) -> Option<ReplayCaptureOutcome> {
-        let mut active = false;
-        let mut admitted = true;
-        let mut completion = ReplayCaptureOutcome::Complete;
-        for source in &attempt.sources {
-            let Some(endpoint) = self
-                .endpoint_deadlines
-                .get(source.token.request.as_ref())
-                .and_then(|relays| relays.get(&source.token.relay))
-                .filter(|endpoint| endpoint.serial == source.serial)
-            else {
-                return Some(ReplayCaptureOutcome::Stale);
-            };
-            active |= endpoint.capturing;
-            admitted &= endpoint.boundary_admitted;
-            if self
-                .subscriptions
-                .get(source.token.request.as_ref())
-                .and_then(|relays| relays.get(&source.token.relay))
-                != Some(&RelayReplay::Eose)
-            {
-                completion = ReplayCaptureOutcome::Incomplete;
-            }
-        }
-        if !active && admitted {
-            Some(ReplayCaptureOutcome::Complete)
-        } else if attempt.cancellation.is_cancelled() {
-            Some(ReplayCaptureOutcome::Cancelled)
-        } else if active {
-            None
-        } else if completion == ReplayCaptureOutcome::Incomplete {
-            Some(completion)
-        } else if self.buffered_items != 0 || !self.unplaced.is_empty() || self.flushing {
-            None
-        } else {
-            Some(ReplayCaptureOutcome::Incomplete)
-        }
-    }
-
     fn streams_ready<'a>(
         &self,
         streams: impl Iterator<Item = (&'a ReplayOwner, &'a HistoryReplay)>,
     ) -> bool {
-        streams.into_iter().all(|(_, stream)| {
-            !matches!(
-                stream.phase,
-                ReplayAdmission::Waiting | ReplayAdmission::Queued | ReplayAdmission::Paging
-            )
-        })
+        streams
+            .into_iter()
+            .all(|(_, stream)| stream.phase != ReplayAdmission::Waiting)
     }
 
     // Empty input may qualify limited native admission from one ready peer.
@@ -4547,7 +3866,6 @@ impl AccountReplayCoverage {
                             .and_then(|relays| relays.get(&owner.relay))
                             .is_some_and(|stored| stored.events > 0);
                 }
-                ReplayAdmission::Queued | ReplayAdmission::Paging => return false,
                 ReplayAdmission::Complete => complete = true,
                 ReplayAdmission::Dormant | ReplayAdmission::Abandoned => {}
             }
@@ -4583,19 +3901,11 @@ impl AccountReplayCoverage {
             || self.native_held().0 != 0
             || self.unplaced_pending()
             || self.groups.values().any(|group| {
-                group.streams.values().any(|stream| {
-                    matches!(
-                        stream.phase,
-                        ReplayAdmission::Waiting
-                            | ReplayAdmission::Queued
-                            | ReplayAdmission::Paging
-                    )
-                })
+                group
+                    .streams
+                    .values()
+                    .any(|stream| stream.phase == ReplayAdmission::Waiting)
             })
-            || self
-                .endpoint_deadlines
-                .values()
-                .any(|relays| relays.values().any(|endpoint| endpoint.capturing))
     }
 
     fn request_admitted(&self, id: &str, relay: Option<RelayIndex>) -> bool {
@@ -4751,7 +4061,7 @@ impl AccountReplayCoverage {
         if let Some(window) = window {
             self.windows.insert(id.clone(), window);
         }
-        let deadline = tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration;
+        let deadline = tokio::time::Instant::now() + REPLAY_WAIT_LIMIT;
         // Coverage is added before the REQ goes out, so any query that
         // answers it runs after this.
         let requested_at = unix_now_seconds();
@@ -4774,7 +4084,6 @@ impl AccountReplayCoverage {
                         RelayReplay::Refused | RelayReplay::Incomplete => {
                             ReplayAdmission::Abandoned
                         }
-                        RelayReplay::Paging => ReplayAdmission::Paging,
                         RelayReplay::Awaiting => ReplayAdmission::Waiting,
                     };
                     group.streams.insert(
@@ -4788,7 +4097,7 @@ impl AccountReplayCoverage {
                             since,
                         },
                     );
-                    if matches!(phase, ReplayAdmission::Waiting | ReplayAdmission::Paging) {
+                    if phase == ReplayAdmission::Waiting {
                         if let Some(ingress) = &self.ingress {
                             ingress.invalidate_group(group_id);
                         }
@@ -4810,11 +4119,7 @@ impl AccountReplayCoverage {
                         ReplayEndpoint {
                             deadline: Some(deadline),
                             serial,
-                            capturing: false,
                             boundary_admitted: false,
-                            queued: None,
-                            owner_capture: false,
-                            loss_debt: None,
                             requested_at,
                             live_count: None,
                             count_id: 0,
@@ -4823,7 +4128,6 @@ impl AccountReplayCoverage {
                             sent_again: false,
                             connection: connections.get(relay).copied(),
                             ended_count: None,
-                            cancellation: self.cancellation.child_token(),
                         },
                     )
                 })
@@ -4917,46 +4221,10 @@ impl AccountReplayCoverage {
             ReplayAdmission::Abandoned
         };
         let claims = std::mem::take(&mut stream.claims);
-        let discarded = self.drop_claims(group_id, claims);
-        let owed = reason == ReplayAbandon::Cut
-            && self
-                .endpoint_deadlines
-                .get(owner.request.as_ref())
-                .and_then(|relays| relays.get(&owner.relay))
-                .is_some_and(|endpoint| endpoint.owner_capture);
-        if force || (discarded && !owed) {
+        if self.drop_claims(group_id, claims) || force {
             self.record_loss(since);
-        } else if discarded {
-            self.defer_loss(&owner.request, owner.relay, since);
         }
         self.wake_replay();
-    }
-
-    /// Hold a cut capture's loss on its endpoint until the source is either
-    /// admitted by a finished capture or readmitted or retired another way.
-    fn defer_loss(&mut self, id: &str, relay: RelayIndex, since: u64) {
-        if let Some(endpoint) = self
-            .endpoint_deadlines
-            .get_mut(id)
-            .and_then(|relays| relays.get_mut(&relay))
-        {
-            endpoint.loss_debt = Some(endpoint.loss_debt.map_or(since, |debt| debt.min(since)));
-        } else {
-            self.record_loss(since);
-        }
-    }
-
-    /// Record a cut capture's deferred loss: the source no longer waits for
-    /// the owner's capture to fetch that window again.
-    fn charge_loss_debt(&mut self, id: &str, relay: RelayIndex) {
-        if let Some(since) = self
-            .endpoint_deadlines
-            .get_mut(id)
-            .and_then(|relays| relays.get_mut(&relay))
-            .and_then(|endpoint| endpoint.loss_debt.take())
-        {
-            self.record_loss(since);
-        }
     }
 
     fn stage_ready(
@@ -5122,7 +4390,7 @@ impl AccountReplayCoverage {
             }
             _ => return Ok(()),
         };
-        let historical = matches!(input, ReplayInput::History | ReplayInput::Page);
+        let historical = input == ReplayInput::History;
         let owner = self.delivery_owner(
             group,
             delivery.source.subscription_id.as_deref(),
@@ -5152,9 +4420,7 @@ impl AccountReplayCoverage {
                 self.record_loss(stream.since);
                 return Ok(());
             }
-            if (input == ReplayInput::Page && stream.phase != ReplayAdmission::Paging)
-                || stream.claims.contains(&id)
-            {
+            if stream.claims.contains(&id) {
                 return Ok(());
             }
         } else if self.released.contains(&id) || group.live.contains(&id) {
@@ -5400,16 +4666,6 @@ impl AccountReplayCoverage {
         for (group_id, owner) in &owners {
             self.abandon_stream(group_id, owner, ReplayAbandon::Unfinished);
         }
-        if let Some(floor) = self
-            .endpoint_deadlines
-            .get_mut(id)
-            .into_iter()
-            .flat_map(HashMap::values_mut)
-            .filter_map(|endpoint| endpoint.loss_debt.take())
-            .min()
-        {
-            self.record_loss(floor);
-        }
         for (group_id, owner) in owners {
             let group = self
                 .groups
@@ -5470,29 +4726,19 @@ impl AccountReplayCoverage {
         for request in requests {
             match restart {
                 ReplayRestart::ReceiverLoss => {
-                    if self
-                        .restart_request(&request, relay, ReplayStart::Gap)
-                        .is_some()
-                    {
-                        // A missing ordered payload invalidates this source;
-                        // only the account owner may grant replacement IO.
-                        self.stop_capture(&request, relay);
-                    }
+                    // A missing ordered payload invalidates this source; the
+                    // recovery runner owns fetching that window again.
+                    self.restart_request(&request, relay, ReplayStart::Gap);
                 }
                 ReplayRestart::Connection => {
                     // An initial boundary starts the waiting allowance, but
-                    // must not undo a completed source or an owned capture.
+                    // must not undo a completed source.
                     let complete = self
                         .subscriptions
                         .get(&request)
                         .and_then(|relays| relays.get(&relay))
                         .is_some_and(|replay| replay.input_ended());
-                    let capturing = self
-                        .endpoint_deadlines
-                        .get(&request)
-                        .and_then(|relays| relays.get(&relay))
-                        .is_some_and(|endpoint| endpoint.capturing);
-                    if (origin == ReplayOrigin::Changed || (!complete && !capturing))
+                    if (origin == ReplayOrigin::Changed || !complete)
                         && self
                             .restart_request(&request, relay, ReplayStart::Connection)
                             .is_some()
@@ -5515,19 +4761,6 @@ impl AccountReplayCoverage {
         }
     }
 
-    fn queue_capture(&mut self, paging: ReplayPaging) {
-        if let Some(endpoint) = self
-            .endpoint_deadlines
-            .get_mut(&paging.subscription_id)
-            .and_then(|relays| relays.get_mut(&paging.relay))
-            && endpoint.serial == paging.serial
-            && endpoint.capturing
-        {
-            endpoint.queued = Some(paging);
-            self.wake_replay();
-        }
-    }
-
     fn fail_execution(&mut self) {
         if !self.outbox.is_empty()
             || self.groups.values().any(|group| {
@@ -5543,15 +4776,6 @@ impl AccountReplayCoverage {
         {
             self.record_loss(self.retained_since.unwrap_or(0));
         }
-        if let Some(floor) = self
-            .endpoint_deadlines
-            .values_mut()
-            .flat_map(HashMap::values_mut)
-            .filter_map(|endpoint| endpoint.loss_debt.take())
-            .min()
-        {
-            self.record_loss(floor);
-        }
         self.retain_supplements();
         self.unplaced
             .retain(|id, _| self.native_ids.contains_key(id));
@@ -5566,10 +4790,6 @@ impl AccountReplayCoverage {
             .values_mut()
             .flat_map(HashMap::values_mut)
         {
-            endpoint.cancellation.cancel();
-            endpoint.queued = None;
-            endpoint.capturing = false;
-            endpoint.owner_capture = false;
             endpoint.drop_boundary();
             endpoint.deadline = None;
         }
@@ -5604,23 +4824,16 @@ impl AccountReplayCoverage {
         self.wake_replay();
     }
 
-    fn restart_request(
-        &mut self,
-        id: &str,
-        relay: RelayIndex,
-        restart: ReplayStart,
-    ) -> Option<(ReplayWindow, u64)> {
+    /// Start a new serial for one relay's source of an activation REQ. `None`
+    /// when the relay refused the REQ or the adapter does not track it.
+    fn restart_request(&mut self, id: &str, relay: RelayIndex, restart: ReplayStart) -> Option<()> {
         if self.subscriptions.get(id)?.get(&relay)? == &RelayReplay::Refused {
             return None;
         }
-        let window = self.windows.get(id)?.clone();
-        if restart == ReplayStart::Connection {
-            // A plain reconnect readmits the source without the owner's capture.
-            self.charge_loss_debt(id, relay);
-        }
+        self.windows.get(id)?;
         self.source_serial += 1;
         let serial = self.source_serial;
-        let deadline = tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration;
+        let deadline = tokio::time::Instant::now() + REPLAY_WAIT_LIMIT;
         let owners = self
             .request_groups
             .get(id)
@@ -5652,15 +4865,12 @@ impl AccountReplayCoverage {
                     .get(id)
                     .and_then(|relays| relays.get(&relay))
                     .is_some_and(|stored| stored.events > 0);
-            if restart != ReplayStart::Capture && (observed || restart == ReplayStart::Gap) {
+            if observed || restart == ReplayStart::Gap {
                 self.abandon_stream(
                     &group_id,
                     &owner,
                     if complete {
                         ReplayAbandon::Unfinished
-                    } else if restart == ReplayStart::Gap {
-                        // Receiver loss leaves the source to the owner.
-                        ReplayAbandon::Cut
                     } else {
                         ReplayAbandon::Interrupted
                     },
@@ -5675,17 +4885,17 @@ impl AccountReplayCoverage {
                 .get_mut(&owner)
                 .expect("restarting history exists");
             let mut redundant = HashSet::new();
-            if restart != ReplayStart::Capture {
-                for event in std::mem::take(&mut stream.claims) {
-                    if !group.ready_history.insert(event) {
-                        redundant.insert(event);
-                    }
+            for event in std::mem::take(&mut stream.claims) {
+                if !group.ready_history.insert(event) {
+                    redundant.insert(event);
                 }
-                stream.observed = false;
             }
+            stream.observed = false;
             stream.phase = match restart {
                 ReplayStart::Connection => ReplayAdmission::Waiting,
-                ReplayStart::Gap | ReplayStart::Capture => ReplayAdmission::Queued,
+                // Nothing on this source is admitted until the runner
+                // fetches the window again.
+                ReplayStart::Gap => ReplayAdmission::Abandoned,
             };
             stream.deadline = deadline;
             stream.serial = serial;
@@ -5711,15 +4921,13 @@ impl AccountReplayCoverage {
                     .get(id)
                     .and_then(|relays| relays.get(&relay))
                     .is_some_and(|stored| stored.ended));
-        if restart != ReplayStart::Capture {
-            self.stored.get_mut(id)?.insert(
-                relay,
-                StoredReplay {
-                    ended,
-                    ..StoredReplay::default()
-                },
-            );
-        }
+        self.stored.get_mut(id)?.insert(
+            relay,
+            StoredReplay {
+                ended,
+                ..StoredReplay::default()
+            },
+        );
         let endpoint = self.endpoint_deadlines.get_mut(id)?.get_mut(&relay)?;
         endpoint.drop_boundary();
         endpoint.stopped = false;
@@ -5727,17 +4935,12 @@ impl AccountReplayCoverage {
         endpoint.sent_again = true;
         endpoint.deadline = (restart == ReplayStart::Connection).then_some(deadline);
         endpoint.serial = serial;
-        endpoint.capturing = restart != ReplayStart::Connection;
-        endpoint.owner_capture = restart == ReplayStart::Capture;
-        endpoint.queued = None;
-        endpoint.cancellation.cancel();
-        endpoint.cancellation = self.cancellation.child_token();
         *self.replay_mut(id, relay)? = match restart {
             ReplayStart::Connection => RelayReplay::Awaiting,
-            ReplayStart::Gap | ReplayStart::Capture => RelayReplay::Paging,
+            ReplayStart::Gap => RelayReplay::Incomplete,
         };
         self.wake_replay();
-        Some((window, serial))
+        Some(())
     }
 
     fn snapshot(&self) -> AccountSubscriptionEose {
@@ -5814,30 +5017,19 @@ impl AccountReplayCoverage {
     }
 
     #[cfg(test)]
-    fn record_eose(
-        &mut self,
-        id: &str,
-        relay: RelayIndex,
-        now_ms: u64,
-    ) -> Option<(ReplayWindow, u64)> {
-        self.record_eose_reply(id, relay, now_ms, false)
+    fn record_eose(&mut self, id: &str, relay: RelayIndex) {
+        self.record_eose_reply(id, relay, false);
     }
 
     /// Record `relay`'s EOSE for `id`; `sent_nothing` when the wire showed
     /// it sent no EVENT frame for the REQ before it.
-    fn record_eose_reply(
-        &mut self,
-        id: &str,
-        relay: RelayIndex,
-        now_ms: u64,
-        sent_nothing: bool,
-    ) -> Option<(ReplayWindow, u64)> {
+    fn record_eose_reply(&mut self, id: &str, relay: RelayIndex, sent_nothing: bool) {
         if !self
             .subscriptions
             .get(id)
             .is_some_and(|relays| relays.contains_key(&relay))
         {
-            return None;
+            return;
         }
         self.stored
             .entry(id.to_owned())
@@ -5859,20 +5051,16 @@ impl AccountReplayCoverage {
             })
         });
         if discarded {
-            if self
-                .endpoint_deadlines
-                .get(id)
-                .and_then(|relays| relays.get(&relay))
-                .is_none_or(|endpoint| !endpoint.capturing)
+            if let Some(replay) = self.replay_mut(id, relay)
+                && *replay != RelayReplay::Refused
             {
-                let replay = self.replay_mut(id, relay)?;
-                if *replay != RelayReplay::Refused {
-                    *replay = RelayReplay::Incomplete;
-                }
+                *replay = RelayReplay::Incomplete;
             }
-            return None;
+            return;
         }
-        let replay = self.replay_mut(id, relay)?;
+        let Some(replay) = self.replay_mut(id, relay) else {
+            return;
+        };
         if *replay != RelayReplay::Awaiting {
             // A REQ the SDK sent again after a kept `CLOSED` counts afresh.
             if let Some(endpoint) = self
@@ -5884,7 +5072,7 @@ impl AccountReplayCoverage {
                 endpoint.install_live_count(endpoint.eose_count(recount, sent_nothing));
                 self.arm_fence(id, relay);
             }
-            return None;
+            return;
         }
         if let Some(endpoint) = self
             .endpoint_deadlines
@@ -5895,17 +5083,10 @@ impl AccountReplayCoverage {
             endpoint.install_live_count(endpoint.eose_count(stored, sent_nothing));
             self.arm_fence(id, relay);
         }
-        let delegated = self.recovery_delegated;
-        let replay = self.replay_mut(id, relay)?;
-        if !delegated
-            && stored.events >= RELAY_REPLAY_PAGE_LIMIT
-            && let Some(oldest) = stored.oldest
-        {
-            return self
-                .own_replay_window(id, relay, now_ms)
-                .map(|window| (window, oldest));
-        }
-        *replay = if delegated && stored.events >= RELAY_REPLAY_PAGE_LIMIT {
+        let Some(replay) = self.replay_mut(id, relay) else {
+            return;
+        };
+        *replay = if stored.events >= RELAY_REPLAY_PAGE_LIMIT {
             RelayReplay::Delegated
         } else {
             RelayReplay::Eose
@@ -5935,121 +5116,6 @@ impl AccountReplayCoverage {
         // Apply this ordered EOF before peers at the same deadline expire.
         self.expire_replay(tokio::time::Instant::now());
         self.wake_replay();
-        None
-    }
-
-    fn own_replay_window(
-        &mut self,
-        id: &str,
-        relay: RelayIndex,
-        _now_ms: u64,
-    ) -> Option<ReplayWindow> {
-        let window = self.windows.get(id)?.clone();
-        let replay = self.replay_mut(id, relay)?;
-        if *replay != RelayReplay::Awaiting {
-            return None;
-        }
-        *replay = RelayReplay::Paging;
-        if let Some(endpoint) = self
-            .endpoint_deadlines
-            .get_mut(id)
-            .and_then(|relays| relays.get_mut(&relay))
-        {
-            endpoint.deadline = None;
-            endpoint.capturing = true;
-            endpoint.owner_capture = false;
-        }
-        for (group_id, group) in &mut self.groups {
-            for (owner, stream) in &mut group.streams {
-                if owner.request.as_ref() == id
-                    && owner.relay == relay
-                    && matches!(stream.phase, ReplayAdmission::Waiting)
-                {
-                    stream.phase = ReplayAdmission::Queued;
-                    if let Some(ingress) = &self.ingress {
-                        ingress.invalidate_group(group_id);
-                    }
-                }
-            }
-        }
-        self.wake_replay();
-        Some(window)
-    }
-
-    fn finish_paging(&mut self, id: &str, relay: RelayIndex) {
-        self.expire_replay(tokio::time::Instant::now());
-        let incomplete = self.groups.values().any(|group| {
-            group.streams.iter().any(|(owner, stream)| {
-                owner.request.as_ref() == id
-                    && owner.relay == relay
-                    && stream.phase != ReplayAdmission::Complete
-            })
-        });
-        if incomplete {
-            self.stop_capture(id, relay);
-            return;
-        }
-        let Some(endpoint) = self
-            .endpoint_deadlines
-            .get_mut(id)
-            .and_then(|relays| relays.get_mut(&relay))
-        else {
-            return;
-        };
-        endpoint.capturing = false;
-        endpoint.owner_capture = false;
-        endpoint.deadline = None;
-        // The finished capture fetched the window the cut left owed.
-        endpoint.loss_debt = None;
-        if let Some(replay) = self.replay_mut(id, relay) {
-            *replay = RelayReplay::Eose;
-        }
-        self.refresh_boundaries();
-        self.wake_replay();
-    }
-
-    fn stop_capture(&mut self, id: &str, relay: RelayIndex) {
-        if let Some(endpoint) = self
-            .endpoint_deadlines
-            .get_mut(id)
-            .and_then(|relays| relays.get_mut(&relay))
-        {
-            endpoint.capturing = false;
-            endpoint.drop_boundary();
-            endpoint.queued = None;
-            endpoint.cancellation.cancel();
-            endpoint.deadline = None;
-        }
-        let owners = self
-            .groups
-            .iter()
-            .flat_map(|(group_id, group)| {
-                group
-                    .streams
-                    .iter()
-                    .filter(move |(owner, stream)| {
-                        owner.request.as_ref() == id
-                            && owner.relay == relay
-                            && (!stream.claims.is_empty()
-                                || matches!(
-                                    stream.phase,
-                                    ReplayAdmission::Waiting
-                                        | ReplayAdmission::Queued
-                                        | ReplayAdmission::Paging
-                                ))
-                    })
-                    .map(move |(owner, _)| (group_id.clone(), owner.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (group_id, owner) in owners {
-            self.abandon_stream(&group_id, &owner, ReplayAbandon::Cut);
-        }
-        if let Some(replay) = self.replay_mut(id, relay)
-            && *replay != RelayReplay::Refused
-        {
-            *replay = RelayReplay::Incomplete;
-        }
-        self.wake_replay();
     }
 
     fn record_refusal(
@@ -6058,11 +5124,6 @@ impl AccountReplayCoverage {
         relay: RelayIndex,
         disposition: SubscriptionRefusalDisposition,
     ) {
-        let ended = self
-            .stored
-            .get(id)
-            .and_then(|relays| relays.get(&relay))
-            .is_some_and(|stored| stored.ended);
         // Past `Awaiting`, the restored reply's stored events no longer count
         // through `stored`.
         let after_eose = self
@@ -6108,22 +5169,13 @@ impl AccountReplayCoverage {
         if disposition == SubscriptionRefusalDisposition::Pending {
             return;
         }
-        // Only a physical EOSE makes a later CLOSED irrelevant to paging.
-        // A refetch started after receiver loss has no such wire certificate.
-        if *replay == RelayReplay::Paging && ended {
-            return;
-        }
         *replay = RelayReplay::Refused;
-        self.charge_loss_debt(id, relay);
         if let Some(endpoint) = self
             .endpoint_deadlines
             .get_mut(id)
             .and_then(|relays| relays.get_mut(&relay))
         {
             endpoint.deadline = None;
-            endpoint.capturing = false;
-            endpoint.queued = None;
-            endpoint.cancellation.cancel();
         }
         let owners = self
             .groups
@@ -6153,245 +5205,6 @@ impl AccountReplayCoverage {
             .and_then(|relays| relays.get_mut(&relay))
     }
 
-    fn page_units(&self, paging: &ReplayPaging) -> Vec<ReplayWindow> {
-        let ReplayScope::Groups(ids) = &paging.window.scope else {
-            return vec![paging.window.clone()];
-        };
-        let mut units = self
-            .groups
-            .iter()
-            .filter_map(|(group_id, group)| {
-                let mut routes = group
-                    .routes
-                    .get(&paging.subscription_id)?
-                    .iter()
-                    .filter(|route| ids.contains(route))
-                    .copied()
-                    .collect::<Vec<_>>();
-                if routes.is_empty() {
-                    return None;
-                }
-                routes.sort_unstable();
-                routes.dedup();
-                Some((
-                    group_id,
-                    ReplayWindow {
-                        scope: ReplayScope::Groups(routes),
-                        since: paging.window.since,
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        units.sort_unstable_by(|(a, _), (b, _)| a.as_slice().cmp(b.as_slice()));
-        units.into_iter().map(|(_, window)| window).collect()
-    }
-
-    fn page_allowed(&self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
-        if self
-            .endpoint_deadlines
-            .get(&paging.subscription_id)
-            .and_then(|relays| relays.get(&paging.relay))
-            .is_none_or(|endpoint| endpoint.cancellation.is_cancelled())
-        {
-            return false;
-        }
-        if self
-            .page_deadline(paging, window)
-            .is_none_or(|deadline| deadline <= tokio::time::Instant::now())
-        {
-            return false;
-        }
-        match &window.scope {
-            ReplayScope::Inbox => {
-                self.subscriptions
-                    .get(&paging.subscription_id)
-                    .and_then(|relays| relays.get(&paging.relay))
-                    == Some(&RelayReplay::Paging)
-            }
-            ReplayScope::Groups(routes) => self.groups.values().any(|group| {
-                group.streams.iter().any(|(owner, stream)| {
-                    owner.request.as_ref() == paging.subscription_id.as_str()
-                        && owner.relay == paging.relay
-                        && routes.contains(&owner.route)
-                        && stream.phase == ReplayAdmission::Paging
-                })
-            }),
-        }
-    }
-
-    fn page_deadline(
-        &self,
-        paging: &ReplayPaging,
-        _window: &ReplayWindow,
-    ) -> Option<tokio::time::Instant> {
-        let endpoint = self
-            .endpoint_deadlines
-            .get(&paging.subscription_id)?
-            .get(&paging.relay)?;
-        (endpoint.serial == paging.serial && endpoint.capturing)
-            .then_some(endpoint.deadline)
-            .flatten()
-    }
-
-    fn capture_current(&self, paging: &ReplayPaging) -> bool {
-        self.endpoint_deadlines
-            .get(&paging.subscription_id)
-            .and_then(|relays| relays.get(&paging.relay))
-            .is_some_and(|endpoint| endpoint.serial == paging.serial && endpoint.capturing)
-    }
-
-    /// The capture is still current, so its stop or failure leaves the source
-    /// incomplete, or it was already stopped incomplete: either way the
-    /// source waits for the owner's next grant.
-    fn capture_still_owed(&self, paging: &ReplayPaging) -> bool {
-        self.capture_current(paging)
-            || self
-                .subscriptions
-                .get(&paging.subscription_id)
-                .and_then(|relays| relays.get(&paging.relay))
-                == Some(&RelayReplay::Incomplete)
-    }
-
-    /// Defer the loss of a discarded page body while its capture's source
-    /// still awaits the owner; false when the loss must be recorded now.
-    fn defer_capture_loss(&mut self, paging: &ReplayPaging) -> bool {
-        if !self.capture_still_owed(paging) {
-            return false;
-        }
-        self.defer_loss(&paging.subscription_id, paging.relay, paging.window.since);
-        true
-    }
-
-    fn start_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
-        if !self.capture_current(paging)
-            || self.endpoint_deadlines[&paging.subscription_id][&paging.relay]
-                .cancellation
-                .is_cancelled()
-        {
-            return false;
-        }
-        let deadline = tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration;
-        let mut started = matches!(window.scope, ReplayScope::Inbox);
-        if let ReplayScope::Groups(routes) = &window.scope {
-            for (group_id, group) in &mut self.groups {
-                for (owner, stream) in &mut group.streams {
-                    if owner.request.as_ref() == paging.subscription_id.as_str()
-                        && owner.relay == paging.relay
-                        && routes.contains(&owner.route)
-                        && stream.phase == ReplayAdmission::Queued
-                    {
-                        stream.phase = ReplayAdmission::Paging;
-                        stream.deadline = deadline;
-                        self.deadlines
-                            .entry(deadline)
-                            .or_default()
-                            .push((group_id.clone(), owner.clone()));
-                        started = true;
-                    }
-                }
-            }
-        }
-        if started {
-            self.endpoint_deadlines
-                .get_mut(&paging.subscription_id)
-                .expect("current request exists")
-                .get_mut(&paging.relay)
-                .expect("current relay exists")
-                .deadline = Some(deadline);
-            self.wake_replay();
-        }
-        started
-    }
-
-    fn finish_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
-        self.expire_replay(tokio::time::Instant::now());
-        if self.page_deadline(paging, window).is_none() {
-            return false;
-        }
-        let mut finished = matches!(window.scope, ReplayScope::Inbox);
-        if let ReplayScope::Groups(routes) = &window.scope {
-            for group in self.groups.values_mut() {
-                for (owner, stream) in &mut group.streams {
-                    if owner.request.as_ref() == paging.subscription_id.as_str()
-                        && owner.relay == paging.relay
-                        && routes.contains(&owner.route)
-                        && stream.phase == ReplayAdmission::Paging
-                    {
-                        stream.phase = ReplayAdmission::Complete;
-                        finished = true;
-                    }
-                }
-            }
-        }
-        self.endpoint_deadlines
-            .get_mut(&paging.subscription_id)
-            .expect("current request exists")
-            .get_mut(&paging.relay)
-            .expect("current relay exists")
-            .deadline = None;
-        self.wake_replay();
-        finished
-    }
-
-    fn fail_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) {
-        if !self.capture_current(paging) {
-            return;
-        }
-        let endpoint = self
-            .endpoint_deadlines
-            .get_mut(&paging.subscription_id)
-            .expect("current request exists")
-            .get_mut(&paging.relay)
-            .expect("current relay exists");
-        endpoint.deadline = None;
-        if let ReplayScope::Groups(routes) = &window.scope {
-            let owners = self
-                .groups
-                .iter()
-                .filter(|(_, group)| {
-                    group
-                        .routes
-                        .get(&paging.subscription_id)
-                        .is_some_and(|owned| owned.iter().any(|route| routes.contains(route)))
-                })
-                .flat_map(|(group_id, group)| {
-                    group
-                        .streams
-                        .keys()
-                        .filter(|owner| {
-                            owner.request.as_ref() == paging.subscription_id.as_str()
-                                && owner.relay == paging.relay
-                        })
-                        .map(|owner| (group_id.clone(), owner.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            for (group_id, owner) in owners {
-                self.abandon_stream(&group_id, &owner, ReplayAbandon::Cut);
-            }
-        }
-        self.wake_replay();
-    }
-
-    fn route_release_pending(&self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
-        let ReplayScope::Groups(routes) = &window.scope else {
-            return false;
-        };
-        self.groups.values().any(|group| {
-            group
-                .routes
-                .get(&paging.subscription_id)
-                .is_some_and(|owned| owned.iter().any(|route| routes.contains(route)))
-                // A fence holds its frames for order; the next route's
-                // history may page meanwhile, within the buffer bounds.
-                && (group.ready_history.iter().any(|id| !group.holds_id(id))
-                    || group
-                        .streams
-                        .values()
-                        .any(|stream| stream.claims.iter().any(|id| !group.holds_id(id))))
-        })
-    }
-
     fn expire_replay(&mut self, now: tokio::time::Instant) {
         while self
             .deadlines
@@ -6407,31 +5220,10 @@ impl AccountReplayCoverage {
                     .get(&group_id)
                     .and_then(|group| group.streams.get(&owner))
                     .is_some_and(|stream| {
-                        stream.deadline == deadline
-                            && matches!(
-                                stream.phase,
-                                ReplayAdmission::Waiting | ReplayAdmission::Paging
-                            )
+                        stream.deadline == deadline && stream.phase == ReplayAdmission::Waiting
                     });
                 if expired {
-                    let group = &self.groups[&group_id];
-                    if group.streams[&owner].phase == ReplayAdmission::Paging {
-                        // A completed newer tag is still partial while another
-                        // tag of this same source/group has not finished.
-                        let siblings = group
-                            .streams
-                            .keys()
-                            .filter(|peer| {
-                                peer.request == owner.request && peer.relay == owner.relay
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        for peer in siblings {
-                            self.abandon_stream(&group_id, &peer, ReplayAbandon::Cut);
-                        }
-                    } else {
-                        self.abandon_stream(&group_id, &owner, ReplayAbandon::Unfinished);
-                    }
+                    self.abandon_stream(&group_id, &owner, ReplayAbandon::Unfinished);
                 }
             }
         }
@@ -6443,7 +5235,6 @@ impl AccountReplayCoverage {
                 endpoint.deadline = None;
             }
         }
-        self.expire_fences(now);
     }
 }
 
@@ -6565,14 +5356,9 @@ struct AdapterState {
     // Lifetime fence, one scalar per account/group that used recovery maintenance.
     // Do not clear on route removal or deactivation: old EOSE can still arrive.
     maintenance_attempt_high_water: HashMap<(MemberId, GroupId), u64>,
-    /// Consumed owner operation serials survive account replacement.
-    capture_attempts: HashMap<MemberId, u64>,
     /// Accounts whose owner fences their groups' live frames. Survives
     /// account replacement, so an activation's first counts arm fences.
     replay_fencing: HashSet<MemberId>,
-    /// Account recovery ownership, fixed before activation and retained for
-    /// replacement REQs. Lower-level callers keep native paging by default.
-    delegated_recovery: HashSet<MemberId>,
     source_clock: Arc<std::sync::atomic::AtomicU64>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
@@ -7038,7 +5824,6 @@ impl AdapterState {
             coverage.attach_ingress(ingress.clone());
         }
         coverage.fencing = self.replay_fencing.contains(account_id);
-        coverage.recovery_delegated = self.delegated_recovery.contains(account_id);
         self.account_replay_coverage
             .insert(account_id.clone(), coverage);
         self.stage_replay_batches(account_id, subscriptions);
@@ -7168,7 +5953,7 @@ impl AdapterState {
         self.sync.record_first_event(subscription_id, relay, now_ms);
     }
 
-    /// Record wire EOSE and its owned paging ticket in one critical section.
+    /// Record wire EOSE in one critical section.
     fn record_subscription_eose(
         &mut self,
         subscription_id: &str,
@@ -7178,22 +5963,8 @@ impl AdapterState {
     ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
-        for (account_id, coverage) in &mut self.account_replay_coverage {
-            if let Some((window, until)) =
-                coverage.record_eose_reply(subscription_id, relay, now_ms, sent_nothing)
-            {
-                let serial = coverage.endpoint_deadlines[subscription_id][&relay].serial;
-                coverage.queue_capture(ReplayPaging {
-                    account_id: account_id.clone(),
-                    subscription_id: subscription_id.to_owned(),
-                    endpoint: endpoint.clone(),
-                    relay,
-                    serial,
-                    window,
-                    until,
-                    credit: None,
-                });
-            }
+        for coverage in self.account_replay_coverage.values_mut() {
+            coverage.record_eose_reply(subscription_id, relay, sent_nothing);
         }
     }
 
@@ -7210,28 +5981,6 @@ impl AdapterState {
         };
         for coverage in self.account_replay_coverage.values_mut() {
             coverage.record_stored_event(subscription_id, relay, created_at);
-        }
-    }
-
-    /// A paged replay reached the start of its window. Applies only while the
-    /// activation that issued the REQ is still current.
-    fn finish_replay_paging(&mut self, paging: &ReplayPaging, now_ms: u64) {
-        let Some(relay) = self.relay_index.existing_index_for(&paging.endpoint) else {
-            return;
-        };
-        if let Some(coverage) = self.account_replay_coverage.get_mut(&paging.account_id)
-            && coverage.capture_current(paging)
-        {
-            coverage.finish_paging(&paging.subscription_id, relay);
-            if coverage
-                .subscriptions
-                .get(&paging.subscription_id)
-                .and_then(|relays| relays.get(&relay))
-                == Some(&RelayReplay::Eose)
-            {
-                self.sync
-                    .record_eose(&paging.subscription_id, relay, now_ms);
-            }
         }
     }
 
@@ -7340,16 +6089,12 @@ impl AdapterState {
                     let window = coverage.windows.get(id)?;
                     let replay =
                         relay.and_then(|relay| coverage.subscriptions.get(id)?.get(&relay));
-                    let serial = relay
-                        .and_then(|relay| coverage.endpoint_deadlines.get(id)?.get(&relay))
-                        .map(|endpoint| endpoint.serial);
                     let ended = relay
                         .and_then(|relay| coverage.stored.get(id)?.get(&relay))
                         .is_some_and(|stored| stored.ended);
                     Some((
                         matches!(window.scope, ReplayScope::Groups(_)),
                         replay.copied(),
-                        serial,
                         ended,
                     ))
                 })
@@ -7360,21 +6105,14 @@ impl AdapterState {
             if copy == RelayCopy::RawGroup && !source.is_some_and(|source| source.0) {
                 continue;
             }
-            if let RelayCopy::Page(serial) = copy
-                && !source.is_some_and(|source| source.2 == Some(serial))
-            {
-                continue;
-            }
-            let input = match copy {
-                RelayCopy::Page(_) => ReplayInput::Page,
-                _ if source.is_none() => ReplayInput::Untracked,
-                _ if source.is_some_and(|source| {
-                    source.1.is_some() && source.1 != Some(RelayReplay::Eose) && !source.3
-                }) =>
+            let input = match source {
+                None => ReplayInput::Untracked,
+                Some((_, replay, ended))
+                    if replay.is_some() && replay != Some(RelayReplay::Eose) && !ended =>
                 {
                     ReplayInput::History
                 }
-                _ => ReplayInput::Live,
+                Some(_) => ReplayInput::Live,
             };
             if let Some(coverage) = self.account_replay_coverage.get_mut(&delivery.account_id) {
                 delivered += 1;
@@ -7950,13 +6688,13 @@ fn hash_component(hasher: &mut Sha256, component: &[u8]) {
 mod batch_tests {
     use super::*;
 
-    /// Ownership is installed before any REQ and survives activation replacement;
-    /// a delegated source cannot be handed back to credited native capture.
+    /// A full reply's EOSE ends that relay's input delegated in every
+    /// activation: what it sent is admitted, but the query is never
+    /// certified complete, because the recovery runner owes the rest.
     #[tokio::test]
-    async fn delegated_recovery_survives_reactivation_and_rejects_native_capture() {
+    async fn a_full_reply_ends_delegated_across_reactivation() {
         let adapter = NostrTransportAdapter::new(Arc::new(ConnectionRelayClient::default()));
         let account = MemberId::new(vec![0xA1; 32]);
-        adapter.delegate_replay_recovery(&account).await.unwrap();
         for _ in 0..2 {
             adapter
                 .activate_account(TransportAccountActivation {
@@ -7967,24 +6705,16 @@ mod batch_tests {
                 })
                 .await
                 .unwrap();
-            adapter.delegate_replay_recovery(&account).await.unwrap();
-            let token = {
+            let request = {
                 let status = adapter.take_replay_status(&account).await;
-                status
-                    .sources()
-                    .next()
-                    .unwrap()
-                    .endpoints()
-                    .next()
-                    .unwrap()
-                    .capture_token()
+                status.sources().next().unwrap().id().to_owned()
             };
             let endpoint = TransportEndpoint("wss://a.example".into());
             for index in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
                 let mut id = [0_u8; 32];
                 id[..8].copy_from_slice(&index.to_be_bytes());
                 adapter
-                    .observe_relay_event(&id, &endpoint, Some(&token.request), 100 + index)
+                    .observe_relay_event(&id, &endpoint, Some(&request), 100 + index)
                     .await;
             }
             let input = adapter.account_subscription_input(&account).await;
@@ -7992,9 +6722,7 @@ mod batch_tests {
                 !input.complete && !input.settled && !input.any,
                 "a full count without physical EOSE is still waiting"
             );
-            adapter
-                .handle_relay_eose(endpoint, token.request.to_string())
-                .await;
+            adapter.handle_relay_eose(endpoint, request).await;
             {
                 let status = adapter.take_replay_status(&account).await;
                 let source = status.sources().next().unwrap();
@@ -8018,43 +6746,7 @@ mod batch_tests {
                 input.complete && input.settled && input.any,
                 "current input ended even though the original query remains unproved"
             );
-            let credit = Arc::new(
-                Arc::new(tokio::sync::Semaphore::new(1))
-                    .acquire_owned()
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(
-                adapter
-                    .capture_replay(
-                        &account,
-                        ReplayCapturePlan {
-                            attempt_serial: 1,
-                            sources: vec![token],
-                            credit,
-                        },
-                        NostrAcquisitionCancellation::new(),
-                    )
-                    .await
-                    .unwrap(),
-                ReplayCaptureOutcome::Stale,
-            );
         }
-        let legacy = MemberId::new(vec![0xB1; 32]);
-        adapter
-            .activate_account(TransportAccountActivation {
-                account_id: legacy.clone(),
-                inbox_endpoints: vec![TransportEndpoint("wss://a.example".into())],
-                group_subscriptions: Vec::new(),
-                since: Some(Timestamp(100)),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            adapter.delegate_replay_recovery(&legacy).await,
-            Err(TransportAdapterError::Subscription(message))
-                if message == "recovery ownership must be installed before activation"
-        ));
     }
 
     fn route(index: u8, endpoint: &str, since: Option<u64>) -> NostrSubscription {
@@ -8111,30 +6803,6 @@ mod batch_tests {
         assert!(!batches[0].carries_group(&GroupId::new(vec![200; 16])));
     }
 
-    /// A batch's replay pages as deep, per route it carries, as one route's
-    /// replay did alone.
-    #[test]
-    fn a_batch_replay_pages_per_route_it_carries() {
-        let routes = (0..3)
-            .map(|index| route(index, "wss://a.example", None))
-            .collect::<Vec<_>>();
-        let account = MemberId::new(vec![0xA1; 32]);
-        let batch =
-            pack_group_batches(&account, &routes, SubscriptionAttempt::INITIAL, 0).remove(0);
-        let window = ReplayWindow::for_subscription(&batch).expect("a batch has a window");
-        assert_eq!(window.max_pages(), 3 * REPLAY_PAGE_MAX_PAGES);
-        let NostrAcquisitionScope::GroupsWindow {
-            transport_group_ids,
-            since,
-            until,
-        } = window.acquisition_scope(500)
-        else {
-            panic!("a batch pages its whole filter");
-        };
-        assert_eq!(transport_group_ids.len(), 3);
-        assert_eq!((since, until), (0, 500));
-    }
-
     fn replay_coverage(routes: usize) -> (AccountReplayCoverage, String, Arc<ReplayLosses>) {
         replay_coverage_on(routes, &HashMap::new())
     }
@@ -8166,30 +6834,10 @@ mod batch_tests {
         (coverage, id, losses)
     }
 
-    fn paging_for(coverage: &mut AccountReplayCoverage, id: &str) -> ReplayPaging {
-        let (window, serial) = coverage
-            .restart_request(id, RelayIndex(2), ReplayStart::Capture)
-            .expect("starts capture");
-        ReplayPaging {
-            account_id: MemberId::new(vec![0xA1; 32]),
-            subscription_id: id.to_owned(),
-            endpoint: TransportEndpoint("wss://a.example".to_owned()),
-            relay: RelayIndex(2),
-            serial,
-            window,
-            until: REPLAY_OPEN_UNTIL,
-            credit: Some(Arc::new(
-                Arc::new(tokio::sync::Semaphore::new(1))
-                    .try_acquire_owned()
-                    .unwrap(),
-            )),
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn repack_keeps_peer_fence() {
         let (mut coverage, old, losses) = replay_coverage(1);
-        coverage.record_eose(&old, RelayIndex(1), 0);
+        coverage.record_eose(&old, RelayIndex(1));
         let mut previous = old;
         for serial in 1..=2 {
             let account = MemberId::new(vec![0xA1; 32]);
@@ -8224,7 +6872,7 @@ mod batch_tests {
     #[tokio::test(start_paused = true)]
     async fn empty_admission_holds_payload() {
         let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let group = coverage.groups.values().next().unwrap();
         assert!(
             !coverage.group_ready(group),
@@ -8242,7 +6890,7 @@ mod batch_tests {
             !coverage.snapshot().complete(),
             "limited admission is not all-peer history certification"
         );
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         coverage.expire_replay(tokio::time::Instant::now());
         assert!(coverage.group_ready(coverage.groups.values().next().unwrap()));
         assert!(
@@ -8256,8 +6904,8 @@ mod batch_tests {
     #[tokio::test(start_paused = true)]
     async fn dormant_metadata_is_not_loss() {
         let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        coverage.record_eose(&id, RelayIndex(1));
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         coverage.expire_replay(tokio::time::Instant::now());
         assert!(
             losses.pending.lock().unwrap().is_empty(),
@@ -8270,10 +6918,10 @@ mod batch_tests {
     #[tokio::test(start_paused = true)]
     async fn dormant_empty_stream_can_end() {
         let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        coverage.record_eose(&id, RelayIndex(1));
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         coverage.expire_replay(tokio::time::Instant::now());
-        coverage.record_eose(&id, RelayIndex(2), 31_000);
+        coverage.record_eose(&id, RelayIndex(2));
         assert!(coverage.snapshot().complete());
         assert!(losses.pending.lock().unwrap().is_empty());
     }
@@ -8282,8 +6930,8 @@ mod batch_tests {
     async fn eose_wins_its_deadline() {
         let (mut coverage, id, losses) = replay_coverage(1);
         coverage.record_stored_event(&id, RelayIndex(1), 150);
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
-        coverage.record_eose(&id, RelayIndex(1), 30_000);
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
+        coverage.record_eose(&id, RelayIndex(1));
         assert!(coverage.request_admitted(&id, Some(RelayIndex(1))));
         assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
         assert!(losses.pending.lock().unwrap().is_empty());
@@ -8292,7 +6940,7 @@ mod batch_tests {
     #[tokio::test]
     async fn boundary_survives_live_pin() {
         let (mut coverage, id, _) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let group = GroupId::new(vec![0; 16]);
         coverage.pin_delivery([7; 32], Some(&group));
         assert!(coverage.admission_pending());
@@ -8317,7 +6965,7 @@ mod batch_tests {
         for created_at in [150, 120, 130] {
             coverage.record_stored_event(&id, RelayIndex(1), created_at);
         }
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let count = ReplayLiveCount {
             events: 3,
             oldest: Some(120),
@@ -8348,7 +6996,7 @@ mod batch_tests {
         // The reconnect's own EOSE counts afresh; receiver loss then ends it
         // without keeping it, and the earlier ended count stays.
         let eose = unix_now_seconds();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let resent = coverage.endpoint_deadlines[&id][&RelayIndex(1)]
             .live_count
             .expect("the resent REQ's EOSE counts");
@@ -8364,7 +7012,7 @@ mod batch_tests {
 
         // A reconnect the transport reported no disconnect for keeps no
         // count from the old connection.
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         coverage.restart_request(&id, RelayIndex(1), ReplayStart::Connection);
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.live_count.is_none());
@@ -8392,7 +7040,7 @@ mod batch_tests {
             None,
         );
         assert_eq!(requested_at(&coverage), issued + 600);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(
             coverage.endpoint_deadlines[&id][&RelayIndex(1)]
                 .live_count
@@ -8421,7 +7069,7 @@ mod batch_tests {
         // its tail starts at this EOSE.
         let (mut coverage, id, _) = replay_coverage(1);
         let issued = coverage.endpoint_deadlines[&id][&RelayIndex(1)].requested_at;
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         coverage.end_relay_live_counts(RelayIndex(1));
         coverage.restart_relay(
             RelayIndex(1),
@@ -8431,7 +7079,7 @@ mod batch_tests {
             None,
         );
         let eose = unix_now_seconds();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let count = coverage.endpoint_deadlines[&id][&RelayIndex(1)]
             .live_count
             .expect("the resend counts");
@@ -8453,8 +7101,8 @@ mod batch_tests {
         let adapter = NostrTransportAdapter::new(client.clone());
         let account = MemberId::new(vec![0xA1; 32]);
         let (mut coverage, id, _) = replay_coverage_on(1, &HashMap::from([(RelayIndex(1), first)]));
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        coverage.record_eose(&id, RelayIndex(2), 0);
+        coverage.record_eose(&id, RelayIndex(1));
+        coverage.record_eose(&id, RelayIndex(2));
         {
             let mut state = adapter.state.write().await;
             for (index, url) in
@@ -8507,7 +7155,7 @@ mod batch_tests {
             .account_replay_coverage
             .get_mut(&account)
             .expect("installed")
-            .record_eose(&id, RelayIndex(1), 0);
+            .record_eose(&id, RelayIndex(1));
         assert_eq!(streams().await, [(true, true), (true, false)]);
 
         client.reports(None);
@@ -8524,7 +7172,7 @@ mod batch_tests {
         }));
         let account = MemberId::new(vec![0xA1; 32]);
         let (mut coverage, id, _) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let first = ReplaySourceGeneration(coverage.endpoint_deadlines[&id][&RelayIndex(1)].serial);
         {
             let mut state = adapter.state.write().await;
@@ -8567,7 +7215,7 @@ mod batch_tests {
     async fn an_eose_after_the_disconnect_counts_nothing_live() {
         let (mut coverage, id, _) = replay_coverage(1);
         coverage.end_relay_live_counts(RelayIndex(1));
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.live_count.is_none() && endpoint.ended_count.is_none());
 
@@ -8576,7 +7224,7 @@ mod batch_tests {
                 .restart_request(&id, RelayIndex(1), ReplayStart::Connection)
                 .is_some()
         );
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert!(
             coverage.endpoint_deadlines[&id][&RelayIndex(1)]
                 .live_count
@@ -8589,7 +7237,7 @@ mod batch_tests {
     #[tokio::test]
     async fn closed_after_eose_ends_the_live_count() {
         let (mut coverage, id, _) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Dropped);
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         assert!(endpoint.boundary_admitted, "EOSE is final");
@@ -8609,10 +7257,10 @@ mod batch_tests {
                 .live_count
                 .map(|count| count.sent_nothing)
         };
-        coverage.record_eose_reply(&id, RelayIndex(1), 0, true);
+        coverage.record_eose_reply(&id, RelayIndex(1), true);
         assert_eq!(sent_nothing(&coverage, 1), Some(true));
         coverage.record_stored_event(&id, RelayIndex(2), 150);
-        coverage.record_eose_reply(&id, RelayIndex(2), 0, true);
+        coverage.record_eose_reply(&id, RelayIndex(2), true);
         assert_eq!(
             sent_nothing(&coverage, 2),
             Some(false),
@@ -8621,7 +7269,7 @@ mod batch_tests {
 
         for wire in [false, true] {
             coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
-            coverage.record_eose_reply(&id, RelayIndex(1), 0, wire);
+            coverage.record_eose_reply(&id, RelayIndex(1), wire);
             assert_eq!(sent_nothing(&coverage, 1), Some(wire), "restored");
         }
     }
@@ -8643,7 +7291,7 @@ mod batch_tests {
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
         coverage.record_stored_event(&id, RelayIndex(1), 400);
         let eose = unix_now_seconds();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(
             counted(&coverage, eose),
             Some((1, Some(400))),
@@ -8657,7 +7305,7 @@ mod batch_tests {
         coverage.record_stored_event(&id, RelayIndex(1), 600);
         coverage.record_stored_event(&id, RelayIndex(1), 500);
         let eose = unix_now_seconds();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(
             counted(&coverage, eose),
             Some((2, Some(500))),
@@ -8666,7 +7314,7 @@ mod batch_tests {
 
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Dropped);
         coverage.record_stored_event(&id, RelayIndex(1), 700);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert!(
             coverage.endpoint_deadlines[&id][&RelayIndex(1)]
                 .live_count
@@ -8683,7 +7331,7 @@ mod batch_tests {
         coverage.record_stored_event(&id, RelayIndex(1), 300);
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
         let eose = unix_now_seconds();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let count = coverage.endpoint_deadlines[&id][&RelayIndex(1)]
             .live_count
             .expect("an empty restored reply counts");
@@ -8698,7 +7346,7 @@ mod batch_tests {
         coverage.record_stored_event(&id, RelayIndex(1), 1_000);
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
         coverage.record_stored_event(&id, RelayIndex(1), 1_200);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(
             coverage.endpoint_deadlines[&id][&RelayIndex(1)]
                 .live_count
@@ -8709,10 +7357,10 @@ mod batch_tests {
 
         let (mut coverage, id, _) = replay_coverage(1);
         coverage.record_stored_event(&id, RelayIndex(1), 400);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
         let eose = unix_now_seconds();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
         let count = endpoint.live_count.expect("an empty recount");
         assert_eq!((count.events, count.oldest), (0, None));
@@ -8720,17 +7368,21 @@ mod batch_tests {
         assert!(endpoint.ended_count.is_some());
     }
 
-    /// A count at the replay page limit is kept through backward paging; the
-    /// boundary it belongs to is admitted only once paging finishes.
+    /// A count at the replay page limit ends delegated: the count is kept and
+    /// its boundary admitted, while the relay's reply stays uncertified.
     #[tokio::test]
-    async fn a_paged_replay_keeps_its_live_count() {
+    async fn a_full_reply_keeps_its_live_count() {
         let (mut coverage, id, _) = replay_coverage(1);
         for created_at in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
             coverage.record_stored_event(&id, RelayIndex(1), 1_000 + created_at);
         }
-        assert!(coverage.record_eose(&id, RelayIndex(1), 0).is_some());
+        coverage.record_eose(&id, RelayIndex(1));
+        assert_eq!(
+            coverage.subscriptions[&id][&RelayIndex(1)],
+            RelayReplay::Delegated
+        );
         let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
-        assert!(!endpoint.boundary_admitted);
+        assert!(endpoint.boundary_admitted);
         assert_eq!(
             endpoint.live_count,
             Some(ReplayLiveCount {
@@ -9015,518 +7667,11 @@ mod batch_tests {
         );
     }
 
-    #[tokio::test]
-    async fn all_group_tags_finish_first() {
-        let account = MemberId::new(vec![0xA1; 32]);
-        let group = GroupId::new(vec![0; 16]);
-        let batch = NostrSubscription::GroupBatch {
-            account_id: account.clone(),
-            routes: vec![
-                GroupBatchRoute {
-                    group_id: group.clone(),
-                    transport_group_id: vec![1; 32],
-                },
-                GroupBatchRoute {
-                    group_id: group.clone(),
-                    transport_group_id: vec![2; 32],
-                },
-            ],
-            endpoints: vec![TransportEndpoint("wss://a.example".into())],
-            since: Some(Timestamp(100)),
-            attempt: SubscriptionAttempt::INITIAL,
-            batch: 0,
-        };
-        let id = batch.subscription_id();
-        let mut coverage = AccountReplayCoverage::new(account, Arc::default(), Arc::default());
-        coverage.add_subscription(
-            id.clone(),
-            &batch,
-            HashMap::from([(RelayIndex(2), RelayReplay::Awaiting)]),
-            &HashMap::new(),
-        );
-        let paging = paging_for(&mut coverage, &id);
-        let units = coverage.page_units(&paging);
-        assert_eq!(
-            units.len(),
-            1,
-            "all tags of one MLS group form a single release unit"
-        );
-        let routes = units[0].per_route();
-        assert_eq!(routes.len(), 2);
-        assert!(coverage.start_route(&paging, &routes[0]));
-        assert!(coverage.finish_route(&paging, &routes[0]));
-        assert!(
-            !coverage.group_ready(&coverage.groups[&group]),
-            "an unobserved queued tag still fences its group"
-        );
-        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
-        assert!(coverage.start_route(&paging, &routes[1]));
-        assert!(coverage.finish_route(&paging, &routes[1]));
-        coverage.finish_paging(&id, RelayIndex(2));
-        assert!(coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
-    }
-
-    #[tokio::test]
-    async fn failed_tag_discards_prefix() {
-        let (mut coverage, old, losses) = replay_coverage(1);
-        coverage.remove_subscription(&old);
-        losses.pending.lock().unwrap().clear();
-        let account = MemberId::new(vec![0xA1; 32]);
-        let group = GroupId::new(vec![0; 16]);
-        let endpoint = TransportEndpoint("wss://a.example".into());
-        let batch = NostrSubscription::GroupBatch {
-            account_id: account,
-            routes: vec![
-                GroupBatchRoute {
-                    group_id: group.clone(),
-                    transport_group_id: vec![1; 32],
-                },
-                GroupBatchRoute {
-                    group_id: group.clone(),
-                    transport_group_id: vec![2; 32],
-                },
-            ],
-            endpoints: vec![endpoint],
-            since: Some(Timestamp(100)),
-            attempt: SubscriptionAttempt::INITIAL,
-            batch: 1,
-        };
-        let id = batch.subscription_id();
-        coverage.add_subscription(
-            id.clone(),
-            &batch,
-            HashMap::from([(RelayIndex(2), RelayReplay::Awaiting)]),
-            &HashMap::new(),
-        );
-        let paging = paging_for(&mut coverage, &id);
-        let routes = paging.window.per_route();
-        assert!(coverage.start_route(&paging, &routes[0]));
-        let delivery = group_delivery(&id, group, vec![1; 32], 7);
-        let (tx, _rx) = mpsc::channel(1);
-        coverage
-            .stage_delivery(delivery, Some(RelayIndex(2)), ReplayInput::Page, &tx)
-            .unwrap();
-        assert!(coverage.finish_route(&paging, &routes[0]));
-        assert!(
-            coverage.take_ready_deliveries().is_empty(),
-            "the retained tag still owns older input"
-        );
-        assert!(coverage.start_route(&paging, &routes[1]));
-        coverage.fail_route(&paging, &routes[1]);
-        assert!(
-            coverage.take_ready_deliveries().is_empty(),
-            "a failed older tag cannot release the newer suffix"
-        );
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(
-            losses.pending.lock().unwrap().is_empty(),
-            "the capture's own discarded re-fetch charges no loss"
-        );
-        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
-    }
-
-    fn group_delivery(
-        id: &str,
-        group: GroupId,
-        transport_group_id: Vec<u8>,
-        message: u8,
-    ) -> TransportDelivery {
-        let endpoint = TransportEndpoint("wss://a.example".into());
-        TransportDelivery {
-            account_id: MemberId::new(vec![0xA1; 32]),
-            group_id_hint: Some(group),
-            message: TransportMessage {
-                id: MessageId::new(vec![message; 32]),
-                payload: vec![1, 2, 3],
-                timestamp: Timestamp(500),
-                causal_deps: Vec::new(),
-                source: TransportSource(NOSTR_SOURCE.into()),
-                envelope: TransportEnvelope::GroupMessage { transport_group_id },
-            },
-            received_at: Timestamp(600),
-            source: TransportDeliverySource {
-                transport: TransportSource(NOSTR_SOURCE.into()),
-                plane: TransportDeliveryPlane::Group,
-                endpoint: Some(endpoint),
-                subscription_id: Some(id.to_owned()),
-                wire: None,
-            },
-        }
-    }
-
-    /// A comparison deadline cancels the owner capture mid-page. The bodies it
-    /// fetched are the obligation's own re-fetch: the source stays unadmitted
-    /// for the next grant and no new loss restarts the obligation (#2513).
-    #[tokio::test(start_paused = true)]
-    async fn cancelled_capture_discards_without_new_loss() {
-        let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        let paging = paging_for(&mut coverage, &id);
-        let routes = paging.window.per_route();
-        assert!(coverage.start_route(&paging, &routes[0]));
-        let (tx, _rx) = mpsc::channel(1);
-        coverage
-            .stage_delivery(
-                group_delivery(&id, GroupId::new(vec![0; 16]), vec![0; 32], 7),
-                Some(RelayIndex(2)),
-                ReplayInput::Page,
-                &tx,
-            )
-            .unwrap();
-        assert_eq!(coverage.buffered_items, 1);
-        coverage.stop_capture(&id, RelayIndex(2));
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(losses.pending.lock().unwrap().is_empty());
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(2)],
-            RelayReplay::Incomplete
-        );
-        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
-        assert!(
-            coverage
-                .restart_request(&id, RelayIndex(2), ReplayStart::Capture)
-                .is_some(),
-            "the next grant captures the same source again"
-        );
-    }
-
-    /// A cut capture's loss is only deferred. A reconnect or refusal that
-    /// readmits or retires the source without a finished capture records it;
-    /// a later capture that finishes clears it.
-    #[tokio::test(start_paused = true)]
-    async fn cut_capture_loss_debt_is_charged_unless_a_capture_finishes() {
-        let account = MemberId::new(vec![0xA1; 32]);
-        let (tx, _rx) = mpsc::channel(4);
-        let cut = |coverage: &mut AccountReplayCoverage, id: &str| {
-            coverage.record_eose(id, RelayIndex(1), 0);
-            let paging = paging_for(coverage, id);
-            let routes = paging.window.per_route();
-            assert!(coverage.start_route(&paging, &routes[0]));
-            coverage
-                .stage_delivery(
-                    group_delivery(id, GroupId::new(vec![0; 16]), vec![0; 32], 7),
-                    Some(RelayIndex(2)),
-                    ReplayInput::Page,
-                    &tx,
-                )
-                .unwrap();
-            coverage.stop_capture(id, RelayIndex(2));
-        };
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        cut(&mut coverage, &id);
-        assert!(losses.pending.lock().unwrap().is_empty());
-        coverage.restart_relay(
-            RelayIndex(2),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        assert_eq!(
-            losses.pending.lock().unwrap().get(&account),
-            Some(&NostrNotificationLossFloor::Since(100)),
-            "a reconnect readmits the source without the capture"
-        );
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        cut(&mut coverage, &id);
-        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
-        assert_eq!(
-            losses.pending.lock().unwrap().get(&account),
-            Some(&NostrNotificationLossFloor::Since(100)),
-            "a refusal retires the source without the capture"
-        );
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        cut(&mut coverage, &id);
-        let paging = paging_for(&mut coverage, &id);
-        for route in paging.window.per_route() {
-            assert!(coverage.start_route(&paging, &route));
-            assert!(coverage.finish_route(&paging, &route));
-        }
-        coverage.finish_paging(&id, RelayIndex(2));
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(2)],
-            RelayReplay::Eose
-        );
-        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
-        coverage.remove_subscription(&id);
-        assert!(
-            losses.pending.lock().unwrap().is_empty(),
-            "the finished capture fetched the window the cut left owed"
-        );
-    }
-
-    /// A cut defers the loss of every body it discards, including a REQ copy
-    /// held from before the capture (a clamped relay's first stored page) and
-    /// a body a finished capture still holds when the next capture is cut: the
-    /// source stays owed either way. A reconnect or refusal then records it.
-    #[tokio::test(start_paused = true)]
-    async fn cut_defers_loss_of_bodies_the_capture_did_not_fetch() {
-        let account = MemberId::new(vec![0xA1; 32]);
-        let group = GroupId::new(vec![0; 16]);
-        let (tx, _rx) = mpsc::channel(4);
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        coverage
-            .stage_delivery(
-                group_delivery(&id, group.clone(), vec![0; 32], 7),
-                Some(RelayIndex(2)),
-                ReplayInput::History,
-                &tx,
-            )
-            .unwrap();
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        let paging = paging_for(&mut coverage, &id);
-        coverage.stop_capture(&id, RelayIndex(2));
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(
-            losses.pending.lock().unwrap().is_empty(),
-            "a REQ copy held before the cut capture is still owed"
-        );
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(2)],
-            RelayReplay::Incomplete
-        );
-        drop(paging);
-        coverage.restart_relay(
-            RelayIndex(2),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        assert_eq!(
-            losses.pending.lock().unwrap().get(&account),
-            Some(&NostrNotificationLossFloor::Since(100)),
-            "a reconnect readmits the source without the capture"
-        );
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        let paging = paging_for(&mut coverage, &id);
-        let routes = paging.window.per_route();
-        assert!(coverage.start_route(&paging, &routes[0]));
-        coverage
-            .stage_delivery(
-                group_delivery(&id, group, vec![0; 32], 8),
-                Some(RelayIndex(2)),
-                ReplayInput::Page,
-                &tx,
-            )
-            .unwrap();
-        assert!(coverage.finish_route(&paging, &routes[0]));
-        coverage.finish_paging(&id, RelayIndex(2));
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(2)],
-            RelayReplay::Eose
-        );
-        assert_eq!(
-            coverage.buffered_items, 1,
-            "the unfinished peer still fences the group"
-        );
-        let _next = paging_for(&mut coverage, &id);
-        coverage.stop_capture(&id, RelayIndex(2));
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(
-            losses.pending.lock().unwrap().is_empty(),
-            "the cut capture's source owes the body again"
-        );
-        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
-        assert_eq!(
-            losses.pending.lock().unwrap().get(&account),
-            Some(&NostrNotificationLossFloor::Since(100)),
-            "a refusal retires the source without the capture"
-        );
-    }
-
-    /// A body the unfinished capture fetched itself discards without loss even
-    /// when a REQ copy, on this relay or a peer, also supplied it: the capture's
-    /// source stays unadmitted and re-fetches it. When a REQ-only holder drops
-    /// the body last, its loss stands.
-    #[tokio::test(start_paused = true)]
-    async fn captured_body_with_other_copies_stays_owed() {
-        let group = GroupId::new(vec![0; 16]);
-        let (tx, _rx) = mpsc::channel(8);
-        let stage = |coverage: &mut AccountReplayCoverage, id: &str, relay, input| {
-            coverage
-                .stage_delivery(
-                    group_delivery(id, group.clone(), vec![0; 32], 7),
-                    Some(RelayIndex(relay)),
-                    input,
-                    &tx,
-                )
-                .unwrap();
-        };
-        let owed = |coverage: &AccountReplayCoverage, id: &str| {
-            !coverage.endpoint_deadlines[id][&RelayIndex(2)].boundary_admitted
-                && coverage.subscriptions[id][&RelayIndex(2)] == RelayReplay::Incomplete
-        };
-
-        // The relay's own REQ copy of a body its capture already fetched.
-        let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        let paging = paging_for(&mut coverage, &id);
-        assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
-        stage(&mut coverage, &id, 2, ReplayInput::Page);
-        stage(&mut coverage, &id, 2, ReplayInput::History);
-        coverage.stop_capture(&id, RelayIndex(2));
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(losses.pending.lock().unwrap().is_empty());
-        assert!(
-            owed(&coverage, &id),
-            "the capture's source still owes the body"
-        );
-
-        // A peer's REQ copy, dropped first, then the capture is cut.
-        let (mut coverage, id, losses) = replay_coverage(1);
-        stage(&mut coverage, &id, 1, ReplayInput::History);
-        let paging = paging_for(&mut coverage, &id);
-        assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
-        stage(&mut coverage, &id, 2, ReplayInput::Page);
-        coverage.restart_relay(
-            RelayIndex(1),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        assert_eq!(
-            coverage.buffered_items, 1,
-            "the capture still holds the body"
-        );
-        coverage.stop_capture(&id, RelayIndex(2));
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(losses.pending.lock().unwrap().is_empty());
-        assert!(
-            owed(&coverage, &id),
-            "the capture's source still owes the body"
-        );
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(1)],
-            RelayReplay::Awaiting,
-            "the peer's restarted REQ owes it too"
-        );
-
-        // The capture is cut first; the peer's REQ copy is dropped last.
-        let (mut coverage, id, losses) = replay_coverage(1);
-        stage(&mut coverage, &id, 1, ReplayInput::History);
-        let paging = paging_for(&mut coverage, &id);
-        assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
-        stage(&mut coverage, &id, 2, ReplayInput::Page);
-        coverage.stop_capture(&id, RelayIndex(2));
-        assert_eq!(coverage.buffered_items, 1, "the peer still holds the body");
-        assert!(losses.pending.lock().unwrap().is_empty());
-        coverage.restart_relay(
-            RelayIndex(1),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        assert_eq!(coverage.buffered_items, 0);
-        assert_eq!(
-            losses
-                .pending
-                .lock()
-                .unwrap()
-                .get(&MemberId::new(vec![0xA1; 32])),
-            Some(&NostrNotificationLossFloor::Since(100)),
-            "a REQ-only holder dropping the body last keeps its loss"
-        );
-    }
-
-    /// Only a cut leaves the capture's source waiting for the owner. A changed
-    /// connection, a refusal or a removed subscription can let the source be
-    /// admitted without the capture, so dropping its pages there keeps the
-    /// loss. Receiver loss fences the source for the owner and charges none.
-    #[tokio::test(start_paused = true)]
-    async fn capture_pages_keep_loss_unless_the_owner_still_owes_them() {
-        let (tx, _rx) = mpsc::channel(4);
-        let capturing = |coverage: &mut AccountReplayCoverage, id: &str| {
-            coverage.record_eose(id, RelayIndex(1), 0);
-            let paging = paging_for(coverage, id);
-            assert!(coverage.start_route(&paging, &paging.window.per_route()[0]));
-            coverage
-                .stage_delivery(
-                    group_delivery(id, GroupId::new(vec![0; 16]), vec![0; 32], 7),
-                    Some(RelayIndex(2)),
-                    ReplayInput::Page,
-                    &tx,
-                )
-                .unwrap();
-            assert_eq!(coverage.buffered_items, 1);
-        };
-        let charged = |losses: &ReplayLosses| {
-            losses
-                .pending
-                .lock()
-                .unwrap()
-                .get(&MemberId::new(vec![0xA1; 32]))
-                .copied()
-        };
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        capturing(&mut coverage, &id);
-        coverage.restart_relay(
-            RelayIndex(2),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        assert_eq!(coverage.buffered_items, 0);
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(2)],
-            RelayReplay::Awaiting,
-            "a fresh REQ boundary can admit the source again"
-        );
-        assert_eq!(
-            charged(&losses),
-            Some(NostrNotificationLossFloor::Since(100))
-        );
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        capturing(&mut coverage, &id);
-        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
-        assert_eq!(coverage.buffered_items, 0);
-        assert_eq!(
-            charged(&losses),
-            Some(NostrNotificationLossFloor::Since(100))
-        );
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        capturing(&mut coverage, &id);
-        coverage.remove_subscription(&id);
-        assert_eq!(coverage.buffered_items, 0);
-        assert_eq!(
-            charged(&losses),
-            Some(NostrNotificationLossFloor::Since(100))
-        );
-
-        let (mut coverage, id, losses) = replay_coverage(1);
-        capturing(&mut coverage, &id);
-        coverage.restart_relay(
-            RelayIndex(2),
-            ReplayRestart::ReceiverLoss,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        assert_eq!(coverage.buffered_items, 0);
-        assert_eq!(
-            coverage.subscriptions[&id][&RelayIndex(2)],
-            RelayReplay::Incomplete,
-            "receiver loss leaves the source to the owner"
-        );
-        assert!(losses.pending.lock().unwrap().is_empty());
-    }
-
     #[tokio::test(start_paused = true)]
     async fn first_connection_reopens_wait() {
         let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        coverage.record_eose(&id, RelayIndex(1));
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         coverage.expire_replay(tokio::time::Instant::now());
         coverage.restart_relay(
             RelayIndex(2),
@@ -9537,7 +7682,7 @@ mod batch_tests {
         );
         tokio::time::advance(Duration::from_secs(20)).await;
         coverage.record_stored_event(&id, RelayIndex(2), 150);
-        coverage.record_eose(&id, RelayIndex(2), 51_000);
+        coverage.record_eose(&id, RelayIndex(2));
         assert!(
             coverage.snapshot().complete(),
             "initial ownership restarts at the actual connection boundary"
@@ -9548,7 +7693,7 @@ mod batch_tests {
     #[tokio::test(start_paused = true)]
     async fn refusal_keeps_terminal_owner() {
         let (mut coverage, id, _) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
         coverage.restart_relay(
             RelayIndex(2),
@@ -9566,10 +7711,10 @@ mod batch_tests {
         );
         assert!(
             coverage
-                .restart_request(&id, RelayIndex(2), ReplayStart::Capture)
+                .restart_request(&id, RelayIndex(2), ReplayStart::Gap)
                 .is_none()
         );
-        coverage.record_eose(&id, RelayIndex(2), 3);
+        coverage.record_eose(&id, RelayIndex(2));
         assert_eq!(
             coverage.subscriptions[&id][&RelayIndex(2)],
             RelayReplay::Refused
@@ -9577,35 +7722,8 @@ mod batch_tests {
         assert!(coverage.snapshot().settled());
         assert!(
             !coverage.snapshot().complete(),
-            "a removed live REQ is not restored by a private capture"
+            "receiver loss does not restore a removed live REQ"
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn queued_units_get_own_budget() {
-        let (mut coverage, id, losses) = replay_coverage(3);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        let paging = paging_for(&mut coverage, &id);
-        for unit in coverage.page_units(&paging) {
-            assert!(coverage.start_route(&paging, &unit));
-            assert_eq!(
-                coverage.page_deadline(&paging, &unit),
-                Some(tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration)
-            );
-            tokio::time::advance(Duration::from_secs(12)).await;
-            coverage.expire_replay(tokio::time::Instant::now());
-            assert!(
-                coverage.page_allowed(&paging, &unit),
-                "a queued route did not spend its allowance before service"
-            );
-            coverage.finish_route(&paging, &unit);
-        }
-        coverage.finish_paging(&id, RelayIndex(2));
-        assert!(
-            coverage.snapshot().complete(),
-            "the batch may take more than one route allowance"
-        );
-        assert!(losses.pending.lock().unwrap().is_empty());
     }
 
     /// Reports every REQ on `owing` as owed by that unreachable relay.
@@ -9782,12 +7900,12 @@ mod batch_tests {
             views().await,
             (
                 RelayReplay::Awaiting,
-                Some(staged + REPLAY_PAGE_LIMITS.max_duration),
+                Some(staged + REPLAY_WAIT_LIMIT),
                 vec![ReplayAdmission::Waiting],
             ),
         );
 
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         adapter
             .state
             .write()
@@ -9818,7 +7936,7 @@ mod batch_tests {
             views().await,
             (
                 RelayReplay::Awaiting,
-                Some(connected + REPLAY_PAGE_LIMITS.max_duration),
+                Some(connected + REPLAY_WAIT_LIMIT),
                 vec![ReplayAdmission::Waiting],
             ),
         );

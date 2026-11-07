@@ -1,6 +1,6 @@
-//! Fences on a group's live frames (mdk#2660 phase 4): the hold that takes
-//! over from owner capture once the account owner's recovery runner owes a
-//! live REQ's unproven range.
+//! Fences on a group's live frames (mdk#2660 phase 4): the hold that keeps
+//! newer live input behind a live REQ's unproven range while the account
+//! owner's recovery runner owes it.
 //!
 //! A live EOSE that counted stored events leaves `[since, oldest seen]`
 //! unproven on that relay: the relay's cap may have cut what it stored there.
@@ -8,8 +8,7 @@
 //! not go ahead of the older history the owner still fetches. So, once the
 //! owner enables fencing for the account:
 //!
-//! - **Arming.** Such a count, unless native paging fetches that window
-//!   itself, holds every group its REQ routes from the REQ's `since`
+//! - **Arming.** Such a count holds every group its REQ routes from the REQ's `since`
 //!   on, from its EOSE. A count only becomes a fact the owner can see once its
 //!   boundary is admitted, and a boundary is admitted only once its group's
 //!   range left the native hold, so without this the frames would be gone
@@ -23,20 +22,15 @@
 //!   each group's release point. Frames sent before it go out oldest first;
 //!   the rest stay held, their claims kept. A group the plan does not name is
 //!   not fenced by the owner.
-//! - **Owner completion.** For delegated recovery, a hold follows the owner's
-//!   durable backlog, not a network request's deadline. Only an answered count
-//!   and the owner's advancing/released point let newer input go. Request
-//!   timeouts, replay-buffer bounds and loss accounting remain independent.
-//! - **Legacy deadline.** A non-delegated fence holds at most one replay deadline from
-//!   when it began. Then everything it held goes out as late input, as an
-//!   expired peer goes dormant, and the owner's fences hold that group no
-//!   more until a new count arms it again. The range stays owed. A fence left
-//!   holding nothing (no unanswered count, no owner point) ends at once, so
-//!   the next count or plan begins a whole deadline of its own.
+//! - **Owner completion.** A hold follows the owner's durable backlog, not a
+//!   network request's deadline. Only an answered count and the owner's
+//!   advancing/released point let newer input go. Request timeouts,
+//!   replay-buffer bounds and loss accounting remain independent. A fence left
+//!   holding nothing (no unanswered count, no owner point) ends at once.
 //! - **What already left.** A fence holds only what is still in the replay
 //!   buffer. A frame its group already handed off, to native ingress (queued
 //!   or borrowed) or to a draining batch without it, goes on as late input,
-//!   as at the fence's deadline, and the range stays owed.
+//!   and the range stays owed.
 //! - **Replacement.** A fresh activation replaces the account's replay
 //!   coverage. The live frames its fences hold have no other copy, so they
 //!   move to the new coverage, held from the same point until the owner's
@@ -49,20 +43,12 @@
 //!   hand-off that rejoined the buffer keeps its placement pin, which a fence
 //!   that holds it there exempts in the same way. Held frames stay in the
 //!   replay buffer under its bounds: overflow is loss.
-//!
-//! Nothing enables fencing before the switch-over (mdk#2660 PR 5g), so until
-//! then no group is ever fenced and every path below behaves as before.
 
 use super::*;
 
-/// A fence on one group until the owner releases it; legacy holds also expire.
+/// A fence on one group until the owner releases it. A request timeout
+/// cannot complete the owner's acquisition or durable admission.
 pub(super) struct GroupFence {
-    /// Only a non-delegated hold expires. A request timeout cannot complete
-    /// the delegated owner's acquisition or durable admission.
-    deadline: Option<tokio::time::Instant>,
-    /// The deadline passed: what the fence held went out as late input, and
-    /// it holds nothing more until a new count arms the group again.
-    spent: bool,
     /// Counts that armed the hold and that no plan has answered yet.
     armed: Vec<FenceArming>,
     /// The owner's release point, while its plans fence the group.
@@ -88,9 +74,6 @@ struct FenceArming {
 impl GroupFence {
     /// The second from which the fence holds frames, while it holds any.
     pub(super) fn held_from(&self) -> Option<u64> {
-        if self.spent {
-            return None;
-        }
         self.armed
             .iter()
             .map(|arming| arming.since)
@@ -212,11 +195,6 @@ impl AccountReplayCoverage {
         })
     }
 
-    /// When the next fence gives up.
-    pub(super) fn next_fence_deadline(&self) -> Option<tokio::time::Instant> {
-        self.fence_deadlines.first_key_value().map(|(at, _)| *at)
-    }
-
     fn next_fence_ticket(&mut self) -> u64 {
         let ticket = self
             .changes
@@ -229,9 +207,9 @@ impl AccountReplayCoverage {
     }
 
     /// `relay`'s EOSE for `id` just installed a live count: unless it is
-    /// empty or being paged natively, it holds every group the REQ routes until the owner
-    /// answers it (or one replay deadline for a legacy owner). One that does not fence retires
-    /// the endpoint's earlier counts that are no fact.
+    /// empty, it holds every group the REQ routes until the owner answers it.
+    /// One that does not fence retires the endpoint's earlier counts that are
+    /// no fact.
     pub(super) fn arm_fence(&mut self, id: &str, relay: RelayIndex) {
         if !self.fencing || self.maintenance.contains(id) {
             return;
@@ -243,10 +221,7 @@ impl AccountReplayCoverage {
         else {
             return;
         };
-        if !endpoint
-            .live_count
-            .is_some_and(|count| count.events > 0 && (self.recovery_delegated || !count.clamped()))
-        {
+        if !endpoint.live_count.is_some_and(|count| count.events > 0) {
             self.retire_fence_armings(id, relay);
             return;
         }
@@ -255,7 +230,6 @@ impl AccountReplayCoverage {
         let answerable = endpoint.boundary_admitted.then(|| self.next_fence_ticket());
         let since = self.windows.get(id).map_or(0, |window| window.since);
         let request: Arc<str> = Arc::from(id);
-        let now = tokio::time::Instant::now();
         let groups = self
             .request_groups
             .get(id)
@@ -275,7 +249,7 @@ impl AccountReplayCoverage {
                 since,
                 answerable,
             };
-            match group.fence.as_mut().filter(|fence| !fence.spent) {
+            match group.fence.as_mut() {
                 Some(fence) => {
                     // A newer count of the same endpoint replaces its last.
                     fence.armed.retain(|armed| {
@@ -284,20 +258,10 @@ impl AccountReplayCoverage {
                     fence.armed.push(arming);
                 }
                 None => {
-                    let deadline =
-                        (!self.recovery_delegated).then_some(now + REPLAY_PAGE_LIMITS.max_duration);
                     group.fence = Some(GroupFence {
-                        deadline,
-                        spent: false,
                         armed: vec![arming],
                         owner: None,
                     });
-                    if let Some(deadline) = deadline {
-                        self.fence_deadlines
-                            .entry(deadline)
-                            .or_default()
-                            .push(group_id.clone());
-                    }
                 }
             }
         }
@@ -312,7 +276,7 @@ impl AccountReplayCoverage {
             let Some(group) = self.groups.get_mut(group_id) else {
                 continue;
             };
-            let Some(fence) = group.fence.as_mut().filter(|fence| !fence.spent) else {
+            let Some(fence) = group.fence.as_mut() else {
                 continue;
             };
             let held = fence.armed.len();
@@ -390,7 +354,7 @@ impl AccountReplayCoverage {
         let endpoints = &self.endpoint_deadlines;
         let mut released = false;
         for group in self.groups.values_mut() {
-            let Some(fence) = group.fence.as_mut().filter(|fence| !fence.spent) else {
+            let Some(fence) = group.fence.as_mut() else {
                 continue;
             };
             let held = fence.armed.len();
@@ -411,48 +375,9 @@ impl AccountReplayCoverage {
         }
     }
 
-    /// Fences whose replay deadline passed by `now` release everything they
-    /// held, as late input, and hold nothing more until a new count arms
-    /// their group.
-    pub(super) fn expire_fences(&mut self, now: tokio::time::Instant) {
-        let mut released = 0usize;
-        while self
-            .fence_deadlines
-            .first_key_value()
-            .is_some_and(|(deadline, _)| *deadline <= now)
-        {
-            let Some((deadline, groups)) = self.fence_deadlines.pop_first() else {
-                break;
-            };
-            for group_id in groups {
-                if let Some(fence) = self
-                    .groups
-                    .get_mut(&group_id)
-                    .and_then(|group| group.fence.as_mut())
-                    .filter(|fence| fence.deadline == Some(deadline) && !fence.spent)
-                {
-                    fence.spent = true;
-                    fence.armed.clear();
-                    fence.owner = None;
-                    released += 1;
-                }
-            }
-        }
-        if released > 0 {
-            tracing::debug!(
-                target: "transport_nostr_adapter::adapter",
-                method = "expire_fences",
-                groups = released,
-                "fences reached their replay deadline"
-            );
-            self.wake_replay();
-        }
-    }
-
     /// Apply the owner's `plan`: it answers the armings its ticket covers,
     /// and sets the release point of each group it names, beginning a fence
-    /// on a group that has none. A spent fence holds nothing however the
-    /// plan names its group.
+    /// on a group that has none.
     pub(super) fn apply_fence_plan(&mut self, plan: &ReplayFencePlan) {
         self.fencing = true;
         // A plan read before the last one applied answers nothing newer, and
@@ -468,10 +393,7 @@ impl AccountReplayCoverage {
                 .and_modify(|at| *at = (*at).min(fence.release_before))
                 .or_insert(fence.release_before);
         }
-        let deadline = (!self.recovery_delegated)
-            .then(|| tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration);
-        let mut begun = Vec::new();
-        for (group_id, group) in &mut self.groups {
+        for group in self.groups.values_mut() {
             let owner = group
                 .routes
                 .values()
@@ -480,7 +402,6 @@ impl AccountReplayCoverage {
                 .copied()
                 .min();
             match group.fence.as_mut() {
-                Some(fence) if fence.spent => {}
                 Some(fence) => {
                     fence.armed.retain(|arming| {
                         arming
@@ -493,21 +414,12 @@ impl AccountReplayCoverage {
                 None => {
                     if owner.is_some() {
                         group.fence = Some(GroupFence {
-                            deadline,
-                            spent: false,
                             armed: Vec::new(),
                             owner,
                         });
-                        begun.push(group_id.clone());
                     }
                 }
             }
-        }
-        if let Some(deadline) = deadline.filter(|_| !begun.is_empty()) {
-            self.fence_deadlines
-                .entry(deadline)
-                .or_default()
-                .extend(begun);
         }
         self.wake_replay();
     }
@@ -588,9 +500,6 @@ impl AccountReplayCoverage {
         // set; one read from this coverage is at least as new.
         self.fence_plan_ticket = self.fence_plan_ticket.max(carried.plan_ticket);
         self.fence_ticket = self.fence_ticket.max(carried.plan_ticket);
-        let deadline = (!self.recovery_delegated)
-            .then(|| tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration);
-        let mut begun = Vec::new();
         let mut lost = false;
         for (group_id, delivery, held) in carried.frames {
             let bytes = delivery.message.payload.len();
@@ -621,27 +530,18 @@ impl AccountReplayCoverage {
             if held {
                 let from = carried.from[&group_id];
                 match group.fence.as_mut() {
-                    Some(fence) if !fence.spent => {
+                    Some(fence) => {
                         fence.owner = Some(fence.owner.map_or(from, |owner| owner.min(from)));
                     }
-                    _ => {
+                    None => {
                         group.fence = Some(GroupFence {
-                            deadline,
-                            spent: false,
                             armed: Vec::new(),
                             owner: Some(from),
                         });
-                        begun.push(group_id.clone());
                     }
                 }
             }
             self.retained_since = Some(self.retained_since.map_or(since, |floor| floor.min(since)));
-        }
-        if let Some(deadline) = deadline.filter(|_| !begun.is_empty()) {
-            self.fence_deadlines
-                .entry(deadline)
-                .or_default()
-                .extend(begun);
         }
         if lost {
             self.record_loss(carried.floor.unwrap_or(0));
@@ -651,12 +551,12 @@ impl AccountReplayCoverage {
 }
 
 /// End a fence that holds nothing any more: no unanswered count, no owner
-/// point. Its deadline entry then matches no fence.
+/// point.
 fn end_idle(group: &mut GroupReplay) {
     if group
         .fence
         .as_ref()
-        .is_some_and(|fence| !fence.spent && fence.armed.is_empty() && fence.owner.is_none())
+        .is_some_and(|fence| fence.armed.is_empty() && fence.owner.is_none())
     {
         group.fence = None;
     }
@@ -759,8 +659,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        coverage.record_eose(id, RelayIndex(1), 0);
-        coverage.record_eose(id, RelayIndex(2), 0);
+        coverage.record_eose(id, RelayIndex(1));
+        coverage.record_eose(id, RelayIndex(2));
     }
 
     /// What the next drain releases, as (group, created_at), oldest first.
@@ -895,7 +795,6 @@ mod tests {
     /// replay losses the coverage they sit in charges.
     fn held_live(groups: &[u8]) -> (AccountReplayCoverage, Arc<ReplayLosses>) {
         let (mut coverage, id, losses) = fenced_coverage(true);
-        coverage.recovery_delegated = true;
         let (tx, mut rx) = mpsc::channel(8);
         replay(&mut coverage, &id, &[(0, 150)], &tx);
         coverage.apply_fence_plan(&plan(&coverage, &[(0, 200), (1, 200)]));
@@ -918,14 +817,13 @@ mod tests {
         (coverage, losses)
     }
 
-    /// Delegated recovery waits one replay deadline for a live REQ's EOSE and
+    /// The adapter waits one replay deadline for a live REQ's EOSE and
     /// no longer: a relay that never sends one has failed. The frames only it
     /// sent are dropped and owed from the REQ's floor, the account's admission
     /// stops waiting, and the group's later live frames flow unfenced.
     #[tokio::test(start_paused = true)]
     async fn a_relay_that_never_sends_eose_fails_after_one_deadline() {
         let (mut coverage, id, losses) = fenced_coverage(true);
-        coverage.recovery_delegated = true;
         let (tx, mut rx) = mpsc::channel(8);
         coverage.record_stored_event(&id, RelayIndex(1), 150);
         coverage
@@ -936,14 +834,14 @@ mod tests {
                 &tx,
             )
             .unwrap();
-        coverage.record_eose(&id, RelayIndex(2), 0);
+        coverage.record_eose(&id, RelayIndex(2));
         assert!(
             released(&mut coverage).is_empty(),
             "relay 1 may still send older frames"
         );
         assert!(coverage.admission_pending());
 
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        tokio::time::advance(REPLAY_WAIT_LIMIT).await;
         coverage.expire_replay(tokio::time::Instant::now());
         assert!(
             released(&mut coverage).is_empty(),
@@ -979,7 +877,6 @@ mod tests {
             ..AdapterState::default()
         };
         state.replay_fencing.insert(account());
-        state.delegated_recovery.insert(account());
         state.account_replay_coverage.insert(account(), coverage);
         let routes = routed.iter().map(|&group| route(group)).collect::<Vec<_>>();
         let batch = pack_group_batches(&account(), &routes, SubscriptionAttempt::INITIAL.next(), 0)
@@ -992,7 +889,7 @@ mod tests {
             .account_replay_coverage
             .get_mut(&account())
             .unwrap()
-            .record_eose(&batch.subscription_id(), relay, 0);
+            .record_eose(&batch.subscription_id(), relay);
         state
     }
 
@@ -1034,7 +931,6 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_activation_keeps_live_frames_waiting_for_admission() {
         let (mut coverage, id, losses) = fenced_coverage(true);
-        coverage.recovery_delegated = true;
         let (tx, mut rx) = mpsc::channel(8);
         coverage
             .stage_delivery(
@@ -1095,7 +991,7 @@ mod tests {
                 &tx,
             )
             .unwrap();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(held_from(&coverage, 0), Some(SINCE), "armed at its EOSE");
         assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
         coverage.restart_relay(
@@ -1127,12 +1023,12 @@ mod tests {
                 &tx,
             )
             .unwrap();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(held_from(&coverage, 0), Some(SINCE));
         assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
         coverage.record_refusal(&id, RelayIndex(1), SubscriptionRefusalDisposition::Pending);
         assert_eq!(held_from(&coverage, 0), None, "the count ended unadmitted");
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert!(
             coverage.endpoint_deadlines[&id][&RelayIndex(1)]
                 .live_count
@@ -1160,7 +1056,7 @@ mod tests {
                 &tx,
             )
             .unwrap();
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(held_from(&coverage, 0), Some(SINCE));
         // The count ends with nothing pruning at once.
         coverage
@@ -1171,7 +1067,7 @@ mod tests {
             .unwrap()
             .hold_live_count(true);
         assert_eq!(held_from(&coverage, 0), Some(SINCE), "not yet pruned");
-        coverage.record_eose(&id, RelayIndex(1), 0);
+        coverage.record_eose(&id, RelayIndex(1));
         assert_eq!(held_from(&coverage, 0), None);
     }
 
@@ -1179,11 +1075,8 @@ mod tests {
     /// no arming of that count a fact, so the next prune drops it.
     #[tokio::test]
     async fn an_ended_count_admitted_later_is_no_fact() {
-        for (delegated, immediate_prune) in
-            [(false, false), (false, true), (true, false), (true, true)]
-        {
+        for immediate_prune in [false, true] {
             let (mut coverage, id, _) = fenced_coverage(true);
-            coverage.recovery_delegated = delegated;
             let (tx, _rx) = mpsc::channel(8);
             replay(&mut coverage, &id, &[(0, 150)], &tx);
             coverage.apply_fence_plan(&plan(&coverage, &[]));
@@ -1204,7 +1097,7 @@ mod tests {
                     &tx,
                 )
                 .unwrap();
-            coverage.record_eose(&id, RelayIndex(1), 0);
+            coverage.record_eose(&id, RelayIndex(1));
             assert_eq!(held_from(&coverage, 0), Some(SINCE));
             assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
             if immediate_prune {
@@ -1240,78 +1133,26 @@ mod tests {
         }
     }
 
-    /// A full reply starts native paging only for a legacy owner. A delegated
-    /// account admits the received input behind its fence without certifying
-    /// that the relay served the original query completely.
+    /// A full reply admits the received input behind its fence without
+    /// certifying that the relay served the original query completely: the
+    /// recovery runner owes the rest.
     #[tokio::test]
     async fn a_full_live_reply_delegates_debt_without_certifying_complete_history() {
-        for delegated in [false, true] {
-            let (mut coverage, id, _) = fenced_coverage(true);
-            coverage.recovery_delegated = delegated;
-            for at in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
-                coverage.record_stored_event(&id, RelayIndex(1), SINCE + at);
-            }
-            let capture = coverage.record_eose(&id, RelayIndex(1), 0);
-            assert_eq!(capture.is_some(), !delegated, "only the legacy path pages");
-            assert!(
-                coverage.endpoint_deadlines[&id][&RelayIndex(1)]
-                    .live_count
-                    .is_some_and(|count| count.clamped())
-            );
-            assert_eq!(coverage.snapshot().relay_subscription_attempts_with_eose, 0);
-            for group in [0, 1] {
-                assert_eq!(held_from(&coverage, group), delegated.then_some(SINCE));
-            }
-            if delegated {
-                assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
-            }
-        }
-    }
-
-    /// A fence holds at most one replay deadline: then what it held goes out
-    /// as late input, and the owner's fences hold that group no more, until a
-    /// new count arms it again.
-    #[tokio::test(start_paused = true)]
-    async fn a_fence_holds_at_most_one_replay_deadline() {
         let (mut coverage, id, _) = fenced_coverage(true);
-        let (tx, mut rx) = mpsc::channel(8);
-        replay(&mut coverage, &id, &[(0, 150)], &tx);
-        coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration - Duration::from_secs(1)).await;
-        coverage.expire_replay(tokio::time::Instant::now());
-        coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
-        assert!(released(&mut coverage).is_empty(), "within its deadline");
-        tokio::time::advance(Duration::from_secs(1)).await;
-        coverage.expire_replay(tokio::time::Instant::now());
-        assert_eq!(held_from(&coverage, 0), None);
-        assert_eq!(released(&mut coverage), vec![(0, 150)]);
-
-        coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
-        assert_eq!(held_from(&coverage, 0), None, "a spent fence holds nothing");
-        coverage
-            .stage_delivery(
-                delivery(0, 400, 9, &id, 1),
-                Some(RelayIndex(1)),
-                ReplayInput::Live,
-                &tx,
-            )
-            .unwrap();
-        assert_eq!(sent(&mut rx), vec![(0, 400)]);
-
-        coverage.restart_relay(
-            RelayIndex(1),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
+        for at in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
+            coverage.record_stored_event(&id, RelayIndex(1), SINCE + at);
+        }
+        coverage.record_eose(&id, RelayIndex(1));
+        assert!(
+            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                .live_count
+                .is_some_and(|count| count.clamped())
         );
-        coverage.record_stored_event(&id, RelayIndex(1), 450);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        assert_eq!(
-            held_from(&coverage, 0),
-            Some(SINCE),
-            "a new count arms it again"
-        );
+        assert_eq!(coverage.snapshot().relay_subscription_attempts_with_eose, 0);
+        for group in [0, 1] {
+            assert_eq!(held_from(&coverage, group), Some(SINCE));
+        }
+        assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
     }
 
     /// Delegated history may take arbitrarily many bounded requests. Neither
@@ -1319,18 +1160,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn delegated_backlog_releases_only_as_its_owner_advances() {
         let (mut coverage, id, _) = fenced_coverage(true);
-        coverage.recovery_delegated = true;
         let (tx, _rx) = mpsc::channel(8);
         replay(&mut coverage, &id, &[(0, 150), (0, 300)], &tx);
 
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration * 2).await;
+        tokio::time::advance(REPLAY_WAIT_LIMIT * 2).await;
         coverage.expire_replay(tokio::time::Instant::now());
         assert_eq!(held_from(&coverage, 0), Some(SINCE), "await the owner");
         assert!(released(&mut coverage).is_empty());
 
         coverage.apply_fence_plan(&plan(&coverage, &[(0, 150)]));
         for _ in 0..3 {
-            tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration * 2).await;
+            tokio::time::advance(REPLAY_WAIT_LIMIT * 2).await;
             coverage.expire_replay(tokio::time::Instant::now());
             assert!(
                 released(&mut coverage).is_empty(),
@@ -1341,7 +1181,7 @@ mod tests {
         assert_eq!(released(&mut coverage), vec![(0, 150)]);
         assert_eq!(held_from(&coverage, 0), Some(200));
 
-        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration * 2).await;
+        tokio::time::advance(REPLAY_WAIT_LIMIT * 2).await;
         coverage.expire_replay(tokio::time::Instant::now());
         assert!(
             released(&mut coverage).is_empty(),
@@ -1408,47 +1248,6 @@ mod tests {
         assert_eq!(released(&mut coverage), vec![(0, 150)]);
     }
 
-    /// A count that ends before it is a fact spends no deadline: its fence
-    /// ends with its arming, and the next count holds for a whole deadline.
-    #[tokio::test(start_paused = true)]
-    async fn a_count_that_ends_unadmitted_spends_no_deadline() {
-        let (mut coverage, id, _) = fenced_coverage(true);
-        let (tx, _rx) = mpsc::channel(8);
-        coverage.record_stored_event(&id, RelayIndex(2), 140);
-        coverage.record_stored_event(&id, RelayIndex(1), 150);
-        coverage
-            .stage_delivery(
-                delivery(0, 150, 1, &id, 1),
-                Some(RelayIndex(1)),
-                ReplayInput::History,
-                &tx,
-            )
-            .unwrap();
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        assert_eq!(held_from(&coverage, 0), Some(SINCE));
-        tokio::time::advance(Duration::from_secs(20)).await;
-        coverage.restart_relay(
-            RelayIndex(1),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        coverage.prune_fence_armings();
-        assert!(coverage.groups[&group_id(0)].fence.is_none());
-
-        coverage.record_stored_event(&id, RelayIndex(1), 160);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        assert_eq!(held_from(&coverage, 0), Some(SINCE));
-        tokio::time::advance(Duration::from_secs(11)).await;
-        coverage.expire_replay(tokio::time::Instant::now());
-        assert_eq!(
-            held_from(&coverage, 0),
-            Some(SINCE),
-            "the first fence's deadline is not this one's"
-        );
-    }
-
     /// Without native ingress, a hand-off waiting for channel capacity
     /// rejoins the buffer only for an arrival to sort in, never for frames a
     /// fence holds behind it. A fence that moves below it does not call it
@@ -1512,7 +1311,7 @@ mod tests {
             None,
             None,
         );
-        coverage.record_eose(&id, RelayIndex(2), 0);
+        coverage.record_eose(&id, RelayIndex(2));
         assert!(coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
         coverage.apply_fence_plan(&plan(&coverage, &[]));
         assert_eq!(released(&mut coverage), vec![(0, 150), (0, 160), (0, 300)]);
@@ -1545,47 +1344,11 @@ mod tests {
                 &tx,
             )
             .unwrap();
-        coverage.record_eose(&id, RelayIndex(2), 0);
+        coverage.record_eose(&id, RelayIndex(2));
         assert_eq!(held_from(&coverage, 0), Some(SINCE));
         assert_eq!(coverage.fence_held_items(), 1);
         assert!(coverage.admission_pending(), "the first copy is still out");
         assert!(!coverage.request_groups_placed(&id, true));
-    }
-
-    /// A fence holds its frames for order, not for completeness: a clamped
-    /// batch's paging goes on to the next group while the fenced group's held
-    /// frames wait.
-    #[tokio::test]
-    async fn held_frames_do_not_stall_the_next_groups_paging() {
-        let (mut coverage, id, _) = fenced_coverage(true);
-        let (tx, _rx) = mpsc::channel(8);
-        replay(&mut coverage, &id, &[(0, 150), (1, 160)], &tx);
-        coverage.apply_fence_plan(&plan(&coverage, &[(0, 120)]));
-        assert_eq!(released(&mut coverage), vec![(1, 160)]);
-        coverage.ack_placement(&delivery(1, 160, 2, &id, 1).message.id);
-        let window = ReplayWindow {
-            scope: ReplayScope::Groups(vec![[0; 32]]),
-            since: SINCE,
-        };
-        let paging = ReplayPaging {
-            account_id: account(),
-            subscription_id: id.clone(),
-            endpoint: TransportEndpoint("wss://a.example".to_owned()),
-            relay: RelayIndex(1),
-            serial: 0,
-            window: window.clone(),
-            until: REPLAY_OPEN_UNTIL,
-            credit: None,
-        };
-        assert!(
-            !coverage.groups[&group_id(0)].ready_history.is_empty()
-                || coverage.groups[&group_id(0)]
-                    .streams
-                    .values()
-                    .any(|stream| !stream.claims.is_empty()),
-            "the held frame keeps its claim"
-        );
-        assert!(!coverage.route_release_pending(&paging, &window));
     }
 
     /// Held frames stay inside the replay buffer's bounds: what does not fit

@@ -43,8 +43,8 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   An injected client's `relay_notification_source` runs under the same supervisor and dispatch as the SDK's stream,
   so a fake relay's EOSE, CLOSED and EVENT reach the plane as a relay's do; give a fake relay client one instead of a
   hook into the adapter.
-- Recovery debt, retry selection and native input qualification belong to the app's AccountRecoveryOwner.
-  Bridge frozen capture plans, the owner's fence plans and borrowed source guards; never schedule quiet-period
+- Recovery debt, retry selection and native input qualification belong to the app's recovery runner.
+  Bridge the runner's fence plans and borrowed source guards; never fetch history of the plane's own or schedule quiet-period
   repair here. Import actual loss before cursor authorization and retain placement/spill locking through the owner's
   callback. The cursor seal caps at the oldest frame the adapter's fence holds at or above the restart floor, as it
   does at a queued delivery.

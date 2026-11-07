@@ -96,7 +96,7 @@ impl PendingMessageBatch {
 
     async fn activate_then_publish(&mut self, bob: &mut AppClient) {
         // These faults belong to ordinary native ingress, which remains
-        // supported with both backward pagers disabled. Establish its live
+        // supported without a native backward pager. Establish its live
         // subscription before publishing; cold replay may instead be admitted
         // by the recovery runner and cannot witness native-drain faults.
         assert!(bob.sync().await.unwrap().messages.is_empty());

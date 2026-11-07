@@ -138,8 +138,9 @@ The simulator comes first; Jeff validates on a phone.
 > replay now only records its REQ windows as ledger debt. Ordered native admission, its turn bound
 > and the cursor seal below remain. Conversion deletes every `SubscriptionReplay` obligation
 > before the first subscription, and nothing makes new ones, so rebuilt REQs ask from the
-> transport cursor less the rebuild lookback alone (#2793). Row 8 of mdk#2660 deletes the
-> remaining `SubscriptionReplay` storage and the adapter's pager.
+> transport cursor less the rebuild lookback alone (#2793). Row 8 of mdk#2660 deleted the
+> adapter's own capture and pager; the remaining `SubscriptionReplay` storage has no production
+> writer and goes with the other data-dead leftovers.
 
 `SubscriptionReplay` records the original live inbox and group query windows. It is not a loss charge.
 Unresolved floors survive cancellation, source replacement and reopen; an unfloored query stays unfloored.
@@ -456,7 +457,7 @@ relay, and three notification lags during the replay.
 A live ingest's own save now promotes the cursor to what the account ingested, when:
 
 - the owner's limited native-input goal is completed or explicitly retired for the guarded source generation;
-  all original ranges must be placed before admission, including backward pages and newly added group REQs;
+  all original ranges must be placed before admission, including newly added group REQs;
 - no loss or spill hand-off is pending, as for any other checkpoint;
 - the cursor advances (not a frozen wake pass) and restarts rebuild from it;
 - the account has a settled floor (below). An account that has never persisted a cursor
@@ -802,9 +803,8 @@ fetches over the ledger and the retry state above, for every account. The old ow
 native capture, comparison job and the `runner_owns_debt` gate that chose between them are
 deleted (5c2a846b4 is the last commit with the old owner). Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
-ledger debt. Autonomous clamp continuation is disabled for app-owned accounts; ordinary native
-input, count facts and bounded fences remain. Supported
-lower-level adapter/session callers still retain the native pager pending its replacement.
+ledger debt. The adapter fetches no history of its own: a full live reply leaves the rest to the
+runner, while ordinary native input, count facts and bounded fences remain.
 With runner ownership (`recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
 exit, a quantum in flight included. A directly owned client runs one pass in place from
@@ -908,8 +908,8 @@ Thus an unavailable relay cannot prevent return visits to healthy relays. After 
 obligation parks visibly. Partial sweep progress does not reset this visit budget. Its count, unfinished-visit
 state and next retry time survive restart, and revisions of a ticket at the same missing epoch preserve them.
 A higher stalled epoch or explicit repair starts a fresh budget. Actual local epoch advancement clears the gap;
-reading all history successfully does not. Suspended groups receive no visits. These visits are unfenced and
-do not enable either native backward pager. Healthy routes retain the six-hour NIP-77-only periodic policy.
+reading all history successfully does not. Suspended groups receive no visits. These visits are unfenced.
+Healthy routes retain the six-hour NIP-77-only periodic policy.
 
 
 Coverage and retention do not imply decryptability. The ledger can prove a range and retain its events while
@@ -1056,6 +1056,11 @@ Deleted once the recovery runner owned all debt (#2660 phase 4; 5c2a846b4 is the
 the old owner):
 
 - The rebuilt REQ floor's lowering to an unadmitted `SubscriptionReplay` scope's floor (#2793).
+- The adapter's owner-granted capture (`capture_replay`, `ReplayCapturePlan`, its outcome and
+  token, the cut-capture `loss_debt`), its native clamp pager and autonomous clamp continuation
+  (`page_replay`, `REPLAY_PAGE_MAX_PAGES`, `REPLAY_PAGE_LIMITS`), the per-account
+  `delegate_replay_recovery` switch and the fence's request deadline (row 8). A full live reply
+  always delegates the rest to the runner.
 - The owner grant (`AttemptGrant`, `authorize_account_recovery`), its capture tokens, plan and
   outcome, and the capture outcome in settlement.
 - `client/sync/comparison_job.rs`: the comparison job, its startup and maintenance passes, the
@@ -1079,7 +1084,9 @@ Still to delete:
 - Old-owner paths no current data reaches: the comparison slot `request_bounded_comparison`
   still joins, qualified-stagnation escalation, capacity-wait eligibility, legacy obligation
   notices, and the storage and adapter APIs only the old owner called.
-- The adapter's native pager and `SubscriptionReplay` (row 8).
+- Data-dead APIs no production code calls since row 8: the storage `SubscriptionReplay` APIs
+  and their test-only writer, the maintenance REQ API (`install_group_maintenance_*`), and the
+  window acquisition scopes (`AccountInboxWindow`, `GroupWindow`, `GroupsWindow`).
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
 Each PR reports exact before/after line counts. The goal is a large net reduction across
@@ -1185,23 +1192,12 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   there cannot certify. The inbox's two-day NIP-59 widening sets that floor at least two
   days back on every route; per-route floors would need per-scope storage. Relays that
   ignore `since` are not detected.
-- Lost end-of-stored-events (#2070, #2375, #2381). Ordered receiver gaps fence the source;
-  they never infer completion from an out-of-band SDK EOSE flag or re-issue its live REQ.
-  The account owner preserves original query windows and grants bounded private capture
-  under its existing retry policy and process credit. Captures and delivery draining
-  survive notification-worker cancellation; owner cancellation retains credit through IO
-  cleanup. Empty expiry creates no loss. Actual discarded ciphertext and real notification
-  gaps retain separate loss evidence. A capture cut by its comparison deadline, or failed,
-  discards what its source held without new loss, including copies the live REQ delivered
-  before the capture: the source stays unadmitted, the pending obligation still owes that
-  window, and a new loss would wipe that obligation's scope certificates so it could never
-  finish. That loss is deferred on the source, not dropped: a finished capture clears it,
-  and a reconnect, refusal, removal or execution failure records it, since the source can
-  then be admitted or retired without the capture. A parked obligation, or one whose notice
-  the user dismissed, schedules no capture, so the debt stays deferred until one of those
-  happens: until then the history the cut discarded is reported only by that notice, as
-  possibly incomplete, not as new loss. Native clamp paging is not an owner capture; its
-  cut records loss at once. See design section 0 for the limited native predicate.
+- Lost end-of-stored-events (#2070, #2375, #2381). Ordered receiver gaps abandon the
+  source's open streams; they never infer completion from an out-of-band SDK EOSE flag or
+  re-issue its live REQ. The recovery runner owes the window as ledger debt; the adapter
+  fetches nothing of its own. Delivery draining survives notification-worker cancellation.
+  Empty expiry creates no loss. Actual discarded ciphertext and real notification gaps retain
+  separate loss evidence. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored

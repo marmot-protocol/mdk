@@ -131,9 +131,9 @@ seconds after the last send to arrive.
 Old-owner comparisons run from the frozen old-owner build (623500b48), whose copy of these proofs carries its own
 control mode; this build has no old owner to compare.
 
-The proofs require both native backward-paging entry points off. Bob's bounded window/by-id requests and aggregate
-runner work together witness that: both native pager paths issue unlimited history-window REQs, which every proof
-rejects. Live REQs have no `until`; runner slices and by-id fetches have limits with the published cap. The wire tap
+The proofs require that no native backward paging runs; the adapter's pager is deleted, and the wire keeps the
+check. Bob's bounded window/by-id requests and aggregate runner work together witness that: native paging issued
+unlimited history-window REQs, which every proof rejects. Live REQs have no `until`; runner slices and by-id fetches have limits with the published cap. The wire tap
 also records packed live group REQs through EOSE, including raw counts, so the fence proof waits for actual replies.
 
 - `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint

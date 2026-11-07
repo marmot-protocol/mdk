@@ -40,7 +40,7 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     is owned by marmot-app's host tests.
     The named 6,000-event ordered-backlog regression retains the captured three-sender failure, competing live
     input, exact visible history and full account reopen. Failed proofs preserve their stopped fixture privately.
-    Bob runs in process with both native backward pagers disabled; zero unlimited history windows witnesses that
+    Bob runs in process, and the adapter has no native backward pager; zero unlimited history windows witnesses that
     on the wire. The fence starts from actual packed-REQ EOSE counts, never a sleep-to-settle assumption. Count bob's own history requests
     (`client_history_requests`), and give any bound that an idle runner would meet a control that it fails.
 

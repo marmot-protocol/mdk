@@ -23,12 +23,12 @@ App account-history recovery uses one coverage-ledger runner (#2660) for startup
 convergence and explicit repair. Before subscriptions activate, it converts retained recovery obligations and
 records loss as durable debt; a worker runs bounded acquisition off its command loop, while a directly owned
 client runs a pass from its event/sync calls. Ordinary native subscription input still enters through the ordered
-admission path. Owner-granted backward capture and the old owner's comparison job are deleted, and autonomous clamp
-continuation is disabled for these accounts. Nonempty live replies may hold bounded fences; empty replies and restart gaps remain unfenced debt.
+admission path. Owner-granted backward capture, the native clamp pager and the old owner's comparison job are
+deleted: the adapter fetches no history of its own, and a full live reply leaves the rest to the runner. Nonempty
+live replies may hold bounded fences; empty replies and restart gaps remain unfenced debt.
 Unresolved epoch gaps authorize paced, bounded return visits to retained group history, including relays without
 NIP-77. Their visit budget survives restart, and exhaustion remains visibly unresolved.
-Coverage, durable retention and visible/decryptable chat history are separate claims. Lower-level adapter/session
-embedders still retain the native pager, whose raw-page accounting and retirement remain tracked by #2885.
+Coverage, durable retention and visible/decryptable chat history are separate claims.
 See [account history recovery](../further-context/account-recovery.md) and the
 [bounded acquisition interface](nostr-bounded-acquisition-interface.md).
 
