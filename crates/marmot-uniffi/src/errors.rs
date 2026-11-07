@@ -1235,6 +1235,86 @@ mod tests {
     }
 
     #[test]
+    fn group_access_errors_keep_typed_actions_and_distinct_identity_payloads() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let group = cgka_traits::GroupId::new(vec![0x11; 16]);
+        let member = cgka_traits::MemberId::new(vec![0x22; 32]);
+        let cases: [(EngineError, Expected); 7] = [
+            (
+                EngineError::UnknownGroup(group.clone()),
+                |e| matches!(e, MarmotKitError::UnknownGroup { group_id_hex } if group_id_hex == &"11".repeat(16)),
+            ),
+            (
+                EngineError::GroupNotHydrated(group.clone()),
+                |e| matches!(e, MarmotKitError::GroupHydrationPending { group_id_hex } if group_id_hex == &"11".repeat(16)),
+            ),
+            (
+                EngineError::NotGroupAdmin {
+                    group_id: group.clone(),
+                },
+                |e| matches!(e, MarmotKitError::NotGroupAdmin { group_id_hex } if group_id_hex == &"11".repeat(16)),
+            ),
+            (
+                EngineError::AdminCannotSelfRemove {
+                    group_id: group.clone(),
+                },
+                |e| matches!(e, MarmotKitError::AdminCannotSelfRemove { group_id_hex } if group_id_hex == &"11".repeat(16)),
+            ),
+            (
+                EngineError::AdminDepletion {
+                    group_id: group.clone(),
+                },
+                |e| matches!(e, MarmotKitError::WouldRemoveLastAdmin { group_id_hex } if group_id_hex == &"11".repeat(16)),
+            ),
+            (
+                EngineError::UnknownMember {
+                    group_id: group.clone(),
+                    member: member.clone(),
+                },
+                |e| matches!(e, MarmotKitError::MemberNotInGroup { group_id_hex, member_id_hex } if group_id_hex == &"11".repeat(16) && member_id_hex == &"22".repeat(32)),
+            ),
+            (
+                EngineError::DisbandingUnsupportedMembers {
+                    group_id: group,
+                    members: vec![member, cgka_traits::MemberId::new(vec![0x33; 32])],
+                },
+                |e| matches!(e, MarmotKitError::DisbandingUnsupportedMembers { group_id_hex, member_ids_hex } if group_id_hex == &"11".repeat(16) && member_ids_hex == &vec!["22".repeat(32), "33".repeat(32)]),
+            ),
+        ];
+        for (source, expected) in cases {
+            let ffi = MarmotKitError::from_engine_error(&source);
+            assert!(expected(&ffi), "{source:?} mapped to {ffi:?}");
+        }
+    }
+
+    #[test]
+    fn app_group_gates_preserve_the_host_recovery_action() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: [(AppError, Expected); 4] = [
+            (
+                AppError::GroupDisbanding("ab".repeat(16)),
+                |e| matches!(e, MarmotKitError::GroupDisbanding { group_id_hex } if group_id_hex == &"ab".repeat(16)),
+            ),
+            (
+                AppError::GroupRemoved("ab".repeat(16)),
+                |e| matches!(e, MarmotKitError::GroupRemoved { group_id_hex } if group_id_hex == &"ab".repeat(16)),
+            ),
+            (
+                AppError::GroupCatchingUp("ab".repeat(16)),
+                |e| matches!(e, MarmotKitError::GroupCatchingUp { group_id_hex } if group_id_hex == &"ab".repeat(16)),
+            ),
+            (
+                AppError::GroupCommitUndelivered("ab".repeat(16)),
+                |e| matches!(e, MarmotKitError::GroupCommitUndelivered { group_id_hex } if group_id_hex == &"ab".repeat(16)),
+            ),
+        ];
+        for (source, expected) in cases {
+            let ffi = MarmotKitError::from(&source);
+            assert!(expected(&ffi), "{source:?} mapped to {ffi:?}");
+        }
+    }
+
+    #[test]
     fn recovery_error_retry_meaning() {
         let group_id = cgka_traits::GroupId::new(vec![0x33; 16]);
         let expected = hex::encode(group_id.as_slice());
