@@ -898,6 +898,14 @@ mod tests {
         hints.sent(&key(), &req("d", vec![filter(60)]));
         assert!(!watch.more());
 
+        // The same bound id on another relay neither supplies a hint nor
+        // consumes this relay's first EOSE, even when it carries no hint.
+        hints.received("wss://elsewhere.example.com/", r#"["EOSE","c",["more"]]"#);
+        hints.received("wss://elsewhere.example.com/", r#"["EOSE","c"]"#);
+        hints.received("wss://elsewhere.example.com/", r#"["EOSE","d",["more"]]"#);
+        assert!(!watch.more());
+        assert!(!other.more());
+
         // Only the bound id's EOSE counts, and only its first.
         hints.received(&key(), r#"["EOSE","b",["more"]]"#);
         hints.received(&key(), r#"["EVENT","c",{}]"#);
