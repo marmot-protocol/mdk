@@ -163,7 +163,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
     application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit
     retry (none for a quarantined group, whose park reads as none), and keeps its count, delay and park across a
-    restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
+    restart; a rejected final Completed-pass write restores independent encrypted canonical rows before reopen
+    and retries the same generation; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
     a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
 - **File:** `apply_history_cost.rs`
