@@ -16722,6 +16722,13 @@ fn same_account_group_reloads_fold_the_newest_real_page() {
         } else {
             timeline_ids(&app.timeline).contains(&"new-row")
                 && rendered_buffer(&mut app).contains("new-row")
+                && app.messages_account_id.as_deref() == Some(account.as_str())
+                && app.messages_group_id.as_deref() == Some(group.as_str())
+                && if subscription_error {
+                    app.status.starts_with("timeline subscription failed: ")
+                } else {
+                    app.status == "loaded 2 message(s)"
+                }
         };
         observed.push((
             first_error,
