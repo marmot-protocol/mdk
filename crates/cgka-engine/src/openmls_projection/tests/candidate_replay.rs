@@ -2182,9 +2182,27 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
     adopt_branch(&bob_storage, &group_id, &first);
-    admit_rival(&alice_storage, &group_id, &stale, 1);
+    // Move far enough that epoch 1 is below the actual pinned horizon,
+    // while both devices still share the source state of the later fork.
+    let fork_epoch = V1_MAX_REWIND_COMMITS + 1;
+    for _ in 2..fork_epoch {
+        let SendResult::GroupEvolution { msg, pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected GroupEvolution")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        adopt_branch(&bob_storage, &group_id, &msg);
+    }
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(fork_epoch));
+    let tip_epoch = fork_epoch + 1;
+    assert_eq!(tip_epoch - V1_MAX_REWIND_COMMITS, 2);
 
-    // Alice commits at epoch 2 and advances; Bob forks from the same epoch.
+    // Alice advances from the shared source; Bob forks from that same epoch.
     let own_commit = match alice
         .send(SendIntent::SelfUpdate {
             group_id: group_id.clone(),
@@ -2198,18 +2216,26 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
         }
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
-    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(tip_epoch));
     let rival = rival_commit(&bob_storage, &member_id(b"peel-halt-bob"), &group_id);
-    admit_rival(&alice_storage, &group_id, &rival, 2);
+    admit_rival(&alice_storage, &group_id, &rival, fork_epoch);
+    admit_rival(&alice_storage, &group_id, &stale, 1);
 
     // Control: with the checkpoint in place both branches materialize, so
     // the halt below is what empties the contexts — not a graph that never
     // had two branches to enumerate.
     let enumerated = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
     assert!(enumerated.contested);
+    assert_eq!(
+        enumerated.contexts.len(),
+        2,
+        "the in-horizon fork offers both branch contexts"
+    );
     assert!(
-        enumerated.contexts.len() > 1,
-        "a two-way epoch-2 fork offers a context per branch"
+        enumerated
+            .contexts
+            .iter()
+            .all(|context| context.tip_epoch == tip_epoch)
     );
 
     let mut selected = super::canonicalize_stored_openmls_messages(
@@ -2217,7 +2243,7 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
         &group_id,
         super::CanonicalizationState {
             retained_anchor_epoch: 2,
-            ..reconstruction_state(3)
+            ..reconstruction_state(tip_epoch)
         },
         vec![],
         super::CanonicalizationPolicy::default(),
@@ -2227,8 +2253,8 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     // Selection may prefer either sibling. Exercise applying the own branch
     // after its checkpoint disappears between selection and application.
     selected.accepted_commits = vec![hex::encode(own_commit.id.as_slice())];
-    selected.selected_tip = Some(3);
-    selected.selected_fork_epoch = Some(2);
+    selected.selected_tip = Some(tip_epoch);
+    selected.selected_fork_epoch = Some(fork_epoch);
     alice_storage
         .update_message_state(&own_commit.id, MessageState::ConvergenceDeferred)
         .unwrap();
@@ -2267,7 +2293,7 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
                     &group_id,
                     super::CanonicalizationState {
                         retained_anchor_epoch: 2,
-                        ..reconstruction_state(3)
+                        ..reconstruction_state(tip_epoch)
                     },
                     vec![],
                     super::CanonicalizationPolicy::default(),
