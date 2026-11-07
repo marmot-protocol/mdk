@@ -398,7 +398,17 @@ async fn a_held_range_certifies_without_fetching() {
     let events = factory.spread(day(), 400);
     let relay = ModelRelay::holding(events.clone());
 
-    let (report, sink) = compare(&relay, day(), &local(&events), policy(2_048)).await;
+    let mut policy = policy(2_048);
+    policy.set_limit = 8;
+    let (report, sink) = compare(&relay, day(), &local(&events), policy).await;
+    assert_eq!(
+        relay.comparisons.lock().unwrap()[0].0,
+        SweepRange {
+            since: T0,
+            until: T0 + 863
+        },
+        "four held events fit before the fifth event at second864",
+    );
 
     assert_eq!(report.end, CompareEnd::Finished);
     assert_eq!(report.stats.fetches, 0);
@@ -553,24 +563,157 @@ async fn fetches_name_at_most_the_relay_cap() {
 
 #[tokio::test(start_paused = true)]
 async fn the_deadline_pauses_the_call() {
-    let mut factory = EventFactory::new();
-    let relay = ModelRelay::holding(factory.spread(day(), 20));
-    let mut sink = RecordingSink::default();
-    let report = run_comparison(
-        CompareRequest {
-            route: route(),
-            range: day(),
-            local: &[],
-            deadline: Some(Instant::now()),
-            policy: policy(2_048),
-        },
-        &relay,
-        &mut sink,
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(report.end, CompareEnd::DeadlineReached);
-    assert_eq!(report.stats.answers, 0);
+    for cancelled in [false, true] {
+        let mut factory = EventFactory::new();
+        let relay = ModelRelay::holding(factory.spread(day(), 20));
+        let mut sink = RecordingSink::default();
+        let cancel = CancellationToken::new();
+        if cancelled {
+            cancel.cancel();
+        }
+        let report = run_comparison(
+            CompareRequest {
+                route: route(),
+                range: day(),
+                local: &[],
+                deadline: Some(
+                    Instant::now()
+                        + if cancelled {
+                            Duration::from_secs(10)
+                        } else {
+                            Duration::ZERO
+                        },
+                ),
+                policy: policy(2_048),
+            },
+            &relay,
+            &mut sink,
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            report.end,
+            if cancelled {
+                CompareEnd::Cancelled
+            } else {
+                CompareEnd::DeadlineReached
+            }
+        );
+        assert_eq!(report.stats.requests, 0);
+        assert_eq!(report.stats.answers, 0);
+        assert_eq!(relay.requests.load(Ordering::SeqCst), 0);
+        assert!(report.certified.is_empty() && sink.batches.is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refusal_waits_stop_on_cancellation_and_deadline_without_retrying() {
+    use TransportEndpointRejectionCategory::{Blocked, RateLimited};
+    for category in [RateLimited, Blocked] {
+        for cancelled in [true, false] {
+            let relay = ModelRelay::default();
+            relay
+                .compare_replies
+                .lock()
+                .unwrap()
+                .push_back(CompareReply::Closed(ClosedReason(Some(category))));
+            let cancel = CancellationToken::new();
+            let mut sink = RecordingSink::default();
+            let mut policy = policy(2_048);
+            policy.pacing.rate_limit_backoff = Duration::from_secs(10);
+            let started = Instant::now();
+            let report = {
+                let call = run_comparison(
+                    CompareRequest {
+                        route: route(),
+                        range: day(),
+                        local: &[],
+                        deadline: (!cancelled).then_some(started + Duration::from_secs(5)),
+                        policy,
+                    },
+                    &relay,
+                    &mut sink,
+                    &cancel,
+                );
+                tokio::pin!(call);
+                if cancelled {
+                    tokio::select! {
+                        biased;
+                        _ = &mut call => panic!("a refused request must wait before its retry"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    assert_eq!(relay.requests.load(Ordering::SeqCst), 1);
+                    cancel.cancel();
+                }
+                call.await
+            };
+            assert_eq!(
+                report.end,
+                if cancelled {
+                    CompareEnd::Cancelled
+                } else {
+                    CompareEnd::DeadlineReached
+                }
+            );
+            assert_eq!(report.stats.requests, 1);
+            assert_eq!(report.stats.comparisons, 1);
+            assert_eq!(report.stats.answers, 0);
+            assert_eq!(
+                (report.stats.rate_limited_waits, report.stats.blocked_waits),
+                if category == RateLimited {
+                    (1, 0)
+                } else {
+                    (0, 1)
+                }
+            );
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert!(report.certified.is_empty() && sink.batches.is_empty());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_refusals_retry_only_within_their_policy() {
+    use TransportEndpointRejectionCategory::{Blocked, Restricted};
+    for (category, repeats, end, waits, requests) in [
+        (Blocked, 2, CompareEnd::Finished, 2, 3),
+        (
+            Blocked,
+            3,
+            CompareEnd::Refused(ClosedReason(Some(Blocked))),
+            2,
+            3,
+        ),
+        (
+            Restricted,
+            1,
+            CompareEnd::Refused(ClosedReason(Some(Restricted))),
+            0,
+            1,
+        ),
+    ] {
+        let relay = ModelRelay::default();
+        relay
+            .compare_replies
+            .lock()
+            .unwrap()
+            .extend((0..repeats).map(|_| CompareReply::Closed(ClosedReason(Some(category)))));
+        let started = Instant::now();
+        let (report, sink) = compare(&relay, day(), &[], policy(2_048)).await;
+        assert_eq!(report.end, end);
+        assert_eq!(report.stats.requests, requests);
+        assert_eq!(report.stats.blocked_waits, waits);
+        assert_eq!(report.stats.rate_limited_waits, 0);
+        assert_eq!(started.elapsed(), Duration::from_secs(waits.into()));
+        assert!(!report.rate_limited);
+        if end == CompareEnd::Finished {
+            assert_eq!(report.certified.len(), 1);
+            assert_eq!(sink.batches.len(), 1);
+            assert!(sink.batches[0].certified && sink.batches[0].events.is_empty());
+        } else {
+            assert!(report.certified.is_empty() && sink.batches.is_empty());
+        }
+    }
 }
 
 /// A fetch the deadline cuts is interrupted and awaited, so the bytes it read
