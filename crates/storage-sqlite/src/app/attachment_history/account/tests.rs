@@ -68,8 +68,8 @@ fn global_albums_equal_times_and_sparse_chats_page_once() {
 fn filtered_empty_page_keeps_its_authoritative_continuation() {
     let s = SqliteAccountStorage::in_memory().unwrap();
     let s_app = s.app_storage();
-    seed(&s, "aa", 1, 3, 10);
-    seed(&s, "bb", 2, 2, 9);
+    seed(&s, "aa", 1, 3, 1_712_345_678);
+    seed(&s, "bb", 2, 2, 1_612_345_678);
     // Pin incarnation bytes so privacy checks use independent literal markers.
     s.lock().unwrap().execute_batch(
         "UPDATE chat_presentation_meta SET store_epoch=x'89d3fdf189d3fdf189d3fdf189d3fdf1' WHERE id=1"
@@ -77,8 +77,8 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
     let query = AccountAttachmentQuery {
         groups: vec!["BB".into(), "bb".into()],
         senders: vec!["11".repeat(32)],
-        min_timeline_at: Some(9),
-        max_timeline_at: Some(10),
+        min_timeline_at: Some(1_612_345_678),
+        max_timeline_at: Some(1_712_345_678),
     };
     let first = s_app
         .account_attachment_history_page(&query, 3, None)
@@ -99,6 +99,8 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
             "137",
             "211",
             "253",
+            "1612345678",
+            "1712345678",
         ] {
             assert!(
                 !debug.contains(private),
