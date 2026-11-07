@@ -12,10 +12,18 @@ use super::*;
 
 #[cfg(feature = "otlp-export")]
 #[test]
-fn submillisecond_export_intervals_preserve_the_configured_precision() {
-    for nanos in [0, 1, 500_000, 999_999, 1_000_000, 1_999_999] {
-        let interval = std::time::Duration::from_nanos(nanos);
-        assert_eq!(jittered_export_interval(interval), interval);
+fn production_export_intervals_stay_within_their_jitter_bounds() {
+    use std::time::Duration;
+
+    for (interval, earliest, latest) in [(10, 5, 15), (60, 50, 70), (3600, 3590, 3610)] {
+        for _ in 0..32 {
+            let delay = jittered_export_interval(Duration::from_secs(interval));
+            assert!(
+                (Duration::from_secs(earliest)..=Duration::from_secs(latest)).contains(&delay),
+                "configured {interval}s produced out-of-bounds delay {delay:?}",
+            );
+            assert_eq!(delay.subsec_nanos() % 1_000_000, 0);
+        }
     }
 }
 

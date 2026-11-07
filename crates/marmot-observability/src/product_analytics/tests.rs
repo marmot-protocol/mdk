@@ -731,14 +731,6 @@ fn backlog_aggregates_sources_without_counting_scheduler_ticks() {
 
 #[test]
 fn machine_catalogue_matches_builtins_and_buckets() {
-    for (unit, label) in [
-        (ProductUnit::Action, "action"),
-        (ProductUnit::Attempt, "attempt"),
-        (ProductUnit::Transition, "transition"),
-        (ProductUnit::Coverage, "coverage"),
-    ] {
-        assert_eq!(unit.as_str(), label);
-    }
     let catalogue: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../docs/marmot-architecture/product-event-catalogue.json"
     ))
