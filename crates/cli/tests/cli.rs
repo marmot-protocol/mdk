@@ -1739,21 +1739,36 @@ fn sync_until_admins<const N: usize>(
     account: &str,
     group_id: &str,
     expected: [&str; N],
+    phase: &'static str,
 ) -> Value {
     let expected = sorted_accounts(expected);
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
+    let mut last_sync_counts = Value::Null;
+    let mut observed_admins = 0;
+    let mut polls = 0;
     while Instant::now() < deadline {
-        let _ = run_json(home, &["--account", account, "sync"]);
+        let sync = run_json(home, &["--account", account, "sync"]);
+        polls += 1;
         let admins = run_json(home, &["--account", account, "groups", "admins", group_id]);
-        if admin_accounts(&admins) == expected {
+        let observed = admin_accounts(&admins);
+        if observed == expected {
             return admins;
         }
+        observed_admins = observed.len();
+        last_sync_counts = serde_json::json!({
+            "joined": sync["joined_groups"].as_array().map_or(0, Vec::len),
+            "messages": sync["messages"].as_array().map_or(0, Vec::len),
+            "events": sync["events"].as_u64().unwrap_or(0),
+            "projection_updates": sync["projection_updates"].as_u64().unwrap_or(0),
+            "epoch_escalations": sync["epoch_stall_escalations"].as_u64().unwrap_or(0),
+        });
         last = admins;
         std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
-        "account <REDACTED_ACCOUNT> did not see expected admins in <REDACTED_GROUP>; {}",
+        "account <REDACTED_ACCOUNT> did not see expected admins in <REDACTED_GROUP>; phase={phase} polls={polls} expected_admins={} observed_admins={observed_admins} last_sync_counts={last_sync_counts} {}",
+        expected.len(),
         json_value_summary("last_admins", &last)
     );
 }
@@ -8242,7 +8257,13 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
     );
 
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
-    sync_until_admins(home.path(), &bob, group_id, [&alice, &bob]);
+    sync_until_admins(
+        home.path(),
+        &bob,
+        group_id,
+        [&alice, &bob],
+        "first-promotion",
+    );
     let bob_rename = run_json(
         home.path(),
         &["--account", &bob, "groups", "rename", group_id, "bob-led"],
@@ -8283,7 +8304,13 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
         ],
     );
     sync_until_joined(home.path(), test_relay_url(), &bob, demote_group_id);
-    sync_until_admins(home.path(), &bob, demote_group_id, [&alice, &bob]);
+    sync_until_admins(
+        home.path(),
+        &bob,
+        demote_group_id,
+        [&alice, &bob],
+        "second-promotion",
+    );
 
     let demoted = run_json(
         home.path(),
@@ -8302,7 +8329,13 @@ fn groups_promote_and_demote_update_admin_policy_authorization() {
         serde_json::json!(sorted_accounts([&alice]))
     );
 
-    sync_until_admins(home.path(), &bob, demote_group_id, [&alice]);
+    sync_until_admins(
+        home.path(),
+        &bob,
+        demote_group_id,
+        [&alice],
+        "second-demotion",
+    );
     let demoted_error = run_json_error(
         home.path(),
         &[
