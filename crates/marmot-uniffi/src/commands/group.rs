@@ -1732,128 +1732,197 @@ mod tests {
         assert!(matches!(stopped, MarmotKitError::RuntimeStopping));
     }
 
-    fn state(self_admin: bool, last_admin: bool) -> GroupManagementStateFfi {
-        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-        let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        GroupManagementStateFfi {
-            my_account_id_hex: self_id.into(),
-            is_self_admin: self_admin,
-            is_last_admin: last_admin,
-            can_invite: self_admin,
-            can_leave: !self_admin,
-            requires_self_demote_before_leave: self_admin,
+    const SELF_ID: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    const OTHER_ID: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const ABSENT_ID: &str = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
+    const GROUP_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    // Native scalar policy builds coherent guard inputs, not expected results.
+    // No full group record, reader execution or command forwarding is claimed.
+    fn state(self_admin: bool, other_admin: bool, unrecoverable: bool) -> GroupManagementStateFfi {
+        let authority = marmot_app::conversation_presentation::ConversationAuthority {
+            is_member: true,
+            self_membership: marmot_app::SelfMembership::Member,
+            is_admin: self_admin,
+            admin_count: usize::from(self_admin) + usize::from(other_admin),
+            pending_confirmation: false,
             leave_request_pending: false,
-            leave_requested_at_ms: None,
-            lifecycle_state: crate::conversions::GroupLifecycleStateFfi::Stable,
-            disbanding_enabled: true,
+            lifecycle: if unrecoverable {
+                marmot_app::AppGroupLifecycleState::Unrecoverable
+            } else {
+                marmot_app::AppGroupLifecycleState::Stable
+            },
+            unrecoverable,
             disbanding: false,
-            can_enable_disbanding: false,
-            can_disband: self_admin,
+            disbanding_enabled: true,
+            has_disbanding_blockers: false,
+        };
+        let capabilities = authority.capabilities();
+        GroupManagementStateFfi {
+            my_account_id_hex: SELF_ID.into(),
+            is_self_admin: capabilities.is_self_admin,
+            is_last_admin: capabilities.is_last_admin,
+            can_invite: capabilities.can_invite,
+            can_leave: capabilities.can_leave,
+            requires_self_demote_before_leave: capabilities.requires_self_demote_before_leave,
+            leave_request_pending: authority.leave_request_pending,
+            leave_requested_at_ms: None,
+            lifecycle_state: authority.lifecycle.into(),
+            disbanding_enabled: authority.disbanding_enabled,
+            disbanding: authority.disbanding,
+            can_enable_disbanding: capabilities.can_enable_disbanding,
+            can_disband: capabilities.can_disband,
             disbanding_blockers: vec![],
             disband_request: None,
-            member_actions: vec![
-                GroupMemberActionStateFfi {
-                    member_id_hex: self_id.into(),
-                    is_self: true,
-                    is_admin: self_admin,
-                    can_remove: false,
-                    can_promote: false,
-                    can_demote: false,
-                },
-                GroupMemberActionStateFfi {
-                    member_id_hex: member_id.into(),
-                    is_self: false,
-                    is_admin: true,
-                    can_remove: self_admin && !last_admin,
-                    can_promote: false,
-                    can_demote: self_admin && !last_admin,
-                },
-            ],
+            member_actions: [(SELF_ID, true, self_admin), (OTHER_ID, false, other_admin)]
+                .into_iter()
+                .map(|(member_id, is_self, is_admin)| {
+                    let actions = authority.member_actions(is_self, is_admin);
+                    GroupMemberActionStateFfi {
+                        member_id_hex: member_id.into(),
+                        is_self,
+                        is_admin,
+                        can_remove: actions.can_remove,
+                        can_promote: actions.can_promote,
+                        can_demote: actions.can_demote,
+                    }
+                })
+                .collect(),
         }
+    }
+
+    fn npub(member_id: &str) -> String {
+        use nostr::prelude::{PublicKey, ToBech32};
+        PublicKey::from_hex(member_id).unwrap().to_bech32().unwrap()
     }
 
     #[test]
     fn remove_preflight_uses_role_and_target_not_display_capabilities() {
-        let mut state = state(true, false);
-        let target = state.member_actions[1].member_id_hex.clone();
-        for is_admin in [false, true] {
-            state.member_actions[1].is_admin = is_admin;
-            state.member_actions[1].can_remove = false;
-            assert!(
-                ensure_can_remove_members(&state, "group", std::slice::from_ref(&target)).is_ok()
-            );
+        for other_admin in [false, true] {
+            let state = state(true, other_admin, true);
+            assert!(!state.member_actions[1].can_remove);
+            assert!(ensure_can_remove_members(&state, GROUP_ID, &[npub(OTHER_ID)]).is_ok());
         }
-        let own = state.my_account_id_hex.clone();
+        let state = state(true, true, false);
         assert!(matches!(
-            ensure_can_remove_members(&state, "group", &[own]),
-            Err(MarmotKitError::AdminCannotSelfRemove { .. })
+            ensure_can_remove_members(&state, GROUP_ID, &[npub(SELF_ID)]),
+            Err(MarmotKitError::AdminCannotSelfRemove { group_id_hex })
+                if group_id_hex == GROUP_ID
         ));
     }
 
     #[test]
     fn promote_preflight_returns_already_admin() {
-        let group_id_hex = "01".repeat(32);
-        let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let err = ensure_can_promote_admin(&state(true, false), &group_id_hex, member_id)
+        let err = ensure_can_promote_admin(&state(true, true, false), GROUP_ID, &npub(OTHER_ID))
             .expect_err("promoting an admin should fail");
-        assert!(matches!(err, MarmotKitError::AlreadyAdmin { .. }));
+        assert!(
+            matches!(err, MarmotKitError::AlreadyAdmin { group_id_hex, member_id_hex }
+            if group_id_hex == GROUP_ID && member_id_hex == OTHER_ID)
+        );
+        assert!(
+            ensure_can_promote_admin(&state(true, false, false), GROUP_ID, &npub(OTHER_ID)).is_ok()
+        );
+        let absent =
+            ensure_can_promote_admin(&state(true, true, false), GROUP_ID, &npub(ABSENT_ID))
+                .expect_err("an absent target must retain its normalized identity");
+        assert!(
+            matches!(absent, MarmotKitError::MemberNotInGroup { group_id_hex, member_id_hex }
+            if group_id_hex == GROUP_ID && member_id_hex == ABSENT_ID)
+        );
     }
 
     #[test]
     fn leave_preflight_does_not_confuse_disabled_display_with_missing_membership() {
-        let mut state = state(false, false);
-        state.can_leave = false;
-        // Frozen/pending groups retain a self roster entry. The runtime owns
-        // the lifecycle refusal (or the explicit pending-invite departure).
-        assert!(ensure_can_request_leave(&state, "group").is_ok());
+        let mut state = state(false, true, true);
+        assert!(!state.can_leave);
+        // The native lifecycle owns the eventual command refusal. These next
+        // two legacy contrasts exercise the lower helper with no self row;
+        // they do not claim a current reader produces this retained roster.
+        assert!(ensure_can_request_leave(&state, GROUP_ID).is_ok());
         state.member_actions.retain(|member| !member.is_self);
         assert!(matches!(
-            ensure_can_request_leave(&state, "group"),
-            Err(MarmotKitError::MemberNotInGroup { .. })
+            ensure_can_request_leave(&state, GROUP_ID),
+            Err(MarmotKitError::MemberNotInGroup { group_id_hex, member_id_hex })
+                if group_id_hex == GROUP_ID && member_id_hex == SELF_ID
         ));
         state.leave_request_pending = true;
+        state.leave_requested_at_ms = Some(1_700_000_000_123);
         assert!(matches!(
-            ensure_can_request_leave(&state, "group"),
-            Err(MarmotKitError::LeaveAlreadyRequested { .. })
+            ensure_can_request_leave(&state, GROUP_ID),
+            Err(MarmotKitError::LeaveAlreadyRequested { group_id_hex })
+                if group_id_hex == GROUP_ID
         ));
     }
 
     #[test]
     fn self_demote_preflight_protects_last_admin() {
-        let group_id_hex = "01".repeat(32);
-        let err = ensure_can_self_demote_admin(&state(true, true), &group_id_hex)
+        let err = ensure_can_self_demote_admin(&state(true, false, false), GROUP_ID)
             .expect_err("last admin self-demote should fail");
-        assert!(matches!(err, MarmotKitError::WouldRemoveLastAdmin { .. }));
+        assert!(
+            matches!(err, MarmotKitError::WouldRemoveLastAdmin { group_id_hex }
+            if group_id_hex == GROUP_ID)
+        );
+        let nonadmin = ensure_can_self_demote_admin(&state(false, true, false), GROUP_ID)
+            .expect_err("a non-admin cannot demote itself");
+        assert!(
+            matches!(nonadmin, MarmotKitError::NotAdmin { group_id_hex, member_id_hex }
+            if group_id_hex == GROUP_ID && member_id_hex == SELF_ID)
+        );
+        assert!(ensure_can_self_demote_admin(&state(true, true, false), GROUP_ID).is_ok());
     }
 
     #[test]
     fn admin_mutation_preflight_checks_caller_admin_first() {
-        let group_id_hex = "01".repeat(32);
-        let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let err = ensure_can_demote_admin(&state(false, false), &group_id_hex, member_id)
+        let nonadmin_state = state(false, true, false);
+        let err = ensure_can_demote_admin(&nonadmin_state, GROUP_ID, OTHER_ID)
             .expect_err("non-admin caller should fail");
-        assert!(matches!(err, MarmotKitError::NotGroupAdmin { .. }));
+        assert!(matches!(err, MarmotKitError::NotGroupAdmin { group_id_hex }
+            if group_id_hex == GROUP_ID));
+        let empty_remove = ensure_can_remove_members(&nonadmin_state, GROUP_ID, &[])
+            .expect_err("even an empty target list requires caller authorization");
+        assert!(
+            matches!(empty_remove, MarmotKitError::NotGroupAdmin { group_id_hex }
+            if group_id_hex == GROUP_ID)
+        );
+
+        // A sole admin targeting the non-admin must get the target-role error
+        // before the last-admin guard, with canonical rather than npub context.
+        let target = ensure_can_demote_admin(&state(true, false, false), GROUP_ID, &npub(OTHER_ID))
+            .expect_err("demotion requires an admin target");
+        assert!(
+            matches!(target, MarmotKitError::NotAdmin { group_id_hex, member_id_hex }
+            if group_id_hex == GROUP_ID && member_id_hex == OTHER_ID)
+        );
+        assert!(
+            ensure_can_demote_admin(&state(true, true, false), GROUP_ID, &npub(OTHER_ID)).is_ok()
+        );
     }
 
     #[test]
     fn admin_mutation_preflight_checks_admin_before_membership() {
-        // A non-admin caller must not be able to distinguish "member exists" from
-        // "member absent" via error-variant differences (membership-existence
-        // oracle). Both promote and demote must short-circuit on caller admin
-        // status before resolving the target, even for a ref that is not in the
-        // group (mdk#667).
-        let group_id_hex = "01".repeat(32);
-        let absent_member = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
-
-        let promote_err =
-            ensure_can_promote_admin(&state(false, false), &group_id_hex, absent_member)
+        // Preserve the membership-existence oracle guard (mdk#667), including
+        // malformed input: authorization precedes parsing and target lookup.
+        let state = state(false, true, false);
+        for target in [ABSENT_ID, "not-a-member-ref"] {
+            let promote_err = ensure_can_promote_admin(&state, GROUP_ID, target)
                 .expect_err("non-admin promote should fail");
-        assert!(matches!(promote_err, MarmotKitError::NotGroupAdmin { .. }));
-
-        let demote_err =
-            ensure_can_demote_admin(&state(false, false), &group_id_hex, absent_member)
+            assert!(
+                matches!(promote_err, MarmotKitError::NotGroupAdmin { group_id_hex }
+                if group_id_hex == GROUP_ID)
+            );
+            let demote_err = ensure_can_demote_admin(&state, GROUP_ID, target)
                 .expect_err("non-admin demote should fail");
-        assert!(matches!(demote_err, MarmotKitError::NotGroupAdmin { .. }));
+            assert!(
+                matches!(demote_err, MarmotKitError::NotGroupAdmin { group_id_hex }
+                if group_id_hex == GROUP_ID)
+            );
+            let remove_err = ensure_can_remove_members(&state, GROUP_ID, &[target.into()])
+                .expect_err("non-admin remove should fail");
+            assert!(
+                matches!(remove_err, MarmotKitError::NotGroupAdmin { group_id_hex }
+                if group_id_hex == GROUP_ID)
+            );
+        }
     }
 
     #[test]
