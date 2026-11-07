@@ -187,6 +187,48 @@ fn configuration_admission_is_closed_and_failed_changes_preserve_the_grant() {
 }
 #[cfg(feature = "product-analytics-export")]
 #[test]
+fn observation_count_and_backlog_producers_reject_unsupported_labels_before_sealing() {
+    let (collector, _) = configured();
+    grant(&collector);
+    let permit = collector.permit().unwrap();
+    for (operation, outcome) in [
+        ("unregistered_operation", "success"),
+        ("startup", "unregistered_outcome"),
+    ] {
+        collector
+            .begin(ProductFamily::Runtime, operation, ProductUnit::Attempt)
+            .unwrap()
+            .finish(outcome);
+        let observation = collector
+            .begin(ProductFamily::Runtime, operation, ProductUnit::Attempt)
+            .unwrap()
+            .counts_only();
+        observation.count(outcome, ProductUnit::Action, 3);
+    }
+    let backlog = collector.backlog_source();
+    backlog.sample(&permit, ProductFamily::Runtime, "unregistered_operation", 9);
+    assert!(collector.test_payloads().is_empty());
+    assert_eq!(collector.status().dropped_events, 0);
+    drop(backlog);
+    collector
+        .begin(ProductFamily::Runtime, "startup", ProductUnit::Attempt)
+        .unwrap()
+        .finish("success");
+    let rows = collector.test_payloads();
+    assert_eq!(rows.len(), 2, "one observation and one coverage summary");
+    let observation = rows
+        .iter()
+        .find(|row| row["props"]["operation"] == "startup")
+        .unwrap();
+    assert_eq!(observation["eventName"], "mdk_runtime_summary");
+    assert_eq!(observation["props"]["outcome"], "success");
+    assert_eq!(observation["props"]["unit"], "attempt");
+    assert_eq!(observation["props"]["count_bucket"], "1");
+    assert_eq!(collector.status().dropped_events, 0);
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
 fn no_preconsent_backlog_and_idempotent_background() {
     let (c, clock) = configured();
     c.observe(
@@ -1350,6 +1392,14 @@ fn consent_preserves_lifecycle_without_replaying_preconsent_activity() {
         properties: BTreeMap::from([("screen".into(), "inbox".into())]),
     };
     c.activity(ProductAnalyticsActivity::ForegroundNotification);
+    c.activity(ProductAnalyticsActivity::AccountChanged);
+    {
+        let state = c.lock();
+        assert!(
+            state.cells.is_empty() && state.backlog.is_empty() && state.window.is_none(),
+            "disabled account changes must not accumulate observations before consent"
+        );
+    }
     assert_eq!(
         c.record(event()).unwrap(),
         ProductRecordResult::IgnoredDisabled
@@ -1372,6 +1422,14 @@ fn consent_preserves_lifecycle_without_replaying_preconsent_activity() {
     assert_ne!(c.lock().session.clone().unwrap().0, first);
     c.revoke_memory();
     c.activity(ProductAnalyticsActivity::Background);
+    c.activity(ProductAnalyticsActivity::AccountChanged);
+    {
+        let state = c.lock();
+        assert!(
+            state.cells.is_empty() && state.backlog.is_empty() && state.window.is_none(),
+            "disabled account changes must not accumulate observations before consent"
+        );
+    }
     grant(&c);
     assert_eq!(
         c.record(event()).unwrap(),
@@ -2100,6 +2158,60 @@ async fn delivery_retry_budget_and_long_cooldowns_drop_an_unaccepted_batch_once(
         assert_eq!(status.dropped_events, 1);
         assert_eq!(status.accepted_batches, 0);
         assert_eq!(status.product_analytics, DiagnosticsExporterStatus::Ready);
+    }
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[tokio::test(start_paused = true)]
+async fn refused_resolution_backoff_and_expiry_drop_the_detached_batch_once() {
+    for expire_during_backoff in [false, true] {
+        let (collector, clock) = configured();
+        let mut config = collector.lock().config.clone();
+        // The production host-safety owner refuses this documentation address
+        // before a connection; sender retries therefore require no DNS or I/O.
+        config.events_endpoint = Some("https://192.0.2.1/api/v0/events".into());
+        config.allow_loopback = false;
+        collector.configure(config, String::new()).unwrap();
+        grant(&collector);
+        collector.activity(ProductAnalyticsActivity::Foreground);
+        assert_eq!(collector.status().queued_events, 1);
+        let permit = collector.permit().unwrap();
+        let started = tokio::time::Instant::now();
+        let sending = collector.send_pending();
+        tokio::pin!(sending);
+        std::future::poll_fn(|cx| {
+            assert!(sending.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // The actual sender has detached its produced event and reached the
+        // first backoff; the batch must not yet be counted as failed.
+        assert_eq!(collector.status().queued_events, 0);
+        assert_eq!(collector.status().failed_batches, 0);
+        if expire_during_backoff {
+            clock
+                .mono
+                .store(EVENT_TTL.as_millis() as u64, Ordering::Relaxed);
+        }
+        tokio::time::timeout(Duration::from_secs(20), sending)
+            .await
+            .unwrap();
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(if expire_during_backoff { 1 } else { 7 }),
+        );
+        let status = collector.status();
+        assert_eq!(
+            (
+                status.queued_events,
+                status.failed_batches,
+                status.dropped_events,
+                status.accepted_batches
+            ),
+            (0, 1, 1, 0),
+        );
+        assert_eq!(status.product_analytics, DiagnosticsExporterStatus::Ready);
+        assert!(permit.valid());
     }
 }
 
