@@ -18,10 +18,7 @@ use marmot_forensics::{
     AuditEventKind, RecoveryGoalBound, RecoveryNeedChange, RecoveryObligationCause,
     TransportCursorTrigger,
 };
-use storage_sqlite::{
-    RecoveryCause, RecoveryDemandTicket, RecoveryDemandTransition, RecoveryLossCause,
-    RecoveryLossImport,
-};
+use storage_sqlite::{RecoveryCause, RecoveryDemandTicket};
 
 use super::AppClient;
 use super::sync::SealedTransportCursor;
@@ -40,15 +37,6 @@ pub(crate) fn obligation_cause(cause: RecoveryCause) -> RecoveryObligationCause 
     }
 }
 
-fn need_change(transition: RecoveryDemandTransition) -> Option<RecoveryNeedChange> {
-    match transition {
-        RecoveryDemandTransition::Recorded => Some(RecoveryNeedChange::Recorded),
-        RecoveryDemandTransition::Joined => Some(RecoveryNeedChange::Joined),
-        RecoveryDemandTransition::Resumed => Some(RecoveryNeedChange::Resumed),
-        RecoveryDemandTransition::Unchanged => None,
-    }
-}
-
 impl AppClient {
     /// Import unresolved delivery loss into its obligations, recording each
     /// change. The storage import is the authority; the rows follow it.
@@ -56,81 +44,10 @@ impl AppClient {
         &self,
         storage: &SqliteAppStorage,
     ) -> Result<(), AppError> {
-        if self.app.recovery_runner_owns_debt() {
-            if self.synchronize_runner_loss(storage)? {
-                self.wake_recovery_runner();
-            }
-            return Ok(());
-        }
-        let imports = storage.synchronize_account_delivery_loss(&self.state.label)?;
-        self.record_recovery_loss_imports(imports);
-        Ok(())
-    }
-
-    /// One `recovery_need_changed` row per loss cause an import changed, with
-    /// the goal bound the comparison will use after it.
-    pub(crate) fn record_recovery_loss_imports(&self, imports: Vec<RecoveryLossImport>) {
-        self.record_coverage_loss(&imports);
-        // Imported loss un-covered its routes: new debt for the runner.
-        if !imports.is_empty() {
+        if self.synchronize_runner_loss(storage)? {
             self.wake_recovery_runner();
         }
-        if imports.is_empty() || !self.audit_v5_enabled() {
-            return;
-        }
-        for import in imports {
-            let Some(change) = need_change(import.transition) else {
-                continue;
-            };
-            // Read in the import's own transaction, so it is the bound of
-            // exactly the revision this row names.
-            let floor = import.goal_floor;
-            self.record_need_changed(
-                None,
-                match import.cause {
-                    RecoveryLossCause::Queue => RecoveryObligationCause::QueueLoss,
-                    RecoveryLossCause::NotificationConsumer => {
-                        RecoveryObligationCause::NotificationLoss
-                    }
-                },
-                change,
-                import.obligation,
-                Some(floor.map_or(RecoveryGoalBound::Unbounded, |_| RecoveryGoalBound::Floor)),
-                floor,
-                Some(import.charged),
-            );
-        }
-    }
-
-    /// A caller-owned or startup request changed demand.
-    pub(crate) fn record_recovery_request(
-        &self,
-        cause: RecoveryCause,
-        ticket: RecoveryDemandTicket,
-        transition: RecoveryDemandTransition,
-    ) {
-        self.record_coverage_request(cause);
-        let Some(change) = need_change(transition) else {
-            return;
-        };
-        if !self.audit_v5_enabled() {
-            return;
-        }
-        let bound = match cause {
-            RecoveryCause::IncrementalHistory => Some(RecoveryGoalBound::RetainedWindow),
-            // Explicit full-history repair stays unfloored by design.
-            RecoveryCause::ExplicitHistory => Some(RecoveryGoalBound::Unbounded),
-            _ => None,
-        };
-        self.record_need_changed(
-            None,
-            obligation_cause(cause),
-            change,
-            ticket,
-            bound,
-            None,
-            None,
-        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

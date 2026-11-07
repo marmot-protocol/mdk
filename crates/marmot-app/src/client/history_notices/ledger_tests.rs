@@ -1,11 +1,10 @@
-//! Ledger-parked routes as notices, and the account's recovery status, behind
-//! the internal `runner_owns_debt` gate (mdk#2660 phase 4): a parked group
+//! Ledger-parked routes as notices, and the account's recovery status
+//! (mdk#2660 phase 4): a parked group
 //! route is a notice in that group's status, an inbox park only in the
 //! account's list, a remainder only once nothing on its route catches up,
 //! and dismissal retires the park, each shown and dismissed notice audited.
 //! A suspended (Unrecoverable) group's routes give none, nor does a park on
-//! a relay a route carries only as best effort. With the gate off none of it
-//! shows.
+//! a relay a route carries only as best effort.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -603,19 +602,27 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     park_recovery_for_test(&client.app.account_storage("alice").unwrap(), loss);
     assert_eq!(
         client.take_history_notice_changes(),
-        Some(Vec::new()),
-        "the old owner's account-wide loss is not yet a ledger group notice"
+        Some(vec![group.clone()]),
+        "the route's park names its group; the old owner's account-wide loss names none"
     );
 
-    // Stage the old owner's parked loss before the production open-time
-    // conversion. An already-owned fixture has converted on its first open.
+    // The old owner's parked loss above is what a build from before the
+    // conversion leaves: rewind the conversion marker, as that build never
+    // ran it. The fixture's own open converted, before any of it existed.
     let owner = client.app.clone();
     owner
         .relay_plane
         .deactivate_account_context(client.adapter.account_id())
         .await
         .unwrap();
+    crate::client::recovery_coverage::scenario_tests::fault_connection(&client)
+        .execute(
+            "UPDATE account_recovery_conversion SET step = 0 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
     drop(client);
+    assert!(app.recovery_conversion_pending().unwrap());
     let owner = owner.with_recovery_runner_ownership_for_test(true);
     let mut client = client_on_app_relay_plane(&owner, "alice").await;
     assert!(!app.recovery_conversion_pending().unwrap());
@@ -638,57 +645,4 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     );
     assert!(!app.recovery_conversion_notices_changed().unwrap());
     assert_eq!(client.take_history_notice_changes(), None);
-}
-
-/// With the gate off, a parked route, a parked inbox and a published survey
-/// change no notice, no group's status, no announcement, no status and no
-/// audit row, and a ledger notice id dismisses nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ledger_notices_and_the_status_stay_dormant_with_the_gate_off() {
-    let dir = tempfile::tempdir().unwrap();
-    let (audited, mut client, app, group, route) = audited_fixture(&dir, false).await;
-    client.take_history_notice_changes();
-    park(&app, &route);
-    park(&app, &TransportReconciliationRoute::Inbox);
-    catching_up(&client, &[&route, &TransportReconciliationRoute::Inbox]);
-
-    assert!(client.history_notices().unwrap().is_empty());
-    assert!(
-        client
-            .group_recovery_status(&group)
-            .unwrap()
-            .history_notice_ids
-            .is_empty()
-    );
-    assert_eq!(client.take_history_notice_changes(), None);
-    assert_eq!(
-        client.account_recovery_status().unwrap(),
-        AccountRecoveryStatus::default()
-    );
-    client.recovery_status_owed = true;
-    assert!(!client.take_recovery_status_changed(true));
-
-    let parked = app.parked_recovery_routes().unwrap();
-    let revision = parked
-        .iter()
-        .find(|parked| parked.route == route)
-        .unwrap()
-        .revision;
-    let id = encode_notice_id(RecoveryDemandTicket {
-        id: ledger_route_tag(&route),
-        revision,
-    });
-    assert!(!client.dismiss_history_notice(&id).unwrap());
-    assert!(matches!(
-        app.recovery_unit(&route, RELAY).unwrap().unwrap().state,
-        RecoveryUnitState::Broken(_)
-    ));
-    client.take_history_notice_changes();
-    assert!(
-        crate::client::audit_recovery::recorded_v5_rows(&audited, "recovery_need_changed")
-            .iter()
-            .all(|row| row["event"]["cause"] != "unproven_history"
-                && row["event"]["change"] == "recorded"),
-        "only the account's own obligations are recorded",
-    );
 }

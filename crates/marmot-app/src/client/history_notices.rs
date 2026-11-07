@@ -3,9 +3,9 @@
 //! never as coverage, and releases a retired loss's cursor fence without
 //! recording recovery success.
 //!
-//! Behind the internal `runner_owns_debt` gate (mdk#2660 phase 4), routes the
-//! coverage ledger parks raise notices too ([`LedgerNotice`]), and the
-//! account's recovery status reads what the recovery runner is catching up.
+//! Routes the coverage ledger parks raise notices too ([`LedgerNotice`]), and
+//! the account's recovery status reads what the recovery runner is catching up
+//! (mdk#2660 phase 4).
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::GroupId;
@@ -61,8 +61,8 @@ impl AppClient {
         Ok(notices)
     }
 
-    /// The routes the coverage ledger parks, one notice each, oldest first,
-    /// behind the internal `runner_owns_debt` gate. What a notice shows, its
+    /// The routes the coverage ledger parks, one notice each, oldest first.
+    /// What a notice shows, its
     /// revision and what dismissing it retires are one set: the route's
     /// broken units on relays it now requires, and its remainder. A remainder
     /// shows with a broken unit's notice, or alone once the window above it is
@@ -81,9 +81,6 @@ impl AppClient {
         &self,
         app: &SqliteAppStorage,
     ) -> Result<Vec<LedgerNotice>, AppError> {
-        if !self.app.recovery_runner_owns_debt() {
-            return Ok(Vec::new());
-        }
         let routes = self
             .recovery_runner_routes()
             .into_iter()
@@ -161,17 +158,13 @@ impl AppClient {
         Ok(notices)
     }
 
-    /// The account's recovery status. Behind the internal `runner_owns_debt`
-    /// gate, it reports the groups and inbox the runner's last survey found
-    /// catching up; otherwise, and until a runner has surveyed, nothing is.
+    /// The account's recovery status: the groups and inbox the runner's last
+    /// survey found catching up. Until a runner has surveyed, nothing is.
     pub(crate) fn account_recovery_status(&self) -> Result<AccountRecoveryStatus, AppError> {
         let mut status = AccountRecoveryStatus {
             notices: self.history_notices()?,
             ..AccountRecoveryStatus::default()
         };
-        if !self.app.recovery_runner_owns_debt() {
-            return Ok(status);
-        }
         let Some(units) = self.routing.recovery_runner_catching_up_now() else {
             return Ok(status);
         };
@@ -194,14 +187,13 @@ impl AppClient {
         Ok(status)
     }
 
-    /// Whether hosts are owed a `RecoveryStatusChanged`, behind the internal
-    /// `runner_owns_debt` gate: the runner's survey changed what is catching
-    /// up ([`AppClient::recovery_status_owed`]), or `notices_changed`. Every
+    /// Whether hosts are owed a `RecoveryStatusChanged`: the runner's survey
+    /// changed what is catching up ([`AppClient::recovery_status_owed`]), or `notices_changed`. Every
     /// survey change counts, even one a later survey undid, so a host never
     /// keeps a state it read in between.
     pub(crate) fn take_recovery_status_changed(&mut self, notices_changed: bool) -> bool {
         let owed = std::mem::take(&mut self.recovery_status_owed);
-        self.app.recovery_runner_owns_debt() && (owed || notices_changed)
+        owed || notices_changed
     }
 
     /// A group-scoped occurrence reaches the host only for a group it may see.
@@ -384,9 +376,8 @@ impl AppClient {
     /// Re-read the parked set and return the groups whose own occurrences
     /// changed since the last call, or `None` when nothing changed. The first
     /// call only records the baseline. A failed read keeps the old baseline,
-    /// so the next publication seam retries. Behind the internal
-    /// `runner_owns_debt` gate the ledger's parked routes count too, and an
-    /// upgrade conversion that changed the notices is announced once, even
+    /// so the next publication seam retries. The ledger's parked routes count
+    /// too, and an upgrade conversion that changed the notices is announced once, even
     /// when the set reads the same.
     pub(crate) fn take_history_notice_changes(&mut self) -> Option<Vec<GroupId>> {
         let mut causes = Vec::new();
@@ -398,8 +389,7 @@ impl AppClient {
                 let app = storage.app_storage();
                 let parked = app.parked_recovery_obligations()?;
                 let ledger = self.ledger_notices(&app)?;
-                if self.app.recovery_runner_owns_debt()
-                    && !app.recovery_conversion_pending()?
+                if !app.recovery_conversion_pending()?
                     && app.recovery_conversion_notices_changed()?
                 {
                     converted = Some(app);
@@ -809,51 +799,6 @@ mod tests {
                 .unwrap()
                 .history_may_be_incomplete
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn new_loss_makes_a_notice_stale_and_after_dismissal_is_a_new_occurrence() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = app(&dir);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        fence_loss(&mut client, 42);
-        let storage = app.account_storage("alice").unwrap();
-        let app = storage.app_storage();
-        let loss = pending(&storage, RecoveryCause::QueueLoss);
-        park_recovery_for_test(&storage, loss);
-        let first = client.history_notices().unwrap().remove(0);
-
-        // The off-worker writer recorded more loss that no import joined yet.
-        // Dismissal imports it first, so the parked occurrence is stale.
-        app.record_account_delivery_loss("alice", 42, 2, crate::unix_now_seconds())
-            .unwrap();
-        assert!(!client.dismiss_history_notice(&first.notice_id).unwrap());
-        assert!(
-            client.history_notices().unwrap().is_empty(),
-            "the new evidence re-armed recovery"
-        );
-        assert!(client.delivery_loss_blocks_cursor());
-
-        park_recovery_for_test(&storage, loss);
-        let second = client.history_notices().unwrap().remove(0);
-        assert_ne!(second.notice_id, first.notice_id);
-        assert!(client.dismiss_history_notice(&second.notice_id).unwrap());
-        assert!(!client.delivery_loss_blocks_cursor());
-
-        // A late duplicate of the retired loss re-arms nothing.
-        app.mark_account_delivery_recovery("alice", 42, 2).unwrap();
-        app.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
-        assert!(client.history_notices().unwrap().is_empty());
-
-        // New loss is a fresh pending obligation, and parks as a new notice.
-        app.mark_account_delivery_recovery("alice", 77, 1).unwrap();
-        assert_eq!(pending(&storage, RecoveryCause::QueueLoss), loss);
-        assert!(client.history_notices().unwrap().is_empty());
-        park_recovery_for_test(&storage, loss);
-        let third = client.history_notices().unwrap().remove(0);
-        assert_ne!(third.notice_id, second.notice_id);
-        assert_ne!(third.notice_id, first.notice_id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

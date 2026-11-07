@@ -13,8 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use cgka_traits::storage::{GroupStorage, StorageError, StorageProvider, StorageResult};
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
-    RecoveryLossImport, SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS,
-    TransportReconciliationRoute,
+    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 use transport_nostr::MarmotRelayPlaneAccountAdapter;
 use transport_nostr_adapter::{
@@ -291,7 +290,7 @@ impl AppClient {
         &self,
         intents: &[storage_sqlite::StoredEpochBackfillIntent],
     ) -> Result<(), AppError> {
-        if !self.app.recovery_runner_owns_debt() || intents.is_empty() {
+        if intents.is_empty() {
             return self
                 .app
                 .arm_epoch_backfill_intents(&self.state.label, intents);
@@ -745,36 +744,6 @@ impl AppClient {
         self.app.account_storage(&self.state.label)
     }
 
-    /// Storage un-covered the loss in the import's own transaction: only the
-    /// routes a routed generation named, each from its own bound, with their
-    /// goals; and every ledger route from the floor of a generation that named
-    /// none. For that, a current route the ledger does not hold yet still owes
-    /// from the floor, so its goal widens here; if this write
-    /// is lost, the pending loss scopes widen it at the next comparison. Every
-    /// account-wide import is new evidence, even with nothing counted or no
-    /// demand changed: a notification lag charges no delivery count.
-    pub(crate) fn record_coverage_loss(&self, imports: &[RecoveryLossImport]) {
-        // Routed loss widened its own routes' goals in the import.
-        let floors = imports
-            .iter()
-            .filter(|import| import.every_route)
-            .map(|import| import.goal_floor.unwrap_or(0))
-            .collect::<Vec<_>>();
-        let Some(floor) = floors.into_iter().min() else {
-            return;
-        };
-        let routes = self
-            .current_coverage_routes()
-            .into_iter()
-            .map(|current| current.route)
-            .collect::<Vec<_>>();
-        if let Err(error) = self.coverage_storage().and_then(|storage| {
-            Ok(self.widen_coverage_goals(&storage.app_storage(), &routes, floor)?)
-        }) {
-            log_failure("record_coverage_loss", &error);
-        }
-    }
-
     /// Widen `routes`' goals to `floor` and wake the recovery runner to read
     /// its ledger again. Only the runner's own routing-change settlement
     /// widens directly without a wake: that turn immediately reads the debt.
@@ -863,33 +832,6 @@ impl AppClient {
         });
         if let Err(error) = result {
             log_failure("record_open_coverage_goals", &error);
-        }
-    }
-
-    /// Startup incremental history wants every current route from its
-    /// standing floor, and explicit repair every route's whole retained
-    /// window. Nothing below the window is owed.
-    pub(crate) fn record_coverage_request(&self, cause: RecoveryCause) {
-        let now = unix_now_seconds();
-        let current = self.current_coverage_routes();
-        let result = self.coverage_storage().and_then(|storage| {
-            let app = storage.app_storage();
-            match cause {
-                RecoveryCause::IncrementalHistory => {
-                    self.widen_standing_goals(&app, &current.iter().collect::<Vec<_>>(), now)
-                }
-                RecoveryCause::ExplicitHistory => {
-                    let routes = current
-                        .into_iter()
-                        .map(|current| current.route)
-                        .collect::<Vec<_>>();
-                    Ok(self.widen_coverage_goals(&app, &routes, retention_floor(now))?)
-                }
-                _ => Ok(()),
-            }
-        });
-        if let Err(error) = result {
-            log_failure("record_coverage_request", &error);
         }
     }
 

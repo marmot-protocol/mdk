@@ -2,7 +2,6 @@
 //! (mdk#2660 phase 4); this module keeps the account's native replay ingress,
 //! flushes the recovery observations each seam owes the ledger, and keeps the
 //! logical clock the ledger's deadlines are read against.
-use cgka_traits::MaintenanceStorage;
 use std::time::{Duration, Instant};
 use storage_sqlite::SqliteAppStorage;
 
@@ -10,7 +9,7 @@ use super::AppClient;
 use crate::{AppError, unix_now_seconds};
 
 use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
-use storage_sqlite::{RecoveryRevisionFence, RecoveryScopePlan, RecoveryScopeToken};
+use storage_sqlite::RecoveryScopePlan;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RecoveryRetryPolicy {
@@ -32,38 +31,12 @@ impl RecoveryRetryPolicy {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct GrantedScope {
-    pub(crate) goal: RecoveryScopePlan,
-    pub(crate) token: RecoveryScopeToken,
-}
-
-/// The post-join history fetch a live maintenance session was installed for,
-/// keyed by the session's subscription id.
-pub(crate) struct PostJoinHistorySession {
-    /// The fetch's id: the post-join obligation created with that copy.
-    pub(crate) fetch: cgka_traits::MessageId,
-    /// The session's recovery boundary qualified: a relay it was admitted
-    /// for reached end-of-stored-events.
-    pub(crate) boundary: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct MaintenanceRecoveryObservation {
-    pub(crate) fence: RecoveryRevisionFence,
-    pub(crate) attempt_serial: u64,
-    pub(crate) id: [u8; 16],
-    pub(crate) scopes: Vec<GrantedScope>,
-}
-
 pub(crate) struct AccountRecoveryOwner {
     pub(super) native_batch: Option<transport_nostr_adapter::ReplayBatch>,
     pub(super) native_ingress: Option<transport_nostr_adapter::ReplayIngress>,
     pub(super) retained_spill: std::collections::HashMap<cgka_traits::MessageId, i64>,
     pub(super) native_cursor_target: Option<u64>,
     pub(super) native_receive_pending: bool,
-    pub(crate) maintenance_observations:
-        std::collections::HashMap<cgka_traits::GroupId, MaintenanceRecoveryObservation>,
     wall_anchor_ms: u64,
     monotonic_anchor: Instant,
     replay_generation: Option<u64>,
@@ -100,12 +73,8 @@ impl AccountRecoveryOwner {
         wall_now_ms: u64,
         monotonic_now: Instant,
         policy: RecoveryRetryPolicy,
-        runner_owns_debt: bool,
     ) -> StorageResult<Self> {
         policy.delay_ms(0)?;
-        if !runner_owns_debt {
-            storage.restore_unacknowledged_recovery_loss()?;
-        }
         storage.restore_recovery_waiters()?;
         storage.reclaim_completed_recovery_events()?;
         storage.restore_recovery_retry(wall_now_ms, duration_ms(policy.cap)?)?;
@@ -115,7 +84,6 @@ impl AccountRecoveryOwner {
             retained_spill: std::collections::HashMap::new(),
             native_cursor_target: None,
             native_receive_pending: false,
-            maintenance_observations: std::collections::HashMap::new(),
             wall_anchor_ms: wall_now_ms,
             monotonic_anchor: monotonic_now,
             replay_generation: None,
@@ -224,9 +192,8 @@ impl AppClient {
             .recovery_owner
             .replay_observed_generation
             .replace(generation);
-        let runner = self.app.recovery_runner_owns_debt();
         if self.recovery_owner.native_replay_authorizes(generation)
-            && !(runner && self.delivery_loss_blocks_cursor())
+            && !self.delivery_loss_blocks_cursor()
         {
             return Ok(());
         }
@@ -351,141 +318,6 @@ impl AppClient {
             .ok()?
             .local_copy_welcome_created_at
             .map(|created_at| crate::history_floor(created_at.0))
-    }
-
-    /// End the group's owed post-join history fetch `fetch`. Once its live
-    /// session's boundary has qualified, it ends as fetched when everything
-    /// that group's replay holds has been ingested, however long after the
-    /// deadline that is; before then, it ends only at the deadline set when
-    /// the session was installed. `boundary` is this pass's qualification.
-    /// Returns whether the fetch ended.
-    pub(super) async fn settle_post_join_history_fetch(
-        &mut self,
-        group_id: &cgka_traits::GroupId,
-        fetch: &cgka_traits::MessageId,
-        boundary: bool,
-    ) -> Result<bool, AppError> {
-        let Some((subscription, _)) = self
-            .post_join_maintenance_subscriptions
-            .get(group_id)
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        let Some(session) = self
-            .post_join_history_sessions
-            .get_mut(&subscription)
-            .filter(|session| session.fetch == *fetch)
-        else {
-            return Ok(false);
-        };
-        session.boundary |= boundary;
-        let completion = if session.boundary {
-            // Native ingress acknowledges a frame only after its ingest, so a
-            // placed session has had everything it delivered processed. The
-            // group's frames flush only once all of its streams are ready, so
-            // placement is the group's, not this subscription's alone.
-            if self.recovery_owner.native_ingress.is_none()
-                || self.adapter.group_maintenance_placed(&subscription).await != Some(true)
-            {
-                return Ok(false);
-            }
-            self.runtime
-                .finish_post_join_history_fetch(group_id, fetch)?
-        } else {
-            self.runtime
-                .expire_post_join_history_fetch(group_id, fetch)?
-        };
-        let Some(completion) = completion else {
-            return Ok(false);
-        };
-        tracing::debug!(
-            target: "marmot_app::maintenance",
-            method = "settle_post_join_history_fetch",
-            outcome = match completion.outcome {
-                cgka_traits::PostJoinHistoryFetchOutcome::Fetched => "fetched",
-                cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired => "deadline_expired",
-            },
-            "post-join history fetch ended"
-        );
-        Ok(true)
-    }
-
-    /// Forget the fetch of every post-join session that is no longer live.
-    pub(super) fn retain_live_post_join_history_sessions(&mut self) {
-        let live = self
-            .post_join_maintenance_subscriptions
-            .values()
-            .map(|(subscription, _)| subscription)
-            .collect::<std::collections::HashSet<_>>();
-        self.post_join_history_sessions
-            .retain(|subscription, _| live.contains(subscription));
-    }
-
-    pub(super) async fn observe_post_join_recovery_boundary(
-        &mut self,
-        group_id: &cgka_traits::GroupId,
-    ) -> Result<bool, AppError> {
-        self.synchronize_native_replay().await?;
-        let Some(observation) = self
-            .recovery_owner
-            .maintenance_observations
-            .get(group_id)
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        let Some((subscription, _)) = self.post_join_maintenance_subscriptions.get(group_id) else {
-            return Ok(false);
-        };
-        let mut checkpoints = Vec::new();
-        for scope in &observation.scopes {
-            let mut endpoints = Vec::new();
-            for endpoint in &scope.goal.admitted_endpoints {
-                if self
-                    .adapter
-                    .group_maintenance_endpoint_eose(
-                        subscription,
-                        &cgka_traits::TransportEndpoint(endpoint.clone()),
-                    )
-                    .await
-                    == Some(true)
-                {
-                    endpoints.push(storage_sqlite::RecoveryEndpointCheckpoint {
-                        endpoint: endpoint.clone(),
-                        outcome: storage_sqlite::RecoveryScopeOutcome::Partial,
-                        exhaustive: false,
-                        admission_complete: false,
-                        first_boundary: true,
-                    });
-                }
-            }
-            checkpoints.push(storage_sqlite::RecoveryScopeCheckpoint {
-                token: scope.token.clone(),
-                endpoints,
-                retained_known_event: false,
-                replay_admitted: false,
-            });
-        }
-        let storage = self.app.account_storage(&self.state.label)?;
-        self.synchronize_recovery_loss(&storage.app_storage())?;
-        self.observe_recovery_route_policy()?;
-        let domain_updates = self.runtime.post_join_eose_updates(group_id)?;
-        storage.with_transaction(|storage| {
-            let qualified = storage.app_storage().checkpoint_recovery_obligation(
-                &observation.fence,
-                observation.attempt_serial,
-                observation.id,
-                &checkpoints,
-                storage_sqlite::RecoveryEligibility::Retry,
-            )?;
-            if qualified {
-                for obligation in &domain_updates {
-                    storage.put_maintenance_obligation(obligation)?;
-                }
-            }
-            Ok(qualified)
-        })
     }
 
     pub(crate) fn observe_recovery_route_policy(&self) -> Result<(), AppError> {

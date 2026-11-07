@@ -7782,9 +7782,9 @@ fn publish_client_pending_applied_summary(
 /// `GroupStateUpdated` for each group whose own notices appeared or
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
-/// calls this; each call is one indexed read of the parked set. Behind the
-/// internal `runner_owns_debt` gate a change in what the recovery runner
-/// catches up, or in the notices, is one `RecoveryStatusChanged`. It also
+/// calls this; each call is one indexed read of the parked set. A change in
+/// what the recovery runner catches up, or in the notices, is one
+/// `RecoveryStatusChanged`, sent first. It also
 /// announces device-group and sign-in changes
 /// ([`publish_device_group_changes`], [`publish_sign_in_changes`]).
 fn publish_account_level_changes(
@@ -8594,6 +8594,11 @@ mod tests {
             .ticket
             .id;
         let expect_change = |received: &mut broadcast::Receiver<MarmotAppEvent>| {
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                MarmotAppEvent::RecoveryStatusChanged { account_id_hex, account_label }
+                    if account_id_hex == account.account_id_hex && account_label == "alice"
+            ));
             assert!(matches!(
                 received.try_recv().unwrap(),
                 MarmotAppEvent::HistoryNoticesChanged { account_id_hex, account_label }

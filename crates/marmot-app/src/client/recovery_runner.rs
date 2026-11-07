@@ -2,12 +2,12 @@
 //! history recovery scheduling over the coverage ledger and its durable retry
 //! state.
 //!
-//! It runs only behind the internal `runner_owns_debt` gate, off until the
-//! switch-over turns it on (PR 5g). With the gate on, the account worker
-//! spawns it and stops it with the worker, and a directly owned client runs it
-//! in place for one pass from `sync()` and `next_event()` ([`host`]). With the
-//! gate off nothing constructs it, so the comparison owner in `recovery.rs`
-//! keeps every behavior and the ledger stays in shadow mode.
+//! It owns every history fetch since PR 5g. The account worker spawns it and
+//! stops it with the worker, and a directly owned client runs it in place for
+//! one pass from `sync()` and `next_event()` ([`host`]). Only tests still turn
+//! the internal `runner_owns_debt` gate off. That skips ownership preparation
+//! and the runner: no conversion before subscriptions, no replay delegation, no
+//! live fences and no runner, so the adapter's own clamp paging still runs.
 //!
 //! One step:
 //!

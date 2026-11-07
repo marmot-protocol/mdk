@@ -4,8 +4,7 @@
 use std::sync::Arc;
 
 use storage_sqlite::{
-    RecoveryCause, SqliteAccountStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS,
-    TransportReconciliationRoute,
+    SqliteAccountStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 
 use crate::client::AppClient;
@@ -382,6 +381,43 @@ async fn notification_lag_uncovers_every_route_from_its_floor() {
     }
 }
 
+/// A notification lag whose REQ floor is unknown un-covers every current
+/// route's whole window: nothing it proved survives, and each owes from its
+/// standing goal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notification_lag_with_no_floor_uncovers_every_routes_whole_window() {
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let routes = routes(&fixture.client);
+    for route in &routes {
+        assert!(!owed(&fixture, route, unix_now_seconds()).await);
+        assert!(
+            !app.recovery_coverage_ranges(route, &relay())
+                .unwrap()
+                .is_empty()
+        );
+    }
+    app.record_account_recovery_loss_bounded(
+        "alice",
+        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+        7,
+        0,
+        unix_now_seconds(),
+        None,
+    )
+    .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    for route in &routes {
+        assert!(
+            app.recovery_coverage_ranges(route, &relay())
+                .unwrap()
+                .is_empty(),
+            "an unknown floor un-covers the whole window"
+        );
+        assert!(owed(&fixture, route, unix_now_seconds()).await);
+    }
+}
+
 /// A lag on the account's own SDK context carries each route's REQ floor, and
 /// the worker records it per route: each route owes from its own floor, so
 /// the inbox REQ's wider window no longer drags the group's debt back with it.
@@ -493,9 +529,7 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         "nothing wanted the new group's route yet"
     );
 
-    fixture
-        .client
-        .record_coverage_request(RecoveryCause::IncrementalHistory);
+    fixture.client.record_open_coverage_goals();
     assert_eq!(
         app.recovery_coverage_goal(&group_route).unwrap(),
         Some(welcome_floor)
@@ -524,14 +558,6 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         app.recovery_coverage_goal(&group_route).unwrap(),
         Some(lost_from)
     );
-
-    // Explicit repair wants the whole window, and nothing below it.
-    fixture
-        .client
-        .record_coverage_request(RecoveryCause::ExplicitHistory);
-    let goal = app.recovery_coverage_goal(&group_route).unwrap().unwrap();
-    assert!(goal >= super::retention_floor(now));
-    assert!(goal <= super::retention_floor(unix_now_seconds()));
 
     // A Welcome older than the window starts nothing below it, and one still
     // ahead of now (the joining clock ran fast) is ignored, even inside the

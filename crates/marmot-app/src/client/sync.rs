@@ -1100,7 +1100,7 @@ impl AppClient {
         }
     }
 
-    fn observe_runner_delivery_overflow(
+    fn observe_delivery_overflow(
         &mut self,
         overflow: transport_nostr::AccountDeliveryOverflow,
     ) -> Result<(), AppError> {
@@ -1149,91 +1149,6 @@ impl AppClient {
             self.adapter.notification_loss_persisted(overflow);
         }
         self.finish_runner_loss_import()?;
-        Ok(())
-    }
-
-    fn observe_delivery_overflow(
-        &mut self,
-        overflow: transport_nostr::AccountDeliveryOverflow,
-    ) -> Result<(), AppError> {
-        if self.app.recovery_runner_owns_debt() {
-            return self.observe_runner_delivery_overflow(overflow);
-        }
-        // The router's process-local fence already froze cursor advancement at
-        // the omission. Re-observe the same token here so the queued signal is
-        // also an idempotent storage boundary before recovery starts.
-        let storage = self.app.account_storage(&self.state.label)?;
-        let app = storage.app_storage();
-        self.synchronize_recovery_loss(&app)?;
-        if overflow.dropped > 0 {
-            // The marker writer may not have named every drop counted here
-            // yet, so the router's routes for them come along; storage merges
-            // them only for drops past the durable count.
-            let routes = self.adapter.delivery_loss_routes(&overflow).map(|routes| {
-                routes
-                    .into_iter()
-                    .map(|(route, earliest)| (crate::reconciliation_route(route), earliest))
-                    .collect::<Vec<_>>()
-            });
-            let marked = app.mark_account_delivery_recovery_observed(
-                &self.state.label,
-                overflow.marker_token,
-                overflow.dropped,
-                overflow.earliest_dropped,
-                routes.as_deref(),
-            )?;
-            self.record_recovery_loss_imports(marked.into_iter().collect());
-        }
-        if overflow.notification_losses > 0 {
-            // The lag's REQ floors bound the loss from below, per route when
-            // every REQ that could have delivered it named its routes. Each
-            // lag mints a fresh token, so a lower floor always imports as new
-            // loss with a new obligation revision rather than rewriting a
-            // frozen goal.
-            let routes = self
-                .adapter
-                .notification_loss_routes(&overflow)
-                .map(|routes| {
-                    routes
-                        .into_iter()
-                        .map(|(route, since)| (crate::reconciliation_route(route), since))
-                        .collect::<Vec<_>>()
-                });
-            app.record_account_recovery_loss_routed(
-                &self.state.label,
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-                overflow.notification_token,
-                0,
-                unix_now_seconds(),
-                overflow.notification_floor,
-                routes.as_deref(),
-            )?;
-            self.synchronize_recovery_loss(&app)?;
-            self.adapter.notification_loss_persisted(overflow);
-        }
-        // A late observation of loss the user already retired rearms nothing.
-        // Release its fence as the dismissal would have, never as coverage.
-        if self.release_retired_delivery_loss(Some(overflow))? {
-            tracing::debug!(
-                target: "marmot_app::relay_plane",
-                method = "observe_delivery_overflow",
-                "observed delivery loss was already retired; cursor fence released",
-            );
-            return Ok(());
-        }
-        self.delivery_overflow_recovery_pending = true;
-        self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
-        tracing::warn!(
-            target: "marmot_app::relay_plane",
-            method = "observe_delivery_overflow",
-            queue_depth = overflow.queue_depth,
-            dropped = overflow.dropped,
-            dropped_bounded = overflow.earliest_dropped.is_some(),
-            notification_losses = overflow.notification_losses,
-            notification_bounded = overflow.notification_floor.is_some(),
-            elapsed_ms = overflow.elapsed_ms,
-            "account delivery loss requires comparison recovery",
-        );
         Ok(())
     }
 
@@ -8790,81 +8705,6 @@ mod tests {
 
 #[cfg(test)]
 mod queued_outbound_schedule_tests;
-
-#[cfg(test)]
-mod retired_loss_observation_tests {
-    use std::sync::Arc;
-
-    use crate::client::history_notices::park_recovery_for_test;
-    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
-    use transport_nostr::AccountDeliveryOverflow;
-
-    /// A dismissal cannot release the plane while that generation still has
-    /// work in flight, such as a queued control record. The later observation
-    /// of the same, now retired, loss must release the fence rather than
-    /// re-raise it, while genuinely new loss still arms recovery.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_late_observation_of_retired_loss_releases_the_fence_without_rearming() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        // This case rearms the old obligation's cursor fence; the runner
-        // imports loss as ledger debt and releases that raw handoff instead.
-        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_recovery_runner_ownership_for_test(false)
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let storage = app.account_storage("alice").unwrap();
-        let app = storage.app_storage();
-        app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(42);
-        client.adapter.start_delivery_overflow_recovery(42);
-        client.adapter.fail_delivery_overflow_recovery();
-        let loss = app
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
-            .unwrap()
-            .ticket
-            .id;
-        park_recovery_for_test(&storage, loss);
-        let ticket = app.parked_recovery_obligations().unwrap()[0].ticket;
-        assert!(
-            app.retire_parked_recovery_obligation(ticket.id, ticket.revision, 1_000)
-                .unwrap()
-        );
-        assert!(client.delivery_loss_blocks_cursor());
-
-        let observed = client.adapter.pending_delivery_overflow().unwrap();
-        client.observe_delivery_overflow(observed).unwrap();
-        assert!(!client.delivery_overflow_recovery_pending);
-        assert!(client.adapter.pending_delivery_overflow().is_none());
-        assert!(!client.delivery_loss_blocks_cursor());
-        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
-        assert!(client.history_notices().unwrap().is_empty());
-
-        client
-            .observe_delivery_overflow(AccountDeliveryOverflow {
-                generation: 9,
-                marker_token: 77,
-                dropped: 1,
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(client.delivery_overflow_recovery_pending);
-        assert_eq!(
-            app.account_delivery_recovery("alice")
-                .unwrap()
-                .unwrap()
-                .marker_token,
-            77,
-            "new loss reopens the retired obligation as pending debt"
-        );
-    }
-}
 
 #[cfg(test)]
 mod routed_loss_observation_tests {

@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-06
+updated: 2026-11-07
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -558,11 +558,10 @@ Welcome floor instead of preserving an accidentally broader goal.
 
 **Coverage versus goals.** No debt means no unproven history against the goals the ledger
 holds; it says nothing about a route with no goal. Every current route therefore needs a
-standing goal, including one added after the account's first cold start. Account open seeds
-these even when the transport cursor skips the old owner's incremental-history request.
+standing goal, including one added after the account's first cold start. Every account open
+seeds these, cursor or not.
 Routing replacements wake the runner, whose next routing-change turn seeds newly current
-routes before selecting debt. With the runner gate off these ledger writes do not change
-the old owner's obligations or host-visible recovery status.
+routes before selecting debt.
 
 **Parked remainders.** Debt the moving retention floor overtakes before anything covers it,
 and loss whose floor is unknown or older than the window, is parked rather than dropped: each
@@ -799,7 +798,9 @@ leave staging in one transaction.
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
 fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
 on. The old owner's grant, native capture and comparison job are deleted (5c2a846b4 is the last
-commit with them); the gate's off arm remains only in tests until the gate itself goes. Before any
+commit with them), and so are the gate's off arms. Until the gate goes, a test that turns it off
+skips ownership preparation and the runner: no conversion before subscriptions, no replay
+delegation, no live fences, so the adapter's clamp paging still runs. Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
 ledger debt. Autonomous clamp continuation is disabled for app-owned accounts; ordinary native
 input, count facts and bounded fences remain. Supported
@@ -1023,8 +1024,7 @@ them) and what dismissing it retires are one set, so such a park moves no revisi
 dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
 its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
 publishes the required units still catching up; the account's recovery status reads that, and
-a change in it or in the notices is one `RecoveryStatusChanged`. With the gate off none of this
-shows.
+a change in it or in the notices is one `RecoveryStatusChanged`.
 
 ## What gets deleted
 
@@ -1063,11 +1063,16 @@ the old owner):
 - The gate-off native replay source sync that kept `SubscriptionReplay` goals and capture tokens.
 - The epoch-backfill reporting arm, the scripted comparison test seams and the worker's
   comparison test commands, and the tests that pinned only the deleted path.
+- The gate's off arms: legacy loss import and restore at open and on overflow, the
+  IncrementalHistory request at open, the gate-off coverage request seam, empty ledger notices
+  and status, and the post-join maintenance subscriptions and history sessions a grant
+  installed. Every account runs the runner's loss import, notices and post-join collection.
 
 Still to delete:
 
-- The old owner's remaining paths: native-replay ownership leftovers, legacy loss import,
-  notices and the post-join maintenance path; then the gate itself and its test fixtures.
+- The gate itself and its test fixtures, and old-owner paths no current data reaches: the
+  comparison slot `request_bounded_comparison` still joins, qualified-stagnation escalation,
+  capacity-wait eligibility, and the storage and adapter APIs only the old owner called.
 - The adapter's native pager and `SubscriptionReplay` (row 8).
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 
@@ -1086,7 +1091,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - The Welcome floor (design section 5): a joined group's standing goal starts at the
   Welcome that installed the copy, less a fifteen-minute clock-skew allowance. The
   runner's post-join collection (`recovery_runner/post_join.rs`) replaces the
-  maintenance subscriptions a grant installed; nothing installs those any more.
+  maintenance subscriptions a grant installed, which are deleted.
 - The #1946 rule that recovery debt is never evicted. Spill rows are capped; unresolved loss
   is not. Every unresolved loss generation and every parked obligation stays, with no fixed
   row cap, until qualified completion (an explicit deep repair counts only when it achieves

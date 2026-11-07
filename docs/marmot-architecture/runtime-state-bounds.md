@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-11-06
+updated: 2026-11-07
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -301,7 +301,7 @@ Retirement is per occurrence and only on the user's decision; it is not such a c
 | --- | --- | --- |
 | Completed known-event rows and scopes | No historical completed-event log | Reclaimed on owner reconstruction. Pending exact-event debt is untouched. |
 | Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it, and a finished pass whose every route's window certified closes it; cancellation removes urgency only. Reopen performs the same cleanup. |
-| Maintenance boundary metadata and live observations | Input-relative to active post-join domain jobs | Removed with the job/session lifecycle; grace and quiet timers remain domain-owned. |
+| Maintenance boundary metadata and the runner's post-join collections | Input-relative to active post-join domain jobs | Removed with the job and collection lifecycle; grace and quiet timers remain domain-owned. |
 | Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
 | Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion, explicit terminal domain retirement, or the user's explicit retirement of a parked occurrence (`state = 2`, "history may be incomplete"). A retired row keeps its unique demand key and its latest scope checkpoints, so it is bounded by the key space; genuinely new demand for that key reopens it. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
 

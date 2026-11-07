@@ -642,18 +642,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. Ledger notices (behind `runner_owns_debt`) record `notice_shown` and
+  charges or history certificates. Ledger notices record `notice_shown` and
   `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs`.
-- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
-  at owner seams only: account open (`record_open_coverage_goals`), the runner's routing-change settlement,
-  loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
-  routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
-  requests (`record_recovery_request`) and native
-  synchronization (`synchronize_native_replay`). Its writes are best effort in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
-  fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
+- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660). It records at owner seams only:
+  account open (`record_open_coverage_goals`), the runner's routing-change settlement, loss imports
+  (`synchronize_recovery_loss`; storage un-covers the ledger inside the import transaction, and inside each receipt
+  release) and native synchronization (`synchronize_native_replay`). Conversion and new loss imports are
+  authoritative and fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
   records its per-cause aggregate `conversion` trace before the first quantum, acknowledges that report and imports
   ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. A newly armed
   epoch-gap obligation and invalidation of its group's existing ledger goals commit together through
@@ -662,8 +660,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the existing retry seam. Wake the runner after the transaction succeeds. The native source's
   original range is durably owed before its generation may authorize a cursor seal; the seal still checks placement,
   spill and held input under the existing locks. A failed ledger write never grants that permission. Every account open widens every current route's standing goal, cursor or not; a runner
-  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
-  without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
+  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly. A live boundary proves only
   what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
@@ -699,10 +696,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
   un-cover or drop debt. It logs aggregate counts only.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
-  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the gate off through
-  the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed. With it
-  off nothing constructs the runner; the old owner's grant and comparison job no longer exist.
+  `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
+  fetch (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the internal `runner_owns_debt` gate off
+  through the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed.
+  With it off `prepare_runner_ownership` returns at once and nothing seats the runner: no conversion before
+  subscriptions, no `delegate_replay_recovery`, no live fences, so a full live reply still takes the adapter's clamp
+  paging. Notice, recovery status and post-join code no longer branch on the gate; the catching-up status stays empty
+  until a runner surveys. The old owner's grant, comparison job and off arms no longer exist.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
@@ -777,10 +777,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
   repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry
   armed; the worker seats it once a preparation succeeds, even if that refresh then fails (`recovery_runner_due`).
-  Gate-off callers keep the legacy behavior. Imported loss releases the plane cursor fence only at the exact
+  Imported loss releases the plane cursor fence only at the exact
   generation/writer barrier; transactional evidence reclamation follows, restoring the guard on failure. This handoff never records recovery success or coverage. The inbox is a route like a group's, compared only and never
   swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
-  comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
+  comparisons, and admission never fences it. Explicit repair (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
   waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight.
   Explicit repair includes history through its request time inside a healthy live tail: a relay may restore stored
@@ -797,8 +797,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
   (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
   routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
-  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows. They, the status and its event show
-  nothing with the gate off.
+  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
   back as an unlisted route's is. A
@@ -987,15 +986,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
   adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
   first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
-- Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626).
-  `advance_post_join_maintenance_subscriptions` keeps a group's session while its fetch is owed, whatever phase commits
-  moved the obligation to, and ends the fetch only through `settle_post_join_history_fetch`: `Fetched` needs the
-  session's qualified boundary, open native ingress and the adapter's placement verdict for that subscription, and
-  the deadline expires only a session whose boundary has not qualified. While a fetch is owed, its session is
-  requested and retained under the fetch's job alone; an early-phase obligation (a re-armed one, or an earlier copy's
-  after a replacement Welcome) keeps the session alive but never picks its job. A session installed for another fetch
-  id (an earlier copy), or whose demand is gone before its boundary qualified, never ends the current one. The fetch never moves the obligation, so self-update timing stays the
-  obligation's own.
+- Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626). The runner's
+  post-join collection (`src/client/recovery_runner/post_join.rs`, advanced by
+  `advance_post_join_maintenance_subscriptions`) keeps a copy's collection while its fetch is owed, whatever phase
+  commits moved the obligation to. It ends the fetch as `Fetched` only once the coverage ledger covers the copy's
+  whole requested range on its required relays, nothing of the route is staged and every source is placed; the
+  deadline expires only a fetch whose range was never acquired. A collection for another copy never ends the current
+  one. The fetch never moves the obligation, so self-update timing stays the obligation's own.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not
