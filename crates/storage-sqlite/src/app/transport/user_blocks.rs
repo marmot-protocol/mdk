@@ -263,6 +263,7 @@ mod tests {
     #[test]
     fn user_blocks_versions_and_public_precedence() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        assert!(!store.app_storage().has_blocked_users().unwrap());
         assert!(adopt(
             &store,
             "bb",
@@ -270,6 +271,7 @@ mod tests {
             &[("alice", true), ("alice", false), ("bob", true)]
         ));
         let first = store.app_storage().block_list_snapshot().unwrap();
+        assert!(store.app_storage().has_blocked_users().unwrap());
         assert_eq!(
             first
                 .users
@@ -282,6 +284,7 @@ mod tests {
         assert!(!adopt(&store, "cc", 10, &[]));
         assert!(!adopt(&store, "aa", 9, &[]));
         assert_eq!(store.app_storage().block_list_snapshot().unwrap(), first);
+        assert!(store.app_storage().has_blocked_users().unwrap());
         assert!(adopt(&store, "aa", 10, &[]));
         assert!(
             store
@@ -295,6 +298,53 @@ mod tests {
             store.app_storage().block_list_snapshot().unwrap().revision,
             first.revision + 1
         );
+        assert!(!store.app_storage().has_blocked_users().unwrap());
+    }
+    #[test]
+    fn unreadable_block_replacements_use_newest_timestamp_then_lowest_id() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        assert!(!app.block_list_has_unreadable_replacement().unwrap());
+        app.record_unreadable_block_list("cc", 9).unwrap();
+        assert!(app.block_list_has_unreadable_replacement().unwrap());
+        assert!(adopt(&store, "bb", 10, &[]));
+        assert!(!app.block_list_has_unreadable_replacement().unwrap());
+        for (incoming_id, incoming_at, kept_id, kept_at, blocks_edit) in [
+            ("aa", 8, "cc", 9, false),
+            ("dd", 9, "cc", 9, false),
+            ("bb", 9, "bb", 9, false),
+            ("cc", 10, "cc", 10, false),
+            ("bb", 10, "bb", 10, false),
+            ("aa", 10, "aa", 10, true),
+            ("zz", 11, "zz", 11, true),
+        ] {
+            app.record_unreadable_block_list(incoming_id, incoming_at)
+                .unwrap();
+            let kept: (String, i64) = app
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT unreadable_event_id,unreadable_event_created_at FROM user_block_list",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(kept, (kept_id.into(), kept_at));
+            assert_eq!(
+                app.block_list_has_unreadable_replacement().unwrap(),
+                blocks_edit
+            );
+        }
+        // Resolving the exact event, a lower equal-time id, or a newer readable
+        // list must all supersede the previously unreadable replacement.
+        assert!(adopt(&store, "zz", 11, &[]));
+        assert!(!app.block_list_has_unreadable_replacement().unwrap());
+        assert!(adopt(&store, "yy", 11, &[]));
+        assert!(!app.block_list_has_unreadable_replacement().unwrap());
+        app.record_unreadable_block_list("xx", 11).unwrap();
+        assert!(app.block_list_has_unreadable_replacement().unwrap());
+        assert!(adopt(&store, "aa", 12, &[]));
+        assert!(!app.block_list_has_unreadable_replacement().unwrap());
     }
     #[test]
     fn user_blocks_transaction_failure_preserves_list_and_revision() {
@@ -329,7 +379,40 @@ mod tests {
         let path = dir.path().join("account.sqlite");
         let key = crate::SqlCipherKey::raw([7; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = store.app_storage();
+        app.record_app_event(&crate::StoredAppEvent {
+            group_id_hex: "group".into(),
+            message_id_hex: "already-received".into(),
+            source_message_id_hex: Some("source".into()),
+            source_epoch: Some(1),
+            direction: "received".into(),
+            sender: "alice".into(),
+            plaintext: "received before blocking".into(),
+            kind: 9,
+            tags: Vec::new(),
+            recorded_at: 1,
+            received_at: 1,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+        assert!(
+            !app.suppress_blocked_notification("alice", "group", "already-received")
+                .unwrap()
+        );
         adopt(&store, "a", 1, &[("alice", true)]);
+        assert!(
+            app.suppress_blocked_notification("alice", "group", "already-received")
+                .unwrap()
+        );
+        assert!(
+            !app.suppress_blocked_notification("bob", "group", "unrelated")
+                .unwrap()
+        );
+        assert!(
+            !app.blocked_notification_suppressed("another-group", "already-received")
+                .unwrap()
+        );
         store
             .app_storage()
             .stage_block_publication(&PendingBlockPublication {
@@ -342,6 +425,7 @@ mod tests {
             .app_storage()
             .dismiss_blocked_welcome("welcome")
             .unwrap();
+        drop(app);
         drop(store);
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert!(reopened.app_storage().is_user_blocked("alice").unwrap());
@@ -362,6 +446,42 @@ mod tests {
             reopened
                 .app_storage()
                 .is_blocked_welcome_dismissed("welcome")
+                .unwrap()
+        );
+        let app = reopened.app_storage();
+        assert!(
+            app.blocked_notification_suppressed("group", "already-received")
+                .unwrap()
+        );
+        app.clear_block_publication().unwrap();
+        assert!(app.pending_block_publication().unwrap().is_none());
+        assert!(app.is_user_blocked("alice").unwrap());
+        assert!(adopt(&reopened, "b", 2, &[]));
+        assert!(
+            app.suppress_blocked_notification("alice", "group", "already-received")
+                .unwrap()
+        );
+        assert!(
+            !app.suppress_blocked_notification("alice", "group", "after-unblock")
+                .unwrap()
+        );
+        drop(app);
+        drop(reopened);
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = reopened.app_storage();
+        assert!(app.pending_block_publication().unwrap().is_none());
+        assert!(app.is_blocked_welcome_dismissed("welcome").unwrap());
+        assert!(!app.has_blocked_users().unwrap());
+        assert!(
+            app.blocked_notification_suppressed("group", "already-received")
+                .unwrap()
+        );
+        assert!(
+            !app.blocked_notification_suppressed("another-group", "already-received")
+                .unwrap()
+        );
+        assert!(
+            !app.blocked_notification_suppressed("group", "unrelated")
                 .unwrap()
         );
     }
