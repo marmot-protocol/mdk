@@ -1393,6 +1393,13 @@ fn consent_preserves_lifecycle_without_replaying_preconsent_activity() {
     };
     c.activity(ProductAnalyticsActivity::ForegroundNotification);
     c.activity(ProductAnalyticsActivity::AccountChanged);
+    {
+        let state = c.lock();
+        assert!(
+            state.cells.is_empty() && state.backlog.is_empty() && state.window.is_none(),
+            "disabled account changes must not accumulate observations before consent"
+        );
+    }
     assert_eq!(
         c.record(event()).unwrap(),
         ProductRecordResult::IgnoredDisabled
@@ -1416,6 +1423,13 @@ fn consent_preserves_lifecycle_without_replaying_preconsent_activity() {
     c.revoke_memory();
     c.activity(ProductAnalyticsActivity::Background);
     c.activity(ProductAnalyticsActivity::AccountChanged);
+    {
+        let state = c.lock();
+        assert!(
+            state.cells.is_empty() && state.backlog.is_empty() && state.window.is_none(),
+            "disabled account changes must not accumulate observations before consent"
+        );
+    }
     grant(&c);
     assert_eq!(
         c.record(event()).unwrap(),
