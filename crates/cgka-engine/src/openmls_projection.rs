@@ -2356,19 +2356,22 @@ fn capture_candidate_tip_context<S: StorageProvider>(
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<Option<CandidateTipState>, OpenMlsProjectionError> {
-    // A path that fails to replay is simply not a reachable branch state; the
-    // BFS already reported that outcome for adjudication.
-    if process_openmls_messages_inner(
+    // The BFS owns semantic rejection. A new backend failure during this
+    // later replay says nothing about the path's validity and must propagate.
+    if let Err(error) = process_openmls_messages_inner(
         storage,
         group_id,
         messages,
         own_commits,
         profile_policy,
         None,
-    )
-    .is_err()
-    {
-        return Ok(None);
+    ) {
+        return match error {
+            error @ (OpenMlsProjectionError::Storage(_) | OpenMlsProjectionError::Snapshot(_)) => {
+                Err(error)
+            }
+            _ => Ok(None),
+        };
     }
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
