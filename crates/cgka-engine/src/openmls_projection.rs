@@ -4477,8 +4477,16 @@ fn kind_from_content_type(content_type: ContentType) -> OpenMlsContentKind {
     }
 }
 
-fn replay_error(context: &str, error: impl std::fmt::Debug) -> OpenMlsProjectionError {
-    OpenMlsProjectionError::Replay(format!("{context}: {error:?}"))
+fn replay_error<E: std::fmt::Debug>(
+    context: &str,
+    error: ProcessMessageError<E>,
+) -> OpenMlsProjectionError {
+    match error {
+        ProcessMessageError::StorageError(error) => {
+            OpenMlsProjectionError::Storage(format!("{context}: {error:?}"))
+        }
+        other => OpenMlsProjectionError::Replay(format!("{context}: {other:?}")),
+    }
 }
 
 /// Process a commit, validating and applying any `AppDataUpdate` proposals it
