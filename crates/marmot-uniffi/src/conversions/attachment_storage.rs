@@ -314,4 +314,39 @@ mod tests {
             assert_eq!((usage.migration, usage.migration_bytes), (expected, bytes));
         }
     }
+
+    #[test]
+    fn storage_summaries_redact_attachment_metadata_but_keep_byte_counts() {
+        let chat = ChatAttachmentUsageFfi {
+            group_id_hex: "PRIVATE_GROUP".into(),
+            bytes: 73,
+            attachment_count: 1,
+        };
+        let attachment = RetainedAttachmentSummaryFfi {
+            group_id_hex: "PRIVATE_GROUP".into(),
+            target: AttachmentLocalTargetFfi {
+                message_id_hex: "PRIVATE_MESSAGE".into(),
+                source_message_id_hex: "PRIVATE_SOURCE".into(),
+                attachment_index: 0,
+            },
+            byte_count: 79,
+            media_type: "image/PRIVATE_MEDIA_TYPE".into(),
+            file_name: "PRIVATE_FILE_NAME".into(),
+            received_at: 83,
+        };
+        let chat_debug = format!("{chat:?}");
+        let attachment_debug = format!("{attachment:?}");
+        assert!(chat_debug.contains("bytes: 73"), "{chat_debug}");
+        assert!(
+            attachment_debug.contains("byte_count: 79"),
+            "{attachment_debug}"
+        );
+        assert!(!attachment_debug.contains("83"), "{attachment_debug}");
+        for value in [chat_debug, attachment_debug] {
+            assert!(
+                !value.contains("PRIVATE_"),
+                "storage summary leaked: {value}"
+            );
+        }
+    }
 }

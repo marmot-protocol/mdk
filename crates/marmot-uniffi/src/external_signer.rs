@@ -330,6 +330,9 @@ mod tests {
         let signed = unsigned.clone().finalize(&keys).unwrap();
         let host = host(&keys, signed.as_json());
         let adapter = ExternalAccountSignerAdapter::new(host.clone());
+        // Formatting cannot expose host identity/event state or open a signer prompt.
+        assert_eq!(format!("{adapter:?}"), "ExternalAccountSignerAdapter(..)");
+        assert!(host.calls.lock().unwrap().is_empty());
         let caller = std::thread::current().id();
 
         assert_eq!(adapter.get_public_key().await.unwrap(), keys.public_key());

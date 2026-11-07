@@ -410,6 +410,9 @@ fn changes_in_another_group_do_not_restart_this_group() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     seed(&store, 1, 2);
+    // Pin incarnation bytes so privacy checks use independent literal markers.
+    sql(&store, "UPDATE chat_presentation_meta SET store_epoch=x'89d3fdf189d3fdf189d3fdf189d3fdf1' WHERE id=1;
+        UPDATE attachment_history_versions SET generation=x'8bd5fbef8bd5fbef8bd5fbef8bd5fbef' WHERE group_id_hex='aa'");
     let before = page(&app);
     sql(
         &store,
@@ -424,9 +427,22 @@ fn changes_in_another_group_do_not_restart_this_group() {
         app.attachment_history_page("aa", 1, before.next_cursor.as_ref())
             .is_ok()
     );
-    let debug = format!("{:?}", page(&app));
-    assert!(!debug.contains("alice"));
-    assert!(!debug.contains("000001"));
+    let current = page(&app);
+    let cursor = current.next_cursor.as_ref().expect("nonempty continuation");
+    for debug in [
+        format!("{current:?}"),
+        format!("{:?}", current.version),
+        format!("{cursor:?}"),
+    ] {
+        for private in [
+            "alice", "000001", "aa", "137", "211", "253", "139", "213", "251",
+        ] {
+            assert!(
+                !debug.contains(private),
+                "attachment history debug leaked {private}: {debug}"
+            );
+        }
+    }
 }
 
 #[test]
