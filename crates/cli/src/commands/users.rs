@@ -221,7 +221,8 @@ mod tests {
     /// signed-out account is a category error, and the runtime refuses it --
     /// so a search for one of those accounts must not ask, or the enhancement
     /// would turn into a failed search for people who can still search fine
-    /// today.
+    /// today. A radius-0 window also skips co-members: cached Bob remains at
+    /// radius 255, whereas a radius-1 seed would move him into the window.
     #[tokio::test]
     async fn an_account_that_cannot_sign_is_never_asked_for_co_members() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
@@ -375,9 +376,6 @@ mod tests {
             .expect("no runtime yields no seeds rather than failing");
         assert!(seeds.is_empty());
     }
-
-    /// Radius-1 seeds cannot affect a window that stops at radius 0, so the
-    /// per-group membership read is skipped rather than paid for nothing.
 
     #[test]
     fn a_clean_traversal_reports_complete() {
