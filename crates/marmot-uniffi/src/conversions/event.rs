@@ -739,22 +739,179 @@ mod tests {
 
     #[test]
     fn transport_resource_refusal_preserves_recovery_fields() {
-        let event = GroupEvent::TransportObjectResourceRefused {
-            group_id: GroupId::new(vec![0x11]),
-            message_id: MessageId::new(vec![0x22; 32]),
-            resource: InboundResourceLimit::TransportDeferredResidenceBudget,
-        };
-
-        assert_eq!(group_id_from_event(&event).as_slice(), &[0x11]);
-        match GroupEventKindFfi::from(event) {
-            GroupEventKindFfi::TransportObjectResourceRefused {
-                message_id_hex,
+        for (resource, expected) in [
+            (
+                InboundResourceLimit::TransportDeferredCapacity,
+                "transport_deferred_capacity",
+            ),
+            (
+                InboundResourceLimit::TransportDeferredRetryBudget,
+                "transport_deferred_retry_budget",
+            ),
+            (
+                InboundResourceLimit::TransportDeferredResidenceBudget,
+                "transport_deferred_residence_budget",
+            ),
+        ] {
+            let event = GroupEvent::TransportObjectResourceRefused {
+                group_id: GroupId::new(vec![0x11]),
+                message_id: MessageId::new(vec![0x22; 32]),
                 resource,
-            } => {
-                assert_eq!(message_id_hex, "22".repeat(32));
-                assert_eq!(resource, "transport_deferred_residence_budget");
+            };
+            assert_eq!(group_id_from_event(&event).as_slice(), &[0x11]);
+            match GroupEventKindFfi::from(event) {
+                GroupEventKindFfi::TransportObjectResourceRefused {
+                    message_id_hex,
+                    resource,
+                } => {
+                    assert_eq!(message_id_hex, "22".repeat(32));
+                    assert_eq!(resource, expected);
+                }
+                other => panic!("unexpected FFI event: {other:?}"),
             }
-            other => panic!("unexpected FFI event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_change_labels_preserve_optional_actor_and_origin_context() {
+        let subject = cgka_traits::MemberId::new(vec![0x33; 32]);
+        for (change, expected) in [
+            (
+                GroupStateChange::MemberAdded {
+                    member: subject.clone(),
+                },
+                "member_added",
+            ),
+            (
+                GroupStateChange::MemberRemoved {
+                    member: subject.clone(),
+                },
+                "member_removed",
+            ),
+            (
+                GroupStateChange::MemberLeft {
+                    member: cgka_traits::MemberId::new(vec![0x44; 32]),
+                },
+                "member_left",
+            ),
+            (
+                GroupStateChange::AdminAdded {
+                    member: subject.clone(),
+                },
+                "admin_added",
+            ),
+            (
+                GroupStateChange::AdminRemoved { member: subject },
+                "admin_removed",
+            ),
+            (
+                GroupStateChange::GroupRenamed {
+                    name: "next name".into(),
+                    previous_name: Some("old name".into()),
+                },
+                "group_renamed",
+            ),
+            (GroupStateChange::GroupAvatarChanged, "group_avatar_changed"),
+            (
+                GroupStateChange::MessageRetentionChanged {
+                    old_seconds: 60,
+                    new_seconds: 300,
+                },
+                "disappearing_timer_changed",
+            ),
+            (GroupStateChange::GroupDisbanded, "group_disbanded"),
+        ] {
+            for (actor_present, origin_present) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let converted = MarmotEventFfi::from(MarmotAppEvent::GroupEvent(app_group_event(
+                    GroupEvent::GroupStateChanged {
+                        group_id: GroupId::new(vec![0x11; 16]),
+                        epoch: cgka_traits::EpochId(17),
+                        actor: actor_present.then(|| cgka_traits::MemberId::new(vec![0x44; 32])),
+                        change: change.clone(),
+                        origin_commit_id: origin_present.then(|| MessageId::new(vec![0x55; 32])),
+                    },
+                )));
+                let MarmotEventFfi::GroupEvent {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    event,
+                } = converted
+                else {
+                    panic!("expected group event: {converted:?}")
+                };
+                assert_eq!(account_id_hex, "aa".repeat(32));
+                assert_eq!(account_label, "alice");
+                assert_eq!(group_id_hex, "11".repeat(16));
+                let GroupEventKindFfi::GroupStateChanged {
+                    epoch,
+                    actor_id_hex,
+                    change,
+                    origin_commit_id_hex,
+                } = event
+                else {
+                    panic!("expected group-state change: {event:?}")
+                };
+                assert_eq!(epoch, 17);
+                assert_eq!(change, expected);
+                assert_eq!(actor_id_hex, actor_present.then(|| "44".repeat(32)));
+                assert_eq!(
+                    origin_commit_id_hex,
+                    origin_present.then(|| "55".repeat(32))
+                );
+            }
+        }
+    }
+
+    fn app_group_event(event: GroupEvent) -> marmot_app::RuntimeGroupEvent {
+        marmot_app::RuntimeGroupEvent {
+            account_id_hex: "aa".repeat(32),
+            account_label: "alice".into(),
+            event,
+        }
+    }
+
+    #[test]
+    fn invalidation_labels_preserve_message_epoch_and_optional_retained_payload() {
+        for (reason, expected) in [
+            (AppMessageInvalidationReason::LosingBranch, "losing_branch"),
+            (AppMessageInvalidationReason::BeyondAnchor, "beyond_anchor"),
+            (
+                AppMessageInvalidationReason::BeyondAppRetention,
+                "beyond_app_retention",
+            ),
+            (
+                AppMessageInvalidationReason::UndecryptableInCanonicalState,
+                "undecryptable_in_canonical_state",
+            ),
+        ] {
+            for retained in [false, true] {
+                let event = GroupEvent::AppMessageInvalidated {
+                    group_id: GroupId::new(vec![0x11; 16]),
+                    message_id: MessageId::new(vec![0x22; 32]),
+                    epoch: cgka_traits::EpochId(29),
+                    reason,
+                    decrypted_payload_ref: retained.then(|| "retained-payload-reference".into()),
+                };
+                let GroupEventKindFfi::AppMessageInvalidated {
+                    message_id_hex,
+                    epoch,
+                    reason,
+                    decrypted_payload_ref,
+                } = GroupEventKindFfi::from(event)
+                else {
+                    panic!("expected app-message invalidation")
+                };
+                assert_eq!(message_id_hex, "22".repeat(32));
+                assert_eq!(epoch, 29);
+                assert_eq!(reason, expected);
+                assert_eq!(
+                    decrypted_payload_ref.as_deref(),
+                    retained.then_some("retained-payload-reference")
+                );
+            }
         }
     }
 
