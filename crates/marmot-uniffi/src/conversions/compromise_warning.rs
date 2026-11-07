@@ -46,3 +46,35 @@ impl From<CompromiseWarningItem> for CompromiseWarningItemFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compromise_reason_keeps_the_named_slot_and_optional_keypackage() {
+        for (native, expected, package) in [
+            (
+                CompromiseWarningReason::RejectedSignIn,
+                CompromiseWarningReasonFfi::RejectedSignIn,
+                None,
+            ),
+            (
+                CompromiseWarningReason::ForeignOwnSlotKeyPackage,
+                CompromiseWarningReasonFfi::ForeignOwnSlotKeyPackage,
+                Some("22".repeat(32)),
+            ),
+        ] {
+            let ffi = CompromiseWarningItemFfi::from(CompromiseWarningItem {
+                reason: native,
+                slot_id_hex: "11".repeat(32),
+                key_package_ref_hex: package.clone(),
+                occurred_at: 73,
+            });
+            assert_eq!(ffi.reason, expected);
+            assert_eq!(ffi.slot_id_hex, "11".repeat(32));
+            assert_eq!(ffi.key_package_ref_hex, package);
+            assert_eq!(ffi.occurred_at, 73);
+        }
+    }
+}
