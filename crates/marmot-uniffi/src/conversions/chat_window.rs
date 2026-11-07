@@ -363,3 +363,47 @@ impl From<app::AccountAttentionSnapshot> for AccountAttentionSnapshotFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_attention_keeps_the_account_and_specific_reason() {
+        // Each row is a separate coherent snapshot; actual account reads can
+        // fail independently while accounts stay present without invented totals.
+        for (native, expected) in [
+            (
+                app::AccountAttentionUnavailable::Preparing,
+                AccountAttentionUnavailableFfi::Preparing,
+            ),
+            (
+                app::AccountAttentionUnavailable::Resetting,
+                AccountAttentionUnavailableFfi::Resetting,
+            ),
+            (
+                app::AccountAttentionUnavailable::ReadFailed,
+                AccountAttentionUnavailableFfi::ReadFailed,
+            ),
+        ] {
+            let snapshot = AccountAttentionSnapshotFfi::from(app::AccountAttentionSnapshot {
+                subscription_generation: "c05ad659-834d-4217-b299-228f5fe17ad9".into(),
+                sequence: 7,
+                accounts: vec![app::AccountAttentionEntry {
+                    account_id_hex:
+                        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+                    state: app::AccountAttentionState::Unavailable(native),
+                }],
+            });
+            assert_eq!(snapshot.accounts.len(), 1);
+            assert_eq!(
+                snapshot.accounts[0].account_id_hex,
+                "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            );
+            assert!(
+                matches!(snapshot.accounts[0].state, AccountAttentionStateFfi::Unavailable { reason } if reason == expected)
+            );
+        }
+        // The real chat-window command owner retains Ready totals.
+    }
+}
