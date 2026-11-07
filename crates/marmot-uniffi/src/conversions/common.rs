@@ -83,6 +83,24 @@ mod tests {
     use crate::markdown::{MarkdownBlockFfi, MarkdownInlineFfi};
 
     #[test]
+    fn membership_keeps_account_departure_distinct_from_device_removal() {
+        for (native, expected) in [
+            (SelfMembership::Member, SelfMembershipFfi::Member),
+            (SelfMembership::Left, SelfMembershipFfi::Left),
+            (SelfMembership::Removed, SelfMembershipFfi::Removed),
+            (
+                SelfMembership::DeviceRemoved,
+                SelfMembershipFfi::DeviceRemoved,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&SelfMembershipFfi::from(native)),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
     fn chat_tokens_include_details_blocks() {
         let tokens = markdown_content_tokens(
             MARMOT_APP_EVENT_KIND_CHAT,
