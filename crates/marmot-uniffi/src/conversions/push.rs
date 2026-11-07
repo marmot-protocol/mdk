@@ -6,6 +6,50 @@ use marmot_app::{
     PushRegistrationSyncResult,
 };
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::discriminant;
+
+    #[test]
+    fn push_platforms_keep_both_host_and_native_choices() {
+        for (host, expected) in [
+            (PushPlatformFfi::Apns, PushPlatform::Apns),
+            (PushPlatformFfi::Fcm, PushPlatform::Fcm),
+        ] {
+            assert_eq!(PushPlatform::from(host), expected);
+        }
+        for (native, expected) in [
+            (PushPlatform::Apns, PushPlatformFfi::Apns),
+            (PushPlatform::Fcm, PushPlatformFfi::Fcm),
+        ] {
+            assert_eq!(
+                discriminant(&PushPlatformFfi::from(native)),
+                discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn pending_push_share_is_distinct_from_complete() {
+        for (native, expected) in [
+            (
+                PushRegistrationShareStatus::Complete,
+                PushRegistrationShareStatusFfi::Complete,
+            ),
+            (
+                PushRegistrationShareStatus::Pending,
+                PushRegistrationShareStatusFfi::Pending,
+            ),
+        ] {
+            assert_eq!(
+                discriminant(&PushRegistrationShareStatusFfi::from(native)),
+                discriminant(&expected)
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum PushPlatformFfi {
     Apns,

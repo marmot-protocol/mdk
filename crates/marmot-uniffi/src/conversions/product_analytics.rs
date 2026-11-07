@@ -342,6 +342,147 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_consent_and_exporter_states_keep_their_host_choices() {
+        // The public telemetry-settings owner already proves Granted.
+        for (native, expected) in [
+            (
+                app::UsageDiagnosticsDecision::AcceptanceRequired,
+                UsageDiagnosticsDecisionFfi::AcceptanceRequired,
+            ),
+            (
+                app::UsageDiagnosticsDecision::Declined,
+                UsageDiagnosticsDecisionFfi::Declined,
+            ),
+        ] {
+            assert_eq!(UsageDiagnosticsDecisionFfi::from(native), expected);
+        }
+        for (native, expected) in [
+            (
+                app::DiagnosticsExporterStatus::Disabled,
+                DiagnosticsExporterStatusFfi::Disabled,
+            ),
+            (
+                app::DiagnosticsExporterStatus::ConsentRequired,
+                DiagnosticsExporterStatusFfi::ConsentRequired,
+            ),
+            (
+                app::DiagnosticsExporterStatus::Unconfigured,
+                DiagnosticsExporterStatusFfi::Unconfigured,
+            ),
+            (
+                app::DiagnosticsExporterStatus::UnsupportedBuild,
+                DiagnosticsExporterStatusFfi::UnsupportedBuild,
+            ),
+            (
+                app::DiagnosticsExporterStatus::Ready,
+                DiagnosticsExporterStatusFfi::Ready,
+            ),
+            (
+                app::DiagnosticsExporterStatus::ConfigurationRejected,
+                DiagnosticsExporterStatusFfi::ConfigurationRejected,
+            ),
+        ] {
+            assert_eq!(DiagnosticsExporterStatusFfi::from(native), expected);
+        }
+    }
+
+    #[test]
+    fn host_modes_and_activity_select_the_native_operation() {
+        for (host, expected) in [
+            (ProductEventModeFfi::Journey, app::ProductEventMode::Journey),
+            (
+                ProductEventModeFfi::Aggregate,
+                app::ProductEventMode::Aggregate,
+            ),
+        ] {
+            assert_eq!(app::ProductEventMode::from(host), expected);
+        }
+        for (host, expected) in [
+            (
+                ProductAnalyticsActivityFfi::Foreground,
+                app::ProductAnalyticsActivity::Foreground,
+            ),
+            (
+                ProductAnalyticsActivityFfi::Background,
+                app::ProductAnalyticsActivity::Background,
+            ),
+            (
+                ProductAnalyticsActivityFfi::AccountChanged,
+                app::ProductAnalyticsActivity::AccountChanged,
+            ),
+            (
+                ProductAnalyticsActivityFfi::ForegroundNotification,
+                app::ProductAnalyticsActivity::ForegroundNotification,
+            ),
+            (
+                ProductAnalyticsActivityFfi::ForegroundDeepLink,
+                app::ProductAnalyticsActivity::ForegroundDeepLink,
+            ),
+        ] {
+            assert_eq!(app::ProductAnalyticsActivity::from(host), expected);
+        }
+    }
+
+    #[test]
+    fn native_recording_results_keep_success_duplicate_and_capacity_distinct() {
+        // The actual record_host_timing command owner proves IgnoredDisabled.
+        for (native, expected) in [
+            (
+                app::ProductRecordResult::Recorded,
+                ProductRecordResultFfi::Recorded,
+            ),
+            (
+                app::ProductRecordResult::IgnoredUnconfigured,
+                ProductRecordResultFfi::IgnoredUnconfigured,
+            ),
+            (
+                app::ProductRecordResult::IgnoredDuplicate,
+                ProductRecordResultFfi::IgnoredDuplicate,
+            ),
+            (
+                app::ProductRecordResult::DroppedCapacity,
+                ProductRecordResultFfi::DroppedCapacity,
+            ),
+        ] {
+            assert_eq!(ProductRecordResultFfi::from(native), expected);
+        }
+    }
+
+    #[test]
+    fn host_property_kinds_keep_native_rules_and_enum_choices() {
+        for (kind, choices, expected) in [
+            (
+                ProductPropertyKindFfi::Enum,
+                vec!["success".into(), "failure".into()],
+                app::ProductPropertyRule::Enum(vec!["success".into(), "failure".into()]),
+            ),
+            (
+                ProductPropertyKindFfi::Boolean,
+                vec![],
+                app::ProductPropertyRule::Boolean,
+            ),
+            (
+                ProductPropertyKindFfi::CountBucket,
+                vec![],
+                app::ProductPropertyRule::CountBucket,
+            ),
+            (
+                ProductPropertyKindFfi::DurationBucket,
+                vec![],
+                app::ProductPropertyRule::DurationBucket,
+            ),
+        ] {
+            let native: app::ProductPropertySchema = ProductPropertySchemaFfi {
+                name: "observation".into(),
+                kind,
+                choices,
+            }
+            .into();
+            assert_eq!(native.rule, expected);
+        }
+    }
+
+    #[test]
     fn product_event_rejects_duplicate_property_names() {
         let property = |name: &str, value: &str| ProductEventPropertyFfi {
             name: name.into(),

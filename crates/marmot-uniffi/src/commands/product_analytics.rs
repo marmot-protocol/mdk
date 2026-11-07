@@ -55,3 +55,66 @@ impl Marmot {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_rejects_choices_for_non_enum_properties() {
+        let root = tempfile::tempdir().unwrap();
+        let kit = Marmot::open(
+            root.path().to_string_lossy().into_owned(),
+            vec![],
+            marmot_app::MarmotAppConfig::default(),
+            Some(std::sync::Arc::new(
+                marmot_account::LocalFileSecretStore::new(root.path()),
+            )),
+        )
+        .unwrap();
+        let config = |kind, choices| ProductAnalyticsRuntimeConfigFfi {
+            events_endpoint: None,
+            app_key: None,
+            metadata: ProductAnalyticsMetadataFfi {
+                app_version: "1.0".into(),
+                os_family: "linux".into(),
+                os_major_version: "1".into(),
+                device_class: "desktop".into(),
+                host_surface: "native".into(),
+                environment: "development".into(),
+                is_debug: true,
+            },
+            registry: vec![ProductEventSchemaFfi {
+                name: "app_conversion_check".into(),
+                mode: ProductEventModeFfi::Aggregate,
+                properties: vec![ProductPropertySchemaFfi {
+                    name: "outcome".into(),
+                    kind,
+                    choices,
+                }],
+            }],
+            allow_loopback: false,
+            operator: "fixture".into(),
+        };
+        for kind in [
+            ProductPropertyKindFfi::Boolean,
+            ProductPropertyKindFfi::CountBucket,
+            ProductPropertyKindFfi::DurationBucket,
+        ] {
+            assert!(matches!(
+                kit.set_product_analytics_runtime_config(config(
+                    kind.clone(),
+                    vec!["success".into()]
+                )),
+                Err(MarmotKitError::InvalidProductAnalyticsConfiguration)
+            ));
+            kit.set_product_analytics_runtime_config(config(kind, vec![]))
+                .expect("the same non-enum property without choices is valid");
+        }
+        kit.set_product_analytics_runtime_config(config(
+            ProductPropertyKindFfi::Enum,
+            vec!["success".into(), "failure".into()],
+        ))
+        .expect("enum choices must reach the native configuration");
+    }
+}
