@@ -1512,6 +1512,29 @@ mod callback_lifetime_tests {
         }
     }
 
+    fn nested_update() -> UserSearchUpdateFfi {
+        UserSearchUpdateFfi {
+            trigger: SearchUpdateTriggerFfi::Error {
+                message: "callback-error".into(),
+            },
+            new_results: vec![UserDirectorySearchResultFfi {
+                account_id_hex: "11".repeat(32),
+                npub: "npub1callback".into(),
+                radius: 1,
+                is_followed_by_searcher: true,
+                matched_field: MatchedFieldFfi::Name,
+                match_quality: MatchQualityFfi::Exact,
+                provider_rank: None,
+                profile: Some(UserProfileMetadataFfi {
+                    name: Some("callback-profile".into()),
+                    ..Default::default()
+                }),
+            }],
+            updated_results: vec![],
+            total_result_count: 1,
+        }
+    }
+
     #[test]
     fn callback_borrows_nested_mirror_until_return_then_frees_and_closes_once() {
         let _serial = audit::test_lock();
@@ -1537,27 +1560,7 @@ mod callback_lifetime_tests {
                 async move { receive.lock().await.recv().await }
             },
         );
-        send.blocking_send(UserSearchUpdateFfi {
-            trigger: SearchUpdateTriggerFfi::Error {
-                message: "callback-error".into(),
-            },
-            new_results: vec![UserDirectorySearchResultFfi {
-                account_id_hex: "11".repeat(32),
-                npub: "npub1callback".into(),
-                radius: 1,
-                is_followed_by_searcher: true,
-                matched_field: MatchedFieldFfi::Name,
-                match_quality: MatchQualityFfi::Exact,
-                provider_rank: None,
-                profile: Some(UserProfileMetadataFfi {
-                    name: Some("callback-profile".into()),
-                    ..Default::default()
-                }),
-            }],
-            updated_results: vec![],
-            total_result_count: 1,
-        })
-        .unwrap();
+        send.blocking_send(nested_update()).unwrap();
         let entered = entered_rx.recv_timeout(Duration::from_secs(5));
         let while_borrowed = audit::live_allocations();
         // Always release the actual callback and close its actual channel
@@ -1598,6 +1601,116 @@ mod callback_lifetime_tests {
             before,
             "pump deep-frees after callback return"
         );
+    }
+
+    #[test]
+    fn clearing_inflight_callback_returns_before_its_borrow_and_task_end() {
+        let _serial = audit::test_lock();
+        let before = audit::live_allocations();
+        let rt = runtime();
+        let core = Arc::new(SubscriptionCore::new(rt.handle().clone()));
+        let (entered_tx, entered_rx) = sync_channel::channel();
+        let (release_tx, release_rx) = sync_channel::channel();
+        let (cleared_tx, cleared_rx) = sync_channel::channel();
+        let mut state = Box::new(HeldCallback {
+            entered: entered_tx,
+            release: StdMutex::new(release_rx),
+            terminals: AtomicUsize::new(0),
+        });
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        let receive = Arc::new(tokio::sync::Mutex::new(receive));
+        let ctx = CallbackCtx {
+            user_data: (&mut *state as *mut HeldCallback).cast(),
+        };
+        assert_eq!(
+            core.install(move |handle| {
+                spawn_callback_pump::<UserSearchUpdateFfi, MarmotUserSearchUpdate, _, _>(
+                    handle,
+                    ctx,
+                    held_callback,
+                    move || {
+                        let receive = Arc::clone(&receive);
+                        async move { receive.lock().await.recv().await }
+                    },
+                )
+            }),
+            MarmotStatus::Ok
+        );
+        let abort = core
+            .callback_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        send.blocking_send(nested_update()).unwrap();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let clearer_core = Arc::clone(&core);
+        // A faulty blocking clear must not prevent releasing the held callback.
+        let clearer = std::thread::spawn(move || {
+            clearer_core.clear();
+            let _ = cleared_tx.send(());
+        });
+        let cleared_while_held = cleared_rx.recv_timeout(Duration::from_secs(5));
+        let while_held = audit::live_allocations();
+        let finished_while_held = abort.is_finished();
+        let terminal_while_held = state.terminals.load(Ordering::SeqCst);
+        // No assertion can strand the C callback or reclaim its context early.
+        let _ = release_tx.send(());
+        let finished = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        });
+        if finished.is_err() {
+            abort.abort();
+            let _ = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !abort.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+            });
+        }
+        if !abort.is_finished() {
+            std::mem::forget(state);
+            panic!("inflight callback did not quiesce after cleanup");
+        }
+        clearer
+            .join()
+            .expect("host clear caller completes after cleanup");
+        let (payload_matches, during) = entered.expect("actual callback entry");
+        cleared_while_held.expect("clear returns while the existing callback is held");
+        assert!(
+            payload_matches,
+            "callback borrows the actual nested payload"
+        );
+        assert!(
+            during > before,
+            "nested allocations are live on callback entry"
+        );
+        assert_eq!(while_held, during, "clear does not end an existing borrow");
+        assert!(
+            !finished_while_held,
+            "clear return is not callback task completion"
+        );
+        assert_eq!(terminal_while_held, 0);
+        finished.expect("cancellation completes after the callback returns");
+        assert_eq!(
+            state.terminals.load(Ordering::SeqCst),
+            0,
+            "abort has no terminal NULL callback"
+        );
+        assert_eq!(
+            audit::live_allocations(),
+            before,
+            "inflight mirror is freed after callback return"
+        );
+        drop(send);
     }
 
     struct PendingCallback {
