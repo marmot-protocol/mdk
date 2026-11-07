@@ -995,12 +995,12 @@ mod group_state_tests {
         let group = AppGroupRecordFfi {
             group_id_hex: "01".repeat(16),
             protocol_profile: AppProtocolProfileFfi::Current,
-            endpoint: "marmot:group:01".into(),
+            endpoint: "wss://relay.example/".into(),
             profile_present: true,
             name: "Group".into(),
             description: String::new(),
             admins: vec![self_id.clone()],
-            relays: vec![],
+            relays: vec!["wss://relay.example/".into()],
             nostr_group_id_hex: "02".repeat(32),
             avatar_url: None,
             avatar_dim: None,
@@ -1037,7 +1037,7 @@ mod group_state_tests {
             group,
             members: vec![GroupMemberDetailsFfi {
                 member_id_hex: self_id.clone(),
-                account: None,
+                account: Some("alice".into()),
                 local: true,
                 is_admin: true,
                 is_self: true,
@@ -1179,7 +1179,7 @@ mod group_state_tests {
                 member_id_hex: self_id.clone(),
                 account: Some("alice".into()),
                 local: true,
-                device_count: 2,
+                device_count: 1,
             }
             .into(),
             AppGroupMemberRecord {
@@ -1214,6 +1214,10 @@ mod group_state_tests {
         // another device of the same account in the canonical roster. That row
         // still carries its admin role, but grants no local management authority.
         let mut details = management_details(AppGroupLifecycleState::Stable);
+        details
+            .mls_state
+            .required_app_components
+            .push(cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID);
         let self_id = details.members[0].member_id_hex.clone();
         let active = group_management_state_ffi(&self_id, &details);
         assert_eq!(
