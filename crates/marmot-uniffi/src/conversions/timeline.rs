@@ -664,6 +664,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn poll_type_choices_keep_their_meaning_in_both_directions() {
+        use marmot_app::PollType;
+        assert!(matches!(
+            PollTypeFfi::from(PollType::SingleChoice),
+            PollTypeFfi::SingleChoice
+        ));
+        assert!(matches!(
+            PollTypeFfi::from(PollType::MultipleChoice),
+            PollTypeFfi::MultipleChoice
+        ));
+        assert!(matches!(
+            PollType::from(PollTypeFfi::SingleChoice),
+            PollType::SingleChoice
+        ));
+        assert!(matches!(
+            PollType::from(PollTypeFfi::MultipleChoice),
+            PollType::MultipleChoice
+        ));
+    }
+
+    #[test]
+    fn current_timeline_labels_keep_their_host_meaning() {
+        // Current writers select these labels in storage's timeline projection,
+        // outgoing delivery updates, reports/import refresh and block filtering.
+        // ReceiptChanged, Cleared and Pruned remain compatibility choices;
+        // they have no current writer in the source reconciled for this owner.
+        macro_rules! trigger {
+            ($label:ident) => {
+                assert!(
+                    matches!(
+                        TimelineUpdateTriggerFfi::from(TimelineUpdateTrigger::$label),
+                        TimelineUpdateTriggerFfi::$label
+                    ),
+                    stringify!($label)
+                );
+            };
+        }
+        trigger!(NewMessage);
+        trigger!(MessageEditedOrReprojected);
+        trigger!(ReactionAdded);
+        trigger!(ReactionRemoved);
+        trigger!(MessageDeleted);
+        trigger!(ReplyPreviewChanged);
+        trigger!(AgentStreamStarted);
+        trigger!(AgentStreamFinished);
+        trigger!(AgentActivity);
+        trigger!(AgentOperation);
+        trigger!(GroupSystem);
+        trigger!(CustomEvent);
+        trigger!(DeliveryOrSendStateChanged);
+        trigger!(SnapshotRefresh);
+        assert!(matches!(
+            TimelineRemoveReasonFfi::from(TimelineRemoveReason::Invalidated),
+            TimelineRemoveReasonFfi::Invalidated
+        ));
+        assert!(matches!(
+            TimelineRemoveReasonFfi::from(TimelineRemoveReason::NoLongerMatchesQuery),
+            TimelineRemoveReasonFfi::NoLongerMatchesQuery
+        ));
+    }
+
+    #[test]
+    fn timeline_subscription_tags_distinguish_snapshots_from_live_projections() {
+        let mut record = record_with_media(Some(7), None, None);
+        record.message_id_hex = "55".repeat(32);
+        record.group_id_hex = "11".repeat(16);
+        record.sender = "22".repeat(32);
+        record.plaintext = "snapshot row".into();
+        let snapshot = TimelineSubscriptionUpdateFfi::from(RuntimeTimelineMessageUpdate::Page {
+            page: TimelinePage {
+                messages: vec![record.clone()],
+                has_more_before: true,
+                has_more_after: false,
+            },
+        });
+        let TimelineSubscriptionUpdateFfi::Page { page } = snapshot else {
+            panic!("a refresh must remain a Page");
+        };
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].message_id_hex, "55".repeat(32));
+        assert_eq!(page.messages[0].plaintext, "snapshot row");
+        assert!(page.has_more_before && !page.has_more_after);
+
+        record.message_id_hex = "66".repeat(32);
+        record.plaintext = "live row".into();
+        let live = TimelineSubscriptionUpdateFfi::from(RuntimeTimelineMessageUpdate::Projection(
+            RuntimeProjectionUpdate {
+                account_id_hex: "22".repeat(32),
+                account_label: "primary".into(),
+                update: AppProjectionUpdate {
+                    group_id_hex: "11".repeat(16),
+                    timeline_messages: vec![record.clone()],
+                    timeline_changes: vec![TimelineMessageChange::Upsert {
+                        trigger: TimelineUpdateTrigger::NewMessage,
+                        message: Box::new(record),
+                    }],
+                    chat_list_row: None,
+                    chat_list_trigger: marmot_app::ChatListUpdateTrigger::NewLastMessage,
+                },
+            },
+        ));
+        let TimelineSubscriptionUpdateFfi::Projection { update } = live else {
+            panic!("a live delta must remain a Projection");
+        };
+        assert_eq!(update.account_id_hex, "22".repeat(32));
+        assert_eq!(update.account_label, "primary");
+        assert_eq!(update.update.group_id_hex, "11".repeat(16));
+        assert_eq!(update.update.messages.len(), 1);
+        assert_eq!(update.update.messages[0].message_id_hex, "66".repeat(32));
+        assert_eq!(update.update.messages[0].plaintext, "live row");
+        assert_eq!(update.update.changes.len(), 1);
+        let TimelineMessageChangeFfi::Upsert {
+            trigger: TimelineUpdateTriggerFfi::NewMessage,
+            message,
+        } = &update.update.changes[0]
+        else {
+            panic!("the live projection must preserve its typed upsert");
+        };
+        assert_eq!(message.message_id_hex, "66".repeat(32));
+        assert_eq!(message.plaintext, "live row");
+    }
+
+    #[test]
     fn reaction_summary_ffi_carries_count_and_sorts_by_count_then_emoji() {
         let summary = TimelineReactionSummary {
             by_emoji: BTreeMap::from([
