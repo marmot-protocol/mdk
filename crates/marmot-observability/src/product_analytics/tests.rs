@@ -2144,6 +2144,15 @@ async fn delivery_worker_replaces_connectivity_samples_from_actual_sdk_health() 
         })
         .await
         .expect("real SDK connections must establish the health precondition");
+        let sample_clock = (
+            1800 + minute as u64 * 60,
+            Duration::from_secs(minute as u64 * 60),
+        );
+        assert_ne!(
+            collector.lock().last_clock,
+            Some(sample_clock),
+            "the fixture must not advance the collector to the new sample clock"
+        );
         tokio::time::timeout(
             Duration::from_secs(5),
             std::future::poll_fn(|cx| {
@@ -2151,10 +2160,10 @@ async fn delivery_worker_replaces_connectivity_samples_from_actual_sdk_health() 
                     worker.as_mut().poll(cx).is_pending(),
                     "granted worker must remain alive"
                 );
-                // A tick opens a recording window before storing its health sample.
-                // After each account-change seal, this is an independent produced milestone;
-                // do not wait for a particular availability value from the subject.
-                if collector.lock().window.is_some() {
+                // Only this tick can advance the collector to the new fake-clock
+                // values. A sender can reopen a window at the previous sample.
+                // Observe completion without waiting for the expected availability.
+                if collector.lock().last_clock == Some(sample_clock) {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
