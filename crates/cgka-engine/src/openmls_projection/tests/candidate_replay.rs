@@ -340,17 +340,36 @@ async fn candidate_probe_preserves_a_real_proposal_rejection() {
         DEFAULT_CIPHERSUITE.signature_algorithm(),
     )
     .unwrap();
-    // This is a valid native public proposal from an untrusted non-admin.
-    // Probe it directly; no ingress or stored admission is invented.
-    let (proposal, _) = group
-        .propose_self_update(
-            &provider,
-            &signer,
-            openmls::prelude::LeafNodeParameters::default(),
+    // Author genuine bytes in temporary native state, then restore every
+    // proposal/own-leaf write before the independent probe reads its source.
+    let before = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    assert!(before.is_some());
+    let proposal = {
+        let authoring = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+            &storage,
+            group_id.clone(),
+            crate::snapshot_guard::RewindSite::Replay,
+            "projection-proposal-authoring",
         )
         .unwrap();
+        let (proposal, _) = group
+            .propose_self_update(
+                &provider,
+                &signer,
+                openmls::prelude::LeafNodeParameters::default(),
+            )
+            .unwrap();
+        let bytes = proposal.tls_serialize_detached().unwrap();
+        authoring.commit().unwrap();
+        bytes
+    };
+    drop(group);
+    assert_eq!(
+        storage.group_replay_state_fingerprint(&group_id).unwrap(),
+        before
+    );
     let proposal = transport_message(
-        &proposal.tls_serialize_detached().unwrap(),
+        &proposal,
         TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
         },
