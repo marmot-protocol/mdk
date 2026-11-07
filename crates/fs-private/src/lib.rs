@@ -1699,6 +1699,12 @@ mod unix_tests {
         let fresh = dir.path().join("fresh.sqlite");
         ensure_private_db_files(&fresh).unwrap();
         assert_eq!(mode_of(&fresh), 0o600);
+        // The preparer must report a failed main-file creation before it can
+        // claim that the database and its sidecars are ready for SQLite.
+        let missing_parent = dir.path().join("missing");
+        let error = ensure_private_db_files(&missing_parent.join("db.sqlite")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!missing_parent.exists());
     }
 
     #[test]
@@ -1926,6 +1932,27 @@ mod unix_tests {
         assert_eq!(prepared.uid(), unsafe { libc::geteuid() });
         assert_eq!(mode_of(&parent), 0o770);
         assert_eq!(mode_of(&leaf), 0o770);
+    }
+
+    #[test]
+    fn prepare_directory_path_reports_a_refused_directory_creation() {
+        if effectively_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(dir.path()).unwrap().join("read-only");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let child = parent.join("child");
+        let result = prepare_directory_path(&child, 0o700, ExistingDirectoryMode::Preserve);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("create directory component"),
+            "{error}"
+        );
+        assert!(!child.exists());
     }
 
     #[test]
@@ -2478,6 +2505,27 @@ mod unix_tests {
             resolve_aliases(ALIASED_PATH, tree).expect("alias above a missing component"),
             Some(PathBuf::from(CANONICAL_PATH))
         );
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_reports_a_regular_file_in_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = std::fs::canonicalize(dir.path()).unwrap().join("file");
+        std::fs::write(&prefix, b"unchanged").unwrap();
+        let error = resolve_platform_directory_aliases(
+            &prefix.join("child").join("leaf"),
+            TRUSTED_PATH_IDS,
+            inspect_path,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+        assert!(
+            error
+                .to_string()
+                .contains("inspect directory path component"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&prefix).unwrap(), b"unchanged");
     }
 
     #[test]
