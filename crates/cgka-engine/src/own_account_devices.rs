@@ -408,21 +408,27 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
-        for sibling_welcome in sibling_welcomes {
-            self.record_staged_sibling_welcome(
-                sibling_welcome,
-                &commit_msg.id,
+        let content_id = self.storage.with_transaction(|storage| {
+            let content_id = self.persist_sent_openmls_message_with_application_stamp(
+                &commit_msg,
+                commit_bytes.as_slice(),
                 &group_id,
                 pre_commit_epoch,
+                None,
             )?;
-        }
-        self.storage.put_group(&group_record)?;
+            for sibling_welcome in sibling_welcomes {
+                self.record_staged_sibling_welcome(
+                    sibling_welcome,
+                    &commit_msg.id,
+                    &group_id,
+                    pre_commit_epoch,
+                )?;
+            }
+            storage.put_group(&group_record)?;
+            Ok::<_, EngineError>(content_id)
+        })?;
+        self.sent_message_ids.insert(commit_msg.id.clone());
+        self.sent_message_ids.insert(content_id);
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         let pending_ref = self.epoch_manager.next_pending_ref()?;

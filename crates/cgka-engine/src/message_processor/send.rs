@@ -698,7 +698,7 @@ impl<S: StorageProvider> Engine<S> {
     /// "Delivery"). This writes nothing, and a caller wraps every Welcome
     /// before it records its Commit: a Welcome that cannot be wrapped, as one
     /// for a KeyPackage that names no publication, refuses the intent with
-    /// nothing written. [`Self::record_staged_welcomes`] records them.
+    /// nothing written. [`Self::persist_staged_welcomes`] records them.
     /// Parsed packages follow ordinary packages, then recovery packages.
     pub(crate) async fn wrap_staged_welcomes(
         &self,
@@ -751,28 +751,7 @@ impl<S: StorageProvider> Engine<S> {
     /// its Commit is recorded. Invites and same-account Adds deliver their
     /// Welcomes this way. A device link's Welcome records `deliver_until`,
     /// after which it is never published.
-    pub(crate) fn record_staged_welcomes(
-        &mut self,
-        welcomes: Vec<WrappedWelcome>,
-        group_id: &GroupId,
-        commit_id: &MessageId,
-        source_epoch: EpochId,
-        deliver_until: Option<cgka_traits::transport::Timestamp>,
-    ) -> Result<Vec<TransportMessage>, EngineError> {
-        let welcomes = self.persist_staged_welcomes(
-            welcomes,
-            group_id,
-            commit_id,
-            source_epoch,
-            deliver_until,
-        )?;
-        for welcome in &welcomes {
-            self.sent_message_ids.insert(welcome.id.clone());
-        }
-        Ok(welcomes)
-    }
-
-    fn persist_staged_welcomes(
+    pub(crate) fn persist_staged_welcomes(
         &self,
         welcomes: Vec<WrappedWelcome>,
         group_id: &GroupId,

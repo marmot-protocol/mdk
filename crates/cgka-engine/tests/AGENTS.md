@@ -269,6 +269,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
     cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
 
+  `account_devices/staging_atomicity.rs` owns late LinkDevice and AddOwnAccountDevices projection faults before a
+  pending ref is exposed: real SQLCipher faults after outbound staging, complete independent rows, physical
+  failure/success reopens, same-KeyPackage retry and actual transport/sibling joins. It runs in policy-test builds.
+
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored
     expectation names, from the existing device's leaf and before the wait ends, which the join consumes. A
