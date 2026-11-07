@@ -2400,6 +2400,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         pending_chat_relist: false,
         pending_mark_read: false,
         loading_chat: None,
+        timeline_load_generation: 0,
         searching_users: None,
         searching_messages: None,
         loading_group_detail: None,
@@ -4331,6 +4332,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
         effect: Effect::LoadTimeline {
             account: foreground_account.clone(),
             group,
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({"messages":[{
             "message_id":"A recovered row","direction":"received","from":"peer",
@@ -4968,6 +4970,7 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
             effect: Effect::LoadTimeline {
                 account: account_b.clone(),
                 group: group.clone(),
+                generation: app.timeline_load_generation,
             },
             result: Ok(vec![
                 serde_json::json!({"messages":[],"has_more_before":false}),
@@ -7881,7 +7884,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                             .recv_timeout(Duration::from_secs(5))
                             .expect("B timeline completed on the actual worker");
                         assert!(
-                            matches!(&done.effect, Effect::LoadTimeline {account, group: target}
+                            matches!(&done.effect, Effect::LoadTimeline {account, group: target, ..}
                             if account == &account_b && target == &group)
                         );
                         app.apply_effect_done(done);
@@ -7943,7 +7946,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     assert_eq!(
                         loading_on_completion
                             .as_ref()
-                            .map(|(account, group)| (account.as_str(), group.as_str())),
+                            .map(|(account, group, _)| (account.as_str(), group.as_str())),
                         (same_pane && selection_matches && completion == "without-id")
                             .then_some((account_a.as_str(), group.as_str())),
                         "only a matching-pane no-ID completion may reload the timeline"
@@ -8393,7 +8396,12 @@ fn messages_pane_shows_loading_while_an_open_chat_load_is_in_flight() {
     let mut app = test_tui_app(test_unused_client(), &account_id);
     app.focus = Focus::Messages;
     // An open-chat load is in flight and the pane has not yet folded any rows.
-    app.loading_chat = Some((account_id.clone(), "bb".repeat(32)));
+    app.timeline_load_generation = 1;
+    app.loading_chat = Some((
+        account_id.clone(),
+        "bb".repeat(32),
+        app.timeline_load_generation,
+    ));
     assert!(app.timeline.is_empty());
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -10864,7 +10872,12 @@ fn messages_pane_renders_the_three_empty_states() {
     app.screen = Screen::Main;
 
     // Loading a chat's timeline off the event loop.
-    app.loading_chat = Some((account_id.clone(), "gg".repeat(32)));
+    app.timeline_load_generation = 1;
+    app.loading_chat = Some((
+        account_id.clone(),
+        "gg".repeat(32),
+        app.timeline_load_generation,
+    ));
     assert!(rendered_buffer(&mut app).contains("loading messages..."));
 
     // Settled, no chat loaded.
@@ -12718,7 +12731,9 @@ fn flick_j_schedules_a_debounced_preview_and_fires_after_the_quiet_window() {
     app.tick();
     assert_eq!(app.flick_countdown, None, "the countdown cleared");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_b.as_str()),
         "the highlighted chat's timeline load fired"
     );
@@ -12819,7 +12834,9 @@ fn rapid_flick_coalesces_to_one_load_of_the_final_selection() {
         app.tick();
     }
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_b.as_str())
     );
     app.settle_effects(1);
@@ -12869,7 +12886,9 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
         app.tick();
     }
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_b.as_str())
     );
     app.settle_effects(1); // fold the flick preview load
@@ -12914,8 +12933,10 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     app.activate_focus()
         .expect("open the same group as another account");
     assert_eq!(
-        app.loading_chat.as_ref(),
-        Some(&(other_account.clone(), group_b.clone()))
+        app.loading_chat
+            .as_ref()
+            .map(|(account, group, _)| (account, group)),
+        Some((&other_account, &group_b))
     );
     assert!(app.timeline.is_empty());
     app.settle_effects(1);
@@ -12930,8 +12951,10 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     app.flick_countdown = Some(1);
     app.tick();
     assert_eq!(
-        app.loading_chat.as_ref(),
-        Some(&(account_id.clone(), group_b.clone()))
+        app.loading_chat
+            .as_ref()
+            .map(|(account, group, _)| (account, group)),
+        Some((&account_id, &group_b))
     );
     app.settle_effects(1);
     finish_queued_effects(&mut app);
@@ -12968,7 +12991,9 @@ fn enter_supersedes_a_pending_flick_preview() {
     );
     assert_eq!(app.focus, Focus::Messages, "Enter moves focus to messages");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_b.as_str())
     );
 }
@@ -14643,6 +14668,7 @@ fn open_chat_load_maps_to_the_timeline_page_argv() {
     let effect = Effect::LoadTimeline {
         account: "aa".repeat(32),
         group: "bb".repeat(32),
+        generation: 1,
     };
     assert_eq!(
         effect.calls(),
@@ -14680,7 +14706,9 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     app.refresh_messages().expect("kickoff");
     assert_eq!(app.status, "loading chat...", "honest in-flight feedback");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_id.as_str())
     );
     assert!(
@@ -14692,6 +14720,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_id.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [{
@@ -14741,10 +14770,13 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
 
     app.selected_chat = 0;
     app.refresh_messages().expect("open A");
+    let generation_a = app.timeline_load_generation;
     app.selected_chat = 1;
     app.refresh_messages().expect("open B");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_b.as_str())
     );
 
@@ -14753,6 +14785,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_a.clone(),
+            generation: generation_a,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [{"message_id":"stale","direction":"received","from":"x","plaintext":"old","timeline_at":1,"received_at":1}],
@@ -14769,7 +14802,9 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
         "the pane never adopts the stale chat"
     );
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|(_, group, _)| group.as_str()),
         Some(group_b.as_str())
     );
 
@@ -14778,6 +14813,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_b.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [{"message_id":"fresh","direction":"received","from":"x","plaintext":"new","timeline_at":9,"received_at":9}],
@@ -14816,6 +14852,7 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
         effect: Effect::LoadTimeline {
             account: account_a.clone(),
             group: group_a.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({"messages": []})]),
     });
@@ -14878,6 +14915,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         .unwrap();
         assert!(app.drain_message_subscription());
         app.refresh_messages().expect("reload A");
+        let generation_a = app.timeline_load_generation;
         assert_eq!(timeline_ids(&app.timeline), vec!["old-account-row"]);
         assert!(rendered_buffer(&mut app).contains("initial account stream"));
 
@@ -14916,6 +14954,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
             effect: Effect::LoadTimeline {
                 account: account_a.clone(),
                 group: group.clone(),
+                generation: generation_a,
             },
             result: Ok(vec![serde_json::json!({"messages":[]})]),
         });
@@ -14924,6 +14963,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
             effect: Effect::LoadTimeline {
                 account: target_account.clone(),
                 group: target_group.clone(),
+                generation: app.timeline_load_generation,
             },
             result: Ok(vec![serde_json::json!({"messages":[{
                 "message_id":"new-owner-row","direction":"received","from":"peer",
@@ -15072,7 +15112,7 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
     }
     assert_eq!(app.chats[0].name, "B joined room");
     app.refresh_messages().unwrap();
-    app.apply_effect_done(EffectDone {effect:Effect::LoadTimeline {account:account_b.clone(), group}, result:Ok(vec![serde_json::json!({"messages":[{
+    app.apply_effect_done(EffectDone {effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
         "message_id":"B row","direction":"received","from":"peer","plaintext":"B timeline","timeline_at":2,"received_at":2
     }]})])});
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -15216,7 +15256,12 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     app.messages_group_id = Some(group_id.clone());
     app.timeline = vec![timeline_row("m1", 100), timeline_row("m2", 200)];
     // A same-chat reload is in flight (its group matches the loaded pane).
-    app.loading_chat = Some((account_id.clone(), group_id.clone()));
+    app.timeline_load_generation = 1;
+    app.loading_chat = Some((
+        account_id.clone(),
+        group_id.clone(),
+        app.timeline_load_generation,
+    ));
 
     // Between enqueue and fold, the live timeline subscription folds in a newer
     // message.
@@ -15227,6 +15272,7 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_id.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [
@@ -16564,4 +16610,133 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn same_account_group_reloads_fold_the_newest_real_page() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observed = Vec::new();
+    for (first_error, second_error, subscription_error) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let row = |id: &str, at: u64| {
+            serde_json::json!({
+                "message_id":id,"direction":"received","from":"peer",
+                "plaintext":id,"timeline_at":at,"received_at":at
+            })
+        };
+        let page = |error: bool, newer: bool| {
+            if error {
+                serde_json::json!({"ok":false,"error":{"message":if newer {"new page offline"} else {"old page offline"}}})
+            } else {
+                let rows = if newer {
+                    vec![row("old-row", 1), row("new-row", 2)]
+                } else {
+                    vec![row("old-row", 1)]
+                };
+                serde_json::json!({"ok":true,"result":{"messages":rows,"has_more_before":false}})
+            }
+        };
+        let catalog = serde_json::json!({"ok":true,"result":{
+            "accounts":[{"account_id":account,"npub":"npub1alice","local_signing":true}],
+            "chats":[{"group_id":group,"profile":{"name":"Room"}}]
+        }});
+        let first = page(first_error, false);
+        let second = page(second_error, true);
+        let calls = dir.path().join("pages");
+        let all_calls = dir.path().join("all-calls");
+        let exe = dir.path().join("wn-pages");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+             *' messages timeline list '*)\n\
+             printf 'page\\n' >> '{}'\n\
+             if mkdir '{}' 2>/dev/null; then\n{}printf '%s\\n' '{first}'\n\
+             else printf '%s\\n' '{second}'; fi;;\n\
+             *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+             *) printf '%s\\n' '{catalog}';;\nesac\n",
+                all_calls.display(),
+                calls.display(),
+                dir.path().join("first").display(),
+                gate.script()
+            ),
+        );
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &account,
+        );
+        app.daemon.running = subscription_error;
+        app.chats = vec![flick_chat(&group, "Room")];
+        app.input.set_value("/refresh");
+        app.submit_input().expect("dispatch refresh");
+        gate.wait_until_entered();
+        app.input.set_value("/refresh");
+        app.submit_input().expect("dispatch refresh");
+        assert_eq!(
+            app.status, "loading chat...",
+            "second request returns before the old page is released"
+        );
+        if subscription_error {
+            app.client.exe = dir.path().join("unavailable-wn");
+        }
+        gate.release();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap().lines().count(),
+            2,
+            "both real page children completed"
+        );
+        let recorded = std::fs::read_to_string(all_calls).unwrap();
+        let current_followups = usize::from(!second_error);
+        assert_eq!(
+            recorded
+                .lines()
+                .filter(|line| line.contains("chats mark-read")
+                    && !line.contains("test-fifo-completion-marker"))
+                .count(),
+            current_followups,
+            "only the newest successful page may mark read"
+        );
+        assert_eq!(
+            recorded
+                .lines()
+                .filter(|line| line.contains("groups show"))
+                .count(),
+            current_followups,
+            "only the newest successful page may fetch diagnostics"
+        );
+        let correct = if second_error {
+            app.status == "error: new page offline"
+        } else {
+            timeline_ids(&app.timeline).contains(&"new-row")
+                && rendered_buffer(&mut app).contains("new-row")
+        };
+        observed.push((
+            first_error,
+            second_error,
+            subscription_error,
+            timeline_ids(&app.timeline)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            app.status.clone(),
+            correct,
+        ));
+    }
+    assert!(
+        observed.iter().all(|row| row.5),
+        "the newest requested page must own the final view/feedback: {observed:?}"
+    );
 }

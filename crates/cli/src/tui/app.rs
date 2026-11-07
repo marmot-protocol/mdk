@@ -65,11 +65,13 @@ pub(crate) struct TuiApp {
     /// zero count leaves it clear. Cleared before the call and re-armed on error
     /// like `pending_chat_relist`, so a failure retries next tick, not forever.
     pub(crate) pending_mark_read: bool,
-    /// The account and group of the most recently requested open-chat /
+    /// The account, group and generation of the most recently requested open-chat /
     /// flick-through timeline load. Only that target's result can settle the
     /// pending load; a later open supersedes an earlier one that has not landed
     /// yet. `None` when the pane is settled.
-    pub(crate) loading_chat: Option<(String, String)>,
+    pub(crate) loading_chat: Option<(String, String, u64)>,
+    /// Monotonic identity for timeline requests, including repeated opens of the same chat.
+    pub(crate) timeline_load_generation: u64,
     /// The query of the most recently requested user search, or `None` when no
     /// search is outstanding. A `UserSearch` result is folded only while its
     /// query still matches (the same stale guard as `loading_chat`).
@@ -191,6 +193,7 @@ impl TuiApp {
             pending_chat_relist: false,
             pending_mark_read: false,
             loading_chat: None,
+            timeline_load_generation: 0,
             searching_users: None,
             searching_messages: None,
             loading_group_detail: None,

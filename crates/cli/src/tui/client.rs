@@ -394,8 +394,12 @@ impl TuiApp {
             Effect::Delete { .. } => {
                 self.fold_status_effect(result, "deleted message".to_owned());
             }
-            Effect::LoadTimeline { account, group } => {
-                self.fold_load_timeline(account, group, result);
+            Effect::LoadTimeline {
+                account,
+                group,
+                generation,
+            } => {
+                self.fold_load_timeline(account, group, generation, result);
             }
             Effect::MarkRead { account, group } => {
                 self.fold_mark_read(account, group, result);
@@ -2251,6 +2255,11 @@ impl TuiApp {
     /// account/group, so a same-chat reload never flashes empty), tag the pending
     /// target for the stale guard, and queue the timeline load.
     pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
+        self.timeline_load_generation = self
+            .timeline_load_generation
+            .checked_add(1)
+            .expect("timeline load generation exhausted");
+        let generation = self.timeline_load_generation;
         // Any explicit or fired load supersedes a pending flick-through preview.
         self.flick_countdown = None;
         self.adopt_message_account(&account_id);
@@ -2265,7 +2274,7 @@ impl TuiApp {
             self.group_state_subscription = None;
             self.group_diagnostics = None;
         }
-        self.loading_chat = Some((account_id.clone(), group_id.clone()));
+        self.loading_chat = Some((account_id.clone(), group_id.clone(), generation));
         self.status = LOADING_TIMELINE_STATUS.to_owned();
         // The account-wide feed belongs to the adopted live account even if
         // this group's page fails. Same-account loads reuse its existing child.
@@ -2277,6 +2286,7 @@ impl TuiApp {
         self.effects.enqueue(Effect::LoadTimeline {
             account: account_id,
             group: group_id,
+            generation,
         });
     }
 
@@ -2291,21 +2301,22 @@ impl TuiApp {
 
     /// Fold a completed timeline load into the pane, exactly as the synchronous
     /// path did after its `run_json` returned — but dropping a result whose
-    /// account/group no longer matches the pending target (a newer open
-    /// superseded it).
+    /// account/group/generation no longer matches the pending request (a newer
+    /// open superseded it, including another refresh of the same chat).
     fn fold_load_timeline(
         &mut self,
         account: String,
         group: String,
+        generation: u64,
         result: Result<Vec<Value>, String>,
     ) {
-        if !self
-            .loading_chat
-            .as_ref()
-            .is_some_and(|(pending_account, pending_group)| {
-                pending_account == &account && pending_group == &group
-            })
-        {
+        if !self.loading_chat.as_ref().is_some_and(
+            |(pending_account, pending_group, pending_generation)| {
+                pending_account == &account
+                    && pending_group == &group
+                    && *pending_generation == generation
+            },
+        ) {
             // A newer load (an explicit open or a fired preview) already claimed
             // the pane; leave `loading_chat` pointing at that pending target so
             // this stale fold cannot cancel it.
