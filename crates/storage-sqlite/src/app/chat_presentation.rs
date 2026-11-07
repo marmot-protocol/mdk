@@ -202,6 +202,22 @@ impl SqliteAppStorage {
     /// The pending partial index is the durable backfill worklist. Committed rows leave it;
     /// interruption or a later invalidation makes precisely that row available again.
     pub fn pending_chat_presentation_inputs(&self) -> StorageResult<Vec<ChatPresentationInput>> {
+        // Every presentation pass asks, and an idle account has nothing
+        // pending: answer that from the partial index without a writer
+        // (mdk#2923).
+        let pending: bool = self
+            .lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM chat_list_rows INDEXED BY chat_presentation_pending
+                 WHERE presentation_json IS NULL
+                    OR presentation_applied_source_revision != presentation_source_revision)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !pending {
+            return Ok(Vec::new());
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let mut query = conn

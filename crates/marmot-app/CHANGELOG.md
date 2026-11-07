@@ -16,6 +16,19 @@
   bound (mdk#3013). Its existing completion, cancellation and worker-stop outcomes are unchanged; the host still
   bounds its OS execution opportunity.
 
+- An idle maintenance tick no longer repeats finished or unchanged housekeeping (mdk#2923 step 1).
+  - One-time work stops once the opened database's data shows it finished: legacy attachment bodies (none left,
+    and no legacy upload that could add one), database-held avatar images, the startup WAL truncate, the content
+    report backfill, and the compaction check once the database is incremental. A deferred outcome never
+    latches: compaction not yet worthwhile, too large or too tight, keep-media `more` and an owed WAL truncate are
+    checked again hourly, or sooner after a deletion. The housekeeping batch spawns only while a part is owed.
+  - The media sweep still runs to completion when a worker takes ownership, then only after a media or partial row
+    was deleted on this connection, another connection committed, a best-effort unlink failed, or its last batch
+    stopped short. A batch that fails owes a full rescan from the start on the next hourly recheck, which the current
+    pass finishing does not clear, so a row it failed on is visited again without retrying every tick.
+  - Upload promotion starts only while a file-backed upload is staged.
+  - All of this is keyed to the opened database, so a reopened, reset or replaced one derives it again.
+
 - Chat-list queries can filter by conversation kind (`ChatListCondition::Direct`, `Group`) and mute (`Muted`)
   (mdk#2983). A window whose filter tests mute re-reads at the next mute expiry among the chats in its view, so a
   chat leaves or enters it at its expiry even when it is off screen. Windows and select-all read mute at the same

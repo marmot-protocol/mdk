@@ -26,6 +26,10 @@ const KEEP_MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How long one "Keep media" pass removes before leaving the rest to the
 /// next tick.
 const KEEP_MEDIA_SWEEP_BUDGET: Duration = Duration::from_millis(250);
+/// How often deferred housekeeping is checked again once nothing else is
+/// owed: free-page reclaim and a compaction that was not yet worthwhile or
+/// did not fit (mdk#2923 §4). Deletions recheck sooner.
+const HOUSEKEEPING_RECHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -71,16 +75,86 @@ pub(super) struct Admission {
     /// A sweep stopped at its time budget with attachments still past the
     /// window, or failed: the next tick runs it again.
     keep_media_more: Arc<std::sync::atomic::AtomicBool>,
+    /// What idle housekeeping has derived from the opened database's data
+    /// (mdk#2923 §4): finished one-time work stops, and the media sweep runs
+    /// only when something may have left work for it.
+    pub(super) latches: HousekeepingLatches,
+}
+
+/// Housekeeping state derived from one opened account database. Keyed to its
+/// [`SqliteAppStorage::connection_serial`]: a reopened, reset or replaced
+/// database starts unlatched and derives everything again from its data.
+/// Only terminal outcomes latch; deferred ones are rechecked on a deadline.
+#[derive(Default)]
+pub(super) struct HousekeepingLatches {
+    serial: Option<u64>,
+    /// No legacy attachment body and no legacy upload that could add one.
+    legacy_bodies_done: Arc<std::sync::atomic::AtomicBool>,
+    /// No avatar image held in the database; nothing writes one any more.
+    database_avatars_done: Arc<std::sync::atomic::AtomicBool>,
+    /// The database is already incremental, so the one-time compaction can
+    /// never be due on it.
+    compaction_settled: Arc<std::sync::atomic::AtomicBool>,
+    /// When deferred housekeeping (reclaim, a compaction not yet worthwhile,
+    /// too large or too tight) is checked again. `None` means now.
+    recheck_due: Option<std::time::Instant>,
+    /// The deletion count the last housekeeping batch saw: a deletion frees
+    /// pages, so reclaim checks again.
+    batch_cleanup_seen: Option<i64>,
+    /// The deletion count, and the other-connection commit count, the last
+    /// media sweep started from. `None` means a sweep is owed.
+    sweep_cleanup_seen: Option<i64>,
+    sweep_foreign_seen: Option<i64>,
+    /// The last sweep batch did not reach the end of the store, or failed.
+    sweep_unfinished: Arc<std::sync::atomic::AtomicBool>,
+    /// A batch failed. Its cursor may have moved past what it failed on, so
+    /// a full pass from the start is owed. Finishing the current pass does
+    /// not clear it; only starting that rescan does.
+    sweep_rescan: Arc<std::sync::atomic::AtomicBool>,
+    /// When the owed rescan runs: one housekeeping recheck after the
+    /// failure, so a failure that persists costs one pass per recheck, not
+    /// one per tick.
+    sweep_rescan_due: Option<std::time::Instant>,
+}
+
+impl HousekeepingLatches {
+    /// Resets everything when `storage` is not the database these were
+    /// derived from.
+    pub(super) fn bind(&mut self, storage: &SqliteAppStorage) {
+        let serial = storage.connection_serial();
+        if self.serial != Some(serial) {
+            *self = Self {
+                serial: Some(serial),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn done(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
-/// to completion when the worker takes ownership, otherwise one batch.
+/// to completion when the worker takes ownership, otherwise one batch, and
+/// then only while something may have left work for it (mdk#2923 §4):
+/// - this connection deleted a `media_files` or `attachment_partial` row,
+///   which can leave a file with no row;
+/// - another connection or process committed (`PRAGMA data_version`);
+/// - the media store reports a best-effort unlink, truncate or abandon that
+///   failed;
+/// - the last batch did not reach the end of the store, or failed.
+///
+/// A crash leaves its orphans to the sweep that runs when the next worker
+/// takes ownership.
 fn spawn_media_sweep(
     admission: &mut Admission,
+    storage: &SqliteAppStorage,
     media: AccountMediaStore,
     until_complete: bool,
     telemetry: &marmot_observability::PerformanceRecorder,
 ) {
+    use std::sync::atomic::Ordering;
     if admission
         .media_sweep
         .as_ref()
@@ -88,15 +162,67 @@ fn spawn_media_sweep(
     {
         return;
     }
+    let latches = &mut admission.latches;
+    latches.bind(storage);
+    // A failed batch owes a rescan from the start on the next recheck.
+    let mut rescan_now = false;
+    if latches.sweep_rescan.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        match latches.sweep_rescan_due {
+            None => latches.sweep_rescan_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
+            Some(due) if now >= due => rescan_now = true,
+            Some(_) => {}
+        }
+    }
+    // Read before the batch starts, so a deletion while it runs is seen.
+    // A failed read counts as a change.
+    let cleanup = storage.media_cleanup_epoch().ok();
+    let foreign = storage.foreign_commit_version().ok();
+    // A failed unlink, truncate or abandon may have left its file behind the
+    // cursor of a pass in progress, so it owes a pass from the start.
+    let store_owed = media.take_sweep_owed();
+    let owed = until_complete
+        | rescan_now
+        | store_owed
+        | latches.sweep_unfinished.load(Ordering::Acquire)
+        | latches.sweep_cleanup_seen.is_none()
+        | (cleanup.is_none() || cleanup != latches.sweep_cleanup_seen)
+        | (foreign.is_none() || foreign != latches.sweep_foreign_seen);
+    if !owed {
+        return;
+    }
+    latches.sweep_cleanup_seen = cleanup;
+    latches.sweep_foreign_seen = foreign;
+    // Each is a full pass from the start, which is what was owed. The
+    // cursor restart takes the store's sweep lock, which an earlier batch
+    // may still hold, so it runs on the blocking pool with the sweep.
+    let restart = rescan_now || until_complete || store_owed;
+    if restart {
+        latches.sweep_rescan.store(false, Ordering::Release);
+        latches.sweep_rescan_due = None;
+    }
+    let unfinished = latches.sweep_unfinished.clone();
+    let rescan = latches.sweep_rescan.clone();
     // Timed on the blocking pool (mdk#2923); a batch that never runs or
     // panics drops its span, which records it as cancelled.
     let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
     admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
+        if restart {
+            media.restart_sweep();
+        }
         let outcome = loop {
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
-                Ok(_) => break TelemetryOutcome::Success,
+                Ok(report) => {
+                    unfinished.store(!report.complete, Ordering::Release);
+                    break TelemetryOutcome::Success;
+                }
                 Err(_) => {
+                    // Not again next tick: a failure that persists would
+                    // repeat every 15 s. A full rescan is owed instead, on
+                    // the next recheck.
+                    unfinished.store(false, Ordering::Release);
+                    rescan.store(true, Ordering::Release);
                     tracing::warn!(target: "marmot_app::runtime", method = "media_sweep",
                         "media store sweep deferred");
                     break TelemetryOutcome::Failure;
@@ -122,6 +248,17 @@ fn spawn_upload_promotion(
         .as_ref()
         .is_some_and(|task| !task.is_finished())
     {
+        return;
+    }
+    // Only a file-backed upload promotes. With none, and no page in
+    // progress, there is nothing to page (mdk#2923). A failed read still
+    // runs the pass.
+    let paging = admission
+        .upload_cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    if !paging && matches!(storage.app_storage().has_file_backed_uploads(), Ok(false)) {
         return;
     }
     let cursor = admission.upload_cursor.clone();
@@ -155,19 +292,29 @@ fn spawn_upload_promotion(
     }));
 }
 
-/// Starts one batch of moving legacy database bodies into the media store
-/// (mdk#2314 step 6) on the blocking pool, unless one is still running, and
-/// then returns freed database pages to the filesystem once the database is
-/// incremental. The account worker calls this once per maintenance tick,
-/// after readiness. A batch that pauses for free space, resumes, finishes,
-/// or drops a corrupt body wakes attachment observers. At worker start and
-/// then hourly, the batch first applies the "Keep media" setting (mdk#2314
-/// step 10) for up to [`KEEP_MEDIA_SWEEP_BUDGET`].
+/// Starts one housekeeping batch on the blocking pool, unless one is still
+/// running or none of its parts is owed (mdk#2923 §4):
+/// - the "Keep media" setting (mdk#2314 step 10), at worker start, then
+///   hourly, or again while a pass left more;
+/// - moving legacy database bodies, then database-held avatar images, into
+///   the media store (mdk#2314 steps 6 and 9), until the data shows none is
+///   left;
+/// - returning freed database pages to the filesystem once the database is
+///   incremental, and a WAL truncate the startup or an earlier pass owes;
+/// - checking whether the one-time compaction is due, until the database is
+///   incremental.
+///
+/// Finished work latches for the life of the opened database; a deferred
+/// outcome (compaction not worthwhile, too large or too tight, keep-media
+/// more, an owed truncate) never does, and is checked again hourly, or sooner
+/// after a deletion. A batch that pauses for free space, resumes, finishes,
+/// or drops a corrupt body wakes attachment observers.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
     admission: &mut Admission,
 ) {
+    use std::sync::atomic::Ordering;
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
         || admission
             .legacy_migration
@@ -176,20 +323,53 @@ pub(super) fn spawn_legacy_migration(
     {
         return;
     }
+    let Ok(storage) = client.app.account_storage(&client.state.label) else {
+        return;
+    };
+    let app_storage = storage.app_storage();
+    admission.latches.bind(&app_storage);
+    let now = std::time::Instant::now();
+    let sweep_keep_media = admission.keep_media_more.load(Ordering::Acquire)
+        || admission.keep_media_due.is_none_or(|due| now >= due);
+    let latches = &mut admission.latches;
+    let legacy_owed = !HousekeepingLatches::done(&latches.legacy_bodies_done);
+    let avatars_owed = !HousekeepingLatches::done(&latches.database_avatars_done);
+    let startup = !admission.startup_wal_settled.load(Ordering::Acquire);
+    let recheck = latches.recheck_due.is_none_or(|due| now >= due);
+    // A deletion frees pages: reclaim checks again. A failed read counts as
+    // one, so the batch still runs.
+    let cleanup = app_storage.media_cleanup_epoch().ok();
+    let deleted = cleanup.is_none() || cleanup != latches.batch_cleanup_seen;
+    let truncate_owed = app_storage.wal_truncate_pending();
+    if !(sweep_keep_media
+        || legacy_owed
+        || avatars_owed
+        || startup
+        || recheck
+        || deleted
+        || truncate_owed)
+    {
+        return;
+    }
+    if sweep_keep_media {
+        admission.keep_media_more.store(false, Ordering::Release);
+        admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
+    }
+    latches.batch_cleanup_seen = cleanup;
+    if recheck {
+        latches.recheck_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL);
+    }
+    let check_compaction = recheck
+        && !admission.compaction_attempted
+        && !HousekeepingLatches::done(&latches.compaction_settled);
+    let legacy_done = latches.legacy_bodies_done.clone();
+    let avatars_done = latches.database_avatars_done.clone();
+    let compaction_settled = latches.compaction_settled.clone();
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
     let startup_wal_settled = admission.startup_wal_settled.clone();
     let compaction_due = admission.compaction_due.clone();
-    let check_compaction = !admission.compaction_attempted;
-    let now = std::time::Instant::now();
-    let sweep_keep_media = admission
-        .keep_media_more
-        .swap(false, std::sync::atomic::Ordering::AcqRel)
-        || admission.keep_media_due.is_none_or(|due| now >= due);
-    if sweep_keep_media {
-        admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
-    }
     let keep_media_more = admission.keep_media_more.clone();
     let batch = shared
         .observer
@@ -209,7 +389,7 @@ pub(super) fn spawn_legacy_migration(
         })();
         let Ok((storage, media, reserve)) = started else {
             if sweep_keep_media {
-                keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                keep_media_more.store(true, Ordering::Release);
             }
             tracing::warn!(target: "marmot_app::storage_maintenance",
                 method = "migrate_legacy_attachments",
@@ -233,7 +413,7 @@ pub(super) fn spawn_legacy_migration(
             ) {
                 Ok((removed, more)) => {
                     if more {
-                        keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                        keep_media_more.store(true, Ordering::Release);
                     }
                     if removed > 0 {
                         tracing::info!(target: "marmot_app::storage_maintenance",
@@ -247,44 +427,61 @@ pub(super) fn spawn_legacy_migration(
                     // Deferred by an error: the batch still runs the rest,
                     // but its span reports the failure.
                     outcome = TelemetryOutcome::Failure;
-                    keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                    keep_media_more.store(true, Ordering::Release);
                     tracing::warn!(target: "marmot_app::storage_maintenance",
                         method = "keep_media_sweep",
                         "keep media sweep deferred");
                 }
             }
         }
-        let changed = crate::media::legacy_migration::run_batch(
-            &app_storage,
-            &media,
-            reserve,
-            &free,
-            &progress,
-        );
-        if changed {
-            // A moved, paused or dropped body: a dropped one leaves Ready.
-            updates.state_changed();
+        if legacy_owed {
+            let changed = crate::media::legacy_migration::run_batch(
+                &app_storage,
+                &media,
+                reserve,
+                &free,
+                &progress,
+            );
+            if changed {
+                // A moved, paused or dropped body: a dropped one leaves Ready.
+                updates.state_changed();
+            }
+            // Finished only when the data shows nothing left, including a
+            // legacy upload whose promotion would add a body; a pause or a
+            // deferral leaves it owed.
+            if matches!(app_storage.has_legacy_attachment_work(), Ok(false)) {
+                legacy_done.store(true, Ordering::Release);
+            }
         }
         // Then images still held in the database move into cache files
         // (mdk#2314 step 9), so compaction can return their pages.
-        if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
-            app.presentation_signals.wake();
-            let _ = app.presentation_signals.avatars.send(label.clone());
+        if avatars_owed {
+            if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
+                app.presentation_signals.wake();
+                let _ = app.presentation_signals.avatars.send(label.clone());
+            }
+            if matches!(app_storage.has_database_held_avatars(), Ok(false)) {
+                avatars_done.store(true, Ordering::Release);
+            }
         }
-        let startup = !startup_wal_settled.load(std::sync::atomic::Ordering::Acquire);
         if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
-            startup_wal_settled.store(true, std::sync::atomic::Ordering::Release);
+            startup_wal_settled.store(true, Ordering::Release);
         }
-        if check_compaction
-            && crate::media::storage_compaction::compaction_check(
+        if check_compaction {
+            // An incremental database never needs the one-time compaction:
+            // that is terminal. Anything else is checked again later.
+            if matches!(app_storage.database_space(), Ok(space) if space.incremental) {
+                compaction_settled.store(true, Ordering::Release);
+            } else if crate::media::storage_compaction::compaction_check(
                 &app_storage,
                 reserve,
                 &free,
                 &progress,
             )
             .is_some()
-        {
-            compaction_due.store(true, std::sync::atomic::Ordering::Release);
+            {
+                compaction_due.store(true, Ordering::Release);
+            }
         }
         batch.finish(outcome);
     }));
@@ -359,6 +556,9 @@ impl Admission {
             CompactionAttempt::RolledBack => {
                 self.compaction_rollbacks += 1;
                 self.compaction_attempted = self.compaction_rollbacks >= MAX_COMPACTION_ROLLBACKS;
+                // A rollback is not the idle path: check again on the next
+                // tick, not after the hourly recheck.
+                self.latches.recheck_due = None;
             }
             CompactionAttempt::NotDue => {}
         }
@@ -578,6 +778,7 @@ pub(super) fn schedule(
         // Reclaim whatever a crash left in the media store before new work.
         spawn_media_sweep(
             admission,
+            &storage.app_storage(),
             client
                 .app
                 .account_media_store(&client.state.label, &storage)?,
@@ -587,6 +788,7 @@ pub(super) fn schedule(
     } else {
         spawn_media_sweep(
             admission,
+            &storage.app_storage(),
             client
                 .app
                 .account_media_store(&client.state.label, &storage)?,

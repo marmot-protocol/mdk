@@ -93,6 +93,23 @@ impl LegacyAttachmentBody {
 }
 
 impl SqliteAppStorage {
+    /// Whether legacy body migration may still have work: a completed legacy
+    /// body, or a legacy upload (staged in the database, `file_id IS NULL`)
+    /// whose promotion copies its body in as one. New uploads are file-backed,
+    /// so once neither exists nothing adds a legacy body (mdk#2923). A read.
+    pub fn has_legacy_attachment_work(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {LEGACY_BODIES})
+                         OR EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id IS NULL)"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Up to `limit` (1..=64) completed legacy bodies, smallest first, so a
     /// body that does not fit means none of the rest fits either.
     pub fn legacy_attachment_bodies(

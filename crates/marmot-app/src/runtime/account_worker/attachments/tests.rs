@@ -2043,3 +2043,441 @@ async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
             .load(std::sync::atomic::Ordering::Acquire)
     );
 }
+
+/// Starts nothing new until the media sweep task this admission holds, if
+/// any, has finished.
+async fn finish_media_sweep(admission: &mut Admission) {
+    if let Some(task) = admission.media_sweep.take() {
+        task.await.unwrap();
+    }
+}
+
+/// The media sweep runs to completion when a worker takes ownership, then
+/// again only once something may have left work for it: here, a deleted
+/// media row. With nothing changed it starts no batch at all (mdk#2923 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_media_sweep_runs_again_only_once_a_media_row_was_deleted() {
+    use media_store::MediaCatalog;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweeps = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMediaSweep)
+            .unwrap()
+            .completed
+    };
+    spawn_media_sweep(
+        &mut admission,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    finish_media_sweep(&mut admission).await;
+    assert_eq!(sweeps(), 1, "the ownership sweep runs");
+    for _ in 0..3 {
+        spawn_media_sweep(
+            &mut admission,
+            &app_storage,
+            media.clone(),
+            false,
+            &telemetry,
+        );
+        finish_media_sweep(&mut admission).await;
+    }
+    assert_eq!(sweeps(), 1, "nothing changed, so no batch starts");
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let id = media_store::FileId([7; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [2; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    // The deletion owes batches until one reaches the end of the store.
+    let mut batches = 0;
+    loop {
+        let before = sweeps();
+        spawn_media_sweep(
+            &mut admission,
+            &app_storage,
+            media.clone(),
+            false,
+            &telemetry,
+        );
+        finish_media_sweep(&mut admission).await;
+        if sweeps() == before {
+            break;
+        }
+        batches += 1;
+        assert!(batches < 1000, "the sweep settles");
+    }
+    assert!(batches >= 1, "a deleted media row owes a sweep");
+}
+
+/// What housekeeping derived from one opened database is dropped when the
+/// account's database is another one: a reopened, reset or replaced
+/// database starts unlatched (mdk#2923 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_latches_reset_for_another_opened_database() {
+    use std::sync::atomic::Ordering;
+    let (_dir, client, stale, _) = offline_fixture().await;
+    let app = &client.app;
+    let mut latches = HousekeepingLatches::default();
+    latches.bind(&stale.app_storage());
+    latches.legacy_bodies_done.store(true, Ordering::Release);
+    latches.database_avatars_done.store(true, Ordering::Release);
+    latches.compaction_settled.store(true, Ordering::Release);
+    latches.sweep_cleanup_seen = Some(0);
+    latches.bind(&stale.app_storage());
+    assert!(
+        latches.legacy_bodies_done.load(Ordering::Acquire),
+        "same database keeps them"
+    );
+
+    app.drop_account_caches("alice");
+    let reopened = app.account_storage("alice").unwrap();
+    latches.bind(&reopened.app_storage());
+    assert!(!latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(!latches.database_avatars_done.load(Ordering::Acquire));
+    assert!(!latches.compaction_settled.load(Ordering::Acquire));
+    assert_eq!(latches.sweep_cleanup_seen, None, "a sweep is owed again");
+}
+
+/// The housekeeping batch spawns while any part of it is owed and not
+/// otherwise (mdk#2923 §4). Finished one-time work (no legacy bodies or
+/// database-held avatars on a fresh account, an incremental database, the
+/// startup truncate) latches; a deferred outcome never does: keep-media
+/// `more`, the hourly recheck and a deletion each owe another batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
+    use media_store::MediaCatalog;
+    use std::sync::atomic::Ordering;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let runtime = crate::MarmotAppRuntime::new(client.app.clone());
+    let shared = runtime.shared_services();
+    let mut admission = Admission::default();
+    let batches = || {
+        shared
+            .observer
+            .performance()
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMaintenanceHousekeepingBatch)
+            .unwrap()
+            .completed
+    };
+    let run = async |admission: &mut Admission| {
+        spawn_legacy_migration(&client, &shared, admission);
+        if let Some(task) = admission.legacy_migration.take() {
+            task.await.unwrap();
+        }
+    };
+    run(&mut admission).await;
+    assert_eq!(batches(), 1, "the first batch derives everything");
+    assert!(admission.latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(
+        admission
+            .latches
+            .database_avatars_done
+            .load(Ordering::Acquire)
+    );
+    assert!(admission.latches.compaction_settled.load(Ordering::Acquire));
+    for _ in 0..3 {
+        run(&mut admission).await;
+    }
+    assert_eq!(batches(), 1, "nothing owed, so no batch");
+
+    admission.keep_media_more.store(true, Ordering::Release);
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(batches(), 2, "keep-media more owes one batch");
+
+    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(batches(), 3, "the deferred recheck owes one batch");
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(storage.app_storage());
+    let id = media_store::FileId([9; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [3; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(
+        batches(),
+        4,
+        "a deletion frees pages, so reclaim checks once"
+    );
+    runtime.shutdown().await;
+}
+
+/// A sweep batch that fails on a row has already moved its cursor past it,
+/// so the rest of that pass would skip the row. A full rescan from the start
+/// is owed instead, on the hourly recheck, and finishing the pass does not
+/// clear it: the row is visited again then. A row that keeps failing costs
+/// one pass per recheck, never one per tick (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_sweep_row_is_revisited_by_the_hourly_rescan_not_every_tick() {
+    use media_store::{FileState, MediaCatalog};
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweeps = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMediaSweep)
+            .unwrap()
+            .completed
+    };
+    // A pending row is one the sweep removes: whether it is still there
+    // shows whether a pass got to it.
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let id = media_store::FileId([6; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [4; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    media.fail_sweep_row_for_test(Some(id));
+    let sweep = async |admission: &mut Admission, until_complete: bool| {
+        spawn_media_sweep(
+            admission,
+            &app_storage,
+            media.clone(),
+            until_complete,
+            &telemetry,
+        );
+        finish_media_sweep(admission).await;
+    };
+    let recheck_now = |admission: &mut Admission| {
+        admission.latches.sweep_rescan_due =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+    };
+
+    sweep(&mut admission, true).await;
+    assert_eq!(sweeps(), 1);
+    assert_eq!(catalog.file_state(id).unwrap(), Some(FileState::Pending));
+    for _ in 0..5 {
+        sweep(&mut admission, false).await;
+    }
+    assert_eq!(sweeps(), 1, "a failure is not retried every tick");
+    assert!(
+        admission.latches.sweep_rescan_due.is_some(),
+        "a rescan is owed"
+    );
+
+    // Another deletion owes the sweep again, and it finishes the current
+    // pass. That pass resumes past the failed row, so it does not settle
+    // the rescan.
+    let other = media_store::FileId([8; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: other,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [5; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(other).unwrap());
+    for _ in 0..1000 {
+        let before = sweeps();
+        sweep(&mut admission, false).await;
+        if sweeps() == before {
+            break;
+        }
+    }
+    assert!(sweeps() > 1, "the deletion owed a batch");
+    assert_eq!(catalog.file_state(id).unwrap(), Some(FileState::Pending));
+    assert!(
+        admission
+            .latches
+            .sweep_rescan
+            .load(std::sync::atomic::Ordering::Acquire),
+        "finishing the pass leaves the rescan owed"
+    );
+    let base = sweeps();
+
+    // A row that keeps failing: one pass per recheck.
+    for round in 1..=2 {
+        recheck_now(&mut admission);
+        sweep(&mut admission, false).await;
+        assert_eq!(sweeps(), base + round, "one rescan on the recheck");
+        for _ in 0..3 {
+            sweep(&mut admission, false).await;
+        }
+        assert_eq!(sweeps(), base + round, "and nothing until the next");
+    }
+
+    // Once the row no longer fails, the next recheck's rescan reaches it.
+    media.fail_sweep_row_for_test(None);
+    recheck_now(&mut admission);
+    for _ in 0..1000 {
+        let before = sweeps();
+        sweep(&mut admission, false).await;
+        if sweeps() == before {
+            break;
+        }
+    }
+    assert_eq!(
+        catalog.file_state(id).unwrap(),
+        None,
+        "the rescan removed it"
+    );
+}
+
+/// Every media store call runs on the blocking pool: the sweep lock may be
+/// held by an earlier batch (for example one waiting on a compacting
+/// connection), so starting a sweep, even one that restarts the cursor,
+/// never takes it on the async worker (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_a_sweep_never_waits_for_the_store_sweep_lock() {
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let media = media.clone();
+        std::thread::spawn(move || {
+            let _hold = media.hold_sweep_for_test();
+            held_tx.send(()).unwrap();
+            // Released after 3 s, so a call that blocks shows as slow
+            // instead of hanging the test.
+            std::thread::sleep(Duration::from_secs(3));
+        })
+    };
+    held_rx.recv().unwrap();
+    let mut admission = Admission::default();
+    let started = std::time::Instant::now();
+    // An ownership sweep restarts the cursor from the start.
+    spawn_media_sweep(
+        &mut admission,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "starting the sweep waited for the held lock: {:?}",
+        started.elapsed()
+    );
+    holder.join().unwrap();
+    finish_media_sweep(&mut admission).await;
+}
+
+/// A file a failed best-effort unlink leaves behind may lie behind the
+/// cursor of a pass already in progress, so resuming that pass would never
+/// reach it. The store reporting it owes a pass from the start, which
+/// removes it (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
+    use media_store::MediaCatalog;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweep = async |admission: &mut Admission, until_complete: bool| {
+        spawn_media_sweep(
+            admission,
+            &app_storage,
+            media.clone(),
+            until_complete,
+            &telemetry,
+        );
+        finish_media_sweep(admission).await;
+    };
+    let plant = |id: media_store::FileId| {
+        let path = media.path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"orphan").unwrap();
+    };
+    sweep(&mut admission, true).await;
+
+    // More orphans in a late shard than one batch takes, so a pass stops
+    // part-way through that shard, past every earlier one.
+    for index in 0..(MEDIA_SWEEP_BATCH + 40) as u16 {
+        let mut id = [0xf0; 16];
+        id[1..3].copy_from_slice(&index.to_be_bytes());
+        plant(media_store::FileId(id));
+    }
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let deleted = media_store::FileId([0x30; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: deleted,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [6; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(deleted).unwrap());
+    sweep(&mut admission, false).await;
+    assert!(
+        admission
+            .latches
+            .sweep_unfinished
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the pass stopped part-way"
+    );
+
+    // An early-shard file is left behind, and a failed unlink reports it.
+    let left = media_store::FileId([0x01; 16]);
+    plant(left);
+    let blocked = media_store::FileId([0x02; 16]);
+    std::fs::create_dir_all(media.path(&blocked).join("held")).unwrap();
+    media.unlink_released(&[blocked]);
+    std::fs::remove_dir_all(media.path(&blocked)).unwrap();
+
+    for _ in 0..1000 {
+        sweep(&mut admission, false).await;
+        if !admission
+            .latches
+            .sweep_unfinished
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            break;
+        }
+    }
+    assert!(
+        !media.path(&left).exists(),
+        "the restarted pass reached the file behind the old cursor"
+    );
+}

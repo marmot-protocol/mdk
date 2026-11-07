@@ -2246,6 +2246,7 @@ impl MarmotApp {
             checkpointed_transport_timestamp,
             saved_transport_timestamp: checkpointed_transport_timestamp,
             observed_commit_version: None,
+            content_report_backfill_done: None,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
             #[cfg(test)]
