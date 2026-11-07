@@ -49,8 +49,9 @@ impl SqliteAppStorage {
         {
             return Err(ChatListPageError::InvalidWindowQuery);
         }
-        // A malformed query is a typed error, never a readiness wait.
-        query.query.validate()?;
+        // A malformed query, or one a window may not evaluate (message
+        // text), is a typed error, never a readiness wait.
+        query.query.validate_for_window()?;
         self.connection.with_deferred_read(|conn| {
             let missing_base: bool = conn
                 .query_row_cached(
@@ -210,7 +211,9 @@ fn choose_anchor(
     conn: &Connection,
     query: &ChatListWindowQuery,
 ) -> Result<Option<String>, ChatListPageError> {
-    let compiled = query.query.compile(query.now_ms)?;
+    let compiled = query
+        .query
+        .compile(query.now_ms, super::query::QueryScope::Window)?;
     let mut stmt = conn
         .prepare_cached(&format!(
             "SELECT group_id_hex FROM chat_list_rows WHERE {} AND lower(group_id_hex)=lower(?{})",

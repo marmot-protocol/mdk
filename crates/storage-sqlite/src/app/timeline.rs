@@ -3819,17 +3819,19 @@ fn timeline_query_sql(
         clauses.push("timeline.group_id_hex = ?".to_owned());
         params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
     }
+    // The chat-list message-text leaf uses the same rule (trim, Unicode
+    // lowercase, literal substring), so a chat it matches shows the match here.
     if let Some(search) = query
         .search
-        .as_ref()
-        .map(|value| value.trim())
+        .as_deref()
+        .map(crate::base::text_search::normalize_search_text)
         .filter(|value| !value.is_empty())
     {
-        clauses.push("timeline.plaintext LIKE ? ESCAPE '\\' COLLATE NOCASE".to_owned());
-        params.push(rusqlite::types::Value::Text(format!(
-            "%{}%",
-            escape_like_literal(search)
-        )));
+        clauses.push(format!(
+            "{}(timeline.plaintext, ?)",
+            crate::base::text_search::SQL_CONTAINS_FUNCTION
+        ));
+        params.push(rusqlite::types::Value::Text(search));
     }
     match (pagination.direction, pagination.cursor_order.as_ref()) {
         (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
@@ -3925,17 +3927,6 @@ fn timeline_query_sql(
         ),
         params,
     ))
-}
-
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
 }
 
 pub(crate) fn canonical_timeline_order_key<'a>(

@@ -2734,7 +2734,7 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
 }
 
 #[test]
-fn timeline_search_treats_like_metacharacters_literally() {
+fn timeline_search_matches_literal_text_after_unicode_lowercasing() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     for (message_id, plaintext) in [
         ("percent", "50% complete"),
@@ -2744,6 +2744,7 @@ fn timeline_search_treats_like_metacharacters_literally() {
         ("backslash", r"path\name"),
         ("backslash-absent", "pathname"),
         ("mixed-case", "Hello There"),
+        ("unicode-case", "Une ÉCOLE"),
     ] {
         store
             .record_app_event(&chat(message_id, "alice", 1, plaintext))
@@ -2755,6 +2756,7 @@ fn timeline_search_treats_like_metacharacters_literally() {
         ("a_b", "underscore"),
         (r"path\name", "backslash"),
         ("hello", "mixed-case"),
+        (" école ", "unicode-case"),
     ] {
         let page = store
             .message_timeline(TimelineMessageQuery {

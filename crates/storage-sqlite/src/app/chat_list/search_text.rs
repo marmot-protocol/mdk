@@ -1,13 +1,9 @@
-//! Text search normalization, shared by chat-list search and user directory
-//! search: trim surrounding whitespace, lowercase by Unicode rules, then match
-//! as a literal substring. Accent and compatibility folding are deliberately
-//! absent; adding them is a format change to `chat_list_rows.search_text`.
+//! Chat-list search text: the stored `chat_list_rows.search_text` column,
+//! normalized by the shared rule in `crate::base::text_search` (trim, Unicode
+//! lowercase, literal substring). Accent and compatibility folding are
+//! deliberately absent; adding them is a format change to the column.
 
-/// Normalize a search query or one searchable value: trim, then Unicode
-/// lowercase. A query that is empty after this matches nothing.
-pub fn normalize_search_text(text: &str) -> String {
-    text.trim().to_lowercase()
-}
+pub use crate::base::text_search::normalize_search_text;
 
 /// Joins fields in `chat_list_rows.search_text`. It is a control character,
 /// and fields never contain one, so a query can only match inside one field.

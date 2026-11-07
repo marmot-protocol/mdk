@@ -543,8 +543,9 @@ pub enum MarmotKitError {
     ChatWindowClosed,
     #[error("chat window query failed: {details}")]
     ChatWindowQuery { details: String },
-    /// A chat-list query broke a size bound or its node list was not one tree.
-    /// Nothing was read; fix the query rather than retrying it.
+    /// A chat-list query broke a size bound, its node list was not one tree,
+    /// or a window was opened with a `MessageText` node. Nothing was read; fix
+    /// the query rather than retrying it.
     #[error("invalid chat-list query: {reason}")]
     InvalidChatListQuery {
         reason: crate::conversions::ChatListQueryErrorFfi,

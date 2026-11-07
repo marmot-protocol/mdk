@@ -16,6 +16,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_installed_custom_emoji` and `marmot_read_installed_custom_emoji` now read off the runtime's workers while
   blocking. A NULL control records a `marmot_last_error_message` detail. Use the matching header and library.
 
+- Add the `MessageText` filter node kind (6), which reads `MarmotChatListFilterNode.text` like `Text`, and append
+  `MessageTextInWindow` (8) to `MarmotChatListQueryError` (mdk#2983). `marmot_chat_list_query_ids` and
+  `marmot_revalidate_chat_list_query_ids` accept it; `marmot_open_chat_list_query_window` returns
+  `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY`. Existing discriminants and the node layout are unchanged. `marmot.h` now
+  names the `MarmotChatListCondition`, `MarmotChatListFilterNodeKind` and `MarmotChatListQueryError` constants, which
+  callers previously passed as bare integers.
+
 - Add the `Text` filter node kind (5), read from the new trailing `MarmotChatListFilterNode.text` field (borrowed,
   NUL-terminated UTF-8, required for that kind), and append `TextTooLong` (7) to `MarmotChatListQueryError`
   (mdk#2983). Existing discriminants are unchanged, but the node struct grows: rebuild against the regenerated

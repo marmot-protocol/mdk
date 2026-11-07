@@ -1997,6 +1997,23 @@ async fn invalid_queries_fail_before_any_read() {
             .await,
         Err(AppError::Hex(_))
     ));
+    // Message text scans history: select-all accepts it, a window refuses it.
+    let messages = filtered(ChatListFilter::Not(Box::new(ChatListFilter::MessageText(
+        "anything".into(),
+    ))));
+    assert!(matches!(
+        f.runtime.open_chat_list_window("alice", messages.clone(), None).await,
+        Err(ChatListWindowError::App(error))
+            if matches!(error.as_ref(), AppError::InvalidChatListQuery(ChatListQueryError::MessageTextInWindow))
+    ));
+    assert_eq!(
+        f.runtime
+            .chat_list_ids("alice", messages)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     f.runtime.shutdown_and_close().await.unwrap();
 }
 

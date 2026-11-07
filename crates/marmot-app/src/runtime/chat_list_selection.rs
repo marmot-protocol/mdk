@@ -26,9 +26,11 @@ impl MarmotAppRuntime {
     /// A fixed view (`ChatListView`) is a query without a filter. The window
     /// pages through the same compiled query, so list, count and selection agree.
     /// The set is complete or the call fails: while base rows are still being
-    /// prepared, or for a `Text` filter while any chat in the view still has
-    /// presentation pending, it returns `ChatPresentationNotReady`, and the
-    /// caller retries.
+    /// prepared, for a `Text` filter while any chat in the view still has
+    /// presentation pending, or for a `MessageText` filter while retained
+    /// deletions and edits are still being backfilled into the timeline, it
+    /// returns `ChatPresentationNotReady`, and the caller retries. Unlike a
+    /// window, this accepts `MessageText`, whose cost grows with history.
     pub async fn chat_list_ids(
         &self,
         account_ref: &str,

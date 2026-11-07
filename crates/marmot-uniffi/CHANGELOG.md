@@ -11,6 +11,13 @@
   `emoji_set`, `installed_custom_emoji` and `read_installed_custom_emoji` are now async. `MimeMismatch` now means a
   non-image response type; any `image/*` type is accepted. Regenerate bindings.
 
+- Add `ChatListFilterNodeFfi::MessageText { text }` and `ChatListQueryErrorFfi::MessageTextInWindow` (mdk#2983):
+  chats with a visible message containing the text, trimmed and lowercased. `chat_list_query_ids` and
+  `revalidate_chat_list_query_ids` accept it; `open_chat_list_query_window` fails with `InvalidChatListQuery`
+  (`MessageTextInWindow`). While retained deletions and edits are still being backfilled it fails with
+  `ChatPresentationNotReady`; retry. Timeline `search` now lowercases non-ASCII text too. Regenerate bindings; an
+  exhaustive Swift/Kotlin `switch` over either enum needs the new case.
+
 - Add `ChatListFilterNodeFfi::Text { text }` and `ChatListQueryErrorFfi::TextTooLong` (mdk#2983): chats whose title,
   group name, description or direct-chat peer profile name contains the text, trimmed and lowercased, at most 1024
   bytes in all. While any chat in the view has pending presentation, a text query fails with
