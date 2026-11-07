@@ -2153,7 +2153,8 @@ impl<S: StorageProvider> Engine<S> {
     /// engine state rather than a convergence input, so
     /// a group whose only pending work is a peer's leave otherwise reads as
     /// idle, and the removal waits for an unrelated commit to run convergence
-    /// (mdk#1736). Only a convergence advance stages the commit.
+    /// (mdk#1736). A convergence advance or an outbound send that reaches the
+    /// due schedule stages the commit.
     pub fn scheduled_self_remove_auto_commit_delay_ms(
         &mut self,
         group_id: &GroupId,

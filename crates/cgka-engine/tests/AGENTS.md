@@ -98,9 +98,6 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     targets or already satisfied), and fresh-material reinvite recovery across real forks, paced lookup, admin grants,
     and genuine replacement-Welcome offers.
 
-  `queued_send_order::a_leave_behind_a_queued_message_goes_out_after_it` also owns the Leaving gate that closes
-  within one drain: the prepared App/Leave prefix returns while a later accepted app stays queued.
-
 - **File:** `distributed_convergence/historical_application_sender.rs`
   - **Owns:** Source-epoch application attribution after removal, replacement leaf reuse, and rejoin; direct
     ingestion and buffered replay after restart, duplicate suppression, and forged replacement-author rejection.
@@ -127,6 +124,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     a drained intent awaiting its outcome holds no later send; and a queued change the settled state already holds is
     retired at drain, so it holds no later send. The device-group refusals behind a queued row are in
     `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
+
+  `queued_send_order::a_leave_behind_a_queued_message_goes_out_after_it` also owns the Leaving gate that closes
+  within one drain: the prepared App/Leave prefix returns while a later accepted app stays queued.
 
 - **File:** `distributed_convergence/refused_queued_intents.rs`
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
