@@ -349,4 +349,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn keep_media_choices_preserve_native_and_host_durations() {
+        for (native, foreign) in [
+            (
+                app::AttachmentKeepMedia::Forever,
+                AttachmentKeepMediaFfi::Forever,
+            ),
+            (
+                app::AttachmentKeepMedia::OneYear,
+                AttachmentKeepMediaFfi::OneYear,
+            ),
+            (
+                app::AttachmentKeepMedia::SixMonths,
+                AttachmentKeepMediaFfi::SixMonths,
+            ),
+            (
+                app::AttachmentKeepMedia::ThirtyDays,
+                AttachmentKeepMediaFfi::ThirtyDays,
+            ),
+        ] {
+            assert_eq!(AttachmentKeepMediaFfi::from(native), foreign);
+            assert_eq!(app::AttachmentKeepMedia::from(foreign), native);
+        }
+    }
 }

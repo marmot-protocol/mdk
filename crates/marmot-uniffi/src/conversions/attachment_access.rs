@@ -84,3 +84,29 @@ redact!(AttachmentHandoffFfi);
 redact!(AttachmentLocalTargetFfi);
 redact!(AttachmentLocalAssetFfi);
 redact!(AttachmentLocalBytesFfi);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_results_distinguish_unavailable_from_available_empty() {
+        let locator = "1:00112233445566778899aabbccddeeff:ffeeddccbbaa99887766554433221100";
+        let absent = AttachmentLocalAssetFfi::from(None);
+        assert!(absent.reference.is_none());
+        assert_eq!(absent.byte_count, 0);
+        let empty = AttachmentLocalAssetFfi::from(Some(app::RetainedAttachmentAsset {
+            reference: app::AttachmentAssetRef::from_opaque(locator).unwrap(),
+            byte_count: 0,
+        }));
+        assert_eq!(empty.reference.as_deref(), Some(locator));
+        assert_eq!(empty.byte_count, 0);
+        let missing_bytes = AttachmentLocalBytesFfi::from(None);
+        assert!(!missing_bytes.available && missing_bytes.bytes.is_empty());
+        let empty_bytes = AttachmentLocalBytesFfi::from(Some(zeroize::Zeroizing::new(Vec::new())));
+        assert!(empty_bytes.available && empty_bytes.bytes.is_empty());
+        let bytes = AttachmentLocalBytesFfi::from(Some(zeroize::Zeroizing::new(vec![0x89, 0x2a])));
+        assert!(bytes.available);
+        assert_eq!(bytes.bytes, [0x89, 0x2a]);
+    }
+}
