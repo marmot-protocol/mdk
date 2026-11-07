@@ -3317,7 +3317,7 @@ fn update_group_record_from_replay<S: StorageProvider>(
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
     if let Some(mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
-        .map_err(|e| OpenMlsProjectionError::Replay(format!("load post-replay group: {e:?}")))?
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("load post-replay group: {e:?}")))?
     {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
@@ -3783,7 +3783,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
     let mut mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
-        .map_err(|e| OpenMlsProjectionError::Replay(format!("load: {e:?}")))?
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("load: {e:?}")))?
         .ok_or(OpenMlsProjectionError::MissingGroup)?;
 
     let mut self_removed_slots = accepted
@@ -3905,7 +3905,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 }
             }
             mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
-                .map_err(|e| OpenMlsProjectionError::Replay(format!("checkpoint reload: {e:?}")))?
+                .map_err(|e| OpenMlsProjectionError::Storage(format!("checkpoint reload: {e:?}")))?
                 .ok_or(OpenMlsProjectionError::MissingGroup)?;
             let actual_authenticator = own_commit_post_merge_epoch_authenticator(&mls_group);
             if mls_group.epoch().as_u64() != resulting_epoch
@@ -4213,8 +4213,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 // Mirror direct ingest: check each added leaf's proof profile
                 // before the merge consumes the staged commit.
                 crate::capability_manager::check_added_leaf_profiles(storage, group_id, &staged)
-                    .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
+                    .map_err(|error| match error {
+                        EngineError::Storage(error) => OpenMlsProjectionError::Storage(format!(
+                            "check replayed Add leaves: {error:?}"
+                        )),
+                        other => OpenMlsProjectionError::Replay(format!(
+                            "check replayed Add leaves: {other}"
+                        )),
                     })?;
                 let roster_before = if retain_replayed_anchors.is_some() {
                     crate::device_roster_departures::capture(&mls_group)
@@ -4245,7 +4250,12 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         &mls_group,
                         &message.id,
                     )
-                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+                    .map_err(|error| match error {
+                        EngineError::Storage(error) => OpenMlsProjectionError::Storage(format!(
+                            "record replayed device-roster departures: {error:?}"
+                        )),
+                        other => OpenMlsProjectionError::Replay(other.to_string()),
+                    })?;
                 }
                 observations.push(OpenMlsReplayObservation::CommitStaged {
                     message_id: message_id.clone(),
