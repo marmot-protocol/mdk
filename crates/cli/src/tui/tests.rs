@@ -14955,3 +14955,241 @@ fn group_state_subscription_drain_scopes_diagnostics_and_tears_down() {
         assert!(app.running);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn slash_account_setup_adopts_the_returned_identity_and_signing_state() {
+    use nostr::prelude::ToBech32;
+    let a = "aa".repeat(32);
+    let keys = nostr::prelude::Keys::generate();
+    let b = keys.public_key().to_hex();
+    let nsec = keys.secret_key().to_bech32().unwrap();
+    let npub = crate::npub_for_account_id(&b).unwrap();
+    for (input, command, action, local_signing, account_id_result) in [
+        (
+            "/create-identity".to_owned(),
+            vec!["create-identity".to_owned()],
+            "created identity",
+            true,
+            true,
+        ),
+        (
+            format!("/login {npub}"),
+            vec!["login".to_owned(), npub.clone()],
+            "logged in public identity",
+            false,
+            false,
+        ),
+        (
+            format!("/login {nsec}"),
+            vec!["login".to_owned(), "--nsec-stdin".to_owned()],
+            "logged in identity",
+            true,
+            true,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = serde_json::json!({
+            "npub":npub,"local_signing":local_signing,"profile":{"display_name":"Returned B"},
+            "accounts":[
+                {"account_id":a,"npub":"npub1alice","display_name":"Old A","local_signing":true},
+                {"account_id":b,"npub":npub,"display_name":"Returned B","local_signing":local_signing}
+            ],"chats":[]
+        });
+        if account_id_result {
+            result["account_id"] = serde_json::json!(b);
+        }
+        let response = serde_json::json!({"ok":true,"result":result}).to_string();
+        let exe = dir.path().join("wn-setup");
+        let args = dir.path().join("args");
+        let stdin = dir.path().join("stdin");
+        let first = dir.path().join("first");
+        let capture_stdin = if action == "logged in identity" {
+            format!("cat > '{}'\n", stdin.display())
+        } else {
+            String::new()
+        };
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nif mkdir '{}' 2>/dev/null; then\nprintf '%s\\n' \"$@\" > '{}'\n{capture_stdin}fi\ncat <<'JSON'\n{response}\nJSON\n",
+                first.display(),
+                args.display()
+            ),
+        );
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &a,
+        );
+        app.daemon.running = false;
+        app.chats = vec![flick_chat("prior-group", "Old room")];
+        app.messages_account_id = Some(a.clone());
+        app.messages_group_id = Some("prior-group".into());
+        app.timeline = vec![timeline_row("old-account-row", 1)];
+        app.input.set_value(&input);
+        app.submit_input().expect("dispatch account setup");
+        assert_eq!(
+            app.selected_account_row().unwrap().account_id,
+            b,
+            "{action}"
+        );
+        assert_eq!(
+            app.status,
+            format!(
+                "{action} Returned B {}",
+                if local_signing {
+                    "local-signing"
+                } else {
+                    "public-only"
+                }
+            )
+        );
+        assert!(app.input.is_empty());
+        assert!(app.chats.is_empty());
+        assert!(app.timeline.is_empty());
+        assert!(app.messages_group_id.is_none());
+        assert_eq!(
+            app.messages_account_id.as_deref(),
+            local_signing.then_some(b.as_str())
+        );
+        let recorded = std::fs::read_to_string(args).unwrap();
+        let mut expected = vec!["--json".to_owned()];
+        expected.extend(command);
+        assert!(!recorded.contains(&nsec), "the secret is never an argument");
+        assert_eq!(recorded.lines().collect::<Vec<_>>(), expected);
+        if action == "logged in identity" {
+            assert!(
+                std::fs::read_to_string(stdin).unwrap() == format!("{nsec}\n"),
+                "the dispatcher must deliver the complete secret through stdin"
+            );
+        } else {
+            assert!(!stdin.exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn slash_management_commands_forward_the_selected_owner_and_requested_options() {
+    let a = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let peer = "dd".repeat(32);
+    for (input, command, selected_account, status) in [
+        (
+            "/chat rename Renamed Room".to_owned(),
+            vec![
+                "groups".into(),
+                "update".into(),
+                group.clone(),
+                "--name".into(),
+                "Renamed Room".into(),
+            ],
+            true,
+            "updated chat; published=2",
+        ),
+        (
+            "/chat describe Project marker".to_owned(),
+            vec![
+                "groups".into(),
+                "update".into(),
+                group.clone(),
+                "--description".into(),
+                "Project marker".into(),
+            ],
+            true,
+            "updated chat; published=2",
+        ),
+        (
+            format!("/members add {peer} {peer}"),
+            vec!["group".into(), "invite".into(), group.clone(), peer.clone()],
+            true,
+            "added member(s); published=2",
+        ),
+        (
+            format!("/members remove {peer} {peer}"),
+            vec!["group".into(), "remove".into(), group.clone(), peer.clone()],
+            true,
+            "removed member(s); published=2",
+        ),
+        (
+            "/members list".to_owned(),
+            vec!["group".into(), "members".into(), group.clone()],
+            true,
+            "members: npub1...amrcaj",
+        ),
+        (
+            format!("/keys fetch {peer}"),
+            vec!["keys".into(), "fetch".into(), peer.clone()],
+            false,
+            "fetched key package bytes=57",
+        ),
+        (
+            "/keys rotate".to_owned(),
+            vec!["keys".into(), "rotate".into()],
+            true,
+            "rotated key package bytes=57",
+        ),
+        (
+            "/profile name Requested Name".to_owned(),
+            vec![
+                "profile".into(),
+                "update".into(),
+                "--name".into(),
+                "Requested Name".into(),
+                "--display-name".into(),
+                "Requested Name".into(),
+            ],
+            true,
+            "published profile name Returned Name",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({"ok":true,"result":{
+            "published":2,"key_package_bytes":57,
+            "members":[{"npub":"npub1424242424242424242424242424242424242424242424242424qamrcaj"}],
+            "profile":{"display_name":"Returned Name"},
+            "accounts":[{"account_id":a,"npub":"npub1alice","local_signing":true}],
+            "chats":[{"group_id":group,"profile":{"name":"Refreshed Room"}}],
+            "messages":[],"has_more_before":false
+        }})
+        .to_string();
+        let exe = dir.path().join("wn-management");
+        let args = dir.path().join("args");
+        let first = dir.path().join("first");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nif mkdir '{}' 2>/dev/null; then\nprintf '%s\\n' \"$@\" > '{}'\nfi\ncat <<'JSON'\n{response}\nJSON\n",
+                first.display(),
+                args.display()
+            ),
+        );
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &a,
+        );
+        app.daemon.running = false;
+        app.chats = vec![flick_chat(&group, "Selected room")];
+        // Chat management follows the selected owner, even with an old pane.
+        app.messages_account_id = Some("bb".repeat(32));
+        app.messages_group_id = Some("ee".repeat(16));
+        app.input.set_value(&input);
+        app.submit_input().expect("dispatch management command");
+        assert_eq!(app.status, status, "{input}");
+        assert!(app.input.is_empty());
+        finish_queued_effects(&mut app);
+        let recorded = std::fs::read_to_string(args).unwrap();
+        let mut expected: Vec<String> = vec!["--json".into()];
+        if selected_account {
+            expected.extend(["--account".into(), a.clone()]);
+        }
+        expected.extend(command);
+        assert_eq!(recorded.lines().collect::<Vec<_>>(), expected, "{input}");
+    }
+}
