@@ -59,6 +59,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
+    and preservation of the earlier peer-Leave deadline after an unrelated pending self-update fails publication.
 
 - **File:** `invite_leave/recovery_batch.rs`
   - **Owns:** Atomic native recovery for two and 32 distinct recipients, exact artifacts and pending references
