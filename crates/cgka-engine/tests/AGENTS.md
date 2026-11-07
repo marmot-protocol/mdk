@@ -88,6 +88,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     deferred capacity and retry through confirmation replay. One-probe public advances must retain the engine's peel
     continuation, restore live state between slices and eventually deliver the real rival application exactly once.
 
+  `generation_close_failure_keeps_recovered_content_retryable_after_reopen` owns completed-sweep and
+  unchanged-context generation-close faults after actual recovery: propagate the real delete error, retain the
+  recovered Commit, opaque application bytes and host wake, preserve generation/progress across encrypted reopen,
+  then apply and deliver the same input exactly once after healing. Its frozen-clock rebase changes only the
+  incarnation id; moving-clock residence rebasing stays with the existing residence/restart owner.
+
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical
     application handoff after catch-up (horizon boundary, restart, bounded turns, and independent send gate).
