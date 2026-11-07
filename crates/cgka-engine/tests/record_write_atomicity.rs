@@ -41,8 +41,9 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
 
 #[path = "record_write_atomicity/application_receive_retry.rs"]
@@ -263,35 +264,75 @@ impl LeaveWriteFault {
     }
 }
 
-/// Nth-write arm like [`LeaveWriteFault`], but scoped to
-/// `update_message_state(_, Failed)` so unrelated state transitions in the
-/// same ingest do not consume it.
+/// Nth-write arm like [`LeaveWriteFault`], scoped to one state transition.
+/// Existing terminal-retirement cases arm `Failed`; the retry case arms
+/// `Retryable` without consuming the fault on unrelated transitions.
 #[derive(Clone, Default)]
-struct FailedStateWriteFault(Arc<AtomicUsize>);
+struct FailedStateWriteFault {
+    remaining: Arc<AtomicUsize>,
+    target_state: Arc<Mutex<Option<MessageState>>>,
+}
 
 impl FailedStateWriteFault {
     #[cfg(feature = "test-policy-overrides")]
     fn arm_on_write(&self, write: usize) {
+        self.arm_on_state_write(MessageState::Failed, write);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    fn arm_on_state_write(&self, state: MessageState, write: usize) {
         assert!(write > 0);
-        self.0.store(write, Ordering::SeqCst);
+        *self.target_state.lock().unwrap() = Some(state);
+        self.remaining.store(write, Ordering::SeqCst);
     }
 
     #[cfg(feature = "test-policy-overrides")]
     fn disarm(&self) {
-        self.0.store(0, Ordering::SeqCst);
+        self.remaining.store(0, Ordering::SeqCst);
     }
 
     fn should_fail(&self, new_state: MessageState) -> bool {
-        if new_state != MessageState::Failed {
+        if new_state
+            != self
+                .target_state
+                .lock()
+                .unwrap()
+                .unwrap_or(MessageState::Failed)
+        {
             return false;
         }
         matches!(
-            self.0
+            self.remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then(|| remaining - 1)
                 }),
             Ok(1)
         )
+    }
+}
+
+/// A release predicate read can fail after metadata admission succeeded.
+/// Arm at that real provider boundary rather than counting unrelated reads.
+#[derive(Clone, Default)]
+struct DeferredReleaseReadFault {
+    arm_after_metadata: Arc<AtomicBool>,
+    fail_next_group_read: Arc<AtomicBool>,
+}
+
+impl DeferredReleaseReadFault {
+    #[cfg(feature = "test-policy-overrides")]
+    fn arm(&self) {
+        self.arm_after_metadata.store(true, Ordering::SeqCst);
+    }
+
+    fn metadata_read(&self) {
+        if self.arm_after_metadata.swap(false, Ordering::SeqCst) {
+            self.fail_next_group_read.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn should_fail(&self) -> bool {
+        self.fail_next_group_read.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -345,6 +386,7 @@ struct FaultStorage {
     apply_snapshots: ApplySnapshotCounter,
     termination_fault: LeaveWriteFault,
     post_commit_disband_read_fault: LeaveWriteFault,
+    deferred_release_read_fault: DeferredReleaseReadFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -368,6 +410,11 @@ impl GroupStorage for FaultStorage {
         self.inner.put_group(group)
     }
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
+        if self.deferred_release_read_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected deferred-release group lookup failure".into(),
+            ));
+        }
         self.inner.get_group(id)
     }
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
@@ -402,7 +449,9 @@ impl MessageStorage for FaultStorage {
         std::thread::sleep(std::time::Duration::from_millis(
             self.preparation_delay.metadata_ms.load(Ordering::SeqCst) as u64,
         ));
-        self.inner.list_deferred_message_metadata(group_id)
+        let metadata = self.inner.list_deferred_message_metadata(group_id)?;
+        self.deferred_release_read_fault.metadata_read();
+        Ok(metadata)
     }
 
     fn list_messages_in_states(
@@ -950,6 +999,7 @@ fn build_counted_fault_selfremove_client(
         apply_snapshots,
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1429,6 +1479,7 @@ fn build_release_fault_client(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1459,6 +1510,7 @@ fn build_leave_write_fault_client(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(identity))
@@ -2365,6 +2417,7 @@ async fn generic_rewind_puts_back_complete_pending_application_output() {
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     };
     generic
         .rollback_group_state_keeping_live_records(&group_id, snapshot)
@@ -2792,6 +2845,7 @@ async fn slow_preparation_case(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"slow-preparation"))
@@ -2866,6 +2920,7 @@ async fn past_peel_backlog_case(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"past-peel-backlog"))
@@ -3227,6 +3282,7 @@ async fn setup_own_intent_fault_case(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"own-intent-fault"))
@@ -3371,6 +3427,7 @@ async fn a_queued_no_change_whose_retirement_fails_keeps_the_pass() {
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .identity(pad32(b"no-change-retirement"))
     .account_identity_proof_signer(proof_signer(b"no-change-retirement"))
@@ -3531,7 +3588,10 @@ async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
 const OPAQUE_MARKER: &[u8] = b"opaque-marker::";
 
 #[cfg(feature = "test-policy-overrides")]
-struct MarkerOpaquePeeler;
+struct MarkerOpaquePeeler {
+    backend_unavailable: Arc<AtomicBool>,
+    welcome_timestamp_from_carrier: bool,
+}
 
 #[cfg(feature = "test-policy-overrides")]
 #[async_trait]
@@ -3542,12 +3602,24 @@ impl TransportPeeler for MarkerOpaquePeeler {
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if msg.payload.starts_with(OPAQUE_MARKER) {
+            if self.backend_unavailable.load(Ordering::SeqCst) {
+                return Err(PeelerError::Backend(
+                    "injected marker peeler unavailable".into(),
+                ));
+            }
             return Err(PeelerError::DecryptFailed);
         }
         MockPeeler.peel_group_message(msg, ctx).await
     }
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
+        let mut peeled = MockPeeler.peel_welcome(msg).await?;
+        if self.welcome_timestamp_from_carrier {
+            let PeeledContent::Welcome { created_at, .. } = &mut peeled.content else {
+                panic!("MockPeeler produces a Welcome");
+            };
+            *created_at = Some(msg.timestamp);
+        }
+        Ok(peeled)
     }
     async fn wrap_group_message(
         &self,
@@ -3591,7 +3663,39 @@ fn opaque_row(label: &[u8], group_id: &GroupId) -> TransportMessage {
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
 async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pass() {
+    assert_deferred_retirement(DeferredRetirementCase::Terminal).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn a_failed_retryable_transition_keeps_the_row_and_its_account_capacity() {
+    assert_deferred_retirement(DeferredRetirementCase::RetryableWrite).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn deferred_release_keeps_refusal_when_group_lookup_is_unavailable() {
+    for fail_group_read in [false, true] {
+        assert_deferred_retirement(DeferredRetirementCase::ExpiredRelease { fail_group_read })
+            .await;
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[derive(Clone, Copy)]
+enum DeferredRetirementCase {
+    Terminal,
+    RetryableWrite,
+    ExpiredRelease { fail_group_read: bool },
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn assert_deferred_retirement(case: DeferredRetirementCase) {
+    let retryable_write_failure = matches!(case, DeferredRetirementCase::RetryableWrite);
+    let expiring = matches!(case, DeferredRetirementCase::ExpiredRelease { .. });
+    let deferred_release_read_fault = DeferredReleaseReadFault::default();
     let failed_state_fault = FailedStateWriteFault::default();
+    let backend_unavailable = Arc::new(AtomicBool::new(false));
     let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let mut carol = EngineBuilder::new(FaultStorage {
@@ -3606,12 +3710,16 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: deferred_release_read_fault.clone(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"carol-retire-atomic"))
     .account_identity_proof_signer(proof_signer(b"carol-retire-atomic"))
     .feature_registry(selfremove_registry())
-    .peeler(Box::new(MarkerOpaquePeeler))
+    .peeler(Box::new(MarkerOpaquePeeler {
+        backend_unavailable: backend_unavailable.clone(),
+        welcome_timestamp_from_carrier: expiring,
+    }))
     .build()
     .unwrap();
     carol
@@ -3638,16 +3746,29 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         panic!("group creation");
     };
     alice.confirm_published(pending).await.unwrap();
-    let welcome = welcomes
+    let mut welcome = welcomes
         .iter()
         .find(|welcome| {
             matches!(&welcome.envelope, TransportEnvelope::Welcome { recipient }
-                if recipient == &MemberId::new(pad32(b"carol-retire-atomic")))
+            if recipient == &MemberId::new(pad32(b"carol-retire-atomic")))
         })
         .cloned()
         .expect("welcome for carol");
+    if expiring {
+        welcome.timestamp = Timestamp(1_000_000_000);
+    }
     carol.join_welcome(welcome).await.unwrap();
     carol.drain_events();
+    if expiring {
+        assert_eq!(
+            handle
+                .get_group(&group_a)
+                .unwrap()
+                .local_copy_welcome_created_at,
+            Some(Timestamp(1_000_000_000))
+        );
+        carol.set_deferred_peel_residence_ms(0);
+    }
 
     // Two retained rows in group A.
     let rows = [
@@ -3681,6 +3802,160 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
     carol.confirm_published(pending).await.unwrap();
     // Exactly the two group-A rows' worth of account budget.
     carol.set_deferred_peel_limits_for_tests(512, usize::MAX, row_bytes.saturating_mul(2));
+
+    if let DeferredRetirementCase::ExpiredRelease { fail_group_read } = case {
+        let before_group = handle.get_group(&group_a).unwrap();
+        let before_mls = handle.group_replay_state_fingerprint(&group_a).unwrap();
+        assert!(before_mls.is_some());
+        let metadata = handle.list_deferred_message_metadata(&group_a).unwrap();
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec![rows[0].id.clone(), rows[1].id.clone()],
+            "durable insertion order supplies the first released id"
+        );
+        carol.drain_events();
+        if fail_group_read {
+            deferred_release_read_fault.arm();
+        }
+        assert_eq!(carol.retry_deferred_peels(&group_a).await.unwrap(), 2);
+        for row in &rows {
+            assert!(matches!(
+                handle.get_message(&row.id),
+                Err(StorageError::NotFound)
+            ));
+            assert!(!handle.has_processed_transport_id(&row.id).unwrap());
+        }
+        assert_eq!(handle.get_group(&group_a).unwrap(), before_group);
+        assert_eq!(
+            handle.group_replay_state_fingerprint(&group_a).unwrap(),
+            before_mls
+        );
+        let refusals: Vec<_> = carol
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::TransportObjectResourceRefused {
+                    group_id,
+                    message_id,
+                    resource,
+                } => Some((group_id, message_id, resource)),
+                _ => None,
+            })
+            .collect();
+        let expected = if fail_group_read {
+            vec![(
+                group_a.clone(),
+                rows[0].id.clone(),
+                cgka_traits::ingest::InboundResourceLimit::TransportDeferredResidenceBudget,
+            )]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            refusals, expected,
+            "only unavailable old-copy evidence keeps the recovery signal"
+        );
+        let probe = opaque_row(b"released-probe-001", &group_b);
+        assert!(
+            cgka_traits::message::StoredMessagePayload::raw_transport(probe.clone())
+                .encode()
+                .unwrap()
+                .len()
+                <= row_bytes
+        );
+        assert!(
+            matches!(
+                carol.ingest(probe).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ),
+            "both release paths return the account bytes"
+        );
+        assert!(
+            matches!(
+                carol.ingest(rows[0].clone()).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ),
+            "a released exact id remains eligible for redelivery"
+        );
+        return;
+    }
+
+    if retryable_write_failure {
+        let original = handle.get_message(&rows[0].id).unwrap();
+        assert!(
+            original
+                .deferred_peel
+                .as_ref()
+                .unwrap()
+                .last_context_fingerprint
+                .is_none()
+        );
+        let before_group = handle.get_group(&group_a).unwrap();
+        let before_mls = handle.group_replay_state_fingerprint(&group_a).unwrap();
+        assert!(before_mls.is_some());
+        backend_unavailable.store(true, Ordering::SeqCst);
+        failed_state_fault.arm_on_state_write(MessageState::Retryable, 1);
+        assert!(matches!(carol.retry_deferred_peels(&group_a).await,
+            Err(EngineError::Storage(StorageError::Busy(detail)))
+                if detail == "injected message-state write failure"
+        ));
+        assert_eq!(handle.get_message(&rows[0].id).unwrap(), original);
+        assert_eq!(handle.get_group(&group_a).unwrap(), before_group);
+        assert_eq!(
+            handle.group_replay_state_fingerprint(&group_a).unwrap(),
+            before_mls
+        );
+        assert!(!handle.has_processed_transport_id(&rows[0].id).unwrap());
+
+        // The other group's refusal observes that the failed transition did
+        // not return a slot, without reading the engine's private counters.
+        backend_unavailable.store(false, Ordering::SeqCst);
+        let probe = opaque_row(b"retryable-probe-01", &group_b);
+        assert!(
+            cgka_traits::message::StoredMessagePayload::raw_transport(probe.clone())
+                .encode()
+                .unwrap()
+                .len()
+                <= row_bytes,
+            "the capacity probe must fit the one row whose transition is retried"
+        );
+        assert!(matches!(
+            carol.ingest(probe.clone()).await.unwrap(),
+            IngestOutcome::ResourceRefused { .. }
+        ));
+        failed_state_fault.disarm();
+        backend_unavailable.store(true, Ordering::SeqCst);
+        assert!(matches!(carol.retry_deferred_peels(&group_a).await,
+            Err(EngineError::Peeler(PeelerError::Backend(detail)))
+                if detail == "injected marker peeler unavailable"
+        ));
+        let mut retryable = original;
+        retryable.state = MessageState::Retryable;
+        retryable.deferred_peel = None;
+        assert_eq!(handle.get_message(&rows[0].id).unwrap(), retryable);
+        assert_eq!(
+            handle.get_message(&rows[1].id).unwrap().state,
+            MessageState::PeelDeferred
+        );
+        assert_eq!(handle.get_group(&group_a).unwrap(), before_group);
+        assert_eq!(
+            handle.group_replay_state_fingerprint(&group_a).unwrap(),
+            before_mls
+        );
+        assert!(!handle.has_processed_transport_id(&rows[0].id).unwrap());
+        backend_unavailable.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(
+                carol.ingest(probe).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ),
+            "only the committed Retryable transition returns account capacity"
+        );
+        return;
+    }
 
     // Alice removes carol. The second row's `Failed` write fails mid-retire.
     let removal = match alice
@@ -3788,6 +4063,7 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
             apply_snapshots: ApplySnapshotCounter::default(),
             termination_fault: termination_fault.clone(),
             post_commit_disband_read_fault: LeaveWriteFault::default(),
+            deferred_release_read_fault: DeferredReleaseReadFault::default(),
         })
         .legacy_compatibility_profile()
         .identity(pad32(b"eviction-atomic-bob"))
@@ -3961,6 +4237,7 @@ async fn assert_convergence_membership_fault(
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: post_commit_disband_read_fault.clone(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"eviction-atomic-bob"))
@@ -4151,6 +4428,7 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
     })
     .identity(pad32(b"bob-disband-cleanup"))
     .account_identity_proof_signer(proof_signer(b"bob-disband-cleanup"))
