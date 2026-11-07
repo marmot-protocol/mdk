@@ -4342,6 +4342,8 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
             "--stream-id",
             stream_id,
             "--quic-candidate",
+            "quic://192.0.2.1:4450",
+            "--quic-candidate",
             &broker_candidate,
         ],
     );
@@ -4368,7 +4370,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     );
     assert_eq!(
         bob_start_message["agent_text_stream"]["quic_candidates"],
-        serde_json::json!([broker_candidate])
+        serde_json::json!(["quic://192.0.2.1:4450", broker_candidate])
     );
 
     let mut watcher = wn(home.path());
@@ -4424,6 +4426,9 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     assert_eq!(value["ok"], true);
     let received = &value["result"];
     assert_eq!(received["brokered"], true);
+    assert_eq!(received["candidate"], broker_candidate);
+    assert_eq!(received["connect"], broker.addr.to_string());
+    assert_eq!(received["trust"], "insecure_local");
     assert_eq!(received["stream_id"], stream_id);
     assert_eq!(received["text"], "hello anchored stream");
     assert_eq!(received["transcript_hash"], sent["transcript_hash"]);
