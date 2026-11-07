@@ -3850,6 +3850,102 @@ async fn fence_held_frame_caps_cursor() {
         "the held frame caps the commit"
     );
 
+    let other_account = MemberId::new(vec![0xB2; 32]);
+    let other = plane.account_adapter(other_account.clone(), relay.clone());
+    other.enable_replay_fencing().await;
+    let other_route = vec![0xD4; 32];
+    other
+        .activate_account(TransportAccountActivation {
+            account_id: other_account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id: other_route.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+        })
+        .await
+        .unwrap();
+    let other_group = issued_id(
+        &relay,
+        |subscription| matches!(subscription, NostrSubscription::GroupBatch { account_id, .. } if account_id == &other_account),
+    );
+    let other_at = created_at + 1;
+    let mut event = group_event("other-account-fence-history", &other_route);
+    event.created_at = other_at;
+    sign_group_event(&mut event);
+    plane
+        .inner
+        .transport
+        .adapter
+        .observe_relay_event(
+            &hex::decode(&event.id).unwrap(),
+            &endpoint,
+            Some(&other_group),
+            other_at,
+        )
+        .await;
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(other_group),
+            event,
+        })
+        .await
+        .unwrap();
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued.iter().filter(|s| s.account_id() == &other_account) {
+        relay
+            .send_eose(&endpoint, subscription.subscription_id())
+            .await;
+    }
+    let other_ticket = timeout(Duration::from_secs(1), async {
+        loop {
+            let status = other.replay_admission().await;
+            if !status.pending && status.fence_held_since(0) == Some(other_at) {
+                break status.fence_ticket();
+            }
+            drop(status);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second account must admit its own counted boundary");
+    // Both accounts have the same MLS group id, separate routing ids and
+    // their own genuine counted boundaries. The adapter-wide ticket clock
+    // makes B's plan capable of answering A's older hold if it is misrouted.
+    // Answer only the second owner.
+    other
+        .fence_replay(&ReplayFencePlan {
+            ticket: other_ticket,
+            fences: Vec::new(),
+        })
+        .await;
+    assert_eq!(
+        adapter.replay_admission().await.fence_held_since(0),
+        Some(created_at)
+    );
+    assert!(
+        adapter.try_receive_account_delivery().is_none(),
+        "the other account's plan must not release this frame"
+    );
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        Some(created_at + CURSOR_LOOKBACK)
+    );
+    let Some(AccountDeliveryReceive::Delivery(other_delivery)) =
+        timeout(Duration::from_secs(1), other.receive_account_delivery())
+            .await
+            .expect("the second account's own plan releases its frame")
+            .unwrap()
+    else {
+        panic!("expected the second held frame");
+    };
+    assert_eq!(other_delivery.message.timestamp.0, other_at);
+    other.release_account_delivery(&other_delivery.message.id);
+
     adapter
         .fence_replay(&ReplayFencePlan {
             ticket,
