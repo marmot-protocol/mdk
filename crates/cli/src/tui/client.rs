@@ -2275,14 +2275,14 @@ impl TuiApp {
             self.group_diagnostics = None;
         }
         self.loading_chat = Some((account_id.clone(), group_id.clone(), generation));
-        self.status = LOADING_TIMELINE_STATUS.to_owned();
         // The account-wide feed belongs to the adopted live account even if
         // this group's page fails. Same-account loads reuse its existing child.
-        if self.daemon.running
-            && let Err(err) = self.ensure_message_subscription(&account_id)
-        {
-            self.status = format!("message subscription failed: {err}");
+        // Acquisition is provisional here: the fold retries and reports its
+        // final outcome, so this attempt must not replace the request's claim.
+        if self.daemon.running {
+            let _ = self.ensure_message_subscription(&account_id);
         }
+        self.status = LOADING_TIMELINE_STATUS.to_owned();
         self.effects.enqueue(Effect::LoadTimeline {
             account: account_id,
             group: group_id,
@@ -2773,7 +2773,7 @@ impl TuiApp {
             return;
         }
         if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
-            self.status = format!("chat subscription failed: {err}");
+            self.set_drain_status(format!("chat subscription failed: {err}"));
         }
     }
 
@@ -2787,7 +2787,7 @@ impl TuiApp {
             return;
         }
         if let Err(err) = self.ensure_message_subscription(&account.account_id) {
-            self.status = format!("message subscription failed: {err}");
+            self.set_drain_status(format!("message subscription failed: {err}"));
         }
     }
 
@@ -2805,7 +2805,7 @@ impl TuiApp {
             return;
         };
         if let Err(err) = self.ensure_group_state_subscription(&account.account_id, &group_id) {
-            self.status = format!("group state subscription failed: {err}");
+            self.set_drain_status(format!("group state subscription failed: {err}"));
         }
     }
 
@@ -2821,7 +2821,7 @@ impl TuiApp {
             return;
         };
         if let Err(err) = self.ensure_timeline_subscription(&account_id, &group_id) {
-            self.status = format!("timeline subscription failed: {err}");
+            self.set_drain_status(format!("timeline subscription failed: {err}"));
         }
     }
 
@@ -2838,7 +2838,7 @@ impl TuiApp {
             return;
         }
         if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
-            self.status = format!("notification subscription failed: {err}");
+            self.set_drain_status(format!("notification subscription failed: {err}"));
         }
     }
 
@@ -2846,9 +2846,12 @@ impl TuiApp {
     /// view is showing. On the login/account-select screen the status line
     /// carries the nsec prompt and picker guidance; a live drain (a picker
     /// reached via `A` keeps its subscriptions running) must apply its state
-    /// changes without clobbering that prompt.
+    /// changes without clobbering that prompt. An active timeline load also
+    /// retains its provisional claim until completion or a newer command/prompt.
     pub(crate) fn set_drain_status(&mut self, status: String) {
-        if self.screen == Screen::Main {
+        if self.screen == Screen::Main
+            && !(self.loading_chat.is_some() && self.status == LOADING_TIMELINE_STATUS)
+        {
             self.status = status;
         }
     }

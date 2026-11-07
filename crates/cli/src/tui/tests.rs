@@ -16610,6 +16610,135 @@ fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
             }
         }
     }
+    // Ambient drains and a provisional acquisition failure belong to this
+    // request; neither is a newer command or prompt that can own its feedback.
+    let mut observed = Vec::new();
+    for origin in ["chat-update", "dispatch-error"] {
+        for outcome in ["success", "page-error", "subscription-error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut page_gate = TestCommandGate::new(dir.path());
+            let chat_dir = dir.path().join("chat");
+            std::fs::create_dir(&chat_dir).unwrap();
+            let mut chat_gate = TestCommandGate::new(&chat_dir);
+            let page = if outcome == "page-error" {
+                serde_json::json!({"ok":false,"error":{"message":"timeline offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"loaded-row","direction":"received","from":"peer",
+                    "plaintext":"loaded page body","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            let chat = serde_json::json!({"ok":true,"result":{
+                "type":"chat","chat":{"group_id":group,
+                    "profile":{"name":"Changed room"},"unread_count":3}
+            }});
+            let exe = dir.path().join("wn-status");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}'\n;;\n\
+                 *' chats subscribe '*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60;;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    page_gate.script(),
+                    chat_gate.script(),
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe: exe.clone(),
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = true;
+            app.chats = vec![flick_chat(&group, "Room")];
+            if origin == "chat-update" {
+                app.ensure_chat_subscription(&account).unwrap();
+                chat_gate.wait_until_entered();
+            } else {
+                // The real FIFO worker already owns its valid client clone.
+                // Only the foreground acquisition encounters a missing child.
+                app.client.exe = dir.path().join("unavailable-wn");
+            }
+            app.refresh_messages().unwrap();
+            page_gate.wait_until_entered();
+            assert!(
+                app.loading_chat.is_some(),
+                "dispatch returned before release"
+            );
+            let dispatch_status = app.status.clone();
+            if origin == "dispatch-error" {
+                assert!(
+                    app.message_subscription.is_none(),
+                    "initial feed spawn failed"
+                );
+            }
+            if origin == "chat-update" {
+                if outcome == "subscription-error" {
+                    // The chat drain also tries a real group-feed acquisition.
+                    app.client.exe = dir.path().join("unavailable-wn");
+                }
+                chat_gate.release();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.chats[0].name != "Changed room" {
+                    assert!(Instant::now() < deadline, "chat child update did not drain");
+                    app.tick();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(app.chats[0].projection.unread_count, 3);
+                assert!(app.loading_chat.is_some(), "chat update preceded page fold");
+            }
+            let pending_status = app.status.clone();
+            app.client.exe = if outcome == "subscription-error" {
+                dir.path().join("unavailable-wn")
+            } else {
+                exe
+            };
+            page_gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.loading_chat.is_some() {
+                assert!(Instant::now() < deadline, "page child did not fold on tick");
+                app.tick();
+                thread::sleep(Duration::from_millis(1));
+            }
+            finish_queued_effects(&mut app);
+            finish_queued_effects(&mut app);
+            let feedback = match outcome {
+                "success" => "loaded 1 message(s)",
+                "page-error" => "error: timeline offline",
+                "subscription-error" if origin == "dispatch-error" => {
+                    "message subscription failed: "
+                }
+                "subscription-error" => "timeline subscription failed: ",
+                _ => unreachable!(),
+            };
+            let rows_folded = if outcome == "page-error" {
+                app.timeline.is_empty() && app.messages_group_id.is_none()
+            } else {
+                timeline_ids(&app.timeline) == vec!["loaded-row"]
+                    && app.messages_account_id.as_deref() == Some(account.as_str())
+                    && app.messages_group_id.as_deref() == Some(group.as_str())
+            };
+            let visible = rendered_buffer(&mut app).contains(feedback.trim());
+            let healed = origin != "dispatch-error"
+                || outcome != "success"
+                || app.message_subscription.is_some();
+            observed.push((
+                origin,
+                outcome,
+                dispatch_status,
+                pending_status,
+                app.status.clone(),
+                rows_folded && healed && visible && app.status.starts_with(feedback),
+            ));
+        }
+    }
+    assert!(
+        observed.iter().all(|row| row.5),
+        "ambient updates and this request's acquisition must preserve completion feedback: {observed:?}"
+    );
 }
 
 #[cfg(unix)]

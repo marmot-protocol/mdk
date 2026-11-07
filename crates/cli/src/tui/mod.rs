@@ -102,12 +102,15 @@ const TUI_CHAT_PREVIEW_LIMIT: usize = 48;
 /// keeps the title tidy and bounded independent of the pane width.
 const MESSAGES_TITLE_NAME_LIMIT: usize = 32;
 
+/// The provisional status owned by an in-flight timeline request. Ambient
+/// drains preserve it; a newer command or prompt can replace it.
+const LOADING_TIMELINE_STATUS: &str = "loading chat...";
+
 /// The in-flight status shown while a group-detail load runs off the event loop,
 /// matching the `sending...`/`loading chat...`/`searching...` in-flight
 /// vocabulary. The fold clears it on settle, and leaving mid-load resets it, both
 /// guarded on this exact value so a more relevant status (e.g. a mutation's
 /// confirmation) is never clobbered.
-const LOADING_TIMELINE_STATUS: &str = "loading chat...";
 const LOADING_GROUP_DETAIL_STATUS: &str = "loading group detail...";
 
 /// The in-flight status shown while the launch daemon auto-start runs off the
