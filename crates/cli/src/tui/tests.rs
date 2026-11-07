@@ -7460,9 +7460,9 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     assert_eq!(
                         loading_on_completion
                             .as_ref()
-                            .map(|(_, group)| group.as_str()),
+                            .map(|(account, group)| (account.as_str(), group.as_str())),
                         (same_pane && selection_matches && completion == "without-id")
-                            .then_some(group.as_str()),
+                            .then_some((account_a.as_str(), group.as_str())),
                         "only a matching-pane no-ID completion may reload the timeline"
                     );
                     assert_eq!(
@@ -14051,76 +14051,122 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
     let account_a = "aa".repeat(32);
     let account_b = "bb".repeat(32);
     let group = "cc".repeat(16);
-    let mut app = test_tui_app(test_unused_client(), &account_a);
-    app.daemon.running = false;
-    app.accounts.push(AccountRow {
-        account_id: account_b.clone(),
-        npub: "npub1bob".into(),
-        display_name: None,
-        local_signing: true,
-    });
-    app.chats = vec![flick_chat(&group, "shared")];
-    app.chats_account_id = Some(account_a.clone());
-    app.messages_account_id = Some(account_a.clone());
-    app.messages_group_id = Some(group.clone());
-    app.timeline = vec![timeline_row("old-account-row", 1)];
-    app.refresh_messages().expect("reload A");
+    let other_group = "ee".repeat(16);
+    for changes_account in [false, true] {
+        let target_account = if changes_account {
+            &account_b
+        } else {
+            &account_a
+        };
+        let target_group = if changes_account {
+            &group
+        } else {
+            &other_group
+        };
+        let mut app = test_tui_app(test_unused_client(), &account_a);
+        app.daemon.running = false;
+        app.accounts.push(AccountRow {
+            account_id: account_b.clone(),
+            npub: "npub1bob".into(),
+            display_name: None,
+            local_signing: true,
+        });
+        app.chats = vec![
+            flick_chat(&group, "shared"),
+            flick_chat(&other_group, "other"),
+        ];
+        app.chats_account_id = Some(account_a.clone());
+        app.messages_account_id = Some(account_a.clone());
+        app.messages_group_id = Some(group.clone());
+        app.timeline = vec![timeline_row("old-account-row", 1)];
+        let (tx, rx) = mpsc::channel();
+        app.message_subscription = Some(MessageSubscription {
+            account_id: account_a.clone(),
+            child: test_sleep_child(),
+            rx,
+        });
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type":"agent_stream_delta","agent_stream_delta":{
+                "group_id":group,"stream_id":"dd".repeat(32),"text":"initial account stream"
+            }
+        })))
+        .unwrap();
+        assert!(app.drain_message_subscription());
+        app.refresh_messages().expect("reload A");
+        assert_eq!(timeline_ids(&app.timeline), vec!["old-account-row"]);
+        assert!(rendered_buffer(&mut app).contains("initial account stream"));
 
-    app.selected_account = 1;
-    app.chats_account_id = Some(account_b.clone());
-    app.refresh_messages().expect("open the same group as B");
-    let pending_action_account = match app
-        .resolve_send_message("pending B message".to_owned())
-        .unwrap()
-    {
-        Effect::SendMessage {
-            account,
-            group: target,
-            ..
-        } => {
-            assert_eq!(target, group);
-            account
-        }
-        _ => panic!("send resolved the wrong effect"),
-    };
-    let pending_rows = timeline_ids(&app.timeline)
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    app.apply_effect_done(EffectDone {
-        effect: Effect::LoadTimeline {
-            account: account_a,
-            group: group.clone(),
-        },
-        result: Ok(vec![serde_json::json!({"messages":[]})]),
-    });
-    let pending_survives_old_result = app.loading_chat.is_some();
-    app.apply_effect_done(EffectDone {
-        effect: Effect::LoadTimeline {
-            account: account_b.clone(),
-            group,
-        },
-        result: Ok(vec![serde_json::json!({"messages":[{
-            "message_id":"new-account-row","direction":"received","from":"peer",
-            "plaintext":"B timeline","timeline_at":2,"received_at":2
-        }],"has_more_before":false})]),
-    });
-    assert_eq!(
-        (
-            pending_action_account,
-            pending_rows,
-            pending_survives_old_result,
-            timeline_ids(&app.timeline),
-            app.messages_account_id.clone()
-        ),
-        (
-            account_b.clone(),
-            Vec::<String>::new(),
-            true,
-            vec!["new-account-row"],
-            Some(account_b)
-        ),
-    );
+        app.selected_account = usize::from(changes_account);
+        app.selected_chat = usize::from(!changes_account);
+        app.chats_account_id = Some(target_account.clone());
+        app.refresh_messages().expect("open the selected owner");
+        // A second load can start before the first page returns. Its pending
+        // owner must keep the same-account feed alive while the pane is empty.
+        app.refresh_messages().expect("reload the pending owner");
+        let pending_action_account =
+            match app.resolve_send_message("pending message".into()).unwrap() {
+                Effect::SendMessage {
+                    account,
+                    group: target,
+                    ..
+                } => {
+                    assert_eq!(&target, target_group);
+                    account
+                }
+                _ => panic!("send resolved the wrong effect"),
+            };
+        let pending_rows = timeline_ids(&app.timeline)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // The account-wide feed must survive a group change within A, while
+        // opening B must disconnect A before its next delta can contaminate B.
+        let outgoing_feed_closed = tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type":"agent_stream_delta","agent_stream_delta":{
+                "group_id":target_group,"stream_id":"ff".repeat(32),"text":"outgoing account stream"
+            }
+        }))).is_err();
+        app.drain_message_subscription();
+        app.apply_effect_done(EffectDone {
+            effect: Effect::LoadTimeline {
+                account: account_a.clone(),
+                group: group.clone(),
+            },
+            result: Ok(vec![serde_json::json!({"messages":[]})]),
+        });
+        let pending_survives_old_result = app.loading_chat.is_some();
+        app.apply_effect_done(EffectDone {
+            effect: Effect::LoadTimeline {
+                account: target_account.clone(),
+                group: target_group.clone(),
+            },
+            result: Ok(vec![serde_json::json!({"messages":[{
+                "message_id":"new-owner-row","direction":"received","from":"peer",
+                "plaintext":"selected timeline","timeline_at":2,"received_at":2
+            }],"has_more_before":false})]),
+        });
+        let outgoing_preview_visible = rendered_buffer(&mut app).contains("account stream");
+        assert_eq!(
+            (
+                pending_action_account,
+                pending_rows,
+                pending_survives_old_result,
+                timeline_ids(&app.timeline),
+                app.messages_account_id.clone(),
+                outgoing_feed_closed,
+                outgoing_preview_visible
+            ),
+            (
+                target_account.clone(),
+                Vec::<String>::new(),
+                true,
+                vec!["new-owner-row"],
+                Some(target_account.clone()),
+                changes_account,
+                !changes_account
+            ),
+        );
+    }
 }
 
 #[test]

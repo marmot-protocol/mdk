@@ -2252,6 +2252,27 @@ impl TuiApp {
     pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
         // Any explicit or fired load supersedes a pending flick-through preview.
         self.flick_countdown = None;
+        let previous_account = self
+            .messages_account_id
+            .as_deref()
+            .or_else(|| {
+                self.message_subscription
+                    .as_ref()
+                    .map(|subscription| subscription.account_id.as_str())
+            })
+            .or_else(|| {
+                self.loading_chat
+                    .as_ref()
+                    .map(|(account, _)| account.as_str())
+            });
+        let account_changed = previous_account != Some(account_id.as_str());
+        if account_changed {
+            // The plain feed and its previews are account-wide. Keep them on
+            // same-account chat changes, and disconnect the old owner before
+            // it can append previews while the new account's page loads.
+            self.message_subscription = None;
+            self.live_stream_previews.clear();
+        }
         if self.messages_account_id.as_deref() != Some(account_id.as_str())
             || self.messages_group_id.as_deref() != Some(group_id.as_str())
         {
