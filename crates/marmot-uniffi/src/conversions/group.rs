@@ -939,6 +939,8 @@ mod group_state_tests {
             unrecoverable: lifecycle_state == AppGroupLifecycleState::Unrecoverable,
             convergence_parked: false,
             required_app_components: vec![
+                cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
+                cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
                 cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
                 cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID,
             ],
