@@ -3206,6 +3206,7 @@ async fn slow_preparation_normalizes_bounded_slices_before_peeling() {
 #[tokio::test]
 async fn deferred_account_reconstruction_retries_after_partial_scan_failure() {
     use cgka_traits::ingest::InboundResourceLimit;
+    use cgka_traits::message::StoredMessagePayload;
 
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let scan_fault = DeferredUsageReadFault::default();
@@ -3269,11 +3270,6 @@ async fn deferred_account_reconstruction_retries_after_partial_scan_failure() {
     drop(engine);
     let mut rebuilt = build();
     rebuilt.hydrate_all_stored_groups().unwrap();
-    rebuilt.set_deferred_peel_limits_for_tests(
-        512,
-        usize::MAX,
-        retained.iter().map(|row| row.payload.len()).sum(),
-    );
     // The backend's returned order only places the fault; its arm requires a
     // completed nonempty read first and makes no generic listing-order promise.
     let groups = storage.list_groups().unwrap();
@@ -3289,6 +3285,12 @@ async fn deferred_account_reconstruction_retries_after_partial_scan_failure() {
             transport_group_id: groups[0].as_slice().to_vec(),
         },
     };
+    let encoded_incoming = StoredMessagePayload::raw_transport(incoming.clone())
+        .encode()
+        .unwrap();
+    let retained_bytes: usize = retained.iter().map(|row| row.payload.len()).sum();
+    let required_bytes = retained_bytes + encoded_incoming.len();
+    rebuilt.set_deferred_peel_limits_for_tests(512, usize::MAX, required_bytes - 1);
     let failed = rebuilt.ingest(incoming.clone()).await;
     assert!(
         matches!(
@@ -3328,6 +3330,24 @@ async fn deferred_account_reconstruction_retries_after_partial_scan_failure() {
             .deferred_peel_account_byte_capacity_refusals,
         1
     );
+
+    // Raising the limit does not rebuild or clear the usage cache. The same
+    // object now fits exactly, so both under-counting and over-counting fail.
+    rebuilt.set_deferred_peel_limits_for_tests(512, usize::MAX, required_bytes);
+    assert!(
+        matches!(
+            rebuilt.ingest(incoming.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "the same input must fit at the exact complete-account byte boundary"
+    );
+    let admitted = storage.get_message(&incoming.id).unwrap();
+    assert_eq!(admitted.state, MessageState::PeelDeferred);
+    assert_eq!(admitted.group_id, groups[0]);
+    assert_eq!(admitted.payload, encoded_incoming);
+    for row in &retained {
+        assert_eq!(&storage.get_message(&row.id).unwrap(), row);
+    }
 }
 
 /// Due rows spend the one progress allowance on release, rather than being
