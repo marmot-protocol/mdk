@@ -158,7 +158,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
     write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
     (mdk#2694), and a queued `NoChange` whose retirement fails waits for the next drain while the pass keeps what it
-    prepared (mdk#2842). `record_write_atomicity/convergence_pass_retry.rs`: a
+    prepared (mdk#2842). `a_failed_retryable_transition_keeps_the_row_and_its_account_capacity` owns a rejected
+    `Retryable` write after a peeler fault retaining the row and its charged account capacity;
+    `deferred_release_keeps_refusal_when_group_lookup_is_unavailable` owns an unavailable group lookup preserving
+    the release refusal while freeing the row (mdk#3176, mdk#3179). Normal old-copy release stays in
+    `epoch_sealed_transport.rs`, and eventual peeler-fault recovery stays in `deferred_peel_lifecycle.rs`.
+    `record_write_atomicity/convergence_pass_retry.rs`: a
     frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit or a
     current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
     application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit

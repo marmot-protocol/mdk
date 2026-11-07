@@ -3663,12 +3663,13 @@ fn opaque_row(label: &[u8], group_id: &GroupId) -> TransportMessage {
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
 async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pass() {
-    for case in [
-        DeferredRetirementCase::Terminal,
-        DeferredRetirementCase::RetryableWrite,
-    ] {
-        assert_deferred_retirement(case).await;
-    }
+    assert_deferred_retirement(DeferredRetirementCase::Terminal).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn a_failed_retryable_transition_keeps_the_row_and_its_account_capacity() {
+    assert_deferred_retirement(DeferredRetirementCase::RetryableWrite).await;
 }
 
 #[tokio::test]
