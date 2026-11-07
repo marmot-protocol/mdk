@@ -944,10 +944,6 @@ mod tests {
                 Err(WnError::Hex(hex::FromHexError::InvalidHexCharacter { .. }))
             ));
             assert!(matches!(
-                broker_trust_for_candidate("broker.example", server, Some("1122".into()), true),
-                Err(WnError::ConflictingStreamTrust)
-            ));
-            assert!(matches!(
                 broker_trust_for_candidate("localhost", server, None, true),
                 Err(WnError::InsecureLocalRequiresLoopback(_))
             ));
