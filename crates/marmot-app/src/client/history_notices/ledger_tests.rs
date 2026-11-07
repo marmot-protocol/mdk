@@ -1,5 +1,5 @@
-//! Ledger-parked routes as notices, and the account's recovery status, behind
-//! the internal `runner_owns_debt` gate (mdk#2660 phase 4): a parked group
+//! Ledger-parked routes as notices, and the account's recovery status
+//! (mdk#2660 phase 4): a parked group
 //! route is a notice in that group's status, an inbox park only in the
 //! account's list, a remainder only once nothing on its route catches up,
 //! and dismissal retires the park, each shown and dismissed notice audited.
