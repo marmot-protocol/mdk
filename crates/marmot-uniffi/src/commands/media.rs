@@ -262,3 +262,26 @@ fn media_reference_error(error: marmot_app::AppError) -> MarmotKitError {
         other => other.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_boundary_remaps_payload_validation_and_preserves_typed_fences() {
+        assert!(matches!(
+            media_reference_error(marmot_app::AppError::InvalidAppMessagePayload("invalid media profile marker".into())),
+            MarmotKitError::InvalidMediaReference {details} if details == "invalid media profile marker"
+        ));
+        assert!(matches!(
+            media_reference_error(marmot_app::AppError::MediaReferenceStaleEpoch {
+                source_epoch: 7,
+                current_epoch: 11
+            }),
+            MarmotKitError::MediaReferenceStaleEpoch {
+                source_epoch: 7,
+                current_epoch: 11
+            }
+        ));
+    }
+}

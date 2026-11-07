@@ -214,13 +214,63 @@ impl Marmot {
                 &group_id_from_hex(&group_id_hex)?,
                 &client_token,
             )?
-            .map(|status| match status {
-                marmot_app::LocalSendStatus::Queued => LocalSendStatusFfi::Queued,
-                marmot_app::LocalSendStatus::EngineOwned => LocalSendStatusFfi::EngineOwned,
-                marmot_app::LocalSendStatus::Completed(summary) => LocalSendStatusFfi::Completed {
-                    summary: summary.into(),
-                },
-                marmot_app::LocalSendStatus::Rejected => LocalSendStatusFfi::Rejected,
-            }))
+            .map(local_send_status_ffi))
+    }
+}
+
+fn local_send_status_ffi(status: marmot_app::LocalSendStatus) -> LocalSendStatusFfi {
+    match status {
+        marmot_app::LocalSendStatus::Queued => LocalSendStatusFfi::Queued,
+        marmot_app::LocalSendStatus::EngineOwned => LocalSendStatusFfi::EngineOwned,
+        marmot_app::LocalSendStatus::Completed(summary) => LocalSendStatusFfi::Completed {
+            summary: summary.into(),
+        },
+        marmot_app::LocalSendStatus::Rejected => LocalSendStatusFfi::Rejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_send_status_preserves_the_host_tag_and_completed_summary() {
+        assert!(matches!(
+            local_send_status_ffi(marmot_app::LocalSendStatus::Queued),
+            LocalSendStatusFfi::Queued
+        ));
+        assert!(matches!(
+            local_send_status_ffi(marmot_app::LocalSendStatus::EngineOwned),
+            LocalSendStatusFfi::EngineOwned
+        ));
+        assert!(matches!(
+            local_send_status_ffi(marmot_app::LocalSendStatus::Rejected),
+            LocalSendStatusFfi::Rejected
+        ));
+        let completed = local_send_status_ffi(marmot_app::LocalSendStatus::Completed(
+            marmot_app::SendSummary {
+                published: 3,
+                message_ids: vec!["first-local-message".into(), "second-local-message".into()],
+                accept_disposition: cgka_traits::SendAcceptDisposition::CompletionUnknown,
+                maintenance_disposition:
+                    cgka_traits::SendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+            },
+        ));
+        let LocalSendStatusFfi::Completed { summary } = completed else {
+            panic!("completed status lost its host tag")
+        };
+        assert_eq!(summary.published, 3);
+        assert_eq!(
+            summary.message_ids,
+            ["first-local-message", "second-local-message"]
+        );
+        assert!(matches!(
+            summary.accept_disposition,
+            SendAcceptDispositionFfi::CompletionUnknown
+        ));
+        assert!(matches!(
+            summary.maintenance_disposition,
+            SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable
+        ));
     }
 }
