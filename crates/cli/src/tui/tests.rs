@@ -8529,6 +8529,16 @@ fn group_detail_leave_confirms_before_the_authoritative_command() {
             );
             app.daemon.running = false;
             app.accounts[0].local_signing = local_signing;
+            app.accounts.insert(
+                0,
+                AccountRow {
+                    account_id: "cc".repeat(32),
+                    npub: "npubother".into(),
+                    display_name: None,
+                    local_signing: true,
+                },
+            );
+            app.selected_account = 1;
             app.chats = vec![flick_chat("other-group", "Other")];
             app.screen = Screen::GroupDetail;
             let admins = if is_admin {
@@ -8811,33 +8821,42 @@ fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
         (
             'R',
             " Renamed",
-            "groups rename g1 Ops Room Renamed",
+            &["groups", "rename", "g1", "Ops Room Renamed"][..],
             "renamed group; published=3",
         ),
         (
             'A',
-            "npubchosen",
-            "groups add-members g1 npubchosen",
+            "npubpasted",
+            &["groups", "add-members", "g1", "npubpasted"][..],
             "added member(s); published=3",
         ),
         (
             'x',
             "",
-            "groups remove-members g1 npubchosen",
+            &["groups", "remove-members", "g1", "npubchosen"][..],
             "removed member(s); published=3",
         ),
         (
             'P',
             "",
-            "groups promote g1 npubchosen",
+            &["groups", "promote", "g1", "npubchosen"][..],
             "promoted admin; published=3",
         ),
     ] {
         for local_signing in [true, false] {
             let dir = tempfile::tempdir().expect("tempdir");
-            let (exe, args_file) = test_appending_arg_executable(
-                dir.path(),
-                r#"{"ok":true,"result":{"published":3}}"#,
+            let exe = dir.path().join("wn-json");
+            let args_file = dir.path().join("recorded-args");
+            let response = r#"{"ok":true,"result":{"published":3}}"#;
+            // NULs separate arguments; an empty record separates calls. This
+            // keeps multiword names observable as one argument.
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nset -eu\nprintf '%s\\0' \"$@\" >> '{}'\nprintf '\\0' >> '{}'\ncat <<'JSON'\n{response}\nJSON\n",
+                    args_file.display(),
+                    args_file.display(),
+                ),
             );
             let account = "aa".repeat(32);
             let mut app = test_tui_app(
@@ -8909,10 +8928,10 @@ fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
             assert_eq!(app.loading_group_detail.as_deref(), Some("g1"));
             finish_queued_effects(&mut app);
             let recorded = std::fs::read_to_string(&args_file).expect("recorded calls");
-            assert_eq!(
-                recorded.lines().next(),
-                Some(format!("--json --account {account} {arguments}").as_str())
-            );
+            let primary: Vec<_> = recorded.split("\0\0").next().unwrap().split('\0').collect();
+            let mut expected = vec!["--json", "--account", account.as_str()];
+            expected.extend_from_slice(arguments);
+            assert_eq!(primary, expected);
         }
     }
 
@@ -13200,8 +13219,17 @@ fn profile_edit_publishes_only_the_selected_field() {
     ] {
         for local_signing in [true, false] {
             let tempdir = tempfile::tempdir().expect("tempdir");
-            let (exe, args_file) =
-                test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+            let exe = tempdir.path().join("wn-json");
+            let args_file = tempdir.path().join("recorded-args");
+            let response = r#"{"ok":true,"result":{}}"#;
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nset -eu\nprintf '%s\\0' \"$@\" >> '{}'\nprintf '\\0' >> '{}'\ncat <<'JSON'\n{response}\nJSON\n",
+                    args_file.display(),
+                    args_file.display(),
+                ),
+            );
             let account = "aa".repeat(32);
             let mut app = test_tui_app(
                 WnClient {
@@ -13227,6 +13255,15 @@ fn profile_edit_publishes_only_the_selected_field() {
                 npub: "npub1self".into(),
                 ..ProfileView::default()
             };
+            view.fields = [
+                "stored-name",
+                "stored-display",
+                "stored-about",
+                "stored-picture",
+                "stored-nip05",
+                "stored-lud16",
+            ]
+            .map(|value| Some(value.to_owned()));
             view.fields[index] = Some(value.to_owned());
             view.selected = index;
             app.profile_view = Some(view);
@@ -13252,15 +13289,23 @@ fn profile_edit_publishes_only_the_selected_field() {
             }
             assert_eq!(app.status, acknowledgement);
             let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
-            let updates: Vec<_> = recorded
-                .lines()
-                .filter(|line| line.contains("profile update"))
+            let updates: Vec<Vec<_>> = recorded
+                .split("\0\0")
+                .filter(|call| !call.is_empty())
+                .map(|call| call.split('\0').collect::<Vec<_>>())
+                .filter(|call| call.get(3) == Some(&"profile") && call.get(4) == Some(&"update"))
                 .collect();
             assert_eq!(
                 updates,
-                [format!(
-                    "--json --account {account} profile update {flag} {value}"
-                )]
+                [vec![
+                    "--json",
+                    "--account",
+                    account.as_str(),
+                    "profile",
+                    "update",
+                    flag,
+                    value
+                ]]
             );
         }
     }
