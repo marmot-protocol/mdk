@@ -4276,3 +4276,164 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
             .any(|event| matches!(event, GroupEvent::GroupStateChanged { .. }))
     );
 }
+
+/// The final joined-anchor write shares the native join's consumed keys,
+/// disposition, dedup, application output and maintenance transaction.
+#[tokio::test]
+async fn late_welcome_anchor_failure_restores_complete_join_across_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("late-welcome-anchor.sqlite");
+    let key = storage_sqlite::SqlCipherKey::raw([0x97; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap()
+    };
+    let mut alice = build(
+        b"late-anchor-alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut bob = build(b"late-anchor-bob", storage.clone());
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "late anchor join".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("expected Current founding")
+    };
+    let welcome = welcomes.remove(0);
+    let read_rows = || {
+        let observer = rusqlite::Connection::open(&database).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &observer,
+            &key,
+            storage_sqlite::SqlCipherHardening::live_cache(),
+        )
+        .unwrap();
+        let tables = observer.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+            .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = observer
+                    .prepare(&format!("SELECT * FROM \"{table}\""))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                rows.sort_by_cached_key(|row| format!("{row:?}"));
+                (table, rows)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = read_rows();
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &observer,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    observer
+        .execute_batch(
+            "CREATE TRIGGER fail_joined_anchor BEFORE INSERT ON cgka_group_snapshots
+         WHEN NEW.name = 'openmls-retained-anchor-1'
+          AND EXISTS(SELECT 1 FROM cgka_groups WHERE id = NEW.group_id AND epoch = 1)
+          AND EXISTS(SELECT 1 FROM cgka_messages WHERE group_id = NEW.group_id AND state = 2)
+          AND EXISTS(SELECT 1 FROM cgka_ingress_dedup)
+          AND EXISTS(SELECT 1 FROM pending_application_events WHERE group_id = NEW.group_id)
+         BEGIN SELECT RAISE(ABORT, 'late-welcome-anchor-fault'); END;",
+        )
+        .unwrap();
+    let failed = bob.join_welcome(welcome.clone()).await;
+    assert!(
+        matches!(&failed, Err(EngineError::Storage(StorageError::Backend(detail))) if detail.contains("late-welcome-anchor-fault")),
+        "final joined-anchor write must be the failing step: {failed:?}"
+    );
+    assert_eq!(
+        read_rows(),
+        before,
+        "late anchor failure left a partial native join"
+    );
+    assert!(bob.live_group_ids().unwrap().is_empty());
+    assert!(bob.drain_events().is_empty());
+    assert!(!storage.has_ingress_dedup_marker(&welcome.id).unwrap());
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    drop(bob);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    assert_eq!(
+        read_rows(),
+        before,
+        "failed join changed after encrypted reopen"
+    );
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let observer = rusqlite::Connection::open(&database).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &observer,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    observer
+        .execute_batch("DROP TRIGGER fail_joined_anchor")
+        .unwrap();
+    let mut reopened = build(b"late-anchor-bob", storage.clone());
+    assert_eq!(
+        reopened.join_welcome(welcome.clone()).await.unwrap(),
+        group_id
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
+    );
+    assert_eq!(reopened.members(&group_id).unwrap().len(), 2);
+    assert_eq!(
+        storage.get_message(&welcome.id).unwrap().state,
+        MessageState::Processed
+    );
+    assert!(storage.has_ingress_dedup_marker(&welcome.id).unwrap());
+    assert_eq!(reopened.drain_events().iter().filter(|event| matches!(event, GroupEvent::GroupJoined {group_id: joined, via_welcome, ..} if joined == &group_id && via_welcome == &welcome.id)).count(),1);
+    assert_eq!(storage.list_pending_application_events().unwrap().iter().filter(|event| matches!(event, GroupEvent::GroupJoined {group_id: joined, via_welcome, ..} if joined == &group_id && via_welcome == &welcome.id)).count(),1);
+    drop(reopened);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut restarted = build(b"late-anchor-bob", storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    assert_eq!(restarted.live_group_ids().unwrap(), vec![group_id.clone()]);
+    assert_eq!(
+        restarted.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
+    );
+    assert_eq!(storage.list_pending_application_events().unwrap().len(), 1);
+    assert!(matches!(
+        restarted.join_welcome(welcome).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
+}
