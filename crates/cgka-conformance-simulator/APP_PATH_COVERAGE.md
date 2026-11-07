@@ -111,11 +111,10 @@ Setup sends retry a `transport_closed` refusal, which happens while the sender's
 when the sender's own timeline lacks the message. The report counts those retries. The measured phase never retries:
 it counts failed status, send and live-send calls.
 
-`public_app_large_account_recovery_scorecard_runner_owns_debt` runs the same workload with bob's recovery runner
-owning history debt (`AppRuntimeHarness::new_with_relay_pair_owning_debt`). Its `scorecard.json` names the history
-owner. Both forms also record bob's history requests on each endpoint (`REQ` filters with `until`, and `NEG-OPEN`s,
-over his own connections, by verb and group kind, with history windows asked more than once) and bob's
-`account_recovery_status` at the end.
+Bob's recovery runner owns his history debt, and the run fails if a native backward pager supplied any of it.
+`scorecard.json` names the history owner. It also records bob's history requests on each endpoint (`REQ` filters
+with `until`, and `NEG-OPEN`s, over his own connections, by verb and group kind, with history windows asked more than
+once) and bob's `account_recovery_status` at the end.
 
 ## Recovery-runner proofs
 
@@ -129,15 +128,11 @@ debug events, captured in process; they carry aggregate fields only. A live mess
 succeeded, at least half the sends the interval allows must have been made, and none may fail; each has up to 60
 seconds after the last send to arrive.
 
-The frozen comparison driver sets `MDK_RECOVERY_PROOF_CONTROL=old-owner` only for the signed old-owner
-control. Its owed-history and upgrade runs stop waiting once history is visible, rather than waiting for a
-survey from the deliberately disabled runner. New-owner runs keep the fresh caught-up requirement. Both modes
-still collect exact history, live delivery and reconnect/wire evidence; runner-only assertions remain strict and
-expected old-owner contract failures are classified separately. Missing runner evidence never selects control mode.
+Old-owner comparisons run from the frozen old-owner build (623500b48), whose copy of these proofs carries its own
+control mode; this build has no old owner to compare.
 
-The runner-enabled proofs require both native backward-paging entry points off. Gate-off builds retain them
-as alternating controls. Bob's bounded window/by-id requests and aggregate runner work together witness the
-replacement: both native pager paths issue unlimited history-window REQs, which every runner-enabled proof
+The proofs require both native backward-paging entry points off. Bob's bounded window/by-id requests and aggregate
+runner work together witness that: both native pager paths issue unlimited history-window REQs, which every proof
 rejects. Live REQs have no `until`; runner slices and by-id fetches have limits with the published cap. The wire tap
 also records packed live group REQs through EOSE, including raw counts, so the fence proof waits for actual replies.
 
@@ -163,7 +158,7 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   close is separate from the first live epoch read after reopening and its elapsed time; the latter may already
   reflect recovery, or be null if unavailable. The report also records bounded by-id group
   requests separately from aggregate runner traces; traces alone do not identify a route. Both loops are selected
-  by the manual command below, or run either exact test name separately for alternating gate-on/control series.
+  by the manual command below, or run either exact test name separately, alternating with the frozen old-owner build.
 - `public_app_runner_finishes_five_thousand_owed_events` owes 5,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:
@@ -190,10 +185,6 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   owed/live message exactly once, zero native paging and the exact timeline after closing/reopening Bob. The
   adapter owner test advances a controlled clock past the former 30-second deadline; this journey checks the real
   wire, MLS and SQLite assembly. Failed journeys preserve their closed account roots and relay publications.
-- `public_app_runner_owns_debt_after_the_upgrade_conversion` starts Bob under the old owner with 2,000 owed events
-  and unanswered history, then reopens the same nightly-shaped account under the runner. It requires nonzero
-  per-cause conversion counts before the first pre-network `attempt_started` event, exact/live/caught-up results, and no native pages.
-  Storage owns the actual released0.14 schema116 fixtures; this journey owns real runtime upgrade integration.
 - `public_app_runner_fences_nonempty_reqs_but_not_empty_ones` has two restarts. In the first, a packed REQ containing
   both groups returns at least 30 raw events; the journey first checks that all 30 sent messages are on the relay.
   A restart asks from the saved cursor less the 120-second rebuild lookback, and only an ingested group event moves
@@ -216,8 +207,8 @@ Each run writes `report.json`, `history.json` (bob's history requests, routes by
 `runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids.
 The loop and owed-history reports also carry a report-only `bandwidth` block for each phase, read from the relay
 proxy over bob's own connections: bytes each way, and the `EVENT` frames and bytes the relays sent him, split by the
-shape of the `REQ` that carried them and with the history-request share summed. Both owners' runs record the same
-fields, so a gate-off control run gives the comparison:
+shape of the `REQ` that carried them and with the history-request share summed. The frozen old-owner build's runs
+record the same fields for comparison. Run them all with:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
@@ -229,12 +220,12 @@ Run these trace-capturing proofs with this filter or one exact test name per inv
 test processes. Do not combine them with other ignored tests in one cargo test process: another test may install
 the process-wide tracing subscriber first.
 
-The runner-enabled report-only large-account scorecard has its own command:
+The report-only large-account scorecard has its own command:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
 cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
-  public_app_large_account_recovery_scorecard_runner_owns_debt -- --exact --ignored --test-threads=1 --nocapture
+  public_app_large_account_recovery_scorecard -- --exact --ignored --test-threads=1 --nocapture
 ```
 
 ## First basic public journeys

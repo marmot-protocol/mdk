@@ -19863,19 +19863,7 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
     config: MarmotAppConfig,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
-    group_at_the_undecryptable_retention_cap_with_owner(dir, relay, config, filled_through, None)
-        .await
-}
-
-async fn group_at_the_undecryptable_retention_cap_with_owner(
-    dir: &tempfile::TempDir,
-    relay: &Arc<ScriptedPushRelayClient>,
-    config: MarmotAppConfig,
-    filled_through: u64,
-    owner: Option<bool>,
-) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
-    let (app, mut client, route) =
-        undecryptable_probe_route_with_owner(dir, relay, config, owner).await;
+    let (app, mut client, route) = undecryptable_probe_route(dir, relay, config).await;
     for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
         client
             .ingest_received_delivery(route.probe(filled_through, &format!("cap-fill-{row}")))
@@ -19898,16 +19886,6 @@ pub(crate) async fn undecryptable_probe_route(
     relay: &Arc<ScriptedPushRelayClient>,
     config: MarmotAppConfig,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
-    undecryptable_probe_route_with_owner(dir, relay, config, None).await
-}
-
-/// The same real fixture, with an explicit owner only for legacy grant tests.
-pub(crate) async fn undecryptable_probe_route_with_owner(
-    dir: &tempfile::TempDir,
-    relay: &Arc<ScriptedPushRelayClient>,
-    config: MarmotAppConfig,
-    owner: Option<bool>,
-) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
     let account_id_hex = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap()
@@ -19915,9 +19893,6 @@ pub(crate) async fn undecryptable_probe_route_with_owner(
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
             .with_test_relay_client(relay.clone());
-    if let Some(owns) = owner {
-        app = app.with_recovery_runner_ownership_for_test(owns);
-    }
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
     app.relay_plane =

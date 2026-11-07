@@ -1503,10 +1503,9 @@ async fn run_app_runtime_account_worker(
         .app
         .device_groups_enabled()
         .then(|| shared.backup_background_conditions.subscribe());
-    // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
-    // Spawned before the deferred commands replay, so a repair among them
-    // goes through it; its turns wait until a repair or the loop below
-    // serves them.
+    // The account's recovery runner (mdk#2660 phase 4). Spawned before the
+    // deferred commands replay, so a repair among them goes through it; its
+    // turns wait until a repair or the loop below serves them.
     let mut recovery_runner = client.spawn_recovery_runner().await;
     // What the runner's survey finds catching up; only a runner changes it.
     // Each client has its own, so a reconnect subscribes again.
@@ -4480,8 +4479,8 @@ struct AccountWorkerCommandContext<'a> {
     shared: &'a RuntimeSharedServices,
     media_http: &'a MediaHttpContext,
     scheduled_convergence: &'a mut ScheduledConvergence,
-    /// The account's recovery runner, behind the internal `runner_owns_debt`
-    /// gate: explicit repair serves its turns while it waits on it.
+    /// The account's recovery runner: explicit repair serves its turns while
+    /// it waits on it.
     recovery_runner: Option<&'a mut SpawnedRunner>,
 }
 
@@ -8557,7 +8556,6 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let group_id = client.create_group("history notices", &[]).await.unwrap();

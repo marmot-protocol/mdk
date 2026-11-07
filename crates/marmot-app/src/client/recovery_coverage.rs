@@ -571,9 +571,6 @@ impl AppClient {
     /// Account-local ownership is installed before even staging native input.
     /// The adapter rejects a late first switch; repeat setup is idempotent.
     pub(crate) async fn prepare_runner_ownership(&mut self) -> Result<(), AppError> {
-        if !self.app.recovery_runner_owns_debt() {
-            return Ok(());
-        }
         let prepared = self.prepare_runner_ownership_once().await;
         // Owed until a preparation succeeds: only then may the worker start
         // a runner it lacks, whatever else the refresh still owes.

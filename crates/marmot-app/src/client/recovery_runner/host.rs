@@ -1,6 +1,4 @@
-//! The account's runner host (mdk#2660 phase 4, PR 5a), dormant behind the
-//! internal `runner_owns_debt` gate
-//! ([`MarmotApp::recovery_runner_owns_debt`](crate::MarmotApp)).
+//! The account's runner host (mdk#2660 phase 4, PR 5a).
 //!
 //! Turns run on whoever owns the account's [`AppClient`]: the account worker
 //! serves them between its other arms ([`SpawnedRunner`]), and a directly
@@ -460,21 +458,17 @@ impl AppClient {
         }
     }
 
-    /// Spawn the account's runner, for the account worker to serve. Only
-    /// with the internal `runner_owns_debt` gate on.
-    /// Whether the worker starts a runner it lacks: the gate is on and no
-    /// failed ownership preparation is still owed. A failed one waits for the
+    /// Whether the worker starts a runner it lacks: no failed ownership
+    /// preparation is still owed. A failed one waits for the
     /// paced subscription-refresh retry to prepare again, so a persistent
     /// failure never spins the worker, and other work that refresh still owes
     /// never keeps the runner out.
     pub(crate) fn recovery_runner_due(&self) -> bool {
-        self.app.recovery_runner_owns_debt() && !self.runner_preparation_owed
+        !self.runner_preparation_owed
     }
 
+    /// Spawn the account's runner, for the account worker to serve.
     pub(crate) async fn spawn_recovery_runner(&mut self) -> Option<SpawnedRunner> {
-        if !self.app.recovery_runner_owns_debt() {
-            return None;
-        }
         if let Err(error) = self.prepare_runner_ownership().await {
             // The worker's existing subscription-refresh retry is paced. A
             // failed conversion or policy installation never starts a runner.
@@ -498,13 +492,10 @@ impl AppClient {
         })
     }
 
-    /// Give a directly owned client its in-place runner. Only with the
-    /// internal `runner_owns_debt` gate on.
+    /// Give a directly owned client its in-place runner.
     pub(crate) async fn seat_recovery_runner_in_place(&mut self) -> Result<(), crate::AppError> {
-        if self.app.recovery_runner_owns_debt() {
-            self.prepare_runner_ownership().await?;
-            self.seat_in_place().await;
-        }
+        self.prepare_runner_ownership().await?;
+        self.seat_in_place().await;
         Ok(())
     }
 
@@ -521,7 +512,7 @@ impl AppClient {
     ///
     /// A plain function boxes the pass: an unoptimized build gives every
     /// await of an inline pass its own stack slot, so a sync that never runs
-    /// one, gate off, would still pay for it.
+    /// one, a worker account's, would still pay for it.
     pub(crate) fn run_recovery_runner_pass(&mut self) -> ClientFuture<'_, Option<PassReport>> {
         Box::pin(async move {
             let mut seat = self.take_in_place_runner().await?;
@@ -619,8 +610,8 @@ impl AppClient {
 /// Where a client's runner lives.
 #[derive(Default)]
 pub(crate) enum RunnerSeat {
-    /// No in-place runner: the gate is off, or the account worker runs the
-    /// account's runner as its own task.
+    /// No in-place runner: the account worker runs the account's runner as
+    /// its own task, or the client has not seated one yet.
     #[default]
     Absent,
     /// A directly owned client's runner, run one pass at a time. Empty while

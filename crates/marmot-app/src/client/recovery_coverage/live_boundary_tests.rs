@@ -473,11 +473,11 @@ async fn a_tail_lapses_when_the_connection_changes_during_the_write() {
     }
 }
 
-/// With the adapter fencing, a counted group's live frames wait for the
-/// runner's answer: the group is held from the next EOSE, its new live
-/// boundary waits, so the gap since its last one stays owed, while the inbox
-/// REQ's boundary is written. Once the runner answers with no fence, the
-/// group's boundary is written too.
+/// A counted group's live frames wait for the runner's answer: after a
+/// reconnect the group is held from the EOSE, its new live boundary waits, so
+/// the gap since its last one stays owed, while the inbox REQ's boundary is
+/// written. Once the runner answers with no fence, the group's boundary is
+/// written too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fenced_groups_boundary_waits_for_the_runners_answer() {
     let mut fixture = fixture().await;
@@ -486,11 +486,13 @@ async fn a_fenced_groups_boundary_waits_for_the_runners_answer() {
     let group = group_route(&fixture);
     let first = live_until(&fixture, &group).expect("the first boundary");
     let read = fixture.client.recovery_runner_live_counts().await;
-    assert!(read.held.is_empty(), "nothing fences before it is enabled");
-    fixture.client.enable_live_fences().await;
+    assert!(
+        read.held.is_empty(),
+        "the fixture's runner answer released it"
+    );
     // The next request goes out in a later second, so a gap exists.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
-    reactivate(&mut fixture).await;
+    super::scenario_tests::reactivate_client(&mut fixture.client).await;
 
     let read = fixture.client.recovery_runner_live_counts().await;
     assert_eq!(read.held.iter().collect::<Vec<_>>(), [&group]);

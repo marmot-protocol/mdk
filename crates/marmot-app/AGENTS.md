@@ -697,12 +697,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   un-cover or drop debt. It logs aggregate counts only.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
-  fetch (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the internal `runner_owns_debt` gate off
-  through the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed.
-  With it off `prepare_runner_ownership` returns at once and nothing seats the runner: no conversion before
-  subscriptions, no `delegate_replay_recovery`, no live fences, so a full live reply still takes the adapter's clamp
-  paging. Notice, recovery status and post-join code no longer branch on the gate; the catching-up status stays empty
-  until a runner surveys. The old owner's grant, comparison job and off arms no longer exist.
+  fetch for every account; there is no other owner and no switch back. `prepare_runner_ownership` converts and
+  imports loss, installs `delegate_replay_recovery` and enables live fences before any subscription activates. A
+  counted live REQ is held until the runner answers it (`fence_live_frames`); test fixtures that need a caught-up
+  account answer it the same way. The catching-up status stays empty until a runner surveys.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
@@ -1101,7 +1099,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (native replay ingress and the recovery seams), `recovery_coverage.rs` (the
   coverage-ledger recorder, mdk#2660), `recovery_runner.rs` (the per-account recovery
-  runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
+  runner, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
   a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
   using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),

@@ -499,12 +499,6 @@ const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 *
 pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
-/// Account history belongs to the coverage-ledger recovery runner; the old
-/// owner is deleted (mdk#2660 phase 4). A test that turns the gate off skips
-/// ownership preparation and the runner: no conversion before subscriptions,
-/// no replay delegation, no live fences, so the adapter's clamp paging still
-/// runs.
-const RECOVERY_RUNNER_OWNS_DEBT: bool = true;
 /// Maximum amount the persisted transport cursor may run ahead of local
 /// wall-clock. The cursor is advanced from the inbound message timestamp, which
 /// is the sender-controlled Nostr `created_at` of the outer kind-445 event and
@@ -598,9 +592,6 @@ pub struct MarmotApp {
     relay_plane: MarmotRelayPlane,
     /// Each relay's NIP-11 caps for the history sweep; see [`Self::relay_caps`].
     relay_caps: relay_caps::RelayCapsCache,
-    /// The internal `runner_owns_debt` gate; see
-    /// [`Self::recovery_runner_owns_debt`].
-    recovery_runner_owns_debt: bool,
     /// See [`Self::with_unvouched_relay_replies_for_test`].
     #[cfg(any(test, feature = "test-support"))]
     unvouched_relay_replies: bool,
@@ -1643,27 +1634,6 @@ impl MarmotApp {
         self.config.cursor_persistence
     }
 
-    /// Run each account's history recovery runner (mdk#2660 phase 4): the
-    /// account worker spawns one per account and a directly owned client runs
-    /// one pass in place from `sync()` and `next_event()`. Internal and
-    /// unsupported: explicitly selects the production default for comparison
-    /// proofs. Not a host setting. Call it before cloning the app or building
-    /// a runtime from it.
-    #[doc(hidden)]
-    pub fn with_recovery_runner_owning_debt(mut self) -> Self {
-        self.recovery_runner_owns_debt = true;
-        self
-    }
-
-    /// Select the existing internal recovery owner for an upgrade/control
-    /// fixture. Only changes the value the production ownership paths read.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn with_recovery_runner_ownership_for_test(mut self, owns: bool) -> Self {
-        self.recovery_runner_owns_debt = owns;
-        self
-    }
-
     /// Treat every live reply this app's accounts read as one the account
     /// pool's wire tap could not vouch for, as from a relay that sends a
     /// frame the tap cannot attribute: an empty live count then proves
@@ -1685,12 +1655,6 @@ impl MarmotApp {
             return false;
         }
         true
-    }
-
-    /// The internal `runner_owns_debt` gate: whether the recovery runner runs
-    /// for this app's accounts.
-    pub(crate) fn recovery_runner_owns_debt(&self) -> bool {
-        self.recovery_runner_owns_debt
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
@@ -1777,7 +1741,6 @@ impl MarmotApp {
             relay_urls,
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
-            recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
             #[cfg(any(test, feature = "test-support"))]
             unvouched_relay_replies: false,
             config,
@@ -1896,7 +1859,6 @@ impl MarmotApp {
             account_home,
             relay_plane,
             relay_caps: relay_caps::RelayCapsCache::default(),
-            recovery_runner_owns_debt: RECOVERY_RUNNER_OWNS_DEBT,
             #[cfg(any(test, feature = "test-support"))]
             unvouched_relay_replies: false,
             config,
@@ -2070,8 +2032,7 @@ impl MarmotApp {
                 .await;
         }
         // Seated here, where the client is already held: in `client()` the
-        // extra await would copy the client through its stack, gate off or
-        // not.
+        // extra await would copy the client through its stack.
         client.seat_recovery_runner_in_place().await?;
         Ok(client)
     }

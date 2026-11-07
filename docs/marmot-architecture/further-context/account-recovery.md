@@ -796,11 +796,9 @@ leave staging in one transaction.
 ### 9. The recovery runner
 
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
-fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
-on. The old owner's grant, native capture and comparison job are deleted (5c2a846b4 is the last
-commit with them), and so are the gate's off arms. Until the gate goes, a test that turns it off
-skips ownership preparation and the runner: no conversion before subscriptions, no replay
-delegation, no live fences, so the adapter's clamp paging still runs. Before any
+fetches over the ledger and the retry state above, for every account. The old owner's grant,
+native capture, comparison job and the `runner_owns_debt` gate that chose between them are
+deleted (5c2a846b4 is the last commit with the old owner). Before any
 subscription activates, ownership preparation converts retained obligations and imports loss as
 ledger debt. Autonomous clamp continuation is disabled for app-owned accounts; ordinary native
 input, count facts and bounded fences remain. Supported
@@ -842,7 +840,7 @@ Units are served by class: held groups, then open conversation windows and the i
 rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
 route debt first, so a large group is served every round. The runner sleeps until a bump, a
 hint change, a relay reconnect or its earliest retry time. An explicit pass runs each due unit
-once in place within a budget, as a directly owned client's `sync()` does behind the gate.
+once in place within a budget, as a directly owned client's `sync()` does.
 Its starting values are convergence-ledger decision A19.
 
 The runner's inputs come from the account itself. A group with a conversation window open is
@@ -1002,8 +1000,8 @@ no owner can open them.
 The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
 never swept, admission takes its events as a group of their own and never fences them, and
 re-checks visit it as they do a group route. A relay that will not compare the inbox refuses
-its unit, which breaks and parks behind a notice, and keeps comparing groups. Explicit repair,
-behind the gate, is one request the account's runner owns. The runner takes it between its own
+its unit, which breaks and parks behind a notice, and keeps comparing groups. Explicit repair
+is one request the account's runner owns. The runner takes it between its own
 steps, with no quantum in flight, and in one turn widens every current route's goal to the
 retention floor and re-arms every unit. Passes then run within the repair's 60 s while the
 caller serves their turns. Cancelling, or the budget running out, stops the request: a quantum
@@ -1067,12 +1065,17 @@ the old owner):
   IncrementalHistory request at open, the gate-off coverage request seam, empty ledger notices
   and status, and the post-join maintenance subscriptions and history sessions a grant
   installed. Every account runs the runner's loss import, notices and post-join collection.
+- The `runner_owns_debt` gate itself, its test builders, and the simulator's old-owner seats,
+  control mode, scorecard variant and upgrade journey. Old-owner comparisons run from the frozen
+  old-owner build (623500b48). Conversion stays owned by the storage tests over released
+  fixtures and by a marmot-app reopen over a rewound conversion marker, which converts an old
+  queue loss before the runner's first attempt and has the runner cover it.
 
 Still to delete:
 
-- The gate itself and its test fixtures, and old-owner paths no current data reaches: the
-  comparison slot `request_bounded_comparison` still joins, qualified-stagnation escalation,
-  capacity-wait eligibility, and the storage and adapter APIs only the old owner called.
+- Old-owner paths no current data reaches: the comparison slot `request_bounded_comparison`
+  still joins, qualified-stagnation escalation, capacity-wait eligibility, legacy obligation
+  notices, and the storage and adapter APIs only the old owner called.
 - The adapter's native pager and `SubscriptionReplay` (row 8).
 - Most of the 16 real-relay qualification test files. They are replaced by the tests below.
 

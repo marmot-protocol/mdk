@@ -43,12 +43,11 @@ pub(in crate::client) async fn fixture() -> Fixture {
 /// [`fixture`], with the relay returning one stored event created at
 /// `stored` before each EOSE, or none.
 pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
-    fixture_on(vec![RELAY.into()], false, stored, None).await
+    fixture_on(vec![RELAY.into()], stored, None).await
 }
 
 pub(in crate::client) async fn fixture_on(
     relays: Vec<String>,
-    runner_owns_debt: bool,
     stored: Option<u64>,
     lookback: Option<std::time::Duration>,
 ) -> Fixture {
@@ -70,7 +69,6 @@ pub(in crate::client) async fn fixture_on(
         relay.clone(),
         app.config.allow_loopback_relay_endpoints,
     );
-    let app = app.with_recovery_runner_ownership_for_test(runner_owns_debt);
     *relay.stored_before_eose.lock().unwrap() = stored;
     let mut state = app.load_state("alice").unwrap();
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
@@ -87,10 +85,9 @@ pub(in crate::client) async fn fixture_on(
             if client
                 .recovery_owner
                 .native_replay_authorizes(observation.generation())
-                && (!client.app.recovery_runner_owns_debt()
-                    || observation
-                        .sources()
-                        .all(|source| source.endpoints().all(|endpoint| endpoint.admitted())))
+                && observation
+                    .sources()
+                    .all(|source| source.endpoints().all(|endpoint| endpoint.admitted()))
             {
                 break;
             }
@@ -100,6 +97,7 @@ pub(in crate::client) async fn fixture_on(
     })
     .await
     .expect("the scripted native windows reach owner admission");
+    release_held_live_frames(&client).await;
     let storage = app.account_storage("alice").unwrap();
     Fixture {
         _dir: dir,
@@ -108,6 +106,21 @@ pub(in crate::client) async fn fixture_on(
         storage,
         group,
     }
+}
+
+/// The runner's answer for an account with nothing owed behind its live
+/// window: every group the live counts hold is released with no fence, as
+/// the runner's fence turn does, and the boundaries that frees are recorded,
+/// as its next read of the live tails does. A counted live REQ is held until
+/// then.
+pub(in crate::client) async fn release_held_live_frames(client: &AppClient) {
+    let read = client.recovery_runner_live_counts().await;
+    if read.held.is_empty() {
+        return;
+    }
+    client.fence_live_frames(read.ticket, &[]).await;
+    let storage = client.app.account_storage(&client.state.label).unwrap();
+    client.record_native_coverage(&storage.app_storage()).await;
 }
 
 /// A second connection to the account's database, only to inject write
@@ -140,10 +153,12 @@ pub(in crate::client) fn clear_coverage_goals(client: &AppClient) {
         .unwrap();
 }
 
-/// Start the account's REQs again, as a reconnect does, and wait until the
-/// new generation's boundaries are admitted.
+/// Start the account's REQs again, as a reconnect does, wait until the new
+/// generation's boundaries are admitted, and answer as the runner does with
+/// nothing owed ([`release_held_live_frames`]).
 pub(super) async fn reactivate(fixture: &mut Fixture) {
     reactivate_client(&mut fixture.client).await;
+    release_held_live_frames(&fixture.client).await;
 }
 
 pub(in crate::client) async fn reactivate_client(client: &mut AppClient) {
@@ -155,10 +170,9 @@ pub(in crate::client) async fn reactivate_client(client: &mut AppClient) {
             if client
                 .recovery_owner
                 .native_replay_authorizes(observation.generation())
-                && (!client.app.recovery_runner_owns_debt()
-                    || observation
-                        .sources()
-                        .all(|source| source.endpoints().all(|endpoint| endpoint.admitted())))
+                && observation
+                    .sources()
+                    .all(|source| source.endpoints().all(|endpoint| endpoint.admitted()))
             {
                 break;
             }
@@ -591,7 +605,6 @@ async fn a_deferred_open_starts_the_goal_at_the_durable_welcome_floor() {
         relay: _relay,
     } = fixture_on(
         vec![RELAY.into()],
-        false,
         None,
         Some(std::time::Duration::from_secs(120)),
     )

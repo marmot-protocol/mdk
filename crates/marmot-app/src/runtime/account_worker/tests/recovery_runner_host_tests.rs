@@ -1,11 +1,9 @@
-//! The account worker runs its recovery runner only with the internal
-//! `runner_owns_debt` gate on: the runner spawns with the worker, serves the
-//! account's debt over its own relay pool, answers a pass, stops with
-//! `shutdown_and_close` even while a quantum waits on its relay, gives a
-//! preempted quantum's attempt back across a reconnect, serves an explicit
-//! repair, one queued during startup too, and announces what it catches up,
-//! across a reconnect too. With the gate off nothing spawns and nothing is
-//! announced.
+//! The account worker runs its recovery runner: the runner spawns with the
+//! worker, serves the account's debt over its own relay pool, answers a pass,
+//! stops with `shutdown_and_close` even while a quantum waits on its relay,
+//! gives a preempted quantum's attempt back across a reconnect, serves an
+//! explicit repair, one queued during startup too, and announces what it
+//! catches up, across a reconnect too.
 
 use super::*;
 use crate::runtime::account_worker::recovery_credits::{MAX_CONCURRENT_JOBS, available_credits};
@@ -82,10 +80,10 @@ impl QueryPolicy for HeldSweep {
 }
 
 /// One account with one group on `url`, whose route owes the last hour, and
-/// the runtime that serves it with the gate as given. Its relay replies are
+/// the runtime that serves it. Its relay replies are
 /// ones the wire tap cannot vouch for: the quiet group's own empty live REQs
 /// would otherwise prove the hour it owes.
-struct GatedWorker {
+struct RunnerWorker {
     _dir: tempfile::TempDir,
     app: MarmotApp,
     runtime: super::super::super::MarmotAppRuntime,
@@ -96,8 +94,8 @@ struct GatedWorker {
     credits: Arc<super::super::recovery_credits::RecoveryCreditPool>,
 }
 
-impl GatedWorker {
-    async fn start(url: &str, gate: bool) -> Self {
+impl RunnerWorker {
+    async fn start(url: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -141,9 +139,7 @@ impl GatedWorker {
                 crate::unix_now_seconds() - HOUR,
             )
             .unwrap();
-        let app = app
-            .with_recovery_runner_ownership_for_test(gate)
-            .with_unvouched_relay_replies_for_test();
+        let app = app.with_unvouched_relay_replies_for_test();
         let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
         let credits = runtime
             .shared_services()
@@ -220,43 +216,7 @@ impl GatedWorker {
     }
 }
 
-/// With the gate off the worker spawns no runner: a pass finds none, the
-/// group's owed hour is never served by one, lost history announces no
-/// recovery status, and the status shows nothing catching up.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_worker_spawns_no_runner_with_the_gate_off() {
-    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
-    let relay = LocalRelay::new(RelayBuilder::default());
-    relay.run().await.unwrap();
-    let url = relay.url().await.to_string();
-    let worker = GatedWorker::start(&url, false).await;
-    let mut events = worker.runtime.subscribe();
-    timeout(SETTLE, worker.runtime.catch_up_accounts())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(worker.pass().await.await.unwrap().is_none());
-    assert!(worker.served_at().is_none());
-    worker.lose_a_day();
-    assert!(worker.pass().await.await.unwrap().is_none());
-    assert_eq!(
-        worker
-            .runtime
-            .account_recovery_status(&worker.label)
-            .await
-            .unwrap(),
-        crate::AccountRecoveryStatus::default()
-    );
-    worker.runtime.shutdown_and_close().await.unwrap();
-    while let Ok(event) = events.try_recv() {
-        assert!(
-            !matches!(event, MarmotAppEvent::RecoveryStatusChanged { .. }),
-            "no status is announced with the gate off"
-        );
-    }
-}
-
-/// With the gate on the runner's survey is the account's recovery status:
+/// The runner's survey is the account's recovery status:
 /// lost history puts the group in it, announced once per change, and once
 /// served it leaves again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -268,7 +228,7 @@ async fn the_workers_runner_announces_what_it_catches_up() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
     timeout(SETTLE, worker.pass().await).await.unwrap().unwrap();
     let group_hex = worker.group_hex();
@@ -345,7 +305,7 @@ async fn a_reconnected_workers_runner_still_announces_what_it_catches_up() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
     timeout(SETTLE, worker.pass().await).await.unwrap().unwrap();
     let held = |count: usize| {
@@ -415,9 +375,9 @@ async fn a_reconnected_workers_runner_still_announces_what_it_catches_up() {
         .unwrap();
 }
 
-/// With the gate on an explicit repair runs through the worker's runner,
-/// which the worker keeps serving meanwhile: the retained window covered, it
-/// ends below it, as today.
+/// An explicit repair runs through the worker's runner, which the worker
+/// keeps serving meanwhile: the retained window covered, it ends below it, as
+/// today.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_workers_runner_serves_an_explicit_repair() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
@@ -425,7 +385,7 @@ async fn the_workers_runner_serves_an_explicit_repair() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
     let repaired = timeout(
         Duration::from_secs(90),
@@ -468,7 +428,7 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
     worker.runtime.shutdown_and_close().await.unwrap();
 
@@ -477,8 +437,7 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
         worker._dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    )
-    .with_recovery_runner_owning_debt();
+    );
     let storage = app.account_storage(&worker.label).unwrap().app_storage();
     let relay_url = storage
         .recovery_units()
@@ -572,9 +531,9 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-/// With the gate on the worker's runner serves the group's owed hour over the
-/// account's relay pool and answers a pass, and every credit it took is back
-/// once it has stopped.
+/// The worker's runner serves the group's owed hour over the account's relay
+/// pool and answers a pass, and every credit it took is back once it has
+/// stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_workers_runner_serves_debt_and_answers_a_pass() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
@@ -582,7 +541,7 @@ async fn the_workers_runner_serves_debt_and_answers_a_pass() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
     let report = timeout(SETTLE, worker.pass().await)
         .await
@@ -605,7 +564,7 @@ async fn shutdown_and_close_stops_the_runner_mid_quantum() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
 
     // Owe an earlier day, and ask for the pass that sweeps it into the hold.
@@ -657,7 +616,7 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let started = crate::unix_now_seconds();
-    let worker = GatedWorker::start(&url, true).await;
+    let worker = RunnerWorker::start(&url).await;
     worker.served_after(started).await;
     // A pass waits for the step in flight, so what the account owed at start
     // is served first.
@@ -760,8 +719,7 @@ async fn successive_group_joins_lose_nothing_and_catch_up() {
     let creator = home.create_account("creator").unwrap();
     let joiner = home.create_account("joiner").unwrap();
     let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
-    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config)
-        .with_recovery_runner_ownership_for_test(true);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
     crate::tests::remember_test_member_inbox(&app, &joiner.account_id_hex, &url);
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     let _credits = runtime
@@ -862,8 +820,7 @@ async fn a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins() {
     let creator = home.create_account("creator").unwrap();
     let joiner = home.create_account("joiner").unwrap();
     let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
-    let mut app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config)
-        .with_recovery_runner_ownership_for_test(true);
+    let mut app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
     app.relay_plane =
         crate::MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
     crate::tests::remember_test_member_inbox(&app, &joiner.account_id_hex, &url);

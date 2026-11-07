@@ -627,7 +627,6 @@ mod tests {
         // These tests own the legacy obligation-based notices; ledger notices
         // and runner status have their own real-boundary module below.
         MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
     }
 

@@ -24,34 +24,31 @@ use crate::{AccountRecoveryStatus, AppClient, HistoryNoticeCause, MarmotApp};
 const RELAY: &str = "wss://relay.example";
 const DAY: u64 = 24 * 60 * 60;
 
-fn app(dir: &tempfile::TempDir, gate: bool) -> MarmotApp {
+fn app(dir: &tempfile::TempDir) -> MarmotApp {
     crate::AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
-    let app = MarmotApp::with_relay(dir.path(), RELAY)
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    app.with_recovery_runner_ownership_for_test(gate)
+    MarmotApp::with_relay(dir.path(), RELAY)
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
 }
 
 /// One account with one group, its client opened directly, and the group's
 /// current route.
 async fn fixture(
     dir: &tempfile::TempDir,
-    gate: bool,
 ) -> (
     AppClient,
     SqliteAppStorage,
     GroupId,
     TransportReconciliationRoute,
 ) {
-    let (_, client, storage, group, route) = opened(app(dir, gate)).await;
+    let (_, client, storage, group, route) = opened(app(dir)).await;
     (client, storage, group, route)
 }
 
 /// [`fixture`] recording audit v5, with its app to read the rows back.
 async fn audited_fixture(
     dir: &tempfile::TempDir,
-    gate: bool,
 ) -> (
     MarmotApp,
     AppClient,
@@ -59,7 +56,7 @@ async fn audited_fixture(
     GroupId,
     TransportReconciliationRoute,
 ) {
-    let app = app(dir, gate);
+    let app = app(dir);
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
     opened(app).await
@@ -134,7 +131,7 @@ fn catching_up(client: &AppClient, units: &[&TransportReconciliationRoute]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parked_group_route_is_a_notice_in_its_groups_status_until_dismissed() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir, true).await;
+    let (mut client, app, group, route) = fixture(&dir).await;
     assert!(client.history_notices().unwrap().is_empty());
     client.take_history_notice_changes();
     park(&app, &route);
@@ -198,7 +195,7 @@ async fn a_parked_group_route_is_a_notice_in_its_groups_status_until_dismissed()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inbox_park_is_a_notice_in_the_account_list_only() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, _) = fixture(&dir, true).await;
+    let (mut client, app, group, _) = fixture(&dir).await;
     client.take_history_notice_changes();
     park(&app, &TransportReconciliationRoute::Inbox);
 
@@ -228,7 +225,7 @@ async fn an_inbox_park_is_a_notice_in_the_account_list_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ledger_notices_are_audited_when_shown_and_dismissed() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, mut client, storage, group, route) = audited_fixture(&dir, true).await;
+    let (app, mut client, storage, group, route) = audited_fixture(&dir).await;
     client.take_history_notice_changes();
     park(&storage, &route);
     park(&storage, &TransportReconciliationRoute::Inbox);
@@ -302,7 +299,7 @@ async fn ledger_notices_are_audited_when_shown_and_dismissed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remainder_is_a_notice_once_nothing_on_its_route_catches_up() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir, true).await;
+    let (mut client, app, group, route) = fixture(&dir).await;
     let now = crate::unix_now_seconds();
     app.widen_recovery_coverage_goals(std::slice::from_ref(&route), now - 2 * DAY)
         .unwrap();
@@ -341,7 +338,7 @@ async fn a_remainder_is_a_notice_once_nothing_on_its_route_catches_up() {
 async fn a_suspended_groups_park_and_remainder_are_no_notices() {
     use cgka_traits::storage::GroupStorage;
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir, true).await;
+    let (mut client, app, group, route) = fixture(&dir).await;
     let storage = client.app.account_storage("alice").unwrap();
     let suspend = |unrecoverable: bool| {
         let mut record = storage.get_group(&group).unwrap();
@@ -404,8 +401,7 @@ async fn a_park_on_a_relay_the_route_carries_only_as_best_effort_is_no_notice() 
             .with_open_ranking_provider(None, Vec::new())
             .with_recovery_operated_relays(vec![OPERATED.into()]),
     )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
-    .with_recovery_runner_owning_debt();
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client
         .create_group_with_options(
@@ -485,8 +481,7 @@ async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
             .with_open_ranking_provider(None, Vec::new())
             .with_recovery_operated_relays(vec![OPERATED.into()]),
     )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()))
-    .with_recovery_runner_owning_debt();
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client
         .create_group_with_options(
@@ -541,7 +536,7 @@ async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_status_reports_what_the_runner_catches_up() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir, true).await;
+    let (mut client, app, group, route) = fixture(&dir).await;
     assert_eq!(
         client.account_recovery_status().unwrap(),
         AccountRecoveryStatus::default(),
@@ -587,7 +582,7 @@ async fn the_status_reports_what_the_runner_catches_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_conversion_that_changed_the_notices_is_announced_once() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir, false).await;
+    let (mut client, app, group, route) = fixture(&dir).await;
     client.take_history_notice_changes();
     park(&app, &route);
     app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
@@ -623,7 +618,6 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
         .unwrap();
     drop(client);
     assert!(app.recovery_conversion_pending().unwrap());
-    let owner = owner.with_recovery_runner_ownership_for_test(true);
     let mut client = client_on_app_relay_plane(&owner, "alice").await;
     assert!(!app.recovery_conversion_pending().unwrap());
     assert!(app.recovery_conversion_notices_changed().unwrap());

@@ -1403,8 +1403,8 @@ impl AppClient {
                 return Err(state_persist(summary, error));
             }
         }
-        // Behind the internal `runner_owns_debt` gate, a directly owned client
-        // also runs its recovery runner in place for one pass (mdk#2660).
+        // A directly owned client also runs its recovery runner in place for
+        // one pass (mdk#2660).
         if explicit && self.has_in_place_recovery_runner() {
             summary = self.run_in_place_recovery_pass(summary).await?;
         }
@@ -2462,8 +2462,7 @@ impl AppClient {
                 // client has no worker, so its recovery job runs here.
                 transport_nostr::AccountDeliveryReceive::Overflow(_) => {
                     self.refresh_pending_recovery().await?;
-                    // Behind the internal `runner_owns_debt` gate, its
-                    // recovery runner runs one pass here (mdk#2660).
+                    // Its recovery runner runs one pass here (mdk#2660).
                     if self.has_in_place_recovery_runner() {
                         self.run_recovery_runner_pass().await;
                         self.take_pending_applied_sync_summary()
@@ -4562,9 +4561,8 @@ impl AppClient {
         self.repair_full_history_cancellable(&|| false, None).await
     }
 
-    /// Explicit repair. Behind the internal `runner_owns_debt` gate it runs
-    /// through the account's runner, `spawned` for a worker account
-    /// (mdk#2660 phase 4).
+    /// Explicit repair. It runs through the account's runner, `spawned` for a
+    /// worker account (mdk#2660 phase 4).
     pub(crate) async fn repair_full_history_cancellable(
         &mut self,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -7076,8 +7074,7 @@ mod runtime_group_subscription_refresh_tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone())
-            .with_recovery_runner_ownership_for_test(true);
+            .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
         client
@@ -8337,11 +8334,10 @@ mod tests {
         {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
-            let (app, mut client, route) = crate::tests::undecryptable_probe_route_with_owner(
+            let (app, mut client, route) = crate::tests::undecryptable_probe_route(
                 &dir,
                 &relay,
                 bounded_epoch_backfill_config(),
-                None,
             )
             .await;
             let group = route.group_id.clone();
