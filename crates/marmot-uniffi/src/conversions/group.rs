@@ -989,9 +989,7 @@ mod group_state_tests {
         let app = MarmotApp::with_relay_and_config(
             root.path(),
             endpoint.0.clone(),
-            MarmotAppConfig::white_noise()
-                .with_allow_loopback_relay_endpoints(true)
-                .with_dev_device_groups(true),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
         );
         let runtime = app.runtime();
         let mut accounts = Vec::new();
@@ -1026,10 +1024,9 @@ mod group_state_tests {
             .enable_group_disbanding(self_id, &group)
             .await
             .unwrap();
-        // Current founding creation negotiates account-devices from the actual
-        // advertised leaves. Its explicit dev build already requires it, so a
-        // second enable command would correctly refuse AlreadyRequired.
-        #[cfg(feature = "dev-device-groups")]
+        // These ordinary app accounts advertise account-devices in every build.
+        // Founding creation negotiates it from their actual leaves; a second
+        // enable command would correctly refuse AlreadyRequired.
         assert_eq!(
             runtime
                 .account_devices_activation(self_id, &group)
@@ -1041,7 +1038,6 @@ mod group_state_tests {
             .group_conversation_snapshot(self_id, &group)
             .await
             .unwrap();
-        #[cfg(feature = "dev-device-groups")]
         assert!(
             snapshot
                 .mls_state
@@ -1086,11 +1082,11 @@ mod group_state_tests {
         assert!(!pending.can_disband);
         details.mls_state.lifecycle_state = GroupLifecycleStateFfi::Stable;
 
-        #[cfg(feature = "dev-device-groups")]
         {
             // Native removal owns the transition. This binding contrast changes
-            // only local membership on the emitted account-devices roster: an
-            // account's remaining device keeps its account row and admin role.
+            // only the always-compiled membership reader on the emitted chat
+            // snapshot. A remaining device keeps this account row/admin role;
+            // this does not perform the native roster-based removal journey.
             let active = group_management_state_ffi(self_id, &details);
             assert_eq!(
                 (active.can_invite, active.is_self_admin, active.can_disband),
