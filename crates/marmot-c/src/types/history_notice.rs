@@ -8,10 +8,10 @@ use marmot_uniffi::conversions::{
 use crate::macros::{c_enum, c_mirror};
 
 c_enum! {
-    /// Why recovery parked. Current policy parks only the first five;
-    /// `KnownEvent` and `MaintenanceBoundary` are reserved, and
-    /// `UnprovenHistory` is not raised until the recovery runner owns
-    /// history (mdk#2660).
+    /// Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
+    /// coverage-ledger parks emit `UnprovenHistory`. Other labels preserve
+    /// compatibility; `KnownEvent` and `MaintenanceBoundary` remain reserved
+    /// for parking policy.
     MarmotHistoryNoticeCause from HistoryNoticeCauseFfi {
         /// Deliveries were dropped from a full account queue, or spilled
         /// rows could not be admitted, and comparison could not recover them.
@@ -53,8 +53,8 @@ c_mirror! {
     /// The account's recovery: `catching_up_group_ids_hex` lists the groups
     /// whose history is still being fetched (lowercase hex, sorted),
     /// `inbox_catching_up` whether the inbox's is, and `notices` every
-    /// current notice. Nothing is catching up until the recovery runner owns
-    /// history (mdk#2660).
+    /// current notice. The recovery runner supplies the groups and inbox whose
+    /// history it is still fetching.
     MarmotAccountRecoveryStatus from AccountRecoveryStatusFfi,
     free marmot_account_recovery_status_free {
         str_vec catching_up_group_ids_hex/catching_up_group_ids_hex_len,

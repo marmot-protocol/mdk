@@ -1471,10 +1471,10 @@ analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-inc
 `account_recovery_status(account_ref)` returns `AccountRecoveryStatusFfi`: the groups whose
 history is still being fetched (`catching_up_group_ids_hex`), whether the inbox's is
 (`inbox_catching_up`), and every notice as `history_notices` lists them. Show the first two
-as "catching up" and re-read on `MarmotEventFfi::RecoveryStatusChanged`. Until the recovery
-runner owns history (mdk#2660) nothing is ever catching up, and neither that event nor
-`HistoryNoticeCauseFfi::UnprovenHistory` (the runner could not prove a route's history and
-stopped retrying it) is produced; handle both in exhaustive switches now.
+as "catching up" and re-read on `MarmotEventFfi::RecoveryStatusChanged`. The recovery
+runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger
+parks emit `HistoryNoticeCauseFfi::UnprovenHistory` without attributing the original reason
+history was owed. Other cause labels preserve compatibility; keep exhaustive switches.
 
 While unresolved epoch-gap recovery covers a group's current local epoch, the group may
 have moved past this device. Group changes (invite, remove, admin changes, profile, image,

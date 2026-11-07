@@ -10,10 +10,10 @@ use storage_sqlite::{
 use crate::AppError;
 
 /// Why recovery parked. Hosts choose wording from this; it carries no
-/// identities. Current policy parks the first five causes. `KnownEvent` and
-/// `MaintenanceBoundary` are reserved for demand that may park in a later
-/// policy, so exhaustive host switches stay source-compatible, and so is
-/// `UnprovenHistory` until the recovery runner owns history (mdk#2660).
+/// identities. Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger
+/// parks emit `UnprovenHistory` without attributing the original reason history
+/// was owed. Other labels preserve compatibility; `KnownEvent` and
+/// `MaintenanceBoundary` remain reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryNoticeCause {
@@ -94,9 +94,9 @@ pub struct HistoryNotice {
 
 /// The account's recovery as the runner sees it: what it is still fetching,
 /// and every "history may be incomplete" notice. Hosts re-read it on
-/// `RecoveryStatusChanged`. Until the recovery runner owns history
-/// (mdk#2660), nothing is ever catching up and the notices are
-/// [`HistoryNotice`]s as `history_notices` lists them.
+/// `RecoveryStatusChanged`. The recovery runner supplies the groups and inbox
+/// whose history it is still fetching; notices are [`HistoryNotice`]s as
+/// `history_notices` lists them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRecoveryStatus {
     /// Groups whose history is still being fetched, as lowercase hex group
