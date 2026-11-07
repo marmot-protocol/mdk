@@ -126,11 +126,59 @@ fn promotion_rejects_terminal_and_suppressed_sources() {
         panic!("deliberate recovery")
     };
     assert!(app.attachment_request_is_explicit(&recovered).unwrap());
+
+    // A completed slot coalesces explicit demand without queuing its bytes again.
+    seed(&store, "ready");
+    let ready = request(&app, "ready");
+    publish(&app, &ready);
+    let before = budget(&store, &ready);
+    assert_eq!(
+        app.request_explicit_attachment(GROUP, &selected("ready"), digest(), 20)
+            .unwrap(),
+        AttachmentDemand::Requested(ready.clone())
+    );
+    assert_eq!(budget(&store, &ready), before);
+    assert_eq!(read(&app, &ready), BODY);
+    assert!(
+        app.claim_attachment_acquisition(&ready, 20, 100)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Source validity and account-store incarnation are checked inside promotion.
 #[test]
 fn promotion_rejects_expired_hidden_pending_and_foreign_sources() {
+    // Existing automatic jobs bypass lower admission, so the explicit wrapper
+    // must revalidate the caller's selected source before promoting that job.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "selected");
+    let automatic = request(&app, "selected");
+    let before = budget(&store, &automatic);
+    for field in ["source", "epoch", "slot"] {
+        let mut stale = selected("selected");
+        match field {
+            "source" => stale.source_message_id_hex = "another-source".into(),
+            "epoch" => stale.source_epoch = Some(4),
+            "slot" => stale.slot = serde_json::json!({"stale":"slot"}),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            app.request_explicit_attachment(GROUP, &stale, digest(), 20)
+                .unwrap(),
+            AttachmentDemand::Unavailable,
+            "{field}"
+        );
+        assert!(!app.attachment_request_is_explicit(&automatic).unwrap());
+        assert_eq!(budget(&store, &automatic), before);
+    }
+    assert_eq!(
+        app.request_explicit_attachment(GROUP, &selected("selected"), digest(), 21)
+            .unwrap(),
+        AttachmentDemand::Requested(automatic.clone())
+    );
+    assert!(app.attachment_request_is_explicit(&automatic).unwrap());
     for (mutation, promoted) in [
         // The unchanged source promotes: the fixture is sound.
         ("SELECT 1", true),
