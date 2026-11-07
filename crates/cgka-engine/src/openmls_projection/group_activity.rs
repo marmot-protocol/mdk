@@ -136,7 +136,8 @@ mod tests {
     use super::*;
     use crate::distributed_convergence::tests::test_engine;
     use cgka_traits::app_components::{
-        GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+        GROUP_AVATAR_URL_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+        GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, encode_group_avatar_url_v1,
     };
     use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
     use cgka_traits::storage::StorageProvider;
@@ -293,6 +294,44 @@ mod tests {
                 GroupStateChange::MemberAdded { member: added }
             )]
         );
+
+        // The legacy profile remains undecodable while an independent,
+        // valid avatar update is authenticated and merged. That must produce
+        // its avatar row without inventing a rename from the unknown name.
+        let avatar = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
+            url: "https://example.com/avatar.png".into(),
+            dim: vec![],
+            thumbhash: vec![],
+        })
+        .unwrap();
+        engine
+            .stage_commit_with_app_data_updates(
+                &mut group,
+                &provider,
+                vec![],
+                vec![],
+                vec![Proposal::AppDataUpdate(Box::new(
+                    openmls::prelude::AppDataUpdateProposal::update(
+                        GROUP_AVATAR_URL_COMPONENT_ID,
+                        avatar,
+                    ),
+                ))],
+                "legacy_unknown_profile_avatar_test",
+            )
+            .unwrap();
+        group.merge_pending_commit(&provider).unwrap();
+        let after_avatar = GroupActivitySnapshot::capture(&group);
+        assert!(after_avatar.name.is_none());
+        assert_eq!(
+            after.changes(&after_avatar, engine.identity.self_id(), &[], &[]),
+            vec![(
+                engine.identity.self_id().clone(),
+                GroupStateChange::GroupAvatarChanged,
+            )],
+            "an unknown legacy profile must not suppress the independent avatar row",
+        );
+        // Continue the existing repair from the actual new native state.
+        let after = after_avatar;
 
         // Drive a real validated AppDataUpdate repairing the legacy profile.
         // This is the same staging helper the author uses, rather than a
