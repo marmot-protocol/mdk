@@ -162,7 +162,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     Commit/content-marker and applicable Welcome artifacts on a late group-projection failure, with independent
     MLS reads, encrypted reopen and real recipient join/removal on retry (mdk#3071, mdk#3127). The existing group-data
     and automatic SelfRemove projection-failure owners also compare complete sent rows, preserving their generic
-    fault-provider, native/proposal/snapshot cleanup and real successful retry. No torn record,
+    fault-provider, native/proposal/snapshot cleanup and real successful retry.
+    `auto_commit_record_write_failure_leaves_no_torn_group_record` also owns the due peer-SelfRemove wakeup and
+    fresh pending-work notification after a returned staging error, followed by same-proposal automatic retry;
+    do not replace that retry with a new explicit removal command. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
@@ -190,10 +193,6 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   `late_welcome_anchor_failure_restores_complete_join_across_reopen` owns the final joined-anchor write after
   consumed keys, processed Welcome, dedup, pending GroupJoined and maintenance writes: independent encrypted rows,
   failure/success reopens, exact same-Welcome retry and durable output all remain atomic.
-
-  `auto_commit_record_write_failure_leaves_no_torn_group_record` also owns the due peer-SelfRemove wakeup and
-  fresh pending-work notification after a returned staging error, followed by same-proposal automatic retry;
-  do not replace that retry with a new explicit removal command.
 
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
