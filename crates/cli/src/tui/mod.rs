@@ -107,6 +107,7 @@ const MESSAGES_TITLE_NAME_LIMIT: usize = 32;
 /// vocabulary. The fold clears it on settle, and leaving mid-load resets it, both
 /// guarded on this exact value so a more relevant status (e.g. a mutation's
 /// confirmation) is never clobbered.
+const LOADING_TIMELINE_STATUS: &str = "loading chat...";
 const LOADING_GROUP_DETAIL_STATUS: &str = "loading group detail...";
 
 /// The in-flight status shown while the launch daemon auto-start runs off the

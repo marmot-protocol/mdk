@@ -16464,3 +16464,104 @@ fn slash_management_commands_forward_the_selected_owner_and_requested_options() 
         assert_eq!(recorded.lines().collect::<Vec<_>>(), expected, "{input}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    for origin in ["refresh", "start", "composer"] {
+        for outcome in ["success", "page-error", "subscription-error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let page = if outcome == "page-error" {
+                serde_json::json!({"ok":false,"error":{"message":"timeline offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"loaded-row","direction":"received","from":"peer",
+                    "plaintext":"loaded page body","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            let ack = serde_json::json!({"ok":true,"result":{
+                "stream_id":"dd".repeat(32),"published":2
+            }});
+            let exe = dir.path().join("wn-status");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}'\n;;\n\
+                 *' stream start '*|*' stream compose-open '*) printf '%s\\n' '{ack}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    gate.script()
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = outcome == "subscription-error";
+            app.chats = vec![flick_chat(&group, "Room")];
+            let immediate = match origin {
+                "refresh" => {
+                    app.refresh_messages().unwrap();
+                    "loading chat..."
+                }
+                "start" => {
+                    app.input
+                        .set_value("/stream start --quic-candidate quic://127.0.0.1:4451");
+                    app.submit_input().unwrap();
+                    "started stream ddddddd...dddddddd; published=2"
+                }
+                "composer" => {
+                    app.input
+                        .set_value("/stream --quic-candidate quic://127.0.0.1:4451");
+                    app.submit_input().unwrap();
+                    "now streaming ddddddd...dddddddd; type text and press Enter to finish"
+                }
+                _ => unreachable!(),
+            };
+            gate.wait_until_entered();
+            assert_eq!(
+                app.status, immediate,
+                "the action completes before page release"
+            );
+            if outcome == "subscription-error" {
+                // The page child is already running; subsequent actual feed
+                // acquisitions encounter an unavailable command executable.
+                app.client.exe = dir.path().join("unavailable-wn");
+            }
+            gate.release();
+            finish_queued_effects(&mut app);
+            // A successful page fold enqueues diagnostics/mark-read after the
+            // first marker. Complete those children before dropping the fixture.
+            finish_queued_effects(&mut app);
+            assert!(app.loading_chat.is_none());
+            if outcome == "page-error" {
+                assert!(app.timeline.is_empty());
+            } else {
+                assert_eq!(timeline_ids(&app.timeline), vec!["loaded-row"]);
+                assert_eq!(app.messages_account_id.as_deref(), Some(account.as_str()));
+                assert_eq!(app.messages_group_id.as_deref(), Some(group.as_str()));
+            }
+            if origin != "refresh" {
+                assert_eq!(app.status, immediate, "{origin}: {outcome}");
+            } else {
+                match outcome {
+                    "success" => assert_eq!(app.status, "loaded 1 message(s)"),
+                    "page-error" => assert_eq!(app.status, "error: timeline offline"),
+                    "subscription-error" => assert!(
+                        app.status.starts_with("message subscription failed: ")
+                            || app.status.starts_with("timeline subscription failed: "),
+                        "ordinary loads must surface their actual feed failure"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}

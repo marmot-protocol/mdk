@@ -2266,7 +2266,7 @@ impl TuiApp {
             self.group_diagnostics = None;
         }
         self.loading_chat = Some((account_id.clone(), group_id.clone()));
-        self.status = "loading chat...".to_owned();
+        self.status = LOADING_TIMELINE_STATUS.to_owned();
         // The account-wide feed belongs to the adopted live account even if
         // this group's page fails. Same-account loads reuse its existing child.
         if self.daemon.running
@@ -2278,6 +2278,15 @@ impl TuiApp {
             account: account_id,
             group: group_id,
         });
+    }
+
+    /// The loading sentinel is the request's claim on the status line. Any
+    /// newer command or prompt replaces it and keeps its feedback when this
+    /// background load completes; page and subscription state still apply.
+    fn finish_timeline_status(&mut self, status: String) {
+        if self.status == LOADING_TIMELINE_STATUS {
+            self.status = status;
+        }
     }
 
     /// Fold a completed timeline load into the pane, exactly as the synchronous
@@ -2321,7 +2330,7 @@ impl TuiApp {
             Ok(value) => value,
             Err(err) => {
                 self.loading_chat = None;
-                self.status = format!("error: {err}");
+                self.finish_timeline_status(format!("error: {err}"));
                 return;
             }
         };
@@ -2393,10 +2402,12 @@ impl TuiApp {
         // returned projection into the row rather than waiting for a push (the
         // chats feed does not emit one after a local mark-read).
         self.effects.enqueue(Effect::MarkRead { account, group });
-        self.status = message_subscription_error
-            .or(timeline_subscription_error)
-            .or(group_state_subscription_error)
-            .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len()));
+        self.finish_timeline_status(
+            message_subscription_error
+                .or(timeline_subscription_error)
+                .or(group_state_subscription_error)
+                .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len())),
+        );
     }
 
     /// Fold a completed mark-read: apply the returned projection to the chat's
