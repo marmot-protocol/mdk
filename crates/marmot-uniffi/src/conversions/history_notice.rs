@@ -76,8 +76,8 @@ impl From<HistoryNotice> for HistoryNoticeFfi {
 }
 
 /// The account's recovery: what is still being fetched, and every "history
-/// may be incomplete" notice. Re-read on `RecoveryStatusChanged`. Until the
-/// recovery runner owns history (mdk#2660), nothing is ever catching up.
+/// may be incomplete" notice. Re-read on `RecoveryStatusChanged`; the recovery
+/// runner supplies the groups and inbox whose history it is still fetching.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AccountRecoveryStatusFfi {
     /// Groups whose history is still being fetched, as lowercase hex group

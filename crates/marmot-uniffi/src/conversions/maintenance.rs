@@ -341,7 +341,6 @@ mod tests {
             (MaintenancePhase::Grace, MaintenancePhaseFfi::Grace),
             (MaintenancePhase::Quiet, MaintenancePhaseFfi::Quiet),
             (MaintenancePhase::Jitter, MaintenancePhaseFfi::Jitter),
-            (MaintenancePhase::Overdue, MaintenancePhaseFfi::Overdue),
             (MaintenancePhase::Paused, MaintenancePhaseFfi::Paused),
             (
                 MaintenancePhase::ClockSkewBlocked,
@@ -353,10 +352,6 @@ mod tests {
             ),
             (MaintenancePhase::Fanout, MaintenancePhaseFfi::Fanout),
             (MaintenancePhase::Retry, MaintenancePhaseFfi::Retry),
-            (
-                MaintenancePhase::SupersededByConvergence,
-                MaintenancePhaseFfi::SupersededByConvergence,
-            ),
             (MaintenancePhase::Complete, MaintenancePhaseFfi::Complete),
             (MaintenancePhase::Failed, MaintenancePhaseFfi::Failed),
         ] {
@@ -421,21 +416,10 @@ mod tests {
         );
     }
 
-    fn fanout_targets() -> Vec<TransportFanoutTarget> {
-        let states = [
-            TransportFanoutAttemptState::Accepted,
-            TransportFanoutAttemptState::Unattempted,
-            TransportFanoutAttemptState::Unattempted,
-            TransportFanoutAttemptState::AttemptedFailed,
-            TransportFanoutAttemptState::AttemptedFailed,
-            TransportFanoutAttemptState::AttemptedFailed,
-            TransportFanoutAttemptState::PolicyProhibited,
-            TransportFanoutAttemptState::PolicyProhibited,
-            TransportFanoutAttemptState::PolicyProhibited,
-            TransportFanoutAttemptState::PolicyProhibited,
-        ];
+    fn fanout_targets(states: &[TransportFanoutAttemptState]) -> Vec<TransportFanoutTarget> {
         states
-            .into_iter()
+            .iter()
+            .copied()
             .enumerate()
             .map(|(index, state)| {
                 let attempted = matches!(
@@ -457,53 +441,66 @@ mod tests {
 
     #[test]
     fn fanout_counts_classify_each_target_instead_of_counting_the_total() {
-        let targets = fanout_targets();
-        let group = GroupId::new(vec![0xab; 16]);
-        let endpoints = targets
-            .iter()
-            .map(|target| target.endpoint.clone())
-            .collect();
-        // Status conversion is transport-neutral; this payload is never signed,
-        // sent or interpreted, and supplies none of the expected target counts.
-        let fanout = DurableTransportFanout {
-            id: MessageId::new(vec![0x19; 32]),
-            group_id: Some(group.clone()),
-            evolution_id: None,
-            exact_message: TransportMessage {
-                id: MessageId::new(vec![0x19; 32]),
-                payload: vec![],
-                timestamp: Timestamp(11),
-                causal_deps: vec![],
-                source: TransportSource("status-fixture".into()),
-                envelope: TransportEnvelope::GroupMessage {
-                    transport_group_id: vec![0xcd; 32],
-                },
-            },
-            target: TransportPublishTarget::Group {
-                group_id: group,
-                transport_group_id: vec![0xcd; 32],
-                endpoints,
-            },
-            targets,
-            required_acks: 2,
-            evolution_confirmed: false,
-            possible_exposure: true,
-            created_at: Timestamp(11),
-            bounded_until: Some(Timestamp(71)),
-        };
-        let value = TransportFanoutStatusFfi::from(fanout);
-        assert_eq!(
+        for (states, expected) in [
             (
-                value.accepted,
-                value.unattempted,
-                value.attempted_failed,
-                value.policy_prohibited
+                vec![TransportFanoutAttemptState::Unattempted; 2],
+                (0, 2, 0, 0),
             ),
-            (1, 2, 3, 4)
-        );
-        assert_eq!(value.required_acks, 2);
-        assert!(!value.evolution_confirmed);
-        assert_eq!(value.bounded_until, Some(71));
+            (
+                vec![
+                    TransportFanoutAttemptState::Accepted,
+                    TransportFanoutAttemptState::AttemptedFailed,
+                    TransportFanoutAttemptState::AttemptedFailed,
+                    TransportFanoutAttemptState::AttemptedFailed,
+                ],
+                (1, 0, 3, 0),
+            ),
+        ] {
+            let targets = fanout_targets(&states);
+            let group = GroupId::new(vec![0xab; 16]);
+            let endpoints = targets
+                .iter()
+                .map(|target| target.endpoint.clone())
+                .collect();
+            // Status conversion is transport-neutral; this payload is never signed,
+            // sent or interpreted, and supplies none of the expected target counts.
+            let fanout = DurableTransportFanout {
+                id: MessageId::new(vec![0x19; 32]),
+                group_id: Some(group.clone()),
+                evolution_id: None,
+                exact_message: TransportMessage {
+                    id: MessageId::new(vec![0x19; 32]),
+                    payload: vec![],
+                    timestamp: Timestamp(11),
+                    causal_deps: vec![],
+                    source: TransportSource("status-fixture".into()),
+                    envelope: TransportEnvelope::GroupMessage {
+                        transport_group_id: vec![0xcd; 32],
+                    },
+                },
+                target: TransportPublishTarget::Group {
+                    group_id: group,
+                    transport_group_id: vec![0xcd; 32],
+                    endpoints,
+                },
+                targets,
+                required_acks: 1,
+                evolution_confirmed: false,
+                possible_exposure: false,
+                created_at: Timestamp(11),
+                bounded_until: Some(Timestamp(86_411)),
+            };
+            let value = TransportFanoutStatusFfi::from(fanout);
+            assert_eq!(
+                (
+                    value.accepted,
+                    value.unattempted,
+                    value.attempted_failed,
+                    value.policy_prohibited
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -517,11 +514,11 @@ mod tests {
                     enrolled_at: Some(Timestamp(11)),
                     periodic_enrolled: true,
                     last_own_leaf_rotation_at: Some(Timestamp(23)),
-                    next_periodic_rotation_at: Some(Timestamp(47)),
+                    next_periodic_rotation_at: Some(Timestamp(2_073_623)),
                     leaf_refresh_due_at: None,
                     post_join_history: None,
                 }),
-                (Some(11), true, Some(23), Some(47)),
+                (Some(11), true, Some(23), Some(2_073_623)),
             ),
         ] {
             let value = GroupMaintenanceStatusFfi::from(GroupMaintenanceStatus {

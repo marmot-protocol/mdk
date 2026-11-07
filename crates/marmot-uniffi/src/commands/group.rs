@@ -1614,15 +1614,22 @@ mod tests {
                     state,
                     cgka_traits::TransportFanoutAttemptState::Accepted
                         | cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+                        | cgka_traits::TransportFanoutAttemptState::PolicyProhibited
                 );
                 cgka_traits::TransportFanoutTarget {
                     endpoint: TransportEndpoint(format!("wss://{state:?}-{index}.example")),
                     state,
                     attempt_count: u32::from(attempted),
                     last_attempt_at: attempted.then_some(artifact.created_at),
-                    failure_code: (state
-                        == cgka_traits::TransportFanoutAttemptState::AttemptedFailed)
-                        .then(|| "publish_failed".into()),
+                    failure_code: match state {
+                        cgka_traits::TransportFanoutAttemptState::AttemptedFailed => {
+                            Some("publish_failed".into())
+                        }
+                        cgka_traits::TransportFanoutAttemptState::PolicyProhibited => {
+                            Some("endpoint_removed_from_policy".into())
+                        }
+                        _ => None,
+                    },
                 }
             })
         })

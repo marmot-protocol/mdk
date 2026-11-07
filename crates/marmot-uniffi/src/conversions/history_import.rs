@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_history_keeps_archive_identity_instead_of_inventing_a_device_source() {
+    fn device_history_provenance_keeps_its_slot_identity() {
         let device = HistoryImportProvenanceFfi::from(marmot_app::HistoryImportProvenance::Device(
             [0x12; 32],
         ));
@@ -153,24 +153,7 @@ mod tests {
                 device_slot_id_hex: "12".repeat(32)
             }
         );
-        let backup = HistoryImportProvenanceFfi::from(marmot_app::HistoryImportProvenance::Backup(
-            marmot_app::BackupHistorySource {
-                recovery_public_key: [0x23; 32],
-                backup_id: [0x45; 16],
-                head_sha256: [0x67; 32],
-                written_at: 89,
-            },
-        ));
-        assert_eq!(
-            backup,
-            HistoryImportProvenanceFfi::Backup {
-                source: BackupHistorySourceFfi {
-                    recovery_public_key_hex: "23".repeat(32),
-                    backup_id_hex: "45".repeat(16),
-                    head_sha256_hex: "67".repeat(32),
-                    written_at: 89,
-                }
-            }
-        );
+        // The cached-conversion keeper already owns literal Backup provenance
+        // and its archive fields; this owner supplies only the Device contrast.
     }
 }
