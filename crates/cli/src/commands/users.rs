@@ -271,7 +271,7 @@ mod tests {
             .create_group(
                 &alice.account_id_hex,
                 "search peers",
-                &[bob.account_id_hex.clone()],
+                std::slice::from_ref(&bob.account_id_hex),
                 None,
             )
             .await
