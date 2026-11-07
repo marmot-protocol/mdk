@@ -117,6 +117,13 @@ mod tests {
 
     #[test]
     fn stream_id_hex_requires_the_profile_length() {
+        // Exercise the actual omitted-id producer through the existing parser;
+        // no entropy or uniqueness guarantee is inferred from this length check.
+        let generated = random_agent_stream_id();
+        assert_eq!(
+            stream_id_from_hex(&hex::encode(&generated)).unwrap().len(),
+            32
+        );
         assert_eq!(
             stream_id_from_hex(&format!(" {} ", "AB".repeat(32))).unwrap(),
             vec![0xAB; 32]

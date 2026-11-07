@@ -59,3 +59,20 @@ impl Marmot {
         Ok(self.runtime.clear_avatar_cache(&account_ref).await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_avatar_count_guard_accepts_the_boundary_and_rejects_overflow() {
+        assert!(check_count(0).is_ok());
+        assert!(check_count(16).is_ok());
+        assert!(
+            matches!(check_count(17), Err(MarmotKitError::InvalidMediaReference { details }) if details == "avatar batch exceeds 16 items")
+        );
+        // Request/read consume this helper. Their opaque codecs and native
+        // budgets/acquisition remain with their existing owners; no forwarding
+        // observation is inferred from a lower guard that could mask omission.
+    }
+}
