@@ -1624,7 +1624,7 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
         let mut bob = build_client(
             b"bob-cancel-founding-retention",
             SqliteAccountStorage::in_memory_for_test().unwrap(),
-            Box::new(MockPeeler::default()),
+            Box::<MockPeeler>::default(),
         );
         let bob_kp = bob.fresh_key_package().await.unwrap();
         let request = CreateGroupRequest {
@@ -1687,7 +1687,7 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
         let mut reopened = build_client(
             b"alice-cancel-founding-retention",
             storage,
-            Box::new(MockPeeler::default()),
+            Box::<MockPeeler>::default(),
         );
         reopened.hydrate_all_stored_groups().unwrap();
         assert!(reopened.live_group_ids().unwrap().is_empty());
@@ -1717,6 +1717,160 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
                 Some(300u64.to_be_bytes().to_vec()),
             );
         }
+    }
+}
+
+/// A second Welcome write fails only after the first Welcome, group projection
+/// and (on Legacy) route were persisted. No unfinished state survives the
+/// returned error or encrypted reopen, and the same creator can retry (mdk#3077).
+#[tokio::test]
+async fn late_founding_welcome_write_failure_restores_state_and_allows_retry() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("late-founding-welcome.sqlite");
+        let key = SqlCipherKey::raw([0x77; 32]);
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let supported = default_group_components()
+            .into_iter()
+            .chain([NOSTR_ROUTING_COMPONENT_ID])
+            .collect::<Vec<_>>();
+        let build = |identity: &[u8], storage| {
+            let builder = EngineBuilder::new(storage)
+                .identity(pad32(identity))
+                .account_identity_proof_signer(proof_signer(identity))
+                .supported_app_components(supported.clone())
+                .protocol_profile(profile)
+                .peeler(Box::<MockPeeler>::default());
+            if profile == ProtocolProfile::Legacy {
+                builder.legacy_compatibility_profile().build().unwrap()
+            } else {
+                builder.build().unwrap()
+            }
+        };
+        let mut alice = build(b"late-founding-alice", storage.clone());
+        let mut bob = build(
+            b"late-founding-bob",
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
+        );
+        let mut carol = build(
+            b"late-founding-carol",
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
+        );
+        let request = CreateGroupRequest {
+            name: "late founding Welcome".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(
+                    &NostrRoutingV1::new([0x77; 32], vec!["wss://relay.example".into()]).unwrap(),
+                )
+                .unwrap(),
+            }],
+            initial_admins: vec![],
+        };
+        let mls_before = encrypted_openmls_rows(&database, &key);
+        let observer = rusqlite::Connection::open(&database).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &observer,
+            &key,
+            storage_sqlite::SqlCipherHardening::live_cache(),
+        )
+        .unwrap();
+        let late_route = if profile == ProtocolProfile::Legacy {
+            "AND EXISTS(SELECT 1 FROM cgka_transport_group_routes WHERE group_id = NEW.group_id)"
+        } else {
+            ""
+        };
+        observer.execute_batch(&format!(
+            "CREATE TRIGGER fail_second_founding_welcome BEFORE INSERT ON cgka_messages
+             WHEN (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.group_id) = 1
+              AND (SELECT json_array_length(json_extract(record, '$.members')) FROM cgka_groups WHERE id = NEW.group_id) = 3
+              {late_route}
+             BEGIN SELECT RAISE(ABORT, 'second-founding-welcome-fault'); END;",
+        )).unwrap();
+        let failed = alice.create_group(request.clone()).await;
+        assert!(
+            matches!(&failed, Err(EngineError::Storage(cgka_traits::storage::StorageError::Backend(detail)))
+                if detail.contains("second-founding-welcome-fault")),
+            "{profile:?}: the second Welcome write must be the failing step: {failed:?}"
+        );
+        assert!(
+            storage.list_groups().unwrap().is_empty(),
+            "{profile:?}: failed creation left its group record"
+        );
+        assert!(alice.live_group_ids().unwrap().is_empty(), "{profile:?}");
+        assert!(alice.drain_events().is_empty(), "{profile:?}");
+        assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
+        assert!(
+            encrypted_openmls_rows(&database, &key) == mls_before,
+            "{profile:?}: unfinished MLS state remained"
+        );
+        for table in [
+            "cgka_groups",
+            "cgka_messages",
+            "cgka_transport_group_routes",
+        ] {
+            let count: i64 = observer
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{profile:?}: failed creation left {table} rows");
+        }
+        observer
+            .execute_batch("DROP TRIGGER fail_second_founding_welcome")
+            .unwrap();
+        let (group_id, retry) = alice.create_group(request).await.unwrap();
+        let mut welcomes = match retry {
+            SendResult::GroupCreated { pending, welcomes } => {
+                alice.confirm_published(pending).await.unwrap();
+                welcomes
+            }
+            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            other => panic!("expected founding result: {other:?}"),
+        };
+        assert_eq!(welcomes.len(), 2);
+        assert_eq!(
+            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        assert_eq!(
+            carol.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        let sent = bob
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&bob, b"routing after late creation failure"),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let SendResult::ApplicationMessage { msg, .. } = sent else {
+            panic!("expected peer application: {sent:?}")
+        };
+        assert_eq!(
+            alice.ingest(msg).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Processed
+        );
+        drop(alice);
+        drop(observer);
+        storage.close().unwrap();
+        drop(storage);
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let mut reopened = build(b"late-founding-alice", storage);
+        reopened.hydrate_all_stored_groups().unwrap();
+        assert_eq!(reopened.live_group_ids().unwrap(), vec![group_id.clone()]);
+        assert_eq!(reopened.members(&group_id).unwrap().len(), 3);
+        assert_eq!(
+            reopened.epoch(&group_id).unwrap(),
+            bob.epoch(&group_id).unwrap()
+        );
     }
 }
 
