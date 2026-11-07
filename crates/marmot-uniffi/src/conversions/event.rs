@@ -1059,4 +1059,169 @@ mod tests {
         assert_eq!(intent_kind, "update_group_data");
         assert_eq!(reason, "not_group_admin");
     }
+
+    // Valid, distinct x-only public keys for the observing account and sender.
+    const CHOICE_ACCOUNT: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    const CHOICE_SENDER: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[test]
+    fn current_account_events_keep_distinct_host_actions() {
+        // These are separate two-field notifications, not a claim that all
+        // account changes occur together or that their native policy ran here.
+        macro_rules! notice {
+            ($kind:ident) => {
+                assert!(matches!(
+                    MarmotEventFfi::from(MarmotAppEvent::$kind {
+                        account_id_hex: CHOICE_ACCOUNT.into(), account_label: "alice".into(),
+                    }),
+                    MarmotEventFfi::$kind { account_id_hex, account_label }
+                        if account_id_hex == CHOICE_ACCOUNT && account_label == "alice"
+                ));
+            };
+        }
+        notice!(HistoryNoticesChanged);
+        notice!(RecoveryStatusChanged);
+        notice!(LinkedDevicesChanged);
+        notice!(KeyPackageRefreshOverdueChanged);
+        notice!(UnrecognizedSignInsChanged);
+        notice!(CompromiseWarningChanged);
+        notice!(DeviceLinkChanged);
+        notice!(ChatHistoryImportsChanged);
+        notice!(DeviceUnlinked);
+        assert!(
+            matches!(MarmotEventFfi::from(MarmotAppEvent::GroupStateUpdated {
+            account_id_hex: CHOICE_ACCOUNT.into(), account_label: "alice".into(),
+            group_id: GroupId::new(vec![0x31; 16]),
+        }), MarmotEventFfi::GroupStateUpdated { account_id_hex, account_label, group_id_hex }
+            if account_id_hex == CHOICE_ACCOUNT && account_label == "alice" && group_id_hex == "31".repeat(16))
+        );
+        // The current setup worker emits this context plus privacy-safe kind.
+        assert!(
+            matches!(MarmotEventFfi::from(MarmotAppEvent::AccountError(marmot_app::RuntimeAccountError {
+            account_id_hex: CHOICE_ACCOUNT.into(), account_label: "alice".into(),
+            message: "generated account publication deferred: transport_closed".into(),
+        })), MarmotEventFfi::AccountError { account_id_hex, account_label, message }
+            if account_id_hex == CHOICE_ACCOUNT && account_label == "alice"
+                && message == "generated account publication deferred: transport_closed")
+        );
+    }
+
+    #[test]
+    fn remaining_current_group_events_keep_their_host_kinds() {
+        use GroupEventKindFfi as F;
+        use cgka_traits::{EpochId, MemberId};
+        let group = || GroupId::new(vec![0x31; 16]);
+        assert!(matches!(
+            F::from(GroupEvent::GroupCreated { group_id: group() }),
+            F::GroupCreated
+        ));
+        // Current joins always know the authenticated welcomer. The retained
+        // None compatibility arm gains no new producer claim from this table.
+        assert!(matches!(F::from(GroupEvent::GroupJoined {
+            group_id: group(), via_welcome: MessageId::new(vec![0x42; 32]),
+            explicitly_confirmed: true,
+            welcomer: Some(MemberId::new(hex::decode(CHOICE_SENDER).unwrap())),
+        }), F::GroupJoined { via_welcome_hex, welcomer_id_hex }
+            if via_welcome_hex == "42".repeat(32) && welcomer_id_hex.as_deref() == Some(CHOICE_SENDER)));
+        let inner =
+            cgka_traits::app_event::MarmotAppEvent::new(CHOICE_SENDER, 11, 9, vec![], "hello");
+        assert!(matches!(F::from(GroupEvent::MessageReceived {
+            group_id: group(), message_id: MessageId::new(vec![0x43; 32]),
+            sender: MemberId::new(hex::decode(CHOICE_SENDER).unwrap()),
+            // App host_group_event strips this device destination before FFI.
+            sender_leaf_index: None, epoch: EpochId(7), payload: inner.encode().unwrap(),
+            authority: None,
+            retention: Some(cgka_traits::app_event::AppMessageRetentionDecision::new(11, 0)),
+            encrypted_media_secret: None,
+        }), F::MessageReceived { sender_id_hex, epoch } if sender_id_hex == CHOICE_SENDER && epoch == 7));
+        assert!(matches!(
+            F::from(GroupEvent::EpochChanged {
+                group_id: group(),
+                from: EpochId(7),
+                to: EpochId(8),
+            }),
+            F::EpochChanged { from: 7, to: 8 }
+        ));
+        assert!(matches!(F::from(GroupEvent::CommitRolledBack {
+            group_id: group(), invalidated_commit_id: MessageId::new(vec![0x44; 32]),
+        }), F::CommitRolledBack { invalidated_commit_id_hex } if invalidated_commit_id_hex == "44".repeat(32)));
+        assert!(matches!(
+            F::from(GroupEvent::GroupUnrecoverable { group_id: group() }),
+            F::GroupUnrecoverable
+        ));
+        assert!(matches!(
+            F::from(GroupEvent::PendingCommitRecovered {
+                group_id: group(),
+                recovered_epoch: EpochId(8),
+            }),
+            F::PendingCommitRecovered { recovered_epoch: 8 }
+        ));
+        assert!(matches!(
+            F::from(GroupEvent::GroupHydrationRecovered {
+                group_id: group(),
+                recovered_epoch: EpochId(8),
+            }),
+            F::GroupHydrationRecovered { recovered_epoch: 8 }
+        ));
+        // Own only this host kind here. The current five typed reason mappings
+        // have their independent group conversion owner, without another table.
+        assert!(matches!(
+            F::from(GroupEvent::GroupHydrationQuarantined {
+                group_id: group(),
+                reason: cgka_traits::engine::GroupHydrationQuarantineReason::OpenMlsGroupMissing,
+            }),
+            F::GroupHydrationQuarantined { .. }
+        ));
+    }
+
+    #[test]
+    fn stream_start_outer_event_projects_only_account_activity() {
+        // The pure native start builder is private to marmot-app. Match its
+        // full current no-parent/no-broker fallback schema, using the public
+        // canonical event constructor. This does not run QUIC or publication.
+        let inner = cgka_traits::app_event::MarmotAppEvent::new(
+            CHOICE_SENDER,
+            11,
+            1200,
+            vec![
+                vec!["stream".into(), "55".repeat(32)],
+                vec!["stream-type".into(), "text".into()],
+                vec!["final-kind".into(), "9".into()],
+                vec!["route".into(), "quic".into()],
+            ],
+            "",
+        );
+        // Sanity-parse the fixture with the native public view. Its parser is
+        // lenient; full profile constraints above are checked against the builder.
+        let view = marmot_app::StreamStartView::from_event(inner.kind, &inner.tags).unwrap();
+        assert_eq!(view.stream_id_hex, "55".repeat(32));
+        assert_eq!(view.route, "quic");
+        assert!(view.quic_candidates.is_empty());
+        let native = MarmotAppEvent::AgentStreamStarted(marmot_app::RuntimeAgentStreamMessage {
+            account_id_hex: CHOICE_ACCOUNT.into(),
+            account_label: "alice".into(),
+            message: marmot_app::ReceivedMessage {
+                authority: None,
+                message_id_hex: inner.id,
+                source_message_id_hex: "43".repeat(32),
+                sender: inner.pubkey,
+                sender_display_name: None,
+                group_id: GroupId::new(vec![0x31; 16]),
+                source_epoch: 7,
+                retention: Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
+                    11, 0,
+                )),
+                plaintext: inner.content,
+                kind: inner.kind,
+                tags: inner.tags,
+                recorded_at: inner.created_at,
+                received_at: 12,
+            },
+        });
+        assert!(
+            matches!(MarmotEventFfi::from(native), MarmotEventFfi::AgentStreamActivity {
+            account_id_hex, account_label,
+        } if account_id_hex == CHOICE_ACCOUNT && account_label == "alice")
+        );
+    }
 }
