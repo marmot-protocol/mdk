@@ -475,7 +475,7 @@ async fn queue_message(
 async fn a_leave_behind_a_queued_message_goes_out_after_it() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut carol, _carol_storage) = build_client(b"carol");
-    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut bob, bob_storage) = build_client(b"bob");
     let group_id = three_member_group(&mut alice, &mut carol, &mut bob).await;
     let epoch = bob.epoch(&group_id).unwrap().0;
     queue_message(&mut bob, &group_id, "sent before leaving").await;
@@ -489,7 +489,50 @@ async fn a_leave_behind_a_queued_message_goes_out_after_it() {
     let leave_queued = matches!(leave, SendResult::Queued { .. });
     let mut published = Published::default();
     published.take(&mut bob, &group_id, leave).await;
-    published.drain(&mut bob, &group_id).await;
+    // The Leave is accepted but has not prepared its durable leaving gate.
+    // This later send legitimately queues; the drain must notice that gate
+    // immediately after preparing the Leave, preserving its prepared prefix.
+    let later = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, "queued after accepting leave"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let SendResult::Queued {
+        intent_id: later_id,
+        ..
+    } = later
+    else {
+        panic!("the later send waits behind the accepted Leave: {later:?}");
+    };
+    let drained = bob
+        .advance_convergence(&group_id)
+        .await
+        .expect("a new leave gate must return its already-prepared prefix");
+    assert!(
+        matches!(
+            drained.as_slice(),
+            [
+                SendResult::ApplicationMessage { .. },
+                SendResult::Proposal { .. }
+            ]
+        ),
+        "the new leave gate must preserve the prepared prefix: {drained:?}"
+    );
+    for result in drained {
+        published.take(&mut bob, &group_id, result).await;
+    }
+    let remaining = bob_storage.list_queued_outbound_intents(&group_id).unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "the newly prepared Leave gate must retain the later queued application"
+    );
+    assert_eq!(remaining[0].id, later_id);
+    assert!(bob.advance_convergence(&group_id).await.unwrap().is_empty());
+    assert!(bob.drain_auto_publish().is_empty());
 
     assert_eq!(
         read(&mut alice, &group_id, &published.messages).await,

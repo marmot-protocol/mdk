@@ -60,6 +60,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
+  `observed_selfremove_proposal_delays_commit_then_retains_outbound_app_messages` owns due automatic maintenance
+  before a public send prepares its wire, plus pre-due sendability and ordered retained sends after confirmation.
+
 - **File:** `invite_leave/recovery_batch.rs`
   - **Owns:** Atomic native recovery for two and 32 distinct recipients, exact artifacts and pending references
     through encrypted reopen, ACK-gated Welcome release, recipient authenticators, and malformed recovery-artifact
@@ -127,6 +130,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     a drained intent awaiting its outcome holds no later send; and a queued change the settled state already holds is
     retired at drain, so it holds no later send. The device-group refusals behind a queued row are in
     `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
+
+  `queued_send_order::a_leave_behind_a_queued_message_goes_out_after_it` also owns the Leaving gate that closes
+  within one drain: the prepared App/Leave prefix returns while a later accepted app stays queued.
 
 - **File:** `distributed_convergence/refused_queued_intents.rs`
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
