@@ -129,6 +129,9 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
         // Exact canonical reconstruction proves these reduced candidates.
         (false, true, false, true),
         (false, false, true, true),
+        // A separate held UNKNOWN control expires without changing the
+        // original unpruned hold's reopen and withdrawal preconditions.
+        (false, true, false, true),
     ];
     let mut fixtures = Vec::new();
     {
@@ -140,7 +143,7 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
         crate::base::migrations::run_through(&mut conn, 177).unwrap();
         for (i, (duplicate, damaged, pruned, hidden)) in cases.into_iter().enumerate() {
             let target = source(9, 10 + i as u64, vec![], &format!("target {i}"));
-            let control = if i >= 7 {
+            let control = if [7, 8].contains(&i) {
                 source(
                     4891,
                     30 + i as u64,
@@ -164,9 +167,9 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
                 serde_json::to_string(&control.tags).unwrap()
             };
             insert_legacy(&conn, &control, &tags);
-            if i == 3 {
+            if i == 9 {
                 conn.execute(
-                    "UPDATE app_events SET retention_seconds=10,retention_expires_at=43
+                    "UPDATE app_events SET retention_seconds=10,retention_expires_at=49
                      WHERE group_id_hex=?1 AND message_id_hex=?2",
                     params![GROUP, control.message_id_hex],
                 )
@@ -190,23 +193,23 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
             "SELECT plaintext,tags_json,retention_seconds,retention_expires_at,
              EXISTS(SELECT 1 FROM content_pruned_controls p WHERE p.group_id_hex=e.group_id_hex AND p.message_id_hex=e.message_id_hex)
              FROM app_events e WHERE group_id_hex=?1 AND message_id_hex=?2",
-            params![GROUP,fixtures[3].1.message_id_hex],
+            params![GROUP,fixtures[9].1.message_id_hex],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
         ).unwrap();
         assert_eq!(body, "");
         assert_eq!(
             tags,
-            serde_json::to_string(&vec![vec!["e", fixtures[3].0.message_id_hex.as_str()]]).unwrap()
+            serde_json::to_string(&vec![vec!["e", fixtures[9].0.message_id_hex.as_str()]]).unwrap()
         );
         assert_eq!((seconds, expires, pruned), (None, None, true));
-        assert_deleted(app, &fixtures[3].0, true);
+        assert_deleted(app, &fixtures[9].0, true);
     };
     {
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = store.app_storage();
         app.rebuild_message_timeline_for_group(GROUP).unwrap();
         for (i, (target, _)) in fixtures.iter().enumerate().filter(|(i, _)| *i != 6) {
-            assert_deleted(&app, target, [0, 3, 4, 7, 8].contains(&i));
+            assert_deleted(&app, target, [0, 3, 4, 7, 8, 9].contains(&i));
         }
         // No hold for a target absent from the pre-upgrade projection.
         app.record_app_event(&fixtures[6].0).unwrap();
@@ -215,8 +218,8 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
         assert_deleted(&app, &fixtures[6].0, false);
         for (i, (_, control)) in fixtures.iter().enumerate() {
             let (state,holds): (u8,u32) = app.lock().unwrap().query_row("SELECT state,(SELECT count(*) FROM content_removal_legacy_holds h WHERE h.group_id_hex=v.group_id_hex AND h.message_id_hex=v.message_id_hex) FROM content_removal_validation v WHERE group_id_hex=?1 AND message_id_hex=?2",params![GROUP,control.message_id_hex],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-            assert_eq!(state, [2, 1, 0, 0, 0, 0, 0, 2, 2][i]);
-            assert_eq!(holds, u32::from([3, 4].contains(&i)));
+            assert_eq!(state, [2, 1, 0, 0, 0, 0, 0, 2, 2, 0][i]);
+            assert_eq!(holds, u32::from([3, 4, 9].contains(&i)));
         }
         // Replay with a reduced, valid-looking tag list must not bless UNKNOWN.
         let mut replay = fixtures[2].1.clone();
@@ -253,7 +256,7 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
         assert_deleted(&app, &fixtures[3].0, true);
         // Expiring the UNKNOWN control itself must retain its exact hold and
         // scrub the original body and optional tags while the target remains.
-        app.secure_prune_expired_app_events(GROUP, 43, "local", &|_, _| false)
+        app.secure_prune_expired_app_events(GROUP, 49, "local", &|_, _| false)
             .unwrap();
         app.rebuild_message_timeline_for_group(GROUP).unwrap();
         assert_expired_hold(&app);
@@ -263,7 +266,7 @@ fn legacy_upgrade_preserves_only_existing_uncertain_hides_through_rebuild_and_re
     app.rebuild_message_timeline_for_group(GROUP).unwrap();
     assert_expired_hold(&app);
     for (i, (target, _)) in fixtures.iter().enumerate() {
-        assert_deleted(&app, target, [0, 3, 4, 7, 8].contains(&i));
+        assert_deleted(&app, target, [0, 3, 4, 7, 8, 9].contains(&i));
     }
     app.invalidate_app_event_by_message_id(GROUP, &fixtures[3].1.message_id_hex, "withdrawn")
         .unwrap();
