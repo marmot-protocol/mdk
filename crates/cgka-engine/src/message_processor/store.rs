@@ -422,6 +422,27 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Stage a Commit without Welcomes together with its projected group,
+    /// before exposing its sent ids or returning a publication handle.
+    pub(crate) fn record_sent_openmls_message_with_group(
+        &mut self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group: &cgka_traits::group::Group,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let content_id = self.storage.with_transaction(|storage| {
+            let content_id = self.persist_sent_openmls_message_with_application_stamp(
+                msg, mls_bytes, &group.id, epoch, None,
+            )?;
+            storage.put_group(group)?;
+            Ok::<_, EngineError>(content_id)
+        })?;
+        self.sent_message_ids.insert(msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        Ok(())
+    }
+
     /// Persist both sent records without advancing the hot cache, so a caller
     /// can include the pair in a larger atomic staging unit.
     pub(crate) fn persist_sent_openmls_message_with_application_stamp(

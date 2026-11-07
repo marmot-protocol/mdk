@@ -334,12 +334,6 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
 
         // `members()` drops the removed leaf while the publish is pending;
         // `confirm_published` and `publish_failed` re-derive the record from
@@ -349,7 +343,12 @@ impl<S: StorageProvider> Engine<S> {
         group_record
             .members
             .retain(|member| member.credential != leaf_signature_key);
-        self.storage.put_group(&group_record)?;
+        self.record_sent_openmls_message_with_group(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_record,
+            pre_commit_epoch,
+        )?;
 
         let pending_ref =
             self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;

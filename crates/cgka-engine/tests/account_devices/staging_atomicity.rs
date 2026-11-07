@@ -2,7 +2,7 @@
 
 use super::device_roster::{
     NO_WELCOME_DEADLINE, entry, expect_link_welcome, found_device_group, key_package_ref, roster,
-    roster_device, roster_device_on, slot,
+    roster_device, roster_device_on, roster_of, slot,
 };
 use super::tagged_siblings::{
     assert_joins_from, chat_device, handed, owed, routed_members, tag_devices,
@@ -19,6 +19,7 @@ use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 enum StagingKind {
     Link,
     Sibling,
+    Unlink,
 }
 
 #[tokio::test]
@@ -29,6 +30,11 @@ async fn late_link_projection_failure_preserves_the_complete_staging_owner() {
 #[tokio::test]
 async fn late_same_account_add_projection_failure_preserves_the_complete_staging_owner() {
     late_staging_failure(StagingKind::Sibling).await;
+}
+
+#[tokio::test]
+async fn late_unlink_projection_failure_preserves_the_complete_staging_owner() {
+    late_staging_failure(StagingKind::Unlink).await;
 }
 
 fn independent_rows(
@@ -97,6 +103,25 @@ async fn late_staging_failure(kind: StagingKind) {
             };
             (phone, tablet, gid, None, intent, Some(key_package))
         }
+        StagingKind::Unlink => {
+            let mut phone = roster_device_on(storage.clone(), b"alice");
+            let mut laptop = roster_device(b"alice");
+            let gid = found_device_group(
+                &mut phone,
+                &roster(&[(1, "Phone"), (2, "Laptop")]),
+                &mut [&mut laptop],
+            )
+            .await;
+            let update =
+                DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::RemoveDevice(slot(2))])
+                    .unwrap();
+            let intent = SendIntent::UnlinkDevice {
+                group_id: gid.clone(),
+                leaf_signature_key: signature_key(&laptop, &gid),
+                roster_update: encode_device_roster_update_v1(&update).unwrap(),
+            };
+            (phone, laptop, gid, None, intent, None)
+        }
         StagingKind::Sibling => {
             let (bob, mut new, device_gid) = tag_devices(vec![
                 roster_device_on(storage.clone(), b"bob"),
@@ -123,8 +148,18 @@ async fn late_staging_failure(kind: StagingKind) {
     let observer = rusqlite::Connection::open(&database).unwrap();
     open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
     let before = independent_rows(&observer);
-    // This fixture's wrapper id is the MLS content id, so staging adds
-    // exactly its signed Commit and one transport or sibling Welcome row.
+    // This fixture's wrapper id is its content id: Add/Link stage one
+    // Commit plus a Welcome, while Unlink stages only the Commit.
+    let projected_members = if matches!(kind, StagingKind::Unlink) {
+        before_record.members.len() - 1
+    } else {
+        before_record.members.len() + 1
+    };
+    let outgoing_rows = if matches!(kind, StagingKind::Unlink) {
+        1
+    } else {
+        2
+    };
     observer
         .execute_batch(&format!(
             "CREATE TRIGGER fail_device_staging_projection BEFORE UPDATE ON cgka_groups
@@ -132,8 +167,8 @@ async fn late_staging_failure(kind: StagingKind) {
           AND (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.id) = {}
          BEGIN SELECT RAISE(ABORT, 'device-staging-projection-fault'); END;",
             hex::encode(group_id.as_slice()),
-            before_record.members.len() + 1,
-            before_messages.len() + 2
+            projected_members,
+            before_messages.len() + outgoing_rows
         ))
         .unwrap();
     let failed = sender.engine.send(intent.clone()).await;
@@ -176,7 +211,7 @@ async fn late_staging_failure(kind: StagingKind) {
         .execute_batch("DROP TRIGGER fail_device_staging_projection")
         .unwrap();
     let identity = match kind {
-        StagingKind::Link => b"alice".as_slice(),
+        StagingKind::Link | StagingKind::Unlink => b"alice".as_slice(),
         StagingKind::Sibling => b"bob".as_slice(),
     };
     let mut sender = roster_device_on(storage.clone(), identity);
@@ -188,7 +223,9 @@ async fn late_staging_failure(kind: StagingKind) {
             .unwrap();
     }
     let SendResult::GroupEvolution {
-        pending, welcomes, ..
+        pending,
+        welcomes,
+        msg,
     } = sender.engine.send(intent).await.unwrap()
     else {
         panic!("{kind:?}: expected staged retry")
@@ -205,6 +242,12 @@ async fn late_staging_failure(kind: StagingKind) {
             );
             assert_joins(&mut target, &welcomes[0], &group_id, &sender).await;
         }
+        StagingKind::Unlink => {
+            assert!(welcomes.is_empty());
+            assert_accepted(&mut target, &route_to_group(&msg, &group_id), &group_id).await;
+            assert!(target.engine.group_record(&group_id).unwrap().removed);
+            assert!(!roster_of(&sender, &group_id).devices.contains_key(&slot(2)));
+        }
         StagingKind::Sibling => {
             assert!(welcomes.is_empty());
             let owed = owed(&sender);
@@ -218,7 +261,7 @@ async fn late_staging_failure(kind: StagingKind) {
     );
     assert_eq!(
         load_group(&sender, &group_id).members().count(),
-        before_record.members.len() + 1
+        projected_members
     );
     drop(sender);
     drop(observer);
@@ -233,6 +276,6 @@ async fn late_staging_failure(kind: StagingKind) {
     );
     assert_eq!(
         load_group(&restarted, &group_id).members().count(),
-        before_record.members.len() + 1
+        projected_members
     );
 }

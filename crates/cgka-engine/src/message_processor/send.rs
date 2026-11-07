@@ -977,18 +977,17 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            &group_id,
-            pre_commit_epoch,
-        )?;
 
         let mut group_record = existing;
         group_record
             .members
             .retain(|member| !target_set.contains(&member.id));
-        self.storage.put_group(&group_record)?;
+        self.record_sent_openmls_message_with_group(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_record,
+            pre_commit_epoch,
+        )?;
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
