@@ -5,7 +5,8 @@
 //!
 //! Destination classifications are renderer-policy input, not authorization.
 //! Hosts must inspect them before navigating to a link or fetching an image;
-//! the original untrusted destination is intentionally preserved.
+//! explicit destinations retain their spelling. Inferred bare domains carry
+//! their original label and a validated ASCII-host HTTPS destination.
 
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
@@ -655,6 +656,23 @@ mod tests {
                 ..
             } if url == "marmot://profile/npub1abc"
         ));
+    }
+
+    #[test]
+    fn bridges_bare_idn_label_and_ascii_destination_without_reclassification() {
+        let document = parse_markdown_document("bücher.de README.md archive.zip report.pdf");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            &inlines[0],
+            MarkdownInlineFfi::Link { dest, children, classification: MarkdownLinkDestinationKindFfi::Web, .. }
+                if dest == "https://xn--bcher-kva.de"
+                    && matches!(children.as_slice(), [MarkdownInlineFfi::Text { content }] if content == "bücher.de")
+        ));
+        assert!(matches!(&inlines[1], MarkdownInlineFfi::Text { content }
+            if content == " README.md archive.zip report.pdf"));
+        assert_eq!(inlines.len(), 2);
     }
 
     #[test]

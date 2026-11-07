@@ -188,6 +188,27 @@ fn deeply_nested_images_do_not_overflow_parse() {
         .expect("nested-image parse panicked or aborted");
 }
 
+/// Dotted labels exercise source replacement without bypassing depth or stack bounds.
+#[test]
+fn deeply_nested_dotted_image_labels_remain_bounded() {
+    let handle = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            // Exercise the inference-disabled label replacement as well as
+            // unknown-root labels that take the same separator fast path.
+            for label in ["example.chat", "a.b"] {
+                let source = format!("{}{}{}", "![".repeat(48_000), label, "](x)".repeat(48_000));
+                let doc = parse(&source);
+                assert!(max_inline_depth(&doc) <= DEPTH_CEILING);
+                assert!(!serde_json::to_string(&doc).expect("serialize").is_empty());
+            }
+        })
+        .expect("spawn");
+    handle
+        .join()
+        .expect("dotted image parse panicked or aborted");
+}
+
 #[test]
 fn excess_image_delimiters_stay_literal_not_dropped() {
     // When wrapping would exceed the cap, the closing `]` is left as literal

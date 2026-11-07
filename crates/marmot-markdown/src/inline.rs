@@ -22,13 +22,13 @@ use crate::scanner;
 /// Keep in sync with the explicit match arms — used as the exit condition
 /// for the plain-byte fast-scan in the `_` wildcard arm.
 ///
-/// `h`, `m`, `t`, `w` are tripwires for bare-URL prefixes (`http(s)://`,
+/// `h`, `m`, `t`, `w` and `W` are tripwires for bare-URL prefixes (`http(s)://`,
 /// `mailto:`, `marmot://`, `tel:`, `whitenoise:`, `www.`); the bulk-scan rescue
 /// below keeps the fast path for the overwhelmingly common case of ordinary
 /// prose containing those letters.
 const INLINE_SPECIAL: [bool; 128] = {
     let mut t = [false; 128];
-    let chars = b"\\`$&[!*_~]<@nhmtw\n";
+    let chars = b"\\`$&[!*_~]<@nhmtwW\n";
     let mut k = 0;
     while k < chars.len() {
         t[chars[k] as usize] = true;
@@ -239,6 +239,18 @@ impl BracketDelim {
 
 /// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
+    tokenize_inner(raw, refs, true, None)
+}
+
+/// Parse a raw inline span. Domain inference is disabled when rebuilding an
+/// explicit label; `edges` preserves its real surrounding bracket punctuation.
+fn tokenize_inner(
+    raw: &str,
+    refs: &HashMap<String, LinkRef>,
+    infer_domains: bool,
+    edges: Option<(u8, u8)>,
+) -> Vec<Inline> {
+    let infer_domains = infer_domains && crate::domain::has_host_separator(raw);
     let bytes = raw.as_bytes();
     let code_span_index = CodeSpanIndex::new(bytes);
     let mut out: Vec<Inline> = Vec::new();
@@ -251,6 +263,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     let mut open_bracket_delims = 0usize;
     let mut i = 0;
     let mut inline_math_closer_exhausted = false;
+    let mut domain_attempted_until = 0;
 
     // Try a "consume an Inline or fall back to a literal byte" recognizer.
     // Used for the recognizers whose only failure mode is "didn't match —
@@ -273,6 +286,16 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
 
     while i < bytes.len() {
         let c = bytes[i];
+        if infer_domains && i >= domain_attempted_until && crate::domain::eligible_start(raw, i) {
+            let (candidate, attempted_end) = crate::domain::scan(raw, i);
+            domain_attempted_until = attempted_end;
+            if let Some((link, end)) = candidate {
+                flush_text(&mut out, &mut buf, &delims);
+                out.push(link);
+                i = end;
+                continue;
+            }
+        }
         match c {
             b'\\' => {
                 if i + 1 < bytes.len() {
@@ -376,7 +399,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
             }
             b'*' | b'_' | b'~' => {
                 flush_text(&mut out, &mut buf, &delims);
-                let (run_len, can_open, can_close) = classify_delim_run(bytes, i, c);
+                let (run_len, can_open, can_close) = classify_delim_run(bytes, i, c, edges);
                 let out_pos = out.len();
                 out.push(Inline::Text(
                     std::str::from_utf8(&bytes[i..i + run_len])
@@ -406,6 +429,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     &mut last_bracket_delim,
                     &mut open_bracket_delims,
                     refs,
+                    infer_domains,
                 ) {
                     i = end;
                 } else {
@@ -458,7 +482,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     i += 1;
                 }
             }
-            b'h' | b'm' | b't' | b'w' => {
+            b'h' | b'm' | b't' | b'w' | b'W' => {
                 if let Some((url, kind, end)) = try_bare_url(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
                     let classification = classify_autolink_destination(&url, kind);
@@ -510,6 +534,12 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                         if cc >= 0x80 {
                             break;
                         }
+                        if infer_domains
+                            && i >= domain_attempted_until
+                            && crate::domain::eligible_start(raw, i)
+                        {
+                            break;
+                        }
                         if INLINE_SPECIAL[cc as usize] {
                             // `n` is in INLINE_SPECIAL only as a tripwire for
                             // the `nostr:` URI scheme and bare `npub1…`
@@ -528,8 +558,8 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                             // Same rescue for `h`/`m`/`t`/`w` — they're
                             // tripwires for bare-URL prefixes and most occur
                             // mid-word in prose.
-                            if matches!(cc, b'h' | b'm' | b't' | b'w')
-                                && !looks_like_bare_url_start(bytes, i)
+                            if matches!(cc, b'h' | b'm' | b't' | b'w' | b'W')
+                                && bare_url_prefix(bytes, i).is_none()
                             {
                                 i += 1;
                                 continue;
@@ -814,8 +844,37 @@ fn deactivate_bracket_delim(
     refresh_active_bracket_state(delims, last_bracket_delim, open_bracket_delims);
 }
 
+/// A generated domain target requires an existing Link node somewhere in the
+/// label. Authored links are harmless false positives; no-Link labels can keep
+/// their already parsed children without rescanning the entire source.
+fn contains_link(items: &[Inline]) -> bool {
+    let mut stack = vec![items];
+    while let Some(items) = stack.pop() {
+        for item in items {
+            match item {
+                Inline::Link { .. } => return true,
+                Inline::Emph(children)
+                | Inline::Strong(children)
+                | Inline::Strikethrough(children) => stack.push(children),
+                Inline::Image { alt, .. } => stack.push(alt),
+                Inline::Text(_)
+                | Inline::SoftBreak
+                | Inline::HardBreak
+                | Inline::Code(_)
+                | Inline::Autolink { .. }
+                | Inline::Math(_)
+                | Inline::NostrMention(_)
+                | Inline::NostrUri(_)
+                | Inline::Timestamp { .. } => {}
+            }
+        }
+    }
+    false
+}
+
 /// Handle a `]` byte at position `i`. Returns the byte index past the close
 /// on success, or `None` if the `]` should be emitted as literal text.
+#[allow(clippy::too_many_arguments)] // Shares the existing delimiter state; no second parser state owner.
 fn try_close_bracket(
     bytes: &[u8],
     i: usize,
@@ -824,6 +883,7 @@ fn try_close_bracket(
     last_bracket_delim: &mut Option<usize>,
     open_bracket_delims: &mut usize,
     refs: &HashMap<String, LinkRef>,
+    infer_domains: bool,
 ) -> Option<usize> {
     // Find the most recent active opener (`[` or `![`) through the bracket-only
     // chain. This is the bracket analogue of the emphasis openers-bottom
@@ -832,17 +892,41 @@ fn try_close_bracket(
     let opener_idx = previous_active_bracket_delim(delims, *last_bracket_delim)?;
     *last_bracket_delim = Some(opener_idx);
     let opener = delims[opener_idx];
+    // Resolve explicit labels from their original source with fuzzy inference
+    // disabled. This preserves escapes/entities without nesting generated links.
+    // The replacement pass never reparses labels again. Work is bounded by the
+    // existing bracket/depth cap, including nested image labels.
+    let explicit_label = |out: &[Inline]| {
+        if !infer_domains || !contains_link(&out[opener.out_pos + 1..]) {
+            return None;
+        }
+        let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
+        // No inferred domain can occur without a raw host separator. Keep
+        // already parsed ordinary labels rather than tokenize them twice.
+        crate::domain::has_host_separator(source).then(|| {
+            // A label is surrounded by bracket punctuation, not paragraph-edge
+            // whitespace. Preserve those bytes for emphasis flanking rules.
+            tokenize_inner(
+                source,
+                refs,
+                false,
+                Some((bytes[opener.input_pos], bytes[i])),
+            )
+        })
+    };
 
     // 1. Inline link: `](dest "title")`
     if bytes.get(i + 1) == Some(&b'(')
         && let Some((dest, title, end)) = parse_inline_link_suffix(bytes, i + 1)
     {
+        let replacement_children = explicit_label(out);
         if absorb_link(
             out,
             delims,
             opener_idx,
             dest,
             title,
+            replacement_children,
             last_bracket_delim,
             open_bracket_delims,
         ) {
@@ -862,12 +946,14 @@ fn try_close_bracket(
             && let Some(def) = refs.get(&crate::block::normalize_label(&label_raw))
         {
             let (dest, title) = (def.dest.clone(), def.title.clone());
+            let replacement_children = explicit_label(out);
             if absorb_link(
                 out,
                 delims,
                 opener_idx,
                 dest,
                 title,
+                replacement_children,
                 last_bracket_delim,
                 open_bracket_delims,
             ) {
@@ -882,12 +968,14 @@ fn try_close_bracket(
             let label = label_text(bytes, opener.input_pos + 1, i);
             if let Some(def) = refs.get(&crate::block::normalize_label(&label)) {
                 let (dest, title) = (def.dest.clone(), def.title.clone());
+                let replacement_children = explicit_label(out);
                 if absorb_link(
                     out,
                     delims,
                     opener_idx,
                     dest,
                     title,
+                    replacement_children,
                     last_bracket_delim,
                     open_bracket_delims,
                 ) {
@@ -910,12 +998,14 @@ fn try_close_bracket(
         && let Some(def) = refs.get(&crate::block::normalize_label(&label))
     {
         let (dest, title) = (def.dest.clone(), def.title.clone());
+        let replacement_children = explicit_label(out);
         if absorb_link(
             out,
             delims,
             opener_idx,
             dest,
             title,
+            replacement_children,
             last_bracket_delim,
             open_bracket_delims,
         ) {
@@ -1010,12 +1100,14 @@ fn label_text(b: &[u8], start: usize, end: usize) -> String {
 /// [`MAX_INLINE_NESTING_DEPTH`] (mdk#208). On refusal `out`/`delims`
 /// are left untouched so the caller can fall back to literal-text handling
 /// of the closing `]` after deactivating the refused opener.
+#[allow(clippy::too_many_arguments)] // Optional source-derived label avoids generated nested targets.
 fn absorb_link(
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
     opener_idx: usize,
     dest: String,
     title: Option<String>,
+    replacement_children: Option<Vec<Inline>>,
     last_bracket_delim: &mut Option<usize>,
     open_bracket_delims: &mut usize,
 ) -> bool {
@@ -1035,14 +1127,20 @@ fn absorb_link(
     // cap, refuse it and leave the delimiters as literal text. The probe is the
     // same iterative, early-pruning O(cap) walk used by process_emphasis, so it
     // neither overflows nor costs anything on ordinary input.
-    if nesting_depth_at_least(&out[opener.out_pos + 1..], MAX_INLINE_NESTING_DEPTH) {
+    if nesting_depth_at_least(
+        replacement_children
+            .as_deref()
+            .unwrap_or(&out[opener.out_pos + 1..]),
+        MAX_INLINE_NESTING_DEPTH,
+    ) {
         return false;
     }
 
     let kind_is_image = opener.kind == b'!';
     let classification = classify_link_destination(&dest);
     // Children = items after the placeholder.
-    let children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
+    let original_children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
+    let children = replacement_children.unwrap_or(original_children);
     // Drop the placeholder Text("[" / "![").
     out.pop();
     if kind_is_image {
@@ -1160,13 +1258,18 @@ const BARE_URL_PREFIXES: &[(&[u8], AutolinkKind)] = &[
     (b"www.", AutolinkKind::Www),
 ];
 
-/// True if the bytes starting at `i` begin with one of the recognized bare-URL
-/// prefixes. Used by the bulk-scan tripwire to keep ordinary text
-/// (every `d`/`h`/`m`/`t`/`w` byte in prose) on the fast path.
-fn looks_like_bare_url_start(bytes: &[u8], i: usize) -> bool {
-    BARE_URL_PREFIXES
-        .iter()
-        .any(|(prefix, _)| bytes.get(i..i + prefix.len()) == Some(*prefix))
+/// Find a bare URL prefix. Only `www.` is case-insensitive; explicit schemes
+/// retain their existing matching policy. Shared with the bulk-scan tripwire.
+fn bare_url_prefix(bytes: &[u8], i: usize) -> Option<(&'static [u8], AutolinkKind)> {
+    BARE_URL_PREFIXES.iter().copied().find(|(prefix, kind)| {
+        bytes.get(i..i + prefix.len()).is_some_and(|candidate| {
+            if *kind == AutolinkKind::Www {
+                candidate.eq_ignore_ascii_case(prefix)
+            } else {
+                candidate == *prefix
+            }
+        })
+    })
 }
 
 /// Try to consume a bare URL (no surrounding `<>`) starting at `i`. Matches
@@ -1186,10 +1289,7 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
     if prev == Some(b'<') {
         return None;
     }
-    let (prefix, kind) = BARE_URL_PREFIXES
-        .iter()
-        .copied()
-        .find(|(prefix, _)| bytes.get(i..i + prefix.len()) == Some(*prefix))?;
+    let (prefix, kind) = bare_url_prefix(bytes, i)?;
     let body_start = i + prefix.len();
     let mut j = body_start;
     while j < bytes.len() {
@@ -1210,7 +1310,7 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
     if j == body_start {
         return None;
     }
-    j = trim_trailing_punct(bytes, body_start, j);
+    j = trim_trailing_punct(bytes, body_start, j, false);
     if j == body_start {
         return None;
     }
@@ -1222,7 +1322,14 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
 /// - Always strip `.`, `,`, `;`, `:`, `!`, `?`, `*`, `_`, `~`.
 /// - Strip `)` only when the body has more `)` than `(` (so balanced parens
 ///   inside the URL — e.g. Wikipedia disambiguation links — are kept).
-fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
+/// - Inferred domains additionally strip terminal quote/Unicode prose punctuation;
+///   internal suffix punctuation remains URL data. Parentheses are counted once.
+pub(crate) fn trim_trailing_punct(
+    bytes: &[u8],
+    start: usize,
+    mut end: usize,
+    inferred_punctuation: bool,
+) -> usize {
     let mut opens = 0usize;
     let mut closes = 0usize;
     for &b in &bytes[start..end] {
@@ -1232,6 +1339,16 @@ fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
             _ => {}
         }
     }
+    let (mut wide_opens, mut wide_closes) = (0usize, 0usize);
+    if inferred_punctuation {
+        for scalar in bytes[start..end].windows(3) {
+            match scalar {
+                [0xef, 0xbc, 0x88] => wide_opens += 1,  // （
+                [0xef, 0xbc, 0x89] => wide_closes += 1, // ）
+                _ => {}
+            }
+        }
+    }
     while end > start {
         let c = bytes[end - 1];
         match c {
@@ -1239,6 +1356,31 @@ fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
             b')' if closes > opens => {
                 end -= 1;
                 closes -= 1;
+            }
+            b'\'' if inferred_punctuation => end -= 1,
+            b if inferred_punctuation && b >= 0x80 => {
+                // Decode only this final UTF-8 scalar, not the whole remaining
+                // token on every iteration. At most four bytes are visited.
+                let mut scalar_start = end - 1;
+                while scalar_start > start && bytes[scalar_start] & 0xc0 == 0x80 {
+                    scalar_start -= 1;
+                }
+                let Ok(scalar) = std::str::from_utf8(&bytes[scalar_start..end]) else {
+                    return end;
+                };
+                match scalar.chars().next() {
+                    Some('）') if wide_closes > wide_opens => {
+                        wide_closes -= 1;
+                        end = scalar_start;
+                    }
+                    Some('）') => return end,
+                    Some('（') => {
+                        wide_opens -= 1;
+                        end = scalar_start;
+                    }
+                    Some(c) if crate::domain::unicode_boundary(c) => end = scalar_start,
+                    _ => return end,
+                }
             }
             b')' => return end,
             _ => return end,
@@ -1433,14 +1575,24 @@ fn try_nostr_uri(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)> {
 // Emphasis / strong / strikethrough — the spec's process_emphasis algorithm.
 // ---------------------------------------------------------------------------
 
-fn classify_delim_run(bytes: &[u8], i: usize, ch: u8) -> (usize, bool, bool) {
+/// Apply delimiter flanking with the original neighbors of a sliced label.
+fn classify_delim_run(
+    bytes: &[u8],
+    i: usize,
+    ch: u8,
+    edges: Option<(u8, u8)>,
+) -> (usize, bool, bool) {
     let mut j = i;
     while j < bytes.len() && bytes[j] == ch {
         j += 1;
     }
     let len = j - i;
-    let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
-    let next = bytes.get(j).copied();
+    let prev = if i == 0 {
+        edges.map(|(left, _)| left)
+    } else {
+        Some(bytes[i - 1])
+    };
+    let next = bytes.get(j).copied().or(edges.map(|(_, right)| right));
     let prev_is_ws = prev.is_none_or(is_ascii_ws_for_flank);
     let next_is_ws = next.is_none_or(is_ascii_ws_for_flank);
     let prev_is_punct = prev.is_some_and(scanner::is_ascii_punct);

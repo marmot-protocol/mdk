@@ -370,3 +370,451 @@ fn malformed_bare_nostr_stays_text() {
     // back to a generic bare-URL autolink — it stays literal.
     assert_eq!(parse_inlines("nostr:foo"), vec![t("nostr:foo")]);
 }
+
+/// Delegated roots beyond common extensions must retain a distinct label and target.
+#[test]
+fn schemeless_domain_has_https_destination_and_original_label() {
+    for source in ["example.network", "example.chat", "example.photography"] {
+        let inlines = parse_inlines(source);
+        assert!(
+            matches!(inlines.as_slice(), [Inline::Link { dest, children, classification: LinkDestinationKind::Web, .. }]
+                if dest == &format!("https://{source}") && children == &vec![t(source)]),
+            "expected typed HTTPS destination and authored label for {source}: {inlines:?}"
+        );
+    }
+}
+
+fn domain_link(label: &str, dest: &str) -> Inline {
+    Inline::Link {
+        dest: dest.into(),
+        title: None,
+        children: vec![t(label)],
+        classification: LinkDestinationKind::Web,
+    }
+}
+
+/// Valid suffix bytes must survive inference without changing the destination path.
+#[test]
+fn schemeless_domain_preserves_label_and_url_components() {
+    for (source, expected) in [
+        (
+            "ExAmPlE.CHAT:8443/a_(b)?q=1&x=2#part",
+            "https://example.chat:8443/a_(b)?q=1&x=2#part",
+        ),
+        (
+            "example.chat/search?q=a,b",
+            "https://example.chat/search?q=a,b",
+        ),
+        ("example.chat/a;b", "https://example.chat/a;b"),
+        ("example.chat/a~b", "https://example.chat/a~b"),
+        (
+            "example.chat/search?q=a*b",
+            "https://example.chat/search?q=a*b",
+        ),
+        ("2nd-site.network", "https://2nd-site.network"),
+        ("example.photography", "https://example.photography"),
+    ] {
+        assert_eq!(parse_inlines(source), vec![domain_link(source, expected)]);
+    }
+    assert_eq!(
+        parse_inlines("See (example.chat)."),
+        vec![
+            t("See ("),
+            domain_link("example.chat", "https://example.chat"),
+            t(").")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("*example.chat*"),
+        vec![Inline::Emph(vec![domain_link(
+            "example.chat",
+            "https://example.chat"
+        )])]
+    );
+}
+
+/// Filename policy and malformed tokens must not acquire rescued URL suffixes.
+#[test]
+fn schemeless_domain_file_endings_and_invalid_contexts_remain_inert() {
+    for source in [
+        "report.pdf",
+        "README.md",
+        "archive.zip",
+        "ARCHIVE.ZIP",
+        "clip.mov",
+        "main.rs",
+        "script.py",
+        "setup.sh",
+        "parser.pl",
+        "Model.java",
+        "library.so",
+        "notes.md/path",
+        "photo.jpg",
+        "config.json",
+        "app.js",
+        "example.notarealtld",
+        "3.14",
+        "1.2.3",
+        "bad_label.example.chat",
+        "-bad.example.chat",
+        "bad-.chat",
+        "a..example.chat",
+        "user@example.chat",
+        "user:pass@example.chat",
+        "custom:example.chat",
+        "javascript:example.chat",
+        "./example.chat",
+        "../example.chat",
+        "/example.chat",
+        "dir/example.chat",
+        "C:\\example.chat",
+        "example.chat:70000",
+        "example.chat:abc",
+        "xn--.chat",
+        "nsec1qqqqqq.chat",
+        "ncryptsec1qqqqqq.chat",
+        "ｎｓｅｃ１qqqqqq.chat",
+        "nｓec1qqqqqq.chat",
+        "ｎｃｒｙｐｔｓｅｃ１qqqqqq.chat",
+        "ｎｐｕｂ１qqqqqq.chat",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source}");
+    }
+}
+
+/// Explicit Markdown syntax owns its labels and code before fuzzy recognition.
+#[test]
+fn schemeless_domain_does_not_override_authored_links_code_or_escapes() {
+    let expected = vec![domain_link("example.chat", "https://other.example")];
+    for label in [
+        "example.chat",
+        "example。chat",
+        "example．chat",
+        "example｡chat",
+        "bücher.de",
+    ] {
+        assert_eq!(
+            parse_inlines(&format!("[{label}](https://other.example)")),
+            vec![domain_link(label, "https://other.example")]
+        );
+    }
+    assert_eq!(
+        parse_inlines("[example.chat][target]\n\n[target]: https://other.example"),
+        expected
+    );
+    for source in ["`example.chat`", "example\\.chat", "example&#46;chat"] {
+        let expected = if source.starts_with('`') {
+            Inline::Code("example.chat".into())
+        } else {
+            t("example.chat")
+        };
+        assert_eq!(parse_inlines(source), vec![expected], "{source}");
+    }
+    assert_eq!(
+        parse_inlines("[example.chat]"),
+        vec![
+            t("["),
+            domain_link("example.chat", "https://example.chat"),
+            t("]")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("![example.chat](image.png)"),
+        vec![Inline::Image {
+            dest: "image.png".into(),
+            title: None,
+            alt: vec![t("example.chat")],
+            classification: LinkDestinationKind::Relative
+        }]
+    );
+    assert_eq!(
+        parse_inlines("https://example.zip"),
+        vec![uri("https://example.zip")]
+    );
+    assert_eq!(
+        parse_inlines("www.example.zip"),
+        vec![www("www.example.zip")]
+    );
+}
+
+/// Canonical targets must reveal IDNs while the visible label remains authored text.
+#[test]
+fn schemeless_domain_idna_exposes_actual_host_without_rewriting_the_label() {
+    for (source, dest) in [
+        ("bücher.de", "https://xn--bcher-kva.de"),
+        ("пример.рф", "https://xn--e1afmkfd.xn--p1ai"),
+        ("例子.中国", "https://xn--fsqu00a.xn--fiqs8s"),
+        ("ｅxample.chat", "https://example.chat"),
+    ] {
+        assert_eq!(parse_inlines(source), vec![domain_link(source, dest)]);
+    }
+    for source in [
+        "еxample.chat", // Cyrillic e mixed with Latin letters.
+        "ex\u{200b}ample.chat",
+        "ex\u{00ad}ample.chat",
+        "ex\u{202e}ample.chat",
+        "example.chat/\u{2066}hidden",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source:?}");
+    }
+}
+
+/// Overlong host rejection must retain bounded progress through the whole token.
+#[test]
+fn schemeless_domain_rejects_whole_overlong_tokens_without_suffix_rescue() {
+    for source in [
+        format!("{}.example.chat", "a".repeat(64)),
+        format!("{}example.chat", "a.".repeat(10000)),
+    ] {
+        assert_eq!(parse_inlines(&source), vec![t(&source)]);
+    }
+}
+
+/// A URL scanner must not consume the backslash that protects a Markdown delimiter.
+#[test]
+fn schemeless_domain_backslashes_preserve_markdown_escape_precedence() {
+    for suffix in ["/", "?q=", "#"] {
+        for escaped in ['`', '[', ']', '<', '>', '\"', '\\', '\''] {
+            let source = format!("example.chat{suffix}\\{escaped}x");
+            let expected = format!("example.chat{suffix}{escaped}x");
+            assert_eq!(parse_inlines(&source), vec![t(&expected)], "{source:?}");
+        }
+    }
+    assert_eq!(
+        parse_inlines(r"example.chat/\`x`"),
+        vec![t("example.chat/`x`")]
+    );
+    assert_eq!(
+        parse_inlines(r"example.chat/\[x](https://other.example)"),
+        vec![t("example.chat/[x]("), uri("https://other.example"), t(")")]
+    );
+    assert_eq!(
+        parse_inlines(r"[example.chat/\](https://other.example)"),
+        vec![t("[example.chat/]("), uri("https://other.example"), t(")")]
+    );
+}
+
+/// Suffix data follows opaque URL semantics, including entity and math-looking bytes.
+#[test]
+fn schemeless_domain_url_suffixes_keep_entities_and_math_literal() {
+    for source in ["example.chat/?a=1&amp;b=2", "example.chat/$x$"] {
+        assert_eq!(
+            parse_inlines(source),
+            vec![domain_link(source, &format!("https://{source}"))]
+        );
+        let qualified = format!("https://{source}");
+        assert_eq!(parse_inlines(&qualified), vec![uri(&qualified)]);
+    }
+}
+
+/// Rebuilding a label must preserve the bracket neighbors used by the rule of three.
+#[test]
+fn schemeless_domain_label_reparse_preserves_bracket_flanking() {
+    for label in ["**.a.b*", "*.a.b**", "**.example.chat*", "*.example.chat**"] {
+        for source in [
+            format!("[{label}](x)"),
+            format!("![{label}](x)"),
+            format!("[{label}][ref]\n\n[ref]: x"),
+            format!("![{label}][ref]\n\n[ref]: x"),
+        ] {
+            let inlines = parse_inlines(&source);
+            let children = match &inlines[..] {
+                [Inline::Link { children, .. }] => children,
+                [Inline::Image { alt, .. }] => alt,
+                other => panic!("unexpected tree for {source:?}: {other:?}"),
+            };
+            assert_eq!(children, &vec![t(label)], "{source:?}");
+        }
+    }
+}
+
+/// Unspaced prose and ideographic sentence stops must not synthesize a new hostname.
+#[test]
+fn schemeless_domains_do_not_absorb_unspaced_prose_or_sentence_stops() {
+    for source in [
+        "请访问example.chat",
+        "詳しくはexample.com",
+        "ไปที่example.com",
+        "네이버naver.com",
+        "ចូលexample.com",
+        "ເຂົ້າexample.com",
+        "သွားexample.com",
+        "ーexample.com",
+        "谢谢。我爱你",
+        "ありがとう。みんな",
+        "收到。公司",
+        "good。It",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source:?}");
+    }
+    assert_eq!(
+        parse_inlines("访问www.example.com"),
+        vec![t("访问"), www("www.example.com")]
+    );
+    assert_eq!(
+        parse_inlines("foo。bar.com"),
+        vec![t("foo。"), domain_link("bar.com", "https://bar.com")]
+    );
+}
+
+/// Internal path apostrophes differ from quotation marks surrounding the whole token.
+#[test]
+fn schemeless_domains_keep_internal_apostrophes_and_surrounding_punctuation() {
+    for label in [
+        "example.chat/O'Reilly",
+        "example.chat/?q=O'Reilly",
+        "example.chat/#O'Reilly",
+    ] {
+        assert_eq!(
+            parse_inlines(label),
+            vec![domain_link(label, &format!("https://{label}"))]
+        );
+        let quoted = format!("'{label}'");
+        assert_eq!(
+            parse_inlines(&quoted),
+            vec![
+                t("'"),
+                domain_link(label, &format!("https://{label}")),
+                t("'")
+            ]
+        );
+    }
+    for source in [
+        "O'Reilly.com",
+        "O’Reilly.com",
+        "it's.me",
+        "I can't.Do",
+        "l‘example.fr",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source:?}");
+    }
+    for (left, right) in [
+        ("“", "”"),
+        ("‘", "’"),
+        ("「", "」"),
+        ("【", "】"),
+        ("（", "）"),
+        ("", "，"),
+        ("", "。"),
+        ("", "’s"),
+    ] {
+        let source = format!("{left}example.chat{right}");
+        let mut expected = Vec::new();
+        if !left.is_empty() {
+            expected.push(t(left));
+        }
+        expected.push(domain_link("example.chat", "https://example.chat"));
+        expected.push(t(right));
+        assert_eq!(parse_inlines(&source), expected, "{source:?}");
+    }
+}
+
+/// Capitalization must preserve explicit www intent even on excluded or unknown roots.
+#[test]
+fn schemeless_domains_accept_capitalized_www_without_changing_lowercase_www() {
+    for label in [
+        "Www.example.com",
+        "WWW.EXAMPLE.COM",
+        "Www.example.zip",
+        "WWW.example.invalid",
+    ] {
+        assert_eq!(parse_inlines(label), vec![www(label)]);
+    }
+    assert_eq!(
+        parse_inlines("www.example.com"),
+        vec![www("www.example.com")]
+    );
+}
+
+/// Finite filename exclusions cannot classify every domain-shaped word or file.
+#[test]
+fn schemeless_domains_document_finite_filename_and_typo_tradeoffs() {
+    for label in [
+        "main.cc",
+        "main.tf",
+        "proguard-rules.pro",
+        "gradle.properties",
+        "Android.mk",
+        "Xcode.app",
+        "Done.Now",
+        "Ok.No",
+    ] {
+        assert_eq!(
+            parse_inlines(label),
+            vec![domain_link(
+                label,
+                &format!("https://{}", label.to_ascii_lowercase())
+            )],
+            "{label:?}"
+        );
+    }
+    for label in [
+        "docs.rs",
+        "allegro.pl",
+        "notion.so",
+        "brew.sh",
+        "document.pdf",
+        "README.md",
+        "archive.zip",
+        "访问ｅｘａｍｐｌｅ.chat",
+        "访问bücher.de",
+        "访问１.com",
+        "访问𝕒.com",
+    ] {
+        assert_eq!(parse_inlines(label), vec![t(label)], "{label:?}");
+    }
+    assert_eq!(
+        parse_inlines("Date.now()"),
+        vec![domain_link("Date.now", "https://date.now"), t("()")]
+    );
+}
+
+/// Suffix punctuation remains data, and long terminal quote clusters trim in one pass.
+#[test]
+fn schemeless_domains_preserve_internal_unicode_suffix_punctuation() {
+    for label in [
+        "example.chat/你好，世界",
+        "example.chat/?q=甲：乙",
+        "example.chat/“quoted”/path",
+    ] {
+        assert_eq!(
+            parse_inlines(label),
+            vec![domain_link(label, &format!("https://{label}"))]
+        );
+    }
+    let suffix = "',".repeat(32_000);
+    let source = format!("example.chat/path{suffix}");
+    assert_eq!(
+        parse_inlines(&source),
+        vec![
+            domain_link("example.chat/path", "https://example.chat/path"),
+            t(&suffix)
+        ]
+    );
+}
+
+/// A prior sentence-like label must not bypass the guard on a later host label.
+#[test]
+fn schemeless_domains_guard_all_labels() {
+    for text in ["好的.请访问example.com", "收到.见example.com"] {
+        assert_eq!(parse_inlines(text), vec![t(text)]);
+    }
+}
+
+/// Fullwidth parentheses in a suffix follow the same balance rule as ASCII ones.
+#[test]
+fn schemeless_domains_balance_fullwidth_path_parens() {
+    let label = "example.chat/甲（乙）";
+    assert_eq!(
+        parse_inlines(label),
+        vec![domain_link(label, &format!("https://{label}"))]
+    );
+    assert_eq!(
+        parse_inlines(&format!("（{label}）")),
+        vec![
+            t("（"),
+            domain_link(label, &format!("https://{label}")),
+            t("）")
+        ]
+    );
+}

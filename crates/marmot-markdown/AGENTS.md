@@ -7,8 +7,8 @@ Markdown parser and typed AST for app message rendering. For the human overview,
 
 - Keep this crate independent from CGKA engine, storage, transport, and runtime state.
 - Parse plaintext message content into a display-oriented AST only; do not define wire format or persistence policy here.
-- Keep the parser dependency-light. Runtime dependencies should stay limited to `serde` unless a deliberate
-  parser-design change is made. `serde_json` is a dev-dependency only. `unsafe_code` is forbidden.
+- Keep the parser dependency-light. Runtime dependencies are `serde`, `idna` (strict
+  internationalized-host validation) and `unicode-script` (mixed-script host-label ambiguity); avoid adding a URL/network stack. `serde_json` is a dev-dependency only. `unsafe_code` is forbidden.
 - Preserve nostr-aware inline handling and reject ergonomic rendering for private-key entities.
 - Add parser behavior with golden/unit coverage before exposing it through FFI (`marmot-app` / `marmot-uniffi`).
 
@@ -20,6 +20,7 @@ Markdown parser and typed AST for app message rendering. For the human overview,
 - `src/details.rs` — bounded `<details>` / `<summary>` grammar.
 - `src/destination.rs` — untrusted link-destination classification.
 - `src/nostr.rs` — bech32 shape validation and HRP classification (shape only, no checksum).
+- `src/domain.rs` handles offline bare-domain inference and filename exceptions; `src/iana-tlds.txt` holds the reviewed root snapshot.
 - `src/entity.rs` — HTML entity decoding. `src/scanner.rs` — shared byte-level scanning helpers.
 - `tests/golden/` — `*.md` inputs with `*.json` expected ASTs; `tests/unit_*.rs`, `tests/spec*.rs` — focused coverage.
 
@@ -30,3 +31,13 @@ cargo test -p marmot-markdown
 # Regenerate golden fixtures only for an intentional output change, then review the diff:
 MARMOT_MD_UPDATE_GOLDEN=1 cargo test -p marmot-markdown --test golden
 ```
+
+## Root snapshot maintenance
+
+Download the complete ASCII TLD list from IANA's official delegated-root endpoint
+linked in README.md. Compare the source version/date and full downloaded bytes,
+then replace `src/iana-tlds.txt` and review the resulting diff before committing.
+Keep its original header and final newline. Run the embedded-root invariant test
+and parser regressions. Sorted-label checks establish syntax, not completeness or
+source authenticity. Verify completeness against the official download.
+Do not fetch registry data during parsing or builds.

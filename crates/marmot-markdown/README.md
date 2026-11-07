@@ -13,7 +13,7 @@ engine behavior.
 - Parses local-time timestamps into `Inline::Timestamp` with Unix seconds and a typed display style.
 - Does not parse general HTML. Tag-like sequences stay literal text; only autolinks, timestamps and the `<details>` extension get
   structured treatment.
-- Keeps dependencies minimal (`serde` only in normal builds).
+- Uses `serde`, strict host validation through `idna`, and Unicode script properties for conservative prose boundaries.
 
 ```rust
 use marmot_markdown::{Block, parse};
@@ -24,9 +24,10 @@ assert!(matches!(doc.blocks.as_slice(), [Block::Heading { level: 1, .. }]));
 
 ## Renderer security contract
 
-Message Markdown and every link destination are untrusted. The parser preserves destinations instead of deleting or
-rewriting them, and annotates links, images, and autolinks with `LinkDestinationKind`. That classification is context
-for client policy; it is not authorization to navigate or fetch.
+Message Markdown and every link destination are untrusted. After Markdown decoding, explicit destinations retain
+their spelling in the AST. Inferred bare domains carry the original visible label and an HTTPS destination with a
+validated ASCII host. Links, images and autolinks also carry `LinkDestinationKind`. This classification informs client
+policy; opening or fetching still requires a client decision.
 
 Renderers **must inspect `classification` before making a destination actionable**. In particular:
 
@@ -128,3 +129,50 @@ Golden fixtures under `tests/golden/` lock parser output. After an intentional o
 `MARMOT_MD_UPDATE_GOLDEN=1 cargo test -p marmot-markdown --test golden`, review the diff, and re-run without the variable.
 
 See [`AGENTS.md`](AGENTS.md) for scope and invariants.
+
+## Scheme-less web domains
+
+Bare domains with a delegated IANA root become `Inline::Link` nodes: the label
+preserves the source spelling and `dest` contains an HTTPS URL with an IDNA-validated
+ASCII host. Root recognition is an offline display heuristic, not evidence that a
+site exists or is safe. Explicit Markdown links, code and escapes take precedence.
+As with scheme-qualified autolinks, entities and math syntax inside an inferred
+URL suffix remain literal URL data. Internal suffix punctuation is retained; terminal
+quote and sentence punctuation is excluded. Balanced ASCII and fullwidth parentheses
+remain part of the suffix. This extra punctuation trimming applies only to inferred URLs.
+A token containing a backslash is not inferred.
+
+Bare `.pdf`, `.md`, `.zip`, `.mov`, `.py`, `.rs`, `.sh`, `.pl`, `.java` and `.so`
+names remain text, case-insensitively, even when the ending is a delegated root. This applies to bare inference only: an explicit
+`https://` URL, case-insensitive `www.` address or Markdown link still expresses navigation intent.
+Other ordinary file extensions absent from the root list also remain text.
+
+Controls, bidirectional formatting controls and default-ignorable formatting
+characters are rejected in inferred destinations.
+IDNA does not detect all lookalike domains. Renderers must retain their labelled-link
+confirmation policy, show the actual ASCII authority when confirming an IDN, and
+never replace confusable characters with a guessed Latin destination. Existing
+explicit URLs retain their original parsing/classification contract.
+
+Bare inference uses ASCII periods between host labels. Ideographic/fullwidth stops
+and common Unicode quotes, brackets and sentence punctuation delimit prose. A host
+label mixing Latin letters or ASCII digits with letters or digits of another script
+stays text: the parser cannot safely distinguish glued prose (`네이버naver.com`) or a
+lookalike (`еxample.chat` with Cyrillic `е`) from a real mixed-script domain. It does
+not guess a different ASCII suffix. Explicit URLs remain available for those hosts.
+Accented Latin and pure Unicode IDNs with ASCII periods remain supported. An
+apostrophe after a letter or digit stays inside the word, so `O'Reilly.com` and
+`it's.me` remain text instead of linking `reilly.com` or `s.me`.
+
+The filename exceptions prioritize common document, archive, source, video and
+shared-library names. They are a finite display policy, not file-type detection:
+`main.cc` and `Xcode.app` still look like domains, while bare `docs.rs` and `notion.so`
+remain text. Use an explicit URL when navigation is intended. Missing spaces and code
+outside code spans can also resemble domains: `Done.Now`, `Ok.No` and `Date.now()`
+are intentionally inferred according to the same root rule.
+
+The bundled [root snapshot](src/iana-tlds.txt) comes from
+[IANA's delegated-TLD list](https://data.iana.org/TLD/tlds-alpha-by-domain.txt).
+Its header records the version/date. Builds and message parsing use it offline;
+newly delegated roots require a reviewed snapshot update. Explicit links remain
+usable before that update. Maintainer steps are in [AGENTS.md](AGENTS.md).

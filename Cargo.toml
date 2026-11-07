@@ -106,6 +106,8 @@ unicode-segmentation = "1"
 rand = "0.8"
 sha2 = "0.10"
 url = "2"
+idna = "1.1"
+unicode-script = "0.5.9"
 psl = "2"
 chacha20poly1305 = "0.10"
 # Device pairing's ephemeral key agreement. Already in the tree through
