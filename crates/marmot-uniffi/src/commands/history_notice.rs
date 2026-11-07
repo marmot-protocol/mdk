@@ -27,7 +27,7 @@ impl Marmot {
     /// The account's recovery status: the groups whose history is still
     /// being fetched, whether the inbox's is, and every notice as
     /// `history_notices` lists them. Refresh on `RecoveryStatusChanged`.
-    /// Until the recovery runner owns history, nothing is ever catching up.
+    /// The recovery runner supplies the catching-up groups and inbox.
     pub async fn account_recovery_status(
         &self,
         account_ref: String,

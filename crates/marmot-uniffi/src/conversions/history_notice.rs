@@ -3,11 +3,11 @@
 
 use marmot_app::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 
-/// Why recovery parked; choose the host's wording from it. Current policy
-/// parks only the first five. `KnownEvent` and `MaintenanceBoundary` are
-/// reserved so exhaustive switches stay source-compatible if a later policy
-/// parks them, and `UnprovenHistory` is not raised until the recovery runner
-/// owns history (mdk#2660).
+/// Why recovery parked; choose the host's wording from it. Current epoch-gap
+/// exhaustion emits `EpochGap`; the coverage ledger emits `UnprovenHistory`
+/// without attributing the original reason its route's history was owed. Other
+/// labels preserve compatibility; `KnownEvent` and `MaintenanceBoundary` remain
+/// reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HistoryNoticeCauseFfi {
     /// Deliveries were dropped from a full account queue, or spilled rows
@@ -77,8 +77,8 @@ impl From<HistoryNotice> for HistoryNoticeFfi {
 }
 
 /// The account's recovery: what is still being fetched, and every "history
-/// may be incomplete" notice. Re-read on `RecoveryStatusChanged`. Until the
-/// recovery runner owns history (mdk#2660), nothing is ever catching up.
+/// may be incomplete" notice. Re-read on `RecoveryStatusChanged`; the recovery
+/// runner supplies the groups and inbox whose history it is still fetching.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AccountRecoveryStatusFfi {
     /// Groups whose history is still being fetched, as lowercase hex group
@@ -96,6 +96,30 @@ impl From<AccountRecoveryStatus> for AccountRecoveryStatusFfi {
             catching_up_group_ids_hex: value.catching_up_group_ids_hex,
             inbox_catching_up: value.inbox_catching_up,
             notices: value.notices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_recovery_notice_causes_keep_their_host_choices() {
+        // Own the epoch-gap exhaustion and coverage-ledger writer outputs.
+        // Compatibility readers and reserved labels retain their mappings,
+        // without a current-writer or migration-runtime claim here.
+        for (native, expected) in [
+            (
+                HistoryNoticeCause::EpochGap,
+                HistoryNoticeCauseFfi::EpochGap,
+            ),
+            (
+                HistoryNoticeCause::UnprovenHistory,
+                HistoryNoticeCauseFfi::UnprovenHistory,
+            ),
+        ] {
+            assert_eq!(HistoryNoticeCauseFfi::from(native), expected);
         }
     }
 }

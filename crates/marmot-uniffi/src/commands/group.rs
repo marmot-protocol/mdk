@@ -1560,7 +1560,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn app_component_ffi_roundtrip() {
+    async fn app_component_and_key_package_status_ffi_roundtrip() {
         let relay = MockRelay::run().await.unwrap();
         let url = relay.url().await.to_string();
         let root = tempfile::tempdir().unwrap();
@@ -1587,6 +1587,136 @@ mod tests {
             .unwrap()
             .account
             .account_id_hex;
+        // Reuse this genuine identity publication for the summary's opaque
+        // KeyPackage and signed event. This is a conversion contrast, not a
+        // second key generation/publication or a replay of native lifecycle proof.
+        let published = kit
+            .runtime
+            .key_package_maintenance_status(&account)
+            .await
+            .unwrap()
+            .expect("identity published a KeyPackage");
+        let artifact = published.authored_signed_event.clone().unwrap();
+        let expected_event = hex::encode(artifact.id.as_slice());
+        let targets: Vec<_> = [
+            (cgka_traits::TransportFanoutAttemptState::Accepted, 1),
+            (cgka_traits::TransportFanoutAttemptState::Unattempted, 2),
+            (cgka_traits::TransportFanoutAttemptState::AttemptedFailed, 3),
+            (
+                cgka_traits::TransportFanoutAttemptState::PolicyProhibited,
+                4,
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(state, count)| {
+            (0..count).map(move |index| {
+                let attempted = matches!(
+                    state,
+                    cgka_traits::TransportFanoutAttemptState::Accepted
+                        | cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+                        | cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+                );
+                cgka_traits::TransportFanoutTarget {
+                    endpoint: TransportEndpoint(format!("wss://{state:?}-{index}.example")),
+                    state,
+                    attempt_count: u32::from(attempted),
+                    last_attempt_at: attempted.then_some(artifact.created_at),
+                    failure_code: match state {
+                        cgka_traits::TransportFanoutAttemptState::AttemptedFailed => {
+                            Some("publish_failed".into())
+                        }
+                        cgka_traits::TransportFanoutAttemptState::PolicyProhibited => {
+                            Some("endpoint_removed_from_policy".into())
+                        }
+                        _ => None,
+                    },
+                }
+            })
+        })
+        .collect();
+        let mut current = published.clone();
+        current.phase = cgka_traits::MaintenancePhase::Fanout;
+        current.publication_targets = targets;
+        let summary = KeyPackageMaintenanceStatusFfi::from(current);
+        assert_eq!(
+            (
+                summary.accepted_fanout_targets,
+                summary.unattempted_fanout_targets,
+                summary.failed_fanout_targets,
+                summary.policy_prohibited_fanout_targets
+            ),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(
+            (
+                summary.pending_event_id_hex,
+                summary.pending_attempt_count,
+                summary.pending_last_failure_code
+            ),
+            (None, 0, None)
+        );
+        let mut pending =
+            cgka_traits::KeyPackageLifecycleState::slot_only(published.stable_slot_id);
+        pending.phase = cgka_traits::MaintenancePhase::Retry;
+        pending.pending_replacement = Some(cgka_traits::PendingKeyPackageReplacement {
+            generation_revision: published.generation_revision,
+            key_package: published.current_key_package.unwrap(),
+            key_package_ref: published.current_key_package_ref.unwrap(),
+            authored_created_at: artifact.created_at,
+            not_before: published.current_not_before.unwrap(),
+            not_after: published.current_not_after.unwrap(),
+            refresh_at: published.refresh_at.unwrap(),
+            signed_event: Some(artifact),
+            targets: published
+                .publication_targets
+                .into_iter()
+                .map(|mut target| {
+                    // Every configured endpoint was attempted; a still-pending
+                    // failed publication has no accepted or unattempted target.
+                    target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
+                    target.attempt_count = 1;
+                    target.failure_code = Some("publish_failed".into());
+                    target
+                })
+                .collect(),
+            attempt_count: 1,
+            last_failure_code: Some("publish_failed".into()),
+            consumed_at: None,
+        });
+        let summary = KeyPackageMaintenanceStatusFfi::from(pending.clone());
+        assert_eq!(
+            (
+                summary.pending_event_id_hex,
+                summary.pending_attempt_count,
+                summary.pending_last_failure_code
+            ),
+            (Some(expected_event), 1, Some("publish_failed".into()))
+        );
+        pending.phase = cgka_traits::MaintenancePhase::PendingPublication;
+        let unsigned = pending.pending_replacement.as_mut().unwrap();
+        unsigned.signed_event = None;
+        unsigned.attempt_count = 0;
+        unsigned.last_failure_code = None;
+        // Before signing, no transport target has been attempted.
+        for target in &mut unsigned.targets {
+            target.state = cgka_traits::TransportFanoutAttemptState::Unattempted;
+            target.attempt_count = 0;
+            target.last_attempt_at = None;
+            target.failure_code = None;
+        }
+        let summary = KeyPackageMaintenanceStatusFfi::from(pending);
+        assert_eq!(
+            summary.phase,
+            crate::conversions::MaintenancePhaseFfi::PendingPublication
+        );
+        assert_eq!(
+            (
+                summary.pending_event_id_hex,
+                summary.pending_attempt_count,
+                summary.pending_last_failure_code
+            ),
+            (None, 0, None)
+        );
         let group = kit
             .create_group(account.clone(), "components".into(), vec![], None)
             .await

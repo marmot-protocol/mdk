@@ -601,8 +601,9 @@ disappear and return.
 `marmot_account_recovery_status` writes an owned `MarmotAccountRecoveryStatus`: the groups still catching up
 (`catching_up_group_ids_hex`/`catching_up_group_ids_hex_len`), `inbox_catching_up`, and every notice
 (`notices`/`notices_len`); free it with `marmot_account_recovery_status_free` and re-read it on
-`MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. Nothing is catching up, and neither that event nor
-`MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY` is produced, until the recovery runner owns history (mdk#2660).
+`MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. The recovery runner supplies the catching-up fields.
+Current epoch-gap exhaustion emits `MARMOT_HISTORY_NOTICE_CAUSE_EPOCH_GAP`; coverage-ledger parks emit
+`MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY`. Other cause labels preserve compatibility.
 Group changes for a group whose unresolved epoch-gap recovery covers its current local epoch
 return `MARMOT_STATUS_GROUP_CATCHING_UP`. Retry after it syncs, or, once the user accepts that
 the change may split the group, call `marmot_acknowledge_group_catching_up` and retry. See the
