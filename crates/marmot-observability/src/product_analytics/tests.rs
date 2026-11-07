@@ -2173,7 +2173,9 @@ async fn delivery_worker_replaces_connectivity_samples_from_actual_sdk_health() 
         .await
         .expect("the worker must sample health before the window is sealed");
         collector.activity(ProductAnalyticsActivity::AccountChanged);
-        collector.send_pending().await;
+        tokio::time::timeout(Duration::from_secs(5), collector.send_pending())
+            .await
+            .expect("the sampled batch must send without waiting on the parked worker");
         let batch = tokio::time::timeout(Duration::from_secs(5), received.recv())
             .await
             .unwrap()
