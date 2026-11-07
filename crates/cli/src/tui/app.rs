@@ -63,12 +63,11 @@ pub(crate) struct TuiApp {
     /// zero count leaves it clear. Cleared before the call and re-armed on error
     /// like `pending_chat_relist`, so a failure retries next tick, not forever.
     pub(crate) pending_mark_read: bool,
-    /// The group id of the most recently requested open-chat / flick-through
-    /// timeline load. A `LoadTimeline` result is folded only while its group
-    /// still matches this (the subscription-style stale guard); a later open
-    /// supersedes an earlier one that has not landed yet. `None` when the pane
-    /// is settled.
-    pub(crate) loading_chat: Option<String>,
+    /// The account and group of the most recently requested open-chat /
+    /// flick-through timeline load. Only that target's result can settle the
+    /// pending load; a later open supersedes an earlier one that has not landed
+    /// yet. `None` when the pane is settled.
+    pub(crate) loading_chat: Option<(String, String)>,
     /// The query of the most recently requested user search, or `None` when no
     /// search is outstanding. A `UserSearch` result is folded only while its
     /// query still matches (the same stale guard as `loading_chat`).
@@ -904,7 +903,9 @@ impl TuiApp {
         let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
             return;
         };
-        if self.messages_group_id.as_deref() == Some(group_id.as_str()) {
+        if self.messages_account_id.as_deref() == Some(account_id.as_str())
+            && self.messages_group_id.as_deref() == Some(group_id.as_str())
+        {
             return;
         }
         self.begin_timeline_load(account_id, group_id);
@@ -964,6 +965,11 @@ impl TuiApp {
                 // live subscription keeps it current). A load still in flight, a
                 // different highlighted chat, or an empty pane still (re)loads.
                 let already_settled = self.loading_chat.is_none()
+                    && self.messages_account_id.is_some()
+                    && self
+                        .selected_account_row()
+                        .map(|account| account.account_id.as_str())
+                        == self.messages_account_id.as_deref()
                     && self.messages_group_id.is_some()
                     && self.selected_chat_row().map(|chat| chat.group_id.as_str())
                         == self.messages_group_id.as_deref();

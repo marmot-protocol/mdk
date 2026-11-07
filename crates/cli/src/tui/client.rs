@@ -2247,20 +2247,23 @@ impl TuiApp {
     }
 
     /// Reset the pane to a loading state (only when switching to a different
-    /// group, so a same-chat reload never flashes empty), tag the pending target
-    /// for the stale guard, and queue the timeline load.
+    /// account/group, so a same-chat reload never flashes empty), tag the pending
+    /// target for the stale guard, and queue the timeline load.
     pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
         // Any explicit or fired load supersedes a pending flick-through preview.
         self.flick_countdown = None;
-        if self.messages_group_id.as_deref() != Some(group_id.as_str()) {
+        if self.messages_account_id.as_deref() != Some(account_id.as_str())
+            || self.messages_group_id.as_deref() != Some(group_id.as_str())
+        {
             // Drop the prior chat's pane and its per-group subscriptions so their
             // drains cannot pollute the pane while the new chat loads.
             self.clear_timeline_pane();
+            self.messages_account_id = None;
             self.messages_group_id = None;
             self.group_state_subscription = None;
             self.group_diagnostics = None;
         }
-        self.loading_chat = Some(group_id.clone());
+        self.loading_chat = Some((account_id.clone(), group_id.clone()));
         self.status = "loading chat...".to_owned();
         self.effects.enqueue(Effect::LoadTimeline {
             account: account_id,
@@ -2269,15 +2272,22 @@ impl TuiApp {
     }
 
     /// Fold a completed timeline load into the pane, exactly as the synchronous
-    /// path did after its `run_json` returned — but dropping a result whose group
-    /// no longer matches the pending target (a newer open superseded it).
+    /// path did after its `run_json` returned — but dropping a result whose
+    /// account/group no longer matches the pending target (a newer open
+    /// superseded it).
     fn fold_load_timeline(
         &mut self,
         account: String,
         group: String,
         result: Result<Vec<Value>, String>,
     ) {
-        if self.loading_chat.as_deref() != Some(group.as_str()) {
+        if !self
+            .loading_chat
+            .as_ref()
+            .is_some_and(|(pending_account, pending_group)| {
+                pending_account == &account && pending_group == &group
+            })
+        {
             // A newer load (an explicit open or a fired preview) already claimed
             // the pane; leave `loading_chat` pointing at that pending target so
             // this stale fold cannot cancel it.
@@ -2306,7 +2316,9 @@ impl TuiApp {
                 return;
             }
         };
-        if self.messages_group_id.as_deref() == Some(group.as_str()) {
+        if self.messages_account_id.as_deref() == Some(account.as_str())
+            && self.messages_group_id.as_deref() == Some(group.as_str())
+        {
             // Same-chat reload: the pane and its timeline subscription stayed live
             // (a different-chat open clears them and reloads fresh, so a stale
             // fold there is harmless). A subscription insert may have landed
