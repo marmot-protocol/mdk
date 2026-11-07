@@ -6233,7 +6233,25 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .unwrap();
     assert!(matches!(send_result, SendResult::ApplicationMessage { .. }));
 
-    advance_selfremove_auto_commit(&mut carol, &group_id, &clock).await;
+    let due = carol
+        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+        .unwrap()
+        .expect("the authenticated departure has a real deadline");
+    clock.advance_ms(due);
+    let due_payload = app_payload_for(&carol, b"hello at the selfremove deadline");
+    let due_event_id = MarmotAppEvent::decode(&due_payload).unwrap().id;
+    let due_send = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: due_payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(due_send, SendResult::Queued { .. }),
+        "a due automatic Commit must precede the send's own wire: {due_send:?}"
+    );
 
     // Carol now has a projected pending epoch/member set, but the commit is not
     // canonical until its publish obligation is confirmed.
@@ -6245,10 +6263,12 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
     // is pending publication, but the payload is retained rather than refused:
     // she observed someone else's departure, and that must not cost her the
     // message she is typing.
+    let retained_payload = app_payload_for(&carol, b"hello after observing a proposal");
+    let retained_event_id = MarmotAppEvent::decode(&retained_payload).unwrap().id;
     let retained = carol
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
-            payload: app_payload_for(&carol, b"hello after observing a proposal"),
+            payload: retained_payload,
             expected_epoch: None,
         })
         .await;
@@ -6262,10 +6282,21 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
 
     // Resolving the publish releases the retained payload.
     let released = carol.advance_convergence(&group_id).await.unwrap();
-    assert!(
-        matches!(released.as_slice(), [SendResult::ApplicationMessage { .. }]),
-        "the retained message should be released after confirm; got {released:?}"
-    );
+    let released_ids = released
+        .iter()
+        .map(|result| match result {
+            SendResult::ApplicationMessage {
+                app_event_id,
+                source_epoch,
+                ..
+            } => {
+                assert_eq!(source_epoch.0, 2);
+                app_event_id.clone()
+            }
+            other => panic!("only retained applications release after confirm: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(released_ids, vec![due_event_id, retained_event_id]);
 
     let send_result = carol
         .send(SendIntent::AppMessage {
