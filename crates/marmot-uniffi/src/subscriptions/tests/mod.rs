@@ -61,16 +61,26 @@ fn cached_conversion_reuses_unchanged_rows_and_never_serves_stale_content() {
 
     let first = convert_timeline_page_cached(
         &cache,
-        page(vec![record("m1", "hello"), record("m2", "world")]),
+        TimelinePage {
+            messages: vec![record("m1", "hello"), record("m2", "world")],
+            has_more_before: true,
+            has_more_after: false,
+        },
     );
+    assert!(first.has_more_before && !first.has_more_after);
     assert_eq!(first.messages.len(), 2);
     assert_eq!(cache.lock().unwrap().len(), 2);
 
     // Unchanged rows come back identical from the cache.
     let second = convert_timeline_page_cached(
         &cache,
-        page(vec![record("m1", "hello"), record("m2", "world")]),
+        TimelinePage {
+            messages: vec![record("m1", "hello"), record("m2", "world")],
+            has_more_before: false,
+            has_more_after: true,
+        },
     );
+    assert!(!second.has_more_before && second.has_more_after);
     assert_eq!(second.messages[0].plaintext, "hello");
     assert_eq!(second.messages[1].plaintext, "world");
 

@@ -726,6 +726,39 @@ mod tests {
     }
 
     #[test]
+    fn timeline_query_preserves_search_cursor_direction_and_exclusive_before() {
+        let empty = timeline_query_from_ffi(TimelineMessageQueryFfi::default()).unwrap();
+        assert!(empty.group_id_hex.is_none() && empty.search.is_none());
+        assert!(empty.pagination.before.is_none() && empty.pagination.after.is_none());
+        assert!(empty.pagination.limit.is_none());
+        assert!(!empty.pagination.before_inclusive);
+        let query = timeline_query_from_ffi(TimelineMessageQueryFfi {
+            group_id_hex: Some(format!(" {} ", "AB".repeat(16))),
+            search: Some("  needle  ".into()),
+            before: Some(501),
+            before_message_id: Some(format!(" {} ", "CD".repeat(32))),
+            after: Some(201),
+            after_message_id: Some(format!(" {} ", "EF".repeat(32))),
+            limit: Some(42),
+        })
+        .unwrap();
+        assert_eq!(query.group_id_hex, Some("ab".repeat(16)));
+        assert_eq!(query.search.as_deref(), Some("needle"));
+        assert_eq!(query.pagination.before, Some(501));
+        assert_eq!(query.pagination.before_message_id, Some("cd".repeat(32)));
+        assert_eq!(query.pagination.after, Some(201));
+        assert_eq!(query.pagination.after_message_id, Some("ef".repeat(32)));
+        assert_eq!(query.pagination.limit, Some(42));
+        assert!(!query.pagination.before_inclusive);
+        let blank = timeline_query_from_ffi(TimelineMessageQueryFfi {
+            search: Some("  ".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(blank.search.is_none());
+    }
+
+    #[test]
     fn optional_group_id_hex_trims_and_canonicalizes() {
         // None and blank input map to the account-wide tail (None), not an error.
         assert_eq!(optional_group_id_hex(None).unwrap(), None);
