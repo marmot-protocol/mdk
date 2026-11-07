@@ -310,6 +310,78 @@ fn removal_during_the_write_supersedes_publication_and_keeps_nothing() {
 }
 
 #[test]
+fn checkpoint_target_keeps_exact_identity_and_refreshes_progress_expiry() {
+    use media_store::CheckpointTarget;
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let job = fixture.claimed(&"a".repeat(64), b"checkpoint body");
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: [1; 32],
+        locator_digest: [2; 32],
+        etag: "\"v1\"".into(),
+        total: 10,
+    };
+    let target = app.attachment_checkpoint(&job, identity.clone(), || NOW);
+    assert!(fixture.media.checkpoint_append(&target, 0, b"abc").unwrap());
+    let (wire, received) = target.current().unwrap().unwrap();
+    assert_eq!(received, 3);
+    for field in ["ciphertext", "locator", "etag", "total"] {
+        let mut changed = identity.clone();
+        match field {
+            "ciphertext" => changed.ciphertext_digest = [3; 32],
+            "locator" => changed.locator_digest = [4; 32],
+            "etag" => changed.etag = "\"v2\"".into(),
+            "total" => changed.total = 11,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            app.attachment_checkpoint(&job, changed, || NOW)
+                .current()
+                .unwrap(),
+            None,
+            "{field}"
+        );
+        assert_eq!(
+            target.current().unwrap(),
+            Some((wire, 3)),
+            "a mismatch is read-only"
+        );
+    }
+    for expected in [Some(([3; 32], [2; 32])), Some(([1; 32], [4; 32]))] {
+        let mismatch = app.attachment_checkpoint_matching(&job, expected, || NOW);
+        assert_eq!(mismatch.current().unwrap(), None);
+        assert_eq!(mismatch.clear().unwrap(), None);
+        assert_eq!(target.current().unwrap(), Some((wire, 3)));
+    }
+    assert_eq!(
+        app.attachment_checkpoint_matching(&job, None, || NOW)
+            .current()
+            .unwrap(),
+        Some((wire, 3))
+    );
+    let matching = app.attachment_checkpoint_matching(&job, Some(([1; 32], [2; 32])), || NOW);
+    assert_eq!(matching.current().unwrap(), Some((wire, 3)));
+    assert!(matching.begin().unwrap().is_none());
+    assert!(!matching.record(wire, 4).unwrap());
+    assert_eq!(target.current().unwrap(), Some((wire, 3)));
+    let progress = app.attachment_checkpoint(&job, identity.clone(), || NOW + 12 * 60 * 60);
+    assert!(
+        fixture
+            .media
+            .checkpoint_append(&progress, 3, b"def")
+            .unwrap()
+    );
+    let restored = app.attachment_checkpoint(&job, identity, || NOW + 24 * 60 * 60 + 1);
+    assert_eq!(
+        restored.current().unwrap(),
+        Some((wire, 6)),
+        "progress refreshes the old idle deadline"
+    );
+    assert_eq!(restored.clear().unwrap(), Some(wire));
+    assert_eq!(restored.current().unwrap(), None);
+}
+
+#[test]
 fn identical_content_is_attached_without_downloading_and_released_by_the_last_removal() {
     let fixture = Fixture::new();
     let app = fixture.store.app_storage();
@@ -974,6 +1046,13 @@ fn removal_during_a_move_supersedes_it_and_keeps_nothing() {
         fixture.migrate_from(&body, &mut reader),
         Ok(PublishOutcome::Superseded)
     );
+    // A reader opened from the selected legacy descriptor can race that
+    // removal. It refuses the stale body without classifying it as corruption.
+    let mut stale = fixture.store.app_storage().legacy_attachment_reader(&body);
+    assert_eq!(stale.read(&mut []).unwrap(), 0);
+    let error = stale.read(&mut [0; 1]).unwrap_err();
+    assert_eq!(error.to_string(), "legacy attachment read failed");
+    assert!(!stale.body_invalid());
     fixture.sweep();
     assert_eq!(fixture.media_files_on_disk(), 0);
     assert!(fixture.legacy_bodies().is_empty());

@@ -457,6 +457,17 @@ fn bounds_and_errors_do_not_expose_source_or_image_material() {
         .to_string();
     assert!(!error.contains("sensitive"));
     assert!(store.bind_avatar_source("", "source").is_err());
+    assert!(
+        matches!(store.bind_avatar_source("owner", ""), Err(StorageError::Serialization(ref message)) if message == "avatar key exceeds storage bounds")
+    );
+    let oversized = crate::SelectedAvatar::RemoteImage {
+        url: format!("https://example.com/{}", "x".repeat(16384)),
+        cache_key: "oversized".into(),
+    };
+    assert!(
+        matches!(store.request_avatar_acquisition("oversized-owner", &oversized, true), Err(StorageError::Serialization(ref message)) if message == "oversized avatar descriptor")
+    );
+    assert!(store.avatar_reference("oversized-owner").unwrap().is_none());
     for (size, width, height) in [
         (0, 1, 1),
         (1, 0, 1),
@@ -1315,7 +1326,151 @@ fn avatar_native_reference_and_byte_budget_preserve_source_fencing() {
             .availability,
         AvatarAvailability::Invalidated
     );
-    assert!(AvatarAssetRef::from_opaque("bad reference").is_err());
+    let opaque = reference.to_opaque();
+    let parts = opaque.split(':').collect::<Vec<_>>();
+    for (input, message) in [
+        ("bad reference".to_owned(), "invalid avatar reference"),
+        (
+            format!("{}:{}", "g".repeat(32), parts[1]),
+            "invalid avatar token",
+        ),
+        (
+            format!("{}:{}", parts[0], "g".repeat(32)),
+            "invalid avatar token",
+        ),
+        (
+            format!("{}:{}", "a".repeat(31), "b".repeat(33)),
+            "invalid avatar token",
+        ),
+        (
+            format!("{}:{}", "a".repeat(33), "b".repeat(31)),
+            "invalid avatar token",
+        ),
+    ] {
+        assert!(
+            matches!(AvatarAssetRef::from_opaque(&input), Err(StorageError::Serialization(ref actual)) if actual == message),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn avatar_requests_revalidate_the_selected_source_and_report_live_acquisition_state() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed_avatar_group(&store);
+    let selected = selected_url("a");
+    let target = app
+        .avatar_target_presentation("group", None, &selected, 0)
+        .unwrap()
+        .unwrap()
+        .target;
+    assert_eq!(
+        app.request_avatar_target(&target, &selected, None, 0)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated,
+        "a pending presentation has no authoritative avatar selection"
+    );
+    let mut value = crate::StoredChatPresentation {
+        presentation: crate::ConversationPresentation {
+            title: crate::PresentationText::Literal("Room".into()),
+            avatar: selected.clone(),
+            title_source: crate::PresentationSource::Group,
+            avatar_source: crate::PresentationSource::Group,
+            peer_id: None,
+            resolution: crate::PresentationResolution::Cached,
+        },
+        profile_version: None,
+    };
+    let input = app.chat_presentation_input("group").unwrap().unwrap();
+    assert_eq!(
+        app.store_chat_presentation(&input, &value).unwrap(),
+        crate::ChatPresentationWrite::Applied
+    );
+    assert_eq!(
+        app.request_avatar_target(&target, &selected_url("different"), None, 0)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated
+    );
+    value.presentation.avatar = selected_url("b");
+    let input = app.chat_presentation_input("group").unwrap().unwrap();
+    assert_eq!(
+        app.store_chat_presentation(&input, &value).unwrap(),
+        crate::ChatPresentationWrite::Applied
+    );
+    assert_eq!(
+        app.request_avatar_target(&target, &selected, None, 0)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated,
+        "the original source no longer matches the current presentation"
+    );
+    let current = app
+        .avatar_target_presentation("group", None, &value.presentation.avatar, 0)
+        .unwrap()
+        .unwrap();
+    let requested = app
+        .request_avatar_target(&current.target, &value.presentation.avatar, None, 0)
+        .unwrap();
+    assert!(requested.reference.is_some());
+    assert_eq!(requested.acquisition, Some(AvatarAcquisitionState::Queued));
+    let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
+    assert_eq!(
+        presented_acquisition(&app, "b"),
+        Some(AvatarAcquisitionState::Fetching)
+    );
+    app.resume_avatar_acquisition().unwrap();
+    assert_eq!(
+        presented_acquisition(&app, "b"),
+        Some(AvatarAcquisitionState::Queued)
+    );
+    let resumed = app.claim_avatar_acquisition(0).unwrap().unwrap();
+    assert_eq!(
+        app.complete_avatar_acquisition(&job, &image(1, 8), None)
+            .unwrap(),
+        AvatarPublishResult::Superseded
+    );
+    app.complete_avatar_acquisition(&resumed, &image(2, 8), None)
+        .unwrap();
+    assert_eq!(
+        presented_acquisition(&app, "b"),
+        Some(AvatarAcquisitionState::Idle)
+    );
+    let member = "77".repeat(32);
+    let identity = app
+        .avatar_target_presentation("group", Some(&member), &value.presentation.avatar, 0)
+        .unwrap()
+        .unwrap();
+    let missing = app.request_avatar_target(&identity.target, &value.presentation.avatar, None, 0);
+    assert!(
+        matches!(missing, Err(StorageError::Serialization(ref message)) if message == "avatar profile version missing")
+    );
+    assert!(
+        app.requested_avatar_identities_after("")
+            .unwrap()
+            .is_empty()
+    );
+    let version = crate::ChatPresentationVersion {
+        store_epoch: vec![7; 16],
+        revision: 1,
+    };
+    let requested = app
+        .request_avatar_target(
+            &identity.target,
+            &value.presentation.avatar,
+            Some(&version),
+            0,
+        )
+        .unwrap();
+    assert!(requested.reference.is_some());
+    let registered = app.requested_avatar_identities_after("").unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].member, member);
 }
 
 #[test]
@@ -1367,7 +1522,49 @@ fn avatar_screen_targets_reject_another_account_or_recreated_conversation() {
             .availability,
         AvatarAvailability::Invalidated
     );
-    assert!(AvatarAssetTarget::from_opaque(&"x".repeat(1201)).is_err());
+    let opaque = target.to_opaque();
+    let parts = opaque.split(':').map(str::to_owned).collect::<Vec<_>>();
+    for (part, replacement, message) in [
+        (0, "2".into(), "invalid avatar target"),
+        (1, "a".repeat(31), "invalid avatar token"),
+        (2, "a".repeat(31), "invalid avatar token"),
+        (1, "g".repeat(32), "invalid avatar token"),
+        (2, "g".repeat(32), "invalid avatar token"),
+        (3, "a".repeat(63), "invalid avatar target"),
+        (3, "g".repeat(64), "invalid avatar target"),
+        (4, "gg".into(), "invalid avatar target"),
+        (4, "ff".into(), "invalid avatar target"),
+        (4, String::new(), "avatar key exceeds storage bounds"),
+        (
+            4,
+            hex::encode("s".repeat(513)),
+            "avatar key exceeds storage bounds",
+        ),
+    ] {
+        let mut changed = parts.clone();
+        changed[part] = replacement;
+        assert!(
+            matches!(AvatarAssetTarget::from_opaque(&changed.join(":")), Err(StorageError::Serialization(ref actual)) if actual == message),
+            "part {part}"
+        );
+    }
+    for input in [
+        "x".repeat(1201),
+        format!("{opaque}:extra"),
+        parts[..4].join(":"),
+    ] {
+        assert!(
+            matches!(AvatarAssetTarget::from_opaque(&input), Err(StorageError::Serialization(ref message)) if message == "invalid avatar target")
+        );
+    }
+    let mut identity = parts;
+    identity[3] = "AB".repeat(32);
+    assert_eq!(
+        AvatarAssetTarget::from_opaque(&identity.join(":"))
+            .unwrap()
+            .member(),
+        Some("ab".repeat(32).as_str())
+    );
 }
 
 #[test]
