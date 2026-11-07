@@ -4925,12 +4925,15 @@ async fn generation_close_failure_keeps_recovered_content_retryable_after_reopen
         ))
         .unwrap();
     carol.ingest(commit2).await.unwrap();
+    // Model a host consuming the existing wake before driving this quantum.
+    carol.drain_pending_convergence_groups();
     let failed = carol.advance_convergence(&group_id).await;
     assert!(
         matches!(&failed, Err(cgka_traits::EngineError::Storage(StorageError::Backend(detail)))
             if detail.contains("generation-close-fault")),
         "the completed sweep must surface the actual delete failure: {failed:?}"
     );
+    assert!(carol.drain_pending_convergence_groups().contains(&group_id));
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     let generation = storage
         .deferred_peel_generation(&group_id)
@@ -4976,6 +4979,7 @@ async fn generation_close_failure_keeps_recovered_content_retryable_after_reopen
     let (mut carol, storage, _) =
         build_counting_client_with_storage_and_clock(b"carol", storage, clock);
     carol.hydrate_all_stored_groups().unwrap();
+    assert!(carol.drain_pending_convergence_groups().contains(&group_id));
     let failed_again = carol.retry_deferred_peels(&group_id).await;
     assert!(
         matches!(&failed_again, Err(cgka_traits::EngineError::Storage(StorageError::Backend(detail)))
@@ -4987,8 +4991,9 @@ async fn generation_close_failure_keeps_recovered_content_retryable_after_reopen
         Some(generation)
     );
     assert_eq!(storage.get_message(&recovered_id).unwrap(), recovered);
-    // A new engine incarnation rebases the clock identity, while every
-    // residence bound, attempt count and retained byte remains unchanged.
+    // With this frozen manual clock, rebasing rewrites the residence deadline
+    // and high-water to the same values; only the incarnation id differs.
+    // The existing residence/restart owner separately covers a moving clock.
     let rebound = storage.get_message(&application.id).unwrap();
     let mut expected_held = held.clone();
     let old_clock = expected_held
