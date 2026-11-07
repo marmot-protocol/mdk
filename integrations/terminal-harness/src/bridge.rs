@@ -9,7 +9,7 @@ use std::time::Duration;
 use agent_control::{
     AgentControlAccount, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
@@ -358,38 +358,14 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 return DispatchOutcome::Continue;
             }
-            let disposition = classify_prompt(&message.text);
-            let permit = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await;
-            let Some(permit) = permit else {
-                warn!(
-                    target: TRACE_TARGET,
-                    method = "dispatch_event",
-                    event = "queue_full",
-                    "rejecting inbound event because group queue is full"
-                );
-                let ctx_for_reply = ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = send_reply(
-                        &ctx_for_reply,
-                        &account_id_hex,
-                        &group_id_hex,
-                        &message.message_id_hex,
-                        &format!("[{}] too many prompts are already queued for this group; try again shortly.", ctx_for_reply.cfg.spec.reply_prefix),
-                        0,
-                    )
-                    .await
-                    {
-                        warn!(
-                            target: TRACE_TARGET,
-                            method = "queue_full_reply",
-                            error_kind = err.privacy_safe_kind(),
-                            "failed to send queue-full reply"
-                        );
-                    }
-                });
-                return DispatchOutcome::Continue;
+            let inbound = InboundPrompt {
+                account_ref: account_id_hex,
+                group_ref: group_id_hex,
+                message_ref: message.message_id_hex,
+                text: message.text,
+                media: message.media,
             };
-            if !ctx.dedupe.insert(message.message_id_hex.clone()).await {
+            if ctx.dedupe.contains(&inbound.message_ref).await {
                 debug!(
                     target: TRACE_TARGET,
                     method = "dispatch_event",
@@ -398,15 +374,41 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 return DispatchOutcome::Continue;
             }
-
-            let inbound = InboundPrompt {
-                account_ref: account_id_hex,
-                group_ref: group_id_hex,
-                message_ref: message.message_id_hex,
-                text: message.text,
-                media: message.media,
+            // Admit before recording the message ID, so a queue-full rejection
+            // stays recoverable through reconnect replay.
+            let disposition = classify_prompt(&inbound.text);
+            let admission =
+                if ctx.backend.supports_steering() && !bypasses_waiter_quota(&disposition) {
+                    ctx.queues
+                        .reserve_ingress(&inbound.group_ref)
+                        .await
+                        .map(Admission::Ingress)
+                } else {
+                    acquire_dispatch_permit(&ctx.queues, &inbound.group_ref, &disposition)
+                        .await
+                        .map(Admission::Turn)
+                };
+            let Some(admission) = admission else {
+                reply_queue_full(ctx, inbound, "try again shortly");
+                return DispatchOutcome::Continue;
             };
-            tokio::spawn(handle_message(ctx, inbound, permit));
+            if !ctx.dedupe.insert(inbound.message_ref.clone()).await {
+                debug!(
+                    target: TRACE_TARGET,
+                    method = "dispatch_event",
+                    event = "duplicate",
+                    "ignoring duplicate inbound event"
+                );
+                return DispatchOutcome::Continue;
+            }
+            match admission {
+                Admission::Turn(permit) => {
+                    tokio::spawn(handle_message(ctx, inbound, permit));
+                }
+                Admission::Ingress(ingress) => {
+                    tokio::spawn(dispatch_authorized(ctx, inbound, ingress));
+                }
+            }
             DispatchOutcome::Continue
         }
         AgentControlEvent::GroupInvite { .. } => {
@@ -438,6 +440,110 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
             DispatchOutcome::Continue
         }
     }
+}
+
+enum Admission {
+    Turn(GroupPermit),
+    Ingress(IngressPermit),
+}
+
+/// One ordered admission lane per group for steering backends, independent of
+/// the running turn. Downloads and steering never block the global event stream.
+async fn dispatch_authorized(
+    ctx: Arc<BridgeContext>,
+    inbound: InboundPrompt,
+    mut ingress: IngressPermit,
+) {
+    ingress.wait().await;
+    let account_id_hex = inbound.account_ref.clone();
+    let group_id_hex = inbound.group_ref.clone();
+    let disposition = classify_prompt(&inbound.text);
+    // Try live input only after sender authorization and deduplication.
+    // Reserved commands and workdir selection retain their FIFO semantics.
+    if let PromptDisposition::Forward {
+        prompt,
+        allow_workdir_picker,
+    } = &disposition
+        && (!allow_workdir_picker || !prompt.trim_start().starts_with('/'))
+        && ctx.queues.can_steer(&group_id_hex).await
+    {
+        let outcome = if !inbound.media.is_empty() && ctx.backend.has_active_turn(&group_id_hex) {
+            let inbound = InboundPrompt {
+                account_ref: account_id_hex.clone(),
+                group_ref: group_id_hex.clone(),
+                message_ref: inbound.message_ref.clone(),
+                text: prompt.clone(),
+                media: inbound.media.clone(),
+            };
+            match prepare_attachment_batch(&ctx, &inbound).await {
+                Ok(Some(batch)) => {
+                    let attachments = batch.attachments.clone();
+                    ctx.backend
+                        .steer_with_attachments(&group_id_hex, prompt, attachments, Box::new(batch))
+                        .await
+                }
+                Ok(None) => crate::SteerOutcome::Unavailable,
+                Err(err) => {
+                    let _ = send_reply(
+                        &ctx,
+                        &account_id_hex,
+                        &group_id_hex,
+                        &inbound.message_ref,
+                        &attachment_failure_reply(&ctx.cfg, &err),
+                        0,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else if inbound.media.is_empty() {
+            ctx.backend.steer(&group_id_hex, prompt).await
+        } else {
+            crate::SteerOutcome::Unavailable
+        };
+        match outcome {
+            crate::SteerOutcome::Accepted => return,
+            crate::SteerOutcome::Uncertain => {
+                let _ = send_reply(&ctx, &account_id_hex, &group_id_hex,
+                            &inbound.message_ref,
+                            &format!("[{}] Follow-up delivery is unconfirmed. It may already have reached the backend; it has not been queued or retried.", ctx.cfg.spec.reply_prefix), 0).await;
+                return;
+            }
+            crate::SteerOutcome::Unavailable => {}
+        }
+    }
+
+    let Some(mut permit) = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await
+    else {
+        // The message ID is already recorded, so replay will not recover it.
+        reply_queue_full(ctx, inbound, "send a new message shortly");
+        return;
+    };
+    // Keep admission ordered until the handler actually owns its serial turn.
+    // Spawning alone does not enroll a task in Tokio's FIFO mutex wait queue.
+    permit.ingress = Some(ingress);
+    tokio::spawn(handle_message(ctx, inbound, permit));
+}
+
+fn reply_queue_full(ctx: Arc<BridgeContext>, inbound: InboundPrompt, advice: &'static str) {
+    warn!(target: TRACE_TARGET, method = "dispatch_event", event = "queue_full", "rejecting inbound event because group queue is full");
+    tokio::spawn(async move {
+        if let Err(err) = send_reply(
+            &ctx,
+            &inbound.account_ref,
+            &inbound.group_ref,
+            &inbound.message_ref,
+            &format!(
+                "[{}] too many prompts are already queued for this group; {advice}.",
+                ctx.cfg.spec.reply_prefix
+            ),
+            0,
+        )
+        .await
+        {
+            warn!(target: TRACE_TARGET, method = "queue_full_reply", error_kind = err.privacy_safe_kind(), "failed to send queue-full reply");
+        }
+    });
 }
 
 struct InboundPrompt {
@@ -489,17 +595,22 @@ fn is_inspect_disposition(disposition: &PromptDisposition) -> bool {
     )
 }
 
+fn bypasses_waiter_quota(disposition: &PromptDisposition) -> bool {
+    matches!(
+        disposition,
+        PromptDisposition::RetryLast | PromptDisposition::DiscardLast
+    ) || is_inspect_disposition(disposition)
+}
+
 async fn acquire_dispatch_permit(
     queues: &GroupQueues,
     group_ref: &str,
     disposition: &PromptDisposition,
 ) -> Option<GroupPermit> {
-    if matches!(
-        disposition,
-        PromptDisposition::RetryLast | PromptDisposition::DiscardLast
-    ) || is_inspect_disposition(disposition)
-    {
-        queues.enter_without_waiter_quota(group_ref).await
+    if bypasses_waiter_quota(disposition) {
+        queues
+            .enter_without_waiter_quota(group_ref, !is_inspect_disposition(disposition))
+            .await
     } else {
         queues.try_enter_waiter(group_ref).await
     }
@@ -599,6 +710,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         }
     };
 
+    permit.ingress.take();
     let mut retrying = false;
     let forced_run = match disposition {
         PromptDisposition::ResetSession => {
@@ -2714,10 +2826,14 @@ struct GroupQueues {
 }
 
 struct GroupQueue {
+    ingress_tail: Mutex<Option<oneshot::Receiver<()>>>,
+    ingress_slots: Arc<Semaphore>,
+    ingress_active: AtomicUsize,
     serial: Arc<Mutex<()>>,
     pending: Arc<Semaphore>,
     waiting: Arc<Semaphore>,
     active: AtomicUsize,
+    serial_active: AtomicUsize,
     recovery_changed: tokio::sync::watch::Sender<u64>,
 }
 
@@ -2726,6 +2842,41 @@ struct GroupPermit {
     serial: Arc<Mutex<()>>,
     _waiting: Option<OwnedSemaphorePermit>,
     _pending: Option<OwnedSemaphorePermit>,
+    serial_admission: bool,
+    ingress: Option<IngressPermit>,
+}
+
+struct IngressPermit {
+    queue: Arc<GroupQueue>,
+    _slot: OwnedSemaphorePermit,
+    previous: Option<oneshot::Receiver<()>>,
+    done: Option<oneshot::Sender<()>>,
+}
+impl IngressPermit {
+    async fn wait(&mut self) {
+        if let Some(previous) = self.previous.as_mut() {
+            let _ = previous.await;
+        }
+        self.previous = None;
+    }
+}
+impl Drop for IngressPermit {
+    fn drop(&mut self) {
+        let done = self.done.take();
+        if let Some(previous) = self.previous.take() {
+            // Cancelling a waiting admission must not let its successor jump
+            // over the still-running predecessor.
+            tokio::spawn(async move {
+                let _ = previous.await;
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            });
+        } else if let Some(done) = done {
+            let _ = done.send(());
+        }
+        self.queue.ingress_active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl GroupQueues {
@@ -2739,7 +2890,11 @@ impl GroupQueues {
     async fn queue(&self, group_ref: &str) -> Option<Arc<GroupQueue>> {
         let mut inner = self.inner.lock().await;
         if inner.len() >= GROUP_QUEUE_LIMIT {
-            inner.retain(|_, queue| queue.active.load(Ordering::Relaxed) != 0);
+            inner.retain(|_, queue| {
+                queue.active.load(Ordering::Relaxed) != 0
+                    || queue.ingress_active.load(Ordering::Relaxed) != 0
+                    || Arc::strong_count(queue) > 1
+            });
         }
         if inner.len() >= GROUP_QUEUE_LIMIT && !inner.contains_key(group_ref) {
             return None;
@@ -2750,10 +2905,14 @@ impl GroupQueues {
                 .or_insert_with(|| {
                     let (recovery_changed, _) = tokio::sync::watch::channel(0);
                     Arc::new(GroupQueue {
+                        ingress_tail: Mutex::new(None),
+                        ingress_slots: Arc::new(Semaphore::new(self.limit)),
+                        ingress_active: AtomicUsize::new(0),
                         serial: Arc::new(Mutex::new(())),
                         pending: Arc::new(Semaphore::new(self.limit)),
                         waiting: Arc::new(Semaphore::new(self.limit)),
                         active: AtomicUsize::new(0),
+                        serial_active: AtomicUsize::new(0),
                         recovery_changed,
                     })
                 })
@@ -2761,28 +2920,69 @@ impl GroupQueues {
         )
     }
 
+    async fn reserve_ingress(&self, group_ref: &str) -> Option<IngressPermit> {
+        let queue = self.queue(group_ref).await?;
+        let slot = queue.ingress_slots.clone().try_acquire_owned().ok()?;
+        queue.ingress_active.fetch_add(1, Ordering::Relaxed);
+        let mut permit = IngressPermit {
+            queue: queue.clone(),
+            _slot: slot,
+            previous: None,
+            done: None,
+        };
+        let mut tail = queue.ingress_tail.lock().await;
+        permit.previous = tail.take();
+        let (done, next) = oneshot::channel();
+        permit.done = Some(done);
+        *tail = Some(next);
+        drop(tail);
+        Some(permit)
+    }
+
+    /// A queued command/prompt owns a permit beyond the running turn's one.
+    /// Do not let live input overtake a pending reset, workdir, or goal change.
+    async fn can_steer(&self, group_ref: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .get(group_ref)
+            .is_none_or(|queue| queue.serial_active.load(Ordering::Acquire) <= 1)
+    }
+
     async fn try_enter_waiter(&self, group_ref: &str) -> Option<GroupPermit> {
         let queue = self.queue(group_ref).await?;
         let waiting = queue.waiting.clone().try_acquire_owned().ok()?;
         queue.active.fetch_add(1, Ordering::Relaxed);
+        queue.serial_active.fetch_add(1, Ordering::AcqRel);
         Some(GroupPermit {
             queue: queue.clone(),
             serial: queue.serial.clone(),
             _waiting: Some(waiting),
             _pending: None,
+            serial_admission: true,
+            ingress: None,
         })
     }
 
     /// Admits inspect and recovery commands without consuming the waiting quota
     /// or taking the serial lock.
-    async fn enter_without_waiter_quota(&self, group_ref: &str) -> Option<GroupPermit> {
+    async fn enter_without_waiter_quota(
+        &self,
+        group_ref: &str,
+        serial_admission: bool,
+    ) -> Option<GroupPermit> {
         let queue = self.queue(group_ref).await?;
         queue.active.fetch_add(1, Ordering::Relaxed);
+        if serial_admission {
+            queue.serial_active.fetch_add(1, Ordering::AcqRel);
+        }
         Some(GroupPermit {
             queue: queue.clone(),
             serial: queue.serial.clone(),
             _waiting: None,
             _pending: None,
+            serial_admission,
+            ingress: None,
         })
     }
 
@@ -2798,6 +2998,9 @@ impl GroupQueues {
 impl Drop for GroupPermit {
     fn drop(&mut self) {
         self.queue.active.fetch_sub(1, Ordering::Relaxed);
+        if self.serial_admission {
+            self.queue.serial_active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -2818,6 +3021,10 @@ impl InboundDedupe {
             limit,
             inner: Mutex::new(InboundDedupeInner::default()),
         }
+    }
+
+    async fn contains(&self, message_ref: &str) -> bool {
+        self.inner.lock().await.seen.contains(message_ref)
     }
 
     async fn insert(&self, message_ref: String) -> bool {
@@ -2849,6 +3056,273 @@ mod tests {
     use std::os::unix::net::UnixListener as StdUnixListener;
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
+
+    struct AdmissionProbe {
+        entered: mpsc::Sender<String>,
+        release: Semaphore,
+    }
+    #[async_trait]
+    impl Backend for AdmissionProbe {
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        async fn steer(&self, group: &str, text: &str) -> crate::SteerOutcome {
+            self.entered.send(format!("{group}:{text}")).await.unwrap();
+            if group == "slow" {
+                self.release.acquire().await.unwrap().forget();
+            }
+            crate::SteerOutcome::Accepted
+        }
+        async fn run(
+            &self,
+            _: Invocation,
+            _: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            unreachable!("accepted input must not enter the turn queue")
+        }
+    }
+    fn ingress_event(group: &str, id: &str, text: &str) -> AgentControlEvent {
+        AgentControlEvent::InboundMessage {
+            account_id_hex: "account".into(),
+            group_id_hex: group.into(),
+            message: agent_control::AgentControlMessage {
+                message_id_hex: id.into(),
+                text: text.into(),
+                recorded_at: 1,
+                media: vec![],
+                sender: agent_control::AgentControlActor {
+                    account_id_hex: "sender".into(),
+                    display_name: None,
+                    is_self: false,
+                },
+            },
+            mentions_self: false,
+            reply_to: None,
+        }
+    }
+    #[tokio::test]
+    async fn slow_steering_preserves_same_group_order_without_blocking_other_groups() {
+        let root = tempfile::tempdir().unwrap();
+        let (entered, mut receive) = mpsc::channel(8);
+        let backend = Arc::new(AdmissionProbe {
+            entered,
+            release: Semaphore::new(0),
+        });
+        let mut config = test_config(root.path());
+        config.allowed_senders.insert("sender".into());
+        let ctx = test_context_with_backend(
+            root.path(),
+            &root.path().join("home"),
+            config,
+            backend.clone(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch_event(ctx.clone(), ingress_event("slow", "one", "first")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receive.recv().await.unwrap(), "slow:first");
+        dispatch_event(ctx.clone(), ingress_event("slow", "two", "second")).await;
+        dispatch_event(ctx.clone(), ingress_event("fast", "three", "third")).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receive.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "fast:third"
+        );
+        dispatch_event(ctx, ingress_event("fast", "three", "duplicate")).await;
+        backend.release.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receive.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "slow:second"
+        );
+        assert!(receive.try_recv().is_err());
+        backend.release.add_permits(1);
+    }
+    #[tokio::test]
+    async fn inspect_and_recovery_bypass_saturated_ingress_at_dispatch_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RecordingBackend {
+            steering: true,
+            ..Default::default()
+        });
+        let mut config = test_config(root.path());
+        config.allowed_senders.insert("sender".into());
+        let listener = UnixListener::bind(&config.socket).unwrap();
+        let (sent, mut replies) = mpsc::channel(8);
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut BufReader::new(read))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let AgentControlRequest::SendFinal { text, .. } = request.payload else {
+                    panic!("only replies expected")
+                };
+                sent.send(text).await.unwrap();
+                write_frame(
+                    &mut write,
+                    &AgentControlEnvelope::request(
+                        request.id,
+                        AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["reply".into()],
+                            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let ctx = test_context_with_backend(
+            root.path(),
+            &root.path().join("home"),
+            config,
+            backend.clone(),
+        );
+        let mut occupied = Vec::new();
+        for _ in 0..4 {
+            occupied.push(ctx.queues.reserve_ingress("room").await.unwrap());
+        }
+        assert!(ctx.queues.reserve_ingress("room").await.is_none());
+        for (index, command) in ["/status", "/help", "/retry-last", "/discard-last"]
+            .iter()
+            .enumerate()
+        {
+            dispatch_event(
+                ctx.clone(),
+                ingress_event("room", &format!("command-{index}"), command),
+            )
+            .await;
+            let text = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !text.contains("too many prompts"),
+                "{command} was quota blocked"
+            );
+        }
+        assert!(backend.invocations.lock().await.is_empty());
+        server.await.unwrap();
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn cancelled_ingress_cannot_release_successor_before_predecessor() {
+        let queues = GroupQueues::new(4);
+        let first = queues.reserve_ingress("room").await.unwrap();
+        let mut cancelled = queues.reserve_ingress("room").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), cancelled.wait())
+                .await
+                .is_err()
+        );
+        drop(cancelled);
+        let mut third = queues.reserve_ingress("room").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), third.wait())
+                .await
+                .is_err()
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), third.wait())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_keeps_context_admission_until_it_acquires_the_serial_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let mut config = test_config(root.path());
+        config.allowed_senders.insert("sender".into());
+        let server = spawn_final_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            Arc::new(RecordingBackend {
+                steering: true,
+                ..Default::default()
+            }),
+        );
+        ctx.sessions
+            .record_session("group", "old-session".into(), home)
+            .await
+            .unwrap();
+        let queue = ctx.queues.queue("group").await.unwrap();
+        let running = queue.serial.lock().await;
+        dispatch_event(ctx.clone(), ingress_event("group", "reset", "/new")).await;
+        let mut next = ctx.queues.reserve_ingress("group").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queue.serial_active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut wait = Box::pin(next.wait());
+        let state = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(wait.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            state.is_pending(),
+            "later admission overtook the reset before its serial wait"
+        );
+        drop(running);
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .unwrap();
+        drop(next);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queue.serial_active.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            ctx.sessions
+                .get("group")
+                .await
+                .unwrap()
+                .session_id
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_context_change_blocks_steering_until_its_permit_finishes() {
+        let queues = GroupQueues::new(2);
+        let running = queues.try_enter_waiter("room").await.unwrap();
+        assert!(queues.can_steer("room").await);
+        let inspect = queues
+            .enter_without_waiter_quota("room", false)
+            .await
+            .unwrap();
+        assert!(
+            queues.can_steer("room").await,
+            "read-only replies must not delay steering"
+        );
+        drop(inspect);
+        let reset = queues.try_enter_waiter("room").await.unwrap();
+        assert!(!queues.can_steer("room").await);
+        assert!(queues.can_steer("other").await);
+        drop(reset);
+        assert!(queues.can_steer("room").await);
+        drop(running);
+    }
 
     #[test]
     fn attachment_names_are_sanitized_and_keep_stable_ordering() {
@@ -3175,6 +3649,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         invocations: Mutex<Vec<Invocation>>,
+        steering: bool,
     }
 
     #[derive(Debug)]
@@ -3282,6 +3757,10 @@ mod tests {
 
     #[async_trait]
     impl Backend for RecordingBackend {
+        fn supports_steering(&self) -> bool {
+            self.steering
+        }
+
         async fn run(
             &self,
             invocation: Invocation,
@@ -4246,10 +4725,10 @@ mod tests {
         assert!(first.is_some());
         assert_eq!(first.as_ref().unwrap().queue.pending.available_permits(), 1);
         assert!(queues.try_enter_waiter("g").await.is_none());
-        let inspect = queues.enter_without_waiter_quota("g").await;
+        let inspect = queues.enter_without_waiter_quota("g", true).await;
         assert!(inspect.is_some());
         drop(inspect);
-        let recovery = queues.enter_without_waiter_quota("g").await;
+        let recovery = queues.enter_without_waiter_quota("g", true).await;
         assert!(recovery.is_some());
         drop(recovery);
         drop(first);
@@ -5371,7 +5850,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let recovery = queues.enter_without_waiter_quota("g").await.unwrap();
+        let recovery = queues.enter_without_waiter_quota("g", true).await.unwrap();
         let active = recovery.serial.lock().await;
         assert!(recovery.serial.try_lock().is_err());
         drop(active);

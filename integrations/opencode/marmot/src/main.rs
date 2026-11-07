@@ -1,4 +1,5 @@
 mod config;
+mod native;
 mod opencode;
 
 use std::process::ExitCode;
