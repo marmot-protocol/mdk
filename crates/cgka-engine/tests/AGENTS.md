@@ -90,6 +90,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     `peel_deferred -> peel_deferred` audit row. Returned peeler infrastructure faults preserve raw bytes, return
     deferred capacity and retry through confirmation replay. One-probe public advances must retain the engine's peel
     continuation, restore live state between slices and eventually deliver the real rival application exactly once.
+    Readiness leaves complete retained rows untouched and reports no cutoff while their real group is seeded
+    but unhydrated or already quarantined; ordinary hydration preserves the original residence deadline.
 
   `generation_close_failure_keeps_recovered_content_retryable_after_reopen` owns completed-sweep and
   unchanged-context generation-close faults after actual recovery: propagate the real delete error, retain the

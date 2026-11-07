@@ -2077,6 +2077,17 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
         carol_storage.clone(),
         clock.clone(),
     );
+    restarted.hydrate_stable_groups_from_storage().unwrap();
+    assert!(restarted.unhydrated_group_ids().contains(&group_id));
+    let readiness = restarted.deferred_peel_cutoff_delay_ms(&group_id);
+    assert!(
+        matches!(readiness, Ok(None)),
+        "an unhydrated retained row must advertise no cutoff, got {readiness:?}"
+    );
+    assert_eq!(
+        carol_storage.get_message(&stuck_app.id).unwrap(),
+        before_restart
+    );
     restarted.hydrate_all_stored_groups().unwrap();
     restarted.set_deferred_peel_residence_ms(1_000);
     assert_eq!(
@@ -3196,6 +3207,17 @@ async fn quarantined_group_does_not_charge_the_account_byte_budget() {
          group needs",
     )
     .await;
+
+    let before_readiness = storage.get_message(&template_a.id).unwrap();
+    let readiness = restarted.deferred_peel_cutoff_delay_ms(&group_a);
+    assert!(
+        matches!(readiness, Ok(None)),
+        "a quarantined retained row must advertise no cutoff, got {readiness:?}"
+    );
+    assert_eq!(
+        storage.get_message(&template_a.id).unwrap(),
+        before_readiness
+    );
 
     assert_eq!(
         restarted.quarantined_groups(),
