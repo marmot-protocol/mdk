@@ -1163,14 +1163,16 @@ mod tests {
             }),
             F::GroupHydrationRecovered { recovered_epoch: 8 }
         ));
-        // Own only this host kind here. The current five typed reason mappings
-        // have their independent group conversion owner, without another table.
+        // Pin one current reason through the event's full mapping chain. The
+        // five-category mapper table is tracked separately in mdk#3151.
         assert!(matches!(
             F::from(GroupEvent::GroupHydrationQuarantined {
                 group_id: group(),
                 reason: cgka_traits::engine::GroupHydrationQuarantineReason::OpenMlsGroupMissing,
             }),
-            F::GroupHydrationQuarantined { .. }
+            F::GroupHydrationQuarantined {
+                reason: AppGroupHydrationQuarantineReasonFfi::OpenMlsGroupMissing,
+            }
         ));
     }
 
