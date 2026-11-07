@@ -312,7 +312,7 @@ fn live_loss_reach_tx(conn: &Connection) -> StorageResult<Option<RecoveryLossRea
     }
     let mut merged = RecoveryLossReach::default();
     for (label, cause) in live {
-        let reach = loss::reach(conn, &label, loss::ReachOf::Cause(loss_cause(cause)?))?;
+        let reach = loss::reach(conn, &label, loss_cause(cause)?)?;
         merged.every_route_from = match (merged.every_route_from, reach.every_route_from) {
             (Some(merged), Some(floor)) => Some(merged.min(floor)),
             (merged, floor) => merged.or(floor),
@@ -515,9 +515,8 @@ fn dismissed_tx(
 /// named route from its own bound. The part inside the window is owed again,
 /// and what lies below it, where a bound is unknown or older, parks in each
 /// current route's remainder, whatever coverage proved it before the loss.
-/// Generations no import charged yet are charged now, under a new loss
-/// revision they are stamped with, and every live generation then counts as
-/// imported, so a later import does not un-cover it again; their rows stay as
+/// Every live generation then counts as imported, so a later import does
+/// not un-cover it again; their rows stay as
 /// the watermark that keeps a delayed duplicate observation from counting as
 /// new loss. Each account and cause with live loss is recorded with every
 /// generation of it, so the worker can finish the plane's overflow recovery
@@ -551,32 +550,6 @@ fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageRes
         .any(|lowest| lowest < floor)
     {
         park_loss_below_floor_tx(conn, input)?;
-    }
-    let uncharged =
-        format!("{LIVE_LOSS} AND (imported_count IS NULL OR imported_count < dropped_count)");
-    let newly: i64 = conn
-        .query_row_cached(
-            &format!("SELECT COUNT(*) FROM account_delivery_loss_evidence WHERE {uncharged}"),
-            [],
-            |row| row.get(0),
-        )
-        .storage()?;
-    if newly > 0 {
-        conn.execute_cached(
-            "UPDATE account_recovery_state SET loss_revision = loss_revision + 1
-             WHERE singleton = 1",
-            [],
-        )
-        .storage()?;
-        conn.execute_cached(
-            &format!(
-                "UPDATE account_delivery_loss_evidence SET import_revision =
-                     (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
-                 WHERE {uncharged}"
-            ),
-            [],
-        )
-        .storage()?;
     }
     conn.execute_cached(
         &format!(
@@ -847,8 +820,8 @@ impl SqliteAppStorage {
     /// Import only new or grown loss generations into ledger debt after the
     /// one-time conversion has finished. Never creates old-owner obligations.
     /// Current routes and retention rules have the same meaning as conversion.
-    /// Each generation's reach is un-covered and stamped in the transaction
-    /// that marks it imported; duplicates leave later fetch proofs untouched.
+    /// Each generation's reach is un-covered in the transaction that marks it
+    /// imported; duplicates leave later fetch proofs untouched.
     /// Loss below retention remains parked, and the exact acknowledgment set
     /// stays in [`Self::converted_recovery_loss`] until the caller hands it off
     /// to the relay plane and reclaims it. Returns whether evidence was imported.
@@ -869,7 +842,6 @@ impl SqliteAppStorage {
             // a time, retaining only two per-cause flags and its bounded routes.
             let mut causes = [false; 2];
             let mut cursor = (-1_i64, -1_i64);
-            let mut stamped = false;
             let mut below_floor = false;
             loop {
                 let row = conn
@@ -900,22 +872,6 @@ impl SqliteAppStorage {
                 causes[decoded as usize] = true;
                 cursor = (cause, token);
                 if live {
-                    if !stamped {
-                        conn.execute_cached(
-                            "UPDATE account_recovery_state SET loss_revision = loss_revision + 1
-                             WHERE singleton = 1",
-                            [],
-                        )
-                        .storage()?;
-                        stamped = true;
-                    }
-                    conn.execute_cached(
-                        "UPDATE account_delivery_loss_evidence SET import_revision =
-                            (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
-                         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
-                        params![label, cause, token],
-                    )
-                    .storage()?;
                     if let Some(routes) = loss::evidence_routes(&conn, label, cause, token)? {
                         for (route, bound) in routes {
                             uncover_route_loss_tx(&conn, &route, bound, input.now_seconds)?;
@@ -1003,8 +959,8 @@ impl SqliteAppStorage {
     /// Reclaim one entry of [`Self::converted_recovery_loss`] once the plane's
     /// matching generations are acknowledged and every writer for their
     /// tokens has finished; SQL cannot prove that prerequisite. Deletes each
-    /// of its generations still at the count the conversion found, keeping
-    /// how recent the deleted loss was, and ends the entry. A generation whose
+    /// of its generations still at the count the conversion found and ends
+    /// the entry. A generation whose
     /// count grew since is new loss and stays for the import, and so does any
     /// newer generation. Returns `false`, changing nothing, unless `loss` is a
     /// current entry of a finished conversion.
@@ -1025,17 +981,6 @@ impl SqliteAppStorage {
                     sqlite_integer(watermark.marker_token)?,
                     sqlite_integer(watermark.observed_count)?
                 ];
-                conn.execute_cached(
-                    "UPDATE account_recovery_state SET acknowledged_import_revision =
-                        MAX(acknowledged_import_revision, COALESCE(
-                            (SELECT import_revision FROM account_delivery_loss_evidence
-                             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
-                                 AND dropped_count = ?4 AND imported_count = dropped_count),
-                            0))
-                     WHERE singleton = 1",
-                    generation,
-                )
-                .storage()?;
                 conn.execute_cached(
                     "DELETE FROM account_delivery_loss_evidence
                      WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
@@ -1077,4 +1022,47 @@ impl SqliteAppStorage {
             .storage()?;
         Ok(())
     }
+}
+
+/// The inbox alone as the account's current routes, standing from `now`.
+#[cfg(test)]
+fn inbox_only(now_seconds: u64) -> [RecoveryConversionRoute; 1] {
+    [RecoveryConversionRoute {
+        route: TransportReconciliationRoute::Inbox,
+        required_relays: Vec::new(),
+        standing_floor_seconds: now_seconds,
+    }]
+}
+
+/// Finish the upgrade conversion on an account with nothing to convert, as
+/// every account's has finished by the time the recovery runner imports loss.
+#[cfg(test)]
+pub(crate) fn finish_conversion_for_test(app: &SqliteAppStorage, now_seconds: u64) {
+    let routes = inbox_only(now_seconds);
+    app.convert_recovery_obligations(&RecoveryConversionInput {
+        routes: &routes,
+        canonical_relay: &|relay: &str| relay.to_owned(),
+        retention_floor_seconds: 0,
+        now_seconds,
+    })
+    .unwrap();
+}
+
+/// Import `alice`'s new loss into ledger debt as the runner does, with the
+/// inbox as the only current route and nothing below the retention floor.
+#[cfg(test)]
+pub(crate) fn import_loss_for_test(
+    app: &SqliteAppStorage,
+    now_seconds: u64,
+) -> StorageResult<bool> {
+    let routes = inbox_only(now_seconds);
+    app.import_recovery_loss_to_ledger(
+        "alice",
+        &RecoveryConversionInput {
+            routes: &routes,
+            canonical_relay: &|relay: &str| relay.to_owned(),
+            retention_floor_seconds: 0,
+            now_seconds,
+        },
+    )
 }

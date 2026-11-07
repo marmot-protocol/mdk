@@ -12,6 +12,7 @@ plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
 # A10 includes #1946 qualified local observations; no new numeric policy or ledger id.
 # A15's quiet-period relay repair timer was replaced by the existing account owner.
 # A16's backward epoch-gap paging was deleted with the old owner's comparison job (#2660 phase 4).
+# A18's quiet and unserved streaks were deleted with the old owner (#2660 rows 9-10); its attempt cap remains.
 # A19 also owns bounded epoch-gap visits and admission-to-selection fairness; no new numeric policy.
 expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A17 A18 A19 A20 A21)
 inventory_pairs=("__inventory_sentinel__")

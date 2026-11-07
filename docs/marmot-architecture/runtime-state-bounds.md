@@ -299,10 +299,9 @@ Retirement is per occurrence and only on the user's decision; it is not such a c
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
-| Completed known-event rows and scopes | No historical completed-event log | Reclaimed on owner reconstruction. Pending exact-event debt is untouched. |
-| Explicit caller metadata | One serialized account-wide explicit-history row | Successful caller detach removes it, and a finished pass whose every route's window certified closes it; cancellation removes urgency only. Reopen performs the same cleanup. |
+| Completed rows and caller metadata an older owner left | Nothing writes them since the old owner's execution storage went (mdk#2660 rows 9–10): no completed-event log, no explicit-history caller row | Dropped with the old owner's tables (#2660 row 12). Pending exact-event debt is untouched. |
 | Maintenance boundary metadata and the runner's post-join collections | Input-relative to active post-join domain jobs | Removed with the job and collection lifecycle; grace and quiet timers remain domain-owned. |
-| Epoch evidence and qualified certificates | One current record per tracked group/epoch, no per-evaluation log | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
+| Epoch evidence | One current record per tracked group/epoch, no per-evaluation log; nothing writes a qualified certificate since the old owner's stall samples went (mdk#2660 rows 9–10) | Authenticated recovery or terminal retirement clears it; replacement updates the same row. |
 | Unresolved obligations/scopes | Input-relative to unresolved events and frozen historical route/endpoint goals; not a fixed account-wide byte cap | Independent qualified completion, explicit terminal domain retirement, or the user's explicit retirement of a parked occurrence (`state = 2`, "history may be incomplete"). A retired row keeps its unique demand key and its latest scope checkpoints, so it is bounded by the key space; genuinely new demand for that key reopens it. Obsolete routes cannot be silently removed from an outstanding goal. Each scope retains one latest checkpoint rather than an attempt history. |
 
 The owner holds no grant, frozen inventory or in-memory acknowledgment: the
@@ -311,8 +310,8 @@ recovery runner fetches all history against the coverage ledger (see
 conversion turns retained obligations into ledger debt before it starts.
 Each parked obligation is one "history may be incomplete" notice, identified by its
 obligation id and revision and recorded with a `parked_at_ms` time. Dismissing it is
-the user-authorized retirement above; when no loss obligation remains pending it also
-releases the process-local cursor fence without counting a recovery success.
+the user-authorized retirement above. Loss is ledger debt, so a dismissal never releases
+the cursor fence: the loss import does.
 
 ### Recovery comparison slot (#1992 amendment)
 
@@ -321,8 +320,8 @@ sharing the existing recovery retry state. Its frozen descriptor and failed-rout
 subset contain at most the existing four-route pass budget; no per-startup or
 per-attempt history accumulates. Receipts remain in the existing 16,384-item,
 30-day per-route inventory. No pass serves the row since the comparison job's
-deletion: conversion settles what it held, and its remaining writers are old-owner
-leftovers (mdk#2660).
+deletion, and its writers went with the old owner's execution storage (mdk#2660 rows
+9–10): conversion settles what it held, and the row stays until the table is dropped.
 Transiently failed selected routes stay pending; serviced or unattempted routes
 never erase unresolved coverage. Retained inventory may be narrower than older
 coverage debt. This adds no disk-cap claim for the previously approved unresolved

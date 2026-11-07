@@ -190,12 +190,6 @@ pub struct MarmotAppConfig {
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
     pub dev_fail_invite_local_refresh: bool,
-    /// Dev/test-only override for the base interval a recovery attempt waits
-    /// before an automatic seam may start another
-    /// ([`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]). Honored only with
-    /// `test-policy-overrides`; this lets a test exercise both sides of the
-    /// cooldown without spending it in wall-clock.
-    pub dev_epoch_backfill_retry_backoff_ms: Option<u64>,
     /// Dev/test-only override for how long a group wedged at one stalled epoch
     /// must wait between paced re-arms
     /// ([`crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
@@ -290,7 +284,6 @@ impl Default for MarmotAppConfig {
             dev_fail_create_local_projection: false,
             dev_device_groups: false,
             dev_fail_invite_local_refresh: false,
-            dev_epoch_backfill_retry_backoff_ms: None,
             dev_epoch_stall_wedge_rearm_interval_ms: None,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
@@ -470,13 +463,6 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_fail_invite_local_refresh(mut self, enabled: bool) -> Self {
         self.dev_fail_invite_local_refresh = enabled;
-        self
-    }
-
-    /// Pace unconfirmed epoch-gap backfill retries `ms` apart in test-policy
-    /// builds. Normal builds ignore this field.
-    pub fn with_dev_epoch_backfill_retry_backoff_ms(mut self, ms: u64) -> Self {
-        self.dev_epoch_backfill_retry_backoff_ms = Some(ms);
         self
     }
 

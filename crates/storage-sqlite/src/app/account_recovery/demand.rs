@@ -1,30 +1,11 @@
-//! Typed joins for non-legacy recovery callers. Duplicate requests do not rearm
-//! capability-blocked work, alter frozen scopes, or forgive account retry cost.
+//! The old recovery owner's obligations that the runner still reads: the
+//! pending demand read, maintenance reclamation, terminal-group retirement and
+//! epoch-gap capacity pressure. Duplicate pressure joins one row and one
+//! waiting period.
 use super::*;
 #[cfg(test)]
 use crate::SqliteAccountStorage;
 use crate::SqliteAppStorage;
-
-/// Identities are private to this account database. Job/operation identities
-/// come from their existing owner; recovery does not allocate another scheduler.
-pub enum RecoveryRequest<'a> {
-    MaintenanceBoundary {
-        job_id: &'a [u8],
-        group_id: &'a [u8],
-    },
-    ExplicitHistory {
-        operation_id: &'a [u8; 16],
-    },
-    KnownEvent {
-        group_id: &'a [u8],
-        event_id: &'a [u8; 32],
-    },
-    IncrementalHistory,
-    /// The current account owner's opaque live-subscription generation.
-    SubscriptionReplay {
-        snapshot: &'a [u8; 32],
-    },
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
@@ -88,201 +69,6 @@ pub(super) fn recovery_cause(value: i64) -> StorageResult<RecoveryCause> {
 }
 
 impl SqliteAppStorage {
-    pub fn request_recovery(
-        &self,
-        request: RecoveryRequest<'_>,
-        now_ms: u64,
-    ) -> StorageResult<RecoveryDemandTicket> {
-        self.request_recovery_observed(request, now_ms)
-            .map(|(ticket, _)| ticket)
-    }
-
-    /// [`Self::request_recovery`], also reporting how the write changed the
-    /// obligation, for the owner's audit row.
-    pub fn request_recovery_observed(
-        &self,
-        request: RecoveryRequest<'_>,
-        now_ms: u64,
-    ) -> StorageResult<(RecoveryDemandTicket, super::RecoveryDemandTransition)> {
-        let (key, cause, predicate, group, event, caller) = match request {
-            RecoveryRequest::MaintenanceBoundary { job_id, group_id } => {
-                if job_id.is_empty() || group_id.is_empty() {
-                    return Err(invalid_demand());
-                }
-                (
-                    format!(
-                        "maintenance:{}:{}:2",
-                        hex::encode(group_id),
-                        hex::encode(job_id)
-                    ),
-                    2,
-                    2,
-                    Some(group_id),
-                    None,
-                    false,
-                )
-            }
-            RecoveryRequest::ExplicitHistory { operation_id } => (
-                format!("explicit:{}", hex::encode(operation_id)),
-                3,
-                0,
-                None,
-                None,
-                true,
-            ),
-            RecoveryRequest::KnownEvent { group_id, event_id } => {
-                if group_id.is_empty() {
-                    return Err(invalid_demand());
-                }
-                (
-                    format!("known:{}:{}", hex::encode(group_id), hex::encode(event_id)),
-                    4,
-                    1,
-                    Some(group_id),
-                    Some(event_id.as_slice()),
-                    false,
-                )
-            }
-            RecoveryRequest::IncrementalHistory => ("incremental".into(), 5, 0, None, None, false),
-            RecoveryRequest::SubscriptionReplay { snapshot } => (
-                format!("replay:{}", hex::encode(snapshot)),
-                7,
-                3,
-                None,
-                None,
-                false,
-            ),
-        };
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            // Explicit history and native replay each reuse one account row.
-            let before = if cause == 3 || cause == 7 {
-                conn.query_row_cached(
-                    "SELECT id, revision, state, eligibility FROM account_recovery_obligations
-                     WHERE cause = ?1 LIMIT 1",
-                    [cause],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .storage()?
-            } else {
-                super::observe::demand_row(&conn, &key)?
-            };
-            if cause == 3 {
-                // Serialized foreground operations share one account-history
-                // obligation. A new caller expands its revision/goal without
-                // forgiving retry cost; stale cancellation tickets cannot
-                // detach the new caller. The most recent operation key makes
-                // duplicate joins idempotent without an unbounded waiter log.
-                conn.execute_cached(
-                    "UPDATE account_recovery_obligations SET demand_key=?1,
-                     revision=revision+1,state=0,eligibility=0,urgency=1,updated_at_ms=?2,
-                     incomplete_reason=NULL
-                     WHERE cause=3 AND demand_key!=?1",
-                    params![key,sqlite_integer(now_ms)?],
-                ).storage()?;
-            }
-            if cause == 7 {
-                // Only unresolved pending windows cross source generations.
-                // An admitted native range is no longer debt; this fact never
-                // retires loss or certifies history. A completed/retired goal
-                // has no windows to carry forward.
-                // The same snapshot is a no-op even for parked/closed work.
-                // Carry the token high-water through deleted scope rows so a
-                // recreated source ID cannot reuse an earlier generation's
-                // scope token, even when paired with the successor ticket.
-                let scope_revision: i64 = conn.query_row_cached(
-                    "SELECT COALESCE(MAX(s.scope_revision),0)
-                     FROM account_recovery_scopes AS s
-                     JOIN account_recovery_obligations AS o ON o.id=s.obligation_id
-                     WHERE o.cause=7 AND o.demand_key!=?1",
-                    [&key], |row| row.get(0),
-                ).storage()?;
-                let previous = conn.prepare_cached(
-                    "SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload
-                     FROM account_recovery_scopes AS s
-                     JOIN account_recovery_obligations AS o ON o.id=s.obligation_id
-                     WHERE o.cause=7 AND o.predicate=3 AND o.state=0
-                       AND o.demand_key!=?1 AND s.snapshot_state=1",
-                ).storage()?.query_map([&key], |row| Ok((
-                    row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?,
-                ))).storage()?.collect::<Result<Vec<_>, _>>().storage()?;
-                for (id, scope, format, bytes) in previous {
-                    let payload = super::plan::decode_scope(format, &bytes)?;
-                    if super::plan::payload_is_qualified(&payload, RecoveryPredicate::ReplayAdmission as i64, false) {
-                        conn.execute_cached(
-                            "DELETE FROM account_recovery_scopes WHERE obligation_id=?1 AND scope_id=?2",
-                            params![id, scope],
-                        ).storage()?;
-                    }
-                }
-                conn.execute_cached(
-                    "DELETE FROM account_recovery_scopes WHERE obligation_id IN (
-                     SELECT id FROM account_recovery_obligations
-                     WHERE cause=7 AND demand_key!=?1 AND state IN (1,2))",
-                    [&key],
-                ).storage()?;
-                // A new wire generation is not new evidence: a goal parked by
-                // its attempt cap stays parked until its notice is dismissed.
-                conn.execute_cached(
-                    "UPDATE account_recovery_obligations SET demand_key=?1,
-                     revision=MAX(revision,?3)+1,state=0,
-                     eligibility=CASE WHEN state=0 AND eligibility=4 AND recovery_attempts>=?4
-                         THEN 4 ELSE 0 END,
-                     parked_at_ms=CASE WHEN state=0 AND eligibility=4 AND recovery_attempts>=?4
-                         THEN parked_at_ms ELSE NULL END,
-                     updated_at_ms=?2,incomplete_reason=NULL
-                     WHERE cause=7 AND demand_key!=?1",
-                    params![key,sqlite_integer(now_ms)?,scope_revision,
-                        sqlite_integer(super::plan::RECOVERY_PARK_AFTER_ATTEMPTS)?],
-                ).storage()?;
-            }
-            // A new request for a known event or incremental history is new
-            // demand even when that key was satisfied or retired before.
-            conn.execute_cached(
-                "INSERT INTO account_recovery_obligations
-                 (demand_key,cause,predicate,group_id,created_at_ms,updated_at_ms,caller_origin,urgency)
-                 VALUES (?1,?2,?3,?4,?5,?5,?6,?6)
-                 ON CONFLICT(demand_key) DO UPDATE SET state=0,revision=revision+1,
-                     eligibility=0,updated_at_ms=excluded.updated_at_ms,incomplete_reason=NULL
-                 WHERE account_recovery_obligations.state IN (1,2)
-                     AND account_recovery_obligations.cause IN (4,5)",
-                params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
-            ).storage()?;
-            let after = super::observe::demand_row(&conn, &key)?.ok_or_else(invalid_demand)?;
-            // Native scopes are issued-source identities supplied by the
-            // owner, not scope zero. Do not invent an unresolved source row.
-            conn.execute_cached(
-                "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id,scope_id,group_id,known_event_id)
-                 SELECT ?1,0,?2,?3 WHERE ?4!=7",
-                params![after.0,group,event,cause],
-            ).storage()?;
-            Ok((
-                super::observe::ticket(&after)?,
-                super::observe::transition(before.as_ref(), &after),
-            ))
-        })
-    }
-
-    /// Restore the temporary session for an existing maintenance job after
-    /// physical session loss. This rearms only its limited boundary predicate;
-    /// history debt, domain grace timers and account retry cost are untouched.
-    /// The worker calls this only when no matching live session exists.
-    pub fn restore_recovery_maintenance_session(
-        &self,
-        ticket: RecoveryDemandTicket,
-    ) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "UPDATE account_recovery_obligations SET state=0,eligibility=1,revision=revision+1
-             WHERE id=?1 AND revision=?2 AND cause=2 AND predicate=2 AND state=1",
-                params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
-            )
-            .storage()?;
-        Ok(())
-    }
-
     /// Remove prerequisites whose owning domain job no longer needs a session.
     /// The caller supplies the complete current domain set; independent history
     /// and loss obligations are never included in this reclamation.
@@ -310,84 +96,21 @@ impl SqliteAppStorage {
         })
     }
 
-    /// The serialized owner calls this only with no live attempt or caller
-    /// referring to known-event completion. Pending debt is never reclaimed;
-    /// epoch certificates and maintenance jobs have their own longer lifetimes.
-    pub fn reclaim_completed_recovery_events(&self) -> StorageResult<usize> {
-        self.lock()?.execute_cached(
-            "DELETE FROM account_recovery_obligations WHERE cause=4 AND predicate=1 AND state=1 AND urgency=0",
-            [],
-        ).storage()
-    }
-
-    /// Close an explicit full-history request whose pass finished: its goal
-    /// has no lower bound, so nothing can complete it, and leaving it pending
-    /// would only park it into a notice. Closing records neither coverage nor
-    /// a retirement notice. The explicit-history row is reused by a later
-    /// request, which raises its revision, so only this ticket's revision is
-    /// closed: newer debt survives. Returns whether a row was closed.
-    pub fn close_explicit_history_request(
+    /// Retire group-scoped recovery only after the account owner observes a
+    /// terminal group. Account-wide loss evidence survives.
+    pub fn retire_terminal_group_recovery(
         &self,
-        ticket: RecoveryDemandTicket,
+        group: &cgka_traits::GroupId,
     ) -> StorageResult<bool> {
-        let closed = self
-            .lock()?
-            .execute_cached(
-                "DELETE FROM account_recovery_obligations
-                 WHERE id=?1 AND revision=?2 AND cause=?3 AND state=0",
-                params![
-                    ticket.id.as_slice(),
-                    sqlite_integer(ticket.revision)?,
-                    RecoveryCause::ExplicitHistory as i64
-                ],
-            )
-            .storage()?;
-        Ok(closed > 0)
-    }
-
-    /// A cancelled last foreground waiter loses urgency, not durable work.
-    /// System demand and other callers have independent identities/predicates.
-    pub fn detach_recovery_waiter(&self, ticket: RecoveryDemandTicket) -> StorageResult<()> {
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            conn.execute_cached("DELETE FROM account_recovery_obligations WHERE id=?1 AND revision=?2 AND caller_origin=1 AND state=1",
-                params![ticket.id.as_slice(),sqlite_integer(ticket.revision)?]).storage()?;
-            conn.execute_cached("UPDATE account_recovery_obligations SET urgency=0 WHERE id=?1 AND revision=?2 AND caller_origin=1",
-                params![ticket.id.as_slice(),sqlite_integer(ticket.revision)?]).storage()?;
-            Ok(())
+            self.lock()?
+                .execute_cached(
+                    "DELETE FROM account_recovery_obligations WHERE group_id=?1 AND cause IN (1,2,4)",
+                    [group.as_slice()],
+                )
+                .storage()?;
+            self.clear_recovery_failure(group)
         })
-    }
-
-    /// A recreated owner has no live caller from the previous session. Retain
-    /// incomplete debt and pacing; reclaim only already-satisfied caller rows.
-    pub fn restore_recovery_waiters(&self) -> StorageResult<()> {
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            conn.execute_cached(
-                "DELETE FROM account_recovery_obligations WHERE caller_origin=1 AND state=1",
-                [],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "UPDATE account_recovery_obligations SET urgency=0 WHERE caller_origin=1",
-                [],
-            )
-            .storage()?;
-            Ok(())
-        })
-    }
-
-    /// Read a completion verdict at the exact obligation revision; superseded
-    /// or reclaimed rows cannot become evidence for an older attempt.
-    pub fn recovery_obligation_is_satisfied(
-        &self,
-        id: [u8; 16],
-        revision: u64,
-    ) -> StorageResult<bool> {
-        self.lock()?.query_row_cached(
-            "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations WHERE id=?1 AND revision=?2 AND state=1)",
-            params![id.as_slice(),sqlite_integer(revision)?], |row| row.get(0),
-        ).storage()
     }
 
     pub fn pending_recovery_demands(&self) -> StorageResult<Vec<RecoveryDemand>> {
@@ -468,282 +191,6 @@ impl SqliteAppStorage {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A second explicit request reuses the row and raises its revision. The
-    /// first repair's late close must not delete that newer debt.
-    #[test]
-    fn a_stale_explicit_close_keeps_a_newer_request() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let first = store
-            .app_storage()
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &[1; 16],
-                },
-                1000,
-            )
-            .unwrap();
-        // The second request lands between the first repair's pass and its
-        // close.
-        let second = store
-            .app_storage()
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &[2; 16],
-                },
-                2000,
-            )
-            .unwrap();
-        assert_eq!(second.id, first.id, "the explicit row is reused");
-        assert!(second.revision > first.revision);
-        let explicit_pending = |store: &SqliteAccountStorage| {
-            store
-                .app_storage()
-                .pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|demand| demand.cause == RecoveryCause::ExplicitHistory)
-        };
-        assert!(
-            !store
-                .app_storage()
-                .close_explicit_history_request(first)
-                .unwrap()
-        );
-        assert!(explicit_pending(&store), "the newer request survives");
-        assert!(
-            store
-                .app_storage()
-                .close_explicit_history_request(second)
-                .unwrap()
-        );
-        assert!(!explicit_pending(&store));
-    }
-
-    #[test]
-    fn cancelling_one_caller_preserves_independent_demand_and_quiescence() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        let operation = [7; 16];
-        let caller = app
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &operation,
-                },
-                1000,
-            )
-            .unwrap();
-        app.request_recovery(RecoveryRequest::IncrementalHistory, 1000)
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        app.reserve_recovery_attempt(&fence, 1000, 15000, true)
-            .unwrap()
-            .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
-            .unwrap();
-        app.detach_recovery_waiter(caller).unwrap();
-        let joined = app
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &operation,
-                },
-                999999,
-            )
-            .unwrap();
-        assert!(joined == caller);
-        app.request_recovery(RecoveryRequest::IncrementalHistory, 999999)
-            .unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
-        assert_eq!(app.pending_recovery_demands().unwrap().len(), 2);
-        assert!(
-            app.recovery_eligible_revision_fence(false)
-                .unwrap()
-                .obligations
-                .is_empty()
-        );
-        assert_eq!(app.recovery_retry_state().unwrap().not_before_ms, 16000);
-    }
-    #[test]
-    fn maintenance_session_restore_and_reclamation_preserve_other_debt_and_retry() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO cgka_groups(id,epoch,record) VALUES (?1,0,x'00')",
-                [b"group".as_slice()],
-            )
-            .unwrap();
-        let ticket = app
-            .request_recovery(
-                RecoveryRequest::MaintenanceBoundary {
-                    job_id: b"job",
-                    group_id: b"group",
-                },
-                1,
-            )
-            .unwrap();
-        let other = app
-            .request_recovery(RecoveryRequest::IncrementalHistory, 1)
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        app.reserve_recovery_attempt(&fence, 1, 15000, false)
-            .unwrap()
-            .unwrap();
-        let retry = app.recovery_retry_state().unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE account_recovery_obligations SET state=1 WHERE id=?1",
-                [ticket.id.as_slice()],
-            )
-            .unwrap();
-        app.restore_recovery_maintenance_session(ticket).unwrap();
-        let restored = app.pending_recovery_demands().unwrap();
-        assert_eq!(
-            restored
-                .iter()
-                .find(|demand| demand.ticket.id == ticket.id)
-                .unwrap()
-                .ticket
-                .revision,
-            ticket.revision + 1
-        );
-        app.restore_recovery_maintenance_session(ticket).unwrap();
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        app.retain_recovery_maintenance_jobs(&[(b"job".to_vec(), b"group".to_vec())])
-            .unwrap();
-        assert_eq!(app.pending_recovery_demands().unwrap().len(), 2);
-        app.retain_recovery_maintenance_jobs(&[]).unwrap();
-        let retained = app.pending_recovery_demands().unwrap();
-        assert_eq!(retained.len(), 1);
-        assert!(retained[0].ticket == other);
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        let count: i64 = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM account_recovery_scopes WHERE obligation_id=?1",
-                [ticket.id.as_slice()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn successive_explicit_callers_reuse_debt_without_free_retry_or_stale_detach() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        let first = app
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &[0; 16],
-                },
-                1,
-            )
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        app.reserve_recovery_attempt(&fence, 1, 15000, true)
-            .unwrap()
-            .unwrap();
-        let retry = app.recovery_retry_state().unwrap();
-        for index in 1..100 {
-            let ticket = app
-                .request_recovery(
-                    RecoveryRequest::ExplicitHistory {
-                        operation_id: &[index; 16],
-                    },
-                    u64::from(index),
-                )
-                .unwrap();
-            assert_eq!(ticket.id, first.id);
-            assert_eq!(ticket.revision, first.revision + u64::from(index));
-            app.detach_recovery_waiter(first).unwrap();
-            assert_eq!(app.pending_recovery_demands().unwrap().len(), 1);
-            assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        }
-        let urgency: i64 = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT urgency FROM account_recovery_obligations",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(urgency, 1);
-    }
-}
-
-#[cfg(test)]
-mod waiter_tests {
-    use super::*;
-    #[test]
-    fn abandoned_waiter_keeps_debt_and_satisfied_waiter_is_reclaimed() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        let ticket = app
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &[7; 16],
-                },
-                1,
-            )
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        let retry = app
-            .reserve_recovery_attempt(&fence, 1, 15_000, true)
-            .unwrap()
-            .unwrap();
-        app.restore_recovery_waiters().unwrap();
-        assert_eq!(
-            app.pending_recovery_demands().unwrap()[0].ticket.id,
-            ticket.id
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT urgency FROM account_recovery_obligations",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        store
-            .lock()
-            .unwrap()
-            .execute("UPDATE account_recovery_obligations SET state=1", [])
-            .unwrap();
-        app.detach_recovery_waiter(ticket).unwrap();
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM account_recovery_obligations",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-    }
-}
-
 impl SqliteAppStorage {
     /// Admission pressure is demand, not permission for immediate replay into
     /// the same queue. Duplicate pressure joins one row and one waiting period.
@@ -792,56 +239,129 @@ impl SqliteAppStorage {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RecoveryLossCause;
+    use crate::app::account_recovery::tests::assert_backend;
+    use crate::base::test_support::{gid, sample_group};
+    use cgka_traits::storage::GroupStorage;
+
+    fn group_obligations(store: &SqliteAccountStorage) -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM account_recovery_obligations WHERE group_id=?1",
+                [gid(1).as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_retirement_failure_preserves_all_group_debt_and_independent_loss() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let group = gid(1);
+        app.ensure_account_projection("alice").unwrap();
+        store.put_group(&sample_group(group.clone(), 1, 2)).unwrap();
+        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group.as_slice()),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+        app.record_epoch_stall_evidence(&[crate::StoredEpochStallEvidence {
+            group_id_hex: hex::encode(group.as_slice()),
+            stalled_epoch: 1,
+            fruitless_completions: 2,
+            fruitless_reported: false,
+            last_arm_at_ms: 1,
+        }])
+        .unwrap();
+        // An upgraded database can still hold the old owner's known-event and
+        // maintenance obligations for the group.
+        app.execute_batch_for_test(&format!(
+            "INSERT INTO account_recovery_obligations (id, demand_key, cause, predicate, group_id, created_at_ms, updated_at_ms)
+             VALUES (x'{known}', 'known', 4, 1, x'{group}', 1, 1), (x'{job}', 'maintenance', 2, 2, x'{group}', 1, 1);",
+            known = "08".repeat(16),
+            job = "09".repeat(16),
+            group = hex::encode(group.as_slice()),
+        ))
+        .unwrap();
+        app.record_account_recovery_loss("alice", RecoveryLossCause::Queue, 55, 1, 1)
+            .unwrap();
+        let loss = app
+            .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+            .unwrap();
+        assert_eq!(group_obligations(&store), 3);
+
+        store.lock().unwrap().execute_batch("CREATE TRIGGER fail_terminal_retire BEFORE DELETE ON app_epoch_stall_evidence BEGIN SELECT RAISE(ABORT, 'injected terminal retire failure'); END;").unwrap();
+        assert_backend(
+            app.retire_terminal_group_recovery(&group),
+            "injected terminal retire failure",
+        );
+        assert_eq!(group_obligations(&store), 3);
+        assert_eq!(app.epoch_stall_evidence().unwrap().len(), 1);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_terminal_retire")
+            .unwrap();
+
+        app.retire_terminal_group_recovery(&group).unwrap();
+        assert_eq!(group_obligations(&store), 0);
+        assert!(app.epoch_stall_evidence().unwrap().is_empty());
+        assert!(
+            app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+                .unwrap()
+                == loss
+        );
+        assert!(!app.retire_terminal_group_recovery(&group).unwrap());
+    }
+}
+
+#[cfg(test)]
 mod capacity_tests {
     use super::*;
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
 
+    fn only_demand(app: &SqliteAppStorage) -> (RecoveryDemandTicket, RecoveryEligibility) {
+        let demands = app.pending_recovery_demands().unwrap();
+        assert_eq!(demands.len(), 1, "duplicate pressure joins one row");
+        (demands[0].ticket, demands[0].eligibility)
+    }
+
     #[test]
-    fn admission_pressure_waits_before_a_probe_without_resetting_retry_cost() {
+    fn admission_pressure_waits_its_relief_interval_before_a_probe() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let app = store.app_storage();
         store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
         app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 1_000)
             .unwrap();
-        let original = app.recovery_revision_fence().unwrap();
+        let (original, eligibility) = only_demand(&app);
+        assert_eq!(eligibility, RecoveryEligibility::WaitingCapacity);
         app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 5_000)
             .unwrap();
-        assert_eq!(app.recovery_revision_fence().unwrap(), original);
+        assert!(only_demand(&app) == (original, RecoveryEligibility::WaitingCapacity));
+
+        // The waiting period runs from the first pressure, not the duplicate.
         app.release_due_recovery_capacity_probes(15_999, 15_000)
             .unwrap();
-        assert!(
-            app.recovery_eligible_revision_fence(false)
-                .unwrap()
-                .obligations
-                .is_empty()
-        );
-        assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
+        assert_eq!(only_demand(&app).1, RecoveryEligibility::WaitingCapacity);
         app.release_due_recovery_capacity_probes(16_000, 15_000)
             .unwrap();
-        let fence = app.recovery_eligible_revision_fence(false).unwrap();
-        let first = app
-            .reserve_recovery_attempt(&fence, 16_000, 15_000, false)
-            .unwrap()
-            .unwrap();
+        assert_eq!(only_demand(&app).1, RecoveryEligibility::Retry);
+
+        // New pressure on the probe starts a new waiting period.
         app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 16_001)
             .unwrap();
+        assert_eq!(only_demand(&app).1, RecoveryEligibility::WaitingCapacity);
         app.release_due_recovery_capacity_probes(31_000, 15_000)
             .unwrap();
-        assert!(
-            app.recovery_eligible_revision_fence(false)
-                .unwrap()
-                .obligations
-                .is_empty()
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), first);
+        assert_eq!(only_demand(&app).1, RecoveryEligibility::WaitingCapacity);
         app.release_due_recovery_capacity_probes(31_001, 15_000)
             .unwrap();
-        let second = app
-            .reserve_recovery_attempt(&fence, 31_001, 30_000, false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(second.ordinal, 2);
-        assert_eq!(app.pending_recovery_demands().unwrap().len(), 1);
+        assert_eq!(only_demand(&app).1, RecoveryEligibility::Retry);
     }
 }

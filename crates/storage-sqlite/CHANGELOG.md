@@ -42,6 +42,16 @@
 
 ### Breaking changes
 
+- Remove the old recovery owner's execution storage (mdk#2660 rows 9–10): the comparison slot API, retry
+  reservations and pacing, scope plans, checkpoints, streaks and the attempt-cap park, qualified stall samples, the
+  `SubscriptionReplay` APIs, loss acknowledgment (`acknowledge_recovery_loss*`, `restore_unacknowledged_recovery_loss`),
+  `recovery_loss_reach_after`, the account-wide loss revision and import stamps, `RecoveryRequest` and its waiters,
+  the legacy delivery-loss APIs (`record_account_delivery_loss*`, `mark_account_delivery_recovery*`, `clear_account_delivery_recovery`,
+  `account_delivery_recovery`, `synchronize_account_delivery_loss`), and the obligation status and transition reads.
+  The recovery runner called none of them. Discarding a spill row after its last retry records loss evidence only;
+  the caller imports it into the ledger. Conversion, the loss evidence writers, epoch-gap demand and parked notices
+  stay. No migration; no table is dropped.
+
 - Remove cross-read chat-list paging (mdk#2983): `chat_list_page`, `chat_list_page_from_anchor`, `ChatListPageQuery`,
   `ChatListCursor`, the `first`/`last` cursors on `ChatListPage`, and the `InvalidLimit`, `CursorMismatch`,
   `StaleCursor` and `FilteredCursorUnsupported` errors. Nothing outside storage tests called them: the runtime window

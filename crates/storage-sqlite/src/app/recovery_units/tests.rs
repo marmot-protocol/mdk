@@ -564,6 +564,71 @@ fn new_loss_over_a_park_earns_one_probe() {
     assert!(app.recovery_unit_spans(&route, RELAY).unwrap().is_empty());
 }
 
+/// Loss is per route (mdk#2660 row 9): importing a loss on one route
+/// un-covers that route and earns its parked unit a probe, while another
+/// route's coverage, goal, unit, spans and debt, and the account's budget,
+/// stay as they were. No account-wide revision or pacing couples them.
+#[test]
+fn a_routed_loss_leaves_other_routes_coverage_and_budgets_alone() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    app.ensure_account_projection("alice").unwrap();
+    crate::app::account_recovery::finish_conversion_for_test(&app, NOW);
+    let (lost, kept) = (group(1), group(2));
+    for route in [&lost, &kept] {
+        owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+        break_unit(&app, route, NOW);
+    }
+    let usage = app.recovery_account_usage(NOW).unwrap();
+    assert_ne!(
+        usage,
+        RecoveryAccountUsage::default(),
+        "the breaks spent budget"
+    );
+    let standing = |route: &TransportReconciliationRoute| {
+        let covered = app
+            .recovery_coverage_ranges(route, RELAY)
+            .unwrap()
+            .into_iter()
+            .map(|proved| (proved.range.since_seconds, proved.range.until_seconds))
+            .collect::<Vec<_>>();
+        (
+            unit(&app, route, RELAY),
+            app.recovery_unit_spans(route, RELAY).unwrap(),
+            app.recovery_unit_debt(route, RELAY, NOW).unwrap(),
+            app.recovery_coverage_goal(route).unwrap(),
+            covered,
+        )
+    };
+    let kept_before = standing(&kept);
+
+    app.record_account_recovery_loss_routed(
+        "alice",
+        crate::RecoveryLossCause::Queue,
+        41,
+        1,
+        NOW,
+        Some(NOW - 700),
+        Some(&[(lost.clone(), NOW - 700)]),
+    )
+    .unwrap();
+    assert!(crate::app::account_recovery::import_loss_for_test(&app, NOW).unwrap());
+
+    assert!(
+        unit(&app, &lost, RELAY).probe,
+        "the lost route earns a probe"
+    );
+    assert_eq!(
+        app.recovery_unit_debt(&lost, RELAY, NOW).unwrap(),
+        vec![range(NOW - 700, NOW)]
+    );
+    assert!(
+        standing(&kept) == kept_before,
+        "another route's coverage and unit are untouched"
+    );
+    assert_eq!(app.recovery_account_usage(NOW).unwrap(), usage);
+}
+
 /// A relay added to the route re-arms its broken unit fully; an active unit
 /// is left as it is.
 #[test]

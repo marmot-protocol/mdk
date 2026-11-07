@@ -128,16 +128,6 @@ pub struct StoredEpochBackfillIntent {
     pub stalled_epoch: u64,
 }
 
-/// Durable evidence that the app relay plane omitted at least one delivery
-/// from a bounded per-account queue and must settle that loss through
-/// recovery before trusting the account's transport cursor again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AccountDeliveryRecovery {
-    pub marker_token: u64,
-    pub pending_since: u64,
-    pub dropped_count: u64,
-}
-
 /// Durable per-group evidence that full-history replay is not moving a group
 /// off one stalled epoch, carried across restarts.
 ///
@@ -678,98 +668,6 @@ impl SqliteAppStorage {
                 .storage()?;
             }
             Ok(())
-        })
-    }
-
-    pub fn account_delivery_recovery(
-        &self,
-        label: &str,
-    ) -> StorageResult<Option<AccountDeliveryRecovery>> {
-        let conn = self.lock()?;
-        conn.query_row_cached(
-            "SELECT marker_token, pending_since, dropped_count
-             FROM account_recovery_obligations
-             WHERE cause = 0 AND state = 0 AND account_label = ?1",
-            params![label],
-            |row| {
-                let marker_token = row.get::<_, i64>(0)?;
-                let pending_since = row.get::<_, i64>(1)?;
-                let dropped_count = row.get::<_, i64>(2)?;
-                Ok(AccountDeliveryRecovery {
-                    marker_token: u64::try_from(marker_token).unwrap_or_default(),
-                    pending_since: u64::try_from(pending_since).unwrap_or_default(),
-                    dropped_count: u64::try_from(dropped_count).unwrap_or_default(),
-                })
-            },
-        )
-        .optional()
-        .storage()
-    }
-
-    /// Persist incomplete recovery before the account may checkpoint a newer
-    /// cursor. Re-observing the same process-local generation raises the count
-    /// monotonically without moving its original detection time.
-    pub fn mark_account_delivery_recovery(
-        &self,
-        label: &str,
-        marker_token: u64,
-        dropped_count: u64,
-    ) -> StorageResult<()> {
-        self.mark_account_delivery_recovery_bounded(label, marker_token, dropped_count, None)
-    }
-
-    /// Like [`Self::mark_account_delivery_recovery`], also charging the
-    /// earliest wire `created_at` among the dropped deliveries, or an unknown
-    /// time, to the generation's bound.
-    pub fn mark_account_delivery_recovery_bounded(
-        &self,
-        label: &str,
-        marker_token: u64,
-        dropped_count: u64,
-        earliest_created_at: Option<u64>,
-    ) -> StorageResult<()> {
-        self.mark_account_delivery_recovery_observed(
-            label,
-            marker_token,
-            dropped_count,
-            earliest_created_at,
-            None,
-        )
-        .map(|_| ())
-    }
-
-    /// Low-level legacy retirement. Recovery completion must use revision-fenced
-    /// owner primitives, not this token-only compatibility operation.
-    pub fn clear_account_delivery_recovery(
-        &self,
-        label: &str,
-        marker_token: u64,
-    ) -> StorageResult<bool> {
-        let marker_token = i64::try_from(marker_token).unwrap_or(i64::MAX);
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let cleared = conn
-                .execute_cached(
-                    "DELETE FROM account_recovery_obligations
-                 WHERE cause = 0 AND account_label = ?1 AND marker_token = ?2",
-                    params![label, marker_token],
-                )
-                .storage()?;
-            if cleared == 0 {
-                return Ok(false);
-            }
-            // Retirement applies only to this token. Keep the imported watermark
-            // against delayed duplicates, but never retire joined generations.
-            conn.execute_cached(
-                "UPDATE account_delivery_loss_evidence
-                SET legacy_retired_count=imported_count
-                WHERE account_label=?1 AND cause=0 AND marker_token=?2",
-                params![label, marker_token],
-            )
-            .storage()?;
-            let remaining = crate::app::account_recovery::restore_legacy_loss_tx(&conn, label)?;
-            // The legacy caller clears its in-memory flag only on true.
-            Ok(!remaining)
         })
     }
 

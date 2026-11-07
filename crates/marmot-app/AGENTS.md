@@ -917,19 +917,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   types (`AccountError`, `SessionError`) and identity-proof signer types, so hosts reach them through `marmot_app`
   (mdk#2602).
 - The recovery runner owns every history fetch (mdk#2660 phase 4); the old owner's grant, comparison job and
-  epoch-gap paging are deleted (5c2a846b4 is the last commit with them). Runtime catch-ups (`SyncMode::Drain`) only
-  drain the live queue. `sync()` drains, flushes recovery observations when debt is pending, and a directly owned
-  client then runs one runner pass in place. Nothing re-subscribes to recover history, and only startup, a frozen
+  epoch-gap paging are deleted (5c2a846b4 is the last commit with them), and so are its startup comparison slot,
+  retry pacing and loss acknowledgment (rows 9–10). Runtime catch-ups (`SyncMode::Drain`) only drain the live
+  queue. Every recovery seam and every startup or explicit `sync()` flushes recovery observations, debt or not,
+  which imports new loss into the ledger and wakes the runner; a directly owned client then runs one runner pass
+  in place. A discarded spill row records loss evidence and the client imports it, as overflow observation does. Nothing re-subscribes to recover history, and only startup, a frozen
   wake or an unactivated client installs live subscriptions. Explicit full-history repair is one request the
   account's runner serves (`recovery_runner/repair.rs`). It never reports complete: history below the retained
   window is unsearched (`BelowRetentionWindow` when the window is covered), so never certify explicit history from a
   window. Repair tests live in `src/client/recovery_runner/repair/tests.rs`. See the README for the
   automatic-recovery and send-fairness limits.
 - A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
-  besides qualified completion. Record it only through `retire_parked_recovery_obligation` (its own outcome,
-  never coverage) and release the delivery-loss fence through `release_retired_delivery_loss`, which keeps the
-  fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
-  never counts a recovery success. Notice ids are opaque and must not be logged.
+  besides qualified completion, and never counts as coverage or a recovery success. A ledger notice retires its
+  route's parked spans (`dismiss_recovery_route_park_on`); a parked epoch-gap obligation retires through
+  `retire_parked_recovery_obligation`, its own outcome. Loss is ledger debt, so no dismissal releases the
+  delivery-loss fence: the loss import does. Notice ids are opaque and must not be logged.
 - Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
   loss with the REQ floors its SDK context reported at the lag (per route when known; record them through
   `record_account_recovery_loss_routed`), and enqueue the generation's control record. Only an
