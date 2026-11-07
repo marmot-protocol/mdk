@@ -390,8 +390,50 @@ impl ApplySnapshotCounter {
     }
 }
 
+/// A one-shot deferred-usage scan fault, placed after a real nonempty prefix.
+#[derive(Clone, Default)]
+struct DeferredUsageReadFault(Arc<Mutex<Option<(GroupId, bool)>>>);
+
+impl DeferredUsageReadFault {
+    #[cfg(feature = "test-policy-overrides")]
+    fn arm_after_other_group(&self, group_id: GroupId) {
+        *self.0.lock().unwrap() = Some((group_id, false));
+    }
+
+    fn read(
+        &self,
+        storage: &SqliteAccountStorage,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if states == [MessageState::PeelDeferred] {
+            let mut armed = self.0.lock().unwrap();
+            if armed
+                .as_ref()
+                .is_some_and(|(target, completed_prefix)| target == group_id && *completed_prefix)
+            {
+                *armed = None;
+                return Err(StorageError::Busy(
+                    "injected deferred account scan after completed prefix".into(),
+                ));
+            }
+        }
+        let records = storage.list_messages_in_states(group_id, states, at_or_after_epoch)?;
+        if states == [MessageState::PeelDeferred]
+            && !records.is_empty()
+            && let Some((target, completed_prefix)) = self.0.lock().unwrap().as_mut()
+            && target != group_id
+        {
+            *completed_prefix = true;
+        }
+        Ok(records)
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
-/// selected record/cache writes. Every other call delegates unchanged.
+/// selected record/cache writes and an armed deferred-account scan.
+/// Every other call delegates unchanged.
 struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: PutGroupFault,
@@ -402,6 +444,7 @@ struct FaultStorage {
     /// `release_message_for_replay` drops retained bytes.
     release_fault: LeaveWriteFault,
     preparation_delay: PreparationDelay,
+    deferred_usage_read_fault: DeferredUsageReadFault,
     retained_anchor_rewinds: RetainedAnchorRewindCounter,
     apply_snapshots: ApplySnapshotCounter,
     termination_fault: LeaveWriteFault,
@@ -488,8 +531,8 @@ impl MessageStorage for FaultStorage {
                 self.preparation_delay.graph_ms.load(Ordering::SeqCst) as u64,
             ));
         }
-        self.inner
-            .list_messages_in_states(group_id, states, at_or_after_epoch)
+        self.deferred_usage_read_fault
+            .read(&self.inner, group_id, states, at_or_after_epoch)
     }
     /// A failed batch's input check reads through the backend's filter. Every
     /// other listing keeps the trait default, so `graph_calls` still counts
@@ -1015,6 +1058,7 @@ fn build_counted_fault_selfremove_client(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots,
         termination_fault: LeaveWriteFault::default(),
@@ -1495,6 +1539,7 @@ fn build_release_fault_client(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault,
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -1526,6 +1571,7 @@ fn build_leave_write_fault_client(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -2440,6 +2486,7 @@ async fn generic_rewind_puts_back_complete_pending_application_output() {
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -2882,6 +2929,7 @@ async fn slow_preparation_case(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: delay.clone(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -2957,6 +3005,7 @@ async fn past_peel_backlog_case(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: rewinds.clone(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -3152,6 +3201,135 @@ async fn slow_preparation_normalizes_bounded_slices_before_peeling() {
     );
 }
 
+/// A late group read must not publish partially reconstructed account capacity.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn deferred_account_reconstruction_retries_after_partial_scan_failure() {
+    use cgka_traits::ingest::InboundResourceLimit;
+
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let scan_fault = DeferredUsageReadFault::default();
+    let build = || {
+        EngineBuilder::new(FaultStorage {
+            inner: storage.clone(),
+            fault: PutGroupFault::default(),
+            leave_write_fault: LeaveWriteFault::default(),
+            intent_write_fault: LeaveWriteFault::default(),
+            failed_state_fault: FailedStateWriteFault::default(),
+            release_fault: LeaveWriteFault::default(),
+            preparation_delay: PreparationDelay::default(),
+            deferred_usage_read_fault: scan_fault.clone(),
+            retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+            apply_snapshots: ApplySnapshotCounter::default(),
+            termination_fault: LeaveWriteFault::default(),
+            post_commit_disband_read_fault: LeaveWriteFault::default(),
+            deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"partial-account-scan"))
+        .account_identity_proof_signer(proof_signer(b"partial-account-scan"))
+        .peeler(Box::new(OpaquePeeler))
+        .build()
+        .unwrap()
+    };
+    let mut engine = build();
+    let mut retained = Vec::new();
+    for index in 0..2 {
+        let (group_id, created) = engine
+            .create_group(CreateGroupRequest {
+                name: format!("partial account scan {index}"),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated { pending, .. } = created else {
+            panic!("expected genuine group creation");
+        };
+        engine.confirm_published(pending).await.unwrap();
+        let message = TransportMessage {
+            id: MessageId::new(format!("partial-account-{index}").into_bytes()),
+            payload: vec![42 + index; 32],
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        };
+        assert!(matches!(
+            engine.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        retained.push(storage.get_message(&message.id).unwrap());
+    }
+    drop(engine);
+    let mut rebuilt = build();
+    rebuilt.hydrate_all_stored_groups().unwrap();
+    rebuilt.set_deferred_peel_limits_for_tests(
+        512,
+        usize::MAX,
+        retained.iter().map(|row| row.payload.len()).sum(),
+    );
+    // The backend's returned order only places the fault; its arm requires a
+    // completed nonempty read first and makes no generic listing-order promise.
+    let groups = storage.list_groups().unwrap();
+    assert_eq!(groups.len(), 2);
+    scan_fault.arm_after_other_group(groups[1].clone());
+    let incoming = TransportMessage {
+        id: MessageId::new(b"partial-account-overflow".to_vec()),
+        payload: vec![44; 32],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: groups[0].as_slice().to_vec(),
+        },
+    };
+    let failed = rebuilt.ingest(incoming.clone()).await;
+    assert!(
+        matches!(
+            &failed,
+            Err(EngineError::Storage(StorageError::Busy(detail)))
+                if detail == "injected deferred account scan after completed prefix"
+        ),
+        "a real account scan after its completed prefix must fail, got {failed:?}"
+    );
+    for row in &retained {
+        assert_eq!(&storage.get_message(&row.id).unwrap(), row);
+    }
+    assert!(matches!(
+        storage.get_message(&incoming.id),
+        Err(StorageError::NotFound)
+    ));
+    assert!(
+        matches!(
+            rebuilt.ingest(incoming.clone()).await.unwrap(),
+            IngestOutcome::ResourceRefused {
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+                ..
+            }
+        ),
+        "the healed same-engine retry must enforce the complete account byte budget"
+    );
+    assert!(matches!(
+        storage.get_message(&incoming.id),
+        Err(StorageError::NotFound)
+    ));
+    for row in &retained {
+        assert_eq!(&storage.get_message(&row.id).unwrap(), row);
+    }
+    assert_eq!(
+        rebuilt
+            .engine_metrics()
+            .deferred_peel_account_byte_capacity_refusals,
+        1
+    );
+}
+
 /// Due rows spend the one progress allowance on release, rather than being
 /// retried after expiry or all released in a single already-expired quantum.
 #[tokio::test]
@@ -3319,6 +3497,7 @@ async fn setup_own_intent_fault_case(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -3464,6 +3643,7 @@ async fn a_queued_no_change_whose_retirement_fails_keeps_the_pass() {
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
@@ -3755,6 +3935,7 @@ async fn assert_deferred_retirement(case: DeferredRetirementCase) {
         failed_state_fault: failed_state_fault.clone(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
@@ -4108,6 +4289,7 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
             failed_state_fault: FailedStateWriteFault::default(),
             release_fault: LeaveWriteFault::default(),
             preparation_delay: PreparationDelay::default(),
+            deferred_usage_read_fault: DeferredUsageReadFault::default(),
             retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
             apply_snapshots: ApplySnapshotCounter::default(),
             termination_fault: termination_fault.clone(),
@@ -4282,6 +4464,7 @@ async fn assert_convergence_membership_fault(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
@@ -4473,6 +4656,7 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),

@@ -42,6 +42,7 @@ fn retry_storage(
         failed_state_fault: FailedStateWriteFault::default(),
         release_fault: LeaveWriteFault::default(),
         preparation_delay,
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
         apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),

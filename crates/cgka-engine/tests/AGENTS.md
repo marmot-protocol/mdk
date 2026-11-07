@@ -205,6 +205,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   suppression. The other typed message-processing callers rely on the shared error-classifier proof, not separate
   per-caller storage-fault witnesses. Genuine validation failures keep their existing input-rejection behavior.
 
+  `deferred_account_reconstruction_retries_after_partial_scan_failure` owns a late account-usage read failure:
+  a healed same-engine retry rebuilds the complete byte total and refuses overflow without changing retained rows.
+
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
     release with `--ignored --nocapture`; it reports timings and never asserts a threshold
