@@ -14956,6 +14956,7 @@ fn group_state_subscription_drain_scopes_diagnostics_and_tears_down() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn slash_account_setup_adopts_the_returned_identity_and_signing_state() {
     use nostr::prelude::ToBech32;
@@ -14967,21 +14968,21 @@ fn slash_account_setup_adopts_the_returned_identity_and_signing_state() {
     for (input, command, action, local_signing, account_id_result) in [
         (
             "/create-identity".to_owned(),
-            "create-identity".to_owned(),
+            vec!["create-identity".to_owned()],
             "created identity",
             true,
             true,
         ),
         (
             format!("/login {npub}"),
-            format!("login {npub}"),
+            vec!["login".to_owned(), npub.clone()],
             "logged in public identity",
             false,
             false,
         ),
         (
             format!("/login {nsec}"),
-            "login --nsec-stdin".to_owned(),
+            vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             "logged in identity",
             true,
             true,
@@ -14999,28 +15000,23 @@ fn slash_account_setup_adopts_the_returned_identity_and_signing_state() {
             result["account_id"] = serde_json::json!(b);
         }
         let response = serde_json::json!({"ok":true,"result":result}).to_string();
-        let (exe, args) = test_appending_arg_executable(dir.path(), &response);
-        if action == "logged in identity" {
-            // The child must consume the secret before replying, as the real
-            // CLI does; an immediate reply could race the parent's pipe write.
-            #[cfg(unix)]
-            write_fake_wn(
-                &exe,
-                &format!(
-                    "#!/bin/sh\necho \"$*\" >> '{}'\ncat > /dev/null\ncat <<'JSON'\n{response}\nJSON\n",
-                    args.display()
-                ),
-            );
-            #[cfg(windows)]
-            std::fs::write(
-                &exe,
-                format!(
-                    "@echo off\r\necho %* >> \"{}\"\r\nmore >nul\r\necho {response}\r\n",
-                    args.display()
-                ),
-            )
-            .unwrap();
-        }
+        let exe = dir.path().join("wn-setup");
+        let args = dir.path().join("args");
+        let stdin = dir.path().join("stdin");
+        let first = dir.path().join("first");
+        let capture_stdin = if action == "logged in identity" {
+            format!("cat > '{}'\n", stdin.display())
+        } else {
+            String::new()
+        };
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nif mkdir '{}' 2>/dev/null; then\nprintf '%s\\n' \"$@\" > '{}'\n{capture_stdin}fi\ncat <<'JSON'\n{response}\nJSON\n",
+                first.display(),
+                args.display()
+            ),
+        );
         let mut app = test_tui_app(
             WnClient {
                 exe,
@@ -15060,15 +15056,22 @@ fn slash_account_setup_adopts_the_returned_identity_and_signing_state() {
             local_signing.then_some(b.as_str())
         );
         let recorded = std::fs::read_to_string(args).unwrap();
-        let setup = recorded.lines().next().unwrap();
-        assert!(setup.ends_with(&command), "account setup dispatch changed");
-        assert!(
-            !setup.contains("--account"),
-            "account setup must not inherit A"
-        );
+        let mut expected = vec!["--json".to_owned()];
+        expected.extend(command);
+        assert_eq!(recorded.lines().collect::<Vec<_>>(), expected);
+        assert!(!recorded.contains(&nsec), "the secret is never an argument");
+        if action == "logged in identity" {
+            assert!(
+                std::fs::read_to_string(stdin).unwrap() == format!("{nsec}\n"),
+                "the dispatcher must deliver the complete secret through stdin"
+            );
+        } else {
+            assert!(!stdin.exists());
+        }
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn slash_management_commands_forward_the_selected_owner_and_requested_options() {
     let a = "aa".repeat(32);
@@ -15077,49 +15080,68 @@ fn slash_management_commands_forward_the_selected_owner_and_requested_options() 
     for (input, command, selected_account, status) in [
         (
             "/chat rename Renamed Room".to_owned(),
-            format!("groups update {group} --name Renamed Room"),
+            vec![
+                "groups".into(),
+                "update".into(),
+                group.clone(),
+                "--name".into(),
+                "Renamed Room".into(),
+            ],
             true,
             "updated chat; published=2",
         ),
         (
             "/chat describe Project marker".to_owned(),
-            format!("groups update {group} --description Project marker"),
+            vec![
+                "groups".into(),
+                "update".into(),
+                group.clone(),
+                "--description".into(),
+                "Project marker".into(),
+            ],
             true,
             "updated chat; published=2",
         ),
         (
             format!("/members add {peer} {peer}"),
-            format!("group invite {group} {peer}"),
+            vec!["group".into(), "invite".into(), group.clone(), peer.clone()],
             true,
             "added member(s); published=2",
         ),
         (
             format!("/members remove {peer} {peer}"),
-            format!("group remove {group} {peer}"),
+            vec!["group".into(), "remove".into(), group.clone(), peer.clone()],
             true,
             "removed member(s); published=2",
         ),
         (
             "/members list".to_owned(),
-            format!("group members {group}"),
+            vec!["group".into(), "members".into(), group.clone()],
             true,
             "members: npub1...amrcaj",
         ),
         (
             format!("/keys fetch {peer}"),
-            format!("keys fetch {peer}"),
+            vec!["keys".into(), "fetch".into(), peer.clone()],
             false,
             "fetched key package bytes=57",
         ),
         (
             "/keys rotate".to_owned(),
-            "keys rotate".to_owned(),
+            vec!["keys".into(), "rotate".into()],
             true,
             "rotated key package bytes=57",
         ),
         (
             "/profile name Requested Name".to_owned(),
-            "profile update --name Requested Name --display-name Requested Name".to_owned(),
+            vec![
+                "profile".into(),
+                "update".into(),
+                "--name".into(),
+                "Requested Name".into(),
+                "--display-name".into(),
+                "Requested Name".into(),
+            ],
             true,
             "published profile name Returned Name",
         ),
@@ -15134,7 +15156,17 @@ fn slash_management_commands_forward_the_selected_owner_and_requested_options() 
             "messages":[],"has_more_before":false
         }})
         .to_string();
-        let (exe, args) = test_appending_arg_executable(dir.path(), &response);
+        let exe = dir.path().join("wn-management");
+        let args = dir.path().join("args");
+        let first = dir.path().join("first");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nif mkdir '{}' 2>/dev/null; then\nprintf '%s\\n' \"$@\" > '{}'\nfi\ncat <<'JSON'\n{response}\nJSON\n",
+                first.display(),
+                args.display()
+            ),
+        );
         let mut app = test_tui_app(
             WnClient {
                 exe,
@@ -15153,12 +15185,11 @@ fn slash_management_commands_forward_the_selected_owner_and_requested_options() 
         assert!(app.input.is_empty());
         finish_queued_effects(&mut app);
         let recorded = std::fs::read_to_string(args).unwrap();
-        let requested = recorded.lines().next().unwrap();
-        assert!(requested.ends_with(&command), "{input}: {requested}");
-        assert_eq!(
-            requested.contains(&format!("--account {a}")),
-            selected_account,
-            "{input}: {requested}"
-        );
+        let mut expected: Vec<String> = vec!["--json".into()];
+        if selected_account {
+            expected.extend(["--account".into(), a.clone()]);
+        }
+        expected.extend(command);
+        assert_eq!(recorded.lines().collect::<Vec<_>>(), expected, "{input}");
     }
 }
