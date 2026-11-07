@@ -5591,7 +5591,43 @@ async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_
             .unwrap()
             .expect("a processed SelfRemove must keep the runtime timer armed");
         assert!((10..=50).contains(&delay));
-        clock.advance_ms(delay - 1);
+        let elapsed = if reopen {
+            0
+        } else {
+            let SendResult::GroupEvolution { pending, .. } = alice
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("expected a real pre-deadline self-update");
+            };
+            assert_eq!(
+                alice
+                    .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                    .unwrap(),
+                None,
+                "pending publication temporarily blocks automatic staging"
+            );
+            clock.advance_ms(1);
+            alice.publish_failed(pending).await.unwrap();
+            assert_eq!(
+                alice.epoch(&group_id).unwrap(),
+                cgka_traits::types::EpochId(1)
+            );
+            assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+            assert!(alice.drain_auto_publish().is_empty());
+            assert_eq!(
+                alice
+                    .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                    .unwrap(),
+                Some(delay - 1),
+                "publish rollback must preserve the earlier peer Leave deadline"
+            );
+            1
+        };
+        clock.advance_ms(delay - 1 - elapsed);
         assert_eq!(
             alice
                 .scheduled_self_remove_auto_commit_delay_ms(&group_id)

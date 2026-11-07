@@ -59,6 +59,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
+    and preservation of the earlier peer-Leave deadline after an unrelated pending self-update fails publication.
 
   `observed_selfremove_proposal_delays_commit_then_retains_outbound_app_messages` owns due automatic maintenance
   before a public send prepares its wire, plus pre-due sendability and ordered retained sends after confirmation.
@@ -168,7 +169,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     Commit/content-marker and applicable Welcome artifacts on a late group-projection failure, with independent
     MLS reads, encrypted reopen and real recipient join/removal on retry (mdk#3071, mdk#3127). The existing group-data
     and automatic SelfRemove projection-failure owners also compare complete sent rows, preserving their generic
-    fault-provider, native/proposal/snapshot cleanup and real successful retry. No torn record,
+    fault-provider, native/proposal/snapshot cleanup and real successful retry.
+    `auto_commit_record_write_failure_leaves_no_torn_group_record` also owns the due peer-SelfRemove wakeup and
+    fresh pending-work notification after a returned staging error, followed by same-proposal automatic retry;
+    do not replace that retry with a new explicit removal command. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns

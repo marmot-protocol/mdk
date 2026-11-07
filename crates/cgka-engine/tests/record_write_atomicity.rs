@@ -1762,7 +1762,7 @@ async fn welcome_record_failure_restores_key_package_for_retry() {
 /// A `put_group` failure during auto-commit staging must leave no torn group
 /// record (mdk#333): the record stays at the pre-stage epoch with all members,
 /// no orphaned pending publish or leaked snapshot survives, and the group
-/// remains usable for a fresh commit.
+/// keeps the original departure scheduled for an automatic retry (#3185).
 #[tokio::test]
 async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     let fault = PutGroupFault::default();
@@ -1825,7 +1825,12 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
     assert!(alice.drain_auto_publish().is_empty());
-    clock.advance_ms(75);
+    let delay = alice
+        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+        .unwrap()
+        .expect("the authenticated leave must schedule an automatic commit");
+    assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+    clock.advance_ms(delay);
 
     let snapshot_baseline = handle.list_group_snapshots(&group_id).unwrap().len();
 
@@ -1869,25 +1874,41 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
         "failed automatic staging left unowned signed Commit or content marker"
     );
 
-    // The group stays fully usable: the state machine remained Stable, the
-    // staged OpenMLS commit was cleared, AND the stored SelfRemove proposal
-    // was removed from the proposal store (left behind, OpenMLS 0.8.1 panics
-    // when this remove_members filters it against the Remove for bob's
-    // leaf). A fresh commit stages, confirms, and lands. (The failed attempt
-    // consumed bob's scheduled auto-commit — schedule removal precedes
-    // replay by design — so the admin completes the removal explicitly.)
-    let evolution = alice
-        .send(SendIntent::RemoveMembers {
-            group_id: group_id.clone(),
-            members: vec![bob_member_id.clone()],
-        })
-        .await
-        .unwrap();
-    let pending = match evolution {
-        SendResult::GroupEvolution { pending, .. } => pending,
-        other => panic!("expected GroupEvolution, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
+    // The same retained proposal must remain scheduled after the transient
+    // failure. No new send, proposal or restart should be needed to wake it.
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        Some(0),
+        "a transient staging error must retain the due SelfRemove wakeup"
+    );
+    assert!(
+        alice.drain_pending_convergence_groups().contains(&group_id),
+        "the host must be notified that the original departure still needs work"
+    );
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut publications = alice.drain_auto_publish();
+    assert_eq!(
+        publications.len(),
+        1,
+        "retry must stage the original departure"
+    );
+    let publication = publications.remove(0);
+    alice.confirm_published(publication.pending).await.unwrap();
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None
+    );
+    assert!(alice.drain_auto_publish().is_empty());
     let record = handle.get_group(&group_id).unwrap();
     assert_eq!(record.epoch, EpochId(2));
     assert_eq!(record.members.len(), 2);
