@@ -902,11 +902,9 @@ fn assert_processed_commit_replay(effects: &IngestEffects) {
             effects.outcome,
             IngestOutcome::Ignored {
                 category: InputRejectionCategory::Duplicate
-            } | IngestOutcome::Stale {
-                reason: StaleReason::AlreadyAtEpoch { .. }
             }
         ),
-        "processed commit replay must be duplicate/stale; actual_variant_tag={outcome_tag}"
+        "an admitted commit replay must be Duplicate; actual_variant_tag={outcome_tag}"
     );
     assert!(effects.effects.events.is_empty());
 }
