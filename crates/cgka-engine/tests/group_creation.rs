@@ -1595,70 +1595,304 @@ async fn current_group_initial_retention_rejects_unsupported_invitee_before_stat
     assert!(alice.live_group_ids().unwrap().is_empty());
 }
 
+/// Cancelling the real wrapping await must clean up provisional MLS state in
+/// either profile without dropping the engine that owns it (mdk#3061).
 #[tokio::test]
 async fn cancelling_founding_retention_before_canonicalization_leaves_no_group() {
-    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
-    let supported = default_group_components()
-        .into_iter()
-        .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
-        .collect::<Vec<_>>();
-    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
-        .identity(pad32(b"bob-cancel-founding-retention"))
-        .account_identity_proof_signer(proof_signer(b"bob-cancel-founding-retention"))
-        .supported_app_components(supported.clone())
-        .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
-        .build()
-        .unwrap();
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let started = Arc::new(tokio::sync::Notify::new());
-    let task_storage = storage.clone();
-    let task_supported = supported.clone();
-    let task_started = started.clone();
-    let creation = tokio::spawn(async move {
-        let mut alice = EngineBuilder::new(task_storage)
-            .identity(pad32(b"alice-cancel-founding-retention"))
-            .account_identity_proof_signer(proof_signer(b"alice-cancel-founding-retention"))
-            .supported_app_components(task_supported)
-            .protocol_profile(ProtocolProfile::Current)
-            .peeler(Box::new(BlockingWelcomePeeler {
-                inner: MockPeeler::default(),
-                started: task_started,
-            }))
-            .build()
-            .unwrap();
-        alice
-            .create_group(CreateGroupRequest {
-                name: "cancel founding retention".into(),
-                description: String::new(),
-                members: vec![bob_kp],
-                required_features: vec![],
-                app_components: vec![AppComponentData {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("cancelled-creation.sqlite");
+        let database_key = SqlCipherKey::raw([0x61; 32]);
+        let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
+        let supported = default_group_components()
+            .into_iter()
+            .chain([GROUP_MESSAGE_RETENTION_COMPONENT_ID])
+            .collect::<Vec<_>>();
+        let build_client = |identity: &[u8], storage, peeler: Box<dyn TransportPeeler>| {
+            let builder = EngineBuilder::new(storage)
+                .identity(pad32(identity))
+                .account_identity_proof_signer(proof_signer(identity))
+                .supported_app_components(supported.clone())
+                .protocol_profile(profile)
+                .peeler(peeler);
+            if profile == ProtocolProfile::Legacy {
+                builder.legacy_compatibility_profile().build().unwrap()
+            } else {
+                builder.build().unwrap()
+            }
+        };
+        let mut bob = build_client(
+            b"bob-cancel-founding-retention",
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
+            Box::<MockPeeler>::default(),
+        );
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let request = CreateGroupRequest {
+            name: "cancel founding retention".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: if profile == ProtocolProfile::Current {
+                vec![AppComponentData {
                     component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
                     data: 300u64.to_be_bytes().to_vec(),
-                }],
-                initial_admins: vec![],
+                }]
+            } else {
+                vec![]
+            },
+            initial_admins: vec![],
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut alice = build_client(
+            b"alice-cancel-founding-retention",
+            storage.clone(),
+            Box::new(BlockingWelcomePeeler {
+                inner: MockPeeler::default(),
+                started: started.clone(),
+            }),
+        );
+        let before = encrypted_openmls_rows(&database, &database_key);
+        assert!(!before.is_empty(), "retain the creator's identity keys");
+        {
+            let creation = alice.create_group(request.clone());
+            tokio::pin!(creation);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    _ = started.notified() => {},
+                    result = &mut creation => panic!("wrapping must still be pending: {result:?}"),
+                }
             })
             .await
-    });
+            .expect("creation must reach its Welcome wrapping await");
+            assert!(
+                encrypted_openmls_rows(&database, &database_key) != before,
+                "{profile:?}: cancellation must happen after OpenMLS wrote group state"
+            );
+        }
+        assert!(storage.list_groups().unwrap().is_empty(), "{profile:?}");
+        assert!(alice.live_group_ids().unwrap().is_empty(), "{profile:?}");
+        assert!(alice.drain_events().is_empty(), "{profile:?}");
+        assert!(
+            encrypted_openmls_rows(&database, &database_key) == before,
+            "{profile:?}: cancellation left orphaned OpenMLS state"
+        );
+        drop(alice);
+        drop(storage);
 
-    started.notified().await;
-    creation.abort();
-    assert!(creation.await.unwrap_err().is_cancelled());
+        let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
+        assert!(
+            encrypted_openmls_rows(&database, &database_key) == before,
+            "{profile:?}: orphaned state survived encrypted reopen"
+        );
+        let mut reopened = build_client(
+            b"alice-cancel-founding-retention",
+            storage,
+            Box::<MockPeeler>::default(),
+        );
+        reopened.hydrate_all_stored_groups().unwrap();
+        assert!(reopened.live_group_ids().unwrap().is_empty());
+        let (group_id, result) = reopened.create_group(request).await.unwrap();
+        let mut welcomes = match result {
+            SendResult::GroupCreated { pending, welcomes } => {
+                reopened.confirm_published(pending).await.unwrap();
+                welcomes
+            }
+            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            other => panic!("expected founding creation, got {other:?}"),
+        };
+        assert_eq!(welcomes.len(), 1);
+        assert_eq!(
+            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        assert_eq!(
+            reopened.epoch(&group_id).unwrap(),
+            bob.epoch(&group_id).unwrap()
+        );
+        assert_eq!(reopened.members(&group_id).unwrap().len(), 2);
+        if profile == ProtocolProfile::Current {
+            assert_eq!(
+                bob.app_component(&group_id, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+                    .unwrap(),
+                Some(300u64.to_be_bytes().to_vec()),
+            );
+        }
+    }
+}
 
-    let mut reopened = EngineBuilder::new(storage)
-        .identity(pad32(b"alice-cancel-founding-retention"))
-        .account_identity_proof_signer(proof_signer(b"alice-cancel-founding-retention"))
-        .supported_app_components(supported)
-        .protocol_profile(ProtocolProfile::Current)
-        .peeler(Box::new(MockPeeler::default()))
-        .build()
+/// A second Welcome write fails only after the first Welcome, group projection
+/// and (on Legacy) route were persisted. No unfinished state survives the
+/// returned error or encrypted reopen, and the same creator can retry (mdk#3077).
+#[tokio::test]
+async fn late_founding_welcome_write_failure_restores_state_and_allows_retry() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("late-founding-welcome.sqlite");
+        let key = SqlCipherKey::raw([0x77; 32]);
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let supported = default_group_components()
+            .into_iter()
+            .chain([NOSTR_ROUTING_COMPONENT_ID])
+            .collect::<Vec<_>>();
+        let build = |identity: &[u8], storage| {
+            let builder = EngineBuilder::new(storage)
+                .identity(pad32(identity))
+                .account_identity_proof_signer(proof_signer(identity))
+                .supported_app_components(supported.clone())
+                .protocol_profile(profile)
+                .peeler(Box::<MockPeeler>::default());
+            if profile == ProtocolProfile::Legacy {
+                builder.legacy_compatibility_profile().build().unwrap()
+            } else {
+                builder.build().unwrap()
+            }
+        };
+        let mut alice = build(b"late-founding-alice", storage.clone());
+        let mut bob = build(
+            b"late-founding-bob",
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
+        );
+        let mut carol = build(
+            b"late-founding-carol",
+            SqliteAccountStorage::in_memory_for_test().unwrap(),
+        );
+        let request = CreateGroupRequest {
+            name: "late founding Welcome".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(
+                    &NostrRoutingV1::new([0x77; 32], vec!["wss://relay.example".into()]).unwrap(),
+                )
+                .unwrap(),
+            }],
+            initial_admins: vec![],
+        };
+        let mls_before = encrypted_openmls_rows(&database, &key);
+        let observer = rusqlite::Connection::open(&database).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &observer,
+            &key,
+            storage_sqlite::SqlCipherHardening::live_cache(),
+        )
         .unwrap();
-    reopened.hydrate_all_stored_groups().unwrap();
-    assert!(
-        reopened.live_group_ids().unwrap().is_empty(),
-        "cancellation before the canonical transaction must clean up the provisional MLS group"
-    );
+        let late_route = if profile == ProtocolProfile::Legacy {
+            "AND EXISTS(SELECT 1 FROM cgka_transport_group_routes WHERE group_id = NEW.group_id)"
+        } else {
+            ""
+        };
+        observer.execute_batch(&format!(
+            "CREATE TRIGGER fail_second_founding_welcome BEFORE INSERT ON cgka_messages
+             WHEN (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.group_id) = 1
+              AND (SELECT json_array_length(json_extract(record, '$.members')) FROM cgka_groups WHERE id = NEW.group_id) = 3
+              {late_route}
+             BEGIN SELECT RAISE(ABORT, 'second-founding-welcome-fault'); END;",
+        )).unwrap();
+        let failed = alice.create_group(request.clone()).await;
+        assert!(
+            matches!(&failed, Err(EngineError::Storage(cgka_traits::storage::StorageError::Backend(detail)))
+                if detail.contains("second-founding-welcome-fault")),
+            "{profile:?}: the second Welcome write must be the failing step: {failed:?}"
+        );
+        assert!(
+            storage.list_groups().unwrap().is_empty(),
+            "{profile:?}: failed creation left its group record"
+        );
+        assert!(alice.live_group_ids().unwrap().is_empty(), "{profile:?}");
+        assert!(alice.drain_events().is_empty(), "{profile:?}");
+        assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
+        assert!(
+            encrypted_openmls_rows(&database, &key) == mls_before,
+            "{profile:?}: unfinished MLS state remained"
+        );
+        for table in [
+            "cgka_groups",
+            "cgka_messages",
+            "cgka_transport_group_routes",
+        ] {
+            let count: i64 = observer
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{profile:?}: failed creation left {table} rows");
+        }
+        observer
+            .execute_batch("DROP TRIGGER fail_second_founding_welcome")
+            .unwrap();
+        let (group_id, retry) = alice.create_group(request).await.unwrap();
+        let mut welcomes = match retry {
+            SendResult::GroupCreated { pending, welcomes } => {
+                alice.confirm_published(pending).await.unwrap();
+                welcomes
+            }
+            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            other => panic!("expected founding result: {other:?}"),
+        };
+        assert_eq!(welcomes.len(), 2);
+        assert_eq!(
+            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        assert_eq!(
+            carol.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        let sent = bob
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&bob, b"routing after late creation failure"),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let SendResult::ApplicationMessage { msg, .. } = sent else {
+            panic!("expected peer application: {sent:?}")
+        };
+        assert_eq!(
+            alice.ingest(msg).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Processed
+        );
+        drop(alice);
+        drop(observer);
+        storage.close().unwrap();
+        drop(storage);
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let mut reopened = build(b"late-founding-alice", storage);
+        reopened.hydrate_all_stored_groups().unwrap();
+        assert_eq!(reopened.live_group_ids().unwrap(), vec![group_id.clone()]);
+        assert_eq!(reopened.members(&group_id).unwrap().len(), 3);
+        assert_eq!(
+            reopened.epoch(&group_id).unwrap(),
+            bob.epoch(&group_id).unwrap()
+        );
+    }
+}
+
+/// Independent reads include orphaned rows that group hydration cannot find.
+fn encrypted_openmls_rows(
+    database: &std::path::Path,
+    database_key: &SqlCipherKey,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        database_key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    connection
+        .prepare("SELECT storage_key, value FROM openmls_values ORDER BY storage_key")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 /// A legacy-profile create whose Welcome cannot be wrapped is refused before
@@ -1704,26 +1938,7 @@ async fn legacy_create_whose_welcome_cannot_be_wrapped_writes_no_group() {
     let database = directory.path().join("refused-legacy-create.sqlite");
     let database_key = SqlCipherKey::raw([0x28; 32]);
     let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
-    // An independent connection sees durable MLS rows, including orphaned ones
-    // that list_groups and hydration cannot discover without a Marmot record.
-    let mls_rows = || {
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        storage_sqlite::open_hardened_sqlcipher(
-            &connection,
-            &database_key,
-            storage_sqlite::SqlCipherHardening::live_cache(),
-        )
-        .unwrap();
-        connection
-            .prepare("SELECT storage_key, value FROM openmls_values ORDER BY storage_key")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
+    let mls_rows = || encrypted_openmls_rows(&database, &database_key);
     let mut alice = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice-unwrappable-welcome"))

@@ -42,7 +42,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `group_creation.rs`
   - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
-    writes no group or orphaned OpenMLS state (encrypted reopen and successful retry); creator component admission,
+    writes no group or orphaned OpenMLS state (encrypted reopen and successful retry); cancelled founding creation
+    in both profiles restores independently read encrypted MLS rows before reopen/retry; a late second Welcome-write
+    failure cleans group/message/route rows in both profiles and permits same-engine retry and recipient joins; creator component admission,
     exact-length and staged-source exporter assembly, and snapshot-name privacy.
     Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
