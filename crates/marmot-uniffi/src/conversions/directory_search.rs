@@ -165,3 +165,75 @@ impl From<UserSearchUpdate> for UserSearchUpdateFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::discriminant;
+
+    #[test]
+    fn match_quality_and_field_attribution_keep_their_typed_choices() {
+        for (native, expected) in [
+            (MatchQuality::Exact, MatchQualityFfi::Exact),
+            (MatchQuality::Prefix, MatchQualityFfi::Prefix),
+            (MatchQuality::Contains, MatchQualityFfi::Contains),
+        ] {
+            let actual: MatchQualityFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+        for (native, expected) in [
+            (MatchedField::Name, MatchedFieldFfi::Name),
+            (MatchedField::Nip05, MatchedFieldFfi::Nip05),
+            (MatchedField::DisplayName, MatchedFieldFfi::DisplayName),
+            (MatchedField::About, MatchedFieldFfi::About),
+            (MatchedField::Npub, MatchedFieldFfi::Npub),
+            (MatchedField::Pubkey, MatchedFieldFfi::Pubkey),
+        ] {
+            let actual: MatchedFieldFfi = native.into();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+        }
+    }
+
+    #[test]
+    fn search_progress_preserves_trigger_and_its_radius_or_error() {
+        type TriggerCheck = fn(SearchUpdateTriggerFfi) -> bool;
+        let cases: [(SearchUpdateTrigger, TriggerCheck); 9] = [
+            (SearchUpdateTrigger::RadiusStarted { radius: 2 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusStarted { radius: 2 })
+            }),
+            (SearchUpdateTrigger::ResultsFound { radius: 2 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::ResultsFound { radius: 2 })
+            }),
+            (SearchUpdateTrigger::DiscoveryResultsFound, |v| {
+                matches!(v, SearchUpdateTriggerFfi::DiscoveryResultsFound)
+            }),
+            (SearchUpdateTrigger::CachedResultsFound, |v| {
+                matches!(v, SearchUpdateTriggerFfi::CachedResultsFound)
+            }),
+            (SearchUpdateTrigger::RadiusCompleted { radius: 1 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusCompleted { radius: 1 })
+            }),
+            (SearchUpdateTrigger::RadiusTimeout { radius: 2 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTimeout { radius: 2 })
+            }),
+            (SearchUpdateTrigger::RadiusTruncated { radius: 2 }, |v| {
+                matches!(v, SearchUpdateTriggerFfi::RadiusTruncated { radius: 2 })
+            }),
+            (SearchUpdateTrigger::SearchCompleted, |v| {
+                matches!(v, SearchUpdateTriggerFfi::SearchCompleted)
+            }),
+            (
+                SearchUpdateTrigger::Error {
+                    message: marmot_app::DirectoryError::RelayDirectory(
+                        "fixture fetch failure".into(),
+                    )
+                    .to_string(),
+                },
+                |v| matches!(v, SearchUpdateTriggerFfi::Error { message } if message == "relay directory fetch failed: fixture fetch failure"),
+            ),
+        ];
+        for (index, (native, accepts)) in cases.into_iter().enumerate() {
+            assert!(accepts(native.into()), "search progress case {index}");
+        }
+    }
+}
