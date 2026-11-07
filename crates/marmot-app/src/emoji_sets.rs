@@ -911,8 +911,9 @@ impl MarmotApp {
         shortcode: &str,
     ) -> Result<AppEmojiSetAsset, AppError> {
         let coordinate = parse_emoji_set_input(coordinate)?;
-        let storage = self.emoji_storage(account_ref)?;
-        let set = shown_version(&storage, &coordinate, expected_event_id_hex)?;
+        let set = self
+            .read_shown_version(account_ref, &coordinate, expected_event_id_hex)
+            .await?;
         let entry = set
             .emoji
             .into_iter()
@@ -948,8 +949,9 @@ impl MarmotApp {
         expected_event_id_hex: &str,
     ) -> Result<AppEmojiSetCover, AppError> {
         let coordinate = parse_emoji_set_input(coordinate)?;
-        let storage = self.emoji_storage(account_ref)?;
-        let url = shown_version(&storage, &coordinate, expected_event_id_hex)?
+        let url = self
+            .read_shown_version(account_ref, &coordinate, expected_event_id_hex)
+            .await?
             .image_url
             .ok_or(AppError::EmojiSetNotFound)?;
         let image = self
@@ -990,9 +992,14 @@ impl MarmotApp {
         control: &EmojiSetInstallControl,
     ) -> Result<AppEmojiSetInstallResult, AppError> {
         let coordinate = parse_emoji_set_input(coordinate)?;
-        let account = self.account_home().account(account_ref)?;
-        let storage = self.account_storage(&account.label)?.app_storage();
-        let lock = self.emoji_set_mutation_lock(&account.label);
+        let (app, account_ref) = (self.clone(), account_ref.to_owned());
+        let (label, storage) = read_blocking(move || {
+            let account = app.account_home().account(&account_ref)?;
+            let storage = app.account_storage(&account.label)?.app_storage();
+            Ok((account.label, storage))
+        })
+        .await?;
+        let lock = self.emoji_set_mutation_lock(&label);
         let stop = self.emoji_install_stopped(control);
         tokio::pin!(stop);
         // Owned so the write below can keep it if this call is cancelled.
@@ -1001,29 +1008,13 @@ impl MarmotApp {
             () = &mut stop => return Err(AppError::EmojiSetInstallCancelled),
             guard = lock.lock_owned() => guard,
         };
-        let set = shown_version(&storage, &coordinate, expected_event_id_hex)?;
-        if set.emoji.is_empty() {
-            return Err(no_valid_emoji());
-        }
-        let installed_sets = storage.installed_emoji_sets()?;
-        if installed_sets.len() >= MAX_INSTALLED_EMOJI_SETS
-            && !installed_sets
-                .iter()
-                .any(|installed| installed.coordinate == coordinate)
-        {
-            return Err(AppError::EmojiSetLimit(
-                "too many installed emoji sets".into(),
-            ));
-        }
-        let budget = MAX_INSTALLED_EMOJI_SET_BYTES.min(
-            MAX_INSTALLED_EMOJI_BYTES
-                .saturating_sub(storage.installed_emoji_bytes_excluding(&coordinate)?),
-        );
-        if budget == 0 {
-            return Err(AppError::EmojiSetLimit(
-                "installed emoji storage is full".into(),
-            ));
-        }
+        // Read under the lock, so no other install or uninstall changes the
+        // version, the set count or the byte budget before the write.
+        let (set, budget) = {
+            let (storage, coordinate) = (storage.clone(), coordinate.clone());
+            let expected = expected_event_id_hex.to_owned();
+            read_blocking(move || install_plan(&storage, &coordinate, &expected)).await?
+        };
         let mut skipped = parse_skips(&set.skipped);
         control.start(set.emoji.len());
         let (kept, install_skips) = tokio::select! {
@@ -1055,21 +1046,29 @@ impl MarmotApp {
         let installed_count = kept.len().try_into().unwrap_or(u32::MAX);
         let writer = storage.clone();
         let (cancelled, stopped) = (control.cancelled.clone(), self.emoji_install_stop.clone());
-        let outcome = write_holding_guard(guard, move || {
+        let (outcome, installed) = write_holding_guard(guard, move || {
             // The write starts here, however long the task waited for the
             // blocking pool: the last point a cancellation or shutdown can
             // stop the install.
             if install_cancelled(&cancelled, &stopped) {
                 return Err(AppError::EmojiSetInstallCancelled);
             }
-            Ok(writer.install_emoji_set(
+            let outcome = writer.install_emoji_set(
                 &snapshot,
                 &kept,
                 EmojiSetInstallLimits {
                     max_sets: MAX_INSTALLED_EMOJI_SETS,
                     max_total_bytes: MAX_INSTALLED_EMOJI_BYTES,
                 },
-            )?)
+            )?;
+            // Still under the lock: the set as this install left it.
+            let installed = match outcome {
+                EmojiSetInstallOutcome::Installed => {
+                    Some(stored_app_set(&writer, &snapshot.coordinate)?)
+                }
+                _ => None,
+            };
+            Ok((outcome, installed))
         })
         .await??;
         match outcome {
@@ -1086,7 +1085,7 @@ impl MarmotApp {
             }
         }
         Ok(AppEmojiSetInstallResult {
-            set: stored_app_set(&storage, &coordinate)?,
+            set: installed.ok_or(AppError::EmojiSetNotFound)?,
             installed_count,
             skipped,
         })
@@ -1422,6 +1421,23 @@ impl MarmotApp {
         Ok(self.account_storage(&account.label)?.app_storage())
     }
 
+    /// [`shown_version`] for a preview or cover download, with the account
+    /// resolved and its storage opened on the blocking pool.
+    async fn read_shown_version(
+        &self,
+        account_ref: &str,
+        coordinate: &str,
+        expected_event_id_hex: &str,
+    ) -> Result<StoredEmojiSet, AppError> {
+        let app = self.clone();
+        let (account_ref, coordinate) = (account_ref.to_owned(), coordinate.to_owned());
+        let expected = expected_event_id_hex.to_owned();
+        read_blocking(move || {
+            shown_version(&app.emoji_storage(&account_ref)?, &coordinate, &expected)
+        })
+        .await
+    }
+
     /// The relays sticker discovery uses: the account's outbox relays.
     fn emoji_context(&self, account_ref: &str) -> Result<EmojiAccountContext, AppError> {
         let account = self.account_home().account(account_ref)?;
@@ -1597,6 +1613,40 @@ fn shown_version(
         });
     }
     Ok(set)
+}
+
+/// The shown version to install and the byte budget it may use, refused
+/// before any download when the set has no valid emoji, would exceed the
+/// installed set count, or no storage is left.
+fn install_plan(
+    storage: &SqliteAppStorage,
+    coordinate: &str,
+    expected_event_id_hex: &str,
+) -> Result<(StoredEmojiSet, u64), AppError> {
+    let set = shown_version(storage, coordinate, expected_event_id_hex)?;
+    if set.emoji.is_empty() {
+        return Err(no_valid_emoji());
+    }
+    let installed_sets = storage.installed_emoji_sets()?;
+    if installed_sets.len() >= MAX_INSTALLED_EMOJI_SETS
+        && !installed_sets
+            .iter()
+            .any(|installed| installed.coordinate == coordinate)
+    {
+        return Err(AppError::EmojiSetLimit(
+            "too many installed emoji sets".into(),
+        ));
+    }
+    let budget = MAX_INSTALLED_EMOJI_SET_BYTES.min(
+        MAX_INSTALLED_EMOJI_BYTES
+            .saturating_sub(storage.installed_emoji_bytes_excluding(coordinate)?),
+    );
+    if budget == 0 {
+        return Err(AppError::EmojiSetLimit(
+            "installed emoji storage is full".into(),
+        ));
+    }
+    Ok((set, budget))
 }
 
 /// Run a local read on the blocking pool, so account resolution, a cold

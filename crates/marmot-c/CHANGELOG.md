@@ -14,7 +14,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_emoji_set_cover_free`. Append `MARMOT_STATUS_EMOJI_SET_CHANGED` (127) and
   `MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED` (128). `marmot_emoji_sets`, `marmot_emoji_set`,
   `marmot_installed_custom_emoji` and `marmot_read_installed_custom_emoji` now read off the runtime's workers while
-  blocking. Use the matching header and library.
+  blocking. A NULL control records a `marmot_last_error_message` detail. Use the matching header and library.
 
 - Append `Direct` (13), `Group` (14) and `Muted` (15) to the `MarmotChatListCondition` discriminants a filter node
   carries (mdk#2983). Existing values are unchanged. Use the matching library.
