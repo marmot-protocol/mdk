@@ -35,12 +35,12 @@ use crate::error::{DirectoryError, blocking_directory_task};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use crate::reference::{ReferenceContext, ReferenceTarget, decode_reference, is_replaceable};
 use cgka_traits::TransportEndpoint;
 use cgka_traits::storage::StorageError;
 use nostr::event::Event;
 use nostr::nips::nip01::Coordinate;
-use nostr::nips::nip19::{FromBech32, Nip19};
-use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
+use nostr::prelude::{EventId, Filter, Kind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::resources::{DirectoryAccount, DirectoryResources};
@@ -48,8 +48,6 @@ use super::{Directory, unix_now_seconds};
 
 /// Maximum references in one cached batch read.
 pub const MAX_PUBLIC_EVENT_REFERENCES: usize = 16;
-/// Longest reference string accepted; longer input is `Unsupported`.
-const MAX_REFERENCE_BYTES: usize = 5_000;
 /// Largest signed event JSON retained.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_ENTRIES: i64 = 1_024;
@@ -103,13 +101,6 @@ struct Reference {
     relay_hints: Vec<TransportEndpoint>,
 }
 
-fn is_replaceable(kind: Kind) -> bool {
-    // Local rule: rust-nostr also counts kind 41, which is not replaceable
-    // by coordinate in NIP-01.
-    let kind = kind.as_u16();
-    kind == 0 || kind == 3 || (10_000..20_000).contains(&kind)
-}
-
 fn first_d_tag(event: &Event) -> &str {
     event
         .tags
@@ -134,43 +125,20 @@ fn supersedes(candidate: &Event, current: &Event) -> bool {
 }
 
 fn parse_reference(raw: &str) -> Option<Reference> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.len() > MAX_REFERENCE_BYTES {
-        return None;
-    }
-    let raw = raw.strip_prefix("nostr:").unwrap_or(raw);
-    if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Some(Reference {
-            target: Target::EventId(EventId::from_hex(raw).ok()?),
-            relay_hints: Vec::new(),
-        });
-    }
-    let hints = |relays: &[RelayUrl]| {
-        relays
+    let decoded = decode_reference(raw, ReferenceContext::Event).ok()?;
+    let target = match decoded.target {
+        ReferenceTarget::Event(id) => Target::EventId(id),
+        ReferenceTarget::Coordinate(coordinate) => Target::Coordinate(coordinate),
+        ReferenceTarget::Identity(_) => return None,
+    };
+    Some(Reference {
+        target,
+        relay_hints: decoded
+            .relay_hints
             .iter()
             .map(|relay| TransportEndpoint(relay.to_string()))
-            .collect()
-    };
-    match Nip19::from_bech32(raw).ok()? {
-        Nip19::EventId(id) => Some(Reference {
-            target: Target::EventId(id),
-            relay_hints: Vec::new(),
-        }),
-        Nip19::Event(event) => Some(Reference {
-            target: Target::EventId(event.event_id),
-            relay_hints: hints(&event.relays),
-        }),
-        Nip19::Coordinate(naddr) => {
-            let kind = naddr.coordinate.kind;
-            let supported = kind.is_addressable()
-                || (is_replaceable(kind) && naddr.coordinate.identifier.is_empty());
-            supported.then(|| Reference {
-                target: Target::Coordinate(naddr.coordinate.clone()),
-                relay_hints: hints(&naddr.relays),
-            })
-        }
-        _ => None,
-    }
+            .collect(),
+    })
 }
 
 impl Target {

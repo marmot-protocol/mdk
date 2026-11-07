@@ -1,7 +1,8 @@
 use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, ToBech32};
-use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, Timestamp};
+use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, RelayUrl, Tag, Timestamp};
 
 use super::*;
+use crate::reference::MAX_REFERENCE_BYTES;
 
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
