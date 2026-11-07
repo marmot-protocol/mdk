@@ -1150,6 +1150,102 @@ mod tests {
         assert!(s_app.backfill_content_reports(1).unwrap().is_empty());
     }
     #[test]
+    fn bounded_backfill_queues_canonical_unresolved_control_authority() {
+        use crate::base::test_support::{sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+        use sha2::{Digest, Sha256};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let group = GroupId::new(vec![99; 16]);
+        store.put_group(&sample_group(group.clone(), 7, 0)).unwrap();
+        let mut expected = Vec::new();
+        for (n, template, retention) in [
+            (2, dismiss(2, &[1]), None),
+            (
+                3,
+                removal(3, 1),
+                Some(AppMessageRetentionDecision::new(3, 60)),
+            ),
+        ] {
+            let inner = MarmotAppEvent::new(
+                template.sender,
+                template.recorded_at,
+                template.kind,
+                template.tags,
+                template.plaintext,
+            );
+            let payload = inner.encode().unwrap();
+            let inner = MarmotAppEvent::decode(&payload).unwrap();
+            let source = MessageId::new(vec![n; 32]);
+            let mut message = sample_message(source.clone(), group.clone(), 7);
+            message.payload = payload.clone();
+            store.put_message(&message).unwrap();
+            app.record_app_event_with_source(
+                &StoredAppEvent {
+                    group_id_hex: hex::encode(group.as_slice()),
+                    message_id_hex: inner.id,
+                    source_message_id_hex: Some(hex::encode(source.as_slice())),
+                    source_epoch: Some(7),
+                    direction: "received".into(),
+                    sender: inner.pubkey,
+                    plaintext: inner.content,
+                    kind: inner.kind,
+                    tags: inner.tags,
+                    recorded_at: inner.created_at,
+                    received_at: inner.created_at,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+                retention,
+                None,
+            )
+            .unwrap();
+            expected.push(cgka_traits::app_event::PendingAppMessageAuthority {
+                group_id: group.clone(),
+                message_id: source,
+                epoch: EpochId(7),
+                sender: MemberId::new(vec![20; 32]),
+                payload_digest: Sha256::digest(&payload).into(),
+                retention,
+            });
+        }
+        assert!(
+            store
+                .pending_application_authority_batch(None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        // Capture the historical prefix the migration schedules. The live app
+        // recording path above supplies canonical, unresolved source evidence.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE content_report_backfill SET after_order=0,
+             through_order=(SELECT MAX(insert_order) FROM app_events)",
+            )
+            .unwrap();
+        for count in 1..=2 {
+            app.backfill_content_reports(1).unwrap();
+            assert_eq!(
+                store
+                    .pending_application_authority_batch(None, 100)
+                    .unwrap(),
+                expected[..count],
+                "each bounded producer step must queue its source-bound request",
+            );
+        }
+        assert!(app.backfill_content_reports(1).unwrap().is_empty());
+        assert_eq!(
+            store
+                .pending_application_authority_batch(None, 100)
+                .unwrap(),
+            expected
+        );
+    }
+    #[test]
     fn blocking_does_not_filter_report_records_or_labels() {
         let s = SqliteAccountStorage::in_memory().unwrap();
         let s_app = s.app_storage();
