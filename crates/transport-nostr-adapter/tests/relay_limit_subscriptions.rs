@@ -283,8 +283,32 @@ fn assert_filter_shapes(stats: &LimitStats) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
     const G: usize = 1_000;
-    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
     fx.store_group_events(G).await;
+    // The 1,000-event history arrives faster than a debug build dispatches it.
+    // The public forwarder's 256-entry queue declares loss on that burst
+    // (#2939), and no supervisor here replays it. Dispatch in order from the
+    // SDK's own bounded receiver instead, as the relay plane's consumer does:
+    // the burst then waits there, and any real gap still ends the consumer.
+    let mut source = fx.sdk.notifications();
+    let consumer = tokio::spawn({
+        let adapter = fx.adapter.clone();
+        let sdk = fx.sdk.clone();
+        async move {
+            while let Some(update) = source.next().await {
+                let NotificationUpdate::Notification(notification) = update else {
+                    return;
+                };
+                if dispatch_sdk_replay(notification, &adapter, None, &|reason| {
+                    sdk.subscription_refusal(reason)
+                })
+                .await
+                {
+                    return;
+                }
+            }
+        }
+    });
     let url = fx.limit.url();
     fx.adapter
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url)))
@@ -311,8 +335,8 @@ async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
     assert_eq!(
         delivered.len(),
         G,
-        "forwarder_finished={} loss={:?}",
-        fx.forwarder.as_ref().is_some_and(|task| task.is_finished()),
+        "consumer_finished={} loss={:?}",
+        consumer.is_finished(),
         fx.sdk
             .notification_loss()
             .unwrap()
@@ -321,6 +345,12 @@ async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
             .map(|loss| (loss.receiver_generation, loss.cumulative_skipped))
     );
     assert!(eose.complete());
+    consumer.abort();
+    let _ = consumer.await;
+    assert!(
+        fx.sdk.notification_loss().unwrap().borrow().is_none(),
+        "the burst must not lose notifications"
+    );
     fx.shutdown().await;
 }
 
