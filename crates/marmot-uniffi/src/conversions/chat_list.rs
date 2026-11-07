@@ -441,6 +441,113 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
 mod tests {
     use super::*;
 
+    #[test]
+    fn chat_preview_kinds_and_local_send_states_keep_their_host_choices() {
+        for (native, expected) in [
+            (
+                ChatListAttachmentKind::Photo,
+                ChatListAttachmentKindFfi::Photo,
+            ),
+            (
+                ChatListAttachmentKind::Video,
+                ChatListAttachmentKindFfi::Video,
+            ),
+            (
+                ChatListAttachmentKind::Audio,
+                ChatListAttachmentKindFfi::Audio,
+            ),
+            (
+                ChatListAttachmentKind::File,
+                ChatListAttachmentKindFfi::File,
+            ),
+            (
+                ChatListAttachmentKind::Mixed,
+                ChatListAttachmentKindFfi::Mixed,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&ChatListAttachmentKindFfi::from(native)),
+                std::mem::discriminant(&expected)
+            );
+        }
+        for (native, expected) in [
+            (
+                ChatListMessageDeliveryState::NotApplicable,
+                ChatListMessageDeliveryStateFfi::NotApplicable,
+            ),
+            (
+                ChatListMessageDeliveryState::Pending,
+                ChatListMessageDeliveryStateFfi::Pending,
+            ),
+            (
+                ChatListMessageDeliveryState::Delivered,
+                ChatListMessageDeliveryStateFfi::Delivered,
+            ),
+            (
+                ChatListMessageDeliveryState::Failed,
+                ChatListMessageDeliveryStateFfi::Failed,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&ChatListMessageDeliveryStateFfi::from(native)),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn current_chat_triggers_preserve_the_host_refresh_reason() {
+        // PendingConfirmationChanged and ConversationKindChanged retain their
+        // compatibility mappings without a current-writer claim.
+        use ChatListUpdateTriggerFfi as Host;
+        use marmot_app::ChatListUpdateTrigger as Native;
+        for (native, expected) in [
+            (Native::NewGroup, Host::NewGroup),
+            (Native::NewLastMessage, Host::NewLastMessage),
+            (Native::LastMessageDeleted, Host::LastMessageDeleted),
+            (Native::ArchiveChanged, Host::ArchiveChanged),
+            (Native::MembershipChanged, Host::MembershipChanged),
+            (Native::UnreadChanged, Host::UnreadChanged),
+            (Native::ManualUnreadChanged, Host::ManualUnreadChanged),
+            (Native::MuteChanged, Host::MuteChanged),
+            (
+                Native::LatestMessageDeliveryChanged,
+                Host::LatestMessageDeliveryChanged,
+            ),
+            (Native::PinOrderChanged, Host::PinOrderChanged),
+            (Native::SnapshotRefresh, Host::SnapshotRefresh),
+            (Native::Removed, Host::Removed),
+            (
+                Native::LastMessageContentChanged,
+                Host::LastMessageContentChanged,
+            ),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&Host::from(native)),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn chat_row_updates_remain_distinct_from_removal_actions() {
+        let row = RuntimeChatListUpdate::Row {
+            trigger: marmot_app::ChatListUpdateTrigger::NewGroup,
+            row: Box::new(sample_row()),
+        };
+        assert!(
+            matches!(ChatListSubscriptionUpdateFfi::from(row), ChatListSubscriptionUpdateFfi::Row { trigger: ChatListUpdateTriggerFfi::NewGroup, row } if row.group_id_hex == "11")
+        );
+        let removed = RuntimeChatListUpdate::RemoveRow {
+            trigger: marmot_app::ChatListUpdateTrigger::Removed,
+            group_id_hex: "22".into(),
+        };
+        assert!(
+            matches!(ChatListSubscriptionUpdateFfi::from(removed), ChatListSubscriptionUpdateFfi::RemoveRow { trigger: ChatListUpdateTriggerFfi::Removed, group_id_hex } if group_id_hex == "22")
+        );
+        // The actual pin workflow in commands/chat_list owns nonempty Snapshot.
+    }
+
     fn sample_row() -> ChatListRow {
         ChatListRow {
             group_id_hex: "11".to_owned(),

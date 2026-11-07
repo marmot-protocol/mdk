@@ -224,3 +224,74 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot_app::RuntimeAgentStreamMessage;
+
+    #[test]
+    fn retention_sweep_outcomes_keep_deferred_and_failed_host_choices() {
+        for (native, expected) in [
+            (
+                RetentionSweepStatus::NoExpiredMessages,
+                RetentionSweepStatusFfi::NoExpiredMessages,
+            ),
+            (
+                RetentionSweepStatus::Pruned,
+                RetentionSweepStatusFfi::Pruned,
+            ),
+            (
+                RetentionSweepStatus::DeferredClockSkew,
+                RetentionSweepStatusFfi::DeferredClockSkew,
+            ),
+            (
+                RetentionSweepStatus::DeferredUnread,
+                RetentionSweepStatusFfi::DeferredUnread,
+            ),
+            (
+                RetentionSweepStatus::Failed,
+                RetentionSweepStatusFfi::Failed,
+            ),
+        ] {
+            assert_eq!(RetentionSweepStatusFfi::from(native), expected);
+        }
+    }
+
+    #[test]
+    fn raw_message_and_stream_start_updates_keep_different_host_tags() {
+        // The recovery subscription also rebuilds legacy projection rows with
+        // no authority or outer transport id; these are DTO contrasts only.
+        let message = |kind, byte| ReceivedMessage {
+            authority: None,
+            message_id_hex: hex::encode([byte; 32]),
+            source_message_id_hex: String::new(),
+            sender: "ab".repeat(32),
+            sender_display_name: None,
+            group_id: cgka_traits::GroupId::new(vec![0xcd; 16]),
+            source_epoch: 7,
+            retention: None,
+            plaintext: "hello".into(),
+            kind,
+            tags: vec![],
+            recorded_at: 11,
+            received_at: 12,
+        };
+        let chat = RuntimeMessageUpdate::Message(RuntimeMessageReceived {
+            account_id_hex: "ac".repeat(32),
+            account_label: "alice".into(),
+            message: message(9, 0x11),
+        });
+        let stream = RuntimeMessageUpdate::AgentStreamStarted(RuntimeAgentStreamMessage {
+            account_id_hex: "ac".repeat(32),
+            account_label: "alice".into(),
+            message: message(1200, 0x22),
+        });
+        assert!(
+            matches!(MessageUpdateFfi::from(chat), MessageUpdateFfi::Message { received } if received.message.kind == 9 && received.message.message_id_hex == "11".repeat(32))
+        );
+        assert!(
+            matches!(MessageUpdateFfi::from(stream), MessageUpdateFfi::AgentStreamStarted { received } if received.message.kind == 1200 && received.message.message_id_hex == "22".repeat(32))
+        );
+    }
+}

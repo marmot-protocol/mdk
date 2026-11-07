@@ -78,3 +78,42 @@ impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_updates_keep_incremental_status_record_and_terminal_tags() {
+        assert!(
+            matches!(AgentStreamUpdateFfi::from(RuntimeAgentStreamUpdate::Chunk { seq: 2, text: "fragment".into() }), AgentStreamUpdateFfi::Chunk { seq: 2, text } if text == "fragment")
+        );
+        assert!(
+            matches!(AgentStreamUpdateFfi::from(RuntimeAgentStreamUpdate::Status { seq: 3, status: "working".into() }), AgentStreamUpdateFfi::Status { seq: 3, status } if status == "working")
+        );
+        assert!(
+            matches!(AgentStreamUpdateFfi::from(RuntimeAgentStreamUpdate::Progress { seq: 4, text: "step completed".into() }), AgentStreamUpdateFfi::Progress { seq: 4, text } if text == "step completed")
+        );
+        // Checkpoint text is decoded and forwarded as a non-delta record.
+        assert!(
+            matches!(AgentStreamUpdateFfi::from(RuntimeAgentStreamUpdate::Record { seq: 5, record_type: 4, text: "record body".into() }), AgentStreamUpdateFfi::Record { seq: 5, record_type: 4, text } if text == "record body")
+        );
+        let mut transcript = cgka_traits::AgentTextStreamTranscriptV1::new(
+            vec![1; cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN],
+            cgka_traits::MessageId::new(vec![2; 32]),
+        );
+        for (index, fragment) in ["complete ", "tran", "s", "cri", "p", "t"]
+            .into_iter()
+            .enumerate()
+        {
+            transcript.append(index as u64 + 1, 1, fragment.as_bytes());
+        }
+        let hash = hex::encode(transcript.hash());
+        assert!(
+            matches!(AgentStreamUpdateFfi::from(RuntimeAgentStreamUpdate::Finished { text: "complete transcript".into(), transcript_hash_hex: hash.clone(), chunk_count: 6 }), AgentStreamUpdateFfi::Finished { text, transcript_hash_hex, chunk_count: 6 } if text == "complete transcript" && transcript_hash_hex == hash)
+        );
+        assert!(
+            matches!(AgentStreamUpdateFfi::from(RuntimeAgentStreamUpdate::Failed { message: "broker disconnected".into() }), AgentStreamUpdateFfi::Failed { message } if message == "broker disconnected")
+        );
+    }
+}
