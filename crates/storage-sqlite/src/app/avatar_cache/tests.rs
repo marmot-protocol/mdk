@@ -1414,6 +1414,16 @@ fn avatar_requests_revalidate_the_selected_source_and_report_live_acquisition_st
         .avatar_target_presentation("group", None, &value.presentation.avatar, 0)
         .unwrap()
         .unwrap();
+    // Presentation maintenance created the original binding. Eviction removes
+    // that demand while leaving the authoritative selected source unchanged.
+    app.remove_avatar_source(current.reference.as_ref().unwrap())
+        .unwrap();
+    let evicted = app
+        .avatar_target_presentation("group", None, &value.presentation.avatar, 0)
+        .unwrap()
+        .unwrap();
+    assert!(evicted.reference.is_none());
+    assert!(evicted.acquisition.is_none());
     let requested = app
         .request_avatar_target(&current.target, &value.presentation.avatar, None, 0)
         .unwrap();
