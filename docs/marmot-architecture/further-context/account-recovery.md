@@ -558,11 +558,10 @@ Welcome floor instead of preserving an accidentally broader goal.
 
 **Coverage versus goals.** No debt means no unproven history against the goals the ledger
 holds; it says nothing about a route with no goal. Every current route therefore needs a
-standing goal, including one added after the account's first cold start. Account open seeds
-these even when the transport cursor skips the old owner's incremental-history request.
+standing goal, including one added after the account's first cold start. Every account open
+seeds these, cursor or not.
 Routing replacements wake the runner, whose next routing-change turn seeds newly current
-routes before selecting debt. With the runner gate off these ledger writes do not change
-the old owner's obligations or host-visible recovery status.
+routes before selecting debt.
 
 **Parked remainders.** Debt the moving retention floor overtakes before anything covers it,
 and loss whose floor is unknown or older than the window, is parked rather than dropped: each
@@ -1024,8 +1023,7 @@ them) and what dismissing it retires are one set, so such a park moves no revisi
 dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
 its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
 publishes the required units still catching up; the account's recovery status reads that, and
-a change in it or in the notices is one `RecoveryStatusChanged`. With the gate off none of this
-shows.
+a change in it or in the notices is one `RecoveryStatusChanged`.
 
 ## What gets deleted
 

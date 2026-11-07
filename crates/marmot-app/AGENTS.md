@@ -642,7 +642,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. Ledger notices (behind `runner_owns_debt`) record `notice_shown` and
+  charges or history certificates. Ledger notices record `notice_shown` and
   `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
@@ -660,8 +660,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the existing retry seam. Wake the runner after the transaction succeeds. The native source's
   original range is durably owed before its generation may authorize a cursor seal; the seal still checks placement,
   spill and held input under the existing locks. A failed ledger write never grants that permission. Every account open widens every current route's standing goal, cursor or not; a runner
-  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
-  without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
+  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly. A live boundary proves only
   what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
@@ -697,10 +696,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
   un-cover or drop debt. It logs aggregate counts only.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
-  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the gate off through
-  the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed. With it
-  off nothing constructs the runner; the old owner's grant and comparison job no longer exist.
+  `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
+  fetch (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Tests can still turn the internal `runner_owns_debt` gate off
+  through the value-only `test-support` builder, never a host setting or cargo feature, until the gate is removed.
+  With it off nothing constructs or seats the runner, so nothing fetches history; every other recovery seam (loss
+  import, ledger notices, recovery status and its event, post-join collection) runs the same either way. The old
+  owner's grant, comparison job and off arms no longer exist.
   `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
   reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
   A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
@@ -775,10 +776,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
   repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry
   armed; the worker seats it once a preparation succeeds, even if that refresh then fails (`recovery_runner_due`).
-  Gate-off callers keep the legacy behavior. Imported loss releases the plane cursor fence only at the exact
+  Imported loss releases the plane cursor fence only at the exact
   generation/writer barrier; transactional evidence reclamation follows, restoring the guard on failure. This handoff never records recovery success or coverage. The inbox is a route like a group's, compared only and never
   swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
-  comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
+  comparisons, and admission never fences it. Explicit repair (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
   waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight.
   Explicit repair includes history through its request time inside a healthy live tail: a relay may restore stored
@@ -795,8 +796,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
   (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
   routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
-  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows. They, the status and its event show
-  nothing with the gate off.
+  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows.
   An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
   each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
   back as an unlisted route's is. A

@@ -498,8 +498,9 @@ const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 *
 pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
-/// Account history belongs to the coverage-ledger recovery runner. The old
-/// owner remains available only for controlled comparisons during retirement.
+/// Account history belongs to the coverage-ledger recovery runner. Tests may
+/// turn the gate off only to keep the runner from starting; the old owner is
+/// deleted (mdk#2660 phase 4).
 const RECOVERY_RUNNER_OWNS_DEBT: bool = true;
 /// Maximum amount the persisted transport cursor may run ahead of local
 /// wall-clock. The cursor is advanced from the inbound message timestamp, which
