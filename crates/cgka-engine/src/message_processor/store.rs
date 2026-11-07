@@ -335,8 +335,8 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_transport_message(msg, group_id, epoch, MessageState::Sent)
     }
 
-    pub(crate) fn record_staged_invite_welcome(
-        &mut self,
+    pub(super) fn persist_staged_invite_welcome(
+        &self,
         msg: &TransportMessage,
         origin_commit_id: &MessageId,
         key_package_ref: Vec<u8>,
@@ -344,7 +344,6 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
-        self.sent_message_ids.insert(msg.id.clone());
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
@@ -421,7 +420,29 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
         application_stamp: Option<OwnApplicationConvergenceStamp>,
     ) -> Result<(), EngineError> {
-        // Also remember and persist the content-derived id so our own commit /
+        let content_id = self.persist_sent_openmls_message_with_application_stamp(
+            msg,
+            mls_bytes,
+            group_id,
+            epoch,
+            application_stamp,
+        )?;
+        self.sent_message_ids.insert(msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        Ok(())
+    }
+
+    /// Persist both sent records without advancing the hot cache, so a caller
+    /// can include the pair in a larger atomic staging unit.
+    pub(super) fn persist_sent_openmls_message_with_application_stamp(
+        &self,
+        msg: &TransportMessage,
+        mls_bytes: &[u8],
+        group_id: &GroupId,
+        epoch: EpochId,
+        application_stamp: Option<OwnApplicationConvergenceStamp>,
+    ) -> Result<MessageId, EngineError> {
+        // Persist the content-derived id too, so our own commit /
         // app message echoed back inside a freshly re-wrapped transport envelope
         // (different transport id) is still classified `OwnEcho` by the
         // post-peel content check after the hot-process cache misses or the
@@ -455,10 +476,7 @@ impl<S: StorageProvider> Engine<S> {
                 epoch,
             )
         })?;
-        // Do not seed the hot-process cache until both durable rows commit.
-        self.sent_message_ids.insert(msg.id.clone());
-        self.sent_message_ids.insert(content_id);
-        Ok(())
+        Ok(content_id)
     }
 
     pub(crate) fn record_sent_openmls_message_with_leave_request(

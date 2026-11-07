@@ -142,8 +142,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut addressed = payload.ciphertext.clone();
+        addressed.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&addressed),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -4275,4 +4277,138 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
             .iter()
             .any(|event| matches!(event, GroupEvent::GroupStateChanged { .. }))
     );
+}
+
+/// Ordinary Invite has no native-recovery descriptor to compensate its
+/// unreturned Commit and Welcomes. A late projection fault must leave no
+/// publication work owned by a handle the caller never received (mdk#3071).
+#[tokio::test]
+async fn ordinary_invite_late_projection_failure_rewinds_staged_artifacts() {
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("ordinary-invite-rollback.sqlite");
+    let key = SqlCipherKey::raw([0x71; 32]);
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let build = |identity: &[u8], storage| {
+        EngineBuilder::new(storage)
+            .identity(pad32(identity))
+            .account_identity_proof_signer(proof_signer(identity))
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap()
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut alice = build(b"ordinary-invite-rollback-alice", storage.clone());
+    let mut bob = build(
+        b"ordinary-invite-rollback-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let mut carol = build(
+        b"ordinary-invite-rollback-carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "ordinary invite rollback".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, SendResult::FoundingGroupCreated { .. }));
+    let intent = SendIntent::Invite {
+        group_id: group_id.clone(),
+        key_packages: vec![
+            bob.fresh_key_package().await.unwrap(),
+            carol.fresh_key_package().await.unwrap(),
+        ],
+        initial_admins: vec![],
+    };
+    let record_before = storage.get_group(&group_id).unwrap();
+    let messages_before = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    assert!(messages_before.is_empty());
+    let observer = open_observer();
+    let mls_rows = |connection: &rusqlite::Connection| {
+        connection
+            .prepare("SELECT storage_key, value FROM openmls_values ORDER BY storage_key")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let mls_before = mls_rows(&observer);
+    alice.drain_events();
+    observer
+        .execute_batch(
+            "CREATE TRIGGER fail_ordinary_invite_projection BEFORE UPDATE ON cgka_groups
+         WHEN json_array_length(json_extract(NEW.record, '$.members')) = 3
+          AND (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.id) = 4
+         BEGIN SELECT RAISE(ABORT, 'ordinary-invite-projection-fault'); END;",
+        )
+        .unwrap();
+    let failed = alice.send(intent.clone()).await;
+    assert!(
+        matches!(&failed, Err(EngineError::Storage(StorageError::Backend(detail)))
+            if detail.contains("ordinary-invite-projection-fault")),
+        "the group projection must fail after both staged Welcomes: {failed:?}"
+    );
+    assert_eq!(storage.get_group(&group_id).unwrap(), record_before);
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(0));
+    assert!(alice.drain_events().is_empty());
+    assert!(
+        mls_rows(&observer) == mls_before,
+        "failed staging changed the live MLS state"
+    );
+    assert!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap() == messages_before,
+        "failed ordinary Invite left unowned Commit or Welcome artifacts"
+    );
+    assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
+
+    drop(alice);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let observer = open_observer();
+    assert!(mls_rows(&observer) == mls_before);
+    assert_eq!(storage.get_group(&group_id).unwrap(), record_before);
+    assert!(storage.list_messages(&group_id, EpochId(0)).unwrap() == messages_before);
+    observer
+        .execute_batch("DROP TRIGGER fail_ordinary_invite_projection")
+        .unwrap();
+    let mut alice = build(b"ordinary-invite-rollback-alice", storage);
+    alice.hydrate_all_stored_groups().unwrap();
+    let retry = alice.send(intent).await.unwrap();
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        ..
+    } = retry
+    else {
+        panic!("retry must acquire a publication handle: {retry:?}")
+    };
+    assert_eq!(welcomes.len(), 2);
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+        group_id
+    );
+    assert_eq!(
+        carol.join_welcome(welcomes.remove(0)).await.unwrap(),
+        group_id
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
 }

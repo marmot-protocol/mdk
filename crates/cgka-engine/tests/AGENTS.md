@@ -145,7 +145,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `record_write_atomicity.rs`
   - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
-    seam that projects the record. No torn record,
+    seam that projects the record. Ordinary Current-profile Invite also owns rollback of Commit/content-marker
+    and staged Welcome artifacts on a late group-projection failure, with independent MLS reads, encrypted reopen
+    and recipient joins on retry (mdk#3071). No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
