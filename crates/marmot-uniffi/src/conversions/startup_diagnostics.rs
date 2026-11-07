@@ -117,3 +117,91 @@ impl From<marmot_app::NativeStartupSnapshot> for NativeStartupSnapshotFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot_app::{NativeStartupOutcome as Outcome, NativeStartupStage as Stage};
+
+    #[test]
+    fn native_startup_stages_remain_distinct_for_hosts() {
+        for (native, expected) in [
+            (
+                Stage::AttachmentTaskQueued,
+                NativeStartupStageFfi::AttachmentTaskQueued,
+            ),
+            (
+                Stage::AccountResolution,
+                NativeStartupStageFfi::AccountResolution,
+            ),
+            (
+                Stage::AccountStorageCache,
+                NativeStartupStageFfi::AccountStorageCache,
+            ),
+            (
+                Stage::StorageAdmission,
+                NativeStartupStageFfi::StorageAdmission,
+            ),
+            (
+                Stage::DatabaseOpenLock,
+                NativeStartupStageFfi::DatabaseOpenLock,
+            ),
+            (Stage::SigningKeys, NativeStartupStageFfi::SigningKeys),
+            (
+                Stage::ExternalDatabaseSecret,
+                NativeStartupStageFfi::ExternalDatabaseSecret,
+            ),
+            (Stage::KeyDerivation, NativeStartupStageFfi::KeyDerivation),
+            (Stage::SaltRead, NativeStartupStageFfi::SaltRead),
+            (Stage::RecoveryProbe, NativeStartupStageFfi::RecoveryProbe),
+            (Stage::RecoveryRekey, NativeStartupStageFfi::RecoveryRekey),
+            (
+                Stage::EncryptedStoreOpen,
+                NativeStartupStageFfi::EncryptedStoreOpen,
+            ),
+            (
+                Stage::CipherConfiguration,
+                NativeStartupStageFfi::CipherConfiguration,
+            ),
+            (
+                Stage::CipherKeyApplication,
+                NativeStartupStageFfi::CipherKeyApplication,
+            ),
+            (
+                Stage::OperationalPragmas,
+                NativeStartupStageFfi::OperationalPragmas,
+            ),
+            (
+                Stage::MigrationInspection,
+                NativeStartupStageFfi::MigrationInspection,
+            ),
+            (Stage::MigrationApply, NativeStartupStageFfi::MigrationApply),
+            (
+                Stage::AttachmentLocalRead,
+                NativeStartupStageFfi::AttachmentLocalRead,
+            ),
+            (
+                Stage::AttachmentFutureWait,
+                NativeStartupStageFfi::AttachmentFutureWait,
+            ),
+            (
+                Stage::ProductAnalyticsAdmission,
+                NativeStartupStageFfi::ProductAnalyticsAdmission,
+            ),
+        ] {
+            assert_eq!(NativeStartupStageFfi::from(native), expected);
+        }
+    }
+
+    #[test]
+    fn native_startup_abandonment_is_distinct_from_failure_and_success() {
+        for (native, expected) in [
+            (Outcome::Active, NativeStartupOutcomeFfi::Active),
+            (Outcome::Success, NativeStartupOutcomeFfi::Success),
+            (Outcome::Failure, NativeStartupOutcomeFfi::Failure),
+            (Outcome::Abandoned, NativeStartupOutcomeFfi::Abandoned),
+        ] {
+            assert_eq!(NativeStartupOutcomeFfi::from(native), expected);
+        }
+    }
+}
