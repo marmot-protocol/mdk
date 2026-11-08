@@ -27,8 +27,8 @@ pub enum EmojiSkipReasonFfi {
     TooLarge,
     /// Not PNG/APNG, GIF, WebP or JPEG, or malformed.
     UnsupportedImage,
-    /// Served as a non-image type (such as `text/html`). Any `image/*` type,
-    /// right or wrong, defers to the bytes.
+    /// Served as a non-image MIME type (such as `text/html`). For any image
+    /// MIME type, the downloaded bytes determine the image format.
     MimeMismatch,
 }
 
