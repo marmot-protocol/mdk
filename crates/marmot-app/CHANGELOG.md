@@ -506,7 +506,8 @@
   a shared account inbox. Usable forks still require explicit consent, and
   removed members cannot use this path to reenter.
   Explicit Repair rearms eligible parked episodes through the runtime's
-  authorization and budget checks.
+  authorization and budget checks. Hosts receive the status change before
+  Repair returns, even when history coverage remains unproven.
   Linked-device recovery sets the device's tag signature key and announces
   the replacement KeyPackage before publishing it. Host-held device groups
   defer those writes. Roster and replacement-Commit effects reach the app even

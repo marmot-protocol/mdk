@@ -284,7 +284,7 @@ impl AppClient {
             && effects.failed_app_messages.is_empty()
             && effects.published_app_messages.is_empty()
         {
-            self.remember_published_reports(&effects);
+            self.retain_applied_effects(&effects);
             return result.map_err(AppError::from);
         }
         // Reuse native maintenance projection, group-route refresh and buffered

@@ -115,23 +115,33 @@ async fn app_retry_rearms_halted_job() {
         marmot_session::GroupRejoinStatus::Parked { attempts: 32 }
     );
 
-    let repair = bob_client.repair_full_history().await.unwrap_err();
+    drop(bob_client);
+    drop(alice_client);
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.drain_in_flight_work().await.unwrap();
+    let mut events = runtime.subscribe();
+    let repair = runtime.repair_full_history(&bob.label).await.unwrap_err();
     assert!(matches!(
-        repair.source,
-        AppError::FullHistoryRepairIncomplete { .. }
+        repair.full_history_repair_incomplete(),
+        Some((_, false))
     ));
-
-    assert_eq!(
-        bob_client.runtime.group_rejoin_status(&group).unwrap(),
-        marmot_session::GroupRejoinStatus::Pending { attempts: 0 }
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+            event,
+            MarmotAppEvent::GroupStateUpdated { account_label, group_id, .. }
+                if account_label == bob.label && group_id == group
+        )),
+        "Repair announces the rearmed group before returning its incomplete-history outcome"
     );
     assert!(
-        !bob_client
-            .group_recovery_status(&group)
+        !runtime
+            .group_recovery_status(&bob.label, &group)
+            .await
             .unwrap()
             .automatic_recovery_failed
     );
-    drop(bob_client);
+    runtime.shutdown().await;
     let reopened = app.client(&bob.label).await.unwrap();
     assert_eq!(
         reopened.runtime.group_rejoin_status(&group).unwrap(),
