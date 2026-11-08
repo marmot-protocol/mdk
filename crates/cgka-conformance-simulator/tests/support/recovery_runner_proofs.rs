@@ -2735,6 +2735,8 @@ pub(super) async fn multi_epoch_progress() {
         let alice = subject.probe("alice")?;
         let bob_epoch_at_stop = subject.probe("bob")?.epoch(&group).await?;
         subject.set_online("bob", false).await?;
+        // A commit bob had not applied when he stopped is owed like the rest.
+        let alice_epoch_at_stop = alice.epoch(&group).await?;
         let per_round = ROUND_MESSAGES_PER_SENDER * SENDERS.len();
         let (mut expected, mut round_epochs) = (Vec::new(), Vec::new());
         for round in 0..EPOCH_ROUNDS {
@@ -2838,6 +2840,7 @@ pub(super) async fn multi_epoch_progress() {
             "rounds": EPOCH_ROUNDS,
             "epochs": {
                 "bob_at_stop": bob_epoch_at_stop,
+                "alice_at_bob_stop": alice_epoch_at_stop,
                 "alice_after_each_round": round_epochs,
                 "alice_at_restart": alice_epoch,
                 "bob_at_end": bob_epoch,
