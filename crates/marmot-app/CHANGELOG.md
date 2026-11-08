@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A starting account worker is given up on after 45 s without startup progress, not after 45 s in total
+  (mdk#3145). Entering a startup step, or each migration an open of the account's database applies, starts the 45 s
+  again, whichever caller runs that open. A slow device whose first open migrates for longer than that, as a second
+  device's login does, becomes ready instead of failing with `account worker startup timed out at account_state`. A
+  startup that stops progressing still fails after 45 s.
+
 - The account's devices mark and remove inactive devices (mdk#2628 item 3.6b-2), behind the device-group gates. A
   device caught up with its device group marks a sibling `Inactive` about 30 days after it last heard from it, and
   removes one still marked without **Keep while inactive** at about 90 days, leaving its KeyPackage slot. Time counts

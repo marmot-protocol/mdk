@@ -226,10 +226,13 @@ pub(crate) fn blocked_daemon_execute_command(
 /// `wn daemon start` spawned while it is still running. A warm start answers
 /// in well under a second, but the first launch of a freshly linked binary on a loaded macOS machine
 /// waited up to 8.5 s before reaching `main` (mdk#2696), and the daemon answers
-/// only after its app runtime starts, which waits up to 45 s for each account
-/// to open (`APP_RUNTIME_ACCOUNT_READY_WAIT` in `marmot-app`). The cap covers
-/// both, so it stops only a daemon that has outlived its own startup budget. A
-/// daemon that exits fails the start at once.
+/// only after its app runtime starts, which gives up on an account after 45 s
+/// without startup progress (`APP_RUNTIME_ACCOUNT_READY_WAIT` in `marmot-app`).
+/// The cap covers both, so it stops a daemon that has outlived its own startup
+/// budget. A daemon still applying an account's migrations at the cap, which
+/// takes a slow device and many pending migrations, is stopped too; each
+/// migration commits on its own, so the next start resumes them. A daemon that
+/// exits fails the start at once.
 pub(crate) const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);

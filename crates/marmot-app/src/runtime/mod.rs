@@ -7791,8 +7791,10 @@ impl AccountManager {
                     }
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
-                    let startup_progress =
-                        AccountStartupProgress::new(self.shared.observer.performance().clone());
+                    let startup_progress = AccountStartupProgress::new(
+                        self.shared.observer.performance().clone(),
+                        self.app.account_open_progress(&account.label),
+                    );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
@@ -7834,7 +7836,11 @@ impl AccountManager {
             let mut ready_waits = FuturesUnordered::new();
             for (account_id, account_started_at, ready, startup_progress) in ready_receivers {
                 ready_waits.push(async move {
-                    let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
+                    // A startup gives up after a whole wait with no progress,
+                    // not a whole wait in total (mdk#3145).
+                    let ready_result = startup_progress
+                        .wait_ready(ready, APP_RUNTIME_ACCOUNT_READY_WAIT)
+                        .await;
                     (
                         account_id,
                         account_started_at.elapsed(),
@@ -7866,7 +7872,7 @@ impl AccountManager {
                             SyncErrorClass::TransportClosed,
                         )),
                     ),
-                    Err(_) => {
+                    Err(account_worker::StartupStalled) => {
                         // Name the pre-ready step the worker is blocked in
                         // (mdk#1911); the stage is the only context exported.
                         let stage = startup_progress.expire();
