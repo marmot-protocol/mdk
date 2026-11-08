@@ -813,6 +813,7 @@ impl Reader {
                             admin_count: facts.admin_count,
                             pending_confirmation: account.pending_confirmation,
                             leave_request_pending: account.leave_request_pending,
+                            leave_blocked: account.leave_blocked,
                             lifecycle: authority.lifecycle.into(),
                             unrecoverable: facts.unrecoverable,
                             disbanding: authority.disbanding,
@@ -836,6 +837,7 @@ impl Reader {
                             admin_count: 0,
                             pending_confirmation: account.pending_confirmation,
                             leave_request_pending: account.leave_request_pending,
+                            leave_blocked: account.leave_blocked,
                             lifecycle: if account.disbanded {
                                 crate::AppGroupLifecycleState::Disbanded
                             } else {

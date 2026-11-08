@@ -107,6 +107,7 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
                 group_id: group.clone(),
                 requested_at_ms: 123,
                 last_proposed_epoch: None,
+                blocked: None,
             })
             .unwrap();
         assert!(page(&app, ChatListView::Chats).rows.is_empty(), "{id}");
@@ -194,6 +195,7 @@ fn a_queued_leave_still_lists_as_left_after_reopen() {
             group_id: group,
             requested_at_ms: 123,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
     store.close().unwrap();
@@ -205,6 +207,26 @@ fn a_queued_leave_still_lists_as_left_after_reopen() {
         page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
         Some(123)
     );
+}
+
+/// A blocked leave lists with its marker, read from the same engine row as
+/// the leave stamp (mdk#3014).
+#[test]
+fn a_blocked_leave_lists_as_blocked() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "01", true, "member", 3, false);
+    let group = engine_group(&store, "01");
+    store
+        .put_leave_request(&LeaveRequest {
+            group_id: group,
+            requested_at_ms: 123,
+            last_proposed_epoch: None,
+            blocked: Some(cgka_traits::storage::LeaveBlockReason::LastActiveAdmin),
+        })
+        .unwrap();
+    let rows = page(&store.app_storage(), ChatListView::Left).rows;
+    assert_eq!(rows[0].leave_requested_at_ms, Some(123));
+    assert!(rows[0].leave_blocked);
 }
 
 #[test]
@@ -536,6 +558,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                         group_id: group.clone(),
                         requested_at_ms: 123,
                         last_proposed_epoch: None,
+                        blocked: None,
                     })
                     .unwrap();
             });
@@ -1052,6 +1075,7 @@ fn account_attention_tracks_queued_departure_cancellation_and_caller_rollback() 
             group_id: group.clone(),
             requested_at_ms: 123,
             last_proposed_epoch: None,
+            blocked: None,
         })?;
         assert!(!s.app_storage().account_attention_total()?.has_unread());
         Err(StorageError::NotFound)
@@ -1128,6 +1152,7 @@ fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_r
             group_id: group.clone(),
             requested_at_ms: 123,
             last_proposed_epoch: None,
+            blocked: None,
         })?;
         assert!(!s.app_storage().account_attention_total()?.has_unread());
         Err(StorageError::NotFound)

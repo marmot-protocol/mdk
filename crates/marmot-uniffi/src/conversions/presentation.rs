@@ -454,6 +454,7 @@ mod tests {
                 muted: false,
                 muted_until_ms: None,
                 leave_requested_at_ms: None,
+                leave_blocked: false,
             }),
             presentation: presentation.clone(),
             avatar_asset: None,

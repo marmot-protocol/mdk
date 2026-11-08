@@ -450,6 +450,9 @@ struct FaultStorage {
     termination_fault: LeaveWriteFault,
     post_commit_disband_read_fault: LeaveWriteFault,
     deferred_release_read_fault: DeferredReleaseReadFault,
+    /// Faults `list_messages`, the scan a Cancel of a blocked leave reads
+    /// before its one durable step.
+    message_list_fault: LeaveWriteFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -587,6 +590,9 @@ impl MessageStorage for FaultStorage {
         group_id: &GroupId,
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>> {
+        if self.message_list_fault.should_fail() {
+            return Err(StorageError::Busy("injected message list failure".into()));
+        }
         self.inner.list_messages(group_id, at_or_after_epoch)
     }
     fn put_pending_application_event(
@@ -1064,6 +1070,7 @@ fn build_counted_fault_selfremove_client(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1545,6 +1552,7 @@ fn build_release_fault_client(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1577,6 +1585,7 @@ fn build_leave_write_fault_client(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(identity))
@@ -2513,6 +2522,7 @@ async fn generic_rewind_puts_back_complete_pending_application_output() {
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     };
     generic
         .rollback_group_state_keeping_live_records(&group_id, snapshot)
@@ -2956,6 +2966,7 @@ async fn slow_preparation_case(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"slow-preparation"))
@@ -3032,6 +3043,7 @@ async fn past_peel_backlog_case(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"past-peel-backlog"))
@@ -3246,6 +3258,7 @@ async fn deferred_account_reconstruction_retries_after_partial_scan_failure() {
             termination_fault: LeaveWriteFault::default(),
             post_commit_disband_read_fault: LeaveWriteFault::default(),
             deferred_release_read_fault: DeferredReleaseReadFault::default(),
+            message_list_fault: LeaveWriteFault::default(),
         })
         .legacy_compatibility_profile()
         .identity(pad32(b"partial-account-scan"))
@@ -3544,6 +3557,7 @@ async fn setup_own_intent_fault_case(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"own-intent-fault"))
@@ -3690,6 +3704,7 @@ async fn a_queued_no_change_whose_retirement_fails_keeps_the_pass() {
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .identity(pad32(b"no-change-retirement"))
     .account_identity_proof_signer(proof_signer(b"no-change-retirement"))
@@ -3982,6 +3997,7 @@ async fn assert_deferred_retirement(case: DeferredRetirementCase) {
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: deferred_release_read_fault.clone(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"carol-retire-atomic"))
@@ -4336,6 +4352,7 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
             termination_fault: termination_fault.clone(),
             post_commit_disband_read_fault: LeaveWriteFault::default(),
             deferred_release_read_fault: DeferredReleaseReadFault::default(),
+            message_list_fault: LeaveWriteFault::default(),
         })
         .legacy_compatibility_profile()
         .identity(pad32(b"eviction-atomic-bob"))
@@ -4404,6 +4421,7 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
                 group_id: group_id.clone(),
                 requested_at_ms: 1,
                 last_proposed_epoch: None,
+                blocked: None,
             })
             .unwrap();
         for tag in 0..queued_count {
@@ -4511,6 +4529,7 @@ async fn assert_convergence_membership_fault(
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: post_commit_disband_read_fault.clone(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"eviction-atomic-bob"))
@@ -4567,6 +4586,7 @@ async fn assert_convergence_membership_fault(
             group_id: group_id.clone(),
             requested_at_ms: 1,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
     for tag in 0..queued_count {
@@ -4703,6 +4723,7 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     })
     .identity(pad32(b"bob-disband-cleanup"))
     .account_identity_proof_signer(proof_signer(b"bob-disband-cleanup"))
@@ -5846,4 +5867,107 @@ async fn native_private_message_storage_failure_retains_the_authenticated_branch
         carol.ingest(application).await.unwrap(),
         IngestOutcome::Processed
     ));
+}
+
+/// A blocked leave (mdk#3014) survives storage faults on both of its steps.
+/// When the re-drive's write of the blocked marker fails, the group still
+/// owes a wake, so the next drain records it rather than leaving the host
+/// without its Cancel. A Cancel whose read fails changes nothing: the
+/// request and its marker stay, and the same Cancel succeeds once storage
+/// recovers.
+#[tokio::test]
+async fn a_blocked_leave_retries_its_marker_and_cancel_after_storage_faults() {
+    use cgka_traits::group::ProtocolProfile;
+    use cgka_traits::storage::LeaveBlockReason;
+
+    let leave_write_fault = LeaveWriteFault::default();
+    let message_list_fault = LeaveWriteFault::default();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        leave_write_fault: leave_write_fault.clone(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: message_list_fault.clone(),
+    })
+    .identity(pad32(b"blocked-leave-faults"))
+    .account_identity_proof_signer(proof_signer(b"blocked-leave-faults"))
+    .protocol_profile(ProtocolProfile::Current)
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, _) = engine
+        .create_group(CreateGroupRequest {
+            name: "last admin".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    storage
+        .put_leave_request(&LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 0,
+            last_proposed_epoch: None,
+            blocked: None,
+        })
+        .unwrap();
+    let stored_marker = || {
+        storage
+            .leave_request(&group_id)
+            .unwrap()
+            .expect("the leave request stays")
+            .blocked
+    };
+
+    leave_write_fault.arm_on_write(1);
+    engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(leave_write_fault.remaining(), 0, "the marker write failed");
+    assert_eq!(stored_marker(), None);
+    assert!(
+        engine.leave_redrive_owed(&group_id).unwrap(),
+        "the unrecorded marker keeps a wake owed"
+    );
+    engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .unwrap();
+    assert_eq!(stored_marker(), Some(LeaveBlockReason::LastActiveAdmin));
+    assert!(!engine.leave_redrive_owed(&group_id).unwrap());
+
+    // The second scan: the first is Cancel's settled check, the second the
+    // read of the schedules it restores.
+    message_list_fault.arm_on_write(2);
+    assert!(matches!(
+        engine.cancel_leave(&group_id),
+        Err(EngineError::Storage(_))
+    ));
+    assert_eq!(
+        message_list_fault.remaining(),
+        0,
+        "the Cancel's read failed"
+    );
+    assert!(engine.leave_in_progress(&group_id).unwrap());
+    assert_eq!(stored_marker(), Some(LeaveBlockReason::LastActiveAdmin));
+
+    engine
+        .cancel_leave(&group_id)
+        .expect("the same Cancel succeeds once storage recovers");
+    assert_eq!(storage.leave_request(&group_id).unwrap(), None);
+    assert!(!engine.leave_in_progress(&group_id).unwrap());
 }

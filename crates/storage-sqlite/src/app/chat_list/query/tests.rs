@@ -370,6 +370,7 @@ fn every_condition_matches_exactly_the_chats_with_that_fact() {
             group_id: leaving,
             requested_at_ms: 1,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
     seed(&store, "b1", &[]);

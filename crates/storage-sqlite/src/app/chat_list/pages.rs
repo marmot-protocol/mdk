@@ -316,9 +316,8 @@ fn page_rows(
     let mut rows = HashMap::with_capacity(keys.len());
     for record in records {
         let (mut row, leave, disband, candidate) = record.storage()?;
-        row.leave_requested_at_ms = leave
-            .map(|b| deserialize::<LeaveRequest>(&b).map(|r| r.requested_at_ms))
-            .transpose()?;
+        let leave = leave.map(|b| deserialize::<LeaveRequest>(&b)).transpose()?;
+        row.stamp_leave_request(leave.as_ref());
         row.disband_request = disband
             .map(|b| deserialize::<DisbandRequest>(&b))
             .transpose()?;

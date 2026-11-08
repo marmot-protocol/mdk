@@ -241,6 +241,7 @@ mod tests {
             self_membership: SelfMembershipFfi::Member,
             leave_request_pending: false,
             leave_requested_at_ms: None,
+            leave_blocked: false,
             disbanding: false,
             disband_request: None,
             disbanded: false,

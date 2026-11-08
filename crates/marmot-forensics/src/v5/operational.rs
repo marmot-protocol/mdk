@@ -165,6 +165,7 @@ fn safe_failure_category(input: &str) -> String {
         | "invalid_credential_identity"
         | "admin_cannot_self_remove"
         | "leave_already_requested"
+        | "leave_not_blocked"
         | "admin_depletion"
         | "missing_required_capabilities"
         | "disbanding_unsupported_members"

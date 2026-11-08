@@ -4109,6 +4109,12 @@ where
         Ok(self.session.leave_redrive_owed(group_id)?)
     }
 
+    /// Cancel this group's blocked leave on this device; see
+    /// `Engine::cancel_leave`.
+    pub fn cancel_leave(&mut self, group_id: &GroupId) -> AccountResult<()> {
+        Ok(self.session.cancel_leave(group_id)?)
+    }
+
     /// Milliseconds until a scheduled SelfRemove auto-commit for this group is
     /// due; schedulers must keep a wakeup armed while this is `Some`.
     pub fn scheduled_self_remove_auto_commit_delay_ms(

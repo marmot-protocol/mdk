@@ -290,6 +290,7 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
         ("epoch pin", reopened.epoch_pin(&group_id).map(drop)),
         ("own leaf", reopened.own_leaf_index(&group_id).map(drop)),
         ("own leaf hash", reopened.own_leaf_hash(&group_id).map(drop)),
+        ("leave blocked", reopened.leave_blocked(&group_id).map(drop)),
         ("live check", reopened.check_group_live(&group_id)),
         (
             "feature",

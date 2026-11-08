@@ -5,8 +5,7 @@ use cgka_traits::types::GroupId;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 
-/// Every durable leave request keyed by lowercase hex group id, mapped to its
-/// `requested_at_ms`.
+/// Every durable leave request keyed by lowercase hex group id.
 ///
 /// The engine owns this table and clears rows from several paths that never
 /// notify the app projection (an accepted commit that removed us, hydration
@@ -20,7 +19,7 @@ use std::collections::HashMap;
 /// `group_id_hex` (which could not use the primary-key index anyway).
 pub(crate) fn pending_leave_requests_by_group_hex_tx(
     tx: &Connection,
-) -> StorageResult<HashMap<String, u64>> {
+) -> StorageResult<HashMap<String, LeaveRequest>> {
     let mut statement = tx
         .prepare_cached("SELECT group_id, record FROM cgka_leave_requests")
         .storage()?;
@@ -32,10 +31,7 @@ pub(crate) fn pending_leave_requests_by_group_hex_tx(
         .collect::<rusqlite::Result<Vec<_>>>()
         .storage()?;
     rows.into_iter()
-        .map(|(group_id, record)| {
-            let request: LeaveRequest = deserialize(&record)?;
-            Ok((hex::encode(group_id), request.requested_at_ms))
-        })
+        .map(|(group_id, record)| Ok((hex::encode(group_id), deserialize(&record)?)))
         .collect()
 }
 
@@ -45,7 +41,7 @@ impl SqliteAccountStorage {
     /// The app layer uses this to project a pending leave onto group records
     /// without denormalizing a column; see
     /// [`pending_leave_requests_by_group_hex_tx`].
-    pub fn pending_leave_requests(&self) -> StorageResult<HashMap<String, u64>> {
+    pub fn pending_leave_requests(&self) -> StorageResult<HashMap<String, LeaveRequest>> {
         let conn = self.lock()?;
         pending_leave_requests_by_group_hex_tx(&conn)
     }
@@ -105,6 +101,7 @@ mod tests {
             group_id: group.id.clone(),
             requested_at_ms: 42,
             last_proposed_epoch: Some(EpochId(3)),
+            blocked: None,
         };
         store.put_leave_request(&request).unwrap();
         assert_eq!(store.leave_request(&group.id).unwrap(), Some(request));

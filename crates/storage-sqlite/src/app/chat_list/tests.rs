@@ -806,6 +806,7 @@ fn direct_row(group_id_hex: &str, activity_sort_at: u64) -> ChatListRow {
         muted: false,
         muted_until_ms: None,
         leave_requested_at_ms: None,
+        leave_blocked: false,
     }
 }
 
@@ -1152,6 +1153,7 @@ fn direct_conversation_candidates_carry_a_queued_leave() {
             group_id: GroupId::new(engine_id),
             requested_at_ms: 123,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
     let candidates = app.direct_conversation_candidate_rows(&peer).unwrap();
@@ -3864,6 +3866,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
             group_id: group_id.clone(),
             requested_at_ms: 1_700_000_000_123,
             last_proposed_epoch: Some(EpochId(3)),
+            blocked: None,
         })
         .unwrap();
 

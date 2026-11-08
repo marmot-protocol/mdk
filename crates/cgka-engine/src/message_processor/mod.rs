@@ -69,8 +69,8 @@ use cgka_traits::message::{
     DeferredMessageMetadata, MessageRecord, MessageState, StoredMessagePayload,
 };
 use cgka_traits::storage::{
-    DeferredPeelGeneration, OpenMlsContentFilter, QueuedOutboundIntent, StorageError,
-    StorageProvider,
+    DeferredPeelGeneration, LeaveBlockReason, OpenMlsContentFilter, QueuedOutboundIntent,
+    StorageError, StorageProvider,
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -410,6 +410,33 @@ fn previous_deferred_payload_bytes(
     }
 }
 
+/// Durable proposal rows at `source_epoch` whose SelfRemove auto-commit
+/// wakeup a restart or Cancel rebuilds. Replay performs the authenticated
+/// SelfRemove/type/authorization checks before staging.
+fn self_remove_auto_commit_candidates(
+    records: &[MessageRecord],
+    source_epoch: EpochId,
+) -> Vec<MessageId> {
+    records
+        .iter()
+        .filter(|record| {
+            record.epoch == source_epoch
+                && matches!(
+                    record.state,
+                    MessageState::Created
+                        | MessageState::Retryable
+                        | MessageState::ConvergenceDeferred
+                        | MessageState::Processed
+                )
+                && decode_openmls_wire_projection(&record.payload).is_some_and(|(_, projection)| {
+                    projection.kind == crate::openmls_projection::OpenMlsContentKind::Proposal
+                        && projection.source_epoch == Some(source_epoch.0)
+                })
+        })
+        .map(|record| record.id.clone())
+        .collect()
+}
+
 /// `(source_epoch, digest)` of one stored commit in the convergence graph.
 type CommitEdge = (u64, [u8; 32]);
 
@@ -705,14 +732,32 @@ pub(crate) enum PendingProposals {
     Keep,
 }
 
-/// The step a durable leave request owes on a `Stable` epoch.
+/// Where a durable leave request stands on a `Stable` epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OwedLeaveStep {
+pub(crate) enum LeaveStep {
     /// The selected branch keeps this account an admin and another active
     /// admin remains: take it off the admin list first.
     StepDown,
     /// No SelfRemove has been proposed at this epoch yet.
     SelfRemove,
+    /// This epoch's SelfRemove is out; a member's Commit finishes the leave.
+    AwaitingCommit,
+    /// Nothing this client sends can move the leave forward.
+    Blocked(LeaveBlockReason),
+}
+
+impl LeaveStep {
+    /// Whether the drain would stage something for the leave now.
+    pub(crate) fn is_owed(self) -> bool {
+        matches!(self, Self::StepDown | Self::SelfRemove)
+    }
+
+    pub(crate) fn blocked(self) -> Option<LeaveBlockReason> {
+        match self {
+            Self::Blocked(reason) => Some(reason),
+            Self::StepDown | Self::SelfRemove | Self::AwaitingCommit => None,
+        }
+    }
 }
 
 struct FairnessReservation {
@@ -1677,6 +1722,20 @@ impl<S: StorageProvider> Engine<S> {
         if self.load_leave_request_state(group_id)?.is_some() {
             return Ok(());
         }
+        self.insert_self_remove_auto_commit_schedule(group_id, proposal_id, source_epoch, now_ms);
+        Ok(())
+    }
+
+    /// [`Self::schedule_self_remove_auto_commit`] for a caller that already
+    /// knows this account holds no leave request. Infallible, so it can run
+    /// after a durable step.
+    fn insert_self_remove_auto_commit_schedule(
+        &mut self,
+        group_id: &GroupId,
+        proposal_id: &MessageId,
+        source_epoch: EpochId,
+        now_ms: u64,
+    ) {
         let due_at_ms =
             now_ms.saturating_add(self.self_remove_auto_commit_jitter_ms(group_id, proposal_id));
         let scheduled = ScheduledSelfRemoveAutoCommit {
@@ -1693,7 +1752,6 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         self.schedule_pending_convergence_group(group_id);
-        Ok(())
     }
 
     pub(crate) fn drop_self_remove_auto_commit_schedules_for_group(&mut self, group_id: &GroupId) {
@@ -1730,32 +1788,11 @@ impl<S: StorageProvider> Engine<S> {
         now_ms: u64,
         records: &[MessageRecord],
     ) -> Result<bool, EngineError> {
-        let mut restored = false;
-        for record in records {
-            if record.epoch != source_epoch
-                || !matches!(
-                    record.state,
-                    MessageState::Created
-                        | MessageState::Retryable
-                        | MessageState::ConvergenceDeferred
-                        | MessageState::Processed
-                )
-            {
-                continue;
-            }
-            let Some((_message, projection)) = decode_openmls_wire_projection(&record.payload)
-            else {
-                continue;
-            };
-            if projection.kind != crate::openmls_projection::OpenMlsContentKind::Proposal
-                || projection.source_epoch != Some(source_epoch.0)
-            {
-                continue;
-            }
-            self.schedule_self_remove_auto_commit(group_id, &record.id, source_epoch, now_ms)?;
-            restored = true;
+        let proposals = self_remove_auto_commit_candidates(records, source_epoch);
+        for proposal_id in &proposals {
+            self.schedule_self_remove_auto_commit(group_id, proposal_id, source_epoch, now_ms)?;
         }
-        Ok(restored)
+        Ok(!proposals.is_empty())
     }
 
     fn self_remove_auto_commit_jitter_ms(
@@ -2239,10 +2276,12 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Whether this group's durable leave request owes its next step: a fresh
     /// step-down or a SelfRemove the drain would stage now (see
-    /// `owed_leave_step`). Runtime schedulers must keep a wakeup armed while
+    /// `next_leave_step`). Runtime schedulers must keep a wakeup armed while
     /// this holds. The request is neither a queued outbound intent nor a
     /// convergence input, so once the step-down a leave staged has merged, a
     /// quiet group otherwise reads as idle and its SelfRemove is never sent.
+    /// A stored blocked marker the selected branch no longer matches is owed
+    /// too, so a marker write that failed is retried rather than left stale.
     pub fn leave_redrive_owed(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
         if self.quarantined_reason(group_id).is_some() || self.unhydrated_groups.contains(group_id)
         {
@@ -2262,9 +2301,88 @@ impl<S: StorageProvider> Engine<S> {
         if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
             return Ok(false);
         }
+        let step = self.next_leave_step(group_id, &request, group.epoch)?;
+        Ok(step.is_owed() || request.blocked != step.blocked())
+    }
+
+    /// Why this group's durable leave request is blocked, as the leave
+    /// re-drive last recorded it (see `next_leave_step`). `None` when there is
+    /// no leave request or it can still move forward. Hosts show a blocked
+    /// leave with a Cancel action instead of as leaving. A quarantined group
+    /// reads as `UnknownGroup` and a seeded one as `GroupNotHydrated`, as on
+    /// every group-state accessor.
+    pub fn leave_blocked(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<LeaveBlockReason>, EngineError> {
+        self.ensure_group_live(group_id)?;
         Ok(self
-            .owed_leave_step(group_id, &request, group.epoch)?
-            .is_some())
+            .load_leave_request_state(group_id)?
+            .and_then(|request| request.blocked))
+    }
+
+    /// Cancel a blocked leave, on this device only (member-departure.md,
+    /// "Behavior"). Allowed only while the selected branch makes this
+    /// account the last active admin on a `Stable`, settled group (no
+    /// unresolved convergence input), re-checked here rather than read from
+    /// the stored marker. On that state no member can commit a SelfRemove of
+    /// this account: an admin's SelfRemove is never authorized. So clearing
+    /// the request is true, and the account is its last admin again. Any
+    /// other state is refused with `LeaveNotBlocked`. Cancel withdraws
+    /// nothing already published: a later selected branch that removes the
+    /// account still applies. A shared Decline is left as it is.
+    ///
+    /// Every read comes before the one durable step, clearing the request,
+    /// so a failed Cancel changes nothing and can be retried.
+    pub fn cancel_leave(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
+        let _ = self.ensure_hydrated(group_id);
+        self.ensure_group_live(group_id)?;
+        let not_blocked = || EngineError::LeaveNotBlocked {
+            group_id: group_id.clone(),
+        };
+        let Some(request) = self.load_leave_request_state(group_id)? else {
+            return Err(not_blocked());
+        };
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !state.is_stable()
+        {
+            return Err(not_blocked());
+        }
+        if self.has_pending_convergence_inputs(group_id)? {
+            return Err(not_blocked());
+        }
+        let Some(group) = self.stored_group_record(group_id)? else {
+            return Err(not_blocked());
+        };
+        if !crate::identity::local_copy_is_member(&group, self.identity.self_id())
+            || self
+                .next_leave_step(group_id, &request, group.epoch)?
+                .blocked()
+                .is_none()
+        {
+            return Err(not_blocked());
+        }
+        // A leaving account drops its auto-commit schedules for other
+        // members' SelfRemoves; restore them as hydration would, so a co-admin
+        // that left meanwhile is not left waiting on this account.
+        let records = self.storage.list_messages(group_id, group.epoch)?;
+        let proposals = self_remove_auto_commit_candidates(&records, group.epoch);
+        let now_ms = self.convergence_now_ms();
+        self.clear_leave_request_state(group_id)?;
+        for proposal_id in &proposals {
+            self.insert_self_remove_auto_commit_schedule(
+                group_id,
+                proposal_id,
+                group.epoch,
+                now_ms,
+            );
+        }
+        tracing::info!(
+            target: "cgka_engine::leave_request",
+            method = "cancel_leave",
+            "blocked leave request cancelled"
+        );
+        Ok(())
     }
 
     fn note_foreground_deferred_phase(

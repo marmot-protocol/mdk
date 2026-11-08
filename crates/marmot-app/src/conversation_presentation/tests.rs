@@ -14,6 +14,7 @@ fn authority() -> ConversationAuthority {
         admin_count: 1,
         pending_confirmation: false,
         leave_request_pending: false,
+        leave_blocked: false,
         lifecycle: AppGroupLifecycleState::Stable,
         unrecoverable: false,
         disbanding: false,
@@ -210,6 +211,7 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
         let a = ConversationAuthority {
             self_membership: membership,
             leave_request_pending: leaving,
+            leave_blocked: false,
             pending_confirmation: pending,
             lifecycle,
             ..input
@@ -233,6 +235,19 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
             !stepping_down
                 .capabilities()
                 .requires_self_demote_before_leave
+        );
+        // A blocked leave still reads as leaving and offers Cancel; the
+        // marker offers nothing outside a pending leave (mdk#3014).
+        assert!(!c.can_cancel_leave);
+        let blocked = ConversationAuthority {
+            leave_blocked: true,
+            ..a
+        }
+        .capabilities();
+        assert_eq!(blocked.participation, expected);
+        assert_eq!(
+            blocked.can_cancel_leave,
+            expected == ConversationParticipation::Leaving
         );
     }
     input.unrecoverable = true;

@@ -23,7 +23,7 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
-use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::storage::{LeaveRequest, StorageError, StorageResult};
 pub use pages::{ChatListPage, ChatListPageDirection, ChatListPageError, ChatListView};
 pub use query::{
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListQueryError, ChatListViewQuery,
@@ -398,6 +398,21 @@ pub struct ChatListRow {
     /// `None` means no leave is outstanding.
     #[serde(default)]
     pub leave_requested_at_ms: Option<u64>,
+    /// The outstanding leave is blocked: the selected branch makes this
+    /// account the group's last active admin, so nothing it sends can finish
+    /// the leave. Hosts show it with a Cancel action. Derived at read time
+    /// from the same `cgka_leave_requests` row as `leave_requested_at_ms`, and
+    /// only ever true while that is `Some`.
+    #[serde(default)]
+    pub leave_blocked: bool,
+}
+
+impl ChatListRow {
+    /// Stamp the read-time leave fields from this group's durable request.
+    pub(crate) fn stamp_leave_request(&mut self, request: Option<&LeaveRequest>) {
+        self.leave_requested_at_ms = request.map(|request| request.requested_at_ms);
+        self.leave_blocked = request.is_some_and(|request| request.blocked.is_some());
+    }
 }
 
 /// One-group facts the marmot-app retention sweep prunes on (mdk#2425). The
@@ -2590,7 +2605,7 @@ pub(crate) fn chat_list_rows_tx(
     let pending = pending_leave_requests_by_group_hex_tx(tx)?;
     if !pending.is_empty() {
         for row in &mut rows {
-            row.leave_requested_at_ms = pending.get(&row.group_id_hex).copied();
+            row.stamp_leave_request(pending.get(&row.group_id_hex));
         }
     }
     let disbanding = disbanding_group_ids_hex_tx(tx)?;
@@ -2646,7 +2661,7 @@ fn direct_conversation_candidate_rows_tx(
     let pending = pending_leave_requests_by_group_hex_tx(tx)?;
     if !pending.is_empty() {
         for row in &mut rows {
-            row.leave_requested_at_ms = pending.get(&row.group_id_hex).copied();
+            row.stamp_leave_request(pending.get(&row.group_id_hex));
         }
     }
     let disbanding = disbanding_group_ids_hex_tx(tx)?;
@@ -2675,9 +2690,7 @@ pub(crate) fn chat_list_row_tx(
     .storage()?
     .map(|mut row| {
         // Same read-time derivation as `chat_list_rows_tx`; see there.
-        row.leave_requested_at_ms = pending_leave_requests_by_group_hex_tx(tx)?
-            .get(&row.group_id_hex)
-            .copied();
+        row.stamp_leave_request(pending_leave_requests_by_group_hex_tx(tx)?.get(&row.group_id_hex));
         let disband_requests = disband_requests_by_group_hex_tx(tx)?;
         row.disbanding = disbanding_group_ids_hex_with_requests_tx(tx, &disband_requests)?
             .contains(&row.group_id_hex);
@@ -2891,6 +2904,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         // Not a `chat_list_rows` column; the callers above stamp it from
         // `cgka_leave_requests` after the row is decoded.
         leave_requested_at_ms: None,
+        leave_blocked: false,
     })
 }
 

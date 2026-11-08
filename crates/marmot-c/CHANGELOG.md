@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- A blocked leave is shown and can be cancelled (mdk#3014). `MarmotAppGroupRecord` and `MarmotChatListRow` append
+  `leave_blocked`, `MarmotGroupManagementState` appends `leave_blocked` and `can_cancel_leave`, and
+  `MarmotConversationCapabilities` appends `can_cancel_leave`. New `marmot_cancel_leave` cancels the leave on this
+  device only; any other state fails with the new `MARMOT_STATUS_LEAVE_NOT_BLOCKED` (129). Rebuild against the
+  matching header and library.
+
 - `MarmotDeviceLinkSnapshot` appends `device_group_stalled` (`bool`): this device can no longer catch up with its
   device group; offer `marmot_reset_device_group_for_repair`. Rebuild against the matching header and library.
 - An admin's `marmot_leave_group`, and an admin invitee's `marmot_decline_group_invite`, fail with

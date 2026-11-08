@@ -2368,6 +2368,7 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
         "upgrade_group_capabilities",
     );
     unknown(alice.own_leaf_index(&group_id).map(drop), "own_leaf_index");
+    unknown(alice.leave_blocked(&group_id).map(drop), "leave_blocked");
     unknown(
         alice
             .safe_export_secret_with_epoch(&group_id, component)

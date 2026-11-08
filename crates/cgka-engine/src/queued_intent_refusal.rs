@@ -82,6 +82,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::InvalidCredentialIdentity(_)
         | EngineError::AdminCannotSelfRemove { .. }
         | EngineError::LeaveAlreadyRequested { .. }
+        | EngineError::LeaveNotBlocked { .. }
         | EngineError::AdminDepletion { .. }
         | EngineError::MissingRequiredCapabilities { .. }
         | EngineError::DisbandingUnsupportedMembers { .. }

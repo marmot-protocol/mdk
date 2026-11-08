@@ -330,6 +330,11 @@ enum MarmotStatus
    * runtime is shutting down or closing. Nothing was stored.
    */
   MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED = 128,
+  /**
+   * `marmot_cancel_leave` found no blocked leave: no leave, an unsettled
+   * epoch, or a leave that can still finish. Show the leave's progress.
+   */
+  MARMOT_STATUS_LEAVE_NOT_BLOCKED = 129,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2846,6 +2851,12 @@ typedef struct MarmotAppGroupRecord {
   bool disbanded;
   char *welcomer_account_id_hex;
   char *via_welcome_message_id_hex;
+  /**
+   * The pending leave is blocked: this account is the last active
+   * admin. Keep rendering it as leaving and offer
+   * `marmot_cancel_leave`. Only true while `leave_request_pending`.
+   */
+  bool leave_blocked;
 } MarmotAppGroupRecord;
 
 /**
@@ -2956,6 +2967,15 @@ typedef struct MarmotGroupManagementState {
   struct MarmotDisbandRequest *disband_request;
   struct MarmotGroupMemberActionState *member_actions;
   uintptr_t member_actions_len;
+  /**
+   * The pending leave is blocked: this account is the last active
+   * admin, so the leave cannot finish.
+   */
+  bool leave_blocked;
+  /**
+   * Offer Cancel on the blocked leave (`marmot_cancel_leave`).
+   */
+  bool can_cancel_leave;
 } MarmotGroupManagementState;
 
 /**
@@ -4202,6 +4222,12 @@ typedef struct MarmotChatListRow {
    *Only meaningful when the matching `has_` flag is set.
    */
   uint64_t leave_requested_at_ms;
+  /**
+   * The pending leave is blocked: this account is the last active
+   * admin. Offer `marmot_cancel_leave`. Only true while
+   * `leave_request_pending`.
+   */
+  bool leave_blocked;
 } MarmotChatListRow;
 
 /**
@@ -7164,6 +7190,10 @@ typedef struct MarmotConversationCapabilities {
   bool requires_self_demote_before_leave;
   bool can_enable_disbanding;
   bool can_disband;
+  /**
+   * Offer Cancel on a blocked leave (`marmot_cancel_leave`).
+   */
+  bool can_cancel_leave;
 } MarmotConversationCapabilities;
 
 typedef struct MarmotConversationHeader {
@@ -8568,6 +8598,22 @@ MarmotStatus marmot_leave_group(const struct MarmotClient *client,
                                 const char *account_ref,
                                 const char *group_id_hex,
                                 struct MarmotSendSummary **out);
+
+/**
+ * Cancel this account's blocked leave on this device. Offer it while
+ * `MarmotGroupManagementState.can_cancel_leave`: the account is the
+ * last active admin, so the leave cannot finish. The chat reads as
+ * joined again. Any other state fails with `MARMOT_STATUS_LEAVE_NOT_BLOCKED`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cancel_leave(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *group_id_hex);
 
 /**
  * Delete this group's local app data without an MLS leave. Cancel

@@ -1107,6 +1107,13 @@ a committed demotion remains if the following Leave fails. Already admitted nati
 owner. A SelfRemove applied without readable sibling attribution establishes no new automatic-Add hold, and later
 repair does not promise to recover that attribution retroactively.
 
+A leave can become blocked after it was accepted: if the selected branch makes the account the group's last active
+admin (two admins left at once and the other's step-down won, say), no Commit can finish the leave. The chat keeps
+reading as leaving (`leave_request_pending`), and `leave_blocked` is set on the group record, the chat-list row and
+management state. MDK does not retry, rejoin or reverse a Decline on its own. Show "Can't leave: you're the only
+admin" with a Cancel action while `can_cancel_leave` holds; `cancel_leave` clears the leave on this device and the chat
+reads as joined again. To leave after that, make another member an admin, demote, and Leave again.
+
 A local chat copy that has applied its own removal stays terminal: later branch changes do not resume convergence
 on that copy. Rejoining requires a fresh valid Welcome that replaces its cryptographic state; an invitation alone is
 not a guarantee of recovery. The remaining members do not promise to recommit every removal forever. An admin's

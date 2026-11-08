@@ -48,6 +48,7 @@ fn retry_storage(
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
         deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
     }
 }
 

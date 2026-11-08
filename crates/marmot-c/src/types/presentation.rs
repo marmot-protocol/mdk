@@ -460,6 +460,7 @@ mod tests {
             muted_until_ms: None,
             leave_request_pending: false,
             leave_requested_at_ms: None,
+            leave_blocked: false,
         }
     }
 }

@@ -454,6 +454,10 @@ pub(crate) enum AccountWorkerCommand {
         for_sign_out: bool,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    CancelLeave {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     ForgetGroupLocal {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -5452,6 +5456,19 @@ fn account_worker_command_future<'a>(
                 account_label,
                 &group_id,
             );
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CancelLeave { group_id, respond } => Box::pin(async move {
+            let result = client.cancel_leave(&group_id);
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

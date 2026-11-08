@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A blocked leave is visible and can be cancelled (mdk#3014). When the selected branch makes a leaving account the
+  last active admin, the leave re-drive records `LeaveRequest::blocked = Some(LastActiveAdmin)` and clears it as soon
+  as the leave can move forward again; nothing retries meanwhile. New `Engine::leave_blocked`, and
+  `Engine::cancel_leave`, which clears the request only while the leave is blocked on a `Stable`, settled group and
+  otherwise returns the new `EngineError::LeaveNotBlocked`. A stored marker the branch no longer matches keeps
+  `leave_redrive_owed` true until the re-drive records it. No wire or schema change.
+
 - Retire D90/D91 device-group source-observation/proof recovery and its unused Engine APIs; sibling-Welcome origin, current tagged participation, expiry and immutable-carrier guards remain (D100).
 
 - Separate explicit dev device-roster advertisement capability from policy-test timing overrides.

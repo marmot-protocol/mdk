@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `LeaveRequest` gains `blocked: Option<LeaveBlockReason>` (`#[serde(default)]`; one reason, `LastActiveAdmin`), and
+  `EngineError` gains `LeaveNotBlocked { group_id }` (kind `leave_not_blocked`) for a Cancel asked of a leave that is
+  not blocked (mdk#3014). Struct literals and exhaustive matches need them. Stored requests without the field read as
+  not blocked; no schema change.
+
 - Add `TooLarge` endpoint rejection, coarse `EventSizeClass`, and optional size evidence on endpoint and aggregate
   publish failures. Rust struct literals and exhaustive matches must adopt the new fields/case. Old retained JSON
   remains readable with unknown evidence; older readers may reject newly written rejection variants. No schema or wire change.

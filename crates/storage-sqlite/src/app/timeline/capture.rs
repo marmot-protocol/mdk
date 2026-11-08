@@ -3,6 +3,7 @@
 use super::*;
 use crate::SqliteAppStorage;
 use crate::{ChatPresentationInput, SelectedMessageDraft};
+use cgka_traits::storage::LeaveRequest;
 
 /// Persisted inputs captured together. The timeline has a single owner in
 /// `page`; provenance cannot be replaced independently of its rows.
@@ -18,6 +19,8 @@ pub struct ConversationAccountSnapshot {
     pub archived: bool,
     pub disbanded: bool,
     pub leave_request_pending: bool,
+    /// The outstanding leave is blocked (see `ChatListRow::leave_blocked`).
+    pub leave_blocked: bool,
     /// Persisted admin projection; app selection derives the local scalar role.
     pub admin_keys_hex: String,
 }
@@ -60,13 +63,23 @@ fn capture_tx(
     let presentation_input = crate::app::chat_presentation::presentation_input_tx(conn, group)?
         .ok_or(StorageError::NotFound)?;
     let draft = crate::app::message_drafts::revisioned::selected_tx(conn, group)?;
-    let (archived, admin_keys_hex, leave_request_pending, disbanded) = conn
+    let (archived, admin_keys_hex, leave_record, disbanded) = conn
         .query_row_cached(
             crate::cross::views::CONVERSATION_GROUP_STATE_SQL,
             params![group, group_bytes],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get(3)?,
+                ))
+            },
         )
         .storage()?;
+    let leave_request = leave_record
+        .map(|record| crate::deserialize::<LeaveRequest>(&record))
+        .transpose()?;
     Ok(ConversationAccountSnapshot {
         page: presentation::presentation_page_tx(conn, opening.page)?,
         presentation_input,
@@ -77,7 +90,8 @@ fn capture_tx(
         draft,
         archived,
         disbanded,
-        leave_request_pending,
+        leave_request_pending: leave_request.is_some(),
+        leave_blocked: leave_request.is_some_and(|request| request.blocked.is_some()),
         admin_keys_hex,
     })
 }

@@ -733,6 +733,12 @@ c_cmd! {
     /// copies and refuses the last admin. Free with `marmot_send_summary_free`.
     async fn marmot_leave_group(account_ref: str, group_id_hex: str) -> rec(MarmotSendSummary) = leave_group;
 
+    /// Cancel this account's blocked leave on this device. Offer it while
+    /// `MarmotGroupManagementState.can_cancel_leave`: the account is the
+    /// last active admin, so the leave cannot finish. The chat reads as
+    /// joined again. Any other state fails with `MARMOT_STATUS_LEAVE_NOT_BLOCKED`.
+    async fn marmot_cancel_leave(account_ref: str, group_id_hex: str) -> unit = cancel_leave;
+
     /// Delete this group's local app data without an MLS leave. Cancel
     /// active UI subscriptions for the group first. MLS state stays
     /// intact; a future fresh delivery can recreate a chat row. Writes

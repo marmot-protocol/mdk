@@ -4794,7 +4794,7 @@ impl MarmotApp {
         let pending = storage.pending_leave_requests()?;
         if !pending.is_empty() {
             for group in &mut groups {
-                group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
+                group.stamp_leave_request(pending.get(&group.group_id_hex));
             }
         }
         let disbanding = storage.disbanding_group_ids_hex()?;
@@ -4822,7 +4822,12 @@ impl MarmotApp {
     /// would silently go stale.
     pub fn pending_leave_requests(&self, label: &str) -> Result<HashMap<String, u64>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self.account_storage(label)?.pending_leave_requests()?)
+        Ok(self
+            .account_storage(label)?
+            .pending_leave_requests()?
+            .into_iter()
+            .map(|(group_id_hex, request)| (group_id_hex, request.requested_at_ms))
+            .collect())
     }
 
     /// Group invites still pending the local device's confirmation decision.
@@ -4937,9 +4942,7 @@ impl MarmotApp {
             return Ok(Some(group));
         }
         let group_id = GroupId::new(group_id);
-        group.leave_requested_at_ms = storage
-            .leave_request(&group_id)?
-            .map(|request| request.requested_at_ms);
+        group.stamp_leave_request(storage.leave_request(&group_id)?.as_ref());
         let request = storage.disband_request(&group_id)?;
         group.disbanding = request
             .as_ref()

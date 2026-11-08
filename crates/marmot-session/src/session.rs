@@ -1739,6 +1739,11 @@ impl AccountDeviceSession {
         Ok(self.engine.leave_redrive_owed(group_id)?)
     }
 
+    /// See `Engine::cancel_leave`.
+    pub fn cancel_leave(&mut self, group_id: &GroupId) -> SessionResult<()> {
+        Ok(self.engine.cancel_leave(group_id)?)
+    }
+
     /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.
     pub fn scheduled_self_remove_auto_commit_delay_ms(
         &mut self,

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
+  `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
+  finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New
+  `Marmot::cancel_leave(account_ref, group_id_hex)` cancels it on this device only; the chat reads as joined again.
+  Any other state returns the new `MarmotKitError::LeaveNotBlocked`; exhaustive error switches need it. Regenerate
+  bindings.
+
 - `DeviceLinkSnapshotFfi` gains `device_group_stalled` (default `false`): this device can no longer catch up with its
   device group; offer `reset_device_group_for_repair`. Devices now mark and remove inactive siblings themselves
   (mdk#2628 item 3.6b-2). Experimental device-group builds only. Regenerate bindings.

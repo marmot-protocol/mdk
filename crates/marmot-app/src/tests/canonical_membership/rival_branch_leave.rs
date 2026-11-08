@@ -2,15 +2,18 @@
 //! reaches the winning branch and leaves. It holds its own SelfRemove as a
 //! pending proposal sealed under the losing branch's state, and convergence
 //! must not count that proposal against the rival (mdk#3226). An admin whose
-//! step-down the winning branch never held steps down again first (mdk#3014).
+//! step-down the winning branch never held steps down again first, and the
+//! last admin's leave is blocked until it cancels (mdk#3014).
 
 use super::*;
 
+const LABELS: [&str; 3] = ["alice", "bob", "carol"];
+
 /// alice and bob are admins, carol is not; all three start at the same epoch.
 struct Fork {
-    _app: MarmotApp,
+    app: MarmotApp,
     relay: Arc<ScriptedPushRelayClient>,
-    clients: [AppClient; 3],
+    clients: Vec<AppClient>,
     cursors: [usize; 3],
     group: GroupId,
     accounts: [String; 3],
@@ -21,7 +24,7 @@ impl Fork {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
-        let accounts = ["alice", "bob", "carol"].map(|label| home.create_account(label).unwrap());
+        let accounts = LABELS.map(|label| home.create_account(label).unwrap());
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = app_at(&dir, relay.clone());
         for peer in &accounts {
@@ -49,9 +52,9 @@ impl Fork {
         bob.accept_group_invite(&group).unwrap();
         carol.accept_group_invite(&group).unwrap();
         let mut fork = Self {
-            _app: app,
+            app,
             relay,
-            clients: [alice, bob, carol],
+            clients: vec![alice, bob, carol],
             cursors,
             group,
             accounts: accounts.map(|account| account.account_id_hex),
@@ -87,6 +90,20 @@ impl Fork {
             .group_record(&self.group)
             .unwrap()
             .name
+    }
+
+    fn record(&self, index: usize) -> crate::AppGroupRecord {
+        self.app
+            .group(LABELS[index], &hex::encode(self.group.as_slice()))
+            .unwrap()
+            .expect("the group record exists")
+    }
+
+    /// Close `index`'s client and open it again from its stored state.
+    async fn restart(&mut self, index: usize) {
+        drop(self.clients.remove(index));
+        let client = self.app.client(LABELS[index]).await.unwrap();
+        self.clients.insert(index, client);
     }
 
     fn published_since(&self, start: usize) -> Vec<NostrTransportEvent> {
@@ -363,5 +380,99 @@ fn a_member_who_left_on_a_losing_branch_reaches_the_winning_branch_and_leaves() 
         // On the winning branch the leave goes ahead: alice commits carol's
         // SelfRemove and carol's copy reads removed.
         fork.until_removed(2, &[2, 0]).await;
+    });
+}
+
+/// #3014's first acceptance case: alice and bob each step down and leave from
+/// the same epoch. The selected branch keeps one step-down, so the other admin
+/// is now the last one and its leave is blocked (D116): still shown as
+/// leaving, never retried, and joined again only through its own Cancel. Its
+/// SelfRemove, sealed at the same epoch number on the losing branch, does not
+/// bring the leave back after a restart, and the other admin's leave completes.
+#[test]
+fn the_last_admin_after_a_rival_step_down_has_a_blocked_leave_until_it_cancels() {
+    run_composed_app_runtime_test("rival-branch-admin-leave-blocked", || async {
+        let mut fork = Fork::new().await;
+        let source = fork.epoch(0);
+        let mut leaves = Vec::new();
+        for index in [0, 1] {
+            let start = fork.published();
+            fork.clients[index]
+                .self_demote_admin(&fork.group)
+                .await
+                .unwrap();
+            fork.clients[index].leave_group(&fork.group).await.unwrap();
+            assert_eq!(fork.epoch(index), source + 1);
+            leaves.push(fork.published_since(start));
+        }
+        deliver_events(&mut fork.clients[0], &leaves[1]).await;
+        deliver_events(&mut fork.clients[1], &leaves[0]).await;
+        fork.settle(&[0, 1]).await;
+        let (blocked, other) = match (fork.admin(0, 0), fork.admin(0, 1)) {
+            (true, false) => (0, 1),
+            (false, true) => (1, 0),
+            admins => panic!("exactly one step-down stands; admins {admins:?}"),
+        };
+        assert_eq!(fork.name(blocked), fork.name(other), "one selected branch");
+        assert_eq!(fork.epoch(blocked), source + 1);
+        assert!(fork.admin(blocked, blocked), "the last admin");
+
+        let record = fork.record(blocked);
+        assert!(record.leave_requested_at_ms.is_some(), "still leaving");
+        assert!(record.leave_blocked);
+        assert_eq!(
+            fork.clients[blocked]
+                .convergence_schedule_state(&fork.group)
+                .unwrap(),
+            crate::client::ConvergenceScheduleState::Idle,
+            "no wake is armed"
+        );
+        let published = fork.published();
+        fork.wake(blocked).await;
+        assert_eq!(fork.published(), published, "nothing retries");
+        assert!(fork.leaving(blocked));
+
+        let refused = fork.clients[other].cancel_leave(&fork.group).unwrap_err();
+        assert!(
+            matches!(
+                refused.as_engine_error(),
+                Some(cgka_traits::error::EngineError::LeaveNotBlocked { .. })
+            ),
+            "a leave that can finish is not cancelled: {refused:?}"
+        );
+
+        fork.clients[blocked].cancel_leave(&fork.group).unwrap();
+        assert!(!fork.leaving(blocked));
+        let record = fork.record(blocked);
+        assert_eq!(record.leave_requested_at_ms, None);
+        assert!(!record.leave_blocked);
+        assert_eq!(
+            record.self_membership,
+            SelfMembership::Member,
+            "joined again"
+        );
+        assert!(
+            fork.clients[blocked]
+                .runtime
+                .scheduled_self_remove_auto_commit_delay_ms(&fork.group)
+                .unwrap()
+                .is_some(),
+            "the other admin's SelfRemove is scheduled for commit again"
+        );
+        fork.clients[blocked]
+            .send(&fork.group, b"staying after all")
+            .await
+            .unwrap();
+
+        fork.restart(blocked).await;
+        fork.advance(blocked).await;
+        assert!(
+            !fork.leaving(blocked),
+            "a restart does not restore the leave"
+        );
+        assert_eq!(fork.record(blocked).leave_requested_at_ms, None);
+
+        fork.until_removed(other, &[blocked, other]).await;
+        assert!(fork.admin(blocked, blocked));
     });
 }
