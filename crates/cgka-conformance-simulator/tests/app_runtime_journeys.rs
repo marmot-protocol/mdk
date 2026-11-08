@@ -726,6 +726,12 @@ async fn public_app_runner_finishes_five_thousand_owed_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_opens_multi_epoch_history_while_a_relay_stalls() {
+    recovery_runner_proofs::multi_epoch_progress().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "captured 6,000-message admission-order failure; see APP_PATH_COVERAGE.md"]
 async fn public_app_runner_orders_six_thousand_backlog_messages_before_live_input() {
     recovery_runner_proofs::ordered_backlog_regression().await;

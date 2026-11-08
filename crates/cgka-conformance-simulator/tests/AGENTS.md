@@ -31,12 +31,15 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     also selected by the dedicated required public recovery CI job with production policy.
     Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
-    `support/recovery_scorecard.rs` holds the report-only large-account recovery scorecard: it asserts
-    recovery correctness only and records latency, per-relay traffic and idle downloads in `scorecard.json`.
+    `support/recovery_scorecard.rs` holds the large-account recovery scorecard: it asserts recovery correctness
+    and an end state with nothing catching up and no notice, and records latency, per-relay traffic split by cause
+    (first fetch, reconnect, retry, fallback) and idle downloads in `scorecard.json`.
     It measures the recovery runner, and records bob's per-endpoint history requests too.
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and 5,000 owed events through a restart, an idle window and a
-    reconnect, and counted/empty per-REQ fences across two restarts. Upgrade conversion before the first quantum
+    reconnect, with fairness asserted while the backlog is admitted. They also cover a six-epoch backlog opened
+    while a relay stalls, with the spacing between opened messages bounded, and counted/empty per-REQ fences across
+    two restarts. Upgrade conversion before the first quantum
     is owned by marmot-app's host tests.
     The named 6,000-event ordered-backlog regression retains the captured three-sender failure, competing live
     input, exact visible history and full account reopen. Failed proofs preserve their stopped fixture privately.

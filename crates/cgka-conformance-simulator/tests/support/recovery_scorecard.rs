@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use cgka_conformance_simulator::app_runtime::RelayTrafficV1;
+use cgka_conformance_simulator::app_runtime::{
+    ConnectionTrafficV1, RelayDeliveryPath, RelayTrafficV1,
+};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, ScenarioMessageSelectorV2,
     SubjectCreateGroup, SubjectError, SubjectSendApplication, SubjectUpdateGroupData,
@@ -17,7 +19,7 @@ use cgka_conformance_simulator::{
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
 
-use super::recovery_runner_proofs::history_summary;
+use super::recovery_runner_proofs::{history_summary, notices_view, unix_ms};
 use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 
 const LARGE_GROUP_MEMBERS: usize = 51;
@@ -421,7 +423,89 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     summary["novel_frames"] = json!(novel);
     summary["same_relay_repeat_frames"] = json!(repeats);
     summary["event_frames_by_kind"] = json!(by_kind);
+    summary["download_split"] = download_split(relay, workload);
     summary
+}
+
+/// Every copy of an event this endpoint sent after bob's restart, by cause,
+/// so amplification reads apart from what bob had to fetch. Copies count per
+/// endpoint; events both endpoints sent are `events_delivered_by_both_relays`.
+///
+/// - first fetch: the first copy of an event bob did not hold;
+/// - reconnect amplification: a held event's first copy through a live or
+///   maintenance subscription (the restart's rebuild-lookback replay), and
+///   every further copy such a subscription, or one never seen, brought;
+/// - retry amplification: every further copy a history request (ids, window
+///   or paged window) brought, which that endpoint had already sent;
+/// - fallback amplification: a held event's first copy through a history
+///   request, fetched rather than proved by comparison.
+///
+/// A copy's bytes are its event's bytes over its copies, the remainder on the
+/// first, so the four sum to the endpoint's event bytes exactly.
+fn download_split(relay: &RelayTrafficV1, workload: &Workload) -> Value {
+    const CAUSES: [&str; 4] = [
+        "first_fetch",
+        "reconnect_amplification",
+        "retry_amplification",
+        "fallback_amplification",
+    ];
+    let (first_fetch, reconnect, retry, fallback) = (0, 1, 2, 3);
+    let mut causes = [(0_u64, 0_u64); 4];
+    let (mut frames, mut bytes) = (0, 0);
+    for (id, delivery) in relay
+        .events
+        .iter()
+        .filter(|(_, delivery)| delivery.count > 0)
+    {
+        (frames, bytes) = (frames + delivery.count, bytes + delivery.bytes);
+        let copy = delivery.bytes / delivery.count;
+        let repeats = delivery.count - 1;
+        let first_by_history = matches!(
+            delivery.first,
+            Some((
+                RelayDeliveryPath::Ids | RelayDeliveryPath::Window | RelayDeliveryPath::PagedWindow,
+                _
+            ))
+        );
+        let first = match (workload.held.contains(id), first_by_history) {
+            (false, _) => first_fetch,
+            (true, false) => reconnect,
+            (true, true) => fallback,
+        };
+        causes[first].0 += 1;
+        causes[first].1 += delivery.bytes - copy * repeats;
+        let by_history = delivery.via_ids + delivery.via_window + delivery.via_paged_window;
+        let retried = by_history
+            .saturating_sub(u64::from(first_by_history))
+            .min(repeats);
+        causes[retry].0 += retried;
+        causes[retry].1 += copy * retried;
+        causes[reconnect].0 += repeats - retried;
+        causes[reconnect].1 += copy * (repeats - retried);
+    }
+    let summed = causes
+        .iter()
+        .fold((0, 0), |(f, b), (frames, bytes)| (f + frames, b + bytes));
+    let mut split = serde_json::Map::new();
+    for (cause, (frames, bytes)) in CAUSES.iter().zip(causes) {
+        split.insert(
+            (*cause).to_owned(),
+            json!({"frames": frames, "bytes": bytes}),
+        );
+    }
+    split.insert("total".into(), json!({"frames": frames, "bytes": bytes}));
+    split.insert("sums_to_total".into(), json!(summed == (frames, bytes)));
+    Value::Object(split)
+}
+
+/// EVENT frames and bytes over bob's own connections on one endpoint, beside
+/// the per-event split, which counts every connection opened after the
+/// restart.
+fn own_events(traffic: &ConnectionTrafficV1) -> Value {
+    json!({
+        "frames": traffic.event_frames.values().sum::<u64>(),
+        "bytes": traffic.event_bytes.values().sum::<u64>(),
+    })
 }
 
 /// An account recovery status in counts, without group or notice ids, for
@@ -454,6 +538,7 @@ pub(super) fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
 }
 
 /// One probe call: its index, start offset (s), latency (ms) and failure.
+#[derive(Clone)]
 pub(super) struct Sample {
     index: u64,
     at: f64,
@@ -512,10 +597,22 @@ pub(super) fn latencies(samples: &[Sample]) -> Value {
     summary
 }
 
+/// [`latencies`] of the calls that started within `[from, to]`, in seconds
+/// on the probe's own clock.
+pub(super) fn latencies_within(samples: &[Sample], from: f64, to: f64) -> Value {
+    let inside = samples
+        .iter()
+        .filter(|sample| (from..=to).contains(&sample.at));
+    let mut summary = latencies(&inside.cloned().collect::<Vec<_>>());
+    summary["window_seconds"] = json!([from, to]);
+    summary
+}
+
 async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestResult<Value> {
     let group = |label: &str| workload.groups[label].clone();
     let (gap, live, send) = (group("gap"), group("live"), group("send"));
     let mark = next_sessions(subject).await?;
+    let restart_unix_ms = unix_ms();
     let t0 = Instant::now();
     subject.set_online("bob", true).await?;
     let cold_reopen_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -603,6 +700,7 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
     let seen = watcher.await?;
     let telemetry_after = serde_json::to_value(&subject.performance_snapshots()?["bob"])?;
     let measured = subject.relay_traffic(&mark, true).await?;
+    let own = subject.client_traffic("bob", &mark).await?;
     tokio::time::sleep(IDLE_WINDOW).await;
     let idle_end = subject.relay_traffic(&mark, true).await?;
 
@@ -631,6 +729,15 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         .map(|requests| history_summary(requests, &kinds));
     let history_requests = history_requests.collect::<Vec<_>>();
     let account_status = bob.account_recovery_status().await;
+    let group_labels = workload
+        .groups
+        .iter()
+        .map(|(label, group)| (hex::encode(group.as_slice()), label.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let notices_at_end = account_status
+        .as_ref()
+        .ok()
+        .map(|status| notices_view(status, &group_labels, restart_unix_ms));
     let (_, mut observed) = bob.chat_view(&gap, None).await?;
     let mut expected = (0..GAP_MESSAGES)
         .map(|i| format!("gap-{i:05}"))
@@ -676,11 +783,18 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         "status_command_ms": latencies(&status),
         "send_ms": latencies(&sends),
         "live_visibility_ms": live_visibility,
-        "relays": measured.iter().map(|relay| summarize(relay, workload)).collect::<Vec<_>>(),
+        "relays": measured.iter().zip(&own).map(|(relay, own)| {
+            let mut summary = summarize(relay, workload);
+            summary["bob_connections_events"] = own_events(own);
+            summary
+        }).collect::<Vec<_>>(),
         "events_delivered_by_both_relays": both.count(),
         "history_requests": history_requests,
         "native_paging_requests_per_endpoint": super::recovery_runner_proofs::native_pages(&bobs),
         "account_recovery_status_at_end": account_status.as_ref().map(status_summary).map_err(|error| &error.message),
+        // Each notice's route and park time, in seconds after bob's restart.
+        "notices_at_end": notices_at_end,
+        "runner_history_requests_after_restart": bobs.iter().map(Vec::len).sum::<usize>(),
         "idle_window": {"seconds": IDLE_WINDOW.as_secs(), "relays": idle.collect::<Vec<_>>()},
         "telemetry": {"before": telemetry_before, "after": telemetry_after},
     }))
@@ -936,6 +1050,34 @@ pub(super) async fn run() {
         report["recovery"]["gap_messages_each_once"], true,
         "gap messages missing or duplicated"
     );
+    // The account must end with nothing left to fetch. The status lists
+    // nothing until a runner has surveyed, so it counts only after bob's
+    // runner asked for history since the restart; it surveys before each
+    // attempt and after the last one. A notice in this healthy run is its own
+    // failure, named by route and park time.
+    assert!(
+        report["runner_history_requests_after_restart"].as_u64() > Some(0),
+        "bob's runner asked no history after the restart, so his status proves nothing"
+    );
+    let end = &report["account_recovery_status_at_end"]["Ok"];
+    assert!(
+        end["catching_up_groups"] == 0 && end["inbox_catching_up"] == false,
+        "the scorecard ended with history still catching up: {end}"
+    );
+    assert!(
+        report["notices_at_end"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "a healthy run raised a history notice: {}",
+        report["notices_at_end"]
+    );
+    for relay in report["relays"].as_array().into_iter().flatten() {
+        let split = &relay["download_split"];
+        assert_eq!(
+            split["sums_to_total"], true,
+            "the download split must sum to the endpoint's event bytes: {split}"
+        );
+    }
 }
 
 #[test]
