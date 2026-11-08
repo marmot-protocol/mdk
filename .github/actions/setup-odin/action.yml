@@ -3,6 +3,19 @@ description: Install the checksum-pinned Odin compiler used by marmot-markdown
 runs:
   using: composite
   steps:
+    # Keep the pinned release archive in the Actions cache so most runs never
+    # download it. install-odin.sh checks a restored archive against its pinned
+    # sha256 and downloads again on a mismatch, so a cache entry can save a
+    # download but never change the compiler. The script holds every pin, so
+    # its hash is in the key. Like the Rust caches, only master saves (ci.yml
+    # header): one archive per platform, 62-150 MB each.
+    - name: Restore Odin dev-2026-10 archive
+      id: odin-archive
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/odin-archive
+        key: odin-dev-2026-10-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-odin.sh') }}
+
     - name: Install Odin dev-2026-10
       shell: bash
       env:
@@ -15,7 +28,8 @@ runs:
           ODIN_ACTION_PATH="$(cygpath -u "$ODIN_ACTION_PATH")"
         fi
         destination="$temporary/odin-dev-2026-10"
-        bash "$ODIN_ACTION_PATH/../../../scripts/install-odin.sh" "$destination"
+        ODIN_ARCHIVE_CACHE="$temporary/odin-archive" \
+          bash "$ODIN_ACTION_PATH/../../../scripts/install-odin.sh" "$destination"
         if [[ "$RUNNER_OS" == Windows ]]; then
           echo "$(cygpath -w "$destination")" >> "$GITHUB_PATH"
           echo "ODIN=$(cygpath -w "$destination/odin.exe")" >> "$GITHUB_ENV"
@@ -23,3 +37,10 @@ runs:
           echo "$destination" >> "$GITHUB_PATH"
           echo "ODIN=$destination/odin" >> "$GITHUB_ENV"
         fi
+
+    - name: Save Odin dev-2026-10 archive
+      if: github.ref == 'refs/heads/master' && steps.odin-archive.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/odin-archive
+        key: ${{ steps.odin-archive.outputs.cache-primary-key }}

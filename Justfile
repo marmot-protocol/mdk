@@ -534,7 +534,10 @@ _tla-tools:
         mkdir -p "$(dirname "$jar")"
         tmp="$(mktemp "${jar}.tmp.XXXXXX")"
         trap 'rm -f "$tmp"' EXIT
+        # Retry any failure, doubling the wait (1 s, 2 s, 4 s ...); none is scheduled after 300 s.
         curl --fail --location --silent --show-error \
+            --connect-timeout 20 --max-time 300 \
+            --retry 10 --retry-all-errors --retry-max-time 300 \
             https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
             --output "$tmp"
         actual="$(checksum "$tmp")"
