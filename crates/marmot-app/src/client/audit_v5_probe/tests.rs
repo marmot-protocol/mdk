@@ -1220,7 +1220,7 @@ async fn recovery_inbox_audit_metrics() {
             #[cfg(feature = "product-analytics-export")]
             {
                 scenario.alice.app.product_analytics =
-                    crate::product_analytics::test_product_collector();
+                    marmot_observability::test_product_collector();
                 scenario
                     .alice
                     .app
