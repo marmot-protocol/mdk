@@ -97,6 +97,8 @@ mod directory_tests;
 mod drafts;
 mod emoji_sets;
 mod local_submissions;
+#[cfg(test)]
+mod replay_flush_writes;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod backup_archive;
 mod error;
