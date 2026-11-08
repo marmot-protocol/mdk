@@ -3268,6 +3268,85 @@ async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
 
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
+async fn a_startup_that_keeps_progressing_outlives_the_ready_wait() {
+    // A slow device's first open spends longer in `account_state` than the
+    // whole ready-wait, as a fresh database applies every migration (mdk#3145).
+    // Another caller runs that open, as the directory's block-list reconcile
+    // does while a second device's worker waits on the database's open lock.
+    // Each hold is shorter than the wait, and progress comes between them: the
+    // migrations, then the session step. The legacy projection import that
+    // follows the open is where the stage is held after them.
+    let hold = APP_RUNTIME_ACCOUNT_READY_WAIT * 2 / 3;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let keys = app
+        .account_home()
+        .load_signing_keys("alice")
+        .expect("alice keys");
+    let legacy_path = app.legacy_account_projection_path("alice");
+    let legacy_key = app
+        .sqlcipher_key(
+            "alice",
+            &keys,
+            &legacy_path,
+            crate::SqlcipherDatabaseKind::AccountProjection,
+        )
+        .expect("legacy projection key");
+    crate::LegacyAccountProjectionDb::open(legacy_path, &legacy_key).expect("legacy projection");
+    let (import_reached_tx, import_reached) = std::sync::mpsc::channel();
+    let (import_proceed, import_proceed_rx) = std::sync::mpsc::channel::<()>();
+    let import_gate = StdMutex::new((import_reached_tx, import_proceed_rx));
+    app.set_legacy_projection_open_hook_for_test(Arc::new(move || {
+        let (reached, proceed) = &*import_gate.lock().expect("import gate");
+        let _ = reached.send(());
+        let _ = proceed.recv();
+    }));
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let (state_reached, state_proceed) =
+        install_local_open_gate_at(&app, "alice", AccountStartupStage::AccountState);
+    let (session_reached, session_proceed) = install_local_open_gate(&app, "alice");
+    let manager = runtime.accounts();
+    let reconcile = tokio::spawn(async move { manager.reconcile().await });
+
+    wait_for_test_signal(state_reached, "alice account state").await;
+    tokio::time::pause();
+    tokio::time::advance(hold).await;
+    tokio::task::spawn_blocking({
+        let app = app.clone();
+        move || app.account_storage("alice").map(drop)
+    })
+    .await
+    .expect("open task")
+    .expect("another caller opens alice's database");
+    state_proceed.send(()).expect("release the worker's open");
+    wait_for_test_signal(import_reached, "alice legacy import").await;
+    tokio::time::advance(hold).await;
+    import_proceed.send(()).expect("release the import");
+    wait_for_test_signal(session_reached, "alice session open").await;
+    tokio::time::advance(hold).await;
+    session_proceed.send(()).expect("release the session open");
+    tokio::time::resume();
+
+    if let Err(error) = reconcile.await.expect("reconcile task") {
+        panic!("a startup that never stalled for the ready-wait failed: {error:?}");
+    }
+    wait_for_startup_stages_to_settle(&runtime).await;
+    for operation in STARTUP_STAGE_OPERATIONS {
+        assert_eq!(
+            startup_stage_snapshot(&runtime, operation).timeouts,
+            0,
+            "{} timeouts",
+            operation.as_str()
+        );
+    }
+    runtime.shutdown().await;
+}
+
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn a_timed_out_open_stays_in_flight_beside_its_replacement() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);

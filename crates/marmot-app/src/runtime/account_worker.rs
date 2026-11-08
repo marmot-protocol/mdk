@@ -156,17 +156,47 @@ impl AccountStartupStage {
 /// Entering a stage completes the previous span. The last clone to drop ends
 /// an open span as cancelled, so a blocking open that outlives its aborted
 /// worker keeps its stage in flight until the open itself moves on.
+///
+/// Entering a stage, and each migration an open of the account's database
+/// applies, also counts as progress: the ready-waiter gives up only on a
+/// startup that made none for its whole wait (mdk#3145).
 #[derive(Clone, Debug)]
 pub(crate) struct AccountStartupProgress {
     telemetry: marmot_observability::PerformanceRecorder,
     state: Arc<Mutex<StartupStageState>>,
+    account_open: Arc<AccountOpenProgress>,
+}
+
+/// When an open of one account's database last applied a migration,
+/// whichever caller ran it. A fresh database's first open applies every
+/// migration, and a relay-list publish or the directory's block-list
+/// reconcile can be the one running it while the starting worker waits on the
+/// database's open lock (mdk#3145).
+#[derive(Debug, Default)]
+pub(crate) struct AccountOpenProgress(Mutex<Option<TokioInstant>>);
+
+impl AccountOpenProgress {
+    pub(crate) fn migration_applied(&self) {
+        *self.last_migration() = Some(TokioInstant::now());
+    }
+
+    fn last_migration(&self) -> std::sync::MutexGuard<'_, Option<TokioInstant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[derive(Debug)]
 struct StartupStageState {
     stage: AccountStartupStage,
     span: StageSpan,
+    stage_entered: TokioInstant,
 }
+
+/// A starting worker made no progress for its whole ready-wait.
+#[derive(Debug)]
+pub(crate) struct StartupStalled;
 
 #[derive(Debug, Default)]
 struct StageSpan {
@@ -195,8 +225,12 @@ impl Drop for StageSpan {
 }
 
 impl AccountStartupProgress {
-    /// Open the `Spawned` span of a worker about to be spawned.
-    pub(crate) fn new(telemetry: marmot_observability::PerformanceRecorder) -> Self {
+    /// Open the `Spawned` span of a worker about to be spawned for the
+    /// account whose database opens report to `account_open`.
+    pub(crate) fn new(
+        telemetry: marmot_observability::PerformanceRecorder,
+        account_open: Arc<AccountOpenProgress>,
+    ) -> Self {
         let stage = AccountStartupStage::Spawned;
         let span = StageSpan {
             observation: Some(telemetry.observe(stage.operation())),
@@ -204,7 +238,12 @@ impl AccountStartupProgress {
         };
         Self {
             telemetry,
-            state: Arc::new(Mutex::new(StartupStageState { stage, span })),
+            state: Arc::new(Mutex::new(StartupStageState {
+                stage,
+                span,
+                stage_entered: TokioInstant::now(),
+            })),
+            account_open,
         }
     }
 
@@ -216,9 +255,36 @@ impl AccountStartupProgress {
         let mut previous = {
             let mut state = self.state();
             state.stage = stage;
+            state.stage_entered = TokioInstant::now();
             std::mem::replace(&mut state.span, next)
         };
         previous.end(TelemetryOutcome::Success);
+    }
+
+    fn last_progress(&self) -> TokioInstant {
+        let stage_entered = self.state().stage_entered;
+        let migrated = *self.account_open.last_migration();
+        migrated.map_or(stage_entered, |migrated| migrated.max(stage_entered))
+    }
+
+    /// Wait for the worker's ready signal until its startup has made no
+    /// progress for `stall`. A long open that keeps moving, such as a fresh
+    /// database applying every migration on a slow disk, is not stuck; the
+    /// blocking open cannot be cancelled anyway, so giving up on it would only
+    /// fail the caller of a startup that is about to finish.
+    pub(crate) async fn wait_ready<T>(
+        &self,
+        mut ready: oneshot::Receiver<T>,
+        stall: Duration,
+    ) -> Result<Result<T, oneshot::error::RecvError>, StartupStalled> {
+        loop {
+            let deadline = self.last_progress() + stall;
+            match tokio::time::timeout_at(deadline, &mut ready).await {
+                Ok(result) => return Ok(result),
+                Err(_) if self.last_progress() + stall > TokioInstant::now() => {}
+                Err(_) => return Err(StartupStalled),
+            }
+        }
     }
 
     /// End the current stage's span: the worker signalled ready, or its open
@@ -9058,7 +9124,7 @@ mod tests {
             commands.clone(),
             receiver,
             ready,
-            AccountStartupProgress::new(shared.observer.performance().clone()),
+            AccountStartupProgress::new(shared.observer.performance().clone(), Arc::default()),
             shutdown_rx,
         );
         let runtime = super::super::MarmotAppRuntime::new(app.clone());

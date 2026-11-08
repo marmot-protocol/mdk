@@ -41,9 +41,10 @@ impl AgentConnector {
         write_control_frame(writer, &response).await?;
 
         // Request the initial catch-up without blocking this drain loop. catch_up_accounts() can
-        // block for up to APP_RUNTIME_ACCOUNT_READY_WAIT per account and can itself emit many
-        // runtime events; keeping this loop live prevents the bounded broadcast channel from
-        // dropping inbound user messages while catch-up is in flight.
+        // block for as long as an account's startup keeps progressing, up to
+        // APP_RUNTIME_ACCOUNT_READY_WAIT after it stalls, and can itself emit many runtime
+        // events; keeping this loop live prevents the bounded broadcast channel from dropping
+        // inbound user messages while catch-up is in flight.
         let catch_up_driver = self.inbound_catch_up.clone();
         let mut initial_catch_up = Box::pin(async move {
             catch_up_driver

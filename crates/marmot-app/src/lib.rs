@@ -170,7 +170,7 @@ pub use marmot_session::{
     OversizedArtifact, OversizedEvent, SessionError,
 };
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
-use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
+use runtime::account_worker::{AccountOpenProgress, AccountStartupProgress, AccountStartupStage};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -585,6 +585,9 @@ pub struct MarmotApp {
     unvouched_relay_replies: bool,
     config: MarmotAppConfig,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    /// Per account, when an open of its database last applied a migration;
+    /// see [`Self::account_open_progress`].
+    account_open_progress: Arc<Mutex<HashMap<String, Arc<AccountOpenProgress>>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
     /// cached storage handle. Its in-flight set and sweep cursor are per
     /// instance, so every caller shares this one.
@@ -1736,6 +1739,7 @@ impl MarmotApp {
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_open_progress: Arc::default(),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
             legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
@@ -1854,6 +1858,7 @@ impl MarmotApp {
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_open_progress: Arc::default(),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
             legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
@@ -7086,6 +7091,18 @@ impl MarmotApp {
         result
     }
 
+    /// The progress clock every open of `label`'s database advances, whoever
+    /// opens it, so a starting worker sees migrations it waits behind
+    /// (mdk#3145).
+    pub(crate) fn account_open_progress(&self, label: &str) -> Arc<AccountOpenProgress> {
+        self.account_open_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(label.to_owned())
+            .or_default()
+            .clone()
+    }
+
     /// Reuse the caller's scope across analytics admission and native open work; the caller owns retirement.
     fn account_storage_observed(
         &self,
@@ -7165,6 +7182,7 @@ impl MarmotApp {
             ProductUnit::Attempt,
         );
         probe.phase(NativeStartupStage::EncryptedStoreOpen);
+        let account_open = self.account_open_progress(label);
         let observer = |progress| {
             use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
             match progress {
@@ -7177,15 +7195,20 @@ impl MarmotApp {
                 Progress::MigrationStarted(version) => {
                     probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
                 }
-                Progress::MigrationFinished { version, success } => probe.progress(
+                Progress::MigrationFinished { version, success } => {
                     if success {
-                        NativeStartupStage::MigrationInspection
-                    } else {
-                        NativeStartupStage::MigrationApply
-                    },
-                    Some(version),
-                    success,
-                ),
+                        account_open.migration_applied();
+                    }
+                    probe.progress(
+                        if success {
+                            NativeStartupStage::MigrationInspection
+                        } else {
+                            NativeStartupStage::MigrationApply
+                        },
+                        Some(version),
+                        success,
+                    )
+                }
             }
         };
         let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);

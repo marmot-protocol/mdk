@@ -1,7 +1,7 @@
 ---
 title: "Conversation readiness and runtime latency telemetry"
 created: 2026-09-18
-updated: 2026-09-24
+updated: 2026-11-08
 status: implementation
 tags: [marmot, runtime, telemetry, performance]
 ---
@@ -154,17 +154,24 @@ Publication success retains the existing required-ack semantics, not recipient d
 ### Reading account startup stages
 
 The `ensure_account_state` and `open_account` steps run on a blocking-pool thread that
-cannot be cancelled. When a ready-wait expires, reconcile shuts the worker down and aborts
-it after the shutdown wait, but a step running on that thread stays in flight until the
-thread leaves it: the span outlives its worker. `ensure_account_state` holds a process-wide
-lock, so a later open of any account waits in `account_state` behind a stuck one. A later
-open of the same account that finds the session claimed fails fast with
+cannot be cancelled. The ready-wait expires after 45 s without startup progress, not 45 s in
+total: entering a step, or each migration an open of the account's database applies, starts
+the 45 s again (mdk#3145). That open may be another caller's, such as a relay-list publish
+or the directory's block-list reconcile, with the worker waiting on the database's open
+lock. A slow device's first open applies every migration, so `account_state` can take
+longer than 45 s and still become ready. When a ready-wait expires, reconcile shuts the
+worker down and aborts it after the shutdown wait, but a step running on that thread stays
+in flight until the thread leaves it: the span outlives its worker. `ensure_account_state`
+holds a process-wide lock, so a later open of any account waits in `account_state` behind a
+stuck one. A later open of the same account that finds the session claimed fails fast with
 `AccountSessionBusy` instead.
 
 - Where a ready-wait expired: `timeouts` on the step, once its span has ended; while it is
-  still stuck, an `in_flight` span older than the 45 s ready-wait.
+  still stuck, an `in_flight` span older than the 45 s ready-wait. An `account_state` span
+  can be older while an open of its database is still applying migrations.
 - Whether an aborted worker's open is still running: a worker still opening is aborted 5 s after its
-  expiry, so a span older than about 50 s belongs to a worker that no longer exists. `in_flight` above 1 on one step means a replacement is in that step beside it;
+  expiry, so a span other than `account_state` older than about 50 s belongs to a worker that no longer
+  exists. `in_flight` above 1 on one step means a replacement is in that step beside it;
   one per restart suggests each replacement is stuck behind the first.
 - Slow or stuck: a step whose spans end has a duration histogram and success or timeout
   counts; a stuck step keeps `in_flight` with a growing `oldest_tracked_in_flight_ms` and
