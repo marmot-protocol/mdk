@@ -1721,6 +1721,11 @@ impl AccountDeviceSession {
             .reissue_invite_with_key_packages(commit_id, packages)?)
     }
 
+    /// See `Engine::leave_redrive_owed`.
+    pub fn leave_redrive_owed(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.leave_redrive_owed(group_id)?)
+    }
+
     /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.
     pub fn scheduled_self_remove_auto_commit_delay_ms(
         &mut self,

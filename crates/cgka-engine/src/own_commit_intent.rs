@@ -24,7 +24,7 @@
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::app_components::AppComponentData;
+use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
@@ -36,6 +36,7 @@ use cgka_traits::storage::{
 use cgka_traits::types::{GroupId, MessageId};
 use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider;
+use std::collections::BTreeSet;
 
 /// How many times one intent may be re-queued after losing a same-epoch race.
 pub const MAX_OWN_COMMIT_REISSUE_ATTEMPTS: u32 = 2;
@@ -278,6 +279,23 @@ impl<S: StorageProvider> Engine<S> {
                 record.intent.clone()
             }
             SendIntent::UpdateAppComponents { group_id, updates } => {
+                // A lost step-down of a pending leave belongs to the leave: it
+                // steps down again from the selected branch's admin list
+                // (`stage_leave_step_down`), so re-queueing these bytes would
+                // race it, and a winner that changed admins is no conflict
+                // for the user who chose to leave (mdk#3014). A commit that
+                // also changed anything else keeps the handling below.
+                if self.leave_in_progress(group_id)?
+                    && is_pure_self_step_down(
+                        &crate::app_components::admin_pubkey_from_member_id(
+                            self.identity.self_id(),
+                        )?,
+                        updates,
+                        &record.baseline,
+                    )
+                {
+                    return Ok(None);
+                }
                 let OwnCommitBaseline::AppComponents { components } = &record.baseline else {
                     return Ok(Some((
                         report(
@@ -711,5 +729,100 @@ impl<S: StorageProvider> Engine<S> {
             created_at_ms,
         })?;
         Ok(())
+    }
+}
+
+/// Whether an `UpdateAppComponents` commit did nothing but take `self_pubkey`
+/// off the admin list it was authored against: its one update is the admin
+/// policy, equal to the baseline's admins without this account. Only such a
+/// step-down belongs to a pending leave's re-drive (mdk#3014).
+fn is_pure_self_step_down(
+    self_pubkey: &[u8; 32],
+    updates: &[AppComponentData],
+    baseline: &OwnCommitBaseline,
+) -> bool {
+    let [update] = updates else {
+        return false;
+    };
+    if update.component_id != GROUP_ADMIN_POLICY_COMPONENT_ID {
+        return false;
+    }
+    let OwnCommitBaseline::AppComponents { components } = baseline else {
+        return false;
+    };
+    let Some(Ok(before)) = components
+        .iter()
+        .find(|component| component.component_id == GROUP_ADMIN_POLICY_COMPONENT_ID)
+        .map(|component| crate::app_components::decode_admin_policy(&component.data))
+    else {
+        return false;
+    };
+    let Ok(after) = crate::app_components::decode_admin_policy(&update.data) else {
+        return false;
+    };
+    before.contains(self_pubkey)
+        && after.into_iter().collect::<BTreeSet<_>>()
+            == before
+                .into_iter()
+                .filter(|admin| admin != self_pubkey)
+                .collect::<BTreeSet<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_components::encode_admin_policy;
+
+    const ME: [u8; 32] = [1; 32];
+    const ALICE: [u8; 32] = [2; 32];
+    const CAROL: [u8; 32] = [3; 32];
+
+    fn admin_policy(admins: &[[u8; 32]]) -> AppComponentData {
+        AppComponentData {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            data: encode_admin_policy(admins).unwrap(),
+        }
+    }
+
+    fn authored_against(admins: &[[u8; 32]]) -> OwnCommitBaseline {
+        OwnCommitBaseline::AppComponents {
+            components: vec![admin_policy(admins)],
+        }
+    }
+
+    #[test]
+    fn only_a_commit_that_just_drops_this_account_is_a_pure_step_down() {
+        let baseline = authored_against(&[ME, ALICE]);
+        assert!(is_pure_self_step_down(
+            &ME,
+            &[admin_policy(&[ALICE])],
+            &baseline
+        ));
+        assert!(
+            !is_pure_self_step_down(&ME, &[admin_policy(&[ALICE, CAROL])], &baseline),
+            "a step-down that also promotes someone"
+        );
+        assert!(
+            !is_pure_self_step_down(
+                &ME,
+                &[
+                    admin_policy(&[ALICE]),
+                    AppComponentData {
+                        component_id: GROUP_ADMIN_POLICY_COMPONENT_ID + 1,
+                        data: vec![1],
+                    },
+                ],
+                &baseline
+            ),
+            "a step-down carrying another component update"
+        );
+        assert!(
+            !is_pure_self_step_down(
+                &ME,
+                &[admin_policy(&[ALICE])],
+                &authored_against(&[ALICE, CAROL])
+            ),
+            "an admin edit by an account that was not an admin"
+        );
     }
 }

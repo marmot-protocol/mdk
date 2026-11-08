@@ -336,6 +336,18 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   `SelfUpdate` refused every tick (the field's `UseAfterEviction` loop). A group with `leave_in_progress` or
   `disbanding_in_progress` refuses the same `SelfUpdate`, but its obligation *waits* rather than fails: the removal
   ends it through the terminal verdict, and a reorg or acknowledged disband failure must find its rotation still owed.
+- **A leave request owns its admin step-down (mdk#3014).** While a durable `LeaveRequest` exists, `owed_leave_step`
+  decides the next step on a `Stable` epoch: an account the selected branch makes an admin again stages a step-down
+  (`stage_leave_step_down`: the selected branch's admin list minus itself, never the lost Commit's bytes, and only
+  that update: proposals pending in the store stay there) while another active admin remains, and proposes its
+  SelfRemove only once it is not an admin. The last active admin owes nothing. `leave_redrive_owed` is the scheduler's
+  level signal and hydration schedules a group with a restored request; the drain runs the step.
+  `prepare_superseded_own_commit` leaves a leaving account's lost pure step-down (`is_pure_self_step_down`) to this
+  re-drive and neither re-queues nor reports it; a commit that changed anything else keeps ordinary supersession.
+  Pinned by `invite_leave::the_last_admins_leave_request_owes_no_step`,
+  `invite_leave::a_restored_leave_request_that_owes_a_self_remove_wakes_its_group`,
+  `invite_leave::a_leave_step_down_excludes_an_authentic_stored_peer_proposal` and marmot-app's `rival_branch_leave`
+  tests.
 - **The durable `Group::epoch` mirrors the epoch manager, and hydration seeds the epoch manager from it.** Every mirror
   write belongs to the same durable unit as the MLS change it projects, and every mirror failure propagates. Write the
   record inside the merging transaction (`publish::do_confirm_published`, the inbound apply in

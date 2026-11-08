@@ -1,7 +1,8 @@
-//! mdk#3226: a device that left on a branch that then loses to a longer rival
-//! still reaches the winning branch. It holds its own SelfRemove as a pending
-//! proposal sealed under the losing branch's state, and convergence must not
-//! count that proposal against the rival.
+//! A device that left on a branch that then loses to a longer rival still
+//! reaches the winning branch and leaves. It holds its own SelfRemove as a
+//! pending proposal sealed under the losing branch's state, and convergence
+//! must not count that proposal against the rival (mdk#3226). An admin whose
+//! step-down the winning branch never held steps down again first (mdk#3014).
 
 use super::*;
 
@@ -12,6 +13,7 @@ struct Fork {
     clients: [AppClient; 3],
     cursors: [usize; 3],
     group: GroupId,
+    accounts: [String; 3],
     _dir: tempfile::TempDir,
 }
 
@@ -52,6 +54,7 @@ impl Fork {
             clients: [alice, bob, carol],
             cursors,
             group,
+            accounts: accounts.map(|account| account.account_id_hex),
             _dir: dir,
         };
         // One more canonical advance, so the fork's source epoch keeps an anchor.
@@ -78,6 +81,14 @@ impl Fork {
             .0
     }
 
+    fn name(&self, index: usize) -> String {
+        self.clients[index]
+            .runtime
+            .group_record(&self.group)
+            .unwrap()
+            .name
+    }
+
     fn published_since(&self, start: usize) -> Vec<NostrTransportEvent> {
         self.relay.published_events.lock().unwrap()[start..].to_vec()
     }
@@ -86,7 +97,8 @@ impl Fork {
         self.relay.published_events.lock().unwrap().len()
     }
 
-    async fn advance(&mut self, index: usize) {
+    /// One scheduler wake: advance convergence and observe its effects.
+    async fn wake(&mut self, index: usize) {
         let client = &mut self.clients[index];
         let effects = client
             .runtime
@@ -97,7 +109,11 @@ impl Fork {
             .observe_drained_session_events(&effects)
             .await
             .unwrap();
-        client.run_due_maintenance().await.unwrap();
+    }
+
+    async fn advance(&mut self, index: usize) {
+        self.wake(index).await;
+        self.clients[index].run_due_maintenance().await.unwrap();
     }
 
     /// Advance until no convergence input is pending, then a few more rounds
@@ -147,15 +163,122 @@ impl Fork {
             .leave_in_progress(&self.group)
             .unwrap()
     }
+
+    fn removed(&self, index: usize) -> bool {
+        self.clients[index]
+            .runtime
+            .group_record(&self.group)
+            .unwrap()
+            .removed
+    }
+
+    fn admin(&self, viewer: usize, account: usize) -> bool {
+        self.clients[viewer]
+            .runtime
+            .admin_pubkeys(&self.group)
+            .unwrap()
+            .iter()
+            .any(|admin| hex::encode(admin) == self.accounts[account])
+    }
+
+    /// Exchange traffic among `members` until `leaver`'s copy reads removed.
+    /// A member commits a SelfRemove only once its auto-commit delay has
+    /// passed, which no convergence input waits for.
+    async fn until_removed(&mut self, leaver: usize, members: &[usize]) {
+        for _ in 0..8 {
+            for &index in members {
+                let client = &mut self.clients[index];
+                deliver_new(client, &self.relay, &mut self.cursors[index]).await;
+            }
+            for &index in members {
+                if let Some(delay) = self.clients[index]
+                    .runtime
+                    .scheduled_self_remove_auto_commit_delay_ms(&self.group)
+                    .unwrap()
+                {
+                    tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+                }
+            }
+            self.settle(members).await;
+            if self.removed(leaver) {
+                return;
+            }
+        }
+        panic!("the leave never completed");
+    }
 }
 
-/// #3014's reproduction: bob steps down and leaves on his own branch while
-/// alice extends a longer one. Before mdk#3226, bob's own SelfRemove made
-/// alice's commit terminal on his device and he never left his branch. The
-/// winning branch never held his step-down, so he is an admin there again;
-/// finishing his leave from that state is #3014's re-drive, not this test's.
+/// bob steps down and leaves on his own branch; alice's longer branch, which
+/// never held his step-down, wins. Before mdk#3226 he never left his branch.
+/// On the winning branch he is an admin again, so he steps down again and his
+/// leave completes (mdk#3014).
+async fn admin_leaves_across_a_lost_step_down(
+    fork: &mut Fork,
+    rival: Vec<NostrTransportEvent>,
+    leave: Vec<NostrTransportEvent>,
+) {
+    deliver_events(&mut fork.clients[1], &rival).await;
+    deliver_events(&mut fork.clients[0], &leave).await;
+    deliver_events(&mut fork.clients[2], &leave).await;
+    deliver_events(&mut fork.clients[2], &rival).await;
+    // bob adopts the winning branch, where he is an admin again, and steps
+    // down again in the same wake.
+    for _ in 0..4 {
+        fork.wake(1).await;
+        if !fork.admin(1, 1) {
+            break;
+        }
+    }
+    assert!(
+        !fork.admin(1, 1),
+        "bob steps down again on the winning branch"
+    );
+    assert_eq!(
+        fork.name(1),
+        fork.name(0),
+        "bob reaches the selected branch"
+    );
+    // Nothing but his leave request is left for bob, and only it keeps the
+    // wake armed for the drain that sends his SelfRemove.
+    assert_eq!(
+        fork.clients[1]
+            .convergence_schedule_state(&fork.group)
+            .unwrap(),
+        crate::client::ConvergenceScheduleState::PendingOutbound {
+            retry_after_ms: None
+        }
+    );
+    let published = fork.published();
+    fork.wake(1).await;
+    assert_eq!(
+        fork.published(),
+        published + 1,
+        "the wake sends the SelfRemove"
+    );
+    assert_eq!(
+        fork.clients[1]
+            .convergence_schedule_state(&fork.group)
+            .unwrap(),
+        crate::client::ConvergenceScheduleState::Idle,
+        "the leave now waits on the members"
+    );
+    assert!(
+        fork.clients[1]
+            .take_pending_superseded_change_events()
+            .is_empty(),
+        "the lost step-down is the leave's own work, not a change to report"
+    );
+    fork.settle(&[0, 1, 2]).await;
+    fork.until_removed(1, &[0, 1, 2]).await;
+    assert!(fork.removed(1), "the admin's leave completes");
+    assert!(!fork.admin(0, 1), "the leaver is off the admin list");
+    assert!(fork.admin(0, 0));
+}
+
+/// #3014's third acceptance case: the winning branch leaves the admin list
+/// alone.
 #[test]
-fn an_admin_who_left_on_a_losing_branch_reaches_the_winning_branch() {
+fn an_admin_whose_step_down_lost_to_a_branch_that_left_admins_alone_steps_down_again_and_leaves() {
     run_composed_app_runtime_test("rival-branch-admin-leave", || async {
         let mut fork = Fork::new().await;
         let source = fork.epoch(1);
@@ -168,18 +291,44 @@ fn an_admin_who_left_on_a_losing_branch_reaches_the_winning_branch() {
         assert!(fork.leaving(1));
         assert_eq!(fork.epoch(1), source + 1);
         let leave = fork.published_since(start);
-
         let rival = fork.longer_rival().await;
-        deliver_events(&mut fork.clients[1], &rival).await;
-        deliver_events(&mut fork.clients[0], &leave).await;
-        fork.settle(&[0, 1]).await;
+        admin_leaves_across_a_lost_step_down(&mut fork, rival, leave).await;
+    });
+}
 
-        assert_eq!(fork.epoch(0), source + 4);
-        assert_eq!(
-            fork.epoch(1),
-            fork.epoch(0),
-            "the leaver adopts the longer branch"
-        );
+/// #3014's second acceptance case: the winning branch promotes carol, so the
+/// lost step-down's own bytes would now undo that promotion. bob steps down
+/// from the winning branch's admin list instead, and carol stays an admin.
+#[test]
+fn an_admin_whose_step_down_lost_to_a_promotion_steps_down_again_and_leaves() {
+    run_composed_app_runtime_test("rival-branch-admin-leave-promotion", || async {
+        let mut fork = Fork::new().await;
+        let start = fork.published();
+        fork.clients[1]
+            .self_demote_admin(&fork.group)
+            .await
+            .unwrap();
+        fork.clients[1].leave_group(&fork.group).await.unwrap();
+        let leave = fork.published_since(start);
+        let start = fork.published();
+        let carol = fork.accounts[2].clone();
+        fork.clients[0]
+            .promote_admin(&fork.group, &carol)
+            .await
+            .unwrap();
+        for name in [
+            "after promotion one",
+            "after promotion two",
+            "after promotion three",
+        ] {
+            fork.clients[0]
+                .update_group_profile(&fork.group, Some(name), None)
+                .await
+                .unwrap();
+        }
+        let rival = fork.published_since(start);
+        admin_leaves_across_a_lost_step_down(&mut fork, rival, leave).await;
+        assert!(fork.admin(0, 2), "the winning branch's promotion stands");
     });
 }
 
@@ -212,38 +361,7 @@ fn a_member_who_left_on_a_losing_branch_reaches_the_winning_branch_and_leaves() 
         );
 
         // On the winning branch the leave goes ahead: alice commits carol's
-        // SelfRemove and carol's copy reads removed. Alice stages that commit
-        // only once its auto-commit delay has passed, which no convergence
-        // input waits for.
-        for _ in 0..4 {
-            for index in [2, 0] {
-                let client = &mut fork.clients[index];
-                deliver_new(client, &fork.relay, &mut fork.cursors[index]).await;
-            }
-            if let Some(delay) = fork.clients[0]
-                .runtime
-                .scheduled_self_remove_auto_commit_delay_ms(&fork.group)
-                .unwrap()
-            {
-                tokio::time::sleep(Duration::from_millis(delay + 1)).await;
-            }
-            fork.settle(&[2, 0]).await;
-            if fork.clients[2]
-                .runtime
-                .group_record(&fork.group)
-                .unwrap()
-                .removed
-            {
-                break;
-            }
-        }
-        assert!(
-            fork.clients[2]
-                .runtime
-                .group_record(&fork.group)
-                .unwrap()
-                .removed,
-            "the member's leave completes on the winning branch"
-        );
+        // SelfRemove and carol's copy reads removed.
+        fork.until_removed(2, &[2, 0]).await;
     });
 }

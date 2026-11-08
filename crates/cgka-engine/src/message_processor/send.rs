@@ -4,6 +4,7 @@
 //! convergence inputs before any OpenMLS mutation.
 
 use super::route_wrapped_group_message;
+use super::{LeaveRedrive, OwedLeaveStep, PendingProposals};
 use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -46,6 +47,18 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
         reissue_attempts: u32,
+    ) -> Result<SendResult, EngineError> {
+        self.do_send_ready_staged(intent, reissue_attempts, PendingProposals::Consume)
+            .await
+    }
+
+    /// `do_send_ready`, choosing what an `UpdateAppComponents` Commit does with
+    /// proposals pending in the store. Every other intent stages as usual.
+    async fn do_send_ready_staged(
+        &mut self,
+        intent: SendIntent,
+        reissue_attempts: u32,
+        pending_proposals: PendingProposals,
     ) -> Result<SendResult, EngineError> {
         let group_id = super::send_intent_group_id(&intent).clone();
         if self.storage.disband_tombstone(&group_id)?.is_some() {
@@ -146,9 +159,15 @@ impl<S: StorageProvider> Engine<S> {
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
             SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
-            SendIntent::UpdateAppComponents { group_id, updates } => {
-                self.do_send_update_app_components(group_id, updates).await
-            }
+            SendIntent::UpdateAppComponents { group_id, updates } => match pending_proposals {
+                PendingProposals::Consume => {
+                    self.do_send_update_app_components(group_id, updates).await
+                }
+                PendingProposals::Keep => {
+                    self.do_send_isolated_app_component_updates(group_id, updates)
+                        .await
+                }
+            },
             SendIntent::ReplaceDeviceEntry {
                 group_id,
                 slot,
@@ -1144,46 +1163,60 @@ impl<S: StorageProvider> Engine<S> {
         Ok((wrapped, bytes, EpochId(mls_group.epoch().as_u64())))
     }
 
-    pub(crate) async fn try_auto_repropose_leave_request(&mut self, group_id: &GroupId) {
-        if let Err(err) = self.auto_repropose_leave_request(group_id).await {
-            tracing::warn!(
-                target: "cgka_engine::leave_request",
-                method = "try_auto_repropose_leave_request",
-                error_kind = crate::audit_helpers::engine_error_kind(&err),
-                "failed to re-propose durable leave request"
-            );
+    /// Drive a durable leave request one step and report what it staged.
+    /// A failure is logged and leaves the request for the next pass.
+    pub(crate) async fn try_auto_repropose_leave_request(
+        &mut self,
+        group_id: &GroupId,
+    ) -> LeaveRedrive {
+        match self.auto_repropose_leave_request(group_id).await {
+            Ok(step) => step,
+            Err(err) => {
+                tracing::warn!(
+                    target: "cgka_engine::leave_request",
+                    method = "try_auto_repropose_leave_request",
+                    error_kind = crate::audit_helpers::engine_error_kind(&err),
+                    "failed to re-propose durable leave request"
+                );
+                LeaveRedrive::Idle
+            }
         }
     }
 
     async fn auto_repropose_leave_request(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<LeaveRedrive, EngineError> {
         let Some(mut request) = self.load_leave_request_state(group_id)? else {
             self.leaving_groups.remove(group_id);
-            return Ok(false);
+            return Ok(LeaveRedrive::Idle);
         };
         let group = match self.storage.get_group(group_id) {
             Ok(group) => group,
             Err(StorageError::NotFound) => {
                 self.clear_leave_request_state(group_id)?;
-                return Ok(false);
+                return Ok(LeaveRedrive::Idle);
             }
             Err(e) => return Err(EngineError::Storage(e)),
         };
         if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
             self.clear_leave_request_state(group_id)?;
-            return Ok(false);
+            return Ok(LeaveRedrive::Idle);
         }
         self.leaving_groups.insert(group_id.clone());
 
         if let Some(state) = self.epoch_manager.state(group_id)
             && !state.is_stable()
         {
-            return Ok(false);
+            return Ok(LeaveRedrive::Idle);
         }
-        if request.last_proposed_epoch == Some(group.epoch) {
-            return Ok(false);
+        match self.owed_leave_step(group_id, &request, group.epoch)? {
+            None => return Ok(LeaveRedrive::Idle),
+            Some(OwedLeaveStep::StepDown) => {
+                self.stage_leave_step_down(group_id).await?;
+                return Ok(LeaveRedrive::SteppedDown);
+            }
+            Some(OwedLeaveStep::SelfRemove) => {}
         }
 
         let (msg, proposal_bytes, proposed_epoch) =
@@ -1197,7 +1230,72 @@ impl<S: StorageProvider> Engine<S> {
             &request,
         )?;
         self.auto_proposal_buf.push_back(msg);
-        Ok(true)
+        Ok(LeaveRedrive::Proposed)
+    }
+
+    /// What a durable leave request owes next on a `Stable` epoch, if
+    /// anything. An admin leaves the admin list before its SelfRemove
+    /// (member-departure.md, "Behavior"). A selected branch that dropped the
+    /// step-down makes the account an admin again, at whatever epoch the
+    /// SelfRemove was last proposed: it steps down again while another active
+    /// admin remains (mdk#3014), and the SelfRemove follows once that Commit
+    /// is applied and the epoch is stable again. The last active admin cannot
+    /// step down, so nothing here moves its leave forward.
+    pub(crate) fn owed_leave_step(
+        &mut self,
+        group_id: &GroupId,
+        request: &LeaveRequest,
+        epoch: EpochId,
+    ) -> Result<Option<OwedLeaveStep>, EngineError> {
+        let authority = self.capture_group_authority_facts(group_id)?;
+        if authority.is_admin {
+            return Ok((authority.admin_count >= 2).then_some(OwedLeaveStep::StepDown));
+        }
+        Ok((request.last_proposed_epoch != Some(epoch)).then_some(OwedLeaveStep::SelfRemove))
+    }
+
+    /// Stage the Commit that takes this account off the admin list for a
+    /// pending leave, and hand it to the host to publish.
+    async fn stage_leave_step_down(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
+        let self_pubkey =
+            crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
+        let admins = self.with_mls_group(group_id, |mls_group| {
+            crate::app_components::admins_of_group(mls_group)
+        })?;
+        let remaining: Vec<[u8; 32]> = admins
+            .into_iter()
+            .filter(|admin| admin != &self_pubkey)
+            .collect();
+        let SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } = self
+            .do_send_ready_staged(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![cgka_traits::app_components::AppComponentData {
+                        component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                        data: crate::app_components::encode_admin_policy(&remaining)?,
+                    }],
+                },
+                0,
+                // An automatic Commit never executes another member's queued
+                // Add, Remove or roster update.
+                PendingProposals::Keep,
+            )
+            .await?
+        else {
+            return Err(EngineError::Backend(
+                "leave step-down produced no commit".into(),
+            ));
+        };
+        self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
+            msg,
+            pending,
+            welcomes,
+        });
+        Ok(())
     }
 
     async fn do_send_app_message(

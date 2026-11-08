@@ -5969,6 +5969,91 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
     );
 }
 
+/// A restart can land between a merged step-down and the drain that sends the
+/// SelfRemove (mdk#3014). The restored request is then the group's only work,
+/// so hydration schedules the group and the runtime reads whether it is owed.
+#[tokio::test]
+async fn a_restored_leave_request_that_owes_a_self_remove_wakes_its_group() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "restored leave".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = create
+    else {
+        unreachable!()
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let epoch = bob.epoch(&group_id).unwrap();
+    bob_storage
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 0,
+            last_proposed_epoch: Some(cgka_traits::EpochId(epoch.0 - 1)),
+        })
+        .unwrap();
+
+    drop(bob);
+    let mut bob = build_client_on_storage(b"bob", bob_storage);
+    bob.hydrate_all_stored_groups().unwrap();
+    assert!(bob.leave_redrive_owed(&group_id).unwrap());
+    assert!(bob.drain_pending_convergence_groups().contains(&group_id));
+
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(bob.drain_auto_proposals().len(), 1, "a fresh SelfRemove");
+    assert!(!bob.leave_redrive_owed(&group_id).unwrap());
+}
+
+/// The last active admin cannot step down (mdk#3014), so its leave request
+/// owes nothing: a drain stages no step-down or SelfRemove for it and the
+/// runtime keeps no wake armed.
+#[tokio::test]
+async fn the_last_admins_leave_request_owes_no_step() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let mut bob = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "last admin leave".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = create else {
+        unreachable!()
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice_storage
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 0,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+
+    assert!(!alice.leave_redrive_owed(&group_id).unwrap());
+    alice.advance_convergence(&group_id).await.unwrap();
+    assert!(alice.drain_auto_publish().is_empty(), "no step-down");
+    assert!(alice.drain_auto_proposals().is_empty(), "no SelfRemove");
+}
+
 #[tokio::test]
 async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
     let mut alice = build_client(b"alice");
@@ -6854,6 +6939,89 @@ async fn pure_self_update_excludes_an_authentic_stored_peer_proposal() {
     bob_members.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
     alice_members.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
     assert_eq!(bob_members, alice_members);
+}
+
+/// A leave's automatic step-down carries only its admin-policy update: a
+/// peer's proposal pending in the store stays there (mdk#3014).
+#[tokio::test]
+async fn a_leave_step_down_excludes_an_authentic_stored_peer_proposal() {
+    let (mut alice, alice_storage) = build_with_storage(b"step-down-alice");
+    let (mut bob, bob_storage) = build_with_storage(b"step-down-bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "leave step-down".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("legacy create")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let proposal = raw_self_update_proposal(&bob_storage, &bob.self_id(), &gid);
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let (mut source, _) = load_group_and_signer(&alice_storage, &alice.self_id(), &gid);
+    let message = MlsMessageIn::tls_deserialize_exact(proposal.payload.as_slice()).unwrap();
+    let protocol: ProtocolMessage = match message.extract() {
+        MlsMessageBodyIn::PrivateMessage(value) => value.into(),
+        MlsMessageBodyIn::PublicMessage(value) => value.into(),
+        other => panic!("actual signed proposal: {other:?}"),
+    };
+    let ProcessedMessageContent::ProposalMessage(queued) = source
+        .process_message(&provider, protocol)
+        .unwrap()
+        .into_content()
+    else {
+        panic!("actual proposal admission")
+    };
+    let reference = queued.proposal_reference_ref().clone();
+    source
+        .store_pending_proposal(provider.storage(), *queued)
+        .unwrap();
+    drop(source);
+    alice_storage
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: gid.clone(),
+            requested_at_ms: 0,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+
+    alice.advance_convergence(&gid).await.unwrap();
+    assert_eq!(alice.drain_auto_publish().len(), 1, "the step-down");
+    let staged = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        staged
+            .pending_commit()
+            .unwrap()
+            .queued_proposals()
+            .all(|queued| matches!(queued.proposal(), Proposal::AppDataUpdate(_))),
+        "the step-down must not consume the peer's proposal"
+    );
+    assert_eq!(
+        staged
+            .pending_proposals()
+            .map(|p| p.proposal_reference_ref().clone())
+            .collect::<Vec<_>>(),
+        vec![reference],
+    );
 }
 
 #[tokio::test]
