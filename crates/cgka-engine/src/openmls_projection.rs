@@ -240,9 +240,6 @@ enum CandidatePathProbeResult {
         message_id: String,
         category: cgka_traits::ingest::ProposalRejectionCategory,
     },
-    UnauthorizedCommit {
-        message_id: String,
-    },
     InvalidCommit {
         message_id: String,
         rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
@@ -2521,15 +2518,6 @@ fn build_stored_openmls_candidate_paths_reference<S: StorageProvider>(
                         });
                         continue;
                     }
-                    CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
-                        invalid_commit_drops.push(DroppedMessage {
-                            message_id,
-                            kind: MessageKind::Commit,
-                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                            rejection_category: None,
-                        });
-                        continue;
-                    }
                     CandidatePathProbeResult::InvalidCommit {
                         message_id,
                         rejection_category,
@@ -2662,8 +2650,17 @@ fn probe_candidate_path<S: StorageProvider>(
             message_id,
             category,
         }),
+        // Authentication identified the candidate parent, so a committer who is
+        // not an admin there is terminal `authorization_failed`
+        // (`protocol-core/convergence.md`), like a proposal that fails its own
+        // authorization (mdk#2647).
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
-            Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
+            Ok(CandidatePathProbeResult::InvalidCommit {
+                message_id,
+                rejection_category: Some(
+                    cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed,
+                ),
+            })
         }
         Err(OpenMlsProjectionError::InvalidCommit {
             message_id,

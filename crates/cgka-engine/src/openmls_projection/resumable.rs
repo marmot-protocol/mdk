@@ -171,15 +171,6 @@ impl CandidateSearch {
                         });
                         continue;
                     }
-                    CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
-                        self.invalid_commit_drops.push(DroppedMessage {
-                            message_id,
-                            kind: MessageKind::Commit,
-                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
-                            rejection_category: None,
-                        });
-                        continue;
-                    }
                     CandidatePathProbeResult::InvalidCommit {
                         message_id,
                         rejection_category,
