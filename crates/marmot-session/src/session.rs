@@ -1175,6 +1175,18 @@ impl AccountDeviceSession {
         self.engine.invite_key_package_requirements(group_id)
     }
 
+    /// See [`cgka_engine::Engine::sibling_leaf_supports`].
+    pub fn sibling_leaf_supports(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &cgka_traits::app_components::DeviceSlotId,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+    ) -> Result<bool, EngineError> {
+        self.engine
+            .sibling_leaf_supports(group_id, roster, slot, requirements)
+    }
+
     pub fn create_key_package_requirements(
         &self,
         request: &CreateGroupRequest,

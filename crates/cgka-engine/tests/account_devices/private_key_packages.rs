@@ -1324,3 +1324,79 @@ async fn a_hand_off_takes_key_packages_tagged_as_its_sender() {
         "private KeyPackage refused: last resort",
     );
 }
+
+/// A device asks a sibling for private KeyPackages on behalf of a chat its
+/// held ones cannot serve only while the sibling's leaf in the device group
+/// advertises what that chat requires (mdk#2883). A sibling whose client
+/// lacks a required component would only issue more that lack it.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn a_siblings_device_group_leaf_tells_whether_its_key_packages_could_serve_a_chat() {
+    use super::device_roster::{roster_device, roster_of, slot};
+    use super::tagged_siblings::tag_devices;
+    use cgka_traits::app_components::{
+        DEVICE_ROSTER_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+        NOSTR_ROUTING_COMPONENT_ID,
+    };
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut supported: Vec<_> = default_group_components().into_iter().collect();
+    supported.extend([
+        ACCOUNT_DEVICES_COMPONENT_ID,
+        DEVICE_ROSTER_COMPONENT_ID,
+        NOSTR_ROUTING_COMPONENT_ID,
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    ]);
+    let phone = Device {
+        engine: EngineBuilder::new(storage.clone())
+            .identity(pad32(b"alice"))
+            .account_identity_proof_signer(proof_signer(b"alice"))
+            .protocol_profile(ProtocolProfile::Current)
+            .feature_registry(registry())
+            .supported_app_components(supported)
+            .peeler(Box::<MockPeeler>::default())
+            .build()
+            .unwrap(),
+        storage,
+    };
+    // The laptop's client does not support message retention.
+    let (phone, others, device_group) = tag_devices(vec![phone, roster_device(b"alice")]).await;
+    let laptop = &others[0];
+    let requirements = |components: Vec<AppComponentData>| {
+        phone
+            .engine
+            .create_key_package_requirements(&CreateGroupRequest {
+                name: "chat".into(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: components,
+                initial_admins: Vec::new(),
+            })
+            .unwrap()
+    };
+    let plain = requirements(Vec::new());
+    let retention = requirements(vec![AppComponentData {
+        component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+        data: 300u64.to_be_bytes().to_vec(),
+    }]);
+    let roster = roster_of(&phone, &device_group);
+    let supports = |device: &Device, sibling: u8, requirements| {
+        device
+            .engine
+            .sibling_leaf_supports(&device_group, &roster, &slot(sibling), requirements)
+            .unwrap()
+    };
+    assert!(supports(&phone, 2, &plain));
+    assert!(
+        !supports(&phone, 2, &retention),
+        "the laptop's leaf lacks a component the chat requires"
+    );
+    assert!(
+        supports(laptop, 1, &retention),
+        "the phone's leaf advertises it"
+    );
+    assert!(
+        !supports(&phone, 3, &plain),
+        "a slot with no leaf in the device group serves nothing"
+    );
+}

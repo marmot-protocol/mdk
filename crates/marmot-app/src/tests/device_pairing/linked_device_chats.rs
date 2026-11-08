@@ -3437,6 +3437,110 @@ async fn founding_add_reaches_compatible_private_stock_behind_older_stock() {
     compatible_private_stock_reaches_the_chat(true).await;
 }
 
+/// A chat that finds only time-usable stock lacking what it requires keeps
+/// its demand (mdk#2883): upkeep asks the sibling, whose device-group leaf
+/// advertises the requirement, at the usual hourly pace, and the sibling's
+/// ordinary answer completes the waiting Add while the older stock stays for
+/// chats it fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
+    use cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID;
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = phone
+        .client
+        .create_group_with_options(
+            "retention",
+            &[],
+            AppCreateGroupOptions {
+                disappearing_message_secs: 60,
+                ..AppCreateGroupOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    // Held stock settles the first request's need, so this test's request
+    // is not paced behind it.
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    let issuer = laptop.slot_hex();
+    let template = laptop
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .find(|record| hex::encode(record.recipient_slot) == phone.slot_hex())
+        .unwrap();
+    let older = older_private_package_without_retention(&laptop, &phone, &group, &template);
+    let older_ref = marmot_session::key_package_metadata(&older)
+        .unwrap()
+        .key_package_ref_hex;
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    storage
+        .delete_received_private_key_packages_from(&issuer)
+        .unwrap();
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![older]).await;
+    let held = storage
+        .received_private_key_packages_from(&issuer, crate::unix_now_seconds())
+        .unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(held[0].usable_at(crate::unix_now_seconds()));
+    assert_eq!(storage.private_key_package_need(&issuer).unwrap(), None);
+
+    // The request time is written before the send and put back when the
+    // publication reaches no one, so a request time means it went out.
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+    assert_eq!(taken_from(&phone, &laptop), 0, "A is never spent here");
+    let requested = storage
+        .private_key_package_need(&issuer)
+        .unwrap()
+        .and_then(|need| need.requested_at)
+        .expect("the compatibility miss reaches the sibling as a request");
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        storage
+            .private_key_package_need(&issuer)
+            .unwrap()
+            .and_then(|need| need.requested_at),
+        Some(requested),
+        "a request for the same need waits an hour"
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while leaves_of(&phone, &laptop, &chat, &group) == 0 {
+            deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+            laptop.client.run_due_maintenance().await.unwrap();
+            deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+            phone.client.run_due_maintenance().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the sibling's answer completes the waiting Add");
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert!(
+        storage
+            .received_private_key_packages_from(&issuer, crate::unix_now_seconds())
+            .unwrap()
+            .iter()
+            .any(|record| record.key_package_ref_hex == older_ref),
+        "A stays for chats it fits"
+    );
+    assert!(
+        phone
+            .client
+            .runtime
+            .app_component(&chat, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .unwrap()
+            .is_some()
+    );
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    laptop.client.run_due_maintenance().await.unwrap();
+    assert!(joined(&laptop, &chat));
+}
+
 /// The shared app preference runs after compatibility filtering. Repeated
 /// advisory peeks reuse one batch; only actual claims retire its allocations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

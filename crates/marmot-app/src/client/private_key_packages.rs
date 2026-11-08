@@ -31,6 +31,14 @@
 //!   receipts. An issuer at its cap answers with the newest KeyPackages it
 //!   already issued, handed over again, and this device never keeps one it
 //!   has used (mdk#2628 D42).
+//! - Held KeyPackages meet that need only if they can serve the chats gap
+//!   filling left waiting on the sibling (mdk#2883). A waiting chat that can
+//!   use none of them keeps the request due while the sibling's leaf in the
+//!   device group advertises everything the chat requires, which the engine
+//!   reads against the chat's own requirements. The answer stops counting the
+//!   sibling's earlier KeyPackages and issues fresh ones, whose hand-off wakes
+//!   the waiting chat; the older ones stay for chats they fit. A sibling whose
+//!   leaf lacks a requirement is not asked on that chat's behalf.
 //! - A sibling Welcome (461) adds this device to a chat with one of the
 //!   KeyPackages it issued (3.5b). It is read like a hand-off, and also only
 //!   when its relays are valid and its KeyPackage is one this device issued
@@ -687,9 +695,11 @@ impl AppClient {
 
     /// Ask `sibling` for KeyPackages when this device holds fewer usable ones
     /// than it needs (one, or a burst [`Self::want_private_key_packages`]
-    /// set), at most once an hour while that need lasts. A met need is
-    /// cleared. The request time is recorded before the request is sent, and
-    /// put back only when its publication reaches no one.
+    /// set), or when a chat waits for one it can use
+    /// ([`Self::compatible_stock_wanted`]), at most once an hour while that
+    /// need lasts. A met need is cleared. The request time is
+    /// recorded before the request is sent, and put back only when its
+    /// publication reaches no one.
     async fn request_private_key_packages_when_needed(
         &mut self,
         exchange: &Exchange,
@@ -705,7 +715,7 @@ impl AppClient {
             .count();
         let need = storage.private_key_package_need(&issuer_slot_hex)?;
         let wanted = need.as_ref().map_or(1, |need| need.need);
-        if usable >= wanted as usize {
+        if usable >= wanted as usize && !self.compatible_stock_wanted(exchange, sibling, now) {
             if need.is_some() {
                 storage.delete_private_key_package_need(&issuer_slot_hex)?;
             }
@@ -745,6 +755,68 @@ impl AppClient {
             }
         }
         Ok(())
+    }
+
+    /// Whether a chat that gap filling left waiting on `sibling` can use none
+    /// of the KeyPackages this device holds from it, while the sibling's leaf
+    /// in the device group advertises everything that chat requires
+    /// (mdk#2883). Held stock then does not meet the need: a request makes
+    /// the sibling issue fresh KeyPackages, and its client builds them with
+    /// at least what its leaf advertises. A sibling that cannot serve the
+    /// chat is not asked on its behalf. A chat whose reads fail counts as not
+    /// waiting, so the others and ordinary stock requests go on; gap filling
+    /// reports that chat.
+    fn compatible_stock_wanted(
+        &self,
+        exchange: &Exchange,
+        sibling: &DeviceSlotId,
+        now: u64,
+    ) -> bool {
+        let mut selection = PrivateKeyPackageSelection::default();
+        let mut first_error = None;
+        for chat in self.chats_waiting_for_private_stock(sibling) {
+            match self.chat_wants_compatible_stock(&chat, exchange, sibling, now, &mut selection) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "compatible_stock_wanted",
+                error_kind = error.privacy_safe_kind(),
+                "could not read whether a waiting chat needs compatible private KeyPackages"
+            );
+        }
+        false
+    }
+
+    fn chat_wants_compatible_stock(
+        &self,
+        chat: &GroupId,
+        exchange: &Exchange,
+        sibling: &DeviceSlotId,
+        now: u64,
+        selection: &mut PrivateKeyPackageSelection,
+    ) -> Result<bool, AppError> {
+        let requirements = self
+            .runtime
+            .invite_key_package_requirements(chat)
+            .map_err(marmot_session::SessionError::from)?;
+        let stock = self.prepared_private_key_packages(sibling, exchange, now, selection)?;
+        if !stock
+            .compatible_records(&requirements, &BTreeSet::new(), now)
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime
+            .sibling_leaf_supports(&exchange.group_id, &exchange.roster, sibling, &requirements)
+            .map_err(marmot_session::SessionError::from)?)
     }
 
     pub(crate) fn prepared_private_key_packages<'a>(

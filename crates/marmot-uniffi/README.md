@@ -1171,13 +1171,16 @@ apply. **Bring chat history** applies to future sibling Adds and transfers still
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
 is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
 
-Automatic chat Adds can wait for compatible private KeyPackages. Packages can satisfy stock time checks while
-lacking a required chat capability; when they cover ordinary stock need, that mismatch alone sends no new request.
-An issuer's ordinary upkeep stops counting packages that no longer advertise its current capabilities and can hand
-over compatible replacements. Fresh supply can also follow older stock being used by other chats or passing its
-lifetime midpoint, or a stock request needed for another reason. Repeat requests for an unchanged unmet need
-keep their hourly throttle; an increased need can make a request due at the next upkeep. Progress depends on the
-issuer and device group being available, with no fast or guaranteed discovery deadline for this wait.
+Automatic chat Adds can wait for compatible private KeyPackages. Held packages that satisfy stock time checks
+but lack a capability a waiting chat requires do not cover that chat's need: while the issuing device's leaf in the
+device group advertises what the chat requires, this device asks it for more, and the compatible packages it hands
+over complete the Add. The older packages stay for chats they fit. A device whose leaf does not advertise the
+requirement is not asked on that chat's behalf; its own upkeep still stops counting packages that no longer
+advertise its current capabilities and hands over compatible replacements. An issuer holding as many issued
+packages as it keeps answers with packages it already handed over, so the chat can wait for older stock to expire.
+Repeat requests for an unchanged unmet need keep their hourly throttle; an increased need can make a request due
+at the next upkeep. Progress depends on the issuer and device group being available, with no fast or guaranteed
+discovery deadline for this wait.
 
 On the editing device, new automatic Adds and history transfers wait for a differing local setting intention to
 settle. Existing history debt keeps its original expiry; once ready, a history setting that is off discards that debt.

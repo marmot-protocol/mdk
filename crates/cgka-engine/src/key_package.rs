@@ -257,6 +257,25 @@ impl KeyPackageRequirements {
         self.required.missing_from(&had).is_empty()
     }
 
+    /// Whether a member's `leaf`, in a group of `profile` and `ciphersuite`,
+    /// advertises everything this requires of a KeyPackage. A KeyPackage
+    /// built by that member's client now would carry the group's profile and
+    /// ciphersuite and at least the leaf's capabilities, so this tells whether
+    /// asking the member for one could help (mdk#2883). It authorizes nothing.
+    pub(crate) fn supported_by_leaf(
+        &self,
+        leaf: &openmls::prelude::LeafNode,
+        profile: ProtocolProfile,
+        ciphersuite: openmls_traits::types::Ciphersuite,
+    ) -> bool {
+        profile == self.profile
+            && ciphersuite == self.ciphersuite
+            && self
+                .required
+                .missing_from(&crate::capabilities::capabilities_of_leaf(leaf))
+                .is_empty()
+    }
+
     /// Validate identity, lifetime, profile, ciphersuite, and required capabilities.
     /// Client labels never participate in this admission check.
     pub fn validate(&self, package: &KeyPackage) -> Result<(), EngineError> {
@@ -317,6 +336,39 @@ impl<S: StorageProvider> Engine<S> {
             profile: self.new_protocol_profile,
             ciphersuite: self.ciphersuite,
             required,
+        })
+    }
+
+    /// Whether a leaf of this account's other device in `slot`, read by its
+    /// device tag against `roster`, in the device group `group_id`, advertises
+    /// everything `requirements` asks of a KeyPackage
+    /// ([`KeyPackageRequirements::supported_by_leaf`]). False when no such
+    /// leaf is in the current tree. A device asks that sibling for private
+    /// KeyPackages for a chat its held ones cannot serve only while this
+    /// holds (mdk#2883); it is advisory and authorizes no Add.
+    pub fn sibling_leaf_supports(
+        &self,
+        group_id: &cgka_traits::GroupId,
+        roster: &cgka_traits::app_components::DeviceRosterV1,
+        slot: &cgka_traits::app_components::DeviceSlotId,
+        requirements: &KeyPackageRequirements,
+    ) -> Result<bool, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let profile = self.storage.get_group(group_id)?.protocol_profile;
+        self.with_mls_group(group_id, |group| {
+            let own_leaf = group.own_leaf_index();
+            Ok(group.members().any(|member| {
+                member.index != own_leaf
+                    && openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                        .is_ok_and(|credential| {
+                            credential.identity() == self.identity.self_id().as_slice()
+                        })
+                    && group.public_group().leaf(member.index).is_some_and(|leaf| {
+                        crate::device_tag::device_tag_claim(leaf, roster)
+                            == cgka_traits::app_components::DeviceTagClaim::Device(*slot)
+                            && requirements.supported_by_leaf(leaf, profile, group.ciphersuite())
+                    })
+            }))
         })
     }
 }

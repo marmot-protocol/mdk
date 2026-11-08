@@ -252,6 +252,21 @@ impl AppClient {
         }
     }
 
+    /// The chats this device's gap filling last found no private KeyPackage
+    /// from `slot` for, in id order. Upkeep reads them to tell whether held
+    /// stock can serve them (mdk#2883).
+    pub(super) fn chats_waiting_for_private_stock(&self, slot: &DeviceSlotId) -> Vec<GroupId> {
+        let mut chats: Vec<_> = self
+            .sibling_chat_gaps
+            .waiting_for_stock
+            .iter()
+            .filter(|(_, sibling)| sibling == slot)
+            .map(|(chat, _)| chat.clone())
+            .collect();
+        chats.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        chats
+    }
+
     fn gap_siblings(&mut self, exchange: &Exchange) -> Result<GapSiblings, AppError> {
         let excluded = self.excluded_sibling_slots(exchange)?;
         let mut siblings = GapSiblings {
