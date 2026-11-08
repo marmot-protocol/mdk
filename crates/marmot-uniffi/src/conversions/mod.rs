@@ -290,20 +290,23 @@ mod tests {
                 2 => group.self_membership = SelfMembershipFfi::Removed,
                 _ => group.unrecoverable = true,
             }
-            let state = group_management_state_ffi(
-                self_id,
-                &GroupDetailsFfi {
-                    group,
-                    // Retained historical roster is not current mutation authority.
-                    members: vec![member(self_id, true, true)],
-                    mls_state: mls_state(),
-                },
-                false,
-            );
+            let details = GroupDetailsFfi {
+                group,
+                // Retained historical roster is not current mutation authority.
+                members: vec![member(self_id, true, true)],
+                mls_state: mls_state(),
+            };
+            let state = group_management_state_ffi(self_id, &details, false);
             assert!(!state.can_invite, "inactive scenario {scenario}");
             assert_eq!(state.is_self_admin, matches!(scenario, 0 | 3));
             assert_eq!(state.is_last_admin, matches!(scenario, 0 | 3));
-            assert!(!state.requires_self_demote_before_leave);
+            // Declining a pending invitation is a Leave: an admin invitee
+            // demotes first unless Leave steps it down (mdk#3014 interim).
+            assert_eq!(state.requires_self_demote_before_leave, scenario == 0);
+            assert!(
+                !group_management_state_ffi(self_id, &details, true)
+                    .requires_self_demote_before_leave
+            );
             assert!(!state.can_disband);
         }
     }

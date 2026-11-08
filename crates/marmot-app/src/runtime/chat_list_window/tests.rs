@@ -1641,10 +1641,14 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
                                 admin_leave_steps_down: false,
                             };
                             let capabilities = authority.capabilities();
+                            // A pending invitation departs through Decline,
+                            // which an admin invitee also demotes before.
                             assert_eq!(
                                 ChatListRowActions::for_row(&row).can_start_leave,
-                                capabilities.can_leave
-                                    || capabilities.requires_self_demote_before_leave,
+                                capabilities.participation
+                                    != ConversationParticipation::PendingInvitation
+                                    && (capabilities.can_leave
+                                        || capabilities.requires_self_demote_before_leave),
                                 "{authority:?}"
                             );
                         }
