@@ -616,12 +616,13 @@ pub(super) fn latencies(samples: &[Sample]) -> Value {
     summary
 }
 
-/// [`latencies`] of the calls that started within `[from, to]`, in seconds
-/// on the probe's own clock.
+/// [`latencies`] of the calls in flight at any time within `[from, to]`, in
+/// seconds on the probe's own clock: a call that started before `from` and
+/// waited past it, behind the work that began the window, counts too.
 pub(super) fn latencies_within(samples: &[Sample], from: f64, to: f64) -> Value {
     let inside = samples
         .iter()
-        .filter(|sample| (from..=to).contains(&sample.at));
+        .filter(|sample| sample.at <= to && sample.at + sample.ms / 1e3 >= from);
     let mut summary = latencies(&inside.cloned().collect::<Vec<_>>());
     summary["window_seconds"] = json!([from, to]);
     summary
@@ -1208,4 +1209,28 @@ fn percentiles_use_the_nearest_rank() {
     assert!(none["p50"].is_null() && none["p95"].is_null());
     let hundred = percentiles((1..=100).map(f64::from));
     assert_eq!(hundred["p95"], json!(95.0));
+}
+
+#[test]
+fn a_window_counts_every_call_in_flight_inside_it() {
+    let call = |index, at, ms| Sample {
+        index,
+        at,
+        ms,
+        error: None,
+    };
+    let samples = [
+        // Done before the window opens.
+        call(0, 0.0, 900.0),
+        // Started before it, blocked past its start: the hang counts.
+        call(1, 1.0, 2_400.0),
+        call(2, 4.0, 10.0),
+        // Started at its end.
+        call(3, 5.0, 10.0),
+        // Started after it.
+        call(4, 5.5, 3_000.0),
+    ];
+    let within = latencies_within(&samples, 2.0, 5.0);
+    assert_eq!(within["calls"], json!(3));
+    assert_eq!(within["max"], json!(2_400.0));
 }

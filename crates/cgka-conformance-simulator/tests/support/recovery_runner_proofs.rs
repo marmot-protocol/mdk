@@ -83,7 +83,6 @@ const COMMAND_MAX_MS: f64 = 2_000.0;
 const ADMISSION_COMMANDS_AT_LEAST: u64 = 20;
 /// How often the 5,000-owed proof checks whether every owed message shows.
 const OWED_POLL: Duration = Duration::from_secs(5);
-const OWED_POLL_MS: u64 = OWED_POLL.as_millis() as u64;
 /// Both endpoints stall history in the fence proof, so a nonempty phase's
 /// group is stranded: its live message waits for the runner's next attempt
 /// once history returns, 30 seconds after an unreachable one.
@@ -839,7 +838,7 @@ impl CommandProbe {
         }
     }
 
-    /// Latencies of every call, and of the calls that started within
+    /// Latencies of every call, and of the calls in flight at any time within
     /// `window` (trace clock).
     async fn finish(self, window: (u64, u64)) -> TestResult<(Value, Value)> {
         self.stop.store(true, Ordering::Relaxed);
@@ -1989,16 +1988,14 @@ pub(super) async fn owed_history() {
             }
             tokio::time::sleep(OWED_POLL).await;
         }
-        // Commands that started while the runner admitted the backlog: from
-        // its first admission turn through the one that showed the last owed
-        // message. That turn logs its admit line after its messages show, so
-        // the poll that saw them all may come first: the window takes the
-        // first admit line within one poll after it.
+        // Commands in flight while the runner admitted the backlog: from its
+        // first admission turn to its last logged before every owed message
+        // showed. The trace does not name the messages a turn
+        // admitted, so the window stays inside admission: it can miss the
+        // final turn, whose admit line may follow the poll that saw its
+        // messages, but never takes in a later one.
         let drained_at = drained_trace.unwrap_or_else(runner_trace::now_ms);
-        let last_turn = admitted_between(drained_at, drained_at + OWED_POLL_MS).1;
-        let admitting = admitted_between(trace_restart, drained_at).1.map(|(first, last)| {
-            (first, last_turn.map_or(last, |(turn, _)| turn.max(last)))
-        });
+        let admitting = admitted_between(trace_restart, drained_at).1;
         let admitted_after_quiet = admitted_between(quiet_seen_trace, drained_at).0;
         let (worker_command_ms, admission_command_ms) = commands
             .finish(admitting.unwrap_or((trace_restart, trace_restart)))

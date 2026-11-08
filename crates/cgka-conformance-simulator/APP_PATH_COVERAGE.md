@@ -193,10 +193,11 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   - a message to the quiet group arrives within a minute, while the busy group is still owed;
   - fairness while the backlog is admitted, at the scorecard's targets. Once the runner's trace shows an admission
     turn and owed messages are showing, a second quiet-group message must show within 2 seconds of alice's send
-    returning, before the busy group finishes and before the runner's last admission turn. Status commands that
-    started from the first admission turn through the one that showed the last owed message (at least 20) must
-    all succeed, with p95 under 500 ms and none at 2 seconds or more. The first quiet message shows before
-    admission starts, so it does not count for fairness;
+    returning, before the busy group finishes and before the runner's last admission turn. Status commands in
+    flight at any time between the first admission turn and the last one logged before every owed message showed
+    (at least 20) must all succeed, with p95 under 500 ms and none at 2 seconds or more. The window can miss the
+    final turn but never includes a later one. The first quiet message shows before admission starts, so it does
+    not count for fairness;
   - no history notice before the restart, when the restart reports caught up, or at the end. This is its own
     check, naming each notice's route and park time (#3040).
 
