@@ -100,15 +100,17 @@ under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
   during the measured phase are listed with their counts, timeouts and time taken;
 - commit-applied and decrypted times;
 - per-relay bytes, and EVENT frames split into re-downloaded held history, novel events and the missing commit;
-- each endpoint's EVENT copies and bytes split by cause (`download_split`):
-  - first fetch: the first copy of an event bob lacked;
-  - reconnect amplification: a held event's first copy through a live or maintenance subscription, and every
+- each endpoint's EVENT copies and bytes split by cause (`download_split`). The four causes cover group events
+  (kind 445), the history the workload knows bob held:
+  - first fetch: the first copy of a group event bob lacked;
+  - reconnect amplification: a held group event's first copy through a live or maintenance subscription, and every
     further copy a subscription brought;
   - retry amplification: every further copy a history request brought;
-  - fallback amplification: a held event's first copy through a history request.
+  - fallback amplification: a held group event's first copy through a history request.
 
+  Every copy of another kind (welcomes, relay lists, profiles, KeyPackages) goes on a fifth line, `other_kinds`.
   Copies are counted exactly. Bytes are apportioned: each copy carries its event's mean copy size (copies differ
-  only by subscription id), the remainder on the first. The run asserts that the four sum to the endpoint's EVENT
+  only by subscription id), the remainder on the first. The run asserts that the five sum to the endpoint's EVENT
   frames and bytes as the connections counted them frame by frame, and that no copy came through a subscription
   bob never asked for. An event's first copy is the earliest on the proxy's clock across connections. Bob's own
   connections' totals are reported beside the split, which counts every connection opened after the restart;

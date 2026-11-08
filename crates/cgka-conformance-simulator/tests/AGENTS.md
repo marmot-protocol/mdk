@@ -33,7 +33,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
     `support/recovery_scorecard.rs` holds the large-account recovery scorecard: it asserts recovery correctness
     and an end state with nothing catching up and no notice, and records latency, per-relay traffic split by cause
-    (first fetch, reconnect, retry, fallback) and idle downloads in `scorecard.json`.
+    (first fetch, reconnect, retry and fallback for group events, other kinds apart) and idle downloads in
+    `scorecard.json`.
     It measures the recovery runner, and records bob's per-endpoint history requests too.
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and 5,000 owed events through a restart, an idle window and a

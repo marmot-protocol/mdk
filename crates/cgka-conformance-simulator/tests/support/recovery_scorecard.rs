@@ -51,7 +51,8 @@ const CURSOR_TRAIL_SECS: u64 = 60;
 
 struct Workload {
     groups: BTreeMap<String, GroupId>,
-    /// Relay events admitted before the measured restart, except the gap commit.
+    /// Group events (kind 445) admitted before the measured restart, except
+    /// the gap commit.
     held: BTreeSet<String>,
     commit: String,
     /// Events created at or after this second are inside the restart's
@@ -431,32 +432,39 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
 /// so amplification reads apart from what bob had to fetch. Copies count per
 /// endpoint; events both endpoints sent are `events_delivered_by_both_relays`.
 ///
-/// - first fetch: the first copy of an event bob did not hold;
-/// - reconnect amplification: a held event's first copy through a live or
-///   maintenance subscription (the restart's rebuild-lookback replay), and
+/// The four causes cover group events (kind 445), the history the workload
+/// knows bob held:
+///
+/// - first fetch: the first copy of a group event bob did not hold;
+/// - reconnect amplification: a held group event's first copy through a live
+///   or maintenance subscription (the restart's rebuild-lookback replay), and
 ///   every further copy such a subscription, or one never seen, brought;
 /// - retry amplification: every further copy a history request (ids, window
 ///   or paged window) brought, which that endpoint had already sent;
-/// - fallback amplification: a held event's first copy through a history
-///   request, fetched rather than proved by comparison.
+/// - fallback amplification: a held group event's first copy through a
+///   history request, fetched rather than proved by comparison.
+///
+/// Every copy of another kind (welcomes, relay lists, profiles, KeyPackages)
+/// counts once under `other_kinds`, whatever brought it.
 ///
 /// Copies are counted exactly; bytes are apportioned. The relay records one
 /// byte total per event, so a copy's bytes are its event's bytes over its
 /// copies (copies differ only by subscription id), the remainder on the
-/// first, and the four sum to the per-event totals by construction. Those
-/// totals are checked against the connections' own per-path EVENT counts,
-/// kept frame by frame: `matches_wire_totals` fails if the per-event record
-/// missed a frame, and `unknown_path_frames` counts copies through a
+/// first, and the five lines sum to the per-event totals by construction.
+/// Those totals are checked against the connections' own per-path EVENT
+/// counts, kept frame by frame: `matches_wire_totals` fails if the per-event
+/// record missed a frame, and `unknown_path_frames` counts copies through a
 /// subscription bob never asked for, which no cause can name.
 fn download_split(relay: &RelayTrafficV1, workload: &Workload) -> Value {
-    const CAUSES: [&str; 4] = [
+    const LINES: [&str; 5] = [
         "first_fetch",
         "reconnect_amplification",
         "retry_amplification",
         "fallback_amplification",
+        "other_kinds",
     ];
-    let (first_fetch, reconnect, retry, fallback) = (0, 1, 2, 3);
-    let mut causes = [(0_u64, 0_u64); 4];
+    let (first_fetch, reconnect, retry, fallback, other) = (0, 1, 2, 3, 4);
+    let mut causes = [(0_u64, 0_u64); 5];
     let (mut frames, mut bytes) = (0, 0);
     for (id, delivery) in relay
         .events
@@ -464,6 +472,11 @@ fn download_split(relay: &RelayTrafficV1, workload: &Workload) -> Value {
         .filter(|(_, delivery)| delivery.count > 0)
     {
         (frames, bytes) = (frames + delivery.count, bytes + delivery.bytes);
+        if delivery.kind != 445 {
+            causes[other].0 += delivery.count;
+            causes[other].1 += delivery.bytes;
+            continue;
+        }
         let copy = delivery.bytes / delivery.count;
         let repeats = delivery.count - 1;
         let first_by_history = matches!(
@@ -493,9 +506,9 @@ fn download_split(relay: &RelayTrafficV1, workload: &Workload) -> Value {
         .iter()
         .fold((0, 0), |(f, b), (frames, bytes)| (f + frames, b + bytes));
     let mut split = serde_json::Map::new();
-    for (cause, (frames, bytes)) in CAUSES.iter().zip(causes) {
+    for (line, (frames, bytes)) in LINES.iter().zip(causes) {
         split.insert(
-            (*cause).to_owned(),
+            (*line).to_owned(),
             json!({"frames": frames, "bytes": bytes}),
         );
     }
@@ -1233,4 +1246,76 @@ fn a_window_counts_every_call_in_flight_inside_it() {
     let within = latencies_within(&samples, 2.0, 5.0);
     assert_eq!(within["calls"], json!(3));
     assert_eq!(within["max"], json!(2_400.0));
+}
+
+#[test]
+fn the_download_split_names_group_event_causes_and_keeps_other_kinds_apart() {
+    use RelayDeliveryPath::{Ids, Live, PagedWindow};
+    use cgka_conformance_simulator::app_runtime::RelayEventDeliveryV1;
+    let event = |kind, count, bytes, first, paths: [u64; 3]| RelayEventDeliveryV1 {
+        kind,
+        count,
+        bytes,
+        via_ids: paths[0],
+        via_window: paths[1],
+        via_paged_window: paths[2],
+        via_live: count - paths.iter().sum::<u64>(),
+        first: Some((first, 0)),
+        ..Default::default()
+    };
+    let events = [
+        // Held, replayed live, then sent twice more by window requests.
+        ("held-live", event(445, 3, 300, Live, [0, 2, 0])),
+        // Held, fetched by id and fetched again.
+        ("held-ids", event(445, 2, 201, Ids, [2, 0, 0])),
+        ("new", event(445, 1, 50, Live, [0, 0, 0])),
+        // Retained non-group events bob held, through live and history paths.
+        ("welcome", event(1059, 2, 80, Live, [0, 1, 0])),
+        ("relay-list", event(10050, 1, 40, PagedWindow, [0, 0, 1])),
+    ];
+    // The connection's own count, frame by frame, by path.
+    let traffic = |live: u64| ConnectionTrafficV1 {
+        event_frames: [
+            ("live", live),
+            ("window", 3),
+            ("ids", 2),
+            ("paged_window", 1),
+        ]
+        .map(|(path, frames)| (path.to_owned(), frames))
+        .into(),
+        event_bytes: BTreeMap::from([("live".to_owned(), 671)]),
+        ..Default::default()
+    };
+    let mut relay = RelayTrafficV1 {
+        events: events
+            .map(|(id, delivery)| (id.to_owned(), delivery))
+            .into(),
+        connection_traffic: BTreeMap::from([(0, traffic(3))]),
+        ..Default::default()
+    };
+    let workload = Workload {
+        groups: BTreeMap::new(),
+        held: ["held-live", "held-ids", "welcome", "relay-list"]
+            .map(String::from)
+            .into(),
+        commit: "gap-commit".into(),
+        lookback_from: 0,
+        summary: Value::Null,
+    };
+    let split = download_split(&relay, &workload);
+    let line = |name: &str| (split[name]["frames"].clone(), split[name]["bytes"].clone());
+    assert_eq!(line("first_fetch"), (json!(1), json!(50)));
+    assert_eq!(line("reconnect_amplification"), (json!(1), json!(100)));
+    assert_eq!(line("retry_amplification"), (json!(3), json!(300)));
+    assert_eq!(line("fallback_amplification"), (json!(1), json!(101)));
+    assert_eq!(line("other_kinds"), (json!(3), json!(120)));
+    assert_eq!(line("total"), (json!(9), json!(671)));
+    assert_eq!(split["sums_to_total"], json!(true));
+    assert_eq!(split["matches_wire_totals"], json!(true));
+    // A frame the per-event record missed breaks the wire check.
+    relay.connection_traffic = BTreeMap::from([(0, traffic(4))]);
+    assert_eq!(
+        download_split(&relay, &workload)["matches_wire_totals"],
+        json!(false)
+    );
 }
