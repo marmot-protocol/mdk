@@ -30,7 +30,10 @@ const APP_STATE_MAX_ENCODED_LEN: usize = 8192;
 #[derive(Clone, Copy)]
 enum AppDataCommitPurpose {
     Ordinary,
-    Isolated,
+    /// Proposals pending in the store stay there; `context` prefixes errors.
+    Isolated {
+        context: &'static str,
+    },
     MoveStatus(DeviceSlotId),
 }
 
@@ -79,6 +82,25 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<SendResult, EngineError> {
         self.do_send_app_data_updates(group_id, updates, Vec::new())
             .await
+    }
+
+    /// [`Self::do_send_update_app_components`] for a Commit that carries only
+    /// `updates`: proposals pending in the store stay there. A leave's
+    /// automatic step-down uses it (mdk#3014).
+    pub(crate) async fn do_send_isolated_app_component_updates(
+        &mut self,
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+    ) -> Result<SendResult, EngineError> {
+        self.do_send_app_data_updates_with_purpose(
+            group_id,
+            updates,
+            Vec::new(),
+            AppDataCommitPurpose::Isolated {
+                context: "leave_step_down",
+            },
+        )
+        .await
     }
 
     /// Stage a [`cgka_traits::engine::SendIntent::RecordRemovedSlot`]: one
@@ -191,7 +213,9 @@ impl<S: StorageProvider> Engine<S> {
                 data: update,
             }],
             Vec::new(),
-            AppDataCommitPurpose::Isolated,
+            AppDataCommitPurpose::Isolated {
+                context: "carried_rejections",
+            },
         )
         .await
     }
@@ -458,7 +482,7 @@ impl<S: StorageProvider> Engine<S> {
                 proposals,
                 "app_data_update",
             )?,
-            AppDataCommitPurpose::Isolated => self.stage_app_data_commit(
+            AppDataCommitPurpose::Isolated { context } => self.stage_app_data_commit(
                 &mut mls_group,
                 &provider,
                 Vec::new(),
@@ -466,7 +490,7 @@ impl<S: StorageProvider> Engine<S> {
                 proposals,
                 false,
                 None,
-                "carried_rejections",
+                context,
             )?,
             AppDataCommitPurpose::MoveStatus(slot) => {
                 // Only this status operation tags from the authenticated old

@@ -21,6 +21,11 @@
   `MarmotApp::admin_leave_steps_down`; struct literals need the field. Without it, `requires_self_demote_before_leave`
   is true for an admin and `can_leave` false, as in 0.14.
 
+- An admin's Leave completes when its step-down loses to another branch (mdk#3014). The device steps down again from
+  the winning branch's admin list, keeping any admin that branch promoted, and then sends its SelfRemove; the
+  convergence scheduler keeps a leaving group awake until that is done. The lost step-down is no longer reported as
+  `GroupChangeSuperseded`. A last admin's leave still waits; its blocked state and Cancel are follow-up work.
+
 - Emoji set image downloads are bound to the version the user was shown (breaking; the emoji set API has not
   shipped). `install_emoji_set` takes `expected_event_id_hex` and an `&EmojiSetInstallControl`;
   `fetch_emoji_set_asset` takes `expected_event_id_hex`. Another stored version fails with the new

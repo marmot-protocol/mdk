@@ -4103,6 +4103,12 @@ where
         Ok(self.session.deferred_peel_cutoff_delay_ms(group_id)?)
     }
 
+    /// Whether this group's durable leave request owes its next step;
+    /// schedulers must keep a wakeup armed while this holds.
+    pub fn leave_redrive_owed(&mut self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.leave_redrive_owed(group_id)?)
+    }
+
     /// Milliseconds until a scheduled SelfRemove auto-commit for this group is
     /// due; schedulers must keep a wakeup armed while this is `Some`.
     pub fn scheduled_self_remove_auto_commit_delay_ms(

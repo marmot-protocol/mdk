@@ -116,7 +116,7 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    fn capture_group_authority_facts(
+    pub(crate) fn capture_group_authority_facts(
         &self,
         group_id: &GroupId,
     ) -> Result<GroupAuthorityFacts, EngineError> {

@@ -2486,12 +2486,16 @@ impl<S: StorageProvider> Engine<S> {
             && self
                 .disband_request_pending(group_id)
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        // A leave request may owe a step-down or SelfRemove that nothing else
+        // records; the scheduler reads `leave_redrive_owed` to decide.
+        let has_leave_request = self.leave_requests.contains_key(group_id);
         if has_queued_intents
             || has_convergence_inputs
             || has_canonical_applications
             || has_deferred_peels
             || restored_self_remove_work
             || has_pending_disband
+            || has_leave_request
         {
             self.schedule_pending_convergence_group(group_id);
         }

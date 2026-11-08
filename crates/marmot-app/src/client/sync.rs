@@ -622,12 +622,15 @@ impl AppClient {
                         .is_some_and(|request| {
                             request.status == cgka_traits::DisbandRequestStatus::Pending
                         }))
+                    || self.runtime.leave_redrive_owed(group_id)?
                 {
                     // Acceptance stores a separate durable request, not a queued
                     // outbound intent or convergence input. Keep its wakeup so
                     // the next advance can prepare the closing commit. Existing
                     // convergence and frozen publications retain their precedence;
-                    // an unrecoverable group stays paused.
+                    // an unrecoverable group stays paused. A leave request that
+                    // owes its step-down or SelfRemove is the same kind of
+                    // durable request (mdk#3014).
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: None,
                     })

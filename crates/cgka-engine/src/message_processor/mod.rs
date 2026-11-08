@@ -684,6 +684,37 @@ enum LeaveGateCheck {
     DrainComplete,
 }
 
+/// What one pass over a durable leave request did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaveRedrive {
+    /// Nothing to do on this pass.
+    Idle,
+    /// A fresh SelfRemove proposal is on its way out.
+    Proposed,
+    /// The account was an admin again; the Commit that steps it down is staged.
+    SteppedDown,
+}
+
+/// What an `UpdateAppComponents` Commit does with proposals pending in the
+/// OpenMLS proposal store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingProposals {
+    /// Commit them too, as an ordinary admin Commit does.
+    Consume,
+    /// Leave them in the store; the Commit carries only its own updates.
+    Keep,
+}
+
+/// The step a durable leave request owes on a `Stable` epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwedLeaveStep {
+    /// The selected branch keeps this account an admin and another active
+    /// admin remains: take it off the admin list first.
+    StepDown,
+    /// No SelfRemove has been proposed at this epoch yet.
+    SelfRemove,
+}
+
 struct FairnessReservation {
     available: bool,
     account_devices_required: bool,
@@ -1412,7 +1443,9 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(MaintenanceGate::StagedCommit);
         }
-        self.try_auto_repropose_leave_request(group_id).await;
+        if self.try_auto_repropose_leave_request(group_id).await == LeaveRedrive::SteppedDown {
+            return Ok(MaintenanceGate::StagedCommit);
+        }
         if matches!(leave_gate_check, LeaveGateCheck::Required)
             && self.load_leave_request_state(group_id)?.is_some()
         {
@@ -2202,6 +2235,36 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .list_queued_outbound_intents(group_id)?
             .is_empty())
+    }
+
+    /// Whether this group's durable leave request owes its next step: a fresh
+    /// step-down or a SelfRemove the drain would stage now (see
+    /// `owed_leave_step`). Runtime schedulers must keep a wakeup armed while
+    /// this holds. The request is neither a queued outbound intent nor a
+    /// convergence input, so once the step-down a leave staged has merged, a
+    /// quiet group otherwise reads as idle and its SelfRemove is never sent.
+    pub fn leave_redrive_owed(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+        if self.quarantined_reason(group_id).is_some() || self.unhydrated_groups.contains(group_id)
+        {
+            return Ok(false);
+        }
+        let Some(request) = self.load_leave_request_state(group_id)? else {
+            return Ok(false);
+        };
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !state.is_stable()
+        {
+            return Ok(false);
+        }
+        let Some(group) = self.stored_group_record(group_id)? else {
+            return Ok(false);
+        };
+        if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
+            return Ok(false);
+        }
+        Ok(self
+            .owed_leave_step(group_id, &request, group.epoch)?
+            .is_some())
     }
 
     fn note_foreground_deferred_phase(

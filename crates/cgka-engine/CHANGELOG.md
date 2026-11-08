@@ -8,6 +8,15 @@
 
 ### Fixed
 
+- A leaving account that the selected branch makes an admin again steps down again before its SelfRemove
+  (mdk#3014). While a durable leave request exists and another active admin remains, the drain stages a step-down
+  from the selected branch's admin list, so a promotion on the winning branch stands; the SelfRemove follows once that
+  Commit merges; it carries only that update and leaves pending proposals in the store. The last active admin's leave
+  stages nothing. A leaving account's lost step-down that did nothing else is no longer re-queued or reported as
+  superseded. New `Engine::leave_redrive_owed` (forwarded by the session and runtime) is the
+  scheduler's signal to keep a wake armed, and hydration schedules a group with a restored leave request. No wire or
+  schema change.
+
 - A pending proposal sealed on one branch no longer invalidates a rival branch's commit at the same epoch
   (mdk#3226). Candidate replay records a proposal that fails sender or membership-tag authentication as that
   branch's evidence and keeps judging the path's own commits, so a device that left on a branch that then loses
