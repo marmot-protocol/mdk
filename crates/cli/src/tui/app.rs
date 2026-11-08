@@ -18,18 +18,27 @@ impl Drop for BracketedPasteGuard {
 }
 
 /// Status authority is separate from model/result admission. Every foreground
-/// feedback write creates a revision; asynchronous continuations retain the
-/// revision they were issued under. Retained feedback blocks ambient notices.
+/// user action allocates an identity; presentation writes only advance that
+/// action’s feedback phase. Async continuations carry both. Passive navigation
+/// and ambient updates never acquire an action. Retained feedback blocks notices.
 #[derive(Clone, Copy, Default)]
 pub(crate) enum StatusScope {
     #[default]
     Foreground,
     /// None carries model/resource work without authority over foreground feedback.
-    Completion(Option<u64>),
+    Completion(Option<StatusOwner>),
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StatusOwner {
+    action: u64,
+    revision: u64,
 }
 
 #[derive(Default)]
 pub(crate) struct StatusOwnership {
+    next_action: u64,
+    action: u64,
     pub(crate) revision: u64,
     pub(super) scope: StatusScope,
     pub(super) retained: bool,
@@ -90,16 +99,15 @@ pub(crate) struct TuiApp {
     pub(crate) loading_chat: Option<(String, String, u64)>,
     /// Monotonic identity for timeline requests, including repeated opens of the same chat.
     pub(crate) timeline_load_generation: u64,
-    /// The query of the most recently requested user search, or `None` when no
-    /// search is outstanding. A `UserSearch` result is folded only while its
-    /// query still matches (the same stale guard as `loading_chat`).
+    /// Target of the outstanding user search. Query/account eligibility is
+    /// checked after exact request admission, even for an identical re-search.
     pub(crate) searching_users: Option<String>,
     /// The account, group and query of the outstanding message search. Keeping
     /// its owner lets a completion settle abandoned work without consuming a
     /// replacement pane's identical query.
     pub(crate) searching_messages: Option<(String, String, String)>,
-    /// The group id of the group-detail load in flight, or `None`. A
-    /// `LoadGroupDetail` result is folded only while it still matches.
+    /// Group-detail target, cleared on leaving the view. A separate request ID
+    /// admits only the newest load, including reopen/reload of the same target.
     pub(crate) loading_group_detail: Option<String>,
     /// Whether an invites-list load is in flight, gating a duplicate enqueue and
     /// signalling the fold to open the picker.
@@ -117,11 +125,19 @@ pub(crate) struct TuiApp {
     pub(crate) group_diagnostics: Option<GroupDiagnostics>,
     pub(crate) input: Input,
     pub(crate) streaming: Option<StreamComposer>,
+    /// Coalesce invite notices per local account until Main can display them.
+    /// Deduplicating receipt never discards a notice behind retained feedback.
+    pub(crate) pending_invite_notices: std::collections::HashMap<String, String>,
+    pub(crate) view_status_action: Option<u64>,
+    pub(crate) user_search_request: Option<RequestId>,
+    pub(crate) message_search_request: Option<RequestId>,
+    pub(crate) group_detail_request: Option<RequestId>,
+    pub(crate) invites_request: Option<(String, RequestId)>,
     pub(crate) status: String,
     pub(crate) status_ownership: StatusOwnership,
     pub(crate) flick_status_owner: Option<u64>,
-    pub(crate) stream_status_owner: Option<u64>,
-    pub(crate) daemon_start_status_owner: Option<u64>,
+    pub(crate) stream_status_owner: Option<StatusOwner>,
+    pub(crate) daemon_start_status_owner: Option<StatusOwner>,
     /// The one open modal, or none. While set it captures every key (routed at
     /// the top of `handle_key`) and overlays whatever screen is showing.
     pub(crate) popup: Option<Popup>,
@@ -181,7 +197,54 @@ fn plain(key: KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+impl StatusOwnership {
+    pub(crate) fn owner(&self) -> StatusOwner {
+        StatusOwner {
+            action: self.action,
+            revision: self.revision,
+        }
+    }
+
+    fn reserve_action(&mut self) -> u64 {
+        self.next_action = self
+            .next_action
+            .checked_add(1)
+            .expect("status action exhausted");
+        self.next_action
+    }
+}
+
 impl TuiApp {
+    /// Only semantic foreground entry points acquire feedback authority. Helpers
+    /// invoked by a completion preserve its causal owner, including stale/None.
+    pub(super) fn begin_status_action(&mut self) {
+        if matches!(self.status_ownership.scope, StatusScope::Foreground) {
+            let action = self.status_ownership.reserve_action();
+            self.activate_status_action(action);
+        }
+    }
+
+    /// Secondary-view read feedback may be dismissed on exit, while a newer
+    /// mutation acknowledgement/prompt continues to own the line on Main.
+    pub(super) fn begin_view_action(&mut self) {
+        self.begin_status_action();
+        self.view_status_action = Some(self.status_ownership.action);
+    }
+
+    fn dismiss_view_feedback(&mut self) {
+        if !self.status_ownership.retained
+            || self.view_status_action == Some(self.status_ownership.action)
+        {
+            self.set_status(String::new());
+        }
+        self.view_status_action = None;
+    }
+
+    fn activate_status_action(&mut self, action: u64) {
+        self.status_ownership.action = action;
+        self.status_ownership.revision = 0;
+    }
+
     /// A completion may keep writing only while its captured revision owns the
     /// line. Updating its own revision permits multiple writes in one fold, but
     /// revokes an earlier child refresh once its parent writes an acknowledgement.
@@ -196,7 +259,7 @@ impl TuiApp {
             .expect("status revision exhausted");
         if matches!(self.status_ownership.scope, StatusScope::Completion(_)) {
             self.status_ownership.scope =
-                StatusScope::Completion(Some(self.status_ownership.revision));
+                StatusScope::Completion(Some(self.status_ownership.owner()));
         }
         self.status_ownership.retained = !status.is_empty();
         self.status = status;
@@ -205,13 +268,13 @@ impl TuiApp {
     pub(super) fn status_is_owned(&self) -> bool {
         match self.status_ownership.scope {
             StatusScope::Foreground => true,
-            StatusScope::Completion(owner) => owner == Some(self.status_ownership.revision),
+            StatusScope::Completion(owner) => owner == Some(self.status_ownership.owner()),
         }
     }
 
     pub(super) fn with_status_owner<R>(
         &mut self,
-        owner: Option<u64>,
+        owner: Option<StatusOwner>,
         fold: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let previous = std::mem::replace(
@@ -223,13 +286,13 @@ impl TuiApp {
         result
     }
 
-    pub(super) fn enqueue_effect(&self, effect: Effect) {
+    pub(super) fn enqueue_effect(&self, effect: Effect) -> RequestId {
         // Preserve absent or stale authority through causal child work.
         let owner = match self.status_ownership.scope {
-            StatusScope::Foreground => Some(self.status_ownership.revision),
+            StatusScope::Foreground => Some(self.status_ownership.owner()),
             StatusScope::Completion(owner) => owner,
         };
-        self.effects.enqueue(effect, owner);
+        self.effects.enqueue(effect, owner)
     }
 
     pub(crate) fn new(cli: Cli) -> TuiResult<Self> {
@@ -276,6 +339,12 @@ impl TuiApp {
             group_diagnostics: None,
             input: Input::default(),
             streaming: None,
+            pending_invite_notices: Default::default(),
+            view_status_action: None,
+            user_search_request: None,
+            message_search_request: None,
+            group_detail_request: None,
+            invites_request: None,
             status: "loading accounts".to_owned(),
             status_ownership: StatusOwnership::default(),
             flick_status_owner: None,
@@ -373,6 +442,7 @@ impl TuiApp {
             return;
         }
         if self.streaming.is_some() {
+            self.begin_status_action();
             self.input.insert_str(&text);
             let mut stream_id = None;
             if let Some(streaming) = self.streaming.as_mut() {
@@ -385,7 +455,7 @@ impl TuiApp {
                     shorten(&streaming.stream_id, 18)
                 );
                 self.set_status(status);
-                self.stream_status_owner = Some(self.status_ownership.revision);
+                self.stream_status_owner = Some(self.status_ownership.owner());
             }
             if let Some(stream_id) = stream_id {
                 self.upsert_active_stream_preview(&stream_id);
@@ -498,9 +568,10 @@ impl TuiApp {
                 }
             }
             if app.status_is_owned() {
-                app.stream_status_owner = Some(app.status_ownership.revision);
+                app.stream_status_owner = Some(app.status_ownership.owner());
             }
         });
+        changed |= self.deliver_pending_invite_notice();
         changed
     }
 
@@ -545,7 +616,7 @@ impl TuiApp {
             // cannot revoke a pending foreground load or prompt.
             self.daemon_start_status_owner = (self.screen == Screen::Main
                 && !self.status_ownership.retained)
-                .then_some(self.status_ownership.revision);
+                .then_some(self.status_ownership.owner());
             self.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
         } else {
             self.set_drain_status(DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned());
@@ -579,6 +650,7 @@ impl TuiApp {
     /// the login menu, one drops straight into the main view, several open the
     /// account picker.
     pub(crate) fn start(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         self.load_accounts()?;
         // An explicit `--account`/`WN_ACCOUNT` selector that resolves to a loaded
         // account is honored directly, so it wins over the several-accounts
@@ -607,7 +679,6 @@ impl TuiApp {
     /// account so navigation starts on the current selection and `Esc` discards
     /// cleanly back to that account without committing a different one.
     pub(crate) fn open_account_picker(&mut self) {
-        self.set_status(String::new());
         self.picker_selection = self.selected_account;
         self.screen = Screen::Login(LoginMode::AccountSelect);
     }
@@ -622,6 +693,7 @@ impl TuiApp {
 
     /// Enter the main view for the currently selected account, loading its chats.
     pub(crate) fn enter_main(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         self.show_main();
         self.refresh_chats()
     }
@@ -916,6 +988,7 @@ impl TuiApp {
     /// Open the selected message's downloaded image full-size, or explain on the
     /// status line why it cannot (no capability, not downloaded, or no image).
     fn open_selected_image_viewer(&mut self) {
+        self.begin_status_action();
         let total = self.timeline.len();
         let Some(index) = self.timeline_scroll.resolved_selection(total) else {
             self.set_status("no message selected".to_owned());
@@ -962,8 +1035,7 @@ impl TuiApp {
                     // Flick-through: schedule a debounced preview of the newly
                     // highlighted chat. Focus stays on the chat list; the load
                     // fires only after the movement quiets (see `tick`).
-                    self.set_status(String::new());
-                    self.flick_status_owner = Some(self.status_ownership.revision);
+                    self.flick_status_owner = Some(self.status_ownership.reserve_action());
                     self.flick_countdown = Some(FLICK_PREVIEW_DEBOUNCE_TICKS);
                 }
             }
@@ -986,6 +1058,7 @@ impl TuiApp {
     /// dropped at fold time, and it marks the previewed chat read exactly as
     /// opening it does — the chat is on screen, so viewing-is-reading applies.
     fn fire_flick_preview(&mut self) {
+        let reserved = self.flick_status_owner.take();
         if self.screen != Screen::Main || self.popup.is_some() || self.focus != Focus::Chats {
             return;
         }
@@ -999,14 +1072,27 @@ impl TuiApp {
         let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
             return;
         };
-        if self.messages_account_id.as_deref() == Some(account_id.as_str())
-            && self.messages_group_id.as_deref() == Some(group_id.as_str())
+        if (self.messages_account_id.as_deref() == Some(account_id.as_str())
+            && self.messages_group_id.as_deref() == Some(group_id.as_str()))
+            || self
+                .loading_chat
+                .as_ref()
+                .is_some_and(|(account, group, _)| account == &account_id && group == &group_id)
         {
             return;
         }
-        self.with_status_owner(self.flick_status_owner, |app| {
-            app.begin_timeline_load(account_id, group_id);
-        });
+        // A reservation cannot supersede a command entered after the movement.
+        // Aborted/no-op previews never activate it or revoke the current request.
+        let owner = reserved.filter(|action| *action > self.status_ownership.action);
+        if let Some(action) = owner {
+            self.activate_status_action(action);
+            let claim = self.status_ownership.owner();
+            self.with_status_owner(Some(claim), |app| {
+                app.begin_timeline_load(account_id, group_id)
+            });
+        } else {
+            self.with_status_owner(None, |app| app.begin_timeline_load(account_id, group_id));
+        }
     }
 
     /// Move the account-picker highlight (login/account-select screen only).
@@ -1047,7 +1133,7 @@ impl TuiApp {
             .should_request_older(self.timeline.len())
             && let Err(err) = self.load_older_messages()
         {
-            self.set_status(format!("error: {err}"));
+            self.set_drain_status(format!("error: {err}"));
         }
     }
 
@@ -1087,6 +1173,7 @@ impl TuiApp {
     /// Tab-cycling to Messages would otherwise silently destroy typed text, so an
     /// existing draft is left intact and the status line explains the suppression.
     fn prefill_composer(&mut self, command: &str) {
+        self.begin_status_action();
         if self.input.is_empty() {
             self.input.set_value(command);
             self.focus = Focus::Composer;
@@ -1115,6 +1202,7 @@ impl TuiApp {
     }
 
     pub(crate) fn submit_input(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let input = self.input.value().trim().to_owned();
         self.input.clear();
         if input.is_empty() {
@@ -1130,15 +1218,23 @@ impl TuiApp {
 
     pub(crate) fn handle_streaming_key(&mut self, key: KeyEvent) -> TuiResult<()> {
         match key.code {
-            KeyCode::Enter => self.finish_stream_composer(),
-            KeyCode::Esc => self.cancel_stream_composer(),
+            KeyCode::Enter => {
+                self.begin_status_action();
+                self.finish_stream_composer()
+            }
+            KeyCode::Esc => {
+                self.begin_status_action();
+                self.cancel_stream_composer()
+            }
             KeyCode::Backspace => {
+                self.begin_status_action();
                 self.set_status(
                     "stream editing is append-only in this preview; Esc cancels".to_owned(),
                 );
                 Ok(())
             }
             KeyCode::Char(character) => {
+                self.begin_status_action();
                 self.input.insert(character);
                 let mut stream_id = None;
                 if let Some(streaming) = self.streaming.as_mut() {
@@ -1150,7 +1246,7 @@ impl TuiApp {
                         shorten(&streaming.stream_id, 18)
                     );
                     self.set_status(status);
-                    self.stream_status_owner = Some(self.status_ownership.revision);
+                    self.stream_status_owner = Some(self.status_ownership.owner());
                 }
                 if let Some(stream_id) = stream_id {
                     self.upsert_active_stream_preview(&stream_id);
@@ -1235,6 +1331,7 @@ impl TuiApp {
     /// Create a new local signing identity from the login screen; enter the main
     /// view on success, surface the error on the status line otherwise.
     fn create_identity_from_login(&mut self) {
+        self.begin_status_action();
         match self.create_or_import_account(None, "created identity") {
             Ok(()) => self.show_main(),
             Err(err) => self.set_status(format!("error: {err}")),
@@ -1242,6 +1339,7 @@ impl TuiApp {
     }
 
     fn begin_nsec_entry(&mut self) {
+        self.begin_status_action();
         self.screen = Screen::Login(LoginMode::NsecEntry);
         self.input.clear();
         // Reuse the composer input's masked mode so the field renders as `*` per
@@ -1254,6 +1352,7 @@ impl TuiApp {
     /// path. The value is cleared before shelling out (as the composer does), so
     /// a secret never lingers in state after submission.
     fn submit_nsec_login(&mut self) {
+        self.begin_status_action();
         let identity = self.input.value().trim().to_owned();
         self.input.clear();
         if identity.is_empty() {
@@ -1271,6 +1370,7 @@ impl TuiApp {
     }
 
     pub(crate) fn run_slash_command(&mut self, command: SlashCommand) -> TuiResult<()> {
+        self.begin_status_action();
         match command {
             SlashCommand::Help => {
                 self.popup = Some(Popup::help());
@@ -1387,6 +1487,7 @@ impl TuiApp {
     }
 
     pub(crate) fn select_account_by_selector(&mut self, selector: &str) -> TuiResult<()> {
+        self.begin_status_action();
         let Some(index) = self
             .accounts
             .iter()
@@ -1624,13 +1725,8 @@ impl TuiApp {
         // Clearing the load anchor drops any group-detail result still in flight,
         // so a late load cannot repopulate the view after the screen is left.
         self.loading_group_detail = None;
-        // Leaving mid-load would otherwise strand the "loading group detail..."
-        // status (the fold that clears it is now dropped). Reset it, guarded so a
-        // meaningful status a caller sets afterward (accept-invite, leave-group) is
-        // never clobbered.
-        if self.status == LOADING_GROUP_DETAIL_STATUS {
-            self.set_status(String::new());
-        }
+        self.group_detail_request = None;
+        self.dismiss_view_feedback();
         self.screen = Screen::Main;
         self.focus = Focus::Chats;
     }
@@ -1687,6 +1783,7 @@ impl TuiApp {
     }
 
     fn open_remove_member_popup(&mut self) {
+        self.begin_status_action();
         let Some(view) = &self.group_detail else {
             return;
         };
@@ -1711,6 +1808,7 @@ impl TuiApp {
     }
 
     fn open_promote_member_popup(&mut self) {
+        self.begin_status_action();
         let Some(view) = &self.group_detail else {
             return;
         };
@@ -1766,6 +1864,7 @@ impl TuiApp {
     /// re-addable, so it keeps the lighter `y`/`Enter` confirm. Both bodies state
     /// plainly what is erased and never soften the wording.
     fn open_logout_popup(&mut self) {
+        self.begin_status_action();
         let Some(account) = self.selected_account_row() else {
             self.set_status("no account selected".to_owned());
             return;
@@ -1827,9 +1926,11 @@ impl TuiApp {
         // `loading_group_detail` clear), so reopening the search screen never
         // inherits the abandoned query's results, and resets the "searching..."
         // status the abandoned load would otherwise strand on the status line.
-        if self.searching_users.take().is_some() || self.searching_messages.take().is_some() {
-            self.set_status(String::new());
-        }
+        self.searching_users = None;
+        self.searching_messages = None;
+        self.user_search_request = None;
+        self.message_search_request = None;
+        self.dismiss_view_feedback();
         self.user_search = None;
         self.message_search = None;
         self.profile_view = None;
@@ -1905,6 +2006,8 @@ impl TuiApp {
         // page at fold time, and the status it stranded ("searching...", "N
         // match(es)") described the query that just went away.
         self.searching_messages = None;
+        self.message_search_request = None;
+        self.begin_view_action();
         self.set_status(String::new());
     }
 
@@ -1948,6 +2051,7 @@ impl TuiApp {
     /// to walk back out of the past with — so an out-of-window hit reports what it
     /// would take instead of moving the viewport somewhere misleading.
     fn jump_to_selected_hit(&mut self) {
+        self.begin_status_action();
         let Some(view) = self.message_search.as_ref() else {
             return;
         };
@@ -2052,6 +2156,8 @@ impl TuiApp {
             return;
         }
         self.searching_users = None;
+        self.user_search_request = None;
+        self.begin_view_action();
         self.set_status(String::new());
     }
 
@@ -2125,6 +2231,7 @@ impl TuiApp {
     /// A search opened from group detail already has its target, so it skips the
     /// picker and confirms against that group directly.
     fn open_add_user_to_chat_popup(&mut self) {
+        self.begin_status_action();
         let Some(view) = self.user_search.as_ref() else {
             return;
         };
@@ -2197,6 +2304,7 @@ impl TuiApp {
     /// Open the edit popup for the selected profile field, prefilled with its
     /// current value. A no-op with a status notice when a follow row is selected.
     fn open_profile_edit_popup(&mut self) {
+        self.begin_status_action();
         let Some(view) = &self.profile_view else {
             return;
         };
@@ -2217,6 +2325,7 @@ impl TuiApp {
     }
 
     fn open_unfollow_popup(&mut self) {
+        self.begin_status_action();
         let Some(view) = &self.profile_view else {
             return;
         };

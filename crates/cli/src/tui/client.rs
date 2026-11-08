@@ -249,9 +249,13 @@ pub(crate) fn spawn_subscription_reader(
 /// A completed effect handed back from the worker to the event loop: the effect
 /// that ran (so the fold knows how to interpret it) plus, in order, every call's
 /// parsed result — or the first error encountered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequestId(u64);
+
 pub(crate) struct EffectDone {
+    pub(crate) request_id: RequestId,
     pub(crate) effect: Effect,
-    pub(crate) status_owner: Option<u64>,
+    pub(crate) status_owner: Option<StatusOwner>,
     pub(crate) result: Result<Vec<Value>, String>,
 }
 
@@ -277,22 +281,24 @@ pub(crate) struct EffectDone {
 /// reached the relay); a read (a load) merely wastes the moment it takes to
 /// exit. Neither warrants tracking and reaping children across shutdown.
 pub(crate) struct EffectRunner {
-    tx: mpsc::Sender<(Effect, Option<u64>)>,
+    tx: mpsc::Sender<(RequestId, Effect, Option<StatusOwner>)>,
     rx: Receiver<EffectDone>,
+    next_request: std::cell::Cell<u64>,
 }
 
 impl EffectRunner {
     pub(crate) fn spawn(client: WnClient) -> Self {
-        let (tx, effect_rx) = mpsc::channel::<(Effect, Option<u64>)>();
+        let (tx, effect_rx) = mpsc::channel::<(RequestId, Effect, Option<StatusOwner>)>();
         let (done_tx, rx) = mpsc::channel::<EffectDone>();
         thread::spawn(move || {
             // `recv` returns `Err` once the app drops its `tx` (shutdown), so the
             // worker exits cleanly. Effects run strictly one at a time in the
             // order received.
-            while let Ok((effect, status_owner)) = effect_rx.recv() {
+            while let Ok((request_id, effect, status_owner)) = effect_rx.recv() {
                 let result = run_effect(&client, &effect);
                 if done_tx
                     .send(EffectDone {
+                        request_id,
                         effect,
                         result,
                         status_owner,
@@ -303,14 +309,26 @@ impl EffectRunner {
                 }
             }
         });
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            next_request: std::cell::Cell::new(0),
+        }
     }
 
     /// Queue an effect to run off the event loop. The send only fails if the
     /// worker is gone, which happens only at shutdown; a dropped effect then
     /// simply never folds, which is correct while tearing down.
-    pub(crate) fn enqueue(&self, effect: Effect, owner: Option<u64>) {
-        let _ = self.tx.send((effect, owner));
+    pub(crate) fn enqueue(&self, effect: Effect, owner: Option<StatusOwner>) -> RequestId {
+        let next = self
+            .next_request
+            .get()
+            .checked_add(1)
+            .expect("effect request exhausted");
+        self.next_request.set(next);
+        let request_id = RequestId(next);
+        let _ = self.tx.send((request_id, effect, owner));
+        request_id
     }
 
     /// Drain every effect that finished since the last tick, for folding now.
@@ -370,10 +388,36 @@ impl TuiApp {
     /// and never tears down the session (the caught-error invariant).
     pub(crate) fn apply_effect_done(&mut self, done: EffectDone) {
         let EffectDone {
+            request_id,
             effect,
             result,
             status_owner,
         } = done;
+        // Request admission precedes consuming a pending slot. Mutations and
+        // background projections always fold through their own model guards;
+        // only replaceable view reads use latest-request admission.
+        let slot = match &effect {
+            Effect::UserSearch { .. } => Some(&mut self.user_search_request),
+            Effect::MessageSearch { .. } => Some(&mut self.message_search_request),
+            Effect::LoadGroupDetail { .. } => Some(&mut self.group_detail_request),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            if *slot != Some(request_id) {
+                return;
+            }
+            *slot = None;
+        }
+        if matches!(effect, Effect::LoadInvites { .. }) {
+            if !self
+                .invites_request
+                .as_ref()
+                .is_some_and(|(_, id)| *id == request_id)
+            {
+                return;
+            }
+            self.invites_request = None;
+        }
         self.with_status_owner(status_owner, |app| app.fold_effect(effect, result));
     }
 
@@ -505,6 +549,7 @@ impl TuiApp {
     /// when the send lands (the timeline projection upserts over it by id once it
     /// reaches the materialized view), so nothing blocks the render loop.
     pub(crate) fn send_message(&mut self, text: String) -> TuiResult<()> {
+        self.begin_status_action();
         let effect = self.resolve_send_message(text)?;
         self.set_status("sending...".to_owned());
         self.enqueue_effect(effect);
@@ -526,6 +571,7 @@ impl TuiApp {
     /// interactions use when nothing is selected; the optimistic reply row folds
     /// in when the reply lands.
     pub(crate) fn send_reply(&mut self, text: String) -> TuiResult<()> {
+        self.begin_status_action();
         let effect = self.resolve_reply(text)?;
         self.set_status("sending reply...".to_owned());
         self.enqueue_effect(effect);
@@ -632,6 +678,7 @@ impl TuiApp {
     /// subprocess runs off the event loop; the timeline projection subscription
     /// folds the reaction in both directions, so the fold only updates status.
     pub(crate) fn react_to_selected_message(&mut self, emoji: String) -> TuiResult<()> {
+        self.begin_status_action();
         let effect = self.resolve_react(emoji)?;
         self.set_status("reacting...".to_owned());
         self.enqueue_effect(effect);
@@ -651,6 +698,7 @@ impl TuiApp {
     /// Remove your own reaction from the selected message
     /// (`messages unreact <group> <id>`), off the event loop (see `react_...`).
     pub(crate) fn unreact_selected_message(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let effect = self.resolve_unreact()?;
         self.set_status("removing reaction...".to_owned());
         self.enqueue_effect(effect);
@@ -670,6 +718,7 @@ impl TuiApp {
     /// runs at resolve time, so a clear status-line error fires before anything
     /// is queued. No list refetch: the projection tombstones the row.
     pub(crate) fn delete_selected_message(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let effect = self.resolve_delete()?;
         self.set_status("deleting...".to_owned());
         self.enqueue_effect(effect);
@@ -703,6 +752,7 @@ impl TuiApp {
     /// event id is an explicit argument, not the selected row: timeline rows carry
     /// no failed-send state to target from (documented in the README).
     pub(crate) fn retry_message(&mut self, event_id: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.message_account_id()?;
         let group_id = self.message_group_id()?;
         self.client.run_json(
@@ -718,6 +768,7 @@ impl TuiApp {
         file_path: String,
         caption: Option<String>,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.message_account_id()?;
         let group_id = self.message_group_id()?;
         let args = media_upload_send_args(group_id, file_path, caption);
@@ -746,6 +797,7 @@ impl TuiApp {
         stream_id: Option<String>,
         quic_candidates: Vec<String>,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let preview_group_id = group_id.clone();
@@ -963,6 +1015,7 @@ impl TuiApp {
     }
 
     pub(crate) fn update_profile_name(&mut self, name: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let args = self.client.with_setup_relay(vec![
             "profile".to_owned(),
@@ -983,6 +1036,7 @@ impl TuiApp {
     }
 
     pub(crate) fn create_chat(&mut self, name: String, members: Vec<String>) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let all_members = unique_member_refs(members);
         let mut args = vec!["group".to_owned(), "create".to_owned(), name];
@@ -1010,6 +1064,7 @@ impl TuiApp {
     }
 
     pub(crate) fn add_selected_chat_members(&mut self, members: Vec<String>) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let members = unique_member_refs(members);
@@ -1023,6 +1078,7 @@ impl TuiApp {
     }
 
     pub(crate) fn remove_selected_chat_members(&mut self, members: Vec<String>) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let members = unique_member_refs(members);
@@ -1038,6 +1094,7 @@ impl TuiApp {
     /// Enter the group-detail screen for the selected chat, loading its data
     /// (one-shot; no per-view subscriptions). A fresh selection starts at the top.
     pub(crate) fn open_group_detail(&mut self) -> TuiResult<()> {
+        self.begin_view_action();
         let group_id = self.require_selected_group()?;
         self.group_detail = None;
         self.set_status(LOADING_GROUP_DETAIL_STATUS.to_owned());
@@ -1078,17 +1135,16 @@ impl TuiApp {
     pub(crate) fn load_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         self.loading_group_detail = Some(group_id.to_owned());
-        self.enqueue_effect(Effect::LoadGroupDetail {
+        self.group_detail_request = Some(self.enqueue_effect(Effect::LoadGroupDetail {
             account: account_id,
             group: group_id.to_owned(),
-        });
+        }));
         Ok(())
     }
 
     /// Fold a completed group-detail load. Dropped if a newer open superseded it
-    /// or the selected account or screen changed (`loading_group_detail` is
-    /// cleared on leave, and reloads of the same group keep it set so each
-    /// reload still folds). The
+    /// or the selected account or screen changed. Exact request identity is
+    /// admitted before this fold, including repeated loads of the same group. The
     /// four results arrive in `calls()` order: members, admins, relays, show.
     fn fold_group_detail(
         &mut self,
@@ -1140,12 +1196,9 @@ impl TuiApp {
         );
         view.selected = previous.min(view.members.len().saturating_sub(1));
         self.group_detail = Some(view);
-        // Clear the in-flight status now the load settled, but only if it is still
-        // showing: a reload triggered by a mutation (rename/add/remove/promote)
-        // has already set its own confirmation, which must not be clobbered.
-        if self.status == LOADING_GROUP_DETAIL_STATUS {
-            self.set_status("group detail".to_owned());
-        }
+        // A mutation’s final acknowledgement advances its feedback phase, so
+        // an older child refresh can update the view without replacing it.
+        self.set_status("group detail".to_owned());
     }
 
     fn reload_group_detail_if_active(&mut self, group_id: &str) -> TuiResult<()> {
@@ -1156,6 +1209,7 @@ impl TuiApp {
     }
 
     pub(crate) fn rename_group(&mut self, group_id: &str, name: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let result = self.client.run_json(
             Some(&account_id),
@@ -1169,6 +1223,7 @@ impl TuiApp {
     }
 
     pub(crate) fn add_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let mut args = vec![
             "groups".to_owned(),
@@ -1184,6 +1239,7 @@ impl TuiApp {
     }
 
     pub(crate) fn remove_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let mut args = vec![
             "groups".to_owned(),
@@ -1199,6 +1255,7 @@ impl TuiApp {
     }
 
     pub(crate) fn promote_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let result = self.client.run_json(
             Some(&account_id),
@@ -1213,6 +1270,7 @@ impl TuiApp {
     /// Request Leave through the core command, then reload the chat list.
     /// Admitted work can still be settling; command refusals remain errors.
     pub(crate) fn leave_group(&mut self, group_id: &str) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let result = self
             .client
@@ -1233,6 +1291,7 @@ impl TuiApp {
     /// leaving the TUI pointed at a removed account or a stale subscription (the
     /// account-switch and empty-account clearing both live in that refresh path).
     pub(crate) fn logout_account(&mut self, account_id: &str, npub: &str) -> TuiResult<()> {
+        self.begin_status_action();
         // The wipe is irreversible; its own failure still propagates (nothing was
         // removed, so `error:` is the honest report). But once it succeeds, the
         // account is gone whatever the follow-up reload does — reporting a reload
@@ -1257,14 +1316,20 @@ impl TuiApp {
     /// A load already in flight is not re-queued.
     pub(crate) fn open_invites(&mut self) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
-        if self.loading_invites {
+        if self
+            .invites_request
+            .as_ref()
+            .is_some_and(|(account, _)| account == &account_id)
+        {
             return Ok(());
         }
+        self.begin_status_action();
         self.loading_invites = true;
         self.set_status("loading invites...".to_owned());
-        self.enqueue_effect(Effect::LoadInvites {
-            account: account_id,
+        let request = self.enqueue_effect(Effect::LoadInvites {
+            account: account_id.clone(),
         });
+        self.invites_request = Some((account_id, request));
         Ok(())
     }
 
@@ -1339,6 +1404,7 @@ impl TuiApp {
     /// screen returns to the main view: that screen shows the previously selected
     /// group, which the refreshed list and selection have now moved past.
     pub(crate) fn accept_invite(&mut self, group_id: &str) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         self.client
             .run_json(Some(&account_id), &["groups", "accept", group_id])?;
@@ -1352,6 +1418,7 @@ impl TuiApp {
     }
 
     pub(crate) fn decline_invite(&mut self, group_id: &str) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         self.client
             .run_json(Some(&account_id), &["groups", "decline", group_id])?;
@@ -1375,6 +1442,7 @@ impl TuiApp {
         query: Option<String>,
         purpose: UserSearchPurpose,
     ) {
+        self.begin_view_action();
         let status = match &purpose {
             UserSearchPurpose::Browse => "user search",
             UserSearchPurpose::AddToGroup { .. } => "search a user to add",
@@ -1408,6 +1476,7 @@ impl TuiApp {
     /// With nothing loaded there is no timeline to search or jump into, so this
     /// reports instead of opening an empty screen.
     pub(crate) fn open_message_search(&mut self, query: Option<String>) -> TuiResult<()> {
+        self.begin_view_action();
         let group_id = self
             .messages_group_id
             .clone()
@@ -1456,6 +1525,7 @@ impl TuiApp {
     /// one. Every other pane operation (send, reply, react, delete, retry,
     /// load-older) already resolves the account this way.
     pub(crate) fn run_message_search(&mut self) -> TuiResult<()> {
+        self.begin_view_action();
         let account_id = self.message_account_id()?;
         let Some(view) = self.message_search.as_ref() else {
             return Ok(());
@@ -1468,11 +1538,11 @@ impl TuiApp {
         }
         self.searching_messages = Some((account_id.clone(), group.clone(), query.clone()));
         self.set_status("searching...".to_owned());
-        self.enqueue_effect(Effect::MessageSearch {
+        self.message_search_request = Some(self.enqueue_effect(Effect::MessageSearch {
             account: account_id,
             group,
             query,
-        });
+        }));
         Ok(())
     }
 
@@ -1505,9 +1575,7 @@ impl TuiApp {
                 .map(|view| view.group_id.as_str())
                 != Some(group.as_str())
         {
-            if self.status == "searching..." {
-                self.set_status(String::new());
-            }
+            self.set_status(String::new());
             return;
         }
         let values = match result {
@@ -1550,6 +1618,7 @@ impl TuiApp {
     /// Run the one-shot `users search <query>` off the event loop; the results
     /// fold into the view when they land. An empty query is a no-op with a hint.
     pub(crate) fn run_user_search(&mut self) -> TuiResult<()> {
+        self.begin_view_action();
         let account_id = self.require_selected_local_account()?;
         let query = self
             .user_search
@@ -1562,10 +1631,10 @@ impl TuiApp {
         }
         self.searching_users = Some(query.clone());
         self.set_status("searching...".to_owned());
-        self.enqueue_effect(Effect::UserSearch {
+        self.user_search_request = Some(self.enqueue_effect(Effect::UserSearch {
             account: account_id,
             query,
-        });
+        }));
         Ok(())
     }
 
@@ -1635,6 +1704,7 @@ impl TuiApp {
     /// invert the intent. No selected result is a silent no-op (the key only
     /// renders meaningful in results focus).
     fn update_search_follow(&mut self, follow: bool) {
+        self.begin_status_action();
         let Some(row) = self
             .user_search
             .as_ref()
@@ -1716,6 +1786,7 @@ impl TuiApp {
     /// Open the dismiss-on-any-key profile card for the selected search result
     /// (`users show <pubkey>`).
     pub(crate) fn open_search_profile_card(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let Some(pubkey) = self
             .user_search
             .as_ref()
@@ -1735,6 +1806,7 @@ impl TuiApp {
     /// Enter the own-profile screen, loading fields (`profile show`) and follows
     /// (`follows list`) as a one-shot read.
     pub(crate) fn open_profile(&mut self) -> TuiResult<()> {
+        self.begin_view_action();
         self.profile_view = None;
         self.load_profile()?;
         self.screen = Screen::Profile;
@@ -1767,6 +1839,7 @@ impl TuiApp {
         field: ProfileField,
         value: String,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let args = self.client.with_setup_relay(vec![
             "profile".to_owned(),
@@ -1782,6 +1855,7 @@ impl TuiApp {
     }
 
     pub(crate) fn follow_user(&mut self, pubkey: &str) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let args = self.client.with_setup_relay(vec![
             "follows".to_owned(),
@@ -1795,6 +1869,7 @@ impl TuiApp {
     }
 
     pub(crate) fn unfollow_user(&mut self, pubkey: &str) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let args = self.client.with_setup_relay(vec![
             "follows".to_owned(),
@@ -1818,6 +1893,7 @@ impl TuiApp {
     /// `relay-stats` reads the live `wnd` runtime when a socket exists and falls
     /// back to a fresh in-process read otherwise, so it always returns a snapshot.
     pub(crate) fn open_relay_health(&mut self) -> TuiResult<()> {
+        self.begin_view_action();
         let data = self.load_relay_health()?;
         self.relay_health = Some(RelayHealthView { data, scroll: 0 });
         self.screen = Screen::RelayHealth;
@@ -1827,6 +1903,7 @@ impl TuiApp {
 
     /// Re-read `relay-stats`, preserving the scroll offset.
     pub(crate) fn refresh_relay_health(&mut self) -> TuiResult<()> {
+        self.begin_view_action();
         let data = self.load_relay_health()?;
         let scroll = self.relay_health.as_ref().map_or(0, |view| view.scroll);
         self.relay_health = Some(RelayHealthView { data, scroll });
@@ -1844,6 +1921,7 @@ impl TuiApp {
         name: Option<String>,
         description: Option<String>,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let mut args = vec!["groups".to_owned(), "update".to_owned(), group_id.clone()];
@@ -1864,6 +1942,7 @@ impl TuiApp {
     }
 
     pub(crate) fn set_selected_chat_archived(&mut self, archived: bool) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let verb = if archived { "archive" } else { "unarchive" };
@@ -1879,6 +1958,7 @@ impl TuiApp {
     }
 
     pub(crate) fn set_selected_chat_muted(&mut self, duration: String) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let result = self
@@ -1893,6 +1973,7 @@ impl TuiApp {
     }
 
     pub(crate) fn clear_selected_chat_muted(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         self.client
@@ -1902,6 +1983,7 @@ impl TuiApp {
     }
 
     pub(crate) fn show_selected_chat_members(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let result = self
@@ -1912,6 +1994,7 @@ impl TuiApp {
     }
 
     pub(crate) fn set_archived_chat_visibility(&mut self, include: bool) -> TuiResult<()> {
+        self.begin_status_action();
         self.show_archived_chats = include;
         self.refresh_chats()?;
         self.set_status(if include {
@@ -1927,6 +2010,7 @@ impl TuiApp {
         identity: Option<String>,
         action: &'static str,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let invocation = account_setup_invocation(identity, self.client.account_setup_relay());
         let result = match invocation.stdin {
             Some(stdin) => self
@@ -1980,6 +2064,7 @@ impl TuiApp {
         stream_id: Option<String>,
         quic_candidates: Vec<String>,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let mut args = vec!["stream".to_owned(), "start".to_owned(), group_id];
@@ -2007,6 +2092,7 @@ impl TuiApp {
         stream_id: Option<String>,
         insecure_local: bool,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let mut args = vec![
@@ -2036,6 +2122,7 @@ impl TuiApp {
         chunk_count: u64,
         text: String,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let args = vec![
@@ -2066,6 +2153,7 @@ impl TuiApp {
         transcript_hash: String,
         chunk_count: Option<u64>,
     ) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let mut args = vec![
@@ -2140,6 +2228,7 @@ impl TuiApp {
     }
 
     pub(crate) fn start_daemon(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let args = daemon_start_args(
             &self.client.discovery_relays,
             &self.client.default_account_relays,
@@ -2151,6 +2240,7 @@ impl TuiApp {
     }
 
     pub(crate) fn stop_daemon(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let result = self.client.run_json(None, &["daemon", "stop"])?;
         self.daemon = parse_daemon_view(&result);
         self.chat_subscription = None;
@@ -2177,6 +2267,8 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|accounts| accounts.iter().filter_map(parse_account).collect())
             .unwrap_or_default();
+        self.pending_invite_notices
+            .retain(|id, _| self.accounts.iter().any(|row| &row.account_id == id));
         self.selected_account =
             selected_account_index(&self.accounts, previous_account_id.as_deref()).unwrap_or(0);
         if self.accounts.is_empty() {
@@ -2265,10 +2357,13 @@ impl TuiApp {
                 self.set_status(format!("message subscription failed: {err}"));
                 return Ok(());
             }
-            self.set_status(format!(
-                "loaded account {}; no chats",
-                shorten(&account_display_label(&account), 18)
-            ));
+            self.finish_timeline_status(
+                format!(
+                    "loaded account {}; no chats",
+                    shorten(&account_display_label(&account), 18)
+                ),
+                false,
+            );
             return Ok(());
         }
         self.refresh_messages()
@@ -2279,6 +2374,7 @@ impl TuiApp {
     /// missing) and hands the load to the effect worker; the page, subscriptions,
     /// mark-read, and diagnostics are folded in when the result lands.
     pub(crate) fn refresh_messages(&mut self) -> TuiResult<()> {
+        self.begin_status_action();
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         self.begin_timeline_load(account_id, group_id);
@@ -2622,7 +2718,7 @@ impl TuiApp {
         self.timeline_scroll.on_prepend(prepended);
         self.timeline_scroll.has_more_before = timeline_page_has_more_before(&result);
         self.timeline_scroll.loading_older = false;
-        self.finish_timeline_status(format!("loaded {prepended} older message(s)"), false);
+        self.set_drain_status(format!("loaded {prepended} older message(s)"));
         Ok(())
     }
 
@@ -2902,6 +2998,27 @@ impl TuiApp {
         }
     }
 
+    pub(crate) fn deliver_pending_invite_notice(&mut self) -> bool {
+        if self.screen != Screen::Main || self.status_ownership.retained || !self.status_is_owned()
+        {
+            return false;
+        }
+        let Some(account) = self
+            .selected_account_row()
+            .map(|row| row.account_id.clone())
+        else {
+            return false;
+        };
+        // Account inventory bounds retained notices and discards removed identities.
+        self.pending_invite_notices
+            .retain(|id, _| self.accounts.iter().any(|row| &row.account_id == id));
+        let Some(notice) = self.pending_invite_notices.remove(&account) else {
+            return false;
+        };
+        self.set_drain_status(notice);
+        true
+    }
+
     pub(crate) fn drain_chat_subscription(&mut self) -> bool {
         let Some(subscription) = self.chat_subscription.as_ref() else {
             return false;
@@ -3175,7 +3292,12 @@ impl TuiApp {
                         loaded_group_id.as_deref(),
                         parse_notification_event(&result),
                     ) {
-                        self.set_drain_status(notice);
+                        self.pending_invite_notices
+                            .entry(subscription_account_id.clone())
+                            .and_modify(|pending| {
+                                *pending = "new group invites — press I to view invites".to_owned()
+                            })
+                            .or_insert(notice);
                     }
                 }
                 SubscriptionEvent::Error(err) => {
