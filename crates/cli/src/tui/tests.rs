@@ -2415,6 +2415,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         input: Input::default(),
         streaming: None,
         pending_invite_notices: Default::default(),
+        invite_notice_revision: 0,
         view_status_action: None,
         user_search_request: None,
         message_search_request: None,
@@ -13229,8 +13230,12 @@ fn invites_load_reports_loading_then_opens_the_picker() {
 
     let request_id = app
         .invites_request
-        .get_or_insert_with(|| (String::new(), RequestId::default()))
-        .1;
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
     app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
@@ -13279,8 +13284,12 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
 
     let request_id = app
         .invites_request
-        .get_or_insert_with(|| (String::new(), RequestId::default()))
-        .1;
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
     app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_a.clone(),
@@ -13329,8 +13338,12 @@ fn an_invites_fold_over_an_image_popup_reopens_through_the_close_funnel() {
     app.loading_invites = true;
     let request_id = app
         .invites_request
-        .get_or_insert_with(|| (String::new(), RequestId::default()))
-        .1;
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
     app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
@@ -13372,8 +13385,12 @@ fn an_invites_fold_while_on_the_profile_screen_does_not_open_the_picker() {
 
     let request_id = app
         .invites_request
-        .get_or_insert_with(|| (String::new(), RequestId::default()))
-        .1;
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
     app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
@@ -17923,4 +17940,458 @@ fn invite_notices_wait_for_available_main_feedback() {
             "delivered notices are consumed exactly once"
         );
     }
+    {
+        for outcome in ["success", "failure", "new-during-success"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let exe = dir.path().join("wn-invite-notice-ack");
+            let listing = if outcome == "failure" {
+                serde_json::json!({"ok":false,"error":{"message":"invite list offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"invites":[]}})
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+             *' groups invites '*)\n{}printf '%s\\n' '{listing}';;\n\
+             *) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[]}}}}';;\n\
+             esac\n",
+                    gate.script(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (issued_tx, issued_rx) = mpsc::channel();
+            let (continue_tx, continue_rx) = mpsc::channel::<bool>();
+            let (during_tx, during_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let worker = thread::spawn(move || {
+                let account = "aa".repeat(32);
+                let mut app = test_tui_app(client, &account);
+                app.daemon.running = false;
+                app.focus = Focus::Chats;
+                app.run_slash_command(SlashCommand::Diagnostics).unwrap();
+                let retained = app.status.clone();
+                let (notice_tx, rx) = mpsc::channel();
+                app.notification_subscription = Some(NotificationSubscription {
+                    account_id: account.clone(),
+                    child: test_sleep_child(),
+                    rx,
+                });
+                for (key, name) in [
+                    ("invite:ack-before-one", "Before one"),
+                    ("invite:ack-before-two", "Before two"),
+                ] {
+                    notice_tx
+                        .send(SubscriptionEvent::Result(serde_json::json!({
+                            "type":"notification","account_id":account,
+                            "notification":{"trigger":"GroupInvite","group_name":name,
+                                "notification_key":key}
+                        })))
+                        .unwrap();
+                }
+                app.tick();
+                assert_eq!(
+                    app.status, retained,
+                    "preexisting notices are queued behind retained command feedback"
+                );
+
+                // This must return while the physical groups-invites child is held.
+                app.handle_key(char_key('I')).unwrap();
+                issued_tx.send(app.status.clone()).unwrap();
+                if continue_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    if outcome == "new-during-success" {
+                        notice_tx
+                            .send(SubscriptionEvent::Result(serde_json::json!({
+                                "type":"notification","account_id":account,
+                                "notification":{"trigger":"GroupInvite","group_name":"During list",
+                                    "notification_key":"invite:ack-during-three"}
+                            })))
+                            .unwrap();
+                        app.tick();
+                    }
+                    during_tx.send(app.status.clone()).unwrap();
+                }
+                if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return;
+                }
+                finish_queued_effects(&mut app);
+                let terminal = if outcome == "failure" {
+                    "error: invite list offline"
+                } else {
+                    "0 pending invite(s)"
+                };
+                assert_eq!(app.status, terminal, "{outcome}: actual I outcome");
+                assert!(rendered_buffer(&mut app).contains(terminal));
+
+                // Close the real successful empty-list card, then make Main idle via
+                // the actual empty-chat refresh. No feedback/token state is seeded.
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                app.refresh_chats().unwrap();
+                app.tick();
+                if outcome == "success" {
+                    assert!(
+                        app.status.contains("no chats"),
+                        "successful I acknowledges the already queued notices: {}",
+                        app.status
+                    );
+                    assert!(!rendered_buffer(&mut app).contains("press I to view invites"));
+                } else {
+                    assert_eq!(
+                        app.status, "new group invites — press I to view invites",
+                        "{outcome}: failed I preserves old notices; successful I preserves a newer arrival"
+                    );
+                    assert!(rendered_buffer(&mut app).contains("press I to view invites"));
+                }
+                // Both kinds of retained notice are presented once, not replayed.
+                app.refresh_chats().unwrap();
+                app.tick();
+                assert!(
+                    app.status.contains("no chats"),
+                    "{outcome}: consumed exactly once"
+                );
+            });
+            gate.wait_until_entered();
+            let issued = issued_rx.recv_timeout(Duration::from_secs(5));
+            continue_tx.send(issued.is_ok()).unwrap();
+            let during = if issued.is_ok() {
+                Some(during_rx.recv_timeout(Duration::from_secs(5)))
+            } else {
+                None
+            };
+            let can_finish = issued.is_ok() && during.as_ref().is_some_and(Result::is_ok);
+            // Release before asserting/joining even if a broken foreground blocks.
+            gate.release();
+            finish_tx.send(can_finish).unwrap();
+            worker.join().unwrap();
+            assert_eq!(
+                issued.expect("I returned before list-child release"),
+                "loading invites..."
+            );
+            assert_eq!(
+                during
+                    .unwrap()
+                    .expect("notice drain returned while list child held"),
+                "loading invites...",
+                "{outcome}: occupied list feedback survives the arrival"
+            );
+        }
+    }
+}
+
+// Feedback-free UI actions keep the active request status authority.
+#[cfg(unix)]
+#[test]
+fn no_feedback_main_actions_preserve_the_pending_operations_terminal_feedback() {
+    let mut observed = Vec::new();
+    for ui in [
+        "control",
+        "empty-enter",
+        "whitespace-enter",
+        "react-prefill",
+        "delete-prefill",
+        "ready-image",
+        "logout-submit",
+        "help-submit",
+    ] {
+        for outcome in ["send-success", "send-error", "page-error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let exe = dir.path().join("wn-no-feedback");
+            let args_file = dir.path().join("calls");
+            let send = if outcome == "send-error" {
+                serde_json::json!({"ok":false,"error":{"message":"send offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"message_ids":["sent-id"],"published":2}})
+            };
+            let send_gate = if outcome.starts_with("send-") {
+                gate.script()
+            } else {
+                String::new()
+            };
+            let page_gate = if outcome == "page-error" {
+                gate.script()
+            } else {
+                String::new()
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' messages send '*)\n{send_gate}printf '%s\\n' '{send}';;\n\
+                 *' messages timeline list '*)\n{page_gate}printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"page offline\"}}}}';;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    args_file.display(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let (ui_tx, ui_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let account = "aa".repeat(32);
+                let group = "cc".repeat(16);
+                let mut app = test_tui_app(client, &account);
+                app.daemon.running = false;
+                app.chats = vec![flick_chat(&group, "Room")];
+                app.messages_account_id = Some(account);
+                app.messages_group_id = Some(group);
+                let mut row = timeline_row("existing-row", 100);
+                if ui == "ready-image" {
+                    row.attachments = vec![image_attachment("cafebabe")];
+                    app.media = media_with_ready_image("cafebabe");
+                }
+                app.timeline = vec![row];
+                if outcome == "page-error" {
+                    // A genuine same-chat reload preserves the selected row,
+                    // so image/prefill keys are valid while its child is pending.
+                    app.refresh_messages().unwrap();
+                } else {
+                    app.send_message("pending body".to_owned()).unwrap();
+                }
+                continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let action_ok = match ui {
+                    "control" => true,
+                    "empty-enter" | "whitespace-enter" => {
+                        app.focus = Focus::Composer;
+                        app.input
+                            .set_value(if ui == "empty-enter" { "" } else { " \t " });
+                        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                            .unwrap();
+                        app.input.is_empty() && app.popup.is_none()
+                    }
+                    "react-prefill" | "delete-prefill" => {
+                        app.focus = Focus::Messages;
+                        app.input.clear();
+                        app.handle_key(char_key(if ui == "react-prefill" { 'r' } else { 'd' }))
+                            .unwrap();
+                        app.focus == Focus::Composer
+                            && app.input.value()
+                                == if ui == "react-prefill" {
+                                    "/react "
+                                } else {
+                                    "/delete"
+                                }
+                    }
+                    "ready-image" => {
+                        app.focus = Focus::Messages;
+                        app.handle_key(char_key('o')).unwrap();
+                        matches!(app.popup, Some(Popup::Image { .. }))
+                    }
+                    "logout-submit" | "help-submit" => {
+                        // Exercise submit_input too: removing the popup leaf's
+                        // claim cannot repair a generic claim in slash dispatch.
+                        app.focus = Focus::Composer;
+                        app.input.set_value(if ui == "logout-submit" {
+                            "/logout"
+                        } else {
+                            "/help"
+                        });
+                        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                            .unwrap();
+                        app.input.is_empty()
+                            && if ui == "logout-submit" {
+                                matches!(
+                                    app.popup,
+                                    Some(Popup::Text {
+                                        purpose: TextPurpose::ConfirmLogout { .. },
+                                        ..
+                                    })
+                                )
+                            } else {
+                                matches!(app.popup, Some(Popup::Card { .. }))
+                            }
+                    }
+                    _ => unreachable!(),
+                };
+                ui_tx.send((action_ok, app.status.clone())).unwrap();
+                if finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    finish_queued_effects(&mut app);
+                    Some((
+                        app.status.clone(),
+                        app.loading_chat.is_none(),
+                        timeline_ids(&app.timeline)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            gate.wait_until_entered();
+            continue_tx.send(()).unwrap();
+            let ui_before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+            gate.release();
+            finish_tx.send(ui_before_release.is_ok()).unwrap();
+            let final_state = worker.join().unwrap();
+            let (action_ok, before) =
+                ui_before_release.expect("UI action completed before child release");
+            let (after, settled, ids) =
+                final_state.expect("released operation was folded through FIFO");
+            let expected = match outcome {
+                "send-success" => "sent message; published=2",
+                "send-error" => "error: send offline",
+                "page-error" => "error: page offline",
+                _ => unreachable!(),
+            };
+            let expected_pending = if outcome == "page-error" {
+                LOADING_TIMELINE_STATUS
+            } else {
+                "sending..."
+            };
+            let calls = std::fs::read_to_string(&args_file).unwrap();
+            let sends = calls
+                .lines()
+                .filter(|line| line.contains(" messages send "))
+                .count();
+            let pages = calls
+                .lines()
+                .filter(|line| line.contains(" messages timeline list "))
+                .count();
+            let model_ok = ids.contains(&"existing-row".to_owned())
+                && ids.contains(&"sent-id".to_owned()) == (outcome == "send-success");
+            observed.push((
+                ui,
+                outcome,
+                before.clone(),
+                after.clone(),
+                action_ok
+                    && before == expected_pending
+                    && after == expected
+                    && settled
+                    && model_ok
+                    && sends == usize::from(outcome.starts_with("send-"))
+                    && pages == usize::from(outcome == "page-error"),
+            ));
+        }
+    }
+    assert!(
+        observed.iter().all(|row| row.4),
+        "no-feedback UI actions preserve actual pending terminal feedback: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_search_profile_card_preserves_the_pending_follows_feedback() {
+    // Supported UI path: real user search -> f -> Enter profile card. Do not
+    // invent a Main send/page under Search: entering Search already supersedes
+    // Main feedback. The async follow is the genuine pending action on this view.
+    let mut observed = Vec::new();
+    for fails in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let exe = dir.path().join("wn-card-during-follow");
+        let args_file = dir.path().join("calls");
+        let peer = "bb".repeat(32);
+        let search = serde_json::json!({"ok":true,"result":{"users":[{
+            "account_id_hex":peer,"npub":"npub1bob","radius":1,
+            "matched_field":"name","match_quality":"exact",
+            "profile":{"display_name":"Bob"}
+        }]}});
+        let follow = if fails {
+            serde_json::json!({"ok":false,"error":{"message":"follow offline"}})
+        } else {
+            serde_json::json!({"ok":true,"result":{}})
+        };
+        let card = serde_json::json!({"ok":true,"result":{"user":{
+            "npub":"npub1bob","profile":{"display_name":"Bob"}
+        }}});
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+             *' users search '*) printf '%s\\n' '{search}';;\n\
+             *' follows add '*)\n{}printf '%s\\n' '{follow}';;\n\
+             *' users show '*) printf '%s\\n' '{card}';;\n\
+             *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                args_file.display(),
+                gate.script(),
+            ),
+        );
+        let client = WnClient {
+            exe,
+            relay: Some("wss://relay.example".to_owned()),
+            ..test_unused_client()
+        };
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut app = test_tui_app(client, &"aa".repeat(32));
+            app.daemon.running = false;
+            app.open_user_search(Some("Bob".to_owned()));
+            finish_queued_effects(&mut app);
+            assert_eq!(
+                app.user_search.as_ref().unwrap().focus,
+                UserSearchFocus::Results
+            );
+            app.handle_key(char_key('f')).unwrap();
+            continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            ui_tx
+                .send((
+                    matches!(app.popup, Some(Popup::Card { ref title, .. }) if title == "Profile"),
+                    app.status.clone(),
+                ))
+                .unwrap();
+            if finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                finish_queued_effects(&mut app);
+                Some((
+                    app.status.clone(),
+                    app.user_search.as_ref().unwrap().results[0].following,
+                ))
+            } else {
+                None
+            }
+        });
+        gate.wait_until_entered();
+        continue_tx.send(()).unwrap();
+        let ui_before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+        gate.release();
+        finish_tx.send(ui_before_release.is_ok()).unwrap();
+        let after = worker
+            .join()
+            .unwrap()
+            .expect("follow folded through the real FIFO");
+        let (card_open, before) = ui_before_release.expect("card opened before follow release");
+        let expected = if fails {
+            "error: follow offline"
+        } else {
+            "followed Bob"
+        };
+        let calls = std::fs::read_to_string(args_file).unwrap();
+        observed.push((
+            fails,
+            before.clone(),
+            after.0.clone(),
+            card_open
+                && before == "following Bob..."
+                && after.0 == expected
+                && after.1 == !fails
+                && calls
+                    .lines()
+                    .filter(|line| line.contains(" follows add "))
+                    .count()
+                    == 1
+                && calls
+                    .lines()
+                    .filter(|line| line.contains(" users show "))
+                    .count()
+                    == 1,
+        ));
+    }
+    assert!(
+        observed.iter().all(|row| row.3),
+        "successful profile-card opening cannot strand the actual pending follow: {observed:?}"
+    );
 }

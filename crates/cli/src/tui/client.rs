@@ -408,15 +408,13 @@ impl TuiApp {
             }
             *slot = None;
         }
-        if matches!(effect, Effect::LoadInvites { .. }) {
-            if !self
+        if matches!(effect, Effect::LoadInvites { .. })
+            && !self
                 .invites_request
                 .as_ref()
-                .is_some_and(|(_, id)| *id == request_id)
-            {
-                return;
-            }
-            self.invites_request = None;
+                .is_some_and(|pending| pending.request == request_id)
+        {
+            return;
         }
         self.with_status_owner(status_owner, |app| app.fold_effect(effect, result));
     }
@@ -1319,7 +1317,7 @@ impl TuiApp {
         if self
             .invites_request
             .as_ref()
-            .is_some_and(|(account, _)| account == &account_id)
+            .is_some_and(|pending| pending.account == account_id)
         {
             return Ok(());
         }
@@ -1329,7 +1327,15 @@ impl TuiApp {
         let request = self.enqueue_effect(Effect::LoadInvites {
             account: account_id.clone(),
         });
-        self.invites_request = Some((account_id, request));
+        let notice_revision = self
+            .pending_invite_notices
+            .get(&account_id)
+            .map(|notice| notice.revision);
+        self.invites_request = Some(PendingInvites {
+            account: account_id,
+            request,
+            notice_revision,
+        });
         Ok(())
     }
 
@@ -1341,6 +1347,12 @@ impl TuiApp {
     /// switch or after the user left for another screen never pops a picker of a
     /// switched-away account's invites or over a screen it cannot be opened from.
     fn fold_invites(&mut self, account: String, result: Result<Vec<Value>, String>) {
+        // Exact RequestId was admitted before entering this fold. A successful
+        // listing acknowledges only reminders present when it was requested.
+        let notice_revision = self
+            .invites_request
+            .take()
+            .and_then(|pending| pending.notice_revision);
         if !self.loading_invites {
             return;
         }
@@ -1366,6 +1378,13 @@ impl TuiApp {
                 return;
             }
         };
+        if notice_revision.is_some_and(|revision| {
+            self.pending_invite_notices
+                .get(&account)
+                .is_some_and(|notice| notice.revision == revision)
+        }) {
+            self.pending_invite_notices.remove(&account);
+        }
         let items = parse_invite_items(&result);
         let count = items.len();
         // Route the replacement through the close funnel so a pixel image drawn
@@ -1525,13 +1544,13 @@ impl TuiApp {
     /// one. Every other pane operation (send, reply, react, delete, retry,
     /// load-older) already resolves the account this way.
     pub(crate) fn run_message_search(&mut self) -> TuiResult<()> {
-        self.begin_view_action();
         let account_id = self.message_account_id()?;
         let Some(view) = self.message_search.as_ref() else {
             return Ok(());
         };
         let group = view.group_id.clone();
         let query = view.query.value().trim().to_owned();
+        self.begin_view_action();
         if query.is_empty() {
             self.set_status("type a query, then Enter to search".to_owned());
             return Ok(());
@@ -1704,7 +1723,6 @@ impl TuiApp {
     /// invert the intent. No selected result is a silent no-op (the key only
     /// renders meaningful in results focus).
     fn update_search_follow(&mut self, follow: bool) {
-        self.begin_status_action();
         let Some(row) = self
             .user_search
             .as_ref()
@@ -1714,6 +1732,7 @@ impl TuiApp {
         };
         let pubkey = row.pubkey.clone();
         let label = row.display_label();
+        self.begin_status_action();
         let account = match self.require_selected_local_account() {
             Ok(account) => account,
             Err(err) => {
@@ -1786,7 +1805,6 @@ impl TuiApp {
     /// Open the dismiss-on-any-key profile card for the selected search result
     /// (`users show <pubkey>`).
     pub(crate) fn open_search_profile_card(&mut self) -> TuiResult<()> {
-        self.begin_status_action();
         let Some(pubkey) = self
             .user_search
             .as_ref()
@@ -3015,7 +3033,7 @@ impl TuiApp {
         let Some(notice) = self.pending_invite_notices.remove(&account) else {
             return false;
         };
-        self.set_drain_status(notice);
+        self.set_drain_status(notice.text);
         true
     }
 
@@ -3292,12 +3310,22 @@ impl TuiApp {
                         loaded_group_id.as_deref(),
                         parse_notification_event(&result),
                     ) {
+                        self.invite_notice_revision = self
+                            .invite_notice_revision
+                            .checked_add(1)
+                            .expect("invite notice revision exhausted");
+                        let revision = self.invite_notice_revision;
                         self.pending_invite_notices
                             .entry(subscription_account_id.clone())
                             .and_modify(|pending| {
-                                *pending = "new group invites — press I to view invites".to_owned()
+                                pending.revision = revision;
+                                pending.text =
+                                    "new group invites — press I to view invites".to_owned();
                             })
-                            .or_insert(notice);
+                            .or_insert(PendingInviteNotice {
+                                revision,
+                                text: notice,
+                            });
                     }
                 }
                 SubscriptionEvent::Error(err) => {
