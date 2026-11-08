@@ -752,6 +752,20 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         Some((visible - sample.at) * 1e3)
     });
     let mut live_visibility = percentiles(visible);
+    // The slowest messages, split into alice's send call and the rest, which
+    // is bob's share: visibility runs from the send's start.
+    let mut slowest = sent
+        .clone()
+        .filter_map(|sample| Some((sample, (seen.get(&sample.index)? - sample.at) * 1e3)))
+        .collect::<Vec<_>>();
+    slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+    slowest.truncate(5);
+    live_visibility["slowest"] = json!(slowest.iter().map(|(sample, visible_ms)| json!({
+        "sent_at_seconds": sample.at,
+        "visible_ms": visible_ms,
+        "send_ms": sample.ms,
+        "after_send_ms": visible_ms - sample.ms,
+    })).collect::<Vec<_>>());
     let not_visible = sent.count() as u64 - live_visibility["n"].as_u64().unwrap_or(0);
     live_visibility["not_visible"] = json!(not_visible);
     live_visibility["sends"] = latencies(&live_sends);

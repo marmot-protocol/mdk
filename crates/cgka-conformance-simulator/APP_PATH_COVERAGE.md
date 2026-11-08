@@ -94,7 +94,8 @@ surveyed. `scorecard.json`
 under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 
 - status command (`group_recovery_status`) and send latency p50/p95/max;
-- live-message visibility;
+- live-message visibility, timed from the start of alice's send. The slowest five are listed with their start
+  offset, alice's send time and what came after it, which is bob's share;
 - commit-applied and decrypted times;
 - per-relay bytes, and EVENT frames split into re-downloaded held history, novel events and the missing commit;
 - each endpoint's EVENT copies and bytes split by cause (`download_split`):
