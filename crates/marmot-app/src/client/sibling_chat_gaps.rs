@@ -794,9 +794,18 @@ impl AppClient {
             }
             if !retire.is_empty() {
                 // The Add follows once the Remove confirms and the chat
-                // finds the sibling missing, under a claim of its own.
+                // finds the sibling missing, under a claim of its own. No
+                // user chose this removal, so it carries no human action
+                // (as for gone devices' leaves, device_removal.rs).
                 *budget -= 1;
-                match self.remove_own_account_leaves(chat, retire).await? {
+                match self
+                    .remove_own_account_leaves(
+                        chat,
+                        retire,
+                        marmot_forensics::AuditEventContext::default(),
+                    )
+                    .await?
+                {
                     OwnLeafRemoval::Sent => {
                         self.sibling_chat_gaps
                             .release_own_claim(&gap, &exchange.own_slot);
