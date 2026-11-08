@@ -2166,8 +2166,8 @@ async fn a_non_admin_cannot_commit_anything_beside_its_own_accounts_leaves() {
     // An Add of bob's device carried by reference: alice, an admin, proposes
     // it and bob commits her proposal. A same-account Add is by value only, so
     // the Commit is admin-required. Each proposal is authorized on its own, so
-    // the refusal is the committer check, which replay reports without a
-    // category in every group, as before this class existed (mdk#2647).
+    // the refusal is the committer check, which replay reports as
+    // `authorization_failed` like the proposal checks above (mdk#2647).
     let proposal = standalone_add(&m.alice, &gid, &bob_kp);
     let outcome = m.carol.engine.ingest(proposal.clone()).await.unwrap();
     assert!(
@@ -2188,7 +2188,7 @@ async fn a_non_admin_cannot_commit_anything_beside_its_own_accounts_leaves() {
     );
     assert_eq!(
         assert_rejected_on_replay(&mut m.carol, &by_reference, &gid).await,
-        None
+        Some(ProposalRejectionCategory::AuthorizationFailed)
     );
 
     // Every rejected Commit left the parent open: bob's same-account Add of

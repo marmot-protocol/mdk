@@ -848,6 +848,125 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
     assert_eq!(carol.epoch(&group_id).unwrap(), before_epoch);
 }
 
+/// A Commit refused only because its committer is not an admin is terminal
+/// `authorization_failed` (`protocol-core/convergence.md`), in a group that
+/// does not require account devices. Bob, not an admin, commits Alice's Add
+/// by reference; the proposal passes on its own, so the committer check is
+/// the only refusal. Carol's replay drops the Commit with the category,
+/// records one `Rejection` for it and stays at the parent (mdk#2647).
+#[tokio::test]
+async fn a_non_admin_committing_an_admins_proposal_fails_authorization_on_replay() {
+    use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+
+    let audit_dir = tempfile::TempDir::new().unwrap();
+    let audit_path = audit_dir.path().join("committer-check.jsonl");
+    let recorder = JsonlRecorder::open(&audit_path, "committer-check-test".to_string()).unwrap();
+    let (mut alice, alice_storage) = build_current_with_storage(b"alice-committer-check");
+    let (mut bob, bob_storage) = build_current_with_storage(b"bob-committer-check");
+    let mut carol = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .identity(pad32(b"carol-committer-check"))
+        .account_identity_proof_signer(proof_signer(b"carol-committer-check"))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+    let group_id = establish_current_group(&mut alice, &mut bob, false, "committer-check").await;
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg,
+        pending,
+        mut welcomes,
+    } = invite
+    else {
+        panic!("expected GroupEvolution, got {invite:?}");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(msg).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("bob applies Carol's invite");
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    let crypto = RustCrypto::default();
+    let dave_kp = build_current_with_storage(b"dave-committer-check")
+        .0
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let MlsMessageBodyIn::KeyPackage(dave_kp) =
+        MlsMessageIn::tls_deserialize_exact(dave_kp.bytes())
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected a KeyPackage")
+    };
+    let dave_kp = dave_kp
+        .validate(&crypto, openmls::prelude::ProtocolVersion::Mls10)
+        .unwrap();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let (mut alice_group, alice_signer) =
+        load_group_and_signer(&alice_storage, &crypto, &alice.self_id(), &group_id);
+    let (add, _) = alice_group
+        .propose_add_member(&provider, &alice_signer, &dave_kp)
+        .expect("raw OpenMLS builds the Add proposal");
+    alice_group
+        .clear_pending_proposals(provider.storage())
+        .unwrap();
+    let proposal = proposal_transport(add, &group_id, "raw-add");
+    let outcome = carol.ingest(proposal.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Processed),
+        "an admin's Add proposal is admitted: {outcome:?}"
+    );
+    let commit =
+        commit_pending_proposals(&bob_storage, &crypto, &bob.self_id(), &group_id, &proposal);
+    let commit_id = canonicalization_message_id(&commit);
+    let before_epoch = carol.epoch(&group_id).unwrap();
+
+    carol.ingest(commit).await.unwrap();
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("the committer check is a terminal disposition");
+    assert!(result.accepted_commits.is_empty(), "{result:?}");
+    let dropped = result
+        .dropped_messages
+        .iter()
+        .find(|dropped| dropped.message_id == commit_id)
+        .unwrap_or_else(|| panic!("dropped: {:?}", result.dropped_messages));
+    assert_eq!(
+        (dropped.reason, dropped.rejection_category),
+        (
+            DroppedMessageReason::InvalidAgainstCandidateState,
+            Some(ProposalRejectionCategory::AuthorizationFailed)
+        )
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), before_epoch);
+
+    drop(carol);
+    let rejections = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<AuditEvent>(line).unwrap())
+        .filter_map(|event| match event.kind {
+            AuditEventKind::Rejection { msg_id, reason } => Some((msg_id, reason)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejections,
+        vec![(commit_id, "authorization_failed".to_string())]
+    );
+}
+
 #[tokio::test]
 async fn standalone_update_authorization_is_profile_specific() {
     let (mut alice, _alice_storage) = build_current_with_storage(b"alice-current");
