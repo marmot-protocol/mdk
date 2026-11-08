@@ -26,7 +26,9 @@ to an executable path when Odin is not on `PATH`.
 
 Optimized `x86_64-unknown-linux-gnu` builds use the pinned Rust toolchain's `llvm-tools-preview` component to optimize
 Odin's LLVM IR and generate native code in parallel. This work finishes before Rust consumes the archive; optimization
-is not deferred to an application link. Other targets use Odin's native backend. The separate
+is not deferred to an application link. Android also uses these LLVM tools, with complete Android target triples and
+the selected API level, to reserve arm64's `x18` register and preserve x86 stack alignment. Other targets use Odin's
+native backend. The separate
 [`marmot-markdown-ast`](../marmot-markdown-ast/README.md) crate lets serde/type compilation overlap native compilation
 without changing the public Rust module paths or JSON representation.
 

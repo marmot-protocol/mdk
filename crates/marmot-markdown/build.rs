@@ -57,7 +57,8 @@ fn main() {
     let object_output = os == "android" || os == "ios";
     let parallel_codegen =
         target == "x86_64-unknown-linux-gnu" && env::var("OPT_LEVEL").as_deref() != Ok("0");
-    let native_output = if parallel_codegen {
+    let llvm_output = parallel_codegen || os == "android";
+    let native_output = if llvm_output {
         let directory = out_dir.join("llvm");
         fs::create_dir_all(&directory).expect("create native LLVM output directory");
         directory
@@ -69,7 +70,7 @@ fn main() {
     let mut command = Command::new(compiler);
     command
         .args(["build", "odin", "-no-entry-point", "-bedrock"])
-        .arg(if parallel_codegen {
+        .arg(if llvm_output {
             "-build-mode:llvm-ir"
         } else if object_output {
             "-build-mode:obj"
@@ -83,7 +84,7 @@ fn main() {
         .arg("-thread-count:8")
         .arg("-warnings-as-errors")
         .arg(
-            if parallel_codegen || env::var("OPT_LEVEL").as_deref() == Ok("0") {
+            if llvm_output || env::var("OPT_LEVEL").as_deref() == Ok("0") {
                 "-o:minimal"
             } else {
                 "-o:speed"
@@ -103,10 +104,19 @@ fn main() {
             command.arg(format!("-minimum-os-version:{minimum}"));
         }
     }
+    let mut android_target = None;
     let archiver = if os == "android" {
         let (ndk, toolchain, archiver) = android_toolchain(&target);
         println!("cargo:rerun-if-env-changed=ANDROID_API");
         let api = env::var("ANDROID_API").unwrap_or_else(|_| "26".into());
+        let triple = match arch {
+            "arm64" => "aarch64-unknown-linux-android",
+            "arm32" => "armv7a-unknown-linux-androideabi",
+            "amd64" => "x86_64-unknown-linux-android",
+            "i386" => "i686-unknown-linux-android",
+            _ => unreachable!("validated Odin architecture"),
+        };
+        android_target = Some(format!("{triple}{api}"));
         command
             .arg("-subtarget:android")
             .arg(format!("-minimum-os-version:{api}"))
@@ -132,10 +142,14 @@ fn main() {
     if parallel_codegen {
         finalize_native(&native_output, &archive);
     } else if let Some(mut archiver) = archiver {
+        let object = match android_target {
+            Some(target) => finalize_android(&native_output, &target),
+            None => native_output,
+        };
         let status = archiver
             .arg("crs")
             .arg(&archive)
-            .arg(&native_output)
+            .arg(&object)
             .status()
             .expect("run native object archiver");
         assert!(status.success(), "archive Odin object for {target}");
@@ -147,7 +161,7 @@ fn main() {
     }
 }
 
-fn finalize_native(directory: &Path, archive: &Path) {
+fn native_tools() -> PathBuf {
     let rustc = env::var_os("RUSTC").expect("Cargo RUSTC");
     let sysroot = Command::new(rustc)
         .args(["--print", "sysroot"])
@@ -155,10 +169,45 @@ fn finalize_native(directory: &Path, archive: &Path) {
         .expect("find Rust sysroot");
     assert!(sysroot.status.success(), "find Rust sysroot");
     let sysroot = String::from_utf8(sysroot.stdout).expect("UTF-8 Rust sysroot");
-    let tools = Path::new(sysroot.trim())
+    Path::new(sysroot.trim())
         .join("lib/rustlib")
         .join(env::var("HOST").expect("Cargo HOST"))
-        .join("bin");
+        .join("bin")
+}
+
+fn finalize_android(directory: &Path, target: &str) -> PathBuf {
+    let tools = native_tools();
+    let suffix = env::consts::EXE_SUFFIX;
+    let optimized = env::var("OPT_LEVEL").as_deref() != Ok("0");
+    // Odin's pinned Android triples omit the vendor. Set a complete triple
+    // before optimization/codegen so LLVM reserves x18 and aligns x86 stacks.
+    run_native(
+        Command::new(tools.join(format!("opt{suffix}")))
+            .arg(format!("-mtriple={target}"))
+            .arg(if optimized {
+                "-passes=default<O3>"
+            } else {
+                "-passes=default<O0>"
+            })
+            .arg(directory.join(".ll"))
+            .arg("-o")
+            .arg(directory.join("optimized.bc")),
+    );
+    let object = directory.join("markdown.o");
+    run_native(
+        Command::new(tools.join(format!("llc{suffix}")))
+            .arg(format!("-mtriple={target}"))
+            .args(["-filetype=obj", "-relocation-model=pic"])
+            .arg(if optimized { "-O=2" } else { "-O=0" })
+            .arg(directory.join("optimized.bc"))
+            .arg("-o")
+            .arg(&object),
+    );
+    object
+}
+
+fn finalize_native(directory: &Path, archive: &Path) {
+    let tools = native_tools();
     let suffix = env::consts::EXE_SUFFIX;
     let combine = "instcombine<max-iterations=1;no-verify-fixpoint>";
     // Bounded scalar cleanup plus inlining; ELF LTO partitions only machine-code
