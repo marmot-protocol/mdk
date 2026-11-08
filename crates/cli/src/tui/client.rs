@@ -251,6 +251,7 @@ pub(crate) fn spawn_subscription_reader(
 /// parsed result — or the first error encountered.
 pub(crate) struct EffectDone {
     pub(crate) effect: Effect,
+    pub(crate) status_owner: u64,
     pub(crate) result: Result<Vec<Value>, String>,
 }
 
@@ -276,21 +277,28 @@ pub(crate) struct EffectDone {
 /// reached the relay); a read (a load) merely wastes the moment it takes to
 /// exit. Neither warrants tracking and reaping children across shutdown.
 pub(crate) struct EffectRunner {
-    tx: mpsc::Sender<Effect>,
+    tx: mpsc::Sender<(Effect, u64)>,
     rx: Receiver<EffectDone>,
 }
 
 impl EffectRunner {
     pub(crate) fn spawn(client: WnClient) -> Self {
-        let (tx, effect_rx) = mpsc::channel::<Effect>();
+        let (tx, effect_rx) = mpsc::channel::<(Effect, u64)>();
         let (done_tx, rx) = mpsc::channel::<EffectDone>();
         thread::spawn(move || {
             // `recv` returns `Err` once the app drops its `tx` (shutdown), so the
             // worker exits cleanly. Effects run strictly one at a time in the
             // order received.
-            while let Ok(effect) = effect_rx.recv() {
+            while let Ok((effect, status_owner)) = effect_rx.recv() {
                 let result = run_effect(&client, &effect);
-                if done_tx.send(EffectDone { effect, result }).is_err() {
+                if done_tx
+                    .send(EffectDone {
+                        effect,
+                        result,
+                        status_owner,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -301,8 +309,8 @@ impl EffectRunner {
     /// Queue an effect to run off the event loop. The send only fails if the
     /// worker is gone, which happens only at shutdown; a dropped effect then
     /// simply never folds, which is correct while tearing down.
-    pub(crate) fn enqueue(&self, effect: Effect) {
-        let _ = self.tx.send(effect);
+    pub(crate) fn enqueue(&self, effect: Effect, owner: u64) {
+        let _ = self.tx.send((effect, owner));
     }
 
     /// Drain every effect that finished since the last tick, for folding now.
@@ -361,7 +369,15 @@ impl TuiApp {
     /// handler folded its `run_json` return. A failure lands on the status line
     /// and never tears down the session (the caught-error invariant).
     pub(crate) fn apply_effect_done(&mut self, done: EffectDone) {
-        let EffectDone { effect, result } = done;
+        let EffectDone {
+            effect,
+            result,
+            status_owner,
+        } = done;
+        self.with_status_owner(status_owner, |app| app.fold_effect(effect, result));
+    }
+
+    fn fold_effect(&mut self, effect: Effect, result: Result<Vec<Value>, String>) {
         match effect {
             Effect::SendMessage {
                 account,
@@ -448,10 +464,10 @@ impl TuiApp {
     /// Fold an effect whose only visible outcome is a status line: report
     /// `success` on `Ok`, or the caught error otherwise.
     fn fold_status_effect(&mut self, result: Result<Vec<Value>, String>, success: String) {
-        self.status = match result {
+        self.set_status(match result {
             Ok(_) => success,
             Err(err) => format!("error: {err}"),
-        };
+        });
     }
 
     /// Wait for `count` queued effects to finish on the worker and fold each,
@@ -490,8 +506,8 @@ impl TuiApp {
     /// reaches the materialized view), so nothing blocks the render loop.
     pub(crate) fn send_message(&mut self, text: String) -> TuiResult<()> {
         let effect = self.resolve_send_message(text)?;
-        self.effects.enqueue(effect);
-        self.status = "sending...".to_owned();
+        self.set_status("sending...".to_owned());
+        self.enqueue_effect(effect);
         Ok(())
     }
 
@@ -511,8 +527,8 @@ impl TuiApp {
     /// in when the reply lands.
     pub(crate) fn send_reply(&mut self, text: String) -> TuiResult<()> {
         let effect = self.resolve_reply(text)?;
-        self.effects.enqueue(effect);
-        self.status = "sending reply...".to_owned();
+        self.set_status("sending reply...".to_owned());
+        self.enqueue_effect(effect);
         Ok(())
     }
 
@@ -543,7 +559,7 @@ impl TuiApp {
         let result = match single_effect_value(result) {
             Ok(value) => value,
             Err(err) => {
-                self.status = format!("error: {err}");
+                self.set_status(format!("error: {err}"));
                 return;
             }
         };
@@ -591,7 +607,7 @@ impl TuiApp {
                 let _ = self.refresh_messages();
             }
         }
-        self.status = status;
+        self.set_status(status);
     }
 
     /// The message id of the currently selected timeline row. Errors when the
@@ -609,8 +625,8 @@ impl TuiApp {
     /// folds the reaction in both directions, so the fold only updates status.
     pub(crate) fn react_to_selected_message(&mut self, emoji: String) -> TuiResult<()> {
         let effect = self.resolve_react(emoji)?;
-        self.effects.enqueue(effect);
-        self.status = "reacting...".to_owned();
+        self.set_status("reacting...".to_owned());
+        self.enqueue_effect(effect);
         Ok(())
     }
 
@@ -628,8 +644,8 @@ impl TuiApp {
     /// (`messages unreact <group> <id>`), off the event loop (see `react_...`).
     pub(crate) fn unreact_selected_message(&mut self) -> TuiResult<()> {
         let effect = self.resolve_unreact()?;
-        self.effects.enqueue(effect);
-        self.status = "removing reaction...".to_owned();
+        self.set_status("removing reaction...".to_owned());
+        self.enqueue_effect(effect);
         Ok(())
     }
 
@@ -647,8 +663,8 @@ impl TuiApp {
     /// is queued. No list refetch: the projection tombstones the row.
     pub(crate) fn delete_selected_message(&mut self) -> TuiResult<()> {
         let effect = self.resolve_delete()?;
-        self.effects.enqueue(effect);
-        self.status = "deleting...".to_owned();
+        self.set_status("deleting...".to_owned());
+        self.enqueue_effect(effect);
         Ok(())
     }
 
@@ -685,7 +701,7 @@ impl TuiApp {
             Some(&account_id),
             &["messages", "retry", &group_id, &event_id],
         )?;
-        self.status = format!("retried {}", shorten(&event_id, 18));
+        self.set_status(format!("retried {}", shorten(&event_id, 18)));
         Ok(())
     }
 
@@ -713,7 +729,7 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or_default();
-        self.status = format!("sent {file_name} ({message_count} message(s))");
+        self.set_status(format!("sent {file_name} ({message_count} message(s))"));
         Ok(())
     }
 
@@ -764,10 +780,10 @@ impl TuiApp {
             },
             false,
         );
-        self.status = format!(
+        self.set_status(format!(
             "now streaming {}; type text and press Enter to finish",
             shorten(&stream_id, 18)
-        );
+        ));
         Ok(())
     }
 
@@ -853,7 +869,11 @@ impl TuiApp {
             streaming.flushed_bytes += text.len();
             bytes = streaming.flushed_bytes;
         }
-        self.status = format!("streaming {} bytes on {}", bytes, shorten(&stream_id, 18));
+        self.set_status(format!(
+            "streaming {} bytes on {}",
+            bytes,
+            shorten(&stream_id, 18)
+        ));
         Ok(())
     }
 
@@ -864,7 +884,7 @@ impl TuiApp {
         };
         if self.input.is_empty() {
             self.streaming = Some(streaming);
-            self.status = "stream text is empty; type text or Esc cancels".to_owned();
+            self.set_status("stream text is empty; type text or Esc cancels".to_owned());
             return Ok(());
         }
         self.streaming = Some(streaming);
@@ -902,10 +922,10 @@ impl TuiApp {
             .get("chunk_count")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        self.status = format!(
+        self.set_status(format!(
             "finished stream {} chunks={chunk_count}",
             shorten(&streaming.stream_id, 18)
-        );
+        ));
         Ok(())
     }
 
@@ -927,7 +947,10 @@ impl TuiApp {
             Some(streaming.group_id.as_str()),
             &streaming.stream_id,
         );
-        self.status = format!("cancelled stream {}", shorten(&streaming.stream_id, 18));
+        self.set_status(format!(
+            "cancelled stream {}",
+            shorten(&streaming.stream_id, 18)
+        ));
         Ok(())
     }
 
@@ -947,7 +970,7 @@ impl TuiApp {
             .get("profile")
             .and_then(profile_display_name_from_value)
             .unwrap_or(name);
-        self.status = format!("published profile name {label}");
+        self.set_status(format!("published profile name {label}"));
         Ok(())
     }
 
@@ -963,16 +986,18 @@ impl TuiApp {
         if let Some(group_id) = group_id.as_deref() {
             self.select_chat_by_group_id(group_id)?;
         }
-        self.status = group_id
-            .as_deref()
-            .map(|group_id| {
-                format!(
-                    "created chat {} with {} member(s)",
-                    shorten(group_id, 18),
-                    member_count
-                )
-            })
-            .unwrap_or_else(|| format!("created chat with {member_count} member(s)"));
+        self.set_status(
+            group_id
+                .as_deref()
+                .map(|group_id| {
+                    format!(
+                        "created chat {} with {} member(s)",
+                        shorten(group_id, 18),
+                        member_count
+                    )
+                })
+                .unwrap_or_else(|| format!("created chat with {member_count} member(s)")),
+        );
         Ok(())
     }
 
@@ -985,7 +1010,7 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("added member(s)", &result);
         self.refresh_messages()?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -998,7 +1023,7 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("removed member(s)", &result);
         self.refresh_messages()?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1007,11 +1032,9 @@ impl TuiApp {
     pub(crate) fn open_group_detail(&mut self) -> TuiResult<()> {
         let group_id = self.require_selected_group()?;
         self.group_detail = None;
+        self.set_status(LOADING_GROUP_DETAIL_STATUS.to_owned());
         self.load_group_detail(&group_id)?;
         self.screen = Screen::GroupDetail;
-        // Honest in-flight feedback while the four-call load runs off-loop; the
-        // fold clears it on settle.
-        self.status = LOADING_GROUP_DETAIL_STATUS.to_owned();
         Ok(())
     }
 
@@ -1047,7 +1070,7 @@ impl TuiApp {
     pub(crate) fn load_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         self.loading_group_detail = Some(group_id.to_owned());
-        self.effects.enqueue(Effect::LoadGroupDetail {
+        self.enqueue_effect(Effect::LoadGroupDetail {
             account: account_id,
             group: group_id.to_owned(),
         });
@@ -1077,12 +1100,12 @@ impl TuiApp {
         let results = match result {
             Ok(values) => values,
             Err(err) => {
-                self.status = format!("error: {err}");
+                self.set_status(format!("error: {err}"));
                 return;
             }
         };
         let [members_result, admins_result, relays_result, show_result] = results.as_slice() else {
-            self.status = "group detail load returned unexpected results".to_owned();
+            self.set_status("group detail load returned unexpected results".to_owned());
             return;
         };
         let (name, description) = parse_group_profile(show_result).unwrap_or_else(|| {
@@ -1113,7 +1136,7 @@ impl TuiApp {
         // showing: a reload triggered by a mutation (rename/add/remove/promote)
         // has already set its own confirmation, which must not be clobbered.
         if self.status == LOADING_GROUP_DETAIL_STATUS {
-            self.status = "group detail".to_owned();
+            self.set_status("group detail".to_owned());
         }
     }
 
@@ -1133,7 +1156,7 @@ impl TuiApp {
         let status = publish_status("renamed group", &result);
         self.reload_group_detail_if_active(group_id)?;
         self.refresh_chats()?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1148,7 +1171,7 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("added member(s)", &result);
         self.reload_group_detail_if_active(group_id)?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1163,7 +1186,7 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("removed member(s)", &result);
         self.reload_group_detail_if_active(group_id)?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1175,7 +1198,7 @@ impl TuiApp {
         )?;
         let status = publish_status("promoted admin", &result);
         self.reload_group_detail_if_active(group_id)?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1189,7 +1212,7 @@ impl TuiApp {
         let status = publish_status("left group", &result);
         self.leave_group_detail();
         self.refresh_chats()?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1211,12 +1234,13 @@ impl TuiApp {
         // `/refresh` as the retry.
         self.client.run_json(None, &["logout", account_id])?;
         let logged_out = format!("logged out {}", shorten(&terminal_safe_text(npub), 18));
-        self.status = match self.refresh_or_return_to_login() {
+        let status = match self.refresh_or_return_to_login() {
             Ok(()) => logged_out,
             Err(err) => {
                 format!("{logged_out}; account list reload failed ({err}) — /refresh to retry")
             }
         };
+        self.set_status(status);
         Ok(())
     }
 
@@ -1229,8 +1253,8 @@ impl TuiApp {
             return Ok(());
         }
         self.loading_invites = true;
-        self.status = "loading invites...".to_owned();
-        self.effects.enqueue(Effect::LoadInvites {
+        self.set_status("loading invites...".to_owned());
+        self.enqueue_effect(Effect::LoadInvites {
             account: account_id,
         });
         Ok(())
@@ -1265,7 +1289,7 @@ impl TuiApp {
         let result = match single_effect_value(result) {
             Ok(value) => value,
             Err(err) => {
-                self.status = format!("error: {err}");
+                self.set_status(format!("error: {err}"));
                 return;
             }
         };
@@ -1281,7 +1305,7 @@ impl TuiApp {
         } else {
             Popup::invites(items, 0)
         });
-        self.status = format!("{count} pending invite(s)");
+        self.set_status(format!("{count} pending invite(s)"));
     }
 
     /// After an accept/decline from the invites picker, re-read the pending
@@ -1315,7 +1339,7 @@ impl TuiApp {
         if self.screen == Screen::GroupDetail {
             self.leave_group_detail();
         }
-        self.status = format!("accepted invite {}", shorten(group_id, 18));
+        self.set_status(format!("accepted invite {}", shorten(group_id, 18)));
         Ok(())
     }
 
@@ -1324,7 +1348,7 @@ impl TuiApp {
         self.client
             .run_json(Some(&account_id), &["groups", "decline", group_id])?;
         self.refresh_chats()?;
-        self.status = format!("declined invite {}", shorten(group_id, 18));
+        self.set_status(format!("declined invite {}", shorten(group_id, 18)));
         Ok(())
     }
 
@@ -1360,9 +1384,9 @@ impl TuiApp {
         let run_now = !view.query.is_empty();
         self.user_search = Some(view);
         self.screen = Screen::UserSearch;
-        self.status = status.to_owned();
+        self.set_status(status.to_owned());
         if run_now && let Err(err) = self.run_user_search() {
-            self.status = format!("error: {err}");
+            self.set_status(format!("error: {err}"));
         }
     }
 
@@ -1404,7 +1428,7 @@ impl TuiApp {
         let run_now = !view.query.is_empty();
         self.message_search = Some(view);
         self.screen = Screen::MessageSearch;
-        self.status = "message search".to_owned();
+        self.set_status("message search".to_owned());
         if run_now {
             self.run_message_search()?;
         }
@@ -1431,12 +1455,12 @@ impl TuiApp {
         let group = view.group_id.clone();
         let query = view.query.value().trim().to_owned();
         if query.is_empty() {
-            self.status = "type a query, then Enter to search".to_owned();
+            self.set_status("type a query, then Enter to search".to_owned());
             return Ok(());
         }
         self.searching_messages = Some((account_id.clone(), group.clone(), query.clone()));
-        self.status = "searching...".to_owned();
-        self.effects.enqueue(Effect::MessageSearch {
+        self.set_status("searching...".to_owned());
+        self.enqueue_effect(Effect::MessageSearch {
             account: account_id,
             group,
             query,
@@ -1474,14 +1498,14 @@ impl TuiApp {
                 != Some(group.as_str())
         {
             if self.status == "searching..." {
-                self.status.clear();
+                self.set_status(String::new());
             }
             return;
         }
         let values = match result {
             Ok(values) => values,
             Err(err) => {
-                self.status = format!("error: {err}");
+                self.set_status(format!("error: {err}"));
                 return;
             }
         };
@@ -1511,7 +1535,8 @@ impl TuiApp {
         } else {
             ""
         };
-        self.status = format!("{} match(es){refine}", view.match_count_label());
+        let status = format!("{} match(es){refine}", view.match_count_label());
+        self.set_status(status);
     }
 
     /// Run the one-shot `users search <query>` off the event loop; the results
@@ -1524,12 +1549,12 @@ impl TuiApp {
             .map(|view| view.query.value().trim().to_owned())
             .unwrap_or_default();
         if query.is_empty() {
-            self.status = "type a query, then Enter to search".to_owned();
+            self.set_status("type a query, then Enter to search".to_owned());
             return Ok(());
         }
         self.searching_users = Some(query.clone());
-        self.status = "searching...".to_owned();
-        self.effects.enqueue(Effect::UserSearch {
+        self.set_status("searching...".to_owned());
+        self.enqueue_effect(Effect::UserSearch {
             account: account_id,
             query,
         });
@@ -1560,7 +1585,7 @@ impl TuiApp {
         let values = match result {
             Ok(values) => values,
             Err(err) => {
-                self.status = format!("error: {err}");
+                self.set_status(format!("error: {err}"));
                 return;
             }
         };
@@ -1582,7 +1607,7 @@ impl TuiApp {
             view.results = results;
             view.selected = 0;
         }
-        self.status = format!("found {count} user(s)");
+        self.set_status(format!("found {count} user(s)"));
     }
 
     /// Follow the highlighted search result (`f`) off the event loop; the fold
@@ -1614,16 +1639,16 @@ impl TuiApp {
         let account = match self.require_selected_local_account() {
             Ok(account) => account,
             Err(err) => {
-                self.status = format!("error: {err}");
+                self.set_status(format!("error: {err}"));
                 return;
             }
         };
         let relay = self.client.account_setup_relay();
-        self.status = if follow {
+        self.set_status(if follow {
             format!("following {label}...")
         } else {
             format!("unfollowing {label}...")
-        };
+        });
         let effect = if follow {
             Effect::FollowUser {
                 account,
@@ -1639,7 +1664,7 @@ impl TuiApp {
                 relay,
             }
         };
-        self.effects.enqueue(effect);
+        self.enqueue_effect(effect);
     }
 
     /// Fold a search-screen follow/unfollow: report the outcome, then badge the
@@ -1658,14 +1683,14 @@ impl TuiApp {
         result: Result<Vec<Value>, String>,
     ) {
         if let Err(err) = single_effect_value(result) {
-            self.status = format!("error: {err}");
+            self.set_status(format!("error: {err}"));
             return;
         }
-        self.status = if following {
+        self.set_status(if following {
             format!("followed {label}")
         } else {
             format!("unfollowed {label}")
-        };
+        });
         if self
             .selected_account_row()
             .map(|row| row.account_id.as_str())
@@ -1705,7 +1730,7 @@ impl TuiApp {
         self.profile_view = None;
         self.load_profile()?;
         self.screen = Screen::Profile;
-        self.status = "profile".to_owned();
+        self.set_status("profile".to_owned());
         Ok(())
     }
 
@@ -1744,7 +1769,7 @@ impl TuiApp {
         self.client.run_json(Some(&account_id), &args)?;
         self.load_profile()?;
         self.refresh_accounts()?;
-        self.status = format!("updated {}", field.label());
+        self.set_status(format!("updated {}", field.label()));
         Ok(())
     }
 
@@ -1757,7 +1782,7 @@ impl TuiApp {
         ]);
         self.client.run_json(Some(&account_id), &args)?;
         self.reload_follows()?;
-        self.status = format!("followed {}", shorten(pubkey, 18));
+        self.set_status(format!("followed {}", shorten(pubkey, 18)));
         Ok(())
     }
 
@@ -1770,7 +1795,7 @@ impl TuiApp {
         ]);
         self.client.run_json(Some(&account_id), &args)?;
         self.reload_follows()?;
-        self.status = format!("unfollowed {}", shorten(pubkey, 18));
+        self.set_status(format!("unfollowed {}", shorten(pubkey, 18)));
         Ok(())
     }
 
@@ -1788,7 +1813,7 @@ impl TuiApp {
         let data = self.load_relay_health()?;
         self.relay_health = Some(RelayHealthView { data, scroll: 0 });
         self.screen = Screen::RelayHealth;
-        self.status = "relay health".to_owned();
+        self.set_status("relay health".to_owned());
         Ok(())
     }
 
@@ -1797,7 +1822,7 @@ impl TuiApp {
         let data = self.load_relay_health()?;
         let scroll = self.relay_health.as_ref().map_or(0, |view| view.scroll);
         self.relay_health = Some(RelayHealthView { data, scroll });
-        self.status = "refreshed relay health".to_owned();
+        self.set_status("refreshed relay health".to_owned());
         Ok(())
     }
 
@@ -1826,7 +1851,7 @@ impl TuiApp {
         let status = publish_status("updated chat", &result);
         self.refresh_chats()?;
         self.select_chat_by_group_id(&group_id)?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1837,11 +1862,11 @@ impl TuiApp {
         self.client
             .run_json(Some(&account_id), &["chats", verb, &group_id])?;
         self.refresh_chats()?;
-        self.status = if archived {
+        self.set_status(if archived {
             format!("archived chat {}", shorten(&group_id, 18))
         } else {
             format!("unarchived chat {}", shorten(&group_id, 18))
-        };
+        });
         Ok(())
     }
 
@@ -1852,10 +1877,10 @@ impl TuiApp {
             .client
             .run_json(Some(&account_id), &["chats", "mute", &group_id, &duration])?;
         let muted_until = result.get("muted_until_ms").and_then(Value::as_i64);
-        self.status = match muted_until {
+        self.set_status(match muted_until {
             Some(until) => format!("muted chat {} until {}", shorten(&group_id, 18), until),
             None => format!("muted chat {} forever", shorten(&group_id, 18)),
-        };
+        });
         Ok(())
     }
 
@@ -1864,7 +1889,7 @@ impl TuiApp {
         let group_id = self.require_selected_group()?;
         self.client
             .run_json(Some(&account_id), &["chats", "unmute", &group_id])?;
-        self.status = format!("unmuted chat {}", shorten(&group_id, 18));
+        self.set_status(format!("unmuted chat {}", shorten(&group_id, 18)));
         Ok(())
     }
 
@@ -1874,18 +1899,18 @@ impl TuiApp {
         let result = self
             .client
             .run_json(Some(&account_id), &["group", "members", &group_id])?;
-        self.status = group_members_status(&result);
+        self.set_status(group_members_status(&result));
         Ok(())
     }
 
     pub(crate) fn set_archived_chat_visibility(&mut self, include: bool) -> TuiResult<()> {
         self.show_archived_chats = include;
         self.refresh_chats()?;
-        self.status = if include {
+        self.set_status(if include {
             "showing archived chats".to_owned()
         } else {
             "hiding archived chats".to_owned()
-        };
+        });
         Ok(())
     }
 
@@ -1938,7 +1963,7 @@ impl TuiApp {
             .map(account_display_label)
             .or(result_display_name)
             .unwrap_or(npub);
-        self.status = format!("{action} {} {signing}", shorten(&display_name, 18));
+        self.set_status(format!("{action} {} {signing}", shorten(&display_name, 18)));
         Ok(())
     }
 
@@ -1965,7 +1990,7 @@ impl TuiApp {
             &result,
         );
         self.refresh_messages()?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -1992,7 +2017,7 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         self.refresh_daemon_status()?;
         let watch_id = value_string(&result, "watch_id").unwrap_or_else(|| "stream".to_owned());
-        self.status = format!("watching stream {}", shorten(&watch_id, 24));
+        self.set_status(format!("watching stream {}", shorten(&watch_id, 24)));
         Ok(())
     }
 
@@ -2023,7 +2048,7 @@ impl TuiApp {
             &result,
         );
         self.refresh_messages()?;
-        self.status = status;
+        self.set_status(status);
         Ok(())
     }
 
@@ -2053,7 +2078,10 @@ impl TuiApp {
             .get("verified")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        self.status = format!("stream {} verified={verified}", shorten(&stream_id, 18));
+        self.set_status(format!(
+            "stream {} verified={verified}",
+            shorten(&stream_id, 18)
+        ));
         Ok(())
     }
 
@@ -2065,6 +2093,11 @@ impl TuiApp {
     /// `daemon.running` each frame.
     fn adopt_daemon_view(&mut self, result: &Value) {
         self.daemon = parse_daemon_view(result);
+        // A currently owned daemon result may report its acquisition failures.
+        // A stale result still adopts resources without releasing newer feedback.
+        if self.status_is_owned() {
+            self.status_ownership.retained = false;
+        }
         self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
@@ -2075,29 +2108,25 @@ impl TuiApp {
     /// Fold the launch daemon auto-start's outcome: adopt the started daemon or
     /// surface the failure on the status line. Either way the session stays up.
     ///
-    /// The status write is guarded on the `starting daemon...` sentinel the
-    /// auto-start set (the same idiom the group-detail load uses). Because it runs
-    /// off the event loop, a user action may have queued a newer status (e.g.
-    /// `sending...`) meanwhile; that must survive. Only overwrite while the
-    /// sentinel is still showing, and otherwise let the status-bar dot — which
-    /// reads `daemon.running` each frame — tell the story. The daemon view is
-    /// always adopted regardless, so the dot and the subscriptions reflect the
-    /// start either way; checking the sentinel after the adopt also preserves a
-    /// genuine subscription-failure status the adopt may have surfaced.
+    /// The independently running launch request carries its own status claim.
+    /// Adoption always updates resources; only an owned result updates feedback,
+    /// and acquisition failures take precedence over the readiness sentence.
     pub(crate) fn fold_daemon_start(&mut self, result: Result<Value, String>) {
-        match result {
-            Ok(value) => {
-                self.adopt_daemon_view(&value);
-                if self.status == STARTING_DAEMON_STATUS {
-                    self.status = daemon_status_sentence(&self.daemon);
+        self.with_status_owner(self.daemon_start_status_owner, |app| {
+            let before_adoption = app.status_ownership.revision;
+            match result {
+                Ok(value) => {
+                    app.adopt_daemon_view(&value);
+                    if app.status_ownership.revision == before_adoption {
+                        app.set_status(daemon_status_sentence(&app.daemon));
+                    } else {
+                        // Acquisition feedback takes precedence over readiness.
+                        app.status_ownership.retained = true;
+                    }
                 }
+                Err(err) => app.set_status(format!("daemon start failed: {err}")),
             }
-            Err(err) => {
-                if self.status == STARTING_DAEMON_STATUS {
-                    self.status = format!("daemon start failed: {err}");
-                }
-            }
-        }
+        });
     }
 
     pub(crate) fn refresh_daemon_status(&mut self) -> TuiResult<()> {
@@ -2113,7 +2142,7 @@ impl TuiApp {
         );
         let result = self.client.run_json(None, &args)?;
         self.adopt_daemon_view(&result);
-        self.status = daemon_status_sentence(&self.daemon);
+        self.set_status(daemon_status_sentence(&self.daemon));
         Ok(())
     }
 
@@ -2125,7 +2154,7 @@ impl TuiApp {
         self.group_state_subscription = None;
         self.timeline_subscription = None;
         self.notification_subscription = None;
-        self.status = "daemon stopped".to_owned();
+        self.set_status("daemon stopped".to_owned());
         Ok(())
     }
 
@@ -2157,7 +2186,7 @@ impl TuiApp {
             self.group_state_subscription = None;
             self.notification_subscription = None;
             self.group_diagnostics = None;
-            self.status = "no identities yet; create one from the login screen".to_owned();
+            self.set_status("no identities yet; create one from the login screen".to_owned());
         }
         Ok(())
     }
@@ -2182,7 +2211,7 @@ impl TuiApp {
             self.group_state_subscription = None;
             self.notification_subscription = None;
             self.group_diagnostics = None;
-            self.status = "no account selected".to_owned();
+            self.set_status("no account selected".to_owned());
             return Ok(());
         };
         if !account.local_signing {
@@ -2196,8 +2225,9 @@ impl TuiApp {
             self.group_state_subscription = None;
             self.notification_subscription = None;
             self.group_diagnostics = None;
-            self.status =
-                "selected account is public-only; choose a local signing account".to_owned();
+            self.set_status(
+                "selected account is public-only; choose a local signing account".to_owned(),
+            );
             return Ok(());
         }
 
@@ -2217,10 +2247,10 @@ impl TuiApp {
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
         if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
-            self.status = format!("chat subscription failed: {err}");
+            self.set_status(format!("chat subscription failed: {err}"));
         }
         if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
-            self.status = format!("notification subscription failed: {err}");
+            self.set_status(format!("notification subscription failed: {err}"));
         }
         if self.chats.is_empty() {
             self.clear_timeline_pane();
@@ -2228,13 +2258,13 @@ impl TuiApp {
             self.messages_group_id = None;
             self.group_state_subscription = None;
             if let Err(err) = self.ensure_message_subscription(&account.account_id) {
-                self.status = format!("message subscription failed: {err}");
+                self.set_status(format!("message subscription failed: {err}"));
                 return Ok(());
             }
-            self.status = format!(
+            self.set_status(format!(
                 "loaded account {}; no chats",
                 shorten(&account_display_label(&account), 18)
-            );
+            ));
             return Ok(());
         }
         self.refresh_messages()
@@ -2282,20 +2312,21 @@ impl TuiApp {
         if self.daemon.running {
             let _ = self.ensure_message_subscription(&account_id);
         }
-        self.status = LOADING_TIMELINE_STATUS.to_owned();
-        self.effects.enqueue(Effect::LoadTimeline {
+        self.set_status(LOADING_TIMELINE_STATUS.to_owned());
+        self.enqueue_effect(Effect::LoadTimeline {
             account: account_id,
             group: group_id,
             generation,
         });
     }
 
-    /// The loading sentinel is the request's claim on the status line. Any
-    /// newer command or prompt replaces it and keeps its feedback when this
-    /// background load completes; page and subscription state still apply.
-    fn finish_timeline_status(&mut self, status: String) {
-        if self.status == LOADING_TIMELINE_STATUS {
-            self.status = status;
+    /// Successful ordinary loads leave idle feedback for live notices. Errors,
+    /// prompts and acknowledgements stay retained. A superseded load changes
+    /// neither the text nor its disposition.
+    fn finish_timeline_status(&mut self, status: String, retain: bool) {
+        if self.status_is_owned() {
+            self.set_status(status);
+            self.status_ownership.retained = retain;
         }
     }
 
@@ -2341,7 +2372,7 @@ impl TuiApp {
             Ok(value) => value,
             Err(err) => {
                 self.loading_chat = None;
-                self.finish_timeline_status(format!("error: {err}"));
+                self.finish_timeline_status(format!("error: {err}"), true);
                 return;
             }
         };
@@ -2393,32 +2424,37 @@ impl TuiApp {
             .ensure_group_state_subscription(&account, &group)
             .err()
             .map(|err| format!("group state subscription failed: {err}"));
-        if self.daemon.running && group_state_subscription_error.is_none() {
-            if self
+        if self.daemon.running
+            && group_state_subscription_error.is_none()
+            && self
                 .group_diagnostics
                 .as_ref()
                 .is_none_or(|diagnostics| diagnostics.group_id != group)
-            {
-                self.group_diagnostics =
-                    Some(GroupDiagnostics::unavailable(&group, "loading group state"));
-            }
-        } else {
-            // No daemon (or its state feed failed): fetch diagnostics off-loop.
-            self.effects.enqueue(Effect::GroupDiagnostics {
-                account: account.clone(),
-                group: group.clone(),
-            });
+        {
+            self.group_diagnostics =
+                Some(GroupDiagnostics::unavailable(&group, "loading group state"));
         }
         // Opening a chat clears its badge: mark it read off-loop and fold the
         // returned projection into the row rather than waiting for a push (the
         // chats feed does not emit one after a local mark-read).
-        self.effects.enqueue(Effect::MarkRead { account, group });
+        let subscription_error = message_subscription_error
+            .or(timeline_subscription_error)
+            .or(group_state_subscription_error);
+        let retained = subscription_error.is_some();
         self.finish_timeline_status(
-            message_subscription_error
-                .or(timeline_subscription_error)
-                .or(group_state_subscription_error)
+            subscription_error
                 .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len())),
+            retained,
         );
+        // Capture followups after final feedback so a matching mark-read failure
+        // remains eligible while an ordinary successful page is idle.
+        if !self.daemon.running || self.group_state_subscription.is_none() {
+            self.enqueue_effect(Effect::GroupDiagnostics {
+                account: account.clone(),
+                group: group.clone(),
+            });
+        }
+        self.enqueue_effect(Effect::MarkRead { account, group });
     }
 
     /// Fold a completed mark-read: apply the returned projection to the chat's
@@ -2582,7 +2618,7 @@ impl TuiApp {
         self.timeline_scroll.on_prepend(prepended);
         self.timeline_scroll.has_more_before = timeline_page_has_more_before(&result);
         self.timeline_scroll.loading_older = false;
-        self.status = format!("loaded {prepended} older message(s)");
+        self.set_status(format!("loaded {prepended} older message(s)"));
         Ok(())
     }
 
@@ -2842,17 +2878,13 @@ impl TuiApp {
         }
     }
 
-    /// Assign a status produced by a background drain, but only while the main
-    /// view is showing. On the login/account-select screen the status line
-    /// carries the nsec prompt and picker guidance; a live drain (a picker
-    /// reached via `A` keeps its subscriptions running) must apply its state
-    /// changes without clobbering that prompt. An active timeline load also
-    /// retains its provisional claim until completion or a newer command/prompt.
+    /// Ambient notices replace only idle Main feedback. Queued background work
+    /// must also match its captured revision; state and retry handling are separate.
     pub(crate) fn set_drain_status(&mut self, status: String) {
-        if self.screen == Screen::Main
-            && !(self.loading_chat.is_some() && self.status == LOADING_TIMELINE_STATUS)
+        if self.screen == Screen::Main && !self.status_ownership.retained && self.status_is_owned()
         {
-            self.status = status;
+            self.set_status(status);
+            self.status_ownership.retained = false;
         }
     }
 

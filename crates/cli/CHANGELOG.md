@@ -11,8 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Keep the newest overlapping TUI timeline refresh for the same chat, including page errors; stale
   completions cannot consume the newer request or apply its subscriptions and followups.
-- Preserve newer TUI command acknowledgements and stream composer instructions when their background timeline
-  refresh completes. Ordinary timeline loads still report their loaded or error result (#3139).
+- Preserve TUI command acknowledgements, prompts and load errors using explicit request ownership. Older
+  command completions and background notices cannot overwrite newer feedback; ordinary successful loads
+  still permit live notices, and background refreshes continue updating the pane (#3139).
 
 - Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
   retained panes under a different account's list. Start the adopted account's live feed even when its page
