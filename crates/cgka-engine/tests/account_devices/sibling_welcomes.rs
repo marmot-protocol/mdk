@@ -1112,6 +1112,73 @@ async fn a_sibling_add_owes_its_sibling_welcome_once_its_commit_confirms() {
     );
 }
 
+/// Gap filling reads a sibling's leaves in a chat to tell a copy it can
+/// never open (mdk#3042). The leaf an Add built from the sibling's KeyPackage
+/// reads with that KeyPackage's `not_after` until the sibling commits there.
+/// A leaf counts for a slot by its tag, or by the tag signature key the
+/// caller names, and another of the account's leaves never does.
+#[tokio::test]
+async fn a_siblings_add_leaf_reads_as_unused_until_it_commits() {
+    let (bob, mut new, device_gid) = tagged_devices(b"bob", 1).await;
+    let mut m = routed_members(chat_device(b"alice"), bob).await;
+    let gid = m.gid.clone();
+    let laptop = &mut new[0];
+    let sibling = handed(laptop, slot(2), slot(1));
+    let not_after = laptop
+        .engine
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.key_package == sibling.key_package.bytes())
+        .unwrap()
+        .not_after;
+    let SendResult::GroupEvolution { pending, .. } = m
+        .bob
+        .engine
+        .send(add_own_devices(&gid, vec![sibling]))
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    m.bob.engine.confirm_published(pending).await.unwrap();
+    let roster = super::device_roster::roster_of(&m.bob, &device_gid);
+    let leaves = |bob: &Device, slot, key| {
+        bob.engine
+            .own_device_leaves(&gid, &roster, &slot, key)
+            .unwrap()
+    };
+    let added = leaves(&m.bob, slot(2), None);
+    let [leaf] = &added[..] else {
+        panic!("the laptop's one leaf, not bob's untagged sibling's: {added:?}")
+    };
+    assert_eq!(leaf.add_not_after, Some(not_after));
+    assert!(leaves(&m.bob, slot(3), None).is_empty());
+    assert_eq!(
+        leaves(&m.bob, slot(3), Some(leaf.signature_key.as_slice())),
+        added
+    );
+
+    let [owed] = &owed(&m.bob)[..] else {
+        panic!("one owed sibling Welcome")
+    };
+    assert_joins_from(laptop, owed, &gid, &m.bob).await;
+    let update = send_commit(
+        laptop,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut m.bob, &update, &gid).await;
+    let updated = leaves(&m.bob, slot(2), None);
+    let [leaf] = &updated[..] else {
+        panic!("the laptop's one leaf: {updated:?}")
+    };
+    assert_eq!(leaf.add_not_after, None);
+}
+
 /// The host records a 461's app event id on the row before its send. A
 /// second carrier is refused while one is on its way; only the carrier that
 /// failed clears, and the row is owed again; only the carrier that went out

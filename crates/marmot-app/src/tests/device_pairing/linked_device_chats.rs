@@ -3583,6 +3583,151 @@ async fn a_compatibility_miss_asks_nothing_while_a_settings_edit_waits() {
     assert_eq!(storage.private_key_package_need(&issuer).unwrap(), None);
 }
 
+/// The laptop's leaves in `chat` as `phone` reads them: whether each is
+/// still the leaf an Add built, and until when its KeyPackage lived.
+fn laptop_leaves(
+    phone: &Device,
+    laptop: &Device,
+    chat: &GroupId,
+    group: &GroupId,
+) -> Vec<Option<u64>> {
+    let slot = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    phone
+        .client
+        .runtime
+        .own_device_leaves(chat, &phone.roster(group), &slot, None)
+        .unwrap()
+        .into_iter()
+        .map(|leaf| leaf.add_not_after)
+        .collect()
+}
+
+async fn send_heartbeat(
+    relay: &ScriptedPushRelayClient,
+    from: &mut Device,
+    to: &mut Device,
+    group: &GroupId,
+) {
+    from.client
+        .send_device_group_message(
+            group,
+            crate::client::device_group::KIND_DEVICE_HEARTBEAT,
+            r#"{"v":1}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+    deliver_new(&mut to.client, relay, &mut to.cursor).await;
+}
+
+/// A chat whose Add used a private KeyPackage the laptop can no longer open
+/// (its keys gone at `not_after`) holds a leaf the laptop never joins
+/// through, and would count the laptop present forever (mdk#3042). Gap
+/// filling retires that unused leaf once the laptop has been active an hour
+/// after the KeyPackage expired, then adds the laptop again from fresh
+/// private stock, and the laptop joins. While the laptop is not heard from,
+/// or only just heard from, the leaf stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unopenable_add_leaf_is_retired_and_the_sibling_added_again() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = phone.client.create_group("stale add", &[]).await.unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let issuer = laptop.slot_hex();
+    let template = laptop
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .find(|record| hex::encode(record.recipient_slot) == phone.slot_hex())
+        .unwrap();
+    // A KeyPackage that lives a few seconds. The laptop is away until it has
+    // expired, and discards its keys then, so the Welcome for it can never
+    // open.
+    let now = crate::unix_now_seconds();
+    let not_after = now + 4;
+    let short_lived = private_package_with_lifetime(
+        &laptop,
+        &phone,
+        &group,
+        &template,
+        true,
+        (now - 60, not_after),
+    );
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    storage
+        .delete_received_private_key_packages_from(&issuer)
+        .unwrap();
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![short_lived]).await;
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        laptop_leaves(&phone, &laptop, &chat, &group),
+        [Some(not_after)]
+    );
+    while crate::unix_now_seconds() <= not_after {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    laptop.client.sibling_key_package_upkeep(&[]).await;
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    laptop.client.run_due_maintenance().await.unwrap();
+    assert!(!joined(&laptop, &chat));
+
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    for _ in 0..2 {
+        phone.client.run_due_maintenance().await.unwrap();
+    }
+    assert_eq!(
+        laptop_leaves(&phone, &laptop, &chat, &group),
+        [Some(not_after)],
+        "a laptop not heard from since keeps its leaf"
+    );
+    send_heartbeat(&relay, &mut laptop, &mut phone, &group).await;
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        laptop_leaves(&phone, &laptop, &chat, &group),
+        [Some(not_after)],
+        "one heartbeat after the expiry starts the wait"
+    );
+
+    // Heartbeats are dated when they are read, so an hour of the laptop's
+    // activity is recorded ahead rather than waited for. Its next heartbeat
+    // wakes the chat.
+    let activity = storage
+        .device_activity()
+        .unwrap()
+        .into_iter()
+        .find(|activity| activity.slot_id_hex == issuer)
+        .unwrap();
+    let first = activity.last_active_at.unwrap();
+    storage
+        .note_device_active(
+            &issuer,
+            activity.linked_at,
+            first + 3600,
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+    send_heartbeat(&relay, &mut laptop, &mut phone, &group).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&laptop, &chat) {
+            phone.client.run_due_maintenance().await.unwrap();
+            deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+            laptop.client.run_due_maintenance().await.unwrap();
+            deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the laptop joins once its unused leaf is retired");
+    let leaves = laptop_leaves(&phone, &laptop, &chat, &group);
+    assert_eq!(leaves.len(), 1, "the retired leaf is gone: {leaves:?}");
+    assert_ne!(leaves[0], Some(not_after));
+    // The expired KeyPackage's record went at its `not_after`; the Add
+    // again took one fresh KeyPackage.
+    assert_eq!(taken_from(&phone, &laptop), 1);
+}
+
 /// The shared app preference runs after compatibility filtering. Repeated
 /// advisory peeks reuse one batch; only actual claims retire its allocations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

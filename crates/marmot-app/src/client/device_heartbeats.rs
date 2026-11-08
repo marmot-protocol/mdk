@@ -193,6 +193,9 @@ impl AppClient {
                 heartbeat_time(created_at, now),
                 now,
             )?;
+        // Gap filling waits on a sibling's activity to retire an unused Add
+        // leaf whose KeyPackage expired (mdk#3042).
+        self.sibling_gap_activity(&slot);
         Ok(())
     }
 }

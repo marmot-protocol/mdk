@@ -57,8 +57,8 @@ pub use device_roster::{
 };
 pub use device_tag::{
     DEVICE_TAG_NONCE_LEN, DEVICE_TAG_VECTOR_MAX_LEN, DeviceTagClaim, DeviceTagContentV1,
-    DeviceTagV1, decode_device_tag_content_v1, decode_device_tag_v1, encode_device_tag_content_v1,
-    encode_device_tag_signed_content_v1, encode_device_tag_v1,
+    DeviceTagV1, OwnDeviceLeaf, decode_device_tag_content_v1, decode_device_tag_v1,
+    encode_device_tag_content_v1, encode_device_tag_signed_content_v1, encode_device_tag_v1,
 };
 pub use encrypted_media::{
     BlobStoreEndpointV1, EncryptedMediaPolicyV1, decode_encrypted_media_policy_v1,
