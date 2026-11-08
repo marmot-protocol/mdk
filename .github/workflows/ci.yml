@@ -13,7 +13,9 @@ name: CI
 # so that budget holds only the caches saved here and the wn-agent darwin
 # builds, which wait for the shared macOS runners. Other workflows build without
 # a cache or restore one of these with `save-if: false`;
-# scripts/test_ci_workflow_policy.py checks it.
+# scripts/test_ci_workflow_policy.py checks it. The one other saver is the
+# setup-odin action, which keeps the pinned Odin archive from master runs: one
+# per platform, at most four, about 350 MB in all.
 on:
   pull_request:
   push:
@@ -1418,7 +1420,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/maude.zip"
+          # Retry any failure, doubling the wait (1 s, 2 s, 4 s ...); none is scheduled after 300 s.
           curl --fail --location --silent --show-error \
+            --connect-timeout 20 --max-time 300 \
+            --retry 10 --retry-all-errors --retry-max-time 300 \
             https://github.com/maude-lang/Maude/releases/download/Maude3.5.1/Maude-3.5.1-linux-x86_64.zip \
             --output "$archive"
           echo "72ed1ca87e3b3d0dfc6ee1436baf154bf04c45ff97d521bec040c5e8dfc8f92c  $archive" | sha256sum --check --strict
@@ -1436,7 +1441,10 @@ jobs:
           TAMARIN_VERSION: 1.12.0
         run: |
           set -euo pipefail
+          # Retry any failure, doubling the wait (1 s, 2 s, 4 s ...); none is scheduled after 300 s.
           curl -L --fail --show-error --silent \
+            --connect-timeout 20 --max-time 300 \
+            --retry 10 --retry-all-errors --retry-max-time 300 \
             "https://github.com/tamarin-prover/tamarin-prover/releases/download/${TAMARIN_VERSION}/tamarin-prover-${TAMARIN_VERSION}-linux64-ubuntu.tar.gz" \
             -o /tmp/tamarin-prover.tar.gz
           echo "201be06f469e47cff554df6ca93db8366fc2c69d70c61fcbd1370a1074b469c6  /tmp/tamarin-prover.tar.gz" | sha256sum --check --strict

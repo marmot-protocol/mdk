@@ -514,6 +514,16 @@ class CacheBudgetPolicyTests(unittest.TestCase):
                         self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS'$")
         self.assertEqual(saving, {"ci.yml", "wn-agent-binaries.yml"})
 
+    def test_only_setup_odin_saves_an_actions_cache_and_only_from_master(self):
+        # The pinned Odin archive is the one cache saved outside rust-cache.
+        savers = [path.relative_to(ROOT).as_posix()
+                  for path in sorted((ROOT / ".github").rglob("*.y*ml"))
+                  if re.search(r"uses: actions/cache(/save)?@", path.read_text())]
+        self.assertEqual(savers, [".github/actions/setup-odin/action.yml"])
+        action = (ROOT / ".github/actions/setup-odin/action.yml").read_text()
+        save = action.split("uses: actions/cache/save@", 1)[0].rsplit("\n    - ", 1)[1]
+        self.assertIn("if: github.ref == 'refs/heads/master' && ", save)
+
     def test_binding_packages_build_from_a_clean_target_directory(self):
         for workflow in ("bindings.yaml", "bindings-profile.yml", "c-bindings.yml"):
             with self.subTest(workflow=workflow):

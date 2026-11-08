@@ -55,17 +55,37 @@ download() {
     --retry 4 --retry-all-errors --retry-max-time 120 \
     --output "$archive" "$@"
 }
-
-if ! download "https://github.com/odin-lang/Odin/releases/download/$version/$asset"; then
-  # The API endpoint can issue a fresh asset redirect if the download URL fails.
-  download -H 'Accept: application/octet-stream' \
-    "https://api.github.com/repos/odin-lang/Odin/releases/assets/$asset_id?download=1"
-fi
 # Verify the archive before extracting or executing any upstream content.
-if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | sha256sum -c -)
+verify_archive() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | sha256sum -c -)
+  else
+    (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | shasum -a 256 -c)
+  fi
+}
+# ODIN_ARCHIVE_CACHE optionally names a directory that keeps the archive
+# between runs; CI restores it from the Actions cache. A kept copy is used only
+# if it matches the pinned checksum, and is replaced otherwise.
+cached="${ODIN_ARCHIVE_CACHE:+$ODIN_ARCHIVE_CACHE/$asset}"
+if [[ -n "$cached" && -f "$cached" ]] && cp "$cached" "$archive" && verify_archive; then
+  echo "Using the kept $asset" >&2
 else
-  (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | shasum -a 256 -c)
+  if [[ -n "$cached" && -f "$cached" ]]; then
+    echo "The kept $asset does not match its pinned sha256; downloading it again" >&2
+  fi
+  if ! download "https://github.com/odin-lang/Odin/releases/download/$version/$asset"; then
+    # The API endpoint can issue a fresh asset redirect if the download URL fails.
+    download -H 'Accept: application/octet-stream' \
+      "https://api.github.com/repos/odin-lang/Odin/releases/assets/$asset_id?download=1"
+  fi
+  verify_archive || {
+    echo "error: $asset does not match its pinned sha256" >&2
+    exit 1
+  }
+  if [[ -n "$cached" ]]; then
+    mkdir -p "$ODIN_ARCHIVE_CACHE"
+    cp "$archive" "$cached"
+  fi
 fi
 mkdir "$work/unpack"
 if [[ "$extension" == zip ]]; then
