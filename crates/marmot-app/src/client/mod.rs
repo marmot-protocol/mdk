@@ -981,6 +981,12 @@ pub struct AppClient {
     /// The retention floor the recovery runner's debt turns last pruned the
     /// ledger to in this process, if any did.
     pub(crate) runner_pruned_floor: Option<u64>,
+    /// The clock (Unix seconds) the runner's next prune takes its retention
+    /// floor from: its previous debt turn's, or before its first, the one the
+    /// open seeded standing goals with. It moves only past a prune that
+    /// succeeded, so the seconds of a goal seeded since at its own floor wait
+    /// for a debt turn to sweep them instead of being parked before one could.
+    pub(crate) runner_prune_clock: u64,
     /// One-shot failure of the recovery runner's ownership preparation.
     #[cfg(test)]
     pub(crate) fail_next_runner_preparation: bool,

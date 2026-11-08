@@ -197,20 +197,65 @@ async fn debt_turn_fences(client: &mut AppClient) -> Vec<u64> {
 /// and fences nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
+    let (mut fixture, route, aged) = aged_capture().await;
+
+    assert_eq!(
+        debt_turn_fences(&mut fixture.client).await,
+        Vec::<u64>::new()
+    );
+    only_the_aged_capture_parked(&fixture, &route, aged);
+}
+
+/// A debt turn whose prune failed read no debt, so it is not a turn the
+/// retry may prune behind: the retry prunes to the open's floor, and only the
+/// aged capture parks, not the seconds the inbox's goal has slid by since the
+/// open (mdk#3040).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_prune_leaves_its_retry_the_floor_it_read() {
+    let (mut fixture, route, aged) = aged_capture().await;
+    next_second().await;
+    let faults = fault_connection(&fixture.client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_park BEFORE INSERT ON account_recovery_coverage_remainders
+             BEGIN SELECT RAISE(FAIL, 'prune failed'); END;",
+        )
+        .unwrap();
+    let AccountRunner {
+        runner, mut turns, ..
+    } = fixture.client.build_recovery_runner().await;
+    let host = runner.host.clone();
+    let failed = tokio::spawn(async move { host.debt_turn(|_| Ok(())).await });
+    turns.recv().await.unwrap().serve(&mut fixture.client).await;
+    assert!(
+        matches!(failed.await.unwrap(), Some(Err(_))),
+        "the prune failed"
+    );
+    faults.execute_batch("DROP TRIGGER fail_park").unwrap();
+
+    assert_eq!(
+        debt_turn_fences(&mut fixture.client).await,
+        Vec::<u64>::new()
+    );
+    only_the_aged_capture_parked(&fixture, &route, aged);
+}
+
+/// A fixture whose one group route owes a capture its relay never answered,
+/// a month older than the retention window.
+async fn aged_capture() -> (
+    Fixture,
+    TransportReconciliationRoute,
+    storage_sqlite::RecoveryCoverageRange,
+) {
     use crate::client::recovery_coverage::scenario_tests::fixture_on;
-    let Fixture {
-        mut client,
-        storage,
-        _dir,
-        ..
-    } = fixture_on(
+    let fixture = fixture_on(
         vec!["wss://a.example".into()],
         None,
         Some(Duration::from_secs(120)),
     )
     .await;
-    let ledger = storage.app_storage();
-    let route = group_routes(&client).pop().unwrap();
+    let ledger = fixture.storage.app_storage();
+    let route = group_routes(&fixture.client).pop().unwrap();
     let relay = transport_nostr::canonical_relay("wss://a.example");
     let now = unix_now_seconds();
     let aged = storage_sqlite::RecoveryCoverageRange {
@@ -223,19 +268,26 @@ async fn a_debt_turn_parks_a_capture_older_than_the_retention_window() {
     ledger
         .set_recovery_unit_fences(&route, &relay, &[aged])
         .unwrap();
+    (fixture, route, aged)
+}
 
-    assert_eq!(debt_turn_fences(&mut client).await, Vec::<u64>::new());
-    // Another route's goal may slip a second below the floor while the
-    // fixture starts; only this route's parked history is under test.
-    let remainders = ledger
+/// Only the aged capture's route parked, from the capture up: the inbox's
+/// goal the fixture's open seeded stays whole, whenever the debt turn came
+/// after it (mdk#3040).
+fn only_the_aged_capture_parked(
+    fixture: &Fixture,
+    route: &TransportReconciliationRoute,
+    aged: storage_sqlite::RecoveryCoverageRange,
+) {
+    let remainders = fixture
+        .storage
+        .app_storage()
         .recovery_coverage_remainders()
-        .unwrap()
-        .into_iter()
-        .filter(|remainder| remainder.route == route)
-        .collect::<Vec<_>>();
+        .unwrap();
     let [remainder] = remainders.as_slice() else {
         panic!("one parked remainder, not {}", remainders.len());
     };
+    assert_eq!(&remainder.route, route);
     assert_eq!(remainder.range.since_seconds, aged.since_seconds);
     assert!(remainder.range.until_seconds >= aged.until_seconds);
 }
@@ -2189,4 +2241,57 @@ async fn an_upgraded_accounts_certified_epoch_gap_is_visited_only_while_its_grou
         Some(1)
     );
     assert_eq!(epoch(&client, &stalled), stalled_epoch);
+}
+
+/// A fresh account's open seeds the inbox's goal at the retention floor of
+/// its own clock reading, and the runner's first debt turn comes in a later
+/// second. Its prune leaves that goal whole: the seconds that slid out of the
+/// window in between were never asked of a relay, so the pass sweeps them
+/// instead of parking them, the next hourly prune finds nothing owed either,
+/// and the account never shows a "history may be incomplete" notice
+/// (mdk#3040).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runner_sweeps_rather_than_parks_what_the_open_seeded() {
+    let (_dir, _relay, app, mut client) = direct_client().await;
+    next_second().await;
+
+    client.run_recovery_runner_pass().await.unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    assert!(
+        storage.recovery_coverage_remainders().unwrap().is_empty(),
+        "the first prune parked a remainder"
+    );
+    // The pass surveyed, so a parked remainder would show as a notice.
+    assert!(
+        client
+            .routing
+            .recovery_runner_catching_up_now()
+            .is_some_and(|units| units.is_empty())
+    );
+    assert!(client.account_recovery_status().unwrap().notices.is_empty());
+
+    // The next prune comes once the floor has moved an hour, a debt turn
+    // after the clock got there. The pass swept what the first prune kept.
+    let later = unix_now_seconds() + HOUR;
+    client.prune_runner_retention(&storage, later).unwrap();
+    client.prune_runner_retention(&storage, later).unwrap();
+    assert!(
+        client
+            .runner_pruned_floor
+            .is_some_and(|floor| floor >= later - 30 * DAY)
+    );
+    assert!(
+        storage.recovery_coverage_remainders().unwrap().is_empty(),
+        "the hourly prune parked what the first prune kept"
+    );
+}
+
+/// Sleep into the next wall-clock second. The ledger's clock is wall-clock
+/// seconds with no seam, so a test of a second boundary waits for one.
+async fn next_second() {
+    let into_second = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_millis();
+    tokio::time::sleep(Duration::from_millis(u64::from(1_050 - into_second))).await;
 }

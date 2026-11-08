@@ -179,7 +179,9 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   repeat. The restart requires at least two advancing runner attempts, at most four wasted attempts, a fresh
   caught-up survey. Busy-group live messages may wait for older backlog admission; their maximum delay is bounded
   by the measured backlog recovery plus the 60-second tail-drain allowance. Quiet-group visibility retains its
-  independent bound. Idle traffic remains measured separately.
+  independent bound. Idle traffic remains measured separately. Reconnect traffic counts every connection of bob's
+  since the restart, since endpoint 1's survives the cut. The report lists each notice before the restart and at the
+  end by route (busy, quiet or inbox) and park time, without ids, and keeps the setup's runner trace.
 - `public_app_runner_orders_six_thousand_backlog_messages_before_live_input` retains the captured three-sender
   6,000-event admission-order failure. Live subscription traffic competes with older recovery. It requires every
   owed/live message exactly once, zero native paging and the exact timeline after closing/reopening Bob. The

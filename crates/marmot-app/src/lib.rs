@@ -2210,6 +2210,8 @@ impl MarmotApp {
             pending_runtime_group_subscription_refresh: false,
             runner_preparation_owed: false,
             runner_pruned_floor: None,
+            // Set with the open's goals, just below.
+            runner_prune_clock: unix_now_seconds(),
             #[cfg(test)]
             fail_next_runner_preparation: false,
             checkpointed_transport_timestamp,
