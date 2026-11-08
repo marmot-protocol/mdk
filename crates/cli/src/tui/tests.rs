@@ -9012,9 +9012,15 @@ fn group_detail_leave_confirms_before_the_authoritative_command() {
         (self_id.clone(), "npubself".to_owned()),
         (peer_id.clone(), "npubpeer".to_owned()),
     ];
-    // Core owns demotion and last-admin refusal; eligible admins and ordinary
-    // members must both reach the authoritative command after confirmation.
-    for is_admin in [true, false] {
+    // Ordinary members reach the authoritative command after confirmation.
+    // Where Leave steps an admin down itself (a `dev-device-groups` build),
+    // eligible admins do too; elsewhere the guard below stops them first.
+    let admin_cases: &[bool] = if cfg!(feature = "dev-device-groups") {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for &is_admin in admin_cases {
         for local_signing in [true, false] {
             let dir = tempfile::tempdir().expect("tempdir");
             let (exe, args_file) = test_appending_arg_executable(
@@ -9089,6 +9095,73 @@ fn group_detail_leave_confirms_before_the_authoritative_command() {
                 recorded.lines().next().map(str::trim_end),
                 Some(format!("--json --account {self_id} groups leave g1").as_str())
             );
+        }
+    }
+}
+
+#[test]
+fn group_detail_leave_guard_stops_admins_where_leave_does_not_demote() {
+    let self_id = "aa".repeat(32);
+    let peer_id = "bb".repeat(32);
+    let members = vec![
+        (self_id.clone(), "npubself".to_owned()),
+        (peer_id.clone(), "npubpeer".to_owned()),
+    ];
+    let sole = build_group_detail(
+        "g1",
+        "Ops",
+        "",
+        &members,
+        std::slice::from_ref(&self_id),
+        &[],
+        &self_id,
+        true,
+    );
+    let coadmin = build_group_detail(
+        "g1",
+        "Ops",
+        "",
+        &members,
+        &[self_id.clone(), peer_id.clone()],
+        &[],
+        &self_id,
+        true,
+    );
+    let member = build_group_detail("g1", "Ops", "", &members, &[peer_id], &[], &self_id, true);
+    // Without automatic step-down core refuses every admin's Leave until it
+    // demotes (mdk#3014 interim), and the TUI has no demote action.
+    assert_eq!(
+        leave_group_decision(&sole, false),
+        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
+    );
+    assert_eq!(
+        leave_group_decision(&coadmin, false),
+        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
+    );
+    assert_eq!(leave_group_decision(&member, false), LeaveDecision::Confirm);
+    // With it, the command demotes or refuses the last admin itself.
+    for view in [&sole, &coadmin, &member] {
+        assert_eq!(leave_group_decision(view, true), LeaveDecision::Confirm);
+    }
+
+    if cfg!(feature = "dev-device-groups") {
+        return;
+    }
+    let mut app = test_tui_app(test_unused_client(), &self_id);
+    app.screen = Screen::GroupDetail;
+    for (view, message) in [
+        (sole, LEAVE_SOLE_ADMIN_MESSAGE),
+        (coadmin, LEAVE_CO_ADMIN_MESSAGE),
+    ] {
+        app.group_detail = Some(view);
+        app.popup = None;
+        app.handle_key(char_key('L')).expect("L on an admin");
+        match &app.popup {
+            Some(Popup::Card { title, body }) => {
+                assert_eq!(title, CANNOT_LEAVE_TITLE);
+                assert_eq!(body[0], message);
+            }
+            other => panic!("expected the admin info card, got {other:?}"),
         }
     }
 }

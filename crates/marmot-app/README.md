@@ -327,9 +327,9 @@ the recipient retains the private package, or that every relay disclosed all rep
 in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
 
-**Leaving.** An admin account's Leave is refused with `AdminCannotSelfRemove` before anything is written or sent; the
-host demotes it first (`self_demote_admin`) and then leaves, and a last admin first makes another member an admin.
-`requires_self_demote_before_leave` says so. With experimental device groups on (`MarmotApp::admin_leave_steps_down`),
+**Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
+`AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
+leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With experimental device groups on (`MarmotApp::admin_leave_steps_down`),
 User Leave instead demotes this account itself when another active administrator account remains, then requests its
 own leaf's SelfRemove, and the last active administrator account is refused on all its devices before a choice or
 departure is published (mdk#3014 keeps that automatic step-down off elsewhere until a lost step-down can no longer

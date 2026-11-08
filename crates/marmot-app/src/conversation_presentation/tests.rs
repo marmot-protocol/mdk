@@ -220,6 +220,20 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
         assert!(!a.member_actions(false, false).can_promote);
         assert_eq!(c.is_self_admin, membership == SelfMembership::Member);
         assert!(!c.is_last_admin); // Two actual admins in this fixture.
+        // Declining is a Leave: an admin invitee demotes first.
+        assert_eq!(
+            c.requires_self_demote_before_leave,
+            expected == ConversationParticipation::PendingInvitation
+        );
+        let stepping_down = ConversationAuthority {
+            admin_leave_steps_down: true,
+            ..a
+        };
+        assert!(
+            !stepping_down
+                .capabilities()
+                .requires_self_demote_before_leave
+        );
     }
     input.unrecoverable = true;
     assert!(!input.capabilities().can_send);

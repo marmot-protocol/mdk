@@ -411,10 +411,10 @@ pub struct GroupManagementStateFfi {
     /// and membership before acting.
     pub can_leave: bool,
     /// Whether an admin must demote itself (`self_demote_admin`) before
-    /// Leave, which otherwise returns `AdminCannotSelfRemove`. A last admin
-    /// first makes another member an admin. False while experimental device
-    /// groups are on (core demotes), and when disbanding or a terminal
-    /// lifecycle hides ordinary actions.
+    /// Leave or declining a pending invitation, which otherwise return
+    /// `AdminCannotSelfRemove`. A last admin first makes another member an
+    /// admin. False while experimental device groups are on (core demotes),
+    /// and when disbanding or a terminal lifecycle hides ordinary actions.
     pub requires_self_demote_before_leave: bool,
     /// A leave is already in flight for this group; `Marmot::leave_group` would
     /// return `MarmotKitError::LeaveAlreadyRequested`. Render progress rather

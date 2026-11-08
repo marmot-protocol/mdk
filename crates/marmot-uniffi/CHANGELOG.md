@@ -5,9 +5,10 @@
 - `DeviceLinkSnapshotFfi` gains `device_group_stalled` (default `false`): this device can no longer catch up with its
   device group; offer `reset_device_group_for_repair`. Devices now mark and remove inactive siblings themselves
   (mdk#2628 item 3.6b-2). Experimental device-group builds only. Regenerate bindings.
-- An admin's `leave_group` returns `AdminCannotSelfRemove` until `self_demote_admin`, and management state reports
-  `requires_self_demote_before_leave` for admins, as in 0.14 (mdk#3014). Only the experimental device-groups
-  constructor makes Leave demote a nonlast admin account itself. No API change.
+- An admin's `leave_group`, and an admin invitee's `decline_group_invite`, return `AdminCannotSelfRemove` until
+  `self_demote_admin`, and management state reports `requires_self_demote_before_leave` for them, as in 0.14
+  (mdk#3014). Only the experimental device-groups constructor makes Leave demote a nonlast admin account itself. No
+  API change.
 
 - Emoji set changes (breaking; no host has shipped against the emoji set API).
   `install_emoji_set(account_ref, coordinate, expected_event_id_hex, control)` binds the install to the version the

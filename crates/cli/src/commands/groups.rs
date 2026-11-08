@@ -2314,6 +2314,11 @@ mod tests {
         let pending = group_management_json(&me, &group, &members, &mls, true);
         assert_eq!(pending["can_leave"], false);
         assert_eq!(pending["requires_self_demote_before_leave"], false);
+        // Without automatic step-down an admin invitee demotes before Decline.
+        assert_eq!(
+            group_management_json(&me, &group, &members, &mls, false)["requires_self_demote_before_leave"],
+            true
+        );
         group.pending_confirmation = false;
         assert_eq!(
             group_management_json(&me, &group, &members, &mls, true),

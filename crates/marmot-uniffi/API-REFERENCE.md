@@ -2141,7 +2141,7 @@ Accept a pending group invitation.
 pub async fn decline_group_invite( &self, account_ref: String, group_id_hex: String, ) -> Result<GroupInviteDeclineResultFfi, MarmotKitError>
 ```
 
-Decline a pending group invitation.
+Decline a pending group invitation. An invitee the invite made an admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`), unless the experimental device-groups constructor is used.
 
 [Source](src/commands/group.rs#L1106)
 

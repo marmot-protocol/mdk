@@ -369,7 +369,7 @@ c_mirror! {
         copy can_invite: bool,
         /// Whether a Leave action would do anything right now.
         copy can_leave: bool,
-        /// Whether an admin must self-demote before Leave; false with experimental device groups on.
+        /// Whether an admin must self-demote before Leave or Decline; false with experimental device groups on.
         copy requires_self_demote_before_leave: bool,
         /// A leave is already in flight; render progress, not a Leave
         /// affordance.

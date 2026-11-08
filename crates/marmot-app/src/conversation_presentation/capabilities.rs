@@ -89,6 +89,13 @@ impl ConversationAuthority {
         let admin =
             self.is_member && self.self_membership == SelfMembership::Member && self.is_admin;
         let manage = ordinary && admin;
+        // Declining a pending invitation is a Leave too, so an admin invitee
+        // demotes first as well.
+        let departs_as_admin = admin
+            && matches!(participation, P::Active | P::PendingInvitation)
+            && !self.disbanding
+            && !self.unrecoverable
+            && self.lifecycle != AppGroupLifecycleState::Unrecoverable;
         ConversationCapabilities {
             participation,
             is_self_admin: admin,
@@ -100,7 +107,7 @@ impl ConversationAuthority {
             // demotion in core. Otherwise the host demotes first.
             can_leave: ordinary
                 && (!admin || (self.admin_leave_steps_down && self.admin_count > 1)),
-            requires_self_demote_before_leave: manage && !self.admin_leave_steps_down,
+            requires_self_demote_before_leave: departs_as_admin && !self.admin_leave_steps_down,
             can_enable_disbanding: manage
                 && self.lifecycle == AppGroupLifecycleState::Stable
                 && !self.disbanding_enabled
