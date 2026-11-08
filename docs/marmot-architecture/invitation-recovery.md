@@ -164,7 +164,7 @@ the resulting replacement Welcome. Native height is only a baseline for detectin
 Remote epoch ordering (`observed_epoch`) belongs to the current request. A fresh nonce discards the old coordinator's height claim,
 allowing a lower winning source while retaining reservation cost and the spent one-shot refill.
 
-Requests expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary maintenance.
+Requests expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by host-scheduled recovery turns.
 Expiry rotates to the next candidate without resetting episode cost. A coordinator durably reserves a 600-second
 per-group/member Commit cooldown before staging; a new nonce cannot bypass it. The runtime admits at most 64
 recipient jobs per account, 256 coordinator jobs per account and 16 per group; compatible grants batch at most 16
@@ -181,6 +181,7 @@ delivery remain prerequisites.
 Existing membership-profile cutover rules still apply: a current-profile coordinator cannot recover a leaf in a
 legacy group. A recipient whose fresh KeyPackages use a different profile skips recovery before publishing one.
 Quarantined group records retire their stale recipient jobs without blocking recovery in other groups.
+Quarantined coordinators retain unresolved publication debt without new reservations or publication attempts.
 Restored coordinators hydrate their group before advancing a retained Challenge or Grant.
 
 Rust hosts drive `prepare_group_recovery`, resolve only
@@ -195,7 +196,7 @@ Hosts can read `group_rejoin_status` as `Inactive`, `Pending { attempts }` or `P
 lets a host ask the user to retry or request an admin re-add.
 `retry_group_rejoin` explicitly starts a new budget only for an eligible Unrecoverable copy; it grants no authority
 to overwrite a usable copy. It clears the remote epoch high-water mark and restores the one-shot permission, so a
-dishonest coordinator cannot poison every later user-authorized episode. An unexpired grant retains its nonce,
-selected coordinator and exact signed artifact: Retry does not create a second live authorization.
+dishonest coordinator cannot poison every later user-authorized episode. An unexpired Request, Challenge or grant retains
+its nonce, selected coordinator and exact outbound artifact: Retry does not create a second live authorization.
 A withdrawn coordinator publication that expires or loses eligibility retires its commit link; the retained
 cooldown row cannot continually reschedule it.

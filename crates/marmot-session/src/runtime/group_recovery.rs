@@ -7,9 +7,7 @@ use cgka_traits::group_recovery::{
     AuthenticatedGroupRecovery, GroupMemberRecovery, GroupRecoveryBody, GroupRecoveryMessage,
     GroupRecoverySource,
 };
-use cgka_traits::storage::{
-    GroupStorage, MaintenanceStorage, MessageStorage, OutboundFanoutStorage, StorageProvider,
-};
+use cgka_traits::storage::{GroupStorage, MessageStorage, OutboundFanoutStorage, StorageProvider};
 use storage_sqlite::{
     GroupRecoveryPhase as Phase, GroupRecoveryRecord as Record, GroupRecoveryRole as Role,
 };
@@ -87,7 +85,10 @@ where
             record.role == Role::Recipient
                 && &record.group_id == group_id
                 && record.expires_at > now
-                && matches!(record.phase, Phase::Grant | Phase::AwaitWelcome)
+                && matches!(
+                    record.phase,
+                    Phase::Request | Phase::Challenge | Phase::Grant | Phase::AwaitWelcome
+                )
         });
         let record = match live {
             Some(previous)
@@ -95,8 +96,8 @@ where
                     .recipient_recovery_state(group_id)?
                     .is_some_and(|state| Some(state.token) == previous.local_state_token) =>
             {
-                // A live grant still authorizes its original coordinator. Retry
-                // renews the budget without creating a second authorization.
+                // A live handshake still belongs to its original coordinator.
+                // Retry renews its budget without invalidating an in-flight reply.
                 let mut record = previous.clone();
                 record.total_attempts = 0;
                 record.observed_epoch = None;
@@ -159,17 +160,26 @@ where
             .storage
             .list_group_recoveries()
             .map_err(SessionError::from)?;
-        let evolutions = if records.iter().any(|record| {
-            record.role == Role::Coordinator
-                && matches!(record.phase, Phase::Grant | Phase::Publishing)
-        }) {
-            self.session
-                .storage
-                .list_group_evolutions()
-                .map_err(SessionError::from)?
-        } else {
-            Vec::new()
-        };
+        // Quarantine retains publication debt, but grants no scheduling authority.
+        records.retain(|record| {
+            record.role != Role::Coordinator || !self.recovery_group_quarantined(&record.group_id)
+        });
+        let mut evolutions = Vec::new();
+        let mut inspected = HashSet::new();
+        for record in &records {
+            if record.role != Role::Coordinator
+                || !matches!(record.phase, Phase::Grant | Phase::Publishing)
+                || !inspected.insert(&record.group_id)
+            {
+                continue;
+            }
+            if !self.session.ensure_group_hydrated(&record.group_id)?
+                || self.recovery_group_quarantined(&record.group_id)
+            {
+                continue;
+            }
+            evolutions.extend(self.session.group_evolutions_for_group(&record.group_id)?);
+        }
         let mut publications = HashMap::new();
         for evolution in &evolutions {
             if !matches!(
@@ -358,6 +368,8 @@ where
         records.retain(|record| {
             record.phase != Phase::Complete
                 && record.phase != Phase::Parked
+                && (record.role != Role::Coordinator
+                    || !self.recovery_group_quarantined(&record.group_id))
                 && (record.role != Role::Recipient
                     || record.total_attempts < MAX_RECIPIENT_ATTEMPTS)
                 && record.retry_at <= now
@@ -443,6 +455,10 @@ where
         }
         let mut ready = Vec::new();
         for record in reserved {
+            if record.role == Role::Coordinator && self.recovery_group_quarantined(&record.group_id)
+            {
+                continue;
+            }
             let current = self
                 .session
                 .storage
@@ -575,6 +591,13 @@ where
             self.publish_recovery_control(&mut record).await?;
         }
         Ok(())
+    }
+
+    fn recovery_group_quarantined(&self, group_id: &GroupId) -> bool {
+        matches!(
+            self.session.engine.check_group_live(group_id),
+            Err(EngineError::UnknownGroup(_))
+        )
     }
 
     fn recipient_recovery_state(

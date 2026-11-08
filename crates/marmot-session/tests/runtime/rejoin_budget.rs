@@ -1,5 +1,44 @@
 // Exercise the runtime owner: reservations precede lookup and survive request TTLs.
 #[tokio::test]
+async fn rejoin_retry_keeps_handshake() {
+    for challenged in [false, true] {
+        let mut peers = recovery_peers(0).await;
+        let challenge = issue_recovery_challenge(&mut peers).await;
+        let recipient = peers.recipient.self_id();
+        if challenged {
+            peers
+                .recipient
+                .ingest_delivery(&recovery_inbox_delivery(recipient.clone(), challenge.clone()))
+                .await
+                .unwrap();
+        }
+        peers.recipient.retry_group_rejoin(&peers.group).unwrap();
+        let accepted = peers
+            .recipient
+            .ingest_delivery(&recovery_inbox_delivery(recipient, challenge))
+            .await
+            .unwrap();
+        assert!(
+            !accepted.left_object_unpersisted,
+            "retry must retain the nonce of the coordinator's live Challenge"
+        );
+        peers.recipient.prepare_group_recovery().unwrap();
+        peers
+            .recipient
+            .advance_group_recovery(&[], &mut AccountDeviceEffects::default())
+            .await
+            .unwrap();
+        let grant = peers.bob_adapter.publishes().last().unwrap().message.clone();
+        let accepted = peers
+            .coordinator
+            .ingest_delivery(&recovery_inbox_delivery(peers.coordinator.self_id(), grant))
+            .await
+            .unwrap();
+        assert!(!accepted.left_object_unpersisted);
+    }
+}
+
+#[tokio::test]
 async fn recovery_batch_keeps_effects() {
     let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;

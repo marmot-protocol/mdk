@@ -1,5 +1,59 @@
 // Recovery eligibility must be checked before account-wide work or public KP rotation.
 #[tokio::test]
+async fn recovery_quarantine_parks_work() {
+    let mut peers = recovery_peers(0).await;
+    exchange_recovery(&mut peers).await;
+    let published = peers.adapter.publishes().len();
+    *peers.adapter.inner.endpoint_gate.lock().unwrap() = Some((
+        TransportEndpoint("wss://recovery-group.example".into()),
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    ));
+    {
+        let mut effects = AccountDeviceEffects::default();
+        let mut pending = Box::pin(peers.coordinator.advance_group_recovery(&[], &mut effects));
+        wait_for_publish_count(pending.as_mut(), &peers.adapter, published + 1).await;
+    }
+    let path = peers._dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    drop(peers.coordinator);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let retained = storage.list_group_recoveries().unwrap();
+    assert_eq!(retained[0].phase, storage_sqlite::GroupRecoveryPhase::Publishing);
+    assert!(storage.outbound_fanout(retained[0].commit_id.as_ref().unwrap()).unwrap()
+        .is_some_and(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_))));
+    drop(storage);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection.execute(
+        "UPDATE cgka_group_evolutions SET record = X'ff' WHERE group_id = ?1",
+        rusqlite::params![peers.group.as_slice()],
+    ).unwrap();
+    drop(connection);
+    *peers.adapter.inner.endpoint_gate.lock().unwrap() = None;
+    peers.coordinator = eligibility_runtime(
+        nostr_device_session(&path, &key, b"cancel-alice"),
+        peers.recipient.self_id(),
+        peers.wall.clone(),
+        peers.adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    assert!(peers.coordinator.quarantined_groups().iter().any(|(id, _)| id == &peers.group));
+    let published = peers.adapter.publishes().len();
+    peers.wall.set(peers.wall.now().0 + 120);
+    assert!(peers.coordinator.prepare_group_recovery().unwrap().is_empty());
+    peers.coordinator.advance_group_recovery(&[], &mut AccountDeviceEffects::default()).await.unwrap();
+    assert_eq!(peers.adapter.publishes().len(), published);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert_eq!(storage.list_group_recoveries().unwrap(), retained,
+        "quarantine retains pending publication debt without spending another reservation");
+}
+
+#[tokio::test]
 async fn recovery_control_identity() {
     let mut peers = recovery_peers(0).await;
     let challenge = issue_recovery_challenge(&mut peers).await;

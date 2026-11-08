@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Preserve pending group-rejoin handshakes on explicit retry. Quarantined
+  coordinators retain unresolved publication debt without reserving more work.
+
 ### Security
 
 - Verify live directory events independently at MDK's relay forwarding and
