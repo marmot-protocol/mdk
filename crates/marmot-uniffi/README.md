@@ -1141,8 +1141,9 @@ the device group this device trusts, for a Devices screen:
   whose `status` is `Inactive` and whose `keep_while_inactive` is off. About 90 days after, a device still marked
   `Inactive` without **Keep while inactive** is removed as by `remove_linked_device`, except that its KeyPackage slot
   is left on the relays. A marked device that is running clears its own mark once it has caught up. One whose recovery
-  gave up on a missed Commit, or whose copy is unrecoverable, can't catch up, see or clear its mark, and is removed at
-  90 days like one that never came back: offer the reset on `device_group_stalled` (below).
+  gave up on a missed Commit, or whose copy is unrecoverable with no automatic rejoin underway, can't catch up, see or
+  clear its mark, and is removed at 90 days like one that never came back: offer the reset on `device_group_stalled`
+  (below).
 - The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
   without explicit experimental device-group intent.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
@@ -1202,9 +1203,9 @@ choice. To apply it again, edit the device once it is listed in the selected ros
 ### Explicit local device-group reset before fresh pairing
 
 `DeviceLinkSnapshotFfi.device_group_stalled` says this device can no longer catch up with its device group: automatic
-recovery gave up on a change it missed, or its copy is unrecoverable. It cannot see or clear an `Inactive` mark, and
-its siblings remove it about 90 days after they last heard from it. Offer the reset below, then fresh pairing. Re-read
-on `DeviceLinkChanged`, which fires when it changes.
+recovery gave up on a change it missed, or its copy is unrecoverable and automatic rejoin is not underway. It cannot
+see or clear an `Inactive` mark, and its siblings remove it about 90 days after they last heard from it. Offer the reset
+below, then fresh pairing. Re-read on `DeviceLinkChanged`, which fires when it changes.
 
 In an experimental device-group build, offer `reset_device_group_for_repair(account_ref)` only after the user chooses
 to discard this device's local hidden device-group copy. It keeps account credentials, the stable device slot and

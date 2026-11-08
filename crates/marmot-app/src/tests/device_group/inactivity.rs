@@ -26,8 +26,11 @@ fn prove_history(client: &AppClient, group: &GroupId) {
 }
 
 /// Widen the goal of each of `group`'s routes in `client`'s ledger to
-/// `goal_from` and cover it from `covered_from` through a day from now on
-/// every relay. Returns the routes with the relays that certify them.
+/// `goal_from`, cover it from `covered_from` through a day from now on every
+/// relay, and dismiss the routes' remainders: the setup's first prune can
+/// park the seconds between a goal's start and that prune, which a device
+/// whose clock had run as long as the tests plant would have proved.
+/// Returns the routes with the relays that certify them.
 fn prove_history_from(
     client: &AppClient,
     group: &GroupId,
@@ -60,6 +63,15 @@ fn prove_history_from(
                     now + DAY,
                 )
                 .unwrap();
+        }
+    }
+    for remainder in storage.recovery_coverage_remainders().unwrap() {
+        if routes.iter().any(|route| route.route == remainder.route) {
+            assert!(
+                storage
+                    .dismiss_recovery_route_park(&remainder.route, remainder.revision)
+                    .unwrap()
+            );
         }
     }
     routes
@@ -442,4 +454,65 @@ async fn a_device_stuck_behind_a_missed_commit_is_offered_the_reset() {
             .unwrap(),
         None
     );
+}
+
+/// A copy that turned Unrecoverable can still get a fresh one from a sibling
+/// through automatic rejoin, so it is offered the reset only while no rejoin
+/// is underway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrecoverable_copy_is_offered_the_reset_only_once_its_rejoin_stops() {
+    use cgka_traits::storage::GroupStorage as _;
+    let (mut devices, group) = settled_linked_devices().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let storage = devices.laptop_app.account_storage("alice").unwrap();
+    let mut record = storage.get_group(&group).unwrap();
+    record.unrecoverable = true;
+    storage.put_group(&record).unwrap();
+
+    let request_id = [7; 32];
+    let expires_at = crate::unix_now_seconds() + 600;
+    let mut rejoin = storage_sqlite::GroupRecoveryRecord {
+        group_id: group.clone(),
+        request_id,
+        role: storage_sqlite::GroupRecoveryRole::Recipient,
+        peer: cgka_traits::MemberId::new(vec![1; 32]),
+        leaf_index: 0,
+        local_state_token: Some([2; 32]),
+        expires_at,
+        retry_at: expires_at,
+        attempts: 1,
+        total_attempts: 1,
+        candidate_set_hash: None,
+        native_epoch: None,
+        observed_epoch: None,
+        remote_rearmed: false,
+        commit_started_at: None,
+        phase: storage_sqlite::GroupRecoveryPhase::Request,
+        message: cgka_traits::group_recovery::GroupRecoveryMessage {
+            group_id: group.clone(),
+            request_id,
+            expires_at,
+            body: cgka_traits::group_recovery::GroupRecoveryBody::Request {
+                device_key_hash: [3; 32],
+            },
+        },
+        outbound: None,
+        commit_id: None,
+    };
+    storage.put_group_recovery(&rejoin).unwrap();
+    let snapshot = devices
+        .laptop
+        .device_link(DeviceLinkOp::Read)
+        .await
+        .unwrap();
+    assert!(!snapshot.device_group_stalled);
+
+    rejoin.phase = storage_sqlite::GroupRecoveryPhase::Parked;
+    storage.put_group_recovery(&rejoin).unwrap();
+    let snapshot = devices
+        .laptop
+        .device_link(DeviceLinkOp::Read)
+        .await
+        .unwrap();
+    assert!(snapshot.device_group_stalled);
 }

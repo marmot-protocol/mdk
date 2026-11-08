@@ -45,11 +45,11 @@
 //!   device's heartbeat only after the clear, may mark it once more, and
 //!   that device clears it again.
 //! - **Stalled.** A device whose recovery gave up on an epoch gap in its
-//!   device group, or whose copy is unrecoverable, can never catch up, see
-//!   or clear its mark: its link snapshot shows `device_group_stalled`, which
-//!   offers the explicit reset and fresh pairing (D112). The pairing drive
-//!   raises `DeviceLinkChanged` when that changes, as for any change to the
-//!   snapshot.
+//!   device group, or whose copy is unrecoverable with no automatic rejoin
+//!   underway, can never catch up, see or clear its mark: its link snapshot
+//!   shows `device_group_stalled`, which offers the explicit reset and fresh
+//!   pairing (D112). The pairing drive raises `DeviceLinkChanged` when that
+//!   changes, as for any change to the snapshot.
 //!
 //! One pass makes at most one Commit here. Nothing runs while device groups
 //! are off, maintenance is paused or the account is signing out.
@@ -133,8 +133,8 @@ impl AppClient {
 
     /// Whether this device can no longer catch up with the device group it
     /// trusts: automatic recovery gave up on an epoch gap at its epoch, or its
-    /// copy is unrecoverable. Only the explicit reset and fresh pairing bring
-    /// it back (D112).
+    /// copy is unrecoverable and no automatic rejoin is underway. Only the
+    /// explicit reset and fresh pairing bring it back (D112).
     #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) fn device_group_stalled(&self) -> Result<bool, AppError> {
         let Some(group_id) = self.trusted_device_group()? else {
@@ -146,12 +146,18 @@ impl AppClient {
         if record.is_terminal() {
             return Ok(false);
         }
-        Ok(record.unrecoverable
-            || self
-                .app
-                .account_storage(&self.state.label)?
-                .app_storage()
-                .epoch_gap_recovery_given_up(group_id.as_slice(), record.epoch.0)?)
+        if record.unrecoverable {
+            // A sibling may still send it a fresh copy (automatic rejoin).
+            return Ok(!matches!(
+                self.runtime.group_rejoin_status(&group_id)?,
+                marmot_session::GroupRejoinStatus::Pending { .. }
+            ));
+        }
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .epoch_gap_recovery_given_up(group_id.as_slice(), record.epoch.0)?)
     }
 
     /// Whether this device is caught up with its device group `group_id` at
