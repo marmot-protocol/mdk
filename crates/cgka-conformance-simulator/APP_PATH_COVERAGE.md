@@ -94,8 +94,9 @@ surveyed. `scorecard.json`
 under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 
 - status command (`group_recovery_status`) and send latency p50/p95/max;
-- live-message visibility, timed from the start of alice's send. The slowest five are listed with their start
-  offset, alice's send time and what came after it, which is bob's share;
+- alice's live send latency and live-message visibility twice: from the start of her send, and from its return,
+  which is bob's own share (negative when he saw the message before her call returned). The slowest five from the
+  start are listed with their start offset, her send time and bob's share;
 - commit-applied and decrypted times;
 - per-relay bytes, and EVENT frames split into re-downloaded held history, novel events and the missing commit;
 - each endpoint's EVENT copies and bytes split by cause (`download_split`):
@@ -111,8 +112,9 @@ under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 - a 60-second idle window.
 
 The public API exposes no recovery-attempt counter, so those counts are proxies. Targets (status and send p95 under
-500 ms, visibility p95 under 2 s, no held-history re-download beyond the restart's 120-second rebuild lookback, the
-commit fetched at most once per relay besides that replay's copy, no idle EVENTs) are evaluated but not enforced.
+500 ms, visibility after alice's send returns p95 under 2 s, no held-history re-download beyond the restart's
+120-second rebuild lookback, the commit fetched at most once per relay besides that replay's copy, no idle EVENTs)
+are evaluated but not enforced.
 `MDK_SCORECARD_TRACE` takes a tracing filter for bob's in-process runtime.
 
 Bob's runtime runs in the coordinator process so probes can overlap, because process RPC is serial. The relay and the
