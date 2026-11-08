@@ -2876,3 +2876,231 @@ async fn uncontested_peel_skips_replay_state_fingerprint() {
 
 #[path = "candidate_replay/read_faults.rs"]
 mod read_faults;
+
+// These failure owners need the real encrypted native fork and an independent
+// SQLCipher connection; their setup cost buys the actual backend boundary.
+fn capture_fault_observer(root: &std::path::Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(root.join("observer.sqlite3")).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &storage_sqlite::SqlCipherKey::raw([0x73; 32]),
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    connection
+}
+
+fn capture_native_fingerprint(observer: &rusqlite::Connection) -> [u8; 32] {
+    let mut statement = observer
+        .prepare(
+            "SELECT provider_version, label, storage_key, group_key, value
+         FROM openmls_values ORDER BY provider_version, storage_key",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .unwrap();
+    let mut hash = Sha256::new();
+    for row in rows {
+        let bytes = serde_json::to_vec(&row.unwrap()).unwrap();
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    hash.finalize().into()
+}
+
+#[tokio::test]
+async fn candidate_context_capture_keeps_a_late_native_storage_error() {
+    let (root, storage, group_id, messages) = encrypted_replay_graph_fixture(2, 2, 1).await;
+    for message in &messages {
+        admit_rival(&storage, &group_id, message, 1);
+    }
+    let inputs = super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+    let mut budget = super::ReplayBudget::for_pass(messages.len(), V1_MAX_REWIND_COMMITS);
+    let paths = super::build_stored_openmls_candidate_paths(
+        &storage,
+        &group_id,
+        inputs.commit_messages,
+        &inputs.pending_messages,
+        inputs.replay_start_epoch,
+        &inputs.own_commits,
+        ReplayProfilePolicy::default(),
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(paths.materialized.len(), 2);
+    let path = &paths.candidate_paths[0];
+    let pending = super::pending_proposal_messages(&inputs.pending_messages).unwrap();
+    let before = replay_state(&storage, &group_id);
+    let fingerprint = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    assert!(fingerprint.is_some());
+    let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+    let observer = capture_fault_observer(root.path());
+    let key =
+        serde_json::to_vec(&openmls::group::GroupId::from_slice(group_id.as_slice())).unwrap();
+    let (version, label, storage_key, context): (i64, Vec<u8>, Vec<u8>, Vec<u8>) = observer
+        .query_row(
+            "SELECT provider_version, label, storage_key, value FROM openmls_values
+             WHERE CAST(label AS TEXT) = 'GroupContext' AND group_key = ?1",
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    // The BFS above succeeded. Only its later capture replay sees this fault;
+    // restoring the exact source context stays possible.
+    observer
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_candidate_capture BEFORE INSERT ON openmls_values
+         WHEN NEW.provider_version = {version}
+          AND NEW.label = X'{}' AND NEW.storage_key = X'{}'
+          AND NEW.value <> X'{}'
+         BEGIN SELECT RAISE(ABORT, 'candidate-capture-storage-fault'); END;",
+            hex::encode(label),
+            hex::encode(storage_key),
+            hex::encode(context),
+        ))
+        .unwrap();
+    let consumed = budget.consumed;
+    let failed = super::candidate_path_peel_context(
+        &storage,
+        &group_id,
+        path,
+        &pending,
+        &inputs.own_commits,
+        ReplayProfilePolicy::default(),
+        &mut budget,
+    );
+    assert!(
+        matches!(&failed, Err(super::OpenMlsProjectionError::Storage(detail))
+            if detail.contains("candidate-capture-storage-fault")),
+        "a new capture storage failure must propagate after successful BFS"
+    );
+    assert_eq!(budget.consumed, consumed + 1);
+    assert!(replay_state(&storage, &group_id) == before);
+    assert_eq!(
+        storage.group_replay_state_fingerprint(&group_id).unwrap(),
+        fingerprint
+    );
+    assert!(storage.list_messages(&group_id, EpochId(0)).unwrap() == ledger);
+    assert!(storage.list_queued_outbound_intents(&group_id).unwrap() == queued);
+    observer
+        .execute_batch("DROP TRIGGER fail_candidate_capture")
+        .unwrap();
+    let context = super::candidate_path_peel_context(
+        &storage,
+        &group_id,
+        path,
+        &pending,
+        &inputs.own_commits,
+        ReplayProfilePolicy::default(),
+        &mut budget,
+    )
+    .unwrap()
+    .expect("the same genuine path is readable once storage recovers");
+    assert_eq!(context.tip_epoch, 2);
+    assert!(replay_state(&storage, &group_id) == before);
+    assert_eq!(
+        storage.group_replay_state_fingerprint(&group_id).unwrap(),
+        fingerprint
+    );
+    assert!(storage.list_messages(&group_id, EpochId(0)).unwrap() == ledger);
+    assert!(storage.list_queued_outbound_intents(&group_id).unwrap() == queued);
+}
+
+#[tokio::test]
+async fn candidate_survey_snapshot_failures_keep_state_and_consumed_work() {
+    let (root, storage, group_id, messages) = encrypted_replay_graph_fixture(2, 2, 1).await;
+    storage
+        .create_group_state_snapshot(&group_id, &super::retained_anchor_snapshot_name(1))
+        .unwrap();
+    adopt_branch(&storage, &group_id, &messages[0]);
+    for message in &messages {
+        admit_rival(&storage, &group_id, message, 1);
+    }
+    let before = replay_state(&storage, &group_id);
+    let fingerprint = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    assert!(fingerprint.is_some());
+    let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+    let survey = || {
+        super::candidate_branch_peel(
+            &storage,
+            &group_id,
+            0,
+            V1_MAX_REWIND_COMMITS,
+            ReplayProfilePolicy::default(),
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+        )
+    };
+    let healthy = survey().unwrap();
+    assert!(healthy.contested && healthy.contexts.len() >= 2);
+    assert!(healthy.replay_probe_count > 0);
+    assert!(replay_state(&storage, &group_id) == before);
+    let guard_name = crate::snapshot_guard::RewindSite::CandidateBranchSweep
+        .snapshot_name(&super::rewind_probe_snapshot_suffix(&group_id, 1));
+    let observer = capture_fault_observer(root.path());
+    let native_before = capture_native_fingerprint(&observer);
+    for (operation, expected_count) in [("INSERT", 0), ("DELETE", healthy.replay_probe_count)] {
+        let row = if operation == "INSERT" { "NEW" } else { "OLD" };
+        observer
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_survey_snapshot BEFORE {operation} ON cgka_group_snapshots
+             WHEN {row}.group_id = X'{}' AND {row}.name = '{guard_name}'
+             BEGIN SELECT RAISE(ABORT, 'candidate-survey-snapshot-fault'); END;",
+                hex::encode(group_id.as_slice()),
+            ))
+            .unwrap();
+        let failed = match survey() {
+            Err(failure) => failure,
+            Ok(_) => panic!("the real outer snapshot fault must reach its caller"),
+        };
+        assert!(
+            matches!(&failed.error, super::OpenMlsProjectionError::Snapshot(detail)
+            if detail.contains("candidate-survey-snapshot-fault"))
+        );
+        assert_eq!(
+            failed.replay_probe_count, expected_count,
+            "snapshot failure must retain the probes actually consumed before its stage"
+        );
+        assert_eq!(capture_native_fingerprint(&observer), native_before);
+        assert!(storage.list_messages(&group_id, EpochId(0)).unwrap() == ledger);
+        assert!(storage.list_queued_outbound_intents(&group_id).unwrap() == queued);
+        let mut expected_snapshots = before.2.clone();
+        if operation == "DELETE" {
+            // Rollback succeeded, but both explicit release and Drop cleanup
+            // meet the same persistent backend refusal. Own that exact residue.
+            expected_snapshots.push(guard_name.clone());
+            expected_snapshots.sort();
+        }
+        let actual = replay_state(&storage, &group_id);
+        assert_eq!(actual.0, before.0);
+        assert_eq!(actual.1, before.1);
+        assert_eq!(actual.2, expected_snapshots);
+        observer
+            .execute_batch("DROP TRIGGER fail_survey_snapshot")
+            .unwrap();
+        if operation == "DELETE" {
+            storage
+                .release_group_snapshot(&group_id, &guard_name)
+                .unwrap();
+        }
+        let recovered = survey().unwrap();
+        assert!(recovered.contested);
+        assert_eq!(branch_ids(&recovered), branch_ids(&healthy));
+        assert_eq!(recovered.replay_probe_count, healthy.replay_probe_count);
+        assert!(replay_state(&storage, &group_id) == before);
+        assert_eq!(
+            storage.group_replay_state_fingerprint(&group_id).unwrap(),
+            fingerprint
+        );
+    }
+}
