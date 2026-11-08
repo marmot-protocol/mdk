@@ -68,8 +68,18 @@ fn main() {
         archive.clone()
     };
     let mut command = Command::new(compiler);
+    command.args(["build", "odin", "-no-entry-point"]);
+    if matches!(os.as_str(), "macos" | "ios") {
+        // Odin's Darwin runtime uses Objective-C declarations that bedrock rejects.
+        command.args([
+            "-default-to-nil-allocator",
+            "-disable-init-fini",
+            "-disable-non-constant-globals",
+        ]);
+    } else {
+        command.arg("-bedrock");
+    }
     command
-        .args(["build", "odin", "-no-entry-point", "-bedrock"])
         .arg(if llvm_output {
             "-build-mode:llvm-ir"
         } else if object_output {
