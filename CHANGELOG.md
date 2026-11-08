@@ -2,10 +2,13 @@
 
 ## Unreleased
 
-### Fixed
+### Added
 
-- Preserve pending group-rejoin handshakes on explicit retry. Quarantined
-  coordinators retain unresolved publication debt without reserving more work.
+- Add host-driven automatic rejoin for eligible Unrecoverable group copies,
+  with bounded retries and Rust status and explicit-retry APIs. Accepted
+  recovery controls are durably retained before their inbox source is
+  acknowledged. Live retries preserve the handshake; quarantined coordinators
+  retain publication debt without scheduling more work.
 
 ### Security
 
