@@ -9,15 +9,21 @@
 //! - **The clock.** Only caught-up passes count. When more than 24 hours pass
 //!   between two of them, or the clock went back, every sibling's clock
 //!   restarts at the second: this device was closed, offline or behind.
-//!   Shorter gaps count as running time. A sibling's clock runs from the
+//!   Shorter gaps count as running time. Every clock also restarts when a
+//!   parked remainder, history the retention floor overtook unproved, reaches
+//!   past the last restart; older remainders cannot hold a heartbeat that
+//!   would move any clock, and they last until a user dismisses them. A sibling's clock runs from the
 //!   latest of when this device first found its entry, its last activity,
 //!   when this device read the heartbeat that showed it (D95), when this
 //!   device saw it clear its own mark, and the last restart. It never starts
 //!   before the Devices screen's judgement (D35), so a mark never comes before
 //!   this device would show the sibling inactive.
 //! - **Mark.** At 30 days a caught-up device commits the sibling's entry with
-//!   status `inactive`, every other field unchanged. A lost mark is reissued
-//!   only while the entry is unchanged; otherwise a later pass decides again.
+//!   status `inactive`, every other field unchanged. A mark that loses branch
+//!   selection is reissued by the engine only while the entry is unchanged:
+//!   it is this pass's decision, and it decides no removal, which checks the
+//!   clock again. A lost mark that is not reissued reads as a clear on the
+//!   next pass and postpones that sibling's mark.
 //! - **Remove.** At 90 days, while the roster still lists the sibling as
 //!   `inactive` and its "keep while inactive" setting is off, a caught-up
 //!   device removes it with the removal Commit a user's removal makes. Nothing
@@ -28,7 +34,10 @@
 //!   expired unless the device kept running without reaching its group.
 //! - **Clear.** A device that finds its own entry `inactive` sets it back to
 //!   `active` once it is caught up and has sent a heartbeat since its clock
-//!   last restarted. A sibling that sees the mark cleared restarts that
+//!   last restarted. The heartbeat and inactivity passes of one maintenance
+//!   pass share a second, so a device back after more than a day clears its
+//!   mark on the pass that sends its first heartbeat. A sibling that sees
+//!   the mark cleared restarts that
 //!   device's clock, so one that applies the clear before it reads the
 //!   heartbeat does not mark it again. A device sees a mark on a caught-up
 //!   pass, or when it commits the mark itself; one that applies another
@@ -52,7 +61,7 @@ use storage_sqlite::{DeviceActivityRecord, DeviceInactivityClock};
 
 use super::AppClient;
 use super::device_heartbeats::INACTIVE_AFTER_SECS;
-use crate::{AppError, unix_now_seconds};
+use crate::AppError;
 
 const TRACE_TARGET: &str = "marmot_app::client::device_inactivity";
 
@@ -103,18 +112,16 @@ fn inactive_for(activity: &DeviceActivityRecord, clock: &DeviceInactivityClock, 
 }
 
 impl AppClient {
-    /// One inactivity pass; a failure waits for the next one.
-    pub(crate) async fn device_inactivity_upkeep(&mut self, held: &[GroupId]) {
+    /// One inactivity pass as of `now`, the second the heartbeat pass used;
+    /// a failure waits for the next one.
+    pub(crate) async fn device_inactivity_upkeep(&mut self, held: &[GroupId], now: u64) {
         if !self.app.device_groups_enabled()
             || self.runtime.maintenance_is_paused()
             || self.signing_out()
         {
             return;
         }
-        if let Err(error) = self
-            .try_device_inactivity_upkeep(held, unix_now_seconds())
-            .await
-        {
+        if let Err(error) = self.try_device_inactivity_upkeep(held, now).await {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "device_inactivity_upkeep",
@@ -174,7 +181,15 @@ impl AppClient {
             return Ok(());
         }
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let clock = advance_clock(storage.device_inactivity_clock()?, now);
+        let mut clock = advance_clock(storage.device_inactivity_clock()?, now);
+        // History since the last restart that fell below the retention floor
+        // unproved may hold a heartbeat this device never read.
+        if self
+            .group_parked_until(group_id.as_slice())?
+            .is_some_and(|until| until >= clock.restarted_at)
+        {
+            clock.restarted_at = now;
+        }
         storage.put_device_inactivity_clock(&clock)?;
         for (slot, entry) in &exchange.roster.devices {
             if exchange.is_sibling(slot) {

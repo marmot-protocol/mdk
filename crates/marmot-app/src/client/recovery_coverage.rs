@@ -772,6 +772,27 @@ impl AppClient {
         Ok(true)
     }
 
+    /// The last second of `group_id`'s history that a parked remainder on one
+    /// of its current routes still owes: debt the retention floor overtook,
+    /// which [`Self::group_history_proved`] does not read, since it lasts
+    /// until a user dismisses it.
+    pub(crate) fn group_parked_until(&self, group_id: &[u8]) -> Result<Option<u64>, AppError> {
+        let routes = self
+            .current_coverage_routes()
+            .into_iter()
+            .filter(|current| current.group_id.as_deref() == Some(group_id))
+            .map(|current| current.route)
+            .collect::<Vec<_>>();
+        Ok(self
+            .coverage_storage()?
+            .app_storage()
+            .recovery_coverage_remainders()?
+            .into_iter()
+            .filter(|remainder| routes.contains(&remainder.route))
+            .map(|remainder| remainder.range.until_seconds)
+            .max())
+    }
+
     /// Whether the group's local copy is Unrecoverable, which suspends its
     /// recovery (mdk#2660 section 6). A group whose record cannot be read is
     /// not suspended.

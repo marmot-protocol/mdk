@@ -1140,9 +1140,9 @@ the device group this device trusts, for a Devices screen:
   after a sibling was last heard from, a caught-up device marks it `Inactive`: show "Remove" and "Keep" for a device
   whose `status` is `Inactive` and whose `keep_while_inactive` is off. About 90 days after, a device still marked
   `Inactive` without **Keep while inactive** is removed as by `remove_linked_device`, except that its KeyPackage slot
-  is left on the relays. A marked device that is running clears its own mark. A device catches up only about 30 days
-  back: one that comes back later can't, and is removed at 90 days like one that never came back
-  (`device_group_stalled` below).
+  is left on the relays. A marked device that is running clears its own mark once it has caught up. One whose recovery
+  gave up on a missed Commit, or whose copy is unrecoverable, can't catch up, see or clear its mark, and is removed at
+  90 days like one that never came back: offer the reset on `device_group_stalled` (below).
 - The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
   without explicit experimental device-group intent.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no

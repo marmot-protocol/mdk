@@ -6,19 +6,34 @@
 //! its own mark, and a device that can no longer catch up is offered the
 //! explicit reset (D112).
 
-use super::heartbeats::{devices_storage, entry_of, heartbeat_sent, listed};
+use super::heartbeats::{age_heartbeat, devices_storage, entry_of, heartbeat_sent, listed};
 use super::*;
 use crate::DeviceLinkOp;
 use crate::client::device_inactivity::{
     MARK_INACTIVE_AFTER_SECS, REMOVE_INACTIVE_AFTER_SECS, RUNNING_GAP_SECS,
 };
-use storage_sqlite::{DeviceInactivityClock, RecoveryCoverageProof, RecoveryCoverageSlice};
+use storage_sqlite::{
+    DeviceInactivityClock, RecoveryCoverageProof, RecoveryCoverageSlice,
+    TransportReconciliationRoute,
+};
 
 const DAY: u64 = 24 * 60 * 60;
 
 /// Make `client`'s coverage ledger prove `group`'s history through a day
 /// from now on every relay, as a completed catch-up leaves it.
 fn prove_history(client: &AppClient, group: &GroupId) {
+    prove_history_from(client, group, crate::unix_now_seconds() - DAY, 0);
+}
+
+/// Widen the goal of each of `group`'s routes in `client`'s ledger to
+/// `goal_from` and cover it from `covered_from` through a day from now on
+/// every relay. Returns the routes with the relays that certify them.
+fn prove_history_from(
+    client: &AppClient,
+    group: &GroupId,
+    goal_from: u64,
+    covered_from: u64,
+) -> Vec<(TransportReconciliationRoute, Vec<String>)> {
     let storage = devices_storage(client);
     let now = crate::unix_now_seconds();
     let routes = client
@@ -27,10 +42,10 @@ fn prove_history(client: &AppClient, group: &GroupId) {
         .filter(|route| route.group_id.as_deref() == Some(group.as_slice()))
         .collect::<Vec<_>>();
     assert!(!routes.is_empty(), "the device group has a route");
-    for route in routes {
+    for route in &routes {
         assert!(!route.required.is_empty());
         storage
-            .widen_recovery_coverage_goals(std::slice::from_ref(&route.route), now - DAY)
+            .widen_recovery_coverage_goals(std::slice::from_ref(&route.route), goal_from)
             .unwrap();
         for relay in route.required.iter().chain(&route.best_effort) {
             storage
@@ -38,7 +53,7 @@ fn prove_history(client: &AppClient, group: &GroupId) {
                     &[RecoveryCoverageSlice {
                         route: &route.route,
                         relay,
-                        since_seconds: 0,
+                        since_seconds: covered_from,
                         until_seconds: now + DAY,
                         proof: RecoveryCoverageProof::Comparison,
                     }],
@@ -47,6 +62,10 @@ fn prove_history(client: &AppClient, group: &GroupId) {
                 .unwrap();
         }
     }
+    routes
+        .into_iter()
+        .map(|route| (route.route, route.required))
+        .collect()
 }
 
 /// Make `reader` find `device` `age` ago and have counted no activity of it
@@ -144,6 +163,63 @@ async fn a_sibling_is_marked_after_thirty_caught_up_days_and_clears_its_own_mark
     );
 }
 
+/// A marked device back after more than a day restarts its clock on the
+/// pass that sends its first heartbeat, and clears its mark on that same
+/// pass however long the heartbeat takes to publish: both use the pass's
+/// second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_back_after_a_day_clears_its_mark_on_its_first_heartbeat_pass() {
+    let (mut devices, group) = settled_linked_devices().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    age_sibling(
+        &mut devices.phone,
+        &devices.laptop,
+        MARK_INACTIVE_AFTER_SECS + 60,
+        60,
+    );
+    prove_history(&devices.phone, &group);
+    devices.phone.run_due_maintenance().await.unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert_eq!(
+        status_of(&devices.laptop, &group, &devices.laptop),
+        DeviceStatusV1::Inactive
+    );
+
+    let now = crate::unix_now_seconds();
+    devices_storage(&devices.laptop)
+        .put_device_inactivity_clock(&DeviceInactivityClock {
+            caught_up_at: now - 2 * DAY,
+            restarted_at: now - 3 * DAY,
+        })
+        .unwrap();
+    age_heartbeat(&devices.laptop);
+    prove_history(&devices.laptop, &group);
+    devices.relay.block_next_publish();
+    let relay = &devices.relay;
+    let (pass, ()) = tokio::join!(devices.laptop.run_due_maintenance(), async {
+        relay.wait_for_blocked_publish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        relay.release_publish();
+    });
+    pass.unwrap();
+    let clock = devices_storage(&devices.laptop)
+        .device_inactivity_clock()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        clock.restarted_at, clock.caught_up_at,
+        "the clock restarted"
+    );
+    assert_eq!(
+        heartbeat_sent(&devices.laptop).map(|sent| sent.sent_at),
+        Some(clock.restarted_at)
+    );
+    assert_eq!(
+        status_of(&devices.laptop, &group, &devices.laptop),
+        DeviceStatusV1::Active
+    );
+}
+
 /// Time between caught-up passes counts only across gaps of a day or less:
 /// after a longer one every sibling's clock restarts, so a sibling 30 days
 /// quiet is not marked.
@@ -181,6 +257,56 @@ async fn a_gap_of_more_than_a_day_between_caught_up_passes_restarts_every_clock(
         status_of(&devices.phone, &group, &devices.laptop),
         DeviceStatusV1::Inactive
     );
+}
+
+/// History since the clock last restarted that the retention floor overtook
+/// unproved, a parked remainder, may hold a heartbeat this device never
+/// read: a caught-up pass that finds one restarts every clock rather than
+/// marking. The remainder lasts until a user dismisses it, but restarts
+/// nothing once the clock has restarted after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remainder_since_the_last_restart_restarts_every_clock() {
+    let (mut devices, group) = settled_linked_devices().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let now = crate::unix_now_seconds();
+    let floor = now - 10 * DAY;
+    let routes = prove_history_from(&devices.phone, &group, now - 20 * DAY, floor);
+    let storage = devices_storage(&devices.phone);
+    storage.prune_recovery_coverage(floor, &routes).unwrap();
+    let remainders = storage.recovery_coverage_remainders().unwrap();
+    assert!(!remainders.is_empty());
+    assert!(
+        remainders
+            .iter()
+            .all(|remainder| remainder.range.until_seconds < floor)
+    );
+
+    age_sibling(
+        &mut devices.phone,
+        &devices.laptop,
+        MARK_INACTIVE_AFTER_SECS + 60,
+        60,
+    );
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        status_of(&devices.phone, &group, &devices.laptop),
+        DeviceStatusV1::Active
+    );
+    let clock = storage.device_inactivity_clock().unwrap().unwrap();
+    assert!(clock.caught_up_at >= now, "the pass was caught up");
+    assert_eq!(clock.restarted_at, clock.caught_up_at);
+
+    let restarted_at = now - 5 * DAY;
+    storage
+        .put_device_inactivity_clock(&DeviceInactivityClock {
+            caught_up_at: now - 60,
+            restarted_at,
+        })
+        .unwrap();
+    devices.phone.run_due_maintenance().await.unwrap();
+    let clock = storage.device_inactivity_clock().unwrap().unwrap();
+    assert!(clock.caught_up_at >= now);
+    assert_eq!(clock.restarted_at, restarted_at);
 }
 
 /// A sibling still marked `inactive` is removed at 90 days with the

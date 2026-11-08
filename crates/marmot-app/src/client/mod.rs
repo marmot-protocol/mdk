@@ -1602,8 +1602,11 @@ impl AppClient {
         )
         .await;
         self.sibling_key_package_upkeep(&held).await;
-        self.device_heartbeat_upkeep(&held).await;
-        self.device_inactivity_upkeep(&held).await;
+        // One second for both, so a heartbeat sent on the pass that restarts
+        // the inactivity clock counts as sent since the restart.
+        let device_pass_at = crate::unix_now_seconds();
+        self.device_heartbeat_upkeep(&held, device_pass_at).await;
+        self.device_inactivity_upkeep(&held, device_pass_at).await;
         finish_maintenance_step(app_passes, marmot_observability::Outcome::Success);
         let session =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceSession);
