@@ -1533,12 +1533,13 @@ impl<S: StorageProvider> Engine<S> {
         // sender's next generation while the queued ones wait for the
         // scheduled drain, so their generations would run against send order.
         // A member reading the group's history in `created_at` order, which
-        // is send order, would then reach the drained messages first and
-        // could step that sender's ratchet past its out-of-order window,
-        // losing the messages that went ahead. A group change going ahead
-        // would apply before a message sent ahead of it. So this send queues
-        // behind them, or is refused by the intents that never queue, and the
-        // drain prepares all of them in queue order.
+        // is send order across seconds (not inside one, mdk#3036), would then
+        // reach the drained messages first and could step that sender's
+        // ratchet past its out-of-order window, losing the messages that went
+        // ahead. A group change going ahead would apply before a message sent
+        // ahead of it. So this send queues behind them, or is refused by the
+        // intents that never queue, and the drain prepares all of them in
+        // queue order.
         Ok(self
             .has_queued_intent_awaiting_preparation(group_id)?
             .then_some(OutboundQueueReason::EarlierIntentQueued))

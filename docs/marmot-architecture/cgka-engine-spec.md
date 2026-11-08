@@ -285,15 +285,18 @@ is already on) is retired when the drain reaches it, with nothing to publish and
 `NoChange`.
 
 Display order does not need this, because the application timeline stamps a message when it is accepted. The ratchet
-does (mdk#2842). Each encryption takes the sender's next generation in the epoch, and a receiver keeps only 100 earlier
-generations of a sender (`DEFAULT_OUT_OF_ORDER_TOLERANCE`). A member that reads the group's history in `created_at`
-order, which is acceptance order because the Nostr binding stamps the outer event with the inner app event's
-`created_at`, steps each sender's ratchet in that order. Had later sends gone ahead of retained ones, it would reach
-the retained ones first, at higher generations, and lose every earlier-generation send more than 100 behind. Outside
+does (mdk#2842). Each encryption takes the sender's next generation in the epoch, and once a receiver has decrypted a
+sender's message it can still open only the 99 generations before it (fewer than `DEFAULT_OUT_OF_ORDER_TOLERANCE`,
+100). A member that reads the group's history in `created_at`
+order steps each sender's ratchet in that order. Across seconds that is acceptance order, because the Nostr binding
+stamps the outer event with the inner app event's `created_at`. Inside one second the event id decides, so more than
+100 application messages from one device in one group in one second can lose their oldest for a member catching up,
+a documented limit (mdk#3036). Had later sends gone ahead of retained ones, it would reach
+the retained ones first, at higher generations, and lose every earlier-generation send 100 or more behind. Outside
 those exceptions, ordering by acceptance also keeps a membership change from taking effect before a message
 accepted ahead of it. A drained
 message keeps its original `created_at`: it is part of the inner event's id, and with sends prepared in acceptance
-order it already sorts by generation.
+order it sorts by generation across seconds; messages sharing a second are ordered by event id.
 
 When the group becomes stable, the application calls:
 

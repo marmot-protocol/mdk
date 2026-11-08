@@ -484,13 +484,16 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   order; only the fairness slot, a requested disband and the engine's maintenance commits (replay rotation, SelfRemove
   auto-commit), none of which an application message takes, let a group change go first. A retried in-flight intent
   waits again and takes a later generation, which is why the session runtime resolves each drained intent within the
-  advance that prepared it. Each encryption takes the sender's next generation, and a member reading history in `created_at` order, which
-  is send order, loses any send more than `DEFAULT_OUT_OF_ORDER_TOLERANCE` generations behind one it already read; a
-  send ahead of the queue also lets a membership change overtake a message sent before it. A drained message keeps its
-  `created_at`: it is the inner event's, part of its id, and the Nostr binding stamps the outer event with it. A
-  queued intent that drains to `NoChange` is retired at once, since no confirmation will; a failed delete leaves it
-  for the next drain and keeps what the pass prepared. Pinned by `tests/distributed_convergence/queued_send_order.rs`
-  and `tests/record_write_atomicity.rs::a_queued_no_change_whose_retirement_fails_keeps_the_pass`.
+  advance that prepared it. Each encryption takes the sender's next generation, and a member reading history in
+  `created_at` order loses any send `DEFAULT_OUT_OF_ORDER_TOLERANCE` (100) or more generations behind one it already
+  read. That order is send order across seconds, not inside one, where the event id decides: more than 100
+  application messages from one device in one group in one second can lose their oldest during catch-up, a
+  documented limit (mdk#3036). A send ahead of the queue also lets a membership change overtake a message sent before
+  it. A drained message keeps its `created_at`: it is the inner event's, part of its id, and the Nostr binding stamps
+  the outer event with it. A queued intent that drains to `NoChange` is retired at once, since no confirmation will; a
+  failed delete leaves it for the next drain and keeps what the pass prepared. Pinned by
+  `tests/distributed_convergence/queued_send_order.rs` and
+  `tests/record_write_atomicity.rs::a_queued_no_change_whose_retirement_fails_keeps_the_pass`.
 - **A held publication and an unresolved convergence input are mutually exclusive**, which is why
   `converge_stored_openmls_messages*` needs no held-publication gate. Outbound: `should_queue_outbound_intent` settles
   convergence before staging, so an unresolved input diverts the intent to the retention queue and `begin_pending` is
