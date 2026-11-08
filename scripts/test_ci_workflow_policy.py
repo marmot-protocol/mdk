@@ -532,6 +532,62 @@ class CacheBudgetPolicyTests(unittest.TestCase):
                 self.assertNotIn("actions/cache", text)
 
 
+class OdinArchiveCacheTests(unittest.TestCase):
+    # install-odin.sh uses a kept archive (CI restores it from the Actions
+    # cache) only if it matches the pinned sha256. Anything else downloads
+    # again, and a download that misses the pin is neither kept nor installed.
+    def install(self, kept, download):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            odin = tmp / "odin"
+            odin.write_text("#!/bin/sh\necho 'odin version dev-2026-10-nightly:84bc3fc'\n")
+            odin.chmod(0o755)
+            archives = {"good": tmp / "good.tar.gz", "bad": tmp / "bad.tar.gz"}
+            with tarfile.open(archives["good"], "w:gz") as archive:
+                archive.add(odin, "odin-linux-amd64-dev-2026-10/odin")
+            archives["bad"].write_bytes(b"not the pinned archive")
+            # Pose as linux-amd64, treat only good.tar.gz as matching the pin,
+            # and serve `download` from curl.
+            stubs = tmp / "bin"
+            stubs.mkdir()
+            for name, body in {
+                "uname": 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac',
+                "sha256sum": 'read -r _ name && cmp -s "$name" "$GOOD"',
+                "curl": 'echo call >> "$CALLS"; while [ "$1" != --output ]; do shift; done; cp "$DOWNLOAD" "$2"',
+            }.items():
+                (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+                (stubs / name).chmod(0o755)
+            kept_dir = tmp / "kept"
+            kept_file = kept_dir / "odin-linux-amd64-dev-2026-10.tar.gz"
+            if kept:
+                kept_dir.mkdir()
+                kept_file.write_bytes(archives[kept].read_bytes())
+            calls = tmp / "calls"
+            result = subprocess.run(
+                ["/bin/bash", str(ROOT / "scripts/install-odin.sh"), str(tmp / "odin-install")],
+                env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}",
+                     "ODIN_ARCHIVE_CACHE": str(kept_dir), "GOOD": str(archives["good"]),
+                     "DOWNLOAD": str(archives[download]), "CALLS": str(calls)},
+                capture_output=True, text=True)
+            kept_bytes = kept_file.read_bytes() if kept_file.exists() else None
+            return (result, len(calls.read_text().splitlines()) if calls.exists() else 0,
+                    kept_bytes == archives["good"].read_bytes() if kept_bytes else None,
+                    (tmp / "odin-install" / "odin").exists())
+
+    def test_a_kept_archive_is_used_only_if_it_matches_the_pin(self):
+        result, downloads, kept_good, installed = self.install(kept="good", download="bad")
+        self.assertEqual((result.returncode, downloads, installed), (0, 0, True), result.stderr)
+
+        result, downloads, kept_good, installed = self.install(kept="bad", download="good")
+        self.assertEqual((result.returncode, downloads, kept_good, installed), (0, 1, True, True),
+                         result.stderr)
+
+        result, downloads, kept_good, installed = self.install(kept=None, download="bad")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match its pinned sha256", result.stderr)
+        self.assertEqual((downloads, kept_good, installed), (1, None, False))
+
+
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
     core, _, pre = version.partition("-")
