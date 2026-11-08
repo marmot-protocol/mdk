@@ -4,6 +4,9 @@ CommonMark and Nostr-aware display parser for Marmot app messages. It turns plai
 serde-friendly AST that CLI, TUI, and mobile renderers draw from. It does not define wire format, persistence, or CGKA
 engine behavior.
 
+The parser is implemented in Odin. Rust provides the existing AST types, serde support and a private native bridge.
+Block parsing and inline tokenization remain separate passes; destination classification also runs in Odin.
+
 ## What this crate does
 
 - Parses CommonMark plus GFM-style tables and strikethrough, math, and a bounded `<details>` extension into `Block` /
@@ -14,6 +17,23 @@ engine behavior.
 - Does not parse general HTML. Tag-like sequences stay literal text; only autolinks, timestamps and the `<details>` extension get
   structured treatment.
 - Keeps dependencies minimal (`serde` only in normal builds).
+
+## Build requirements
+
+Install Odin `dev-2026-10` at commit `84bc3fc2100b0f7880a3af37f71bccdcda41c6f9`, alongside the repository's Rust
+toolchain. `build.rs` checks the compiler version and compiles a static native archive for Cargo's target. Set `ODIN`
+to an executable path when Odin is not on `PATH`.
+
+Optimized `x86_64-unknown-linux-gnu` builds use the pinned Rust toolchain's `llvm-tools-preview` component to optimize
+Odin's LLVM IR and generate native code in parallel. This work finishes before Rust consumes the archive; optimization
+is not deferred to an application link. Other targets use Odin's native backend. The separate
+[`marmot-markdown-ast`](../marmot-markdown-ast/README.md) crate lets serde/type compilation overlap native compilation
+without changing the public Rust module paths or JSON representation.
+
+Each parse starts in caller-owned stack scratch and grows an Odin arena only when needed. The bridge copies the
+completed graph into Rust-owned strings and vectors, then releases overflow blocks. Returned documents do not borrow
+the input or scratch memory. The unsafe boundary is confined to
+`src/native.rs`; the rest of the Rust crate denies unsafe code. There is no Rust parser fallback.
 
 ```rust
 use marmot_markdown::{Block, parse};
@@ -122,9 +142,29 @@ the mobile timestamp renderer.
 
 ```sh
 cargo test -p marmot-markdown
+odin test crates/marmot-markdown/odin
 ```
 
 Golden fixtures under `tests/golden/` lock parser output. After an intentional output change, regenerate them with
 `MARMOT_MD_UPDATE_GOLDEN=1 cargo test -p marmot-markdown --test golden`, review the diff, and re-run without the variable.
+
+## Port acceptance measurements
+
+The port must preserve the existing Rust integration tests and golden ASTs. Native tests retain disclosure grammar,
+boundary and linear-work checks. Every measured input must have an end-to-end parsing ratio of at most `0.95` against
+the Rust implementation; an aggregate cannot hide a failing case. Clean optimized-library compilation, including native
+compilation, must be at most `0.50`.
+These are acceptance thresholds, not performance claims.
+
+Compare an unchanged Rust checkout with this crate:
+
+```sh
+bun crates/marmot-markdown/measure.ts --baseline /path/to/rust/crates/marmot-markdown --candidate crates/marmot-markdown --output /tmp/marmot-markdown-measurements
+```
+
+The runner uses matching isolated manifests and toolchains, reports every corpus case and an aggregate, and includes
+AST allocation, native conversion and destruction in runtime samples. It reports debug and incremental build timings
+separately. Compilation measurements retain third-party dependency caches but rebuild the AST crate, parser shim and
+native archive on every clean sample.
 
 See [`AGENTS.md`](AGENTS.md) for scope and invariants.

@@ -65,6 +65,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.identity.outputs.source_sha }}
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain and Android targets
         shell: bash
         run: |
@@ -170,6 +173,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.identity.outputs.source_sha }}
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain and Apple targets
         shell: bash
         run: |

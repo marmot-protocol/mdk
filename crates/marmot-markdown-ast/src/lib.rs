@@ -1,4 +1,4 @@
-//! AST node definitions.
+//! Owned Markdown AST node definitions and serde implementations.
 //!
 //! Two enums (`Block`, `Inline`) plus a thin document wrapper. Owned `String`
 //! everywhere for v1.

@@ -8,13 +8,11 @@ rust-version = "1.91.0"
 publish = false
 
 [dependencies]
-serde = { workspace = true }
+marmot-markdown-ast = { workspace = true }
 
 [dev-dependencies]
-# `serde_json` is used **only** by the test suite to round-trip the AST
-# through JSON; it is not a library dependency. The zero-deps constraint
-# applies to `[dependencies]`.
+# JSON is used only by tests and measurement examples.
 serde_json = { workspace = true }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

@@ -1,5 +1,9 @@
 FROM rust:1.91-bookworm
 
+COPY scripts/install-odin.sh /tmp/install-odin.sh
+RUN bash /tmp/install-odin.sh /opt/odin
+ENV ODIN=/opt/odin/odin
+
 ARG HERMES_AGENT_REPO_URL=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_AGENT_REF=
 

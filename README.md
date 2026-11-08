@@ -158,7 +158,8 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime, projections and host background controls used by every front end |
 | | [`nostr-directory`](crates/nostr-directory/README.md) | Directory of other people's public Nostr data: lookups, search, KeyPackage resolution |
 | | [`marmot-observability`](crates/marmot-observability/README.md) | Diagnostics exporters: relay telemetry, product analytics and its consent state, audit delivery |
-| | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |
+| | [`marmot-markdown`](crates/marmot-markdown/README.md) | Odin CommonMark + Nostr parser with a Rust AST bridge |
+| | [`marmot-markdown-ast`](crates/marmot-markdown-ast/README.md) | Owned Markdown types and serde implementations; compiled alongside the native parser |
 | | [`marmot-forensics`](crates/marmot-forensics/README.md) | Append-only JSONL forensic audit schema |
 | Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings |
 | | [`marmot-uniffi-macros`](crates/marmot-uniffi-macros/README.md) | Runs MarmotKit's async exports on its own Tokio runtime |
@@ -177,6 +178,17 @@ still land on the same epoch and group state. The engine — not relay order or 
 ## Development
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); most tasks run through [`just`](Justfile).
+
+Builds that include `marmot-markdown` also require Odin `dev-2026-10`. The shared installer verifies pinned release
+checksums before extraction:
+
+```sh
+bash scripts/install-odin.sh "$HOME/.local/share/mdk-odin"
+export ODIN="$HOME/.local/share/mdk-odin/odin"
+```
+
+See the [Markdown crate](crates/marmot-markdown/README.md#build-requirements) for the compiler pin and native ownership
+boundary. CI and the campaign/integration container builds install this toolchain automatically.
 
 ```sh
 just fast-ci                 # formatting, static gates, CI's two clippy passes; skips the `just test` matrix

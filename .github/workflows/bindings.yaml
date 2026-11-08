@@ -234,6 +234,9 @@ jobs:
           ref: ${{ needs.metadata.outputs.source_sha }}
           path: packaged-source
 
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain
         shell: bash
         run: |
@@ -563,6 +566,9 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.metadata.outputs.source_sha }}
           path: packaged-source
+
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
 
       - name: Install Rust toolchain
         shell: bash

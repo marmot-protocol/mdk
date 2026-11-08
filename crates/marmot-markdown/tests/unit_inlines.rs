@@ -8,6 +8,11 @@ fn math(s: &str) -> Inline {
 }
 
 #[test]
+fn code_after_escaped_backtick() {
+    assert_eq!(parse_inlines(r"\``x`"), vec![t("`"), code("x")]);
+}
+
+#[test]
 fn timestamp_styles() {
     for (suffix, style) in [
         ("", TimestampStyle::ShortDateTime),

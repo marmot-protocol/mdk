@@ -93,6 +93,27 @@ fn at_with_uppercase_rejected() {
 }
 
 #[test]
+fn nostr_entity_length_boundary() {
+    let entity = format!("npub1{}", "q".repeat(1019));
+    assert_eq!(
+        parse_inlines(&format!("nostr:{entity}.")),
+        vec![uri(NostrHrp::Npub, &entity), t(".")]
+    );
+
+    let overlong = format!("nostr:{entity}q.");
+    assert_eq!(parse_inlines(&overlong), vec![t(&overlong)]);
+
+    assert_eq!(
+        parse_inlines("nostr:npub1qqqqqq"),
+        vec![uri(NostrHrp::Npub, "npub1qqqqqq")]
+    );
+    assert_eq!(
+        parse_inlines("nostr:npub1qqqqq"),
+        vec![t("nostr:npub1qqqqq")]
+    );
+}
+
+#[test]
 fn at_nevent_rejected_in_bare_form() {
     // Only `@npub` triggers bare-mention; `@nevent...` is just text.
     let s = format!("@{}", nevent_str());

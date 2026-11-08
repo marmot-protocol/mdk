@@ -95,6 +95,9 @@ jobs:
             echo "source_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain
         shell: bash
         run: |
