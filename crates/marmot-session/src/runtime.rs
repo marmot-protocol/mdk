@@ -1074,6 +1074,20 @@ where
         self.session.invite_key_package_requirements(group_id)
     }
 
+    /// Whether the device group's leaf of this account's device in `slot`
+    /// advertises what `requirements` asks of a KeyPackage. See
+    /// [`cgka_engine::Engine::sibling_leaf_supports`].
+    pub fn sibling_leaf_supports(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &cgka_traits::app_components::DeviceSlotId,
+        requirements: &KeyPackageRequirements,
+    ) -> Result<bool, EngineError> {
+        self.session
+            .sibling_leaf_supports(group_id, roster, slot, requirements)
+    }
+
     pub fn create_key_package_requirements(
         &self,
         request: &CreateGroupRequest,

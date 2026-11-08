@@ -347,8 +347,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Select compatible
   private stock before the claim and again afterward, reusing the direct burst's pass-local selection context;
   record the second selection as attempted immediately before atomically taking that exact record for the Add.
-  Missing compatible stock waits without public fallback. The existing refill owner counts time-usable stock,
-  so incompatible held stock can still prevent a compatible replacement request (mdk#2883).
+  Missing compatible stock waits without public fallback. Held stock meets the refill need only while it can serve
+  the chats waiting on that sibling: a waiting chat with no compatible held stock keeps the request due, at the
+  existing hourly pace, when the sibling is a ready target and its device-group leaf advertises the chat's
+  requirements (engine `sibling_leaf_supports`, mdk#2883). Never ask a sibling whose leaf lacks them on that chat's
+  behalf.
   Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling presence at actual
   direct/queued preparation.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
