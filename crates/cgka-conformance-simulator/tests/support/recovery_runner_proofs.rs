@@ -19,12 +19,14 @@ use cgka_conformance_simulator::app_runtime::{
 };
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup,
-    SubjectRemoveMembers, SubjectSelfUpdate,
+    SubjectRemoveMembers, SubjectSelfUpdate, SubjectUpdateGroupData,
 };
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
 
-use super::recovery_scorecard::{Sample, latencies, percentiles, periodic, status_summary};
+use super::recovery_scorecard::{
+    Sample, latencies, latencies_within, percentiles, periodic, status_summary,
+};
 use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 
 /// They publish the owed backlog in parallel, so bob is the only account
@@ -69,6 +71,18 @@ const GROUP_QUIET: Duration = Duration::from_secs(15);
 const COUNTED_MESSAGES: usize = 30;
 const FENCE_STALL: Duration = Duration::from_secs(12);
 const FENCE_RELEASE: Duration = Duration::from_secs(30);
+/// The scorecard's targets (#1945), asserted in the owed proof while the
+/// backlog is admitted: a quiet group's live message shows within 2 s, and
+/// the account worker answers status commands with p95 under 500 ms. One
+/// command over 2 s is a hang a user would notice.
+const LIVE_VISIBLE_TARGET_MS: f64 = 2_000.0;
+const COMMAND_P95_TARGET_MS: f64 = 500.0;
+const COMMAND_MAX_MS: f64 = 2_000.0;
+/// Status commands the admission window must hold for their latency to
+/// count: five seconds of the probe's calls every 250 ms.
+const ADMISSION_COMMANDS_AT_LEAST: u64 = 20;
+/// How often the 5,000-owed proof checks whether every owed message shows.
+const OWED_POLL: Duration = Duration::from_secs(5);
 /// Both endpoints stall history in the fence proof, so a nonempty phase's
 /// group is stranded: its live message waits for the runner's next attempt
 /// once history returns, 30 seconds after an unreachable one.
@@ -795,9 +809,11 @@ fn pacing(from: u64, to: u64) -> Value {
 }
 
 /// Bob's worker command latency while recovery runs: one cheap status command
-/// every 250 ms, as the scorecard samples it. Report only.
+/// every 250 ms, as the scorecard samples it.
 struct CommandProbe {
     stop: Arc<AtomicBool>,
+    /// The trace clock when the probe's own clock started.
+    trace_start_ms: u64,
     samples: tokio::task::JoinHandle<Vec<Sample>>,
 }
 
@@ -805,6 +821,7 @@ impl CommandProbe {
     fn start(bob: &AppRuntimeProbe, group: &GroupId) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let (bob, group) = (bob.clone(), group.clone());
+        let trace_start_ms = runner_trace::now_ms();
         let samples = periodic(
             &stop,
             Duration::from_millis(250),
@@ -814,13 +831,35 @@ impl CommandProbe {
                 async move { bob.group_recovery_status(&group).await.map(|_| 0) }
             },
         );
-        Self { stop, samples }
+        Self {
+            stop,
+            trace_start_ms,
+            samples,
+        }
     }
 
-    async fn finish(self) -> TestResult<Value> {
+    /// Latencies of every call, and of the calls in flight at any time within
+    /// `window` (trace clock).
+    async fn finish(self, window: (u64, u64)) -> TestResult<(Value, Value)> {
         self.stop.store(true, Ordering::Relaxed);
-        Ok(latencies(&self.samples.await?))
+        let samples = self.samples.await?;
+        let seconds = |at: u64| at.saturating_sub(self.trace_start_ms) as f64 / 1e3;
+        let within = latencies_within(&samples, seconds(window.0), seconds(window.1));
+        Ok((latencies(&samples), within))
     }
+}
+
+/// Staged events the runner admitted in `[from, to)` on the trace clock, and
+/// when its first and last admission turns there ended.
+fn admitted_between(from: u64, to: u64) -> (u64, Option<(u64, u64)>) {
+    let admits = runner_trace::between(from, to).into_iter();
+    let admits =
+        admits.filter(|event| event["method"] == "admit" && event["events"].as_u64() > Some(0));
+    admits.fold((0, None), |(total, span), event| {
+        let at = event["at_ms"].as_u64().unwrap_or(0);
+        let span = span.map_or((at, at), |(first, _)| (first, at));
+        (total + event["events"].as_u64().unwrap_or(0), Some(span))
+    })
 }
 
 fn advancing(events: &[Value]) -> usize {
@@ -953,25 +992,29 @@ impl Live {
     }
 }
 
-/// How long one message takes to reach bob's timeline, or `None` past
-/// `limit`.
+/// How long alice's send of one message took, and how long after it
+/// returned the message reached bob's timeline (`None` past `limit`). Bob
+/// cannot see a message before alice publishes it, so visibility is timed
+/// from the send's return; a slow send is the sender's (mdk#3234).
 async fn visible_after(
     alice: &AppRuntimeProbe,
     bob: &AppRuntimeProbe,
     group: &GroupId,
     payload: &str,
     limit: Duration,
-) -> TestResult<Option<f64>> {
-    let started = Instant::now();
+) -> TestResult<(f64, Option<f64>)> {
+    let sending = Instant::now();
     send(alice, group, payload).await?;
+    let send_ms = sending.elapsed().as_secs_f64() * 1e3;
+    let started = Instant::now();
     while started.elapsed() < limit {
         let (_, chat) = bob.chat_view(group, Some(64)).await?;
         if chat.iter().any(|text| text == payload) {
-            return Ok(Some(started.elapsed().as_secs_f64() * 1e3));
+            return Ok((send_ms, Some(started.elapsed().as_secs_f64() * 1e3)));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(None)
+    Ok((send_ms, None))
 }
 
 /// Whether bob's timeline in `group` holds exactly `expected`, each once.
@@ -1425,24 +1468,28 @@ async fn refusals_view(subject: &AppRuntimeHarness, out: &Path) -> TestResult<Va
     Ok(json!(by_member))
 }
 
-/// Whether the runner reports nothing left to fetch and nothing parked, read
-/// after one of its attempts since `trace_from` (trace clock). The status
-/// lists nothing until a runner has surveyed, and keeps its last survey's
-/// answer across a reconnect, so a clear status read before such an attempt
-/// proves nothing: the runner surveys before each attempt. A parked unit
-/// leaves the catching-up fields and shows only as a notice.
-async fn caught_up(bob: &AppRuntimeProbe, trace_from: u64) -> TestResult<bool> {
+/// The account status once the runner reports nothing left to fetch, read
+/// after one of its attempts since `trace_from` (trace clock), or `None`. The
+/// status lists nothing until a runner has surveyed, and keeps its last
+/// survey's answer across a reconnect, so a clear status read before such an
+/// attempt proves nothing: the runner surveys before each attempt. A parked
+/// unit leaves the catching-up fields and shows only as a notice, which the
+/// caller checks on its own (#3040): folded in here, a notice raised during
+/// setup read as a re-sweep that never finished.
+async fn caught_up(
+    bob: &AppRuntimeProbe,
+    trace_from: u64,
+) -> TestResult<Option<marmot_app::AccountRecoveryStatus>> {
     if runner_trace::since(trace_from).is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let status = bob.account_recovery_status().await?;
-    Ok(status.catching_up_group_ids_hex.is_empty()
-        && !status.inbox_catching_up
-        && status.notices.is_empty())
+    let done = status.catching_up_group_ids_hex.is_empty() && !status.inbox_catching_up;
+    Ok(done.then_some(status))
 }
 
 /// Wall-clock milliseconds since the Unix epoch, the clock notices park on.
-fn unix_ms() -> u64 {
+pub(super) fn unix_ms() -> u64 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     now.map_or(0, |elapsed| {
         u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
@@ -1452,7 +1499,7 @@ fn unix_ms() -> u64 {
 /// Each notice as its route's label (`groups` maps group hex to a label; no
 /// group is the inbox) and when it parked, in seconds after `since_unix_ms`
 /// (negative: before). No notice or group ids.
-fn notices_view(
+pub(super) fn notices_view(
     status: &marmot_app::AccountRecoveryStatus,
     groups: &BTreeMap<String, &str>,
     since_unix_ms: u64,
@@ -1888,35 +1935,71 @@ pub(super) async fn owed_history() {
         let bob = subject.probe("bob")?;
         let commands = CommandProbe::start(&bob, &busy);
         let live = Live::start(alice.clone(), bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
-        let quiet_after_restart =
+        let (quiet_after_restart_send_ms, quiet_after_restart) =
             visible_after(&alice, &bob, &quiet, "quiet-after-restart", Duration::from_secs(60)).await?;
         quiet_expected.push("quiet-after-restart".into());
         // It proves nothing unless the busy group was still owed then.
-        let (_, chat) = bob.chat_view(&busy, None).await?;
-        let busy_visible_when_quiet_seen = chat.iter().filter(|text| text.starts_with("owed-")).count();
+        let owed_visible = async || -> TestResult<usize> {
+            let (_, chat) = bob.chat_view(&busy, None).await?;
+            Ok(chat.iter().filter(|text| text.starts_with("owed-")).count())
+        };
+        let busy_visible_when_quiet_seen = owed_visible().await?;
+        // That message shows before admission starts. Fairness is judged
+        // while the backlog is admitted: once the runner has admitted owed
+        // messages and the busy group is still short, a quiet-group message
+        // must show within the scorecard's live-visibility target.
+        let admitting = async || {
+            if admitted_between(trace_restart, u64::MAX).0 == 0 {
+                return Ok(false);
+            }
+            let (_, recent) = bob.chat_view(&busy, Some(64)).await?;
+            Ok(recent.iter().any(|text| text.starts_with("owed-")))
+        };
+        wait_for("admission of the owed backlog", RECOVERY_DEADLINE, admitting).await?;
+        let busy_visible_when_sent = owed_visible().await?;
+        let (quiet_during_admission_send_ms, quiet_during_admission) =
+            visible_after(&alice, &bob, &quiet, "quiet-during-admission", Duration::from_secs(60)).await?;
+        // Admission must still have been running when it showed: owed
+        // messages still unopened could be a tail already admitted.
+        let quiet_seen_trace = runner_trace::now_ms();
+        quiet_expected.push("quiet-during-admission".into());
+        let busy_visible_when_seen = owed_visible().await?;
+        note(started, "quiet message sent during admission");
         // Visible history and the runner's own surveyed verdict must both
         // finish; neither the initial empty status nor a prior survey proves it.
         let (mut drained, mut reported_caught_up) = (None, None);
-        let mut drained_trace = None;
+        let (mut drained_trace, mut status_at_caught_up) = (None, None);
         while drained.is_none() || reported_caught_up.is_none() {
             if t0.elapsed() >= RECOVERY_DEADLINE {
                 break;
             }
-            if drained.is_none() {
-                let (_, chat) = bob.chat_view(&busy, None).await?;
-                if chat.iter().filter(|text| text.starts_with("owed-")).count() == OWED_MESSAGES {
-                    drained = Some(t0.elapsed().as_secs_f64());
-                    drained_trace = Some(runner_trace::now_ms());
-                    note(started, "owed backlog visible");
-                }
+            if drained.is_none() && owed_visible().await? == OWED_MESSAGES {
+                drained = Some(t0.elapsed().as_secs_f64());
+                drained_trace = Some(runner_trace::now_ms());
+                note(started, "owed backlog visible");
             }
-            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob, trace_restart).await? {
+            if drained.is_some()
+                && reported_caught_up.is_none()
+                && let Some(status) = caught_up(&bob, trace_restart).await?
+            {
                 reported_caught_up = Some(t0.elapsed().as_secs_f64());
+                status_at_caught_up = Some(status);
                 note(started, "runner reports caught up");
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(OWED_POLL).await;
         }
-        let worker_command_ms = commands.finish().await?;
+        // Commands in flight while the runner admitted the backlog: from its
+        // first admission turn to its last logged before every owed message
+        // showed. The trace does not name the messages a turn
+        // admitted, so the window stays inside admission: it can miss the
+        // final turn, whose admit line may follow the poll that saw its
+        // messages, but never takes in a later one.
+        let drained_at = drained_trace.unwrap_or_else(runner_trace::now_ms);
+        let admitting = admitted_between(trace_restart, drained_at).1;
+        let admitted_after_quiet = admitted_between(quiet_seen_trace, drained_at).0;
+        let (worker_command_ms, admission_command_ms) = commands
+            .finish(admitting.unwrap_or((trace_restart, trace_restart)))
+            .await?;
         let (live_sent, live_visibility) = live.finish().await?;
         expected.extend(live_sent);
         let busy_exact = holds_exactly(&bob, &busy, &expected).await?;
@@ -1931,8 +2014,12 @@ pub(super) async fn owed_history() {
         let idle_clocks = relay_clocks(subject).await?;
         let idle_started = Instant::now();
         while idle_started.elapsed() < QUIET_AGE {
-            if drained.is_some() && reported_caught_up.is_none() && caught_up(&bob, trace_restart).await? {
+            if drained.is_some()
+                && reported_caught_up.is_none()
+                && let Some(status) = caught_up(&bob, trace_restart).await?
+            {
                 reported_caught_up = Some(t0.elapsed().as_secs_f64());
+                status_at_caught_up = Some(status);
                 note(started, "runner reports caught up");
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1954,7 +2041,7 @@ pub(super) async fn owed_history() {
         subject.interrupt_relay("reconnect", "relay:shared", OUTAGE_MS).await?;
         let reconnected = Instant::now();
         let trace_reconnect = runner_trace::now_ms();
-        let quiet_after_reconnect =
+        let (quiet_after_reconnect_send_ms, quiet_after_reconnect) =
             visible_after(&alice, &bob, &quiet, "quiet-after-reconnect", Duration::from_secs(60)).await?;
         quiet_expected.push("quiet-after-reconnect".into());
         let mut resweep = BTreeSet::new();
@@ -1963,7 +2050,7 @@ pub(super) async fn owed_history() {
             let history = history_since(subject, &reconnect_clocks).await?;
             resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
             Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route)
-                && caught_up(&bob, trace_reconnect).await?)
+                && caught_up(&bob, trace_reconnect).await?.is_some())
         };
         let left = RESWEEP_DEADLINE.saturating_sub(reconnected.elapsed());
         let resweep_result = wait_for("the reconnect's re-sweep", left, resweeps).await;
@@ -1998,7 +2085,8 @@ pub(super) async fn owed_history() {
                 "busy_timeline_exact": busy_exact,
                 "busy_timeline": busy_timeline,
                 "live_visibility_ms": live_visibility,
-                "quiet_message_visible_ms": quiet_after_restart,
+                "quiet_message_send_ms": quiet_after_restart_send_ms,
+                "quiet_message_visible_after_send_ms": quiet_after_restart,
                 "busy_visible_when_quiet_seen": busy_visible_when_quiet_seen,
                 "busy_swept_per_endpoint": swept(&after_restart, &busy_route),
                 "quiet_swept_per_endpoint": swept(&after_restart, &quiet_route),
@@ -2008,6 +2096,16 @@ pub(super) async fn owed_history() {
                 "runner_wasted": wasted(&restart_trace),
                 "pacing": pacing(trace_restart, drained_trace.unwrap_or(trace_idle)),
                 "worker_command_ms": worker_command_ms,
+                "admission_fairness": {
+                    "quiet_message_send_ms": quiet_during_admission_send_ms,
+                    "quiet_message_visible_after_send_ms": quiet_during_admission,
+                    "quiet_target_ms": LIVE_VISIBLE_TARGET_MS,
+                    "busy_visible_when_sent": busy_visible_when_sent,
+                    "busy_visible_when_seen": busy_visible_when_seen,
+                    "owed_admitted_after_quiet_seen": admitted_after_quiet,
+                    "worker_command_ms": admission_command_ms,
+                    "worker_command_targets_ms": {"p95": COMMAND_P95_TARGET_MS, "max": COMMAND_MAX_MS},
+                },
                 "history": summaries(&after_restart),
                 "bandwidth": bandwidth_view(&restart_traffic),
             },
@@ -2019,7 +2117,8 @@ pub(super) async fn owed_history() {
                 "resweep": resweep_result.as_ref().map_or_else(|error| json!(error.to_string()), |()| json!("swept")),
                 "resweep_seconds": resweep_seconds,
                 "routes_swept_on_endpoint_0": resweep.iter().map(|r| labels.get(r).map_or("other", String::as_str)).collect::<Vec<_>>(),
-                "quiet_message_visible_ms": quiet_after_reconnect,
+                "quiet_message_send_ms": quiet_after_reconnect_send_ms,
+                "quiet_message_visible_after_send_ms": quiet_after_reconnect,
                 "quiet_timeline_exact": quiet_exact,
                 "repeated_window_requests_per_endpoint": reconnect_repeats,
                 "history": summaries(&after_reconnect),
@@ -2029,6 +2128,8 @@ pub(super) async fn owed_history() {
             },
             "status_before_restart": status_summary(&status_before_restart),
             "notices_before_restart": notices_view(&status_before_restart, &group_labels, started_unix_ms),
+            "notices_at_caught_up": status_at_caught_up.as_ref()
+                .map(|status| notices_view(status, &group_labels, started_unix_ms)),
             "status_at_end": status_summary(&status),
             "notices_at_end": notices_view(&status, &group_labels, started_unix_ms),
         });
@@ -2041,6 +2142,18 @@ pub(super) async fn owed_history() {
         save(out, "runner-trace.json", &runner_trace::since(trace_restart))?;
         save(out, "runner-trace-setup.json", &trace_between(0, trace_setup))?;
         let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
+        // A healthy run raises no notice at any point (#3040): its own check,
+        // naming each notice's route and park time, so a notice raised during
+        // setup is not read as a wait that never finished.
+        let statuses = [Some(&status_before_restart), status_at_caught_up.as_ref(), Some(&status)];
+        if statuses.into_iter().flatten().any(|status| !status.notices.is_empty()) {
+            let notices = json!({
+                "before_restart": proof["notices_before_restart"],
+                "at_caught_up": proof["notices_at_caught_up"],
+                "at_end": proof["notices_at_end"],
+            });
+            return failure(&format!("a healthy run raised a history notice {notices}"));
+        }
         if drained.is_none() || !busy_exact {
             return failure("the owed group did not finish exactly within the deadline");
         }
@@ -2064,6 +2177,26 @@ pub(super) async fn owed_history() {
         }
         if busy_visible_when_quiet_seen >= OWED_MESSAGES {
             return failure("the busy group finished before the quiet group's message showed");
+        }
+        if busy_visible_when_sent == 0
+            || busy_visible_when_seen >= OWED_MESSAGES
+            || admitted_after_quiet == 0
+        {
+            return failure("the quiet group's message was not measured while the backlog was admitted");
+        }
+        if quiet_during_admission.is_none_or(|ms| ms >= LIVE_VISIBLE_TARGET_MS) {
+            return failure("a quiet group's message took 2 s or more after alice sent it while the backlog was admitted");
+        }
+        let commands = &admission_command_ms;
+        let failed_commands = commands["errors"].as_object().into_iter().flatten();
+        let failed_commands = failed_commands.filter_map(|(_, count)| count.as_u64()).sum::<u64>();
+        if commands["calls"].as_u64() < Some(ADMISSION_COMMANDS_AT_LEAST) || failed_commands > 0 {
+            return failure("too few status commands answered while the backlog was admitted");
+        }
+        if commands["p95"].as_f64().is_none_or(|ms| ms >= COMMAND_P95_TARGET_MS)
+            || commands["max"].as_f64().is_none_or(|ms| ms >= COMMAND_MAX_MS)
+        {
+            return failure("the account worker answered status commands too slowly while the backlog was admitted");
         }
         if resweep_result.is_err() {
             return failure("the reconnect's owed ranges were not swept");
@@ -2138,7 +2271,7 @@ pub(super) async fn ordered_backlog_regression() {
         .await;
         let recovery_seconds = t0.elapsed().as_secs_f64();
         let recovered_trace = runner_trace::now_ms();
-        let worker_command_ms = commands.finish().await?;
+        let (worker_command_ms, _) = commands.finish((trace_from, recovered_trace)).await?;
         let (live_sent, visibility) = live.finish().await?;
         expected.extend(live_sent);
         let exact = holds_exactly(&bob, &group, &expected).await?;
@@ -2581,4 +2714,199 @@ pub(super) async fn stranded_history() {
     })
     .await;
     assert!(report["proof"]["exact_after_seconds"].is_number());
+}
+
+/// Rounds of the multi-epoch backlog, each in its own epoch: alice renames
+/// the group between rounds.
+const EPOCH_ROUNDS: usize = 6;
+/// Messages per sender per round, far inside the ratchet's 100-generation
+/// out-of-order window, so a same-second burst cannot lose any (#3036).
+const ROUND_MESSAGES_PER_SENDER: usize = 30;
+/// How long an attempt on a relay that never answers holds the runner before
+/// it ends unreachable: marmot-app's crate-private `RUNNER_REQUEST_TIMEOUT`.
+const RUNNER_REQUEST_TIMEOUT_MS: f64 = 5_000.0;
+/// The longest bob may wait from his restart to his first open. The stalled
+/// endpoint still owes the group's history, so nothing is admitted until its
+/// unreachable verdict takes it off the admission frontier: one request
+/// timeout, plus 2 s for the restart and the healthy endpoint's proof.
+const FIRST_OPEN_MS: f64 = RUNNER_REQUEST_TIMEOUT_MS + 2_000.0;
+/// The longest bob may go without opening an owed message once he opened the
+/// first: one request timeout, so a single stalled attempt between two opens
+/// fails it.
+const USEFUL_ADVANCE_GAP_MS: f64 = RUNNER_REQUEST_TIMEOUT_MS;
+const MULTI_EPOCH_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// Useful local progress (#1945): bob owes a backlog spread over six epochs
+/// while endpoint 1 never answers history, so each of its attempts holds the
+/// runner for the request timeout and ends unreachable. A stalled relay may
+/// delay the first open by one request timeout ([`FIRST_OPEN_MS`]) and must
+/// never stall the opens once they have begun: bob keeps opening owed
+/// messages at most [`USEFUL_ADVANCE_GAP_MS`] apart. A useful advance is an
+/// owed message newly shown in his timeline, never an admission turn or a
+/// quantum, so a runner that spins on work opening nothing cannot pass.
+pub(super) async fn multi_epoch_progress() {
+    let report = run_proof("runner-multi-epoch-progress", async |subject, out| {
+        let started = Instant::now();
+        let clients = clients();
+        let group = create(subject, "epochs", &clients).await?;
+        settle_maintenance(subject, &clients, std::slice::from_ref(&group)).await?;
+        note(started, "group created and settled");
+        let peers = clients.iter().filter(|member| *member != "bob").cloned().collect::<Vec<_>>();
+        let alice = subject.probe("alice")?;
+        let bob_epoch_at_stop = subject.probe("bob")?.epoch(&group).await?;
+        subject.set_online("bob", false).await?;
+        // A commit bob had not applied when he stopped is owed like the rest.
+        let alice_epoch_at_stop = alice.epoch(&group).await?;
+        let per_round = ROUND_MESSAGES_PER_SENDER * SENDERS.len();
+        let (mut expected, mut round_epochs) = (Vec::new(), Vec::new());
+        for round in 0..EPOCH_ROUNDS {
+            if round > 0 {
+                let before = alice.epoch(&group).await?;
+                let (action, name) = (format!("epochs-rename-{round}"), format!("epochs round {round}"));
+                subject.select_scenario_group("epochs", false)?;
+                let rename = SubjectUpdateGroupData {
+                    action_id: &action,
+                    client: "alice",
+                    name: Some(&name),
+                    description: None,
+                    pending: &action,
+                };
+                subject.update_group_data(rename).await?;
+                // Every sender applies the rename before sending in its epoch.
+                wait_for("the rename at every online member", SETTLEMENT, async || {
+                    let epochs = loop_epochs(subject, &group, &peers).await?;
+                    Ok(epochs.values().all(|epoch| *epoch > before))
+                })
+                .await?;
+            }
+            let prefix = format!("epoch{round}-");
+            expected.extend(payloads(&publish(subject, &group, &prefix, per_round).await?));
+            wait_lanes_published(subject, &group, &prefix, per_round, SETTLEMENT).await?;
+            round_epochs.push(alice.epoch(&group).await?);
+        }
+        let alice_epoch = alice.epoch(&group).await?;
+        note(started, "multi-epoch backlog published");
+
+        let sessions = next_sessions(subject).await?;
+        let clocks = relay_clocks(subject).await?;
+        subject.stall_relay_history(1, true).await?;
+        let trace_restart = runner_trace::now_ms();
+        let t0 = Instant::now();
+        subject.set_online("bob", true).await?;
+        let bob = subject.probe("bob")?;
+        let commands = CommandProbe::start(&bob, &group);
+        // When each owed message first showed in bob's timeline, and bob's
+        // epoch as it changed, in seconds since the restart.
+        let wanted = expected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let (mut opened, mut epochs_seen) = (BTreeMap::<String, f64>::new(), Vec::<(f64, u64)>::new());
+        for poll in 0_u64.. {
+            if opened.len() == expected.len() || t0.elapsed() >= MULTI_EPOCH_DEADLINE {
+                break;
+            }
+            let (_, chat) = bob.chat_view(&group, None).await?;
+            let now = t0.elapsed().as_secs_f64();
+            for text in chat.into_iter().filter(|text| wanted.contains(text.as_str())) {
+                opened.entry(text).or_insert(now);
+            }
+            if poll % 5 == 0
+                && let Ok(epoch) = bob.epoch(&group).await
+                && epochs_seen.last().is_none_or(|(_, last)| *last != epoch)
+            {
+                epochs_seen.push((now, epoch));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        note(started, "multi-epoch backlog opened");
+        let mut advances = opened.values().copied().collect::<Vec<_>>();
+        advances.sort_by(f64::total_cmp);
+        advances.dedup();
+        let (first_open, last_open) = (advances.first().copied(), advances.last().copied());
+        let gaps = advances.windows(2).map(|pair| (pair[1] - pair[0]) * 1e3);
+        let mut gap_view = percentiles(gaps);
+        let mut largest = advances
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0], pair[0]))
+            .collect::<Vec<_>>();
+        largest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        largest.truncate(5);
+        gap_view["limit"] = json!(USEFUL_ADVANCE_GAP_MS);
+        gap_view["largest"] = json!(largest.iter().map(|(gap, at)| json!({
+            "ms": gap * 1e3,
+            "after_seconds": at,
+            "opened_before": opened.values().filter(|seen| *seen <= at).count(),
+        })).collect::<Vec<_>>());
+        let to_trace = |seconds: f64| trace_restart + (seconds * 1e3) as u64;
+        let span = first_open.zip(last_open).map(|(from, to)| (to_trace(from), to_trace(to)));
+        let (_, opening_commands) = commands.finish(span.unwrap_or((trace_restart, trace_restart))).await?;
+        let history = history_since(subject, &clocks).await?;
+        // Endpoint 1's withheld requests, and those while bob was opening.
+        let proxy_ms = |seconds: f64| clocks[1] + (seconds * 1e3) as u64;
+        let withheld = history[1].iter().filter(|request| request.withheld).collect::<Vec<_>>();
+        let withheld_while_opening = first_open.zip(last_open).map(|(from, to)| {
+            let opening = proxy_ms(from)..=proxy_ms(to);
+            withheld.iter().filter(|request| opening.contains(&request.at_ms)).count()
+        });
+        subject.stall_relay_history(1, false).await?;
+        let exact = holds_exactly(&bob, &group, &expected).await?;
+        let bob_epoch = bob.epoch(&group).await?;
+        // Admission turns included, to place the first open against the
+        // stalled endpoint's verdict.
+        save(out, "runner-trace.json", &runner_trace::between(trace_restart, u64::MAX))?;
+        save(out, "history.json", &labeled(&history, &BTreeMap::new()))?;
+        save(out, "opened.json", &opened)?;
+        let native = native_pages(&history);
+        let proof = json!({
+            "owed_messages": expected.len(),
+            "rounds": EPOCH_ROUNDS,
+            "epochs": {
+                "bob_at_stop": bob_epoch_at_stop,
+                "alice_at_bob_stop": alice_epoch_at_stop,
+                "alice_after_each_round": round_epochs,
+                "alice_at_restart": alice_epoch,
+                "bob_at_end": bob_epoch,
+                "bob_seen": epochs_seen,
+            },
+            "opened": opened.len(),
+            "timeline_exact": exact,
+            "timeline": timeline_view(&bob, &group, &expected).await?,
+            "first_open_seconds": first_open,
+            "first_open_limit_ms": FIRST_OPEN_MS,
+            "last_open_seconds": last_open,
+            "useful_advances": advances.len(),
+            "useful_advance_gap_ms": gap_view,
+            "runner_while_opening": span.map(|(from, to)| runner_summary(&trace_between(from, to))),
+            "pacing_while_opening": span.map(|(from, to)| pacing(from, to)),
+            "runner_since_restart": runner_summary(&runner_trace::since(trace_restart)),
+            "worker_command_ms_while_opening": opening_commands,
+            "stalled_endpoint": {
+                "withheld_history_requests": withheld.len(),
+                "withheld_while_opening": withheld_while_opening,
+            },
+            "history": history.iter().map(|requests| history_summary(requests, &BTreeMap::new())).collect::<Vec<_>>(),
+            "native_paging_requests_per_endpoint": native,
+            "bandwidth": bandwidth_view(&bob_traffic(subject, &sessions).await?),
+        });
+        let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
+        if opened.len() != expected.len() || !exact {
+            return failure("the multi-epoch backlog did not open exactly within the deadline");
+        }
+        if bob_epoch < alice_epoch {
+            return failure("bob did not reach alice's epoch");
+        }
+        if withheld.is_empty() {
+            return failure("endpoint 1 was never asked for history, so nothing stalled");
+        }
+        if native.iter().any(|pages| *pages > 0) {
+            return failure("native backward paging supplied history");
+        }
+        if first_open.is_none_or(|seconds| seconds * 1e3 >= FIRST_OPEN_MS) {
+            return failure("bob's first owed message waited longer than one request timeout plus 2 s");
+        }
+        if gap_view["max"].as_f64().is_some_and(|ms| ms >= USEFUL_ADVANCE_GAP_MS) {
+            return failure("bob went one request timeout or more without opening an owed message");
+        }
+        Ok(json!({"proof": proof}))
+    })
+    .await;
+    assert_eq!(report["proof"]["timeline_exact"], true);
 }

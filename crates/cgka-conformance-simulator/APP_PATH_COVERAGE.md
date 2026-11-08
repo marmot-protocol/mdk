@@ -72,7 +72,7 @@ no general production SQLCipher fix is claimed.
 ## Large-account recovery scorecard
 
 `public_app_large_account_recovery_scorecard` (ignored, same file) measures recovery on the #1945 workload. It
-asserts only recovery correctness. One account, `bob`, belongs to 36 groups, one of them with 51 members; the other
+asserts recovery correctness and the account's end state, and records performance. One account, `bob`, belongs to 36 groups, one of them with 51 members; the other
 49 invitees only publish KeyPackages and stay offline. Alice owns four groups, and four senders own eight of the 32
 history groups each, so bob is the only account that holds all of about 11,000 kind-445 events. Bob retains them through
 live delivery.
@@ -82,20 +82,45 @@ messages that need it. The commit is then restored, while both relays keep withh
 rest of the run, so recovery can only use bob's retained copies. Bob cold-restarts while alice sends one message per
 second in a healthy group.
 
-The hard assertions: within 600 seconds the commit is applied and the later messages decrypt, and every gap chat
-message is present exactly once (presence, not order). `scorecard.json`
+The hard assertions:
+
+- within 600 seconds the commit is applied and the later messages decrypt;
+- every gap chat message is present exactly once (presence, not order);
+- after the 60-second idle window, no group and no inbox is still catching up;
+- no history notice was raised. Each notice is named by route and park time.
+
+The end status counts only if bob's runner asked for history after the restart: it lists nothing until a runner has
+surveyed. `scorecard.json`
 under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 
 - status command (`group_recovery_status`) and send latency p50/p95/max;
-- live-message visibility;
+- alice's live send latency and live-message visibility twice: from the start of her send, and from its return,
+  which is bob's own share (negative when he saw the message before her call returned). The slowest five from the
+  start are listed with their start offset, her send time and bob's share. Alice's runtime operations that ran
+  during the measured phase are listed with their counts, timeouts and time taken;
 - commit-applied and decrypted times;
 - per-relay bytes, and EVENT frames split into re-downloaded held history, novel events and the missing commit;
+- each endpoint's EVENT copies and bytes split by cause (`download_split`). The four causes cover group events
+  (kind 445), the history the workload knows bob held:
+  - first fetch: the first copy of a group event bob lacked;
+  - reconnect amplification: a held group event's first copy through a live or maintenance subscription, and every
+    further copy a subscription brought;
+  - retry amplification: every further copy a history request brought;
+  - fallback amplification: a held group event's first copy through a history request.
+
+  Every copy of another kind (welcomes, relay lists, profiles, KeyPackages) goes on a fifth line, `other_kinds`.
+  Copies are counted exactly. Bytes are apportioned: each copy carries its event's mean copy size (copies differ
+  only by subscription id), the remainder on the first. The run asserts that the five sum to the endpoint's EVENT
+  frames and bytes as the connections counted them frame by frame, and that no copy came through a subscription
+  bob never asked for. An event's first copy is the earliest on the proxy's clock across connections. Bob's own
+  connections' totals are reported beside the split, which counts every connection opened after the restart;
 - REQ/NEG-OPEN counts and public telemetry deltas;
 - a 60-second idle window.
 
 The public API exposes no recovery-attempt counter, so those counts are proxies. Targets (status and send p95 under
-500 ms, visibility p95 under 2 s, no held-history re-download beyond the restart's 120-second rebuild lookback, the
-commit fetched at most once per relay besides that replay's copy, no idle EVENTs) are evaluated but not enforced.
+500 ms, visibility after alice's send returns p95 under 2 s, no held-history re-download beyond the restart's
+120-second rebuild lookback, the commit fetched at most once per relay besides that replay's copy, no idle EVENTs)
+are evaluated but not enforced.
 `MDK_SCORECARD_TRACE` takes a tracing filter for bob's in-process runtime.
 
 Bob's runtime runs in the coordinator process so probes can overlap, because process RPC is serial. The relay and the
@@ -167,12 +192,21 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   - during restart recovery, no history window (a `REQ` without ids, or a `NEG-OPEN`) is asked twice on one endpoint;
   - each endpoint sees at most four bursts of history requests;
   - both groups' routes are asked on both endpoints;
-  - a message to the quiet group arrives within a minute, while the busy group is still owed.
+  - a message to the quiet group arrives within a minute, while the busy group is still owed;
+  - fairness while the backlog is admitted, at the scorecard's targets. Once the runner's trace shows an admission
+    turn and owed messages are showing, a second quiet-group message must show within 2 seconds of alice's send
+    returning, before the busy group finishes and before the runner's last admission turn. Status commands in
+    flight at any time between the first admission turn and the last one logged before every owed message showed
+    (at least 20) must all succeed, with p95 under 500 ms and none at 2 seconds or more. The window can miss the
+    final turn but never includes a later one. The first quiet message shows before admission starts, so it does
+    not count for fairness;
+  - no history notice before the restart, when the restart reports caught up, or at the end. This is its own
+    check, naming each notice's route and park time (#3040).
 
   Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
   lookback, every route's new live count there is empty. The journey asserts that both routes are asked again on
   endpoint 0, that the runner's aggregate advancing quanta after the reconnect newly cover at least the outage's span, that the account
-  reports caught up within five minutes (nothing catching up and no notice, read after a runner attempt since the
+  reports caught up within five minutes (nothing catching up, read after a runner attempt since the
   reconnect: until a runner surveys, the status lists nothing, and across a reconnect it keeps its last answer), and
   that a quiet-group message sent after the reconnect arrives. The aggregate includes inbox comparisons; it does
   proves group re-proof by route-specific wire requests with native paging excluded. Reconnect windows may not
@@ -182,6 +216,23 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   independent bound. Idle traffic remains measured separately. Reconnect traffic counts every connection of bob's
   since the restart, since endpoint 1's survives the cut. The report lists each notice before the restart and at the
   end by route (busy, quiet or inbox) and park time, without ids, and keeps the setup's runner trace.
+- `public_app_runner_opens_multi_epoch_history_while_a_relay_stalls` checks useful local progress (#1945).
+  - While bob is stopped, three senders publish six rounds of 90 messages, and alice renames the group between
+    rounds. That is 540 owed messages over six epochs, with at most 30 per sender per round (#3036).
+  - Endpoint 1 never answers history from bob's restart on, so each of its attempts holds the runner for the
+    5-second request timeout and ends unreachable.
+  - Bob's timeline is read every 100 ms. A useful advance is an owed message newly shown; admission turns and
+    quanta count for nothing, so a runner that spins on work opening nothing cannot pass.
+  - It asserts that all 540 show exactly once, that bob reaches alice's epoch, and that endpoint 1 was asked and
+    withheld history.
+  - A stalled relay may delay the start by one request timeout and never stalls the opens once begun. Endpoint 1
+    still owes the history at the restart, so nothing is admitted until its unreachable verdict takes it off the
+    admission frontier. The first open must come within one request timeout plus 2 seconds of the restart. After
+    that, consecutive useful advances must stay under one request timeout apart, so a single stalled attempt
+    between two opens fails it.
+  - The report gives the time to the first open, the largest gaps, bob's epochs as they changed, and the runner's
+    attempts, admission pacing and status-command latency while opening. Its runner trace includes admission
+    turns.
 - `public_app_runner_orders_six_thousand_backlog_messages_before_live_input` retains the captured three-sender
   6,000-event admission-order failure. Live subscription traffic competes with older recovery. It requires every
   owed/live message exactly once, zero native paging and the exact timeline after closing/reopening Bob. The
