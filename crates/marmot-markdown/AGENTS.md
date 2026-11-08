@@ -29,9 +29,11 @@ Markdown parser and typed AST for app message rendering. For the human overview,
 - `build.rs` — pinned Odin invocation and target selection; optimized Linux amd64 finalizes native code with pinned LLVM tools.
 - `tests/golden/` — `*.md` inputs with `*.json` expected ASTs; `tests/unit_*.rs`, `tests/spec*.rs` — focused coverage.
 
-Production builds use `-bedrock`, without runtime type information or built-in maps. The arena must obtain its overflow
-backing from `runtime.heap_allocator()`; the default context allocator is nil in this mode. Keep parser allocation
-inside the parse arena and preserve the Rust bridge's input/scratch borrow until conversion finishes.
+Production builds use `-bedrock` on non-Apple targets. Apple targets use a nil default allocator and disable startup
+hooks and non-constant globals explicitly because Odin's Darwin runtime needs Objective-C declarations. Keep the
+parser free of built-in maps and runtime type inspection on every target. The arena must obtain its overflow backing
+from `runtime.heap_allocator()`. Keep parser allocation inside the parse arena and preserve the Rust bridge's
+input/scratch borrow until conversion finishes.
 The C exports initialize only their assertion handler and explicit allocator. Reference-map keys use direct OS entropy;
 do not reintroduce the default context's TLS random generator, which cannot link on Android ARMv7.
 

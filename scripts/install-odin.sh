@@ -15,18 +15,22 @@ expected_commit=84bc3fc
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64)
     platform=linux-amd64
+    asset_id=615726879
     sha256=c3c8b095621fd0c75f7f73e3a0829f1b4d45324225f20ba11ed8dc4da310a8ab
     ;;
   Linux:aarch64|Linux:arm64)
     platform=linux-arm64
+    asset_id=615726758
     sha256=99c43e9670a285901d6cfee5f56197b74c7d6f7c537b35ecba0c1b44ac2e4df8
     ;;
   Darwin:arm64)
     platform=macos-arm64
+    asset_id=615726666
     sha256=b276c6ac87c3eea17446a6ca9080089b6e9f492057fb773591775ee49d92a1cf
     ;;
   MINGW*:x86_64|MSYS*:x86_64)
     platform=windows-amd64
+    asset_id=615725640
     sha256=b6b2e426a8b6f147b74ec7e18bef8df27cf40fe16193159df7ca09a0cc0c2011
     ;;
   *)
@@ -45,14 +49,23 @@ asset="odin-$platform-$version.$extension"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 archive="$work/$asset"
-curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-  "https://github.com/odin-lang/Odin/releases/download/$version/$asset" \
-  --output "$archive"
+download() {
+  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+    --connect-timeout 15 --max-time 600 --speed-limit 1024 --speed-time 30 \
+    --retry 4 --retry-all-errors --retry-max-time 120 \
+    --output "$archive" "$@"
+}
+
+if ! download "https://github.com/odin-lang/Odin/releases/download/$version/$asset"; then
+  # The API endpoint can issue a fresh asset redirect if the download URL fails.
+  download -H 'Accept: application/octet-stream' \
+    "https://api.github.com/repos/odin-lang/Odin/releases/assets/$asset_id?download=1"
+fi
 # Verify the archive before extracting or executing any upstream content.
 if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | sha256sum --check --status)
+  (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | sha256sum -c -)
 else
-  (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | shasum --algorithm 256 --check --status)
+  (cd "$work" && printf '%s  %s\n' "$sha256" "$asset" | shasum -a 256 -c)
 fi
 mkdir "$work/unpack"
 if [[ "$extension" == zip ]]; then
