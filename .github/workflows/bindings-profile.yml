@@ -15,6 +15,8 @@ on:
       - .github/workflows/bindings-profile.yml
       - .github/workflows/bindings-profile-measurement.yml
       - .github/workflows/bindings.yaml
+      - .github/actions/setup-odin/**
+      - scripts/install-odin.sh
       - crates/marmot-uniffi/**
       - "!crates/marmot-uniffi/*.md"
       - "!crates/marmot-uniffi/**/*.md"
@@ -138,6 +140,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.identity.outputs.source_sha }}
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain
         shell: bash
         run: |
@@ -217,6 +222,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.identity.outputs.source_sha }}
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain
         shell: bash
         run: |

@@ -1,0 +1,14 @@
+[package]
+name = "marmot-markdown-ast"
+version.workspace = true
+description = "Owned Markdown AST types and serde implementations"
+authors = ["Marmot Authors"]
+edition = "2024"
+rust-version = "1.91.0"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

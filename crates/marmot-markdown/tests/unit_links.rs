@@ -478,6 +478,17 @@ fn missing_ref_falls_through_to_text() {
     );
 }
 
+#[test]
+fn reference_unicode_lowercase() {
+    let input = "[𐐀İᎠẞ]: /unicode\n\n[𐐨i\u{307}ꭰß]";
+    assert_eq!(
+        parse_blocks(input),
+        vec![Block::Paragraph {
+            inlines: vec![link("/unicode", None, vec![t("𐐨i\u{307}ꭰß")])]
+        }]
+    );
+}
+
 // ----- Non-ASCII UTF-8 in links --------------------------------------
 
 #[test]

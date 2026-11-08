@@ -161,7 +161,7 @@ fn production_library_sources_do_not_write_direct_output() {
 
     for root in production_source_roots(&repo) {
         for file in rust_source_files(&root) {
-            if is_cli_binary(&file) || is_feature_gated_test_support(&file) {
+            if is_build_or_cli_target(&file) || is_feature_gated_test_support(&file) {
                 continue;
             }
 
@@ -200,7 +200,16 @@ struct TraceInvocation {
     body: String,
 }
 
-fn is_cli_binary(path: &Path) -> bool {
+fn is_build_or_cli_target(path: &Path) -> bool {
+    // Cargo build scripts emit build instructions on stdout, not runtime output.
+    if path.file_name().and_then(|name| name.to_str()) == Some("build.rs")
+        && path
+            .parent()
+            .is_some_and(|parent| parent.join("Cargo.toml").is_file())
+    {
+        return true;
+    }
+
     if path.file_name().and_then(|name| name.to_str()) == Some("main.rs") {
         return true;
     }

@@ -2,6 +2,10 @@
 
 FROM rust:1.97.1-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS builder
 
+COPY scripts/install-odin.sh /tmp/install-odin.sh
+RUN bash /tmp/install-odin.sh /opt/odin
+ENV ODIN=/opt/odin/odin
+
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo ./.cargo

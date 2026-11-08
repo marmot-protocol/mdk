@@ -27,6 +27,10 @@ ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
 
 WORKDIR /work/mdk
+COPY scripts/install-odin.sh /tmp/install-odin.sh
+RUN bash /tmp/install-odin.sh /opt/odin
+ENV ODIN=/opt/odin/odin
+
 COPY . .
 
 # Keep compiler output out of the image and reuse it when only plugin code changes.

@@ -20,6 +20,7 @@ members = [
     "crates/agent-control",
     "crates/agent-connector",
     "crates/marmot-forensics",
+    "crates/marmot-markdown-ast",
     "crates/marmot-markdown",
     "crates/marmot-account",
     "crates/marmot-pairing",
@@ -168,6 +169,7 @@ transport-quic-broker = { path = "crates/transport-quic-broker" }
 agent-stream-compose = { path = "crates/agent-stream-compose" }
 agent-control = { path = "crates/agent-control" }
 marmot-forensics = { path = "crates/marmot-forensics" }
+marmot-markdown-ast = { path = "crates/marmot-markdown-ast" }
 marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-pairing = { path = "crates/marmot-pairing" }

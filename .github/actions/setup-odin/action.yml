@@ -1,0 +1,25 @@
+name: Set up pinned Odin
+description: Install the checksum-pinned Odin compiler used by marmot-markdown
+runs:
+  using: composite
+  steps:
+    - name: Install Odin dev-2026-10
+      shell: bash
+      env:
+        ODIN_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        temporary="$RUNNER_TEMP"
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          temporary="$(cygpath -u "$temporary")"
+          ODIN_ACTION_PATH="$(cygpath -u "$ODIN_ACTION_PATH")"
+        fi
+        destination="$temporary/odin-dev-2026-10"
+        bash "$ODIN_ACTION_PATH/../../../scripts/install-odin.sh" "$destination"
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          echo "$(cygpath -w "$destination")" >> "$GITHUB_PATH"
+          echo "ODIN=$(cygpath -w "$destination/odin.exe")" >> "$GITHUB_ENV"
+        else
+          echo "$destination" >> "$GITHUB_PATH"
+          echo "ODIN=$destination/odin" >> "$GITHUB_ENV"
+        fi

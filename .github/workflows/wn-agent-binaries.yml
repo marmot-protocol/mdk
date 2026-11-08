@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - .github/workflows/wn-agent-binaries.yml
+      - .github/actions/setup-odin/**
+      - scripts/install-odin.sh
       - scripts/classify_ci_changes.py
       - scripts/test_classify_ci_changes.py
       - .cargo/config.toml
@@ -42,6 +44,7 @@ on:
       - crates/marmot-forensics/**
       - crates/marmot-markdown/**
       - crates/marmot-observability/**
+      - crates/marmot-markdown-ast/**
       - crates/marmot-session/**
       - crates/media-store/**
       - crates/nostr-directory/**
@@ -178,6 +181,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
+
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
 
       - name: Install Rust toolchain
         shell: bash

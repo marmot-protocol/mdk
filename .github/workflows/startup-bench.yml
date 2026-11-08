@@ -26,6 +26,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
