@@ -1134,6 +1134,44 @@ pub(crate) fn help_card_lines() -> Vec<String> {
     .collect()
 }
 
+/// The admin-leave guard messages, kept as constants so the guard and its
+/// tests share one source of truth.
+pub(crate) const CANNOT_LEAVE_TITLE: &str = "Cannot Leave Group";
+pub(crate) const LEAVE_SOLE_ADMIN_MESSAGE: &str =
+    "You're the only admin. Promote another member to admin before you can leave.";
+pub(crate) const LEAVE_CO_ADMIN_MESSAGE: &str =
+    "You're an admin of this group. Step down as admin (wn groups self-demote) before leaving.";
+
+/// The TUI Leave guard. `Blocked` carries the info-card body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LeaveDecision {
+    Blocked(&'static str),
+    Confirm,
+}
+
+/// Whether `L` confirms Leave or explains why it cannot. Where Leave steps an
+/// admin down itself (device groups, mdk#2628 D99) the command owns the
+/// last-admin refusal. Otherwise core refuses every admin's Leave until it
+/// demotes (mdk#3014 interim), and the TUI has no demote action, so it says
+/// so before confirming.
+pub(crate) fn leave_group_decision(
+    view: &GroupDetailView,
+    leave_steps_admin_down: bool,
+) -> LeaveDecision {
+    let self_is_admin = view
+        .members
+        .iter()
+        .any(|member| member.is_self && member.is_admin);
+    if leave_steps_admin_down || !self_is_admin {
+        return LeaveDecision::Confirm;
+    }
+    if view.members.iter().filter(|member| member.is_admin).count() <= 1 {
+        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
+    } else {
+        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
+    }
+}
+
 /// The loaded group-detail screen state. Owned as `Option<GroupDetailView>` and
 /// dropped when leaving the screen (no per-view subscriptions to tear down; the
 /// data is a one-shot load).

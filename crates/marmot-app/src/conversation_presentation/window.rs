@@ -583,6 +583,7 @@ mod budget_tests {
             disbanding: false,
             disbanding_enabled: false,
             has_disbanding_blockers: false,
+            admin_leave_steps_down: false,
         };
         let header = ConversationHeader {
             avatar_asset: None,

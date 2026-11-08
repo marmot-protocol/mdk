@@ -8092,6 +8092,16 @@ impl MarmotApp {
         )) && self.config.dev_device_groups
     }
 
+    /// Whether a user's Leave takes an admin account off the chat's admin
+    /// list itself before its SelfRemove (mdk#2628 D99): only while device
+    /// groups are on. Otherwise an admin's Leave is refused with
+    /// `AdminCannotSelfRemove` until the host demotes the account
+    /// (`self_demote_admin`), as before 0.15 (mdk#3014 interim). Fills
+    /// [`conversation_presentation::ConversationAuthority::admin_leave_steps_down`].
+    pub fn admin_leave_steps_down(&self) -> bool {
+        self.device_groups_enabled()
+    }
+
     /// The convergence settlement window the engine runs under, in
     /// milliseconds: the pinned v1 window, or a test-policy build's
     /// override, read as `open_account` reads it (mdk#970).

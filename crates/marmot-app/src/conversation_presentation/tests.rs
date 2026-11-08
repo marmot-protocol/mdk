@@ -19,6 +19,7 @@ fn authority() -> ConversationAuthority {
         disbanding: false,
         disbanding_enabled: true,
         has_disbanding_blockers: false,
+        admin_leave_steps_down: false,
     }
 }
 fn state() -> ConversationHeaderState {
@@ -140,10 +141,21 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
     assert!(!input.capabilities().can_leave);
     assert!(!input.member_actions(true, true).can_remove);
     assert!(!input.member_actions(false, true).can_demote);
+    assert!(input.capabilities().requires_self_demote_before_leave);
     input.admin_count = 2;
     assert!(input.member_actions(false, true).can_demote);
+    // Without device groups an admin demotes first, even with another admin
+    // (mdk#3014 interim); with them, Leave demotes it (D99).
+    assert!(!input.capabilities().can_leave);
+    assert!(input.capabilities().requires_self_demote_before_leave);
+    input.admin_leave_steps_down = true;
     assert!(input.capabilities().can_leave);
     assert!(!input.capabilities().requires_self_demote_before_leave);
+    input.admin_count = 1;
+    assert!(!input.capabilities().can_leave);
+    assert!(!input.capabilities().requires_self_demote_before_leave);
+    input.admin_count = 2;
+    input.admin_leave_steps_down = false;
     for (membership, leaving, pending, lifecycle, expected) in [
         (
             SelfMembership::Member,
@@ -208,6 +220,20 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
         assert!(!a.member_actions(false, false).can_promote);
         assert_eq!(c.is_self_admin, membership == SelfMembership::Member);
         assert!(!c.is_last_admin); // Two actual admins in this fixture.
+        // Declining is a Leave: an admin invitee demotes first.
+        assert_eq!(
+            c.requires_self_demote_before_leave,
+            expected == ConversationParticipation::PendingInvitation
+        );
+        let stepping_down = ConversationAuthority {
+            admin_leave_steps_down: true,
+            ..a
+        };
+        assert!(
+            !stepping_down
+                .capabilities()
+                .requires_self_demote_before_leave
+        );
     }
     input.unrecoverable = true;
     assert!(!input.capabilities().can_send);

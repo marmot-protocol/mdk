@@ -1651,7 +1651,7 @@ pub async fn prewarm_group_member_key_packages( &self, account_ref: String, memb
 
 Resolve the current composition roster before Create is tapped. The result is aggregate-only; no package is reserved or consumed, and the later create call revalidates cached packages before MLS mutation.
 
-[Source](src/commands/group.rs#L395)
+[Source](src/commands/group.rs#L404)
 
 ### `Marmot::create_group`
 
@@ -1663,7 +1663,7 @@ pub async fn create_group( &self, account_ref: String, name: String, member_refs
 
 Create a new MLS group with `name` and the given members. Members are referenced by `npub` or hex account id. Returns the locally canonical group id as hex; this confirms local canonicalization, not Welcome delivery. `WelcomeDeliveryPending` is a delivery-failure signal, not an acknowledgement. Hosts should subscribe before creation and/or query `pending_welcome_deliveries` afterward before presenting invitation success.
 
-[Source](src/commands/group.rs#L414)
+[Source](src/commands/group.rs#L423)
 
 ### `Marmot::create_group_with_options`
 
@@ -1675,7 +1675,7 @@ pub async fn create_group_with_options( &self, account_ref: String, name: String
 
 Create a group with forward-compatible founding options. A nonzero retention value is written into the founding MLS state and Welcome; it does not emit a follow-up retention commit or publication.
 
-[Source](src/commands/group.rs#L431)
+[Source](src/commands/group.rs#L440)
 
 ### `Marmot::create_group_detailed`
 
@@ -1687,7 +1687,7 @@ pub async fn create_group_detailed( &self, account_ref: String, name: String, me
 
 Create a group and return the exact durable chat-list row available to subscriptions and queries at the response boundary.
 
-[Source](src/commands/group.rs#L447)
+[Source](src/commands/group.rs#L456)
 
 ### `Marmot::create_group_with_options_detailed`
 
@@ -1699,7 +1699,7 @@ pub async fn create_group_with_options_detailed( &self, account_ref: String, nam
 
 Create a group with forward-compatible founding options and return the exact durable chat-list row available at the response boundary.
 
-[Source](src/commands/group.rs#L463)
+[Source](src/commands/group.rs#L472)
 
 ### `Marmot::create_group_with_initial_image`
 
@@ -1711,7 +1711,7 @@ pub async fn create_group_with_initial_image( &self, account_ref: String, name: 
 
 Create a group with an optional initial avatar. MDK prefers an encrypted Blossom image and uses `source_url` only when the founding members do not all support that component but do support URL avatars.
 
-[Source](src/commands/group.rs#L480)
+[Source](src/commands/group.rs#L489)
 
 ### `Marmot::stage_prepared_group_image`
 
@@ -1723,7 +1723,7 @@ pub async fn stage_prepared_group_image( &self, account_ref: String, plaintext: 
 
 Validate and durably encrypt a founding image without performing any network transfer. The opaque id survives process restart; keys, ciphertext, and the content hash stay inside MDK's SQLCipher database.
 
-[Source](src/commands/group.rs#L505)
+[Source](src/commands/group.rs#L514)
 
 ### `Marmot::upload_prepared_group_image`
 
@@ -1735,7 +1735,7 @@ pub async fn upload_prepared_group_image( &self, account_ref: String, upload_id:
 
 Upload a staged founding image. A transfer failure is returned as an error after its failed status is durably recorded, and can be retried with the same id; an already uploaded id performs no duplicate HTTP transfer.
 
-[Source](src/commands/group.rs#L523)
+[Source](src/commands/group.rs#L532)
 
 ### `Marmot::prepared_group_image_status`
 
@@ -1747,7 +1747,7 @@ pub async fn prepared_group_image_status( &self, account_ref: String, upload_id:
 
 Read one prepared group-image operation status.
 
-[Source](src/commands/group.rs#L535)
+[Source](src/commands/group.rs#L544)
 
 ### `Marmot::prepared_group_images`
 
@@ -1759,7 +1759,7 @@ pub async fn prepared_group_images( &self, account_ref: String, ) -> Result<Vec<
 
 List prepared group-image operations.
 
-[Source](src/commands/group.rs#L547)
+[Source](src/commands/group.rs#L556)
 
 ### `Marmot::create_group_with_prepared_initial_image`
 
@@ -1771,7 +1771,7 @@ pub async fn create_group_with_prepared_initial_image( &self, account_ref: Strin
 
 Fast founding-image create path. `upload_id` must already be uploaded; the image component is present in epoch-zero metadata and no Blossom request occurs on this call. Reusing a consumed id returns its original canonical group rather than creating a duplicate.
 
-[Source](src/commands/group.rs#L564)
+[Source](src/commands/group.rs#L573)
 
 ### `Marmot::create_group_with_initial_image_detailed`
 
@@ -1783,7 +1783,7 @@ pub async fn create_group_with_initial_image_detailed( &self, account_ref: Strin
 
 Create a group with an initial image and detailed operation outcome.
 
-[Source](src/commands/group.rs#L585)
+[Source](src/commands/group.rs#L594)
 
 ### `Marmot::normalize_member_ref`
 
@@ -1795,7 +1795,7 @@ pub fn normalize_member_ref(&self, member_ref: String) -> Result<MemberRefFfi, M
 
 Normalize a member reference for group-management UI. Accepts hex, `npub`, `nostr:npub...`, `nprofile`, `nostr:nprofile...`, and `marmot://profile/...` references. nprofile relay hints are discarded and never used for routing or membership authorization. Duplicate type-0 TLV entries keep the first key. After wrapper normalization, the nprofile fallback rejects encoded tokens longer than 1023 UTF-8 bytes; a valid 1023-byte token still decodes when wrapped.
 
-[Source](src/commands/group.rs#L615)
+[Source](src/commands/group.rs#L624)
 
 ### `Marmot::group_members`
 
@@ -1807,7 +1807,7 @@ pub async fn group_members( &self, account_ref: String, group_id_hex: String, ) 
 
 Membership roster for `group_id_hex`: one row per member account, with how many of its devices are in the group (`device_count`). An account with several devices is one member.
 
-[Source](src/commands/group.rs#L621)
+[Source](src/commands/group.rs#L630)
 
 ### `Marmot::group_member_ids_page`
 
@@ -1819,7 +1819,7 @@ pub async fn group_member_ids_page( &self, account_ref: String, group_ids_hex: V
 
 Identifier-only rosters for a bounded page of groups. Each member account appears once, however many devices it has in the group.
 
-[Source](src/commands/group.rs#L638)
+[Source](src/commands/group.rs#L647)
 
 ### `Marmot::group_details`
 
@@ -1831,7 +1831,7 @@ pub async fn group_details( &self, account_ref: String, group_id_hex: String, ) 
 
 Group plus enriched member rows for detail screens, one per member account with its `device_count`. Admin counts and last-admin checks therefore count accounts.
 
-[Source](src/commands/group.rs#L663)
+[Source](src/commands/group.rs#L672)
 
 ### `Marmot::group_conversation_snapshot`
 
@@ -1843,7 +1843,7 @@ pub async fn group_conversation_snapshot( &self, account_ref: String, group_id_h
 
 Group details and management state captured for conversation loading in one worker command. The authoritative group record, roster, and MLS state share one session/snapshot frontier; management state is derived from those exact returned details without another await.
 
-[Source](src/commands/group.rs#L676)
+[Source](src/commands/group.rs#L685)
 
 ### `Marmot::group_roster`
 
@@ -1855,7 +1855,7 @@ pub async fn group_roster( &self, account_ref: String, group_id_hex: String, ) -
 
 Lightweight membership roster projection for membership screens: one entry per member account with its `device_count`, and `member_count` counts accounts.
 
-[Source](src/commands/group.rs#L687)
+[Source](src/commands/group.rs#L696)
 
 ### `Marmot::group_management_state`
 
@@ -1867,7 +1867,7 @@ pub async fn group_management_state( &self, account_ref: String, group_id_hex: S
 
 Current caller permissions plus per-member action availability.
 
-[Source](src/commands/group.rs#L698)
+[Source](src/commands/group.rs#L707)
 
 ### `Marmot::enable_group_disbanding`
 
@@ -1879,7 +1879,7 @@ pub async fn enable_group_disbanding( &self, account_ref: String, group_id_hex: 
 
 Install lifecycle-v1 and require it in one admin Commit.
 
-[Source](src/commands/group.rs#L709)
+[Source](src/commands/group.rs#L718)
 
 ### `Marmot::account_devices_activation`
 
@@ -1891,7 +1891,7 @@ pub async fn account_devices_activation( &self, account_ref: String, group_id_he
 
 Whether the account can turn on account-devices in the group now, so its own devices can later add and remove each other there without an admin. Ask before offering `enable_account_devices`, and show the reason when it is not `Eligible`. The answer is about the whole group and never names the members or devices that hold it back; a non-admin only learns `NotAdmin`. It is advisory: `enable_account_devices` checks again.
 
-[Source](src/commands/group.rs#L732)
+[Source](src/commands/group.rs#L741)
 
 ### `Marmot::enable_account_devices`
 
@@ -1903,7 +1903,7 @@ pub async fn enable_account_devices( &self, account_ref: String, group_id_hex: S
 
 Turn on account-devices (`marmot.group.account-devices.v1`) in one admin Commit. Call it only when the user asks: MDK never turns it on by itself, and a group can never turn it off. Refused before anything is published with `AccountDevicesActivationRefused`, carrying the same aggregate reason, unless `account_devices_activation` would answer `Eligible`.
 
-[Source](src/commands/group.rs#L749)
+[Source](src/commands/group.rs#L758)
 
 ### `Marmot::disband_group`
 
@@ -1915,7 +1915,7 @@ pub async fn disband_group( &self, account_ref: String, group_id_hex: String, ) 
 
 Durably accept an irreversible disband request. Completion is observed through normal group state updates after bounded convergence.
 
-[Source](src/commands/group.rs#L769)
+[Source](src/commands/group.rs#L778)
 
 ### `Marmot::acknowledge_disband_failure`
 
@@ -1927,7 +1927,7 @@ pub async fn acknowledge_disband_failure( &self, account_ref: String, group_id_h
 
 Acknowledge the recorded group-disband failure.
 
-[Source](src/commands/group.rs#L783)
+[Source](src/commands/group.rs#L792)
 
 ### `Marmot::invite_members`
 
@@ -1939,7 +1939,7 @@ pub async fn invite_members( &self, account_ref: String, group_id_hex: String, m
 
 Invite `member_refs` into an existing group.
 
-[Source](src/commands/group.rs#L796)
+[Source](src/commands/group.rs#L805)
 
 ### `Marmot::invite_members_with_initial_admins`
 
@@ -1951,7 +1951,7 @@ pub async fn invite_members_with_initial_admins( &self, account_ref: String, gro
 
 Invite `member_refs` and grant admin to `initial_admin_refs` in the same invite commit. Each initial admin must be one of the invitees.
 
-[Source](src/commands/group.rs#L808)
+[Source](src/commands/group.rs#L817)
 
 ### `Marmot::remove_members`
 
@@ -1963,7 +1963,7 @@ pub async fn remove_members( &self, account_ref: String, group_id_hex: String, m
 
 Request removal of selected members; use the detailed variant for operation outcomes.
 
-[Source](src/commands/group.rs#L832)
+[Source](src/commands/group.rs#L841)
 
 ### `Marmot::leave_group`
 
@@ -1973,9 +1973,9 @@ Request removal of selected members; use the detailed variant for operation outc
 pub async fn leave_group( &self, account_ref: String, group_id_hex: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Queue leaving a group; retained local history is separate from membership.
+Queue leaving a group; retained local history is separate from membership. An admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`); only the experimental device-groups constructor demotes a nonlast admin itself.
 
-[Source](src/commands/group.rs#L850)
+[Source](src/commands/group.rs#L859)
 
 ### `Marmot::forget_group_local`
 
@@ -1987,7 +1987,7 @@ pub async fn forget_group_local( &self, account_ref: String, group_id_hex: Strin
 
 Reset a group on this account-device, without sending an MLS leave or disband. Erases local history and protocol state, cancels group work, and rejects old welcomes. A valid Welcome whose authenticated inner creation time is strictly newer than the reset's Unix-second cutoff can join the same group with fresh state. Equal-second invitations are rejected; receipt time and outer wrapper time do not establish freshness. Hosts should close the group's UI subscriptions and clear their media caches. Returns true when resetting, false when already awaiting a fresh Welcome.
 
-[Source](src/commands/group.rs#L872)
+[Source](src/commands/group.rs#L881)
 
 ### `Marmot::delete_group_local`
 
@@ -1999,7 +1999,7 @@ pub async fn delete_group_local( &self, account_ref: String, group_id_hex: Strin
 
 Delete this group's local app data without performing an MLS leave. The caller should cancel any active UI subscriptions for the group before invoking the wipe. The runtime removes the active transport route, then transactionally drops the chat-list/account projection, plaintext app events, timeline rows, agent-stream projection rows, push-token rows, and cached encrypted-media epoch secrets. MLS/OpenMLS group state is left intact; a future fresh group delivery can recreate a local chat row. Returns true if any local rows or a live route were removed.
 
-[Source](src/commands/group.rs#L892)
+[Source](src/commands/group.rs#L901)
 
 ### `Marmot::group_app_component`
 
@@ -2011,7 +2011,7 @@ pub async fn group_app_component( &self, account_ref: String, group_id_hex: Stri
 
 Read one application-owned group component from local committed MLS state. `None` is absence; a record with empty `data` is present empty state. `component_id` must be at or above `APP_OWNED_APP_COMPONENT_ID_START` (`0xf000`), otherwise `InvalidAppComponent` is returned; use the typed profile, image, retention and policy APIs for protocol settings. The protocol registry allocates upward from `0x8001`, so an id picked merely because it is unassigned today can be taken by a later registry entry — applications allocate inside the application range instead, and version their own payloads. Reads are serialized through the account worker and may wait behind an in-flight mutation, so refresh after group events (including `EpochChanged` and convergence) and after local updates.
 
-[Source](src/commands/group.rs#L908)
+[Source](src/commands/group.rs#L917)
 
 ### `Marmot::update_app_component`
 
@@ -2023,7 +2023,7 @@ pub async fn update_app_component( &self, account_ref: String, group_id_hex: Str
 
 Replace one optional application-owned component through an admin-authorized MLS commit. Ids below `APP_OWNED_APP_COMPONENT_ID_START` (`0xf000`), components the group requires, and `data` longer than `APP_COMPONENT_DATA_MAX_LEN` (4096 bytes) are rejected with `InvalidAppComponent`. Before staging, the engine rejects updates whose resulting application-owned state exceeds 32 entries or 8192 encoded bytes (including entry ids and TLS payload length prefixes). Replacements count once; empty values still occupy a slot. The value is re-encoded into the GroupContext of every later commit and into every Welcome, so this is a settings channel rather than a blob store. Empty `data` stores an empty payload; it does not remove the component. The value survives message expiry and reaches newly invited members in their Welcome without sharing earlier application-message history, and unsupported clients preserve the bytes without interpreting them. Publication and convergence semantics match other group mutations: handle publication uncertainty and `GroupChangeSuperseded` rather than assuming a local change wins every later concurrent commit. The runtime does not retry an application's desired value.
 
-[Source](src/commands/group.rs#L927)
+[Source](src/commands/group.rs#L936)
 
 ### `Marmot::update_message_retention`
 
@@ -2035,7 +2035,7 @@ pub async fn update_message_retention( &self, account_ref: String, group_id_hex:
 
 Set the per-group disappearing-message retention, wrapping the engine's `update_message_retention`. `disappearing_message_secs` of `0` disables expiry; any positive value is the retention window in seconds. Thin passthrough over the already-public engine API (mdk#571).
 
-[Source](src/commands/group.rs#L946)
+[Source](src/commands/group.rs#L955)
 
 ### `Marmot::acknowledge_group_catching_up`
 
@@ -2047,7 +2047,7 @@ pub async fn acknowledge_group_catching_up( &self, account_ref: String, group_id
 
 Call only after a group change failed with `GroupCatchingUp` and the user chose to continue anyway. The group may have moved past this device, so the change can split the group for everyone (mdk#2258). Records the acknowledgement for the group at the device's current epoch, then retry the original change. It admits exactly one change attempt and is consumed even if that attempt fails, so a different change asks again. It is not persisted, so a restarted app asks again too. Returns `false`, recording nothing, when the group is not catching up. It is a separate call rather than a flag on every group-change method, and it is distinct from `dismiss_history_notice`, which accepts missing history, not fork risk. Runs on the account worker; no network I/O.
 
-[Source](src/commands/group.rs#L966)
+[Source](src/commands/group.rs#L975)
 
 ### `Marmot::acknowledge_group_commit_undelivered`
 
@@ -2059,7 +2059,7 @@ pub async fn acknowledge_group_commit_undelivered( &self, account_ref: String, g
 
 Call only after a group change failed with `GroupCommitUndelivered` and the user chose to continue anyway. The group's last change confirmed on its first relay acknowledgement but some group relays have not accepted it, so members who read only those relays cannot follow it, or the new change built on it (mdk#2255). Records the acknowledgement for the commit that is currently owed, then retry the original change. It admits exactly one change attempt and is consumed even if that attempt fails, so a different change asks again. It is not persisted. Returns `false`, recording nothing, when no relay is owed the group's last change. Distinct from `acknowledge_group_catching_up`; a change can need both. Runs on the account worker; no network I/O.
 
-[Source](src/commands/group.rs#L984)
+[Source](src/commands/group.rs#L993)
 
 ### `Marmot::group_commit_delivery`
 
@@ -2071,7 +2071,7 @@ pub async fn group_commit_delivery( &self, account_ref: String, group_id_hex: St
 
 Returns the group's oldest change that some group relays have not accepted yet, or `None` once every relay has accepted or definitively rejected it. `owed_relay_urls` lists the relays MDK is still retrying with the exact event; `since` is when the first relay accepted the change, in Unix seconds. A newer change can be owed to other relays as well. Owed relays are reported immediately, so use it to show "not delivered to every relay yet" proactively. `Some` alone does not mean the next change fails: group changes fail with `GroupCommitUndelivered` only once `since` is two minutes old, because a healthy relay cut off at the first acknowledgement is retried after 30 seconds. No event announces delivery completing, so poll while the indicator is visible. Local read on the account worker; no network I/O.
 
-[Source](src/commands/group.rs#L1003)
+[Source](src/commands/group.rs#L1012)
 
 ### `Marmot::pending_welcome_deliveries`
 
@@ -2083,7 +2083,7 @@ pub async fn pending_welcome_deliveries( &self, account_ref: String, ) -> Result
 
 Return the account's retained Welcome repair handles in oldest-first order after a locally canonical create or confirmed Add. This is a local account-worker read, not a new invitation or network retry. `size_class` explains an observed all-target refusal; earlier legacy exposure can be unknown after a crash or expired bookkeeping. Neither a present class nor None proves delivery or non-delivery; None means Unknown, including legacy rows or a later coarse legacy retry. A specific cause can disappear while the same debt remains. `recorded_at` is the local repair-index timestamp in Unix seconds, not proof that the recipient joined. The pending event stays once per process/Welcome; re-read this query for later causes. Use the matching regenerated bindings/native library. See [Welcome delivery and compatibility](README.md#undelivered-welcomes).
 
-[Source](src/commands/group.rs#L1026)
+[Source](src/commands/group.rs#L1035)
 
 ### `Marmot::group_recovery_status`
 
@@ -2095,7 +2095,7 @@ pub async fn group_recovery_status( &self, account_ref: String, group_id_hex: St
 
 Re-read on GroupStateUpdated; display uncertainty separately from whether the user accepted the original invitation. `history_may_be_incomplete` and `history_notice_ids` report recovery parked on this group's own history; account-wide occurrences are listed only by `history_notices`, and each id can be passed to `dismiss_history_notice`.
 
-[Source](src/commands/group.rs#L1042)
+[Source](src/commands/group.rs#L1051)
 
 ### `Marmot::confirm_group_rejoin`
 
@@ -2107,7 +2107,7 @@ pub async fn confirm_group_rejoin( &self, account_ref: String, welcome_id_hex: S
 
 Call only after explicit user consent to replace the active copy. Show the offer's authenticated inviter and pass its exact id and state token.
 
-[Source](src/commands/group.rs#L1057)
+[Source](src/commands/group.rs#L1066)
 
 ### `Marmot::decline_group_rejoin`
 
@@ -2119,7 +2119,7 @@ pub async fn decline_group_rejoin( &self, account_ref: String, welcome_id_hex: S
 
 Decline a proposed recovery rejoin.
 
-[Source](src/commands/group.rs#L1072)
+[Source](src/commands/group.rs#L1081)
 
 ### `Marmot::accept_group_invite`
 
@@ -2131,7 +2131,7 @@ pub async fn accept_group_invite( &self, account_ref: String, group_id_hex: Stri
 
 Accept a pending group invitation.
 
-[Source](src/commands/group.rs#L1084)
+[Source](src/commands/group.rs#L1093)
 
 ### `Marmot::decline_group_invite`
 
@@ -2141,9 +2141,9 @@ Accept a pending group invitation.
 pub async fn decline_group_invite( &self, account_ref: String, group_id_hex: String, ) -> Result<GroupInviteDeclineResultFfi, MarmotKitError>
 ```
 
-Decline a pending group invitation.
+Decline a pending group invitation. An invitee the invite made an admin gets `AdminCannotSelfRemove` until `self_demote_admin` (`requires_self_demote_before_leave`), unless the experimental device-groups constructor is used.
 
-[Source](src/commands/group.rs#L1097)
+[Source](src/commands/group.rs#L1106)
 
 ### `Marmot::update_group_profile`
 
@@ -2155,7 +2155,7 @@ pub async fn update_group_profile( &self, account_ref: String, group_id_hex: Str
 
 Update the group name and description.
 
-[Source](src/commands/group.rs#L1110)
+[Source](src/commands/group.rs#L1119)
 
 ### `Marmot::update_group_image`
 
@@ -2167,7 +2167,7 @@ pub async fn update_group_image( &self, account_ref: String, group_id_hex: Strin
 
 Encrypt and upload a group avatar to Blossom, then commit the `marmot.group.blossom.image.v1` component. `plaintext` must contain the decoded image bytes; use `clear_group_image` to remove an existing encrypted Blossom avatar.
 
-[Source](src/commands/group.rs#L1129)
+[Source](src/commands/group.rs#L1138)
 
 ### `Marmot::clear_group_image`
 
@@ -2179,7 +2179,7 @@ pub async fn clear_group_image( &self, account_ref: String, group_id_hex: String
 
 Clear the group's encrypted Blossom avatar by committing the absent `marmot.group.blossom.image.v1` component state.
 
-[Source](src/commands/group.rs#L1147)
+[Source](src/commands/group.rs#L1156)
 
 ### `Marmot::download_group_blossom_image`
 
@@ -2191,7 +2191,7 @@ pub async fn download_group_blossom_image( &self, account_ref: String, group_id_
 
 Fetch and decrypt the group's encrypted Blossom avatar (`marmot.group.blossom.image.v1`) into raw image bytes (PNG/JPEG/…). Errors when the group has no Blossom image set. Presence and the content hash (for caching) are on `AppGroupRecordFfi::image_hash_hex`; when the group also carries a URL avatar, the URL takes precedence for rendering.
 
-[Source](src/commands/group.rs#L1166)
+[Source](src/commands/group.rs#L1175)
 
 ### `Marmot::update_group_avatar_url`
 
@@ -2203,7 +2203,7 @@ pub async fn update_group_avatar_url( &self, account_ref: String, group_id_hex: 
 
 Set (or clear, with `url = None`) the group's URL-based avatar (`marmot.group.avatar-url.v1`). The URL is validated (https-only, no localhost/private hosts) and normalized before it is committed.
 
-[Source](src/commands/group.rs#L1182)
+[Source](src/commands/group.rs#L1191)
 
 ### `Marmot::replace_encrypted_media_blob_endpoints`
 
@@ -2215,7 +2215,7 @@ pub async fn replace_encrypted_media_blob_endpoints( &self, account_ref: String,
 
 Replace the group's encrypted-media default blob endpoints as a full `marmot.group.encrypted-media.v1` component update. Requires the caller to be an admin.
 
-[Source](src/commands/group.rs#L1201)
+[Source](src/commands/group.rs#L1210)
 
 ### `Marmot::promote_admin`
 
@@ -2227,7 +2227,7 @@ pub async fn promote_admin( &self, account_ref: String, group_id_hex: String, me
 
 Grant admin rights to `member_ref` (npub or hex). Requires the caller to be an admin; publishes a group state update.
 
-[Source](src/commands/group.rs#L1221)
+[Source](src/commands/group.rs#L1230)
 
 ### `Marmot::demote_admin`
 
@@ -2239,7 +2239,7 @@ pub async fn demote_admin( &self, account_ref: String, group_id_hex: String, mem
 
 Revoke `member_ref`'s admin rights.
 
-[Source](src/commands/group.rs#L1240)
+[Source](src/commands/group.rs#L1249)
 
 ### `Marmot::self_demote_admin`
 
@@ -2251,7 +2251,7 @@ pub async fn self_demote_admin( &self, account_ref: String, group_id_hex: String
 
 Step down as an admin of `group_id_hex` (demote the active account).
 
-[Source](src/commands/group.rs#L1259)
+[Source](src/commands/group.rs#L1268)
 
 ### `Marmot::invite_members_detailed`
 
@@ -2263,7 +2263,7 @@ pub async fn invite_members_detailed( &self, account_ref: String, group_id_hex: 
 
 Same as `Self::invite_members`, returning the post-mutation group snapshot.
 
-[Source](src/commands/group.rs#L1278)
+[Source](src/commands/group.rs#L1287)
 
 ### `Marmot::invite_members_detailed_with_initial_admins`
 
@@ -2275,7 +2275,7 @@ pub async fn invite_members_detailed_with_initial_admins( &self, account_ref: St
 
 Same as `Self::invite_members_with_initial_admins`, returning the post-mutation group snapshot.
 
-[Source](src/commands/group.rs#L1295)
+[Source](src/commands/group.rs#L1304)
 
 ### `Marmot::remove_members_detailed`
 
@@ -2287,7 +2287,7 @@ pub async fn remove_members_detailed( &self, account_ref: String, group_id_hex: 
 
 Remove selected members and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1320)
+[Source](src/commands/group.rs#L1329)
 
 ### `Marmot::promote_admin_detailed`
 
@@ -2299,7 +2299,7 @@ pub async fn promote_admin_detailed( &self, account_ref: String, group_id_hex: S
 
 Promote selected members and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1339)
+[Source](src/commands/group.rs#L1348)
 
 ### `Marmot::demote_admin_detailed`
 
@@ -2311,7 +2311,7 @@ pub async fn demote_admin_detailed( &self, account_ref: String, group_id_hex: St
 
 Demote selected administrators and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1358)
+[Source](src/commands/group.rs#L1367)
 
 ### `Marmot::self_demote_admin_detailed`
 
@@ -2323,7 +2323,7 @@ pub async fn self_demote_admin_detailed( &self, account_ref: String, group_id_he
 
 Demote the current account and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1377)
+[Source](src/commands/group.rs#L1386)
 
 ### `Marmot::group_mls_state`
 
@@ -2335,7 +2335,7 @@ pub async fn group_mls_state( &self, account_ref: String, group_id_hex: String, 
 
 Current MLS state (epoch, member count, required components) for the conversation developer/debug view.
 
-[Source](src/commands/group.rs#L1397)
+[Source](src/commands/group.rs#L1406)
 
 ### `Marmot::quarantined_groups`
 
@@ -2347,7 +2347,7 @@ pub async fn quarantined_groups( &self, account_ref: String, ) -> Result<Vec<App
 
 Stored groups that failed session-open hydration and were skipped so the rest of the account could open (mdk#151 / #417). These groups are not in the live roster and otherwise vanish from the account with no explanation; surface them in a per-group recovery flow (mdk#426) distinct from healthy and archived groups, using `reason` to pick the per-reason guidance, and offer `Self::retry_hydrate_quarantined_group`.
 
-[Source](src/commands/group.rs#L1417)
+[Source](src/commands/group.rs#L1426)
 
 ### `Marmot::retry_hydrate_quarantined_group`
 
@@ -2359,7 +2359,7 @@ pub async fn retry_hydrate_quarantined_group( &self, account_ref: String, group_
 
 Re-attempt hydration of a single quarantined group (mdk#426).
 
-[Source](src/commands/group.rs#L1433)
+[Source](src/commands/group.rs#L1442)
 
 ### `Marmot::set_group_archived`
 
@@ -2371,7 +2371,7 @@ pub async fn set_group_archived( &self, account_ref: String, group_id_hex: Strin
 
 Flag a group archived (or restore it). Local-only projection state — it does not change membership or publish anything. The chats list filters archived groups unless `include_archived` is set.
 
-[Source](src/commands/group.rs#L1448)
+[Source](src/commands/group.rs#L1457)
 
 ### `Marmot::group_maintenance_status`
 
@@ -2383,7 +2383,7 @@ pub async fn group_maintenance_status( &self, account_ref: String, group_id_hex:
 
 Inspect maintenance status for a group.
 
-[Source](src/commands/group.rs#L1463)
+[Source](src/commands/group.rs#L1472)
 
 ### `Marmot::key_package_maintenance_status`
 
@@ -2395,7 +2395,7 @@ pub async fn key_package_maintenance_status( &self, account_ref: String, ) -> Re
 
 Inspect account KeyPackage maintenance status.
 
-[Source](src/commands/group.rs#L1476)
+[Source](src/commands/group.rs#L1485)
 
 ### `Marmot::schedule_group_self_update`
 
@@ -2407,7 +2407,7 @@ pub async fn schedule_group_self_update( &self, account_ref: String, group_id_he
 
 Schedule a group self-update.
 
-[Source](src/commands/group.rs#L1487)
+[Source](src/commands/group.rs#L1496)
 
 ### `Marmot::periodic_maintenance_policy`
 
@@ -2419,7 +2419,7 @@ pub async fn periodic_maintenance_policy( &self, account_ref: String, ) -> Resul
 
 Read periodic maintenance policy.
 
-[Source](src/commands/group.rs#L1499)
+[Source](src/commands/group.rs#L1508)
 
 ### `Marmot::set_periodic_maintenance_policy`
 
@@ -2431,7 +2431,7 @@ pub async fn set_periodic_maintenance_policy( &self, account_ref: String, policy
 
 Set periodic maintenance policy.
 
-[Source](src/commands/group.rs#L1510)
+[Source](src/commands/group.rs#L1519)
 
 ### `Marmot::pause_maintenance`
 
@@ -2443,7 +2443,7 @@ pub async fn pause_maintenance(&self, account_ref: String) -> Result<(), MarmotK
 
 Pause maintenance for an account.
 
-[Source](src/commands/group.rs#L1521)
+[Source](src/commands/group.rs#L1530)
 
 ### `Marmot::resume_maintenance`
 
@@ -2455,7 +2455,7 @@ pub async fn resume_maintenance(&self, account_ref: String) -> Result<(), Marmot
 
 Resume maintenance for an account.
 
-[Source](src/commands/group.rs#L1525)
+[Source](src/commands/group.rs#L1534)
 
 ### `Marmot::run_due_maintenance`
 
@@ -2467,7 +2467,7 @@ pub async fn run_due_maintenance( &self, account_ref: String, ) -> Result<Mainte
 
 Run due maintenance for an account.
 
-[Source](src/commands/group.rs#L1529)
+[Source](src/commands/group.rs#L1538)
 
 </details>
 

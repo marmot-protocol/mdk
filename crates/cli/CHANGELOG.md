@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
   with its device group and should be reset and linked again (experimental device-group builds).
+- `wn groups management` reports `requires_self_demote_before_leave` for an admin again, including an admin invitee,
+  and `wn groups leave` and `wn groups decline` refuse an admin until it self-demotes, as in 0.14 (mdk#3014). TUI `L`
+  shows an admin the 0.14 info card again instead of confirming. A `dev-device-groups` build keeps Leave's automatic
+  step-down.
 
 - Keep the newest overlapping TUI timeline refresh for the same chat, including page errors; stale
   completions cannot consume the newer request or apply its subscriptions and followups.

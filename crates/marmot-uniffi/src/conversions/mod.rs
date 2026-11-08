@@ -290,25 +290,29 @@ mod tests {
                 2 => group.self_membership = SelfMembershipFfi::Removed,
                 _ => group.unrecoverable = true,
             }
-            let state = group_management_state_ffi(
-                self_id,
-                &GroupDetailsFfi {
-                    group,
-                    // Retained historical roster is not current mutation authority.
-                    members: vec![member(self_id, true, true)],
-                    mls_state: mls_state(),
-                },
-            );
+            let details = GroupDetailsFfi {
+                group,
+                // Retained historical roster is not current mutation authority.
+                members: vec![member(self_id, true, true)],
+                mls_state: mls_state(),
+            };
+            let state = group_management_state_ffi(self_id, &details, false);
             assert!(!state.can_invite, "inactive scenario {scenario}");
             assert_eq!(state.is_self_admin, matches!(scenario, 0 | 3));
             assert_eq!(state.is_last_admin, matches!(scenario, 0 | 3));
-            assert!(!state.requires_self_demote_before_leave);
+            // Declining a pending invitation is a Leave: an admin invitee
+            // demotes first unless Leave steps it down (mdk#3014 interim).
+            assert_eq!(state.requires_self_demote_before_leave, scenario == 0);
+            assert!(
+                !group_management_state_ffi(self_id, &details, true)
+                    .requires_self_demote_before_leave
+            );
             assert!(!state.can_disband);
         }
     }
 
     #[test]
-    fn group_management_state_leaves_admin_demotion_to_core() {
+    fn group_management_state_asks_the_host_to_demote_without_device_groups() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let mut details = GroupDetailsFfi {
@@ -317,13 +321,14 @@ mod tests {
             mls_state: mls_state(),
         };
 
-        let state = group_management_state_ffi(self_id, &details);
-
+        // Device groups off (mdk#3014 interim): an admin demotes first,
+        // as before 0.15, whether or not another admin remains.
+        let state = group_management_state_ffi(self_id, &details, false);
         assert!(state.is_self_admin);
         assert!(state.is_last_admin);
         assert!(state.can_invite);
         assert!(!state.can_leave);
-        assert!(!state.requires_self_demote_before_leave);
+        assert!(state.requires_self_demote_before_leave);
         let self_action = state
             .member_actions
             .iter()
@@ -339,13 +344,21 @@ mod tests {
         assert!(bob_action.can_remove);
         assert!(bob_action.can_promote);
         assert!(!bob_action.can_demote);
+        // Device groups on: the last admin still cannot leave, but core
+        // performs any eligible demotion (D99).
+        let state = group_management_state_ffi(self_id, &details, true);
+        assert!(!state.can_leave);
+        assert!(!state.requires_self_demote_before_leave);
 
-        // A coadmin may leave directly; core performs the account demotion.
         details.group.admins.push(bob_id.to_owned());
         details.members[1].is_admin = true;
-        let state = group_management_state_ffi(self_id, &details);
+        let state = group_management_state_ffi(self_id, &details, false);
         assert!(state.is_self_admin);
         assert!(!state.is_last_admin);
+        assert!(!state.can_leave);
+        assert!(state.requires_self_demote_before_leave);
+        // A coadmin may leave directly with device groups on.
+        let state = group_management_state_ffi(self_id, &details, true);
         assert!(state.can_leave);
         assert!(!state.requires_self_demote_before_leave);
     }
@@ -360,14 +373,14 @@ mod tests {
             mls_state: mls_state(),
         };
 
-        let snapshot = group_conversation_snapshot_ffi(self_id, details);
+        let snapshot = group_conversation_snapshot_ffi(self_id, details, false);
 
         assert_eq!(snapshot.details.mls_state.epoch, 1);
         assert_eq!(snapshot.details.members.len(), 2);
         assert!(snapshot.management_state.is_self_admin);
         assert!(snapshot.management_state.is_last_admin);
         assert!(!snapshot.management_state.can_leave);
-        assert!(!snapshot.management_state.requires_self_demote_before_leave);
+        assert!(snapshot.management_state.requires_self_demote_before_leave);
         assert_eq!(
             snapshot.management_state.member_actions.len(),
             snapshot.details.members.len()
@@ -378,8 +391,7 @@ mod tests {
     fn group_management_state_suppresses_leave_while_a_request_is_pending() {
         // A non-admin member normally has `can_leave`. Once a leave is durable the
         // engine rejects a second same-epoch request, so the affordance has to go
-        // away. The compatibility demotion flag stays false: core performs
-        // any eligible account demotion rather than asking the host to do it.
+        // away. A non-admin never needs the demotion flag.
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let mut leaving = group(vec![bob_id]);
@@ -391,7 +403,7 @@ mod tests {
             mls_state: mls_state(),
         };
 
-        let state = group_management_state_ffi(self_id, &details);
+        let state = group_management_state_ffi(self_id, &details, false);
 
         assert!(!state.can_leave);
         assert!(!state.requires_self_demote_before_leave);
@@ -404,7 +416,7 @@ mod tests {
             members: details.members,
             mls_state: mls_state(),
         };
-        let state = group_management_state_ffi(self_id, &details);
+        let state = group_management_state_ffi(self_id, &details, false);
         assert!(state.can_leave);
         assert!(!state.leave_request_pending);
         assert_eq!(state.leave_requested_at_ms, None);
@@ -433,6 +445,7 @@ mod tests {
                     members: members.clone(),
                     mls_state: mls,
                 },
+                false,
             );
 
             assert!(!state.can_invite);
@@ -464,6 +477,7 @@ mod tests {
                 members: vec![member(self_id, true, true), member(bob_id, false, false)],
                 mls_state: disabled.clone(),
             },
+            false,
         );
         assert!(state.can_enable_disbanding);
         assert!(!state.can_disband);
@@ -476,6 +490,7 @@ mod tests {
                 members: vec![member(self_id, true, true), member(bob_id, false, false)],
                 mls_state: disabled,
             },
+            false,
         );
         assert!(!state.can_enable_disbanding);
         assert!(!state.can_disband);
@@ -488,6 +503,7 @@ mod tests {
                 members: vec![member(self_id, true, true), member(bob_id, false, false)],
                 mls_state: mls_state(),
             },
+            false,
         );
         assert!(!state.can_enable_disbanding);
         assert!(state.can_disband);
@@ -499,6 +515,7 @@ mod tests {
                 members: vec![member(self_id, false, true), member(bob_id, true, false)],
                 mls_state: mls_state(),
             },
+            false,
         );
         assert!(!state.can_enable_disbanding);
         assert!(!state.can_disband);
@@ -777,7 +794,7 @@ mod tests {
             mls_state: mls_state(),
         };
 
-        let state = group_management_state_ffi(self_id, &details);
+        let state = group_management_state_ffi(self_id, &details, false);
 
         assert!(state.is_self_admin);
         assert!(!state.is_last_admin);
@@ -801,7 +818,7 @@ mod tests {
             mls_state: mls_state(),
         };
 
-        let state = group_management_state_ffi(self_id, &details);
+        let state = group_management_state_ffi(self_id, &details, false);
 
         assert!(!state.is_self_admin);
         assert!(!state.is_last_admin);

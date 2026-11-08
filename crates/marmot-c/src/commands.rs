@@ -728,8 +728,9 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_remove_members(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotSendSummary) = remove_members;
 
-    /// Leave as the active account, including matching linked copies. Core demotes eligible admins; the last admin is refused.
-    /// Failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
+    /// Leave as the active account. An admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until
+    /// `marmot_self_demote_admin`; with experimental device groups core demotes eligible admins, leaves matching linked
+    /// copies and refuses the last admin. Free with `marmot_send_summary_free`.
     async fn marmot_leave_group(account_ref: str, group_id_hex: str) -> rec(MarmotSendSummary) = leave_group;
 
     /// Delete this group's local app data without an MLS leave. Cancel
@@ -998,8 +999,10 @@ c_cmd! {
     async fn marmot_accept_group_invite(account_ref: str, group_id_hex: str) -> rec(MarmotAppGroupRecord) = accept_group_invite;
 
     /// Decline a pending group invite; writes the updated group record
-    /// plus the decline publish summary. Free with
-    /// `marmot_group_invite_decline_result_free`.
+    /// plus the decline publish summary. An invitee the invite made an admin
+    /// fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until
+    /// `marmot_self_demote_admin`, unless experimental device groups are on.
+    /// Free with `marmot_group_invite_decline_result_free`.
     async fn marmot_decline_group_invite(account_ref: str, group_id_hex: str) -> rec(MarmotGroupInviteDeclineResult) = decline_group_invite;
 
     /// Update the group's name and/or description. NULL leaves a field

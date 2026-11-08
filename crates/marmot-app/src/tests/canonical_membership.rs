@@ -557,6 +557,7 @@ fn can_send(client: &AppClient, group: &GroupId) -> bool {
         disbanding: authority.disbanding,
         disbanding_enabled: facts.disbanding_enabled,
         has_disbanding_blockers: facts.has_disbanding_blockers,
+        admin_leave_steps_down: client.app.admin_leave_steps_down(),
     }
     .capabilities()
     .can_send

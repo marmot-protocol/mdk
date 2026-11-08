@@ -1968,22 +1968,29 @@ impl TuiApp {
         });
     }
 
-    /// Confirm before invoking the authoritative Leave command. Core owns
-    /// eligible account demotion and the last-admin refusal.
+    /// Confirm before invoking the authoritative Leave command, or explain why
+    /// an admin cannot leave yet (`leave_group_decision`). The CLI turns
+    /// device groups on exactly in a `dev-device-groups` build, and only there
+    /// does Leave step an admin down itself.
     fn open_leave_group_popup(&mut self) {
         let Some(view) = &self.group_detail else {
             return;
         };
-        self.popup = Some(Popup::Confirm {
-            purpose: ConfirmPurpose::LeaveGroup {
-                group_id: view.group_id.clone(),
+        self.popup = Some(
+            match leave_group_decision(view, cfg!(feature = "dev-device-groups")) {
+                LeaveDecision::Blocked(message) => Popup::info(CANNOT_LEAVE_TITLE, message),
+                LeaveDecision::Confirm => Popup::Confirm {
+                    purpose: ConfirmPurpose::LeaveGroup {
+                        group_id: view.group_id.clone(),
+                    },
+                    title: "Leave Group".to_owned(),
+                    body: vec![format!(
+                        "Leave {}?",
+                        shorten(&terminal_safe_text(&view.name), 24)
+                    )],
+                },
             },
-            title: "Leave Group".to_owned(),
-            body: vec![format!(
-                "Leave {}?",
-                shorten(&terminal_safe_text(&view.name), 24)
-            )],
-        });
+        );
     }
 
     /// Arm the logout popup for the currently selected account, scaling the guard

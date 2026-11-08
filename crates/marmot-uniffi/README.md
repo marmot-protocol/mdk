@@ -1096,9 +1096,11 @@ Leave without replacing the retained winner. Invitation decisions use the existi
 controlled host test builds use the explicit constructor described above. Custom experimental peers must update together before using
 V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
 
-User Leave automatically demotes a nonlast active admin account before SelfRemove. The last active admin account is
-refused on all its devices before any new choice or departure publication. `can_leave` includes eligible admin Leave;
-`requires_self_demote_before_leave` remains in the DTO and is false because core performs that step. The coarse
+An admin account's Leave, and its Decline of an invitation that made it an admin, return `AdminCannotSelfRemove` before
+anything is written or sent: when `requires_self_demote_before_leave` is true, call `self_demote_admin` first and then
+Leave or Decline; a last admin first makes another member an admin. With experimental device groups on, User Leave instead demotes a nonlast active admin account
+itself before SelfRemove, `can_leave` includes that Leave and `requires_self_demote_before_leave` is false; the last
+active admin account is refused on all its devices before any new choice or departure publication. The coarse
 chat-list Leave action opens the authoritative command and need not imply last-admin eligibility. Sign-out stays
 leaf-only and does not demote the account. A recorded Decline remains if a later eligibility check refuses departure;
 a committed demotion remains if the following Leave fails. Already admitted native work retains its ordinary retry

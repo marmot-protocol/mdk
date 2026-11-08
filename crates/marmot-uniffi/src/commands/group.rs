@@ -184,7 +184,11 @@ pub(crate) async fn group_conversation_snapshot_for(
             .await?;
         let my_account_id_hex = snapshot.my_account_id_hex.clone();
         let details = group_details_from_conversation_snapshot_ffi(snapshot)?;
-        Ok(group_conversation_snapshot_ffi(&my_account_id_hex, details))
+        Ok(group_conversation_snapshot_ffi(
+            &my_account_id_hex,
+            details,
+            kit.app.admin_leave_steps_down(),
+        ))
     }
     .await;
     kit.runtime
@@ -203,6 +207,7 @@ pub(crate) async fn group_management_state_for(
     Ok(group_management_state_ffi(
         &account.account_id_hex,
         &details,
+        kit.app.admin_leave_steps_down(),
     ))
 }
 
@@ -215,7 +220,11 @@ pub(crate) async fn group_mutation_result_for(
 ) -> Result<GroupMutationResultFfi, MarmotKitError> {
     let account = kit.runtime.accounts().resolve(account_ref)?;
     let details = group_details_for(kit, account_ref, group_id).await?;
-    let management_state = group_management_state_ffi(&account.account_id_hex, &details);
+    let management_state = group_management_state_ffi(
+        &account.account_id_hex,
+        &details,
+        kit.app.admin_leave_steps_down(),
+    );
     Ok(GroupMutationResultFfi {
         summary,
         details,
@@ -1886,6 +1895,7 @@ mod tests {
             disbanding: false,
             disbanding_enabled: true,
             has_disbanding_blockers: false,
+            admin_leave_steps_down: false,
         };
         let capabilities = authority.capabilities();
         GroupManagementStateFfi {
@@ -1982,6 +1992,20 @@ mod tests {
             Err(MarmotKitError::LeaveAlreadyRequested { group_id_hex })
                 if group_id_hex == GROUP_ID
         ));
+    }
+
+    /// Without device groups an admin demotes before Leave, as before 0.15
+    /// (mdk#3014 interim); the preflight refuses before any command runs.
+    #[test]
+    fn leave_preflight_asks_an_admin_to_demote_first() {
+        for other_admin in [false, true] {
+            assert!(matches!(
+                ensure_can_request_leave(&state(true, other_admin, false), GROUP_ID),
+                Err(MarmotKitError::AdminCannotSelfRemove { group_id_hex })
+                    if group_id_hex == GROUP_ID
+            ));
+        }
+        assert!(ensure_can_request_leave(&state(false, true, false), GROUP_ID).is_ok());
     }
 
     #[test]

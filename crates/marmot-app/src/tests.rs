@@ -4664,6 +4664,179 @@ async fn failed_leave_push_compensation_body() {
     runtime.shutdown().await;
 }
 
+/// Without device groups an admin's Leave is refused as before 0.15, even
+/// with another admin: before any push token removal, durable leave request,
+/// `Left` projection or publication. After the host demotes the account,
+/// Leave goes through (mdk#3014 interim).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_leave_without_device_groups_waits_for_the_host_demotion() {
+    use cgka_traits::storage::LeaveRequestStorage as _;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    assert!(!app.admin_leave_steps_down());
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    bob_app
+        .client("bob")
+        .await
+        .unwrap()
+        .publish_key_package()
+        .await
+        .unwrap();
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let mut alice = app.client("alice").await.unwrap();
+    let solo = alice.create_group("solo", &[]).await.unwrap();
+    let group_id = alice.create_group("coadmins", &[&bob_id]).await.unwrap();
+    alice.promote_admin(&group_id, &bob_id).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    // A shared token would be withdrawn before a departure: a refusal after
+    // that withdrawal publishes it.
+    app.set_native_push_enabled("alice", true).unwrap();
+    let server = nostr::prelude::Keys::generate().public_key().to_hex();
+    alice
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "opaque-token", &server, None)
+        .await
+        .unwrap();
+    assert_eq!(app.group_push_tokens("alice", &group_hex).unwrap().len(), 1);
+    let store = app.account_storage("alice").unwrap();
+    let published = relay.published_events.lock().unwrap().len();
+
+    // The last admin gets the same refusal as a coadmin.
+    for group in [&solo, &group_id] {
+        let refused = alice.leave_group(group).await.unwrap_err();
+        assert!(
+            matches!(
+                refused.as_engine_error(),
+                Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+            ),
+            "{refused}"
+        );
+        assert!(store.leave_request(group).unwrap().is_none());
+        assert_eq!(
+            app.group("alice", &hex::encode(group.as_slice()))
+                .unwrap()
+                .unwrap()
+                .self_membership,
+            SelfMembership::Member
+        );
+    }
+    assert!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(app.group_push_tokens("alice", &group_hex).unwrap().len(), 1);
+    assert_eq!(
+        relay.published_events.lock().unwrap().len(),
+        published,
+        "no token removal, step-down or departure goes out"
+    );
+
+    alice.self_demote_admin(&group_id).await.unwrap();
+    alice.leave_group(&group_id).await.unwrap();
+    assert!(store.leave_request(&group_id).unwrap().is_some());
+    assert_eq!(
+        app.group("alice", &group_hex)
+            .unwrap()
+            .unwrap()
+            .self_membership,
+        SelfMembership::Left
+    );
+}
+
+/// Declining an invitation is a Leave: without device groups an invitee made
+/// an admin by the invite is refused the same way, with the invitation still
+/// pending, until it demotes itself (mdk#3014 interim).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_invitee_without_device_groups_demotes_before_declining() {
+    use cgka_traits::storage::LeaveRequestStorage as _;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    assert!(!app.admin_leave_steps_down());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group_with_options(
+            "Invite",
+            &[&bob.account_id_hex],
+            AppCreateGroupOptions {
+                initial_admins: vec![bob.account_id_hex.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+    let group_hex = hex::encode(group_id.as_slice());
+    assert!(
+        app.group("bob", &group_hex)
+            .unwrap()
+            .unwrap()
+            .pending_confirmation
+    );
+    let store = app.account_storage("bob").unwrap();
+    let published = relay.published_events.lock().unwrap().len();
+
+    let refused = bob_client
+        .decline_group_invite(&group_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.as_engine_error(),
+            Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+        ),
+        "{refused}"
+    );
+    assert!(store.leave_request(&group_id).unwrap().is_none());
+    let pending = app.group("bob", &group_hex).unwrap().unwrap();
+    assert!(pending.pending_confirmation);
+    assert_eq!(pending.self_membership, SelfMembership::Member);
+    assert_eq!(relay.published_events.lock().unwrap().len(), published);
+
+    bob_client.self_demote_admin(&group_id).await.unwrap();
+    bob_client.decline_group_invite(&group_id).await.unwrap();
+    assert!(store.leave_request(&group_id).unwrap().is_some());
+    assert_eq!(
+        app.group("bob", &group_hex)
+            .unwrap()
+            .unwrap()
+            .self_membership,
+        SelfMembership::Left
+    );
+}
+
 #[test]
 fn sole_admin_self_demote_surfaces_the_admin_policy_refusal() {
     run_composed_app_runtime_test("sole-admin-self-demote", || async {

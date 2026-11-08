@@ -8,6 +8,12 @@
   only while the device is caught up, restarting after more than 24 hours without. A marked device that runs clears its
   own mark. `DeviceLinkSnapshot` gains `device_group_stalled`: this device can no longer catch up with its device
   group and should be offered `reset_device_group_for_repair`. Additive.
+- An admin account's User Leave, including declining an invitation that made it an admin, is refused with
+  `AdminCannotSelfRemove` before anything is written or sent, until the host demotes it (`self_demote_admin`), as in
+  0.14 (mdk#3014). Only with experimental device groups on does Leave take a nonlast admin account off the admin
+  list itself before its SelfRemove, refusing the last admin on every device (mdk#2628 D99, #2925). `ConversationAuthority` gains `admin_leave_steps_down`, filled from the new
+  `MarmotApp::admin_leave_steps_down`; struct literals need the field. Without it, `requires_self_demote_before_leave`
+  is true for an admin and `can_leave` false, as in 0.14.
 
 - Emoji set image downloads are bound to the version the user was shown (breaking; the emoji set API has not
   shipped). `install_emoji_set` takes `expected_event_id_hex` and an `&EmojiSetInstallControl`;

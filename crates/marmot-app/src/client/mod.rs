@@ -3640,11 +3640,7 @@ impl AppClient {
         reason: AccountLeaveReason<'_>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        let initially_admin = if matches!(reason, AccountLeaveReason::SignOut) {
-            false
-        } else {
-            self.account_leave_needs_demotion(group_id)?
-        };
+        let initially_admin = self.leave_steps_admin_down(group_id, reason)?;
         if initially_admin {
             self.ensure_group_change_admitted(group_id)?;
         }
@@ -3691,10 +3687,7 @@ impl AppClient {
             {
                 return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
             }
-            if !matches!(reason, AccountLeaveReason::SignOut)
-                && self.account_leave_needs_demotion(group_id)?
-                && !initially_admin
-            {
+            if !initially_admin && self.leave_steps_admin_down(group_id, reason)? {
                 self.ensure_group_change_admitted(group_id)?;
                 Box::pin(self.demote_admitted_account_for_leave(
                     group_id,

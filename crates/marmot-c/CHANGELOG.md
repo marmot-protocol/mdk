@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - `MarmotDeviceLinkSnapshot` appends `device_group_stalled` (`bool`): this device can no longer catch up with its
   device group; offer `marmot_reset_device_group_for_repair`. Rebuild against the matching header and library.
+- An admin's `marmot_leave_group`, and an admin invitee's `marmot_decline_group_invite`, fail with
+  `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until `marmot_self_demote_admin`, and management state reports
+  `requires_self_demote_before_leave` for them, as in 0.14 (mdk#3014). Only the experimental device-groups
+  constructor makes Leave demote a nonlast admin account itself. No ABI change.
 
 - Emoji set changes (breaking; the emoji set ABI has not shipped). `marmot_install_emoji_set` takes
   `expected_event_id_hex` and a `MarmotEmojiSetInstallControl` (`marmot_emoji_set_install_control_new`, `_cancel`,
