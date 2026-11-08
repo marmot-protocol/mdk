@@ -402,14 +402,19 @@ pub struct GroupManagementStateFfi {
     pub is_self_admin: bool,
     pub is_last_admin: bool,
     pub can_invite: bool,
-    /// Whether to offer Leave in the selected state. Core demotes an eligible
-    /// nonlast admin account before departure; hosts need no prior self-demotion.
-    /// False for the last admin, a pending Leave or invitation, inactive
-    /// membership, or a disbanding/disbanded/unrecoverable group. The command
-    /// rechecks current policy and membership before acting.
+    /// Whether to offer Leave in the selected state. False for an admin
+    /// (demote first, see `requires_self_demote_before_leave`), a pending
+    /// Leave or invitation, inactive membership, or a
+    /// disbanding/disbanded/unrecoverable group. With experimental device
+    /// groups on, core demotes an eligible nonlast admin account itself, so
+    /// such an admin may leave directly. The command rechecks current policy
+    /// and membership before acting.
     pub can_leave: bool,
-    /// Compatibility field, always false: core performs any eligible account
-    /// demotion during User Leave. A last admin still has `can_leave == false`.
+    /// Whether an admin must demote itself (`self_demote_admin`) before
+    /// Leave, which otherwise returns `AdminCannotSelfRemove`. A last admin
+    /// first makes another member an admin. False while experimental device
+    /// groups are on (core demotes), and when disbanding or a terminal
+    /// lifecycle hides ordinary actions.
     pub requires_self_demote_before_leave: bool,
     /// A leave is already in flight for this group; `Marmot::leave_group` would
     /// return `MarmotKitError::LeaveAlreadyRequested`. Render progress rather
@@ -581,6 +586,7 @@ pub(crate) fn group_roster_ffi(roster: AppGroupRoster) -> Result<GroupRosterFfi,
 pub(crate) fn group_management_state_ffi(
     my_account_id_hex: &str,
     details: &GroupDetailsFfi,
+    admin_leave_steps_down: bool,
 ) -> GroupManagementStateFfi {
     let admin_count = details
         .members
@@ -615,6 +621,7 @@ pub(crate) fn group_management_state_ffi(
         disbanding: details.mls_state.disbanding,
         disbanding_enabled: details.mls_state.disbanding_enabled,
         has_disbanding_blockers: !details.mls_state.disbanding_blockers.is_empty(),
+        admin_leave_steps_down,
     };
     let capabilities = authority.capabilities();
     let member_actions = details
@@ -655,8 +662,10 @@ pub(crate) fn group_management_state_ffi(
 pub(crate) fn group_conversation_snapshot_ffi(
     my_account_id_hex: &str,
     details: GroupDetailsFfi,
+    admin_leave_steps_down: bool,
 ) -> GroupConversationSnapshotFfi {
-    let management_state = group_management_state_ffi(my_account_id_hex, &details);
+    let management_state =
+        group_management_state_ffi(my_account_id_hex, &details, admin_leave_steps_down);
     GroupConversationSnapshotFfi {
         details,
         management_state,
@@ -1083,13 +1092,13 @@ mod group_state_tests {
             details.mls_state.lifecycle_state,
             GroupLifecycleStateFfi::Stable
         );
-        assert!(group_management_state_ffi(self_id, &details).can_disband);
+        assert!(group_management_state_ffi(self_id, &details, false).can_disband);
 
         // Only lifecycle is overlaid: staging can leave this same active
         // roster/requirements at PendingPublish. This tests the reverse FFI
         // choice, not an emitted pending-publication transition.
         details.mls_state.lifecycle_state = GroupLifecycleStateFfi::PendingPublish;
-        let pending = group_management_state_ffi(self_id, &details);
+        let pending = group_management_state_ffi(self_id, &details, false);
         assert_eq!(
             pending.lifecycle_state,
             GroupLifecycleStateFfi::PendingPublish
@@ -1109,7 +1118,7 @@ mod group_state_tests {
             // only the always-compiled membership reader on the emitted chat
             // snapshot. A remaining device keeps this account row/admin role;
             // this does not perform the native roster-based removal journey.
-            let active = group_management_state_ffi(self_id, &details);
+            let active = group_management_state_ffi(self_id, &details, false);
             assert_eq!(
                 (active.can_invite, active.is_self_admin, active.can_disband),
                 (true, true, true)
@@ -1119,7 +1128,7 @@ mod group_state_tests {
                 details.group.self_membership,
                 SelfMembershipFfi::DeviceRemoved
             ));
-            let removed = group_management_state_ffi(self_id, &details);
+            let removed = group_management_state_ffi(self_id, &details, false);
             assert_eq!(
                 (
                     removed.can_invite,

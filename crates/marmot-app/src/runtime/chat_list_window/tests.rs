@@ -1638,6 +1638,7 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
                                 disbanding,
                                 disbanding_enabled: false,
                                 has_disbanding_blockers: false,
+                                admin_leave_steps_down: false,
                             };
                             let capabilities = authority.capabilities();
                             assert_eq!(
@@ -1675,6 +1676,7 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
             disbanding: false,
             disbanding_enabled: false,
             has_disbanding_blockers: false,
+            admin_leave_steps_down: false,
         }
         .capabilities();
         assert_eq!(capabilities.participation, participation);

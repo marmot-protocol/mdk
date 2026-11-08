@@ -11,6 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
   with its device group and should be reset and linked again (experimental device-group builds).
+- `wn groups management` reports `requires_self_demote_before_leave` for an admin again and `wn groups leave` refuses
+  an admin until it self-demotes, as in 0.14 (mdk#3014); a `dev-device-groups` build keeps Leave's automatic step-down.
 
 - Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
   retained panes under a different account's list. Start the adopted account's live feed even when its page

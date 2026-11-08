@@ -9930,7 +9930,11 @@ fn groups_recovery_quarantine_welcome_and_management_inspection_have_stable_cont
     assert_eq!(alice_management["is_last_admin"], true);
     assert_eq!(alice_management["can_invite"], true);
     assert_eq!(alice_management["can_leave"], false);
-    assert_eq!(alice_management["requires_self_demote_before_leave"], false);
+    // Leave steps an admin down itself only with device groups (mdk#3014).
+    assert_eq!(
+        alice_management["requires_self_demote_before_leave"],
+        !cfg!(feature = "dev-device-groups")
+    );
     assert_eq!(alice_management["lifecycle_state"], "stable");
     assert_eq!(alice_management["disbanding"], false);
     assert_eq!(

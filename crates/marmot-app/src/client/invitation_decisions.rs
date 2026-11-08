@@ -79,6 +79,44 @@ impl AppClient {
         Ok(is_admin)
     }
 
+    /// Whether this Leave first takes its account off the admin list (D99).
+    /// Sign-out never does. With device groups off an admin's Leave is
+    /// refused here, before any choice, push token removal or departure, as
+    /// before 0.15: the host demotes first (mdk#3014 interim).
+    pub(super) fn leave_steps_admin_down(
+        &self,
+        group_id: &GroupId,
+        reason: AccountLeaveReason<'_>,
+    ) -> Result<bool, AppError> {
+        if matches!(reason, AccountLeaveReason::SignOut) {
+            return Ok(false);
+        }
+        let needs_demotion = self.account_leave_needs_demotion(group_id);
+        if self.app.admin_leave_steps_down() {
+            return needs_demotion;
+        }
+        let admin = match needs_demotion {
+            Ok(admin) => admin,
+            Err(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::AdminDepletion { .. })
+                ) =>
+            {
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        if admin {
+            return Err(AppError::from(marmot_session::SessionError::Engine(
+                EngineError::AdminCannotSelfRemove {
+                    group_id: group_id.clone(),
+                },
+            )));
+        }
+        Ok(false)
+    }
+
     /// Ordinary UserLeave includes an already accepted current copy. Unknown
     /// identity/trust and a held MAX leave ordinary leaf departure independent.
     pub(super) fn record_user_leave_decision(

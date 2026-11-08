@@ -2866,7 +2866,7 @@ Local-storage KeyPackage inventory with typed durable provenance. Synchronous SQ
 MarmotStatus marmot_leave_group(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotSendSummary **out);
 ```
 
-Leave as the active account, including matching linked copies. Core demotes eligible admins; the last admin is refused. Failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
+Leave as the active account. An admin fails with `MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE` until `marmot_self_demote_admin`; with experimental device groups core demotes eligible admins, leaves matching linked copies and refuses the last admin, and failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotleave_group) · [Header contract](include/marmot.h#L8566)
 

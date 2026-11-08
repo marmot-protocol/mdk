@@ -2930,7 +2930,7 @@ typedef struct MarmotGroupManagementState {
    */
   bool can_leave;
   /**
-   * Compatibility field, always false; core demotes eligible admins and refuses the last admin.
+   * Whether an admin must self-demote before Leave; false with experimental device groups on.
    */
   bool requires_self_demote_before_leave;
   /**
@@ -8554,8 +8554,8 @@ MarmotStatus marmot_remove_members(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
- * Leave as the active account, including matching linked copies. Core demotes eligible admins; the last admin is refused.
- * Failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
+ * Leave as the active account. An admin self-demotes first; with experimental device groups core demotes eligible
+ * admins and leaves matching linked copies. The last admin is refused. Free with `marmot_send_summary_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

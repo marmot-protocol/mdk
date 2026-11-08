@@ -1050,7 +1050,13 @@ async fn groups_command_once(
                 .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
             let members = runtime.group_members(&account.label, &group_id).await?;
             let mls = runtime.group_mls_state(&account.label, &group_id).await?;
-            let mut json = group_management_json(&account.account_id_hex, &group, &members, &mls);
+            let mut json = group_management_json(
+                &account.account_id_hex,
+                &group,
+                &members,
+                &mls,
+                app.admin_leave_steps_down(),
+            );
             insert_account_fields(&mut json, &account)?;
             Ok(CommandOutput {
                 plain: format!(
@@ -1655,6 +1661,7 @@ fn group_management_json(
     group: &AppGroupRecord,
     members: &[AppGroupMemberRecord],
     mls: &AppGroupMlsState,
+    admin_leave_steps_down: bool,
 ) -> Value {
     let admins = &group.admin_policy.admins;
     let is_admin = |member_id_hex: &str| admins.iter().any(|admin| admin == member_id_hex);
@@ -1685,6 +1692,7 @@ fn group_management_json(
         disbanding: mls.disbanding,
         disbanding_enabled: mls.disbanding_enabled,
         has_disbanding_blockers: !mls.disbanding_blockers.is_empty(),
+        admin_leave_steps_down,
     }
     .capabilities();
     let stable = matches!(mls.lifecycle_state, AppGroupLifecycleState::Stable);
@@ -2207,7 +2215,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut mls = sample_mls(&group);
-        let state = group_management_json(&me, &group, &members, &mls);
+        let state = group_management_json(&me, &group, &members, &mls, false);
         assert_eq!(state["is_last_admin"], false);
         assert_eq!(
             state["member_actions"],
@@ -2217,26 +2225,29 @@ mod tests {
                 {"member_id":member,"is_self":false,"is_admin":false,"can_remove":true,"can_promote":true,"can_demote":false},
             ])
         );
-        let peer_view = group_management_json(&member, &group, &members, &mls);
+        let peer_view = group_management_json(&member, &group, &members, &mls, false);
         assert_eq!(peer_view["can_leave"], true);
         group.leave_requested_at_ms = Some(19);
-        let pending = group_management_json(&member, &group, &members, &mls);
+        let pending = group_management_json(&member, &group, &members, &mls, false);
         assert_eq!(pending["can_leave"], false);
         assert_eq!(pending["leave_request_pending"], true);
         assert_eq!(pending["leave_requested_at_ms"], 19);
         group.leave_requested_at_ms = None;
         group.admin_policy.admins = vec![me.clone()];
-        let last = group_management_json(&me, &group, &members, &mls);
+        let last = group_management_json(&me, &group, &members, &mls, false);
         assert_eq!(last["is_last_admin"], true);
+        // Without device groups the host demotes an admin before Leave.
+        assert_eq!(last["can_leave"], false);
+        assert_eq!(last["requires_self_demote_before_leave"], true);
         assert_eq!(last["can_enable_disbanding"], true);
         assert_eq!(last["can_disband"], false);
         mls.disbanding_blockers = vec![peer.clone()];
-        let blocked = group_management_json(&me, &group, &members, &mls);
+        let blocked = group_management_json(&me, &group, &members, &mls, false);
         assert_eq!(blocked["can_enable_disbanding"], false);
         assert_eq!(blocked["disbanding_blockers"], json!([peer]));
         mls.disbanding_enabled = true;
         assert_eq!(
-            group_management_json(&me, &group, &members, &mls)["can_disband"],
+            group_management_json(&me, &group, &members, &mls, false)["can_disband"],
             true
         );
         for terminal in [false, true] {
@@ -2246,7 +2257,7 @@ mod tests {
             } else {
                 AppGroupLifecycleState::Stable
             };
-            let state = group_management_json(&me, &group, &members, &mls);
+            let state = group_management_json(&me, &group, &members, &mls, false);
             for flag in [
                 "can_invite",
                 "can_leave",
@@ -2295,45 +2306,51 @@ mod tests {
         assert!(!group.pending_confirmation);
         assert_eq!(group.self_membership, marmot_app::SelfMembership::Member);
         group.admin_policy.admins.push(peer.clone());
-        let coadmin = group_management_json(&me, &group, &members, &mls);
+        let coadmin = group_management_json(&me, &group, &members, &mls, true);
         assert_eq!(coadmin["can_leave"], true);
         assert_eq!(coadmin["requires_self_demote_before_leave"], false);
 
         group.pending_confirmation = true;
-        let pending = group_management_json(&me, &group, &members, &mls);
+        let pending = group_management_json(&me, &group, &members, &mls, true);
         assert_eq!(pending["can_leave"], false);
         assert_eq!(pending["requires_self_demote_before_leave"], false);
         group.pending_confirmation = false;
-        assert_eq!(group_management_json(&me, &group, &members, &mls), coadmin);
+        assert_eq!(
+            group_management_json(&me, &group, &members, &mls, true),
+            coadmin
+        );
 
         group.unrecoverable = true;
-        let unrecoverable = group_management_json(&me, &group, &members, &mls);
+        let unrecoverable = group_management_json(&me, &group, &members, &mls, true);
         assert_eq!(unrecoverable["can_leave"], false);
         assert_eq!(unrecoverable["requires_self_demote_before_leave"], false);
         group.unrecoverable = false;
-        assert_eq!(group_management_json(&me, &group, &members, &mls), coadmin);
+        assert_eq!(
+            group_management_json(&me, &group, &members, &mls, true),
+            coadmin
+        );
 
         group.leave_requested_at_ms = Some(1);
         assert_eq!(
-            group_management_json(&me, &group, &members, &mls)["can_leave"],
+            group_management_json(&me, &group, &members, &mls, true)["can_leave"],
             false
         );
         group.leave_requested_at_ms = None;
 
         group.admin_policy.admins = vec![peer.clone()];
-        let nonadmin = group_management_json(&me, &group, &members, &mls);
+        let nonadmin = group_management_json(&me, &group, &members, &mls, true);
         assert_eq!(nonadmin["can_leave"], true);
         assert_eq!(nonadmin["requires_self_demote_before_leave"], false);
 
         group.admin_policy.admins = vec![me.clone()];
-        let member = group_management_json(&me, &group, &members, &mls);
+        let member = group_management_json(&me, &group, &members, &mls, true);
         assert_eq!(member["is_self_admin"], true);
         assert_eq!(member["can_invite"], true);
         assert_eq!(member["can_leave"], false);
         assert_eq!(member["requires_self_demote_before_leave"], false);
 
         group.self_membership = marmot_app::SelfMembership::Removed;
-        let removed = group_management_json(&me, &group, &members, &mls);
+        let removed = group_management_json(&me, &group, &members, &mls, true);
         for flag in [
             "is_self_admin",
             "can_invite",

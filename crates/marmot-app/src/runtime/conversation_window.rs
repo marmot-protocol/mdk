@@ -818,6 +818,7 @@ impl Reader {
                             disbanding: authority.disbanding,
                             disbanding_enabled: facts.disbanding_enabled,
                             has_disbanding_blockers: facts.has_disbanding_blockers,
+                            admin_leave_steps_down: app.admin_leave_steps_down(),
                         },
                     }
                 } else {
@@ -844,6 +845,7 @@ impl Reader {
                             disbanding: false,
                             disbanding_enabled: false,
                             has_disbanding_blockers: false,
+                            admin_leave_steps_down: app.admin_leave_steps_down(),
                         },
                     }
                 };
