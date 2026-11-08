@@ -20,10 +20,18 @@ impl Drop for BracketedPasteGuard {
 /// Status authority is separate from model/result admission. Every foreground
 /// feedback write creates a revision; asynchronous continuations retain the
 /// revision they were issued under. Retained feedback blocks ambient notices.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum StatusScope {
+    #[default]
+    Foreground,
+    /// None carries model/resource work without authority over foreground feedback.
+    Completion(Option<u64>),
+}
+
 #[derive(Default)]
 pub(crate) struct StatusOwnership {
     pub(crate) revision: u64,
-    pub(super) completion: Option<u64>,
+    pub(super) scope: StatusScope,
     pub(super) retained: bool,
 }
 
@@ -111,9 +119,9 @@ pub(crate) struct TuiApp {
     pub(crate) streaming: Option<StreamComposer>,
     pub(crate) status: String,
     pub(crate) status_ownership: StatusOwnership,
-    pub(crate) flick_status_owner: u64,
-    pub(crate) stream_status_owner: u64,
-    pub(crate) daemon_start_status_owner: u64,
+    pub(crate) flick_status_owner: Option<u64>,
+    pub(crate) stream_status_owner: Option<u64>,
+    pub(crate) daemon_start_status_owner: Option<u64>,
     /// The one open modal, or none. While set it captures every key (routed at
     /// the top of `handle_key`) and overlays whatever screen is showing.
     pub(crate) popup: Option<Popup>,
@@ -186,37 +194,41 @@ impl TuiApp {
             .revision
             .checked_add(1)
             .expect("status revision exhausted");
-        if self.status_ownership.completion.is_some() {
-            self.status_ownership.completion = Some(self.status_ownership.revision);
+        if matches!(self.status_ownership.scope, StatusScope::Completion(_)) {
+            self.status_ownership.scope =
+                StatusScope::Completion(Some(self.status_ownership.revision));
         }
         self.status_ownership.retained = !status.is_empty();
         self.status = status;
     }
 
     pub(super) fn status_is_owned(&self) -> bool {
-        self.status_ownership
-            .completion
-            .is_none_or(|owner| owner == self.status_ownership.revision)
+        match self.status_ownership.scope {
+            StatusScope::Foreground => true,
+            StatusScope::Completion(owner) => owner == Some(self.status_ownership.revision),
+        }
     }
 
     pub(super) fn with_status_owner<R>(
         &mut self,
-        owner: u64,
+        owner: Option<u64>,
         fold: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let previous = self.status_ownership.completion.replace(owner);
+        let previous = std::mem::replace(
+            &mut self.status_ownership.scope,
+            StatusScope::Completion(owner),
+        );
         let result = fold(self);
-        self.status_ownership.completion = previous;
+        self.status_ownership.scope = previous;
         result
     }
 
     pub(super) fn enqueue_effect(&self, effect: Effect) {
-        // Inherit even a stale completion's claim: nested work cannot promote
-        // itself into a newer foreground action.
-        let owner = self
-            .status_ownership
-            .completion
-            .unwrap_or(self.status_ownership.revision);
+        // Preserve absent or stale authority through causal child work.
+        let owner = match self.status_ownership.scope {
+            StatusScope::Foreground => Some(self.status_ownership.revision),
+            StatusScope::Completion(owner) => owner,
+        };
         self.effects.enqueue(effect, owner);
     }
 
@@ -266,9 +278,9 @@ impl TuiApp {
             streaming: None,
             status: "loading accounts".to_owned(),
             status_ownership: StatusOwnership::default(),
-            flick_status_owner: 0,
-            stream_status_owner: 0,
-            daemon_start_status_owner: 0,
+            flick_status_owner: None,
+            stream_status_owner: None,
+            daemon_start_status_owner: None,
             popup: None,
             pending_full_repaint: false,
             group_detail: None,
@@ -303,9 +315,8 @@ impl TuiApp {
         let result = (|| -> TuiResult<()> {
             let _ = self.refresh_daemon_status();
             self.start()?;
-            // After the startup routing so the auto-start status is what the
-            // first frame shows, and so its enqueued effect runs behind any
-            // initial loads instead of delaying them on the FIFO worker.
+            // Startup launches independently of the FIFO worker. Its feedback
+            // is ambient, preserving any initial load or onboarding prompt.
             self.autostart_daemon_if_needed(std::env::var("WN_RELAY").ok());
             let mut dirty = true;
             while self.running {
@@ -374,7 +385,7 @@ impl TuiApp {
                     shorten(&streaming.stream_id, 18)
                 );
                 self.set_status(status);
-                self.stream_status_owner = self.status_ownership.revision;
+                self.stream_status_owner = Some(self.status_ownership.revision);
             }
             if let Some(stream_id) = stream_id {
                 self.upsert_active_stream_preview(&stream_id);
@@ -487,7 +498,7 @@ impl TuiApp {
                 }
             }
             if app.status_is_owned() {
-                app.stream_status_owner = app.status_ownership.revision;
+                app.stream_status_owner = Some(app.status_ownership.revision);
             }
         });
         changed
@@ -530,10 +541,14 @@ impl TuiApp {
                 let _ = tx.send(result);
             });
             self.daemon_autostart = Some(rx);
-            self.set_status(STARTING_DAEMON_STATUS.to_owned());
-            self.daemon_start_status_owner = self.status_ownership.revision;
+            // Launch is background work. It may describe an idle line, but it
+            // cannot revoke a pending foreground load or prompt.
+            self.daemon_start_status_owner = (self.screen == Screen::Main
+                && !self.status_ownership.retained)
+                .then_some(self.status_ownership.revision);
+            self.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
         } else {
-            self.set_status(DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned());
+            self.set_drain_status(DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned());
         }
     }
 
@@ -948,7 +963,7 @@ impl TuiApp {
                     // highlighted chat. Focus stays on the chat list; the load
                     // fires only after the movement quiets (see `tick`).
                     self.set_status(String::new());
-                    self.flick_status_owner = self.status_ownership.revision;
+                    self.flick_status_owner = Some(self.status_ownership.revision);
                     self.flick_countdown = Some(FLICK_PREVIEW_DEBOUNCE_TICKS);
                 }
             }
@@ -1135,7 +1150,7 @@ impl TuiApp {
                         shorten(&streaming.stream_id, 18)
                     );
                     self.set_status(status);
-                    self.stream_status_owner = self.status_ownership.revision;
+                    self.stream_status_owner = Some(self.status_ownership.revision);
                 }
                 if let Some(stream_id) = stream_id {
                     self.upsert_active_stream_preview(&stream_id);

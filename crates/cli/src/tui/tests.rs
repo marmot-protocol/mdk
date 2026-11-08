@@ -2416,9 +2416,9 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         streaming: None,
         status: String::new(),
         status_ownership: StatusOwnership::default(),
-        flick_status_owner: 0,
-        stream_status_owner: 0,
-        daemon_start_status_owner: 0,
+        flick_status_owner: None,
+        stream_status_owner: None,
+        daemon_start_status_owner: None,
         popup: None,
         pending_full_repaint: false,
         group_detail: None,
@@ -3917,6 +3917,24 @@ fn a_failed_mark_read_re_arms_for_the_next_tick() {
     app.pending_mark_read = true;
 
     app.tick();
+    // A real feed result is folded before the queued child's completion. Its
+    // idle notice must not revoke that child's background error eligibility.
+    let (tx, rx) = mpsc::channel();
+    app.chat_subscription = Some(ChatSubscription {
+        account_id: account_id.clone(),
+        include_archived: false,
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Result(
+        serde_json::json!({"type":"chat","chat":{
+            "group_id":group_id,"profile":{"name":"renamed while marking read"},"unread_count":3
+        }}),
+    ))
+    .unwrap();
+    assert!(app.drain_chat_subscription());
+    assert_eq!(app.chats[0].name, "renamed while marking read");
+    assert_eq!(app.status, "live chat update: chats=1");
     // The mark-read runs off-loop; folding its failed result re-arms the flag.
     app.settle_effects(1);
 
@@ -3986,7 +4004,7 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     // Establish ownership through the real full-result writer,
                     // then move selection away without changing the loaded rows.
                     app.apply_effect_done(EffectDone {
-                        status_owner: app.status_ownership.revision,
+                        status_owner: Some(app.status_ownership.revision),
                         effect: Effect::Relist {
                             account: list_owner.clone(),
                             include_archived: false,
@@ -3997,7 +4015,7 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     app.selected_account = 1 - app.selected_account;
                     app.status = "current context".to_owned();
                     app.apply_effect_done(EffectDone {
-                        status_owner: app.status_ownership.revision,
+                        status_owner: Some(app.status_ownership.revision),
                         effect: Effect::MarkRead {
                             account: account_a.clone(),
                             group: group.clone(),
@@ -4217,7 +4235,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     app.status = "draft saved".to_owned();
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4297,7 +4315,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     let current_group_child = app.group_state_subscription.as_ref().unwrap().child.id();
     app.status = "draft saved".to_owned();
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::Relist {
             account: a,
             include_archived: false,
@@ -4363,7 +4381,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     );
     app.refresh_messages().expect("open the recovered A chat");
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadTimeline {
             account: foreground_account.clone(),
             group,
@@ -4412,7 +4430,7 @@ fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
                 String::new()
             });
             app.apply_effect_done(EffectDone {
-                status_owner: app.status_ownership.revision,
+                status_owner: Some(app.status_ownership.revision),
                 effect: Effect::Relist {
                     account: a.clone(),
                     include_archived: false,
@@ -4452,7 +4470,7 @@ fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
             }
             app.client = client;
             app.apply_effect_done(EffectDone {
-                status_owner: app.status_ownership.revision,
+                status_owner: Some(app.status_ownership.revision),
                 effect: Effect::Relist {
                     account: a.clone(),
                     include_archived: false,
@@ -4494,7 +4512,7 @@ fn relist_feed_recovery_respects_daemon_and_local_signing_lifecycle() {
         }
         let status = app.status.clone();
         app.apply_effect_done(EffectDone {
-            status_owner: app.status_ownership.revision,
+            status_owner: Some(app.status_ownership.revision),
             effect: Effect::Relist {
                 account: a.clone(),
                 include_archived: false,
@@ -4615,7 +4633,7 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
     let retained = app.chats.clone();
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4625,7 +4643,7 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     assert_eq!(app.chats, retained);
     assert_eq!(app.chats_account_id.as_deref(), Some(b.as_str()));
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4639,7 +4657,7 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
     for (producer, expected) in [(b, 5), (a, 0)] {
         app.apply_effect_done(EffectDone {
-            status_owner: app.status_ownership.revision,
+            status_owner: Some(app.status_ownership.revision),
             effect: Effect::MarkRead {
                 account: producer,
                 group: group.clone(),
@@ -4693,7 +4711,7 @@ fn complete_relist_can_recover_an_initial_failed_load_without_an_owner() {
     assert_eq!(app.chats[0].name, "initial retry");
     assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::MarkRead { account: a, group },
         result: Ok(vec![
             serde_json::json!({"unread_count":0,"has_unread":false}),
@@ -4745,7 +4763,7 @@ fn a_search_completion_settles_after_its_chat_feed_removes_the_loaded_pane() {
     let group = "cc".repeat(32);
     let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4809,7 +4827,7 @@ fn group_diagnostic_completions_belong_to_the_loaded_account_and_group() {
             app.messages_group_id = Some(pane_group.to_owned());
             let previous = GroupDiagnostics::unavailable(pane_group, "current diagnostics");
             app.group_diagnostics = Some(previous.clone());
-            app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+            app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
                 effect: Effect::GroupDiagnostics { account: account_a.clone(), group: group.clone() },
                 result: if fails { Err("diagnostics failed".to_owned()) } else {
                     Ok(vec![serde_json::json!({"group":{"group_id":group},"mls":{"epoch":7,"member_count":2}})])
@@ -4839,7 +4857,7 @@ fn group_detail_completions_do_not_replace_a_new_accounts_same_group_view() {
             app.loading_group_detail = Some(group.clone());
             app.status = LOADING_GROUP_DETAIL_STATUS.to_owned();
             app.apply_effect_done(EffectDone {
-                status_owner: app.status_ownership.revision,
+                status_owner: Some(app.status_ownership.revision),
                 effect: Effect::LoadGroupDetail {
                     account: account_a.clone(),
                     group: group.clone(),
@@ -4879,7 +4897,7 @@ fn user_search_completions_preserve_a_new_accounts_identical_query() {
         for fails in [false, true] {
             let mut app = test_tui_app(test_unused_client(), selected);
             app.open_user_search(Some("alice".to_owned()));
-            app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+            app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
                 effect: Effect::UserSearch { account: account_a.clone(), query: "alice".to_owned() },
                 result: if fails { Err("search failed".to_owned()) } else { Ok(vec![
                     serde_json::json!({"users":[{"account_id_hex":"dd","npub":"npubdd","radius":1,"matched_field":"name","match_quality":"exact"}]}),
@@ -4932,7 +4950,7 @@ fn message_search_completions_preserve_a_new_panes_identical_query() {
             app.messages_group_id = Some(pane_group.to_owned());
             app.open_message_search(Some("hello".to_owned()))
                 .expect("open search");
-            app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+            app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
                 effect: Effect::MessageSearch { account: account_a.clone(), group: group.clone(), query: "hello".to_owned() },
                 result: if fails { Err("search failed".to_owned()) } else {
                     Ok(vec![serde_json::json!({"messages":[{"message_id":"hit","direction":"received","from":"d","plaintext":"hello","timeline_at":1,"received_at":1}],"has_more_before":true})])
@@ -4989,7 +5007,7 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
         let current_status = app.status.clone();
         assert!(rendered_buffer(&mut app).contains("searching..."));
         app.apply_effect_done(EffectDone {
-            status_owner: app.status_ownership.revision,
+            status_owner: Some(app.status_ownership.revision),
             effect: Effect::MessageSearch {
                 account: account_a.clone(),
                 group: group.clone(),
@@ -5023,7 +5041,7 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
             "completed work cannot leave the search spinner stranded"
         );
         app.apply_effect_done(EffectDone {
-            status_owner: app.status_ownership.revision,
+            status_owner: Some(app.status_ownership.revision),
             effect: Effect::LoadTimeline {
                 account: account_b.clone(),
                 group: group.clone(),
@@ -5061,7 +5079,7 @@ fn mark_read_failure_keeps_the_badge_honest() {
     // A failed mark-read folds honestly: it never zeroes the badge locally and
     // re-arms so the next tick retries.
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::MarkRead {
             account: account_id,
             group: group_id,
@@ -7929,7 +7947,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     let switches_account = pane_account == Some(account_b.as_str());
                     if switches_account {
                         app.selected_account = 1;
-                        app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+                        app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
                             effect: Effect::Relist { account: account_b.clone(), include_archived: false },
                             result: Ok(vec![serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"general"}}]})]),
                         });
@@ -7957,7 +7975,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         app.messages_account_id = pane_account.map(str::to_owned);
                         app.messages_group_id = pane_group.map(str::to_owned);
                     }
-                    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+                    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
                         effect: Effect::Relist { account: app.selected_account_row().unwrap().account_id.clone(), include_archived: false },
                         result: Ok(vec![serde_json::json!({"chats":[{"group_id":selected_group,"profile":{"name":"general"}}]})]),
                     });
@@ -7967,7 +7985,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     let previous_len = app.timeline.len();
 
                     app.apply_effect_done(EffectDone {
-                        status_owner: app.status_ownership.revision,
+                        status_owner: Some(app.status_ownership.revision),
                         effect,
                         result: match completion {
                             "with-id" => Ok(vec![
@@ -8153,6 +8171,21 @@ fn load_older_messages_prepends_a_page_and_updates_the_cursor() {
         "page reported no more"
     );
     assert!(!app.timeline_scroll.loading_older, "in-flight flag cleared");
+    assert_eq!(app.status, "loaded 1 older message(s)");
+    let (tx, rx) = mpsc::channel();
+    app.chat_subscription = Some(ChatSubscription {
+        account_id: account_id.to_owned(),
+        include_archived: false,
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Error("history feed offline".to_owned()))
+        .unwrap();
+    assert!(app.drain_chat_subscription());
+    assert_eq!(
+        app.status, "chat subscription failed: history feed offline",
+        "ordinary history completion leaves idle feedback"
+    );
 }
 
 #[test]
@@ -13083,7 +13116,7 @@ fn a_stale_group_detail_load_after_leaving_is_dropped() {
     app.loading_group_detail = None;
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: "cc".repeat(32),
@@ -13119,7 +13152,7 @@ fn open_group_detail_reports_loading_then_settles_on_fold() {
 
     // Folding the completed load clears the in-flight status.
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: group_id.clone(),
@@ -13157,7 +13190,7 @@ fn invites_load_reports_loading_then_opens_the_picker() {
     // A second press while one is in flight does not double-queue.
     app.open_invites().expect("no double-queue");
 
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13203,7 +13236,7 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
     app.loading_invites = true;
     app.selected_account = 1;
 
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadInvites {
             account: account_a.clone(),
         },
@@ -13249,7 +13282,7 @@ fn an_invites_fold_over_an_image_popup_reopens_through_the_close_funnel() {
 
     // The invites load (queued before the image was opened) now lands.
     app.loading_invites = true;
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13288,7 +13321,7 @@ fn an_invites_fold_while_on_the_profile_screen_does_not_open_the_picker() {
     app.screen = Screen::Profile;
     app.loading_invites = true;
 
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13340,7 +13373,7 @@ fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
     app.searching_users = Some("ali".to_owned());
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::UserSearch {
             account: account_id,
             query: "ali".to_owned(),
@@ -13668,7 +13701,7 @@ fn a_stale_user_search_result_for_a_superseded_query_is_dropped() {
     // The pending search is for "bob"; an "alice" result is a superseded query.
     app.searching_users = Some("bob".to_owned());
 
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -13715,7 +13748,7 @@ fn leaving_a_search_in_flight_drops_a_late_result_from_the_reopened_screen() {
 
     // The abandoned "alice" search now completes; its result must not land in the
     // fresh screen.
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -14716,7 +14749,7 @@ fn react_reports_in_flight_then_final_status_via_the_fold() {
     assert_eq!(app.status, "reacting...", "in-flight feedback is honest");
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::React {
             account: account_id,
             group: "bb".repeat(32),
@@ -14783,7 +14816,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     );
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_id.clone(),
@@ -14848,7 +14881,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     );
 
     // A's late result arrives after the user moved to B.
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_a.clone(),
@@ -14876,7 +14909,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     );
 
     // B's result lands and is accepted.
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_b.clone(),
@@ -14916,7 +14949,7 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
     assert!(app.messages_group_id.is_none());
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadTimeline {
             account: account_a.clone(),
             group: group_a.clone(),
@@ -15019,7 +15052,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         }))).is_err();
         app.drain_message_subscription();
         app.apply_effect_done(EffectDone {
-            status_owner: app.status_ownership.revision,
+            status_owner: Some(app.status_ownership.revision),
             effect: Effect::LoadTimeline {
                 account: account_a.clone(),
                 group: group.clone(),
@@ -15029,7 +15062,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         });
         let pending_survives_old_result = app.loading_chat.is_some();
         app.apply_effect_done(EffectDone {
-            status_owner: app.status_ownership.revision,
+            status_owner: Some(app.status_ownership.revision),
             effect: Effect::LoadTimeline {
                 account: target_account.clone(),
                 group: target_group.clone(),
@@ -15182,7 +15215,7 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
     }
     assert_eq!(app.chats[0].name, "B joined room");
     app.refresh_messages().unwrap();
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
         "message_id":"B row","direction":"received","from":"peer","plaintext":"B timeline","timeline_at":2,"received_at":2
     }]})])});
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -15338,7 +15371,7 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     app.timeline.push(timeline_row("m3", 300));
 
     // The reload page returns only what was materialized at enqueue time (m1, m2).
-    app.apply_effect_done(EffectDone { status_owner: app.status_ownership.revision,
+    app.apply_effect_done(EffectDone { status_owner: Some(app.status_ownership.revision),
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_id.clone(),
@@ -15401,7 +15434,7 @@ fn sending_reports_in_flight_then_folds_an_optimistic_row() {
     );
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::SendMessage {
             account: account_id,
             group: group_id,
@@ -15432,7 +15465,7 @@ fn an_optimistic_send_row_for_a_chat_the_user_left_is_dropped() {
     app.messages_group_id = Some("bb".repeat(32));
 
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::SendMessage {
             account: account_id,
             group: "cc".repeat(32),
@@ -15472,7 +15505,7 @@ fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
     app.send_reply("re: hi".to_owned()).expect("kickoff");
     assert_eq!(app.status, "sending reply...");
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect,
         result: Ok(vec![
             serde_json::json!({"published": 1, "message_ids": ["r1"]}),
@@ -15692,8 +15725,8 @@ fn a_failed_daemon_auto_start_reports_and_leaves_the_session_up() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.daemon = DaemonView::default();
     // The in-flight sentinel the auto-start sets before its thread reports.
-    app.set_status(STARTING_DAEMON_STATUS.to_owned());
-    app.daemon_start_status_owner = app.status_ownership.revision;
+    app.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
+    app.daemon_start_status_owner = Some(app.status_ownership.revision);
 
     app.fold_daemon_start(Err("daemon did not become ready".to_owned()));
 
@@ -15753,8 +15786,8 @@ fn a_daemon_auto_start_fold_replaces_its_own_in_flight_sentinel() {
     app.chat_subscription = Some(test_chat_subscription(&account_id, false));
     app.message_subscription = Some(test_message_subscription(&account_id));
     app.notification_subscription = Some(test_notification_subscription(&account_id));
-    app.set_status(STARTING_DAEMON_STATUS.to_owned());
-    app.daemon_start_status_owner = app.status_ownership.revision;
+    app.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
+    app.daemon_start_status_owner = Some(app.status_ownership.revision);
 
     app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
 
@@ -15958,7 +15991,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     // but there is no view to badge — and nothing crashes.
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -15977,7 +16010,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
         view.results[0].pubkey = "cc".to_owned();
     }
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -15996,7 +16029,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     let mut app = user_search_app_with_selected_result(test_unused_client());
     app.accounts[0].account_id = "dd".repeat(32);
     app.apply_effect_done(EffectDone {
-        status_owner: app.status_ownership.revision,
+        status_owner: Some(app.status_ownership.revision),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -16849,13 +16882,19 @@ fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
         "subscription-error",
         "no-id-refresh",
         "newer-command-before-preview",
+        "no-id-pending-success",
+        "no-id-pending-error",
+        "ambient-before-preview-error",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let mut send_gate = TestCommandGate::new(dir.path());
         let page_dir = dir.path().join("page");
         std::fs::create_dir(&page_dir).unwrap();
         let mut page_gate = TestCommandGate::new(&page_dir);
-        let page = if outcome == "page-error" {
+        let page = if matches!(
+            outcome,
+            "page-error" | "no-id-pending-error" | "ambient-before-preview-error"
+        ) {
             serde_json::json!({"ok":false,"error":{"message":"new chat offline"}})
         } else {
             serde_json::json!({"ok":true,"result":{"messages":[{
@@ -16863,7 +16902,7 @@ fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
                 "plaintext":"new chat body","timeline_at":2,"received_at":2
             }],"has_more_before":false}})
         };
-        let send = if outcome == "no-id-refresh" {
+        let send = if outcome.starts_with("no-id-") {
             serde_json::json!({"ok":true,"result":{"published":2}})
         } else {
             serde_json::json!({"ok":true,"result":{"message_ids":["sent-id"],"published":2}})
@@ -16874,10 +16913,11 @@ fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
             &format!(
                 "#!/bin/sh\ncase \" $* \" in\n\
              *' messages send '*)\n{}printf '%s\\n' '{send}';;\n\
-             *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+             *' messages timeline list '*)\nif mkdir '{}' 2>/dev/null; then\n{}fi\nprintf '%s\\n' '{page}';;\n\
              *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
              *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
                 send_gate.script(),
+                page_dir.join("first").display(),
                 page_gate.script()
             ),
         );
@@ -16897,9 +16937,23 @@ fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
         app.messages_group_id = Some(group_a.clone());
         app.send_message("outgoing body".to_owned()).unwrap();
         send_gate.wait_until_entered();
-        if outcome != "no-id-refresh" {
+        if outcome.starts_with("no-id-pending-") {
+            app.refresh_messages().unwrap();
+        } else if outcome != "no-id-refresh" {
             app.focus = Focus::Chats;
             app.move_selection(1);
+            if outcome == "ambient-before-preview-error" {
+                let (tx, rx) = mpsc::channel();
+                app.chat_subscription = Some(ChatSubscription {
+                    account_id: account.clone(),
+                    include_archived: false,
+                    child: test_sleep_child(),
+                    rx,
+                });
+                tx.send(SubscriptionEvent::Error("ambient notice".to_owned()))
+                    .unwrap();
+                assert!(app.drain_chat_subscription());
+            }
             if outcome == "newer-command-before-preview" {
                 app.run_slash_command(SlashCommand::Diagnostics).unwrap();
             }
@@ -16937,7 +16991,9 @@ fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
                 app.status == "diagnostics panel on"
                     && timeline_ids(&app.timeline) == vec!["new-page-row"]
             }
-            "page-error" => app.status == "error: new chat offline" && app.timeline.is_empty(),
+            "page-error" | "no-id-pending-error" | "ambient-before-preview-error" => {
+                app.status == "error: new chat offline" && app.timeline.is_empty()
+            }
             "subscription-error" => {
                 app.status.starts_with("timeline subscription failed: ")
                     && timeline_ids(&app.timeline) == vec!["new-page-row"]
@@ -16956,6 +17012,90 @@ fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
     assert!(
         observed.iter().all(|row| row.3),
         "action order and causal refresh feedback: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_autostart_cannot_supersede_the_first_timeline_feedback() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observed = Vec::new();
+    for page_error in [false, true] {
+        for daemon_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut page_gate = TestCommandGate::new(dir.path());
+            let daemon_dir = dir.path().join("daemon");
+            std::fs::create_dir(&daemon_dir).unwrap();
+            let mut daemon_gate = TestCommandGate::new(&daemon_dir);
+            let catalog = serde_json::json!({"ok":true,"result":{
+                "accounts":[{"account_id":account,"npub":"npub1alice","local_signing":true}],
+                "chats":[{"group_id":group,"profile":{"name":"First chat"}}]
+            }});
+            let page = if page_error {
+                serde_json::json!({"ok":false,"error":{"message":"first page offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"first-row","direction":"received","from":"peer",
+                    "plaintext":"first page body","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            let exe = dir.path().join("wn-startup");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+                 *' daemon start '*)\n{}printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true}}}}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{catalog}';;\nesac\n",
+                    page_gate.script(),
+                    daemon_gate.script()
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = false;
+            app.start().unwrap();
+            page_gate.wait_until_entered();
+            app.autostart_daemon_if_needed(Some("wss://relay.example".to_owned()));
+            daemon_gate.wait_until_entered();
+            if daemon_first {
+                daemon_gate.release();
+                let result = app.recv_daemon_autostart();
+                app.fold_daemon_start(result);
+            }
+            page_gate.release();
+            finish_queued_effects(&mut app);
+            finish_queued_effects(&mut app);
+            if !daemon_first {
+                daemon_gate.release();
+                let result = app.recv_daemon_autostart();
+                app.fold_daemon_start(result);
+            }
+            let expected = if page_error {
+                "error: first page offline"
+            } else {
+                "loaded 1 message(s)"
+            };
+            observed.push((
+                page_error,
+                daemon_first,
+                app.status.clone(),
+                app.status == expected,
+            ));
+            assert!(app.daemon.running, "startup still adopts daemon resources");
+            assert_eq!(app.timeline.is_empty(), page_error);
+        }
+    }
+    assert!(
+        observed.iter().all(|row| row.3),
+        "background startup cannot own foreground load feedback: {observed:?}"
     );
 }
 

@@ -251,7 +251,7 @@ pub(crate) fn spawn_subscription_reader(
 /// parsed result — or the first error encountered.
 pub(crate) struct EffectDone {
     pub(crate) effect: Effect,
-    pub(crate) status_owner: u64,
+    pub(crate) status_owner: Option<u64>,
     pub(crate) result: Result<Vec<Value>, String>,
 }
 
@@ -277,13 +277,13 @@ pub(crate) struct EffectDone {
 /// reached the relay); a read (a load) merely wastes the moment it takes to
 /// exit. Neither warrants tracking and reaping children across shutdown.
 pub(crate) struct EffectRunner {
-    tx: mpsc::Sender<(Effect, u64)>,
+    tx: mpsc::Sender<(Effect, Option<u64>)>,
     rx: Receiver<EffectDone>,
 }
 
 impl EffectRunner {
     pub(crate) fn spawn(client: WnClient) -> Self {
-        let (tx, effect_rx) = mpsc::channel::<(Effect, u64)>();
+        let (tx, effect_rx) = mpsc::channel::<(Effect, Option<u64>)>();
         let (done_tx, rx) = mpsc::channel::<EffectDone>();
         thread::spawn(move || {
             // `recv` returns `Err` once the app drops its `tx` (shutdown), so the
@@ -309,7 +309,7 @@ impl EffectRunner {
     /// Queue an effect to run off the event loop. The send only fails if the
     /// worker is gone, which happens only at shutdown; a dropped effect then
     /// simply never folds, which is correct while tearing down.
-    pub(crate) fn enqueue(&self, effect: Effect, owner: u64) {
+    pub(crate) fn enqueue(&self, effect: Effect, owner: Option<u64>) {
         let _ = self.tx.send((effect, owner));
     }
 
@@ -601,9 +601,17 @@ impl TuiApp {
                 .map(|row| row.account_id.as_str())
                 == Some(account.as_str())
                 && self.selected_chat_row().map(|row| row.group_id.as_str()) == Some(group.as_str())
+                && !self
+                    .loading_chat
+                    .as_ref()
+                    .is_some_and(|(pending_account, pending_group, _)| {
+                        pending_account == &account && pending_group == &group
+                    })
             {
-                // A no-ID completion must not redirect a pending navigation or
-                // reload a different selected account through refresh_messages.
+                // A page already queued for this pane runs after this send on
+                // the FIFO worker. Keep its newer generation/feedback claim;
+                // an older no-ID completion needs no additional recovery read.
+                // Also never redirect pending navigation to another account/chat.
                 let _ = self.refresh_messages();
             }
         }
@@ -2091,18 +2099,21 @@ impl TuiApp {
     /// auto-start fold, so every path that learns the daemon came up reflects
     /// it the same way — including the status-bar dot, which reads
     /// `daemon.running` each frame.
-    fn adopt_daemon_view(&mut self, result: &Value) {
+    fn adopt_daemon_view(&mut self, result: &Value) -> bool {
         self.daemon = parse_daemon_view(result);
         // A currently owned daemon result may report its acquisition failures.
         // A stale result still adopts resources without releasing newer feedback.
         if self.status_is_owned() {
             self.status_ownership.retained = false;
         }
-        self.ensure_selected_chat_subscription();
-        self.ensure_selected_message_subscription();
-        self.ensure_selected_group_state_subscription();
-        self.ensure_selected_timeline_subscription();
-        self.ensure_selected_notification_subscription();
+        // Report acquisition failure explicitly; ambient text changes do not
+        // acquire/revoke an action claim and cannot signal this through revision.
+        let mut failed = self.ensure_selected_chat_subscription();
+        failed |= self.ensure_selected_message_subscription();
+        failed |= self.ensure_selected_group_state_subscription();
+        failed |= self.ensure_selected_timeline_subscription();
+        failed |= self.ensure_selected_notification_subscription();
+        failed
     }
 
     /// Fold the launch daemon auto-start's outcome: adopt the started daemon or
@@ -2112,20 +2123,13 @@ impl TuiApp {
     /// Adoption always updates resources; only an owned result updates feedback,
     /// and acquisition failures take precedence over the readiness sentence.
     pub(crate) fn fold_daemon_start(&mut self, result: Result<Value, String>) {
-        self.with_status_owner(self.daemon_start_status_owner, |app| {
-            let before_adoption = app.status_ownership.revision;
-            match result {
-                Ok(value) => {
-                    app.adopt_daemon_view(&value);
-                    if app.status_ownership.revision == before_adoption {
-                        app.set_status(daemon_status_sentence(&app.daemon));
-                    } else {
-                        // Acquisition feedback takes precedence over readiness.
-                        app.status_ownership.retained = true;
-                    }
+        self.with_status_owner(self.daemon_start_status_owner, |app| match result {
+            Ok(value) => {
+                if !app.adopt_daemon_view(&value) {
+                    app.set_drain_status(daemon_status_sentence(&app.daemon));
                 }
-                Err(err) => app.set_status(format!("daemon start failed: {err}")),
             }
+            Err(err) => app.set_drain_status(format!("daemon start failed: {err}")),
         });
     }
 
@@ -2618,7 +2622,7 @@ impl TuiApp {
         self.timeline_scroll.on_prepend(prepended);
         self.timeline_scroll.has_more_before = timeline_page_has_more_before(&result);
         self.timeline_scroll.loading_older = false;
-        self.set_status(format!("loaded {prepended} older message(s)"));
+        self.finish_timeline_status(format!("loaded {prepended} older message(s)"), false);
         Ok(())
     }
 
@@ -2799,83 +2803,93 @@ impl TuiApp {
         self.timeline_subscription = None;
     }
 
-    pub(crate) fn ensure_selected_chat_subscription(&mut self) {
+    pub(crate) fn ensure_selected_chat_subscription(&mut self) -> bool {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chat_subscription = None;
-            return;
+            return false;
         };
         if !account.local_signing {
             self.chat_subscription = None;
-            return;
+            return false;
         }
         if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
             self.set_drain_status(format!("chat subscription failed: {err}"));
+            return true;
         }
+        false
     }
 
-    pub(crate) fn ensure_selected_message_subscription(&mut self) {
+    pub(crate) fn ensure_selected_message_subscription(&mut self) -> bool {
         let Some(account) = self.selected_account_row().cloned() else {
             self.message_subscription = None;
-            return;
+            return false;
         };
         if !account.local_signing {
             self.message_subscription = None;
-            return;
+            return false;
         }
         if let Err(err) = self.ensure_message_subscription(&account.account_id) {
             self.set_drain_status(format!("message subscription failed: {err}"));
+            return true;
         }
+        false
     }
 
-    pub(crate) fn ensure_selected_group_state_subscription(&mut self) {
+    pub(crate) fn ensure_selected_group_state_subscription(&mut self) -> bool {
         let Some(account) = self.selected_account_row().cloned() else {
             self.group_state_subscription = None;
-            return;
+            return false;
         };
         if !account.local_signing {
             self.group_state_subscription = None;
-            return;
+            return false;
         }
         let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
             self.group_state_subscription = None;
-            return;
+            return false;
         };
         if let Err(err) = self.ensure_group_state_subscription(&account.account_id, &group_id) {
             self.set_drain_status(format!("group state subscription failed: {err}"));
+            return true;
         }
+        false
     }
 
     /// Re-establish the timeline subscription for the currently loaded group (the
     /// pane target), used when daemon state changes. Keyed to the loaded group,
     /// not the highlighted chat, so it stays in lockstep with the pane snapshot.
-    pub(crate) fn ensure_selected_timeline_subscription(&mut self) {
+    pub(crate) fn ensure_selected_timeline_subscription(&mut self) -> bool {
         let (Some(account_id), Some(group_id)) = (
             self.messages_account_id.clone(),
             self.messages_group_id.clone(),
         ) else {
             self.timeline_subscription = None;
-            return;
+            return false;
         };
         if let Err(err) = self.ensure_timeline_subscription(&account_id, &group_id) {
             self.set_drain_status(format!("timeline subscription failed: {err}"));
+            return true;
         }
+        false
     }
 
     /// Re-establish the runtime-wide notification subscription for the selected
     /// local signing account, dropping it for no account or a public-only one.
     /// Mirrors `ensure_selected_message_subscription`; both are account-wide.
-    pub(crate) fn ensure_selected_notification_subscription(&mut self) {
+    pub(crate) fn ensure_selected_notification_subscription(&mut self) -> bool {
         let Some(account) = self.selected_account_row().cloned() else {
             self.notification_subscription = None;
-            return;
+            return false;
         };
         if !account.local_signing {
             self.notification_subscription = None;
-            return;
+            return false;
         }
         if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
             self.set_drain_status(format!("notification subscription failed: {err}"));
+            return true;
         }
+        false
     }
 
     /// Ambient notices replace only idle Main feedback. Queued background work
@@ -2883,8 +2897,8 @@ impl TuiApp {
     pub(crate) fn set_drain_status(&mut self, status: String) {
         if self.screen == Screen::Main && !self.status_ownership.retained && self.status_is_owned()
         {
-            self.set_status(status);
-            self.status_ownership.retained = false;
+            // Background feedback changes presentation, never foreground order.
+            self.status = status;
         }
     }
 
