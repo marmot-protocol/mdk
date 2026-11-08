@@ -440,8 +440,14 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
 /// - fallback amplification: a held event's first copy through a history
 ///   request, fetched rather than proved by comparison.
 ///
-/// A copy's bytes are its event's bytes over its copies, the remainder on the
-/// first, so the four sum to the endpoint's event bytes exactly.
+/// Copies are counted exactly; bytes are apportioned. The relay records one
+/// byte total per event, so a copy's bytes are its event's bytes over its
+/// copies (copies differ only by subscription id), the remainder on the
+/// first, and the four sum to the per-event totals by construction. Those
+/// totals are checked against the connections' own per-path EVENT counts,
+/// kept frame by frame: `matches_wire_totals` fails if the per-event record
+/// missed a frame, and `unknown_path_frames` counts copies through a
+/// subscription bob never asked for, which no cause can name.
 fn download_split(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     const CAUSES: [&str; 4] = [
         "first_fetch",
@@ -495,6 +501,19 @@ fn download_split(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     }
     split.insert("total".into(), json!({"frames": frames, "bytes": bytes}));
     split.insert("sums_to_total".into(), json!(summed == (frames, bytes)));
+    let wire = relay
+        .connection_traffic
+        .values()
+        .fold((0, 0), |(f, b), traffic| {
+            (
+                f + traffic.event_frames.values().sum::<u64>(),
+                b + traffic.event_bytes.values().sum::<u64>(),
+            )
+        });
+    split.insert("matches_wire_totals".into(), json!(wire == (frames, bytes)));
+    let unknown = relay.connection_traffic.values();
+    let unknown = unknown.filter_map(|traffic| traffic.event_frames.get("unknown"));
+    split.insert("unknown_path_frames".into(), json!(unknown.sum::<u64>()));
     Value::Object(split)
 }
 
@@ -1162,9 +1181,11 @@ pub(super) async fn run() {
     );
     for relay in report["relays"].as_array().into_iter().flatten() {
         let split = &relay["download_split"];
-        assert_eq!(
-            split["sums_to_total"], true,
-            "the download split must sum to the endpoint's event bytes: {split}"
+        assert!(
+            split["sums_to_total"] == true
+                && split["matches_wire_totals"] == true
+                && split["unknown_path_frames"] == 0,
+            "the download split must classify every EVENT copy the endpoint sent: {split}"
         );
     }
 }

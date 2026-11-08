@@ -107,8 +107,11 @@ under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
   - retry amplification: every further copy a history request brought;
   - fallback amplification: a held event's first copy through a history request.
 
-  The run asserts that the four sum to the endpoint's event bytes. Bob's own connections' totals are reported
-  beside the split, which counts every connection opened after the restart;
+  Copies are counted exactly. Bytes are apportioned: each copy carries its event's mean copy size (copies differ
+  only by subscription id), the remainder on the first. The run asserts that the four sum to the endpoint's EVENT
+  frames and bytes as the connections counted them frame by frame, and that no copy came through a subscription
+  bob never asked for. An event's first copy is the earliest on the proxy's clock across connections. Bob's own
+  connections' totals are reported beside the split, which counts every connection opened after the restart;
 - REQ/NEG-OPEN counts and public telemetry deltas;
 - a 60-second idle window.
 
@@ -189,10 +192,11 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   - both groups' routes are asked on both endpoints;
   - a message to the quiet group arrives within a minute, while the busy group is still owed;
   - fairness while the backlog is admitted, at the scorecard's targets. Once the runner's trace shows an admission
-    turn and owed messages are showing, a second quiet-group message must show within 2 seconds, before the busy
-    group finishes. Status commands that started between the first admission turn and the last owed message
-    showing (at least 20) must all succeed, with p95 under 500 ms and none at 2 seconds or more. The first quiet
-    message shows before admission starts, so it does not count for fairness;
+    turn and owed messages are showing, a second quiet-group message must show within 2 seconds of alice's send
+    returning, before the busy group finishes and before the runner's last admission turn. Status commands that
+    started from the first admission turn through the one that showed the last owed message (at least 20) must
+    all succeed, with p95 under 500 ms and none at 2 seconds or more. The first quiet message shows before
+    admission starts, so it does not count for fairness;
   - no history notice before the restart, when the restart reports caught up, or at the end. This is its own
     check, naming each notice's route and park time (#3040).
 

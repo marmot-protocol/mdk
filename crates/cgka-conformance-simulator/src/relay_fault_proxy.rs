@@ -162,8 +162,9 @@ pub struct RelayEventDeliveryV1 {
     pub via_maintenance: u64,
     #[serde(default)]
     pub via_live: u64,
-    /// The path of its first delivery on this connection, and when, on the
-    /// scale of [`HistoryRequestV1::at_ms`].
+    /// The path of its first delivery through a subscription the connection
+    /// asked for, and when, on the scale of [`HistoryRequestV1::at_ms`].
+    /// Merged traffic keeps the earliest of its connections' first deliveries.
     #[serde(default)]
     pub first: Option<(RelayDeliveryPath, u64)>,
 }
@@ -954,8 +955,12 @@ impl RelayFaultProxy {
                 merged.via_paged_window += delivery.via_paged_window;
                 merged.via_maintenance += delivery.via_maintenance;
                 merged.via_live += delivery.via_live;
-                // Sessions merge in order, so the earliest one's first stays.
-                if merged.first.is_none() {
+                // The earliest first delivery on the proxy's clock stays: a
+                // newer connection can deliver an event before an older one.
+                if delivery
+                    .first
+                    .is_some_and(|(_, at)| merged.first.is_none_or(|(_, merged_at)| at < merged_at))
+                {
                     merged.first = delivery.first;
                 }
             }
@@ -1270,8 +1275,8 @@ mod tests {
         );
         assert_eq!(cd.first, Some((RelayDeliveryPath::PagedWindow, 10)));
 
-        // Connections merge in order: counts add, and the earliest
-        // connection's first delivery stays.
+        // Connections merge: counts add, and the earliest first delivery
+        // stays, even when a newer connection made it.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let proxy = RelayFaultProxy::start(listener.local_addr().unwrap())
             .await
@@ -1280,7 +1285,11 @@ mod tests {
         proxy.traffic.lock().unwrap().extend([first, second]);
         let merged = proxy.traffic_since(0, true).events;
         assert_eq!((merged["ab"].via_ids, merged["ab"].count), (2, 4));
-        assert_eq!(merged["ab"].first, Some((RelayDeliveryPath::Live, 30)));
+        assert_eq!(merged["ab"].first, Some((RelayDeliveryPath::Ids, 1)));
+        assert_eq!(
+            merged["cd"].first,
+            Some((RelayDeliveryPath::PagedWindow, 10))
+        );
         let later = proxy.traffic_since(1, true).events;
         assert_eq!(later["ab"].first, Some((RelayDeliveryPath::Ids, 1)));
 

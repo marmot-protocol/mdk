@@ -81,6 +81,9 @@ const COMMAND_MAX_MS: f64 = 2_000.0;
 /// Status commands the admission window must hold for their latency to
 /// count: five seconds of the probe's calls every 250 ms.
 const ADMISSION_COMMANDS_AT_LEAST: u64 = 20;
+/// How often the 5,000-owed proof checks whether every owed message shows.
+const OWED_POLL: Duration = Duration::from_secs(5);
+const OWED_POLL_MS: u64 = OWED_POLL.as_millis() as u64;
 /// Both endpoints stall history in the fence proof, so a nonempty phase's
 /// group is stranded: its live message waits for the runner's next attempt
 /// once history returns, 30 seconds after an unreachable one.
@@ -990,25 +993,29 @@ impl Live {
     }
 }
 
-/// How long one message takes to reach bob's timeline, or `None` past
-/// `limit`.
+/// How long alice's send of one message took, and how long after it
+/// returned the message reached bob's timeline (`None` past `limit`). Bob
+/// cannot see a message before alice publishes it, so visibility is timed
+/// from the send's return; a slow send is the sender's (mdk#3234).
 async fn visible_after(
     alice: &AppRuntimeProbe,
     bob: &AppRuntimeProbe,
     group: &GroupId,
     payload: &str,
     limit: Duration,
-) -> TestResult<Option<f64>> {
-    let started = Instant::now();
+) -> TestResult<(f64, Option<f64>)> {
+    let sending = Instant::now();
     send(alice, group, payload).await?;
+    let send_ms = sending.elapsed().as_secs_f64() * 1e3;
+    let started = Instant::now();
     while started.elapsed() < limit {
         let (_, chat) = bob.chat_view(group, Some(64)).await?;
         if chat.iter().any(|text| text == payload) {
-            return Ok(Some(started.elapsed().as_secs_f64() * 1e3));
+            return Ok((send_ms, Some(started.elapsed().as_secs_f64() * 1e3)));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(None)
+    Ok((send_ms, None))
 }
 
 /// Whether bob's timeline in `group` holds exactly `expected`, each once.
@@ -1929,7 +1936,7 @@ pub(super) async fn owed_history() {
         let bob = subject.probe("bob")?;
         let commands = CommandProbe::start(&bob, &busy);
         let live = Live::start(alice.clone(), bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
-        let quiet_after_restart =
+        let (quiet_after_restart_send_ms, quiet_after_restart) =
             visible_after(&alice, &bob, &quiet, "quiet-after-restart", Duration::from_secs(60)).await?;
         quiet_expected.push("quiet-after-restart".into());
         // It proves nothing unless the busy group was still owed then.
@@ -1951,8 +1958,11 @@ pub(super) async fn owed_history() {
         };
         wait_for("admission of the owed backlog", RECOVERY_DEADLINE, admitting).await?;
         let busy_visible_when_sent = owed_visible().await?;
-        let quiet_during_admission =
+        let (quiet_during_admission_send_ms, quiet_during_admission) =
             visible_after(&alice, &bob, &quiet, "quiet-during-admission", Duration::from_secs(60)).await?;
+        // Admission must still have been running when it showed: owed
+        // messages still unopened could be a tail already admitted.
+        let quiet_seen_trace = runner_trace::now_ms();
         quiet_expected.push("quiet-during-admission".into());
         let busy_visible_when_seen = owed_visible().await?;
         note(started, "quiet message sent during admission");
@@ -1977,13 +1987,19 @@ pub(super) async fn owed_history() {
                 status_at_caught_up = Some(status);
                 note(started, "runner reports caught up");
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(OWED_POLL).await;
         }
         // Commands that started while the runner admitted the backlog: from
-        // its first admission turn to its last before every owed message
-        // showed.
+        // its first admission turn through the one that showed the last owed
+        // message. That turn logs its admit line after its messages show, so
+        // the poll that saw them all may come first: the window takes the
+        // first admit line within one poll after it.
         let drained_at = drained_trace.unwrap_or_else(runner_trace::now_ms);
-        let admitting = admitted_between(trace_restart, drained_at).1;
+        let last_turn = admitted_between(drained_at, drained_at + OWED_POLL_MS).1;
+        let admitting = admitted_between(trace_restart, drained_at).1.map(|(first, last)| {
+            (first, last_turn.map_or(last, |(turn, _)| turn.max(last)))
+        });
+        let admitted_after_quiet = admitted_between(quiet_seen_trace, drained_at).0;
         let (worker_command_ms, admission_command_ms) = commands
             .finish(admitting.unwrap_or((trace_restart, trace_restart)))
             .await?;
@@ -2028,7 +2044,7 @@ pub(super) async fn owed_history() {
         subject.interrupt_relay("reconnect", "relay:shared", OUTAGE_MS).await?;
         let reconnected = Instant::now();
         let trace_reconnect = runner_trace::now_ms();
-        let quiet_after_reconnect =
+        let (quiet_after_reconnect_send_ms, quiet_after_reconnect) =
             visible_after(&alice, &bob, &quiet, "quiet-after-reconnect", Duration::from_secs(60)).await?;
         quiet_expected.push("quiet-after-reconnect".into());
         let mut resweep = BTreeSet::new();
@@ -2072,7 +2088,8 @@ pub(super) async fn owed_history() {
                 "busy_timeline_exact": busy_exact,
                 "busy_timeline": busy_timeline,
                 "live_visibility_ms": live_visibility,
-                "quiet_message_visible_ms": quiet_after_restart,
+                "quiet_message_send_ms": quiet_after_restart_send_ms,
+                "quiet_message_visible_after_send_ms": quiet_after_restart,
                 "busy_visible_when_quiet_seen": busy_visible_when_quiet_seen,
                 "busy_swept_per_endpoint": swept(&after_restart, &busy_route),
                 "quiet_swept_per_endpoint": swept(&after_restart, &quiet_route),
@@ -2083,10 +2100,12 @@ pub(super) async fn owed_history() {
                 "pacing": pacing(trace_restart, drained_trace.unwrap_or(trace_idle)),
                 "worker_command_ms": worker_command_ms,
                 "admission_fairness": {
-                    "quiet_message_visible_ms": quiet_during_admission,
+                    "quiet_message_send_ms": quiet_during_admission_send_ms,
+                    "quiet_message_visible_after_send_ms": quiet_during_admission,
                     "quiet_target_ms": LIVE_VISIBLE_TARGET_MS,
                     "busy_visible_when_sent": busy_visible_when_sent,
                     "busy_visible_when_seen": busy_visible_when_seen,
+                    "owed_admitted_after_quiet_seen": admitted_after_quiet,
                     "worker_command_ms": admission_command_ms,
                     "worker_command_targets_ms": {"p95": COMMAND_P95_TARGET_MS, "max": COMMAND_MAX_MS},
                 },
@@ -2101,7 +2120,8 @@ pub(super) async fn owed_history() {
                 "resweep": resweep_result.as_ref().map_or_else(|error| json!(error.to_string()), |()| json!("swept")),
                 "resweep_seconds": resweep_seconds,
                 "routes_swept_on_endpoint_0": resweep.iter().map(|r| labels.get(r).map_or("other", String::as_str)).collect::<Vec<_>>(),
-                "quiet_message_visible_ms": quiet_after_reconnect,
+                "quiet_message_send_ms": quiet_after_reconnect_send_ms,
+                "quiet_message_visible_after_send_ms": quiet_after_reconnect,
                 "quiet_timeline_exact": quiet_exact,
                 "repeated_window_requests_per_endpoint": reconnect_repeats,
                 "history": summaries(&after_reconnect),
@@ -2161,11 +2181,14 @@ pub(super) async fn owed_history() {
         if busy_visible_when_quiet_seen >= OWED_MESSAGES {
             return failure("the busy group finished before the quiet group's message showed");
         }
-        if busy_visible_when_sent == 0 || busy_visible_when_seen >= OWED_MESSAGES {
+        if busy_visible_when_sent == 0
+            || busy_visible_when_seen >= OWED_MESSAGES
+            || admitted_after_quiet == 0
+        {
             return failure("the quiet group's message was not measured while the backlog was admitted");
         }
         if quiet_during_admission.is_none_or(|ms| ms >= LIVE_VISIBLE_TARGET_MS) {
-            return failure("a quiet group's message took 2 s or more while the backlog was admitted");
+            return failure("a quiet group's message took 2 s or more after alice sent it while the backlog was admitted");
         }
         let commands = &admission_command_ms;
         let failed_commands = commands["errors"].as_object().into_iter().flatten();
