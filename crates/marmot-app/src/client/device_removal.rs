@@ -31,7 +31,9 @@
 //!   require `marmot.group.account-devices.v1` can take a same-account
 //!   Remove; the others are counted for the host, and a chat admin can
 //!   remove the leaf. A leaf with no tag reads as unclaimed and is left alone
-//!   (D55).
+//!   (D55). The audit log names that Remove the user's action only on the
+//!   device that keeps their decision; other devices, and every device after
+//!   an automatic removal (3.6b-2), make it on their own.
 //! - **Private KeyPackages.** Every such device also discards the private
 //!   KeyPackages it issued to a gone device's slot, keys included, and those
 //!   that slot handed it, so a Welcome the removed device makes from one
@@ -486,6 +488,7 @@ impl AppClient {
         if gone.slots.is_empty() {
             return Ok(());
         }
+        let chosen = self.chosen_removal_keys(&group_id, &gone)?;
         let mut first_error = None;
         for slot in &gone.slots {
             if let Err(error) = self.discard_private_key_packages_of(slot) {
@@ -493,9 +496,17 @@ impl AppClient {
             }
         }
         for chat_id in self.sibling_commit_chats() {
-            let removal = match self.gone_device_leaves_in(&chat_id, &roster, &gone) {
+            let removal = match self.gone_device_leaves_in(&chat_id, &roster, &gone.keys) {
                 Ok(keys) if keys.is_empty() => continue,
-                Ok(keys) => self.remove_own_account_leaves(&chat_id, keys).await,
+                Ok(keys) => {
+                    match self.gone_leaf_removal_context(&chat_id, &roster, &chosen, keys.len()) {
+                        Ok(context) => {
+                            self.remove_own_account_leaves(&chat_id, keys, context)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 Err(error) => Err(error),
             };
             match removal {
@@ -524,7 +535,7 @@ impl AppClient {
         let mut leftovers = 0u32;
         for chat_id in self.sibling_commit_chats() {
             if !self
-                .gone_device_leaves_in(&chat_id, &roster, &gone)?
+                .gone_device_leaves_in(&chat_id, &roster, &gone.keys)?
                 .is_empty()
                 && !self.group_requires_account_devices(&chat_id)?
             {
@@ -660,26 +671,77 @@ impl AppClient {
     }
 
     /// The signature keys of this account's leaves in `chat_id` whose device
-    /// tag reads as one of the `gone` devices, under `roster`'s
+    /// tag reads as one of the gone devices' `keys`, under `roster`'s
     /// `leaf_tag_key`.
     fn gone_device_leaves_in(
         &self,
         chat_id: &GroupId,
         roster: &DeviceRosterV1,
-        gone: &GoneDevices,
+        keys: &BTreeSet<RosterTagKey>,
     ) -> Result<LeafKeys, AppError> {
-        if gone.keys.is_empty() {
+        if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let keys = gone.keys.iter().cloned().collect::<Vec<_>>();
+        let keys = keys.iter().cloned().collect::<Vec<_>>();
         Ok(self
             .runtime
             .own_account_leaves_tagged_by(chat_id, &roster.leaf_tag_key, &keys)?)
     }
 
+    /// The keys of the `gone` devices whose removal this device's user chose,
+    /// while this device keeps that decision (`device_removals`). An
+    /// automatic removal records none.
+    fn chosen_removal_keys(
+        &self,
+        group_id: &GroupId,
+        gone: &GoneDevices,
+    ) -> Result<BTreeSet<RosterTagKey>, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let chosen = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_removals()?
+            .into_iter()
+            .filter(|removal| removal.group_id_hex == group_id_hex)
+            .map(|removal| removal.slot_hex)
+            .collect::<HashSet<_>>();
+        Ok(gone
+            .keys
+            .iter()
+            .filter(|key| chosen.contains(&hex::encode(key.slot)))
+            .cloned()
+            .collect())
+    }
+
+    /// The audit context of removing `count` gone devices' leaves from
+    /// `chat_id`: the user's when one of them reads as a device whose removal
+    /// they chose here, by its `chosen` keys, and none otherwise.
+    fn gone_leaf_removal_context(
+        &self,
+        chat_id: &GroupId,
+        roster: &DeviceRosterV1,
+        chosen: &BTreeSet<RosterTagKey>,
+        count: usize,
+    ) -> Result<marmot_forensics::AuditEventContext, AppError> {
+        if self
+            .gone_device_leaves_in(chat_id, roster, chosen)?
+            .is_empty()
+        {
+            return Ok(marmot_forensics::AuditEventContext::default());
+        }
+        Ok(Self::local_human_action_context(
+            "remove_own_account_devices",
+            vec!["members"],
+            Vec::new(),
+            u64::try_from(count).ok(),
+        ))
+    }
+
     /// Remove other leaves of this device's account, by signature key, from
-    /// the chat `group_id`, in one same-account Remove. The removal of a
-    /// device and of leaves tied to a rejection (3.7c) both use it.
+    /// the chat `group_id`, in one same-account Remove, audited with
+    /// `audit_context`. The removal of a device and of leaves tied to a
+    /// rejection (3.7c) both use it.
     ///
     /// Nothing is sent, and the result says why, when the chat does not
     /// require `marmot.group.account-devices.v1` or cannot take a commit from
@@ -690,6 +752,7 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         leaf_signature_keys: Vec<Vec<u8>>,
+        audit_context: marmot_forensics::AuditEventContext,
     ) -> Result<OwnLeafRemoval, AppError> {
         if !self.group_requires_account_devices(group_id)? {
             return Ok(OwnLeafRemoval::Unsupported);
@@ -697,12 +760,6 @@ impl AppClient {
         if !self.group_quiet(group_id)? {
             return Ok(OwnLeafRemoval::Busy);
         }
-        let audit_context = Self::local_human_action_context(
-            "remove_own_account_devices",
-            vec!["members"],
-            Vec::new(),
-            u64::try_from(leaf_signature_keys.len()).ok(),
-        );
         let effects = self
             .runtime
             .send_with_audit_context(

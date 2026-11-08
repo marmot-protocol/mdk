@@ -1642,6 +1642,34 @@ async fn settled_linked_devices() -> (Devices, GroupId) {
     (devices, group)
 }
 
+/// `devices` with the phone's client reopened with the audit log on, which a
+/// client reads when it opens.
+async fn with_phone_audit_log(devices: Devices) -> Devices {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    } = devices;
+    drop(phone);
+    phone_app
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    let phone = phone_app.client("alice").await.unwrap();
+    Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    }
+}
+
 pub(super) async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
     let mut cursor = 0;
     deliver_new(client, relay, &mut cursor).await;

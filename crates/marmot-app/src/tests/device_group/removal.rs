@@ -262,6 +262,7 @@ async fn converge_until_labelled(
 async fn removing_a_device_takes_it_out_of_the_device_group_and_its_chats() {
     let (mut devices, group) = tagging_devices().await;
     let chat = chat_with_both(&mut devices).await;
+    let devices = with_phone_audit_log(devices).await;
     let Devices {
         _dirs,
         relay,
@@ -307,6 +308,14 @@ async fn removing_a_device_takes_it_out_of_the_device_group_and_its_chats() {
             .is_empty(),
         "the laptop's chat leaf is gone"
     );
+    // The device that keeps the user's decision names both commits theirs.
+    let actions = crate::tests::recorded_audit_rows(&phone_app)
+        .into_iter()
+        .filter(|row| row["event"]["record_context"]["human_action"]["origin"] == "local_user")
+        .map(|row| row["event"]["record_context"]["human_action"]["action"].clone())
+        .collect::<Vec<_>>();
+    assert!(actions.contains(&"unlink_device".into()));
+    assert!(actions.contains(&"remove_own_account_devices".into()));
     assert_eq!(
         phone
             .linked_devices()
@@ -499,7 +508,11 @@ async fn a_device_removed_from_a_chat_its_account_stays_in_is_not_removed_from_i
     assert_eq!(leaves.len(), 1, "the laptop's leaf");
 
     phone
-        .remove_own_account_leaves(&chat, leaves)
+        .remove_own_account_leaves(
+            &chat,
+            leaves,
+            marmot_forensics::AuditEventContext::default(),
+        )
         .await
         .unwrap();
     assert!(
