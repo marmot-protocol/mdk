@@ -109,7 +109,11 @@ impl AppClient {
                 // Earlier-copy coverage is not a query for this copy. The mark
                 // also prevents an already-running old quantum from re-crediting
                 // it. This creates debt without resetting any retry budget.
-                app.uncover_recovery_coverage(std::slice::from_ref(&route.route), floor)?;
+                app.uncover_recovery_coverage(
+                    std::slice::from_ref(&route.route),
+                    floor,
+                    storage_sqlite::CopyFloorReason::Clamp,
+                )?;
                 self.runner_post_join.insert(
                     group_id,
                     Collection {

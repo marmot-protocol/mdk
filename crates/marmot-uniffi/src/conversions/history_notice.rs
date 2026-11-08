@@ -5,9 +5,9 @@ use marmot_app::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 
 /// Why recovery parked; choose the host's wording from it. Current epoch-gap
 /// exhaustion emits `EpochGap`; the coverage ledger emits `UnprovenHistory`
-/// without attributing the original reason its route's history was owed. Other
-/// labels preserve compatibility; `KnownEvent` and `MaintenanceBoundary` remain
-/// reserved for parking policy.
+/// without attributing the original reason its route's history was owed; a
+/// rejoin emits `BeforeRejoin`. Other labels preserve compatibility;
+/// `KnownEvent` and `MaintenanceBoundary` remain reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HistoryNoticeCauseFfi {
     /// Deliveries were dropped from a full account queue, or spilled rows
@@ -29,6 +29,10 @@ pub enum HistoryNoticeCauseFfi {
     /// and stopped retrying them: a group's (`group_id_hex` names it) or the
     /// account inbox's.
     UnprovenHistory,
+    /// This device rejoined the group (`group_id_hex` names it) with a new
+    /// copy after its old one could not be repaired. Messages from before the
+    /// rejoin that it had not received are unavailable. One notice per rejoin.
+    BeforeRejoin,
 }
 
 impl From<HistoryNoticeCause> for HistoryNoticeCauseFfi {
@@ -42,6 +46,7 @@ impl From<HistoryNoticeCause> for HistoryNoticeCauseFfi {
             HistoryNoticeCause::KnownEvent => Self::KnownEvent,
             HistoryNoticeCause::MaintenanceBoundary => Self::MaintenanceBoundary,
             HistoryNoticeCause::UnprovenHistory => Self::UnprovenHistory,
+            HistoryNoticeCause::BeforeRejoin => Self::BeforeRejoin,
         }
     }
 }
@@ -106,7 +111,7 @@ mod tests {
 
     #[test]
     fn current_recovery_notice_causes_keep_their_host_choices() {
-        // Own the epoch-gap exhaustion and coverage-ledger writer outputs.
+        // Own the epoch-gap exhaustion, coverage-ledger and rejoin writer outputs.
         // Compatibility readers and reserved labels retain their mappings,
         // without a current-writer or migration-runtime claim here.
         for (native, expected) in [
@@ -117,6 +122,10 @@ mod tests {
             (
                 HistoryNoticeCause::UnprovenHistory,
                 HistoryNoticeCauseFfi::UnprovenHistory,
+            ),
+            (
+                HistoryNoticeCause::BeforeRejoin,
+                HistoryNoticeCauseFfi::BeforeRejoin,
             ),
         ] {
             assert_eq!(HistoryNoticeCauseFfi::from(native), expected);

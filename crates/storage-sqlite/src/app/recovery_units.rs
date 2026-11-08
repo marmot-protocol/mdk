@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests;
 
+use crate::app::recovery_copies::{CopyFloorReason, copy_floor_tx};
 use crate::app::recovery_coverage::{
     RecoveryCoverageRange, integer, invalid, route_from, subtract, union,
 };
@@ -627,7 +628,7 @@ fn unit_debt_tx(
     ))
 }
 
-fn next_park_revision_tx(conn: &Connection) -> StorageResult<i64> {
+pub(crate) fn next_park_revision_tx(conn: &Connection) -> StorageResult<i64> {
     conn.query_row_cached(
         "UPDATE account_recovery_park_revision SET revision = revision + 1
          WHERE singleton = 1 RETURNING revision",
@@ -708,7 +709,13 @@ fn rearm_tx(
 
 /// Retire one gone unit: every span it retired, its parked spans and its
 /// debt through `now_seconds` become route gone, and it retires with a fresh
-/// budget and no fences. Returns whether it held any span or owed anything.
+/// budget and no fences. What a rejoin retired as before this copy, and
+/// anything else retired below a rejoined copy's floor ([`copy_floor_tx`]),
+/// stays as it is with its own reason: it belongs to the group's copy, not
+/// to the route's relays, so the relay's return owes none of it (mdk#2660 row
+/// 11). Debt and parked spans below the floor, which only loss, repair or
+/// evidence can reopen there, still become route gone, so the return owes
+/// them again. Returns whether it held any other span or owed anything.
 fn retire_gone_unit_tx(
     conn: &Connection,
     unit: &RecoveryUnit,
@@ -721,26 +728,47 @@ fn retire_gone_unit_tx(
         params![kind, id, unit.relay],
     )
     .storage()?;
+    let floor = copy_floor_tx(conn, &unit.route, CopyFloorReason::Clamp)?;
+    let mut retired = Vec::new();
     let mut gone = unit_debt_tx(conn, &unit.route, &unit.relay, now_seconds)?;
-    for kind in [PARKED_SPAN, RETIRED_SPAN] {
-        gone.extend(
-            spans_tx(conn, &unit.route, &unit.relay, kind)?
-                .iter()
-                .map(|span| span.range),
-        );
+    for span in spans_tx(conn, &unit.route, &unit.relay, RETIRED_SPAN)? {
+        let range = span.range;
+        if span.retired == Some(RecoverySpanRetirement::BeforeThisCopy)
+            || range.until_seconds < floor
+        {
+            retired.push(span);
+        } else if range.since_seconds < floor {
+            retired.push(RecoveryUnitSpan {
+                range: RecoveryCoverageRange {
+                    since_seconds: range.since_seconds,
+                    until_seconds: floor - 1,
+                },
+                retired: span.retired,
+            });
+            gone.push(RecoveryCoverageRange {
+                since_seconds: floor,
+                until_seconds: range.until_seconds,
+            });
+        } else {
+            gone.push(range);
+        }
     }
-    let gone = union(gone)
-        .into_iter()
-        .map(|range| RecoveryUnitSpan {
-            range,
-            retired: Some(RecoverySpanRetirement::RouteGone),
-        })
-        .collect::<Vec<_>>();
+    gone.extend(
+        spans_tx(conn, &unit.route, &unit.relay, PARKED_SPAN)?
+            .iter()
+            .map(|span| span.range),
+    );
+    let gone = union(gone);
     if gone.is_empty() {
         return Ok(false);
     }
+    retired.extend(gone.into_iter().map(|range| RecoveryUnitSpan {
+        range,
+        retired: Some(RecoverySpanRetirement::RouteGone),
+    }));
+    retired.sort_by_key(|span| span.range.since_seconds);
     replace_spans_tx(conn, &unit.route, &unit.relay, PARKED_SPAN, &[])?;
-    replace_spans_tx(conn, &unit.route, &unit.relay, RETIRED_SPAN, &gone)?;
+    replace_spans_tx(conn, &unit.route, &unit.relay, RETIRED_SPAN, &retired)?;
     conn.execute_cached(
         "UPDATE account_recovery_units SET state = ?4, broken_reason = NULL, probe = 0,
          no_progress = 0, backoff_step = 0, next_attempt_at_seconds = 0, parked_at_seconds = NULL
@@ -751,8 +779,105 @@ fn retire_gone_unit_tx(
     Ok(true)
 }
 
+/// Retire as before this copy what each unit on `route` owes in `gap`
+/// (mdk#2660 row 11): the seconds an evidence un-cover's goal widening opened
+/// below a rejoined copy's floor
+/// ([`crate::app::recovery_coverage::uncover_second_tx`]). Before the widening
+/// the gap lay outside the goal, so nothing there was owed, retired or
+/// reopened by loss, and nothing else is touched.
+pub(crate) fn retire_opened_before_copy_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    gap: RecoveryCoverageRange,
+) -> StorageResult<()> {
+    let (kind, id) = route.storage_key();
+    for unit in units_tx(
+        conn,
+        "WHERE route_kind = ?1 AND route_id = ?2",
+        params![kind, id],
+    )? {
+        let opened = unit_debt_tx(conn, route, &unit.relay, gap.until_seconds)?
+            .into_iter()
+            .filter_map(|range| {
+                let since = range.since_seconds.max(gap.since_seconds);
+                (since <= range.until_seconds).then_some(RecoveryCoverageRange {
+                    since_seconds: since,
+                    until_seconds: range.until_seconds,
+                })
+            })
+            .collect::<Vec<_>>();
+        if opened.is_empty() {
+            continue;
+        }
+        let mut retired = spans_tx(conn, route, &unit.relay, RETIRED_SPAN)?;
+        retired.extend(opened.into_iter().map(|range| RecoveryUnitSpan {
+            range,
+            retired: Some(RecoverySpanRetirement::BeforeThisCopy),
+        }));
+        retired.sort_by_key(|span| span.range);
+        replace_spans_tx(conn, route, &unit.relay, RETIRED_SPAN, &retired)?;
+    }
+    Ok(())
+}
+
+/// Settle one unit for its group's new copy (mdk#2660 row 11): what it owes
+/// or parked below `floor_seconds` is retired as before this copy, never
+/// covered, and it starts over active with a fresh budget, so what it parked
+/// at or above the floor is owed again. Its retired spans keep their reasons,
+/// and its fences below the floor drop. A relay with no unit yet gets one,
+/// to hold what it retires.
+pub(crate) fn retire_before_copy_unit_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    relay: &str,
+    floor_seconds: u64,
+) -> StorageResult<()> {
+    ensure_unit_tx(conn, route, relay)?;
+    if let Some(below) = floor_seconds.checked_sub(1) {
+        let clip = |range: RecoveryCoverageRange| {
+            (range.since_seconds <= below).then_some(RecoveryCoverageRange {
+                since_seconds: range.since_seconds,
+                until_seconds: range.until_seconds.min(below),
+            })
+        };
+        let mut owed = unit_debt_tx(conn, route, relay, below)?;
+        owed.extend(
+            spans_tx(conn, route, relay, PARKED_SPAN)?
+                .iter()
+                .filter_map(|span| clip(span.range)),
+        );
+        let mut retired = spans_tx(conn, route, relay, RETIRED_SPAN)?;
+        let held = union(retired.iter().map(|span| span.range).collect());
+        let before = subtract_all(&union(owed), &held);
+        if !before.is_empty() {
+            retired.extend(before.into_iter().map(|range| RecoveryUnitSpan {
+                range,
+                retired: Some(RecoverySpanRetirement::BeforeThisCopy),
+            }));
+            retired.sort_by_key(|span| span.range);
+            replace_spans_tx(conn, route, relay, RETIRED_SPAN, &retired)?;
+        }
+        let (kind, id) = route.storage_key();
+        let floor = integer(floor_seconds)?;
+        conn.execute_cached(
+            "DELETE FROM account_recovery_unit_fences
+             WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3 AND until_seconds < ?4",
+            params![kind, id, relay, floor],
+        )
+        .storage()?;
+        conn.execute_cached(
+            "UPDATE account_recovery_unit_fences SET since_seconds = ?4
+             WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3 AND since_seconds < ?4",
+            params![kind, id, relay, floor],
+        )
+        .storage()?;
+    }
+    rearm_tx(conn, route, relay)
+}
+
 /// [`SqliteAppStorage::rearm_all_recovery_units`] inside the caller's
-/// transaction.
+/// transaction. Explicit repair is its reason ([`CopyFloorReason::Repair`]):
+/// it re-arms what a rejoin retired below its floor too.
 pub(crate) fn rearm_all_units_tx(conn: &Connection) -> StorageResult<usize> {
     let rearmed = conn
         .execute_cached(
@@ -1127,7 +1252,16 @@ pub(crate) fn trim_spans_tx(
 /// Whatever any of the route's `relays` still owes there (not covered on that
 /// relay and not retired; parked seconds are owed) joins the route's parked
 /// remainder, so the prune never makes debt vanish. With no relays, nothing
-/// covers the route and all of it is owed. Only seconds from the route's
+/// covers the route and all of it is owed.
+///
+/// The one exception is what lay before a rejoined copy's floor
+/// ([`copy_floor_tx`], mdk#2660 row 11): nothing parks there. A route keeps
+/// one remainder, so a second still owed below the floor (a held event given
+/// back, or loss) would join debt above it and park the retired history
+/// between, beside the rejoin's notice that already tells the user that
+/// history is gone. Such a second, unfetched when retention passes it, drops
+/// without a remainder; the runner swept it for the whole retention window.
+/// Only seconds from the route's
 /// settled floor up count: an earlier prune parked or dropped everything
 /// below it and kept no coverage there, so a goal widened back below it
 /// parks nothing twice, and a dismissed remainder stays dismissed until loss
@@ -1159,8 +1293,12 @@ pub(crate) fn park_overtaken_tx(
         else {
             continue;
         };
+        let since = i64_to_u64(since)?.max(copy_floor_tx(conn, route, CopyFloorReason::Clamp)?);
+        if since > top {
+            continue;
+        }
         let below = RecoveryCoverageRange {
-            since_seconds: i64_to_u64(since)?,
+            since_seconds: since,
             until_seconds: top,
         };
         let owed = if relays.is_empty() {
@@ -1794,7 +1932,8 @@ impl SqliteAppStorage {
     /// they left it, or, with `relays` `None`, the route ended and every unit
     /// of it goes (mdk#2660 section 3). Each unit's retired and parked spans
     /// and its debt through `now_seconds` are retired as route gone, never
-    /// covered; it retires with a fresh budget and drops its fences. An ended
+    /// covered, except what a rejoin retired as before this copy, which
+    /// stays; it retires with a fresh budget and drops its fences. An ended
     /// route's remainder goes too. So none of it raises a notice, and loss
     /// reopens none of it, while the relay stays gone. Returns the units
     /// retired.

@@ -28,9 +28,10 @@
 //! Until then they are a state the worker resolves, not a leak.
 use super::*;
 use crate::TransportReconciliationRoute;
+use crate::app::recovery_copies::CopyFloorReason;
 use crate::app::recovery_coverage::{
     RecoveryCoverageProof, RecoveryCoverageRange, reopen_goal, settle_goals_tx, uncover_loss_tx,
-    uncover_route_loss_tx, widen_goal,
+    uncover_route_tx, widen_goal,
 };
 use crate::app::recovery_units::{
     break_converted_route_tx, park_overtaken_tx, rearm_all_units_tx, retire_converted_ranges_tx,
@@ -293,6 +294,7 @@ fn quarantine_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> Stor
             conn,
             &current.route,
             current.standing_floor_seconds.max(floor),
+            CopyFloorReason::Clamp,
         )?;
     }
     add_count_tx(conn, "shadow_ranges", ranges as u64)?;
@@ -541,15 +543,17 @@ fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageRes
     for (route, &bound) in &reach.routes {
         match reach.every_route_from {
             // Its coverage went with the account-wide floor.
-            Some(every) if bound >= every => reopen_goal(conn, route, every)?,
-            _ => uncover_route_loss_tx(conn, route, bound, now)?,
+            Some(every) if bound >= every => {
+                reopen_goal(conn, route, every, CopyFloorReason::Loss)?
+            }
+            _ => uncover_route_tx(conn, route, bound, CopyFloorReason::Loss, now)?,
         }
     }
     // The un-covers widened the goals the ledger holds; a current route
     // without one owes from the same floor.
     for current in input.routes {
         if let Some(lowest) = reach.floor(&current.route) {
-            reopen_goal(conn, &current.route, lowest)?;
+            reopen_goal(conn, &current.route, lowest, CopyFloorReason::Loss)?;
         }
     }
     if reach
@@ -631,7 +635,7 @@ fn parked_tx(
         if obligation.cause == RecoveryCause::ExplicitHistory {
             // An explicit repair owes the whole window.
             for current in input.routes {
-                widen_goal(conn, &current.route, floor)?;
+                widen_goal(conn, &current.route, floor, CopyFloorReason::Repair)?;
             }
         }
         let scopes = frozen_scopes_tx(conn, obligation)?;
@@ -675,7 +679,12 @@ fn pending_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> Storage
         .any(|obligation| obligation.cause == RecoveryCause::ExplicitHistory)
     {
         for current in input.routes {
-            widen_goal(conn, &current.route, input.retention_floor_seconds)?;
+            widen_goal(
+                conn,
+                &current.route,
+                input.retention_floor_seconds,
+                CopyFloorReason::Repair,
+            )?;
         }
         rearm_all_units_tx(conn)?;
     }
@@ -913,7 +922,13 @@ impl SqliteAppStorage {
                 if live {
                     if let Some(routes) = loss::evidence_routes(&conn, label, cause, token)? {
                         for (route, bound) in routes {
-                            uncover_route_loss_tx(&conn, &route, bound, input.now_seconds)?;
+                            uncover_route_tx(
+                                &conn,
+                                &route,
+                                bound,
+                                CopyFloorReason::Loss,
+                                input.now_seconds,
+                            )?;
                             below_floor |= bound < input.retention_floor_seconds;
                         }
                     } else {
@@ -921,7 +936,7 @@ impl SqliteAppStorage {
                         uncover_loss_tx(&conn, bound, input.now_seconds)?;
                         // Include current routes the ledger has never seen.
                         for route in input.routes {
-                            reopen_goal(&conn, &route.route, bound)?;
+                            reopen_goal(&conn, &route.route, bound, CopyFloorReason::Loss)?;
                         }
                         below_floor |= bound < input.retention_floor_seconds;
                     }

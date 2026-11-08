@@ -640,9 +640,9 @@ typedef enum MarmotEventSizeClass {
 
 /**
  * Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
- * coverage-ledger parks emit `UnprovenHistory`. Other labels preserve
- * compatibility; `KnownEvent` and `MaintenanceBoundary` remain reserved
- * for parking policy.
+ * coverage-ledger parks emit `UnprovenHistory`; a rejoin emits
+ * `BeforeRejoin`. Other labels preserve compatibility; `KnownEvent` and
+ * `MaintenanceBoundary` remain reserved for parking policy.
  */
 typedef enum MarmotHistoryNoticeCause {
   /**
@@ -680,6 +680,13 @@ typedef enum MarmotHistoryNoticeCause {
    * it) or the account inbox's.
    */
   MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY,
+  /**
+   * This device rejoined the group (`group_id_hex` names it) with a
+   * new copy after its old one could not be repaired. Messages from
+   * before the rejoin that it had not received are unavailable. One
+   * notice per rejoin.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_BEFORE_REJOIN,
 } MarmotHistoryNoticeCause;
 
 /**

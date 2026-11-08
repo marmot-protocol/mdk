@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `HistoryNoticeCauseFfi` gains `BeforeRejoin` (mdk#2660 row 11): one notice per rejoin, when this device rejoined a
+  group with a new copy after its old one could not be repaired. Messages from before the rejoin that it had not
+  received are unavailable. Dismissing it retires nothing further. Exhaustive switches need the case. Regenerate
+  bindings.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
   `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
   finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New

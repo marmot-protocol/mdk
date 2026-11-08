@@ -1511,6 +1511,12 @@ runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`; cov
 parks emit `HistoryNoticeCauseFfi::UnprovenHistory` without attributing the original reason
 history was owed. Other cause labels preserve compatibility; keep exhaustive switches.
 
+When this device rejoins a group with a new copy after its old one could not be repaired,
+the group gets one `HistoryNoticeCauseFfi::BeforeRejoin` notice: messages from before the
+rejoin that the device had not received are unavailable, and recovery stopped fetching
+them. A restart raises no second one, dismissing it retires nothing further, and a later
+rejoin raises a new one.
+
 Durably and natively `Unrecoverable` copies start authenticated automatic rejoin in the existing account workers.
 Hosts use the existing Repair action to rearm an eligible parked episode; restarting alone does not reset its budget.
 A reachable eligible admin and eventual delivery are required. Usable forks still need explicit replacement

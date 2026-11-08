@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cgka_traits::storage::{GroupStorage, StorageError, StorageProvider, StorageResult};
 use storage_sqlite::{
-    RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
-    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
+    RecoveryCause, RecoveryCopy, RecoveryCoverageMark, RecoveryCoverageProof,
+    RecoveryCoverageSlice, RecoveryRejoin, SqliteAppStorage,
+    TRANSPORT_RECONCILIATION_RETENTION_SECS, TransportReconciliationRoute,
 };
 use transport_nostr::MarmotRelayPlaneAccountAdapter;
 use transport_nostr_adapter::{
@@ -722,7 +723,11 @@ impl AppClient {
             // This turn reads the new debt immediately. Do not wake its own
             // runner, especially if a later write keeps the changes pending.
             for (floor, routes) in self.standing_goals(&current.iter().collect::<Vec<_>>(), now)? {
-                app.widen_recovery_coverage_goals(&routes, floor)?;
+                app.widen_recovery_coverage_goals(
+                    &routes,
+                    floor,
+                    storage_sqlite::CopyFloorReason::Clamp,
+                )?;
             }
             for (route, relays) in &gone {
                 let ended = !carried.iter().any(|(carried, _)| carried == *route);
@@ -739,13 +744,106 @@ impl AppClient {
         settled
     }
 
+    /// Settle each routed group's new local copy before the debt turn reads
+    /// debt (mdk#2660 row 11). A replacement Welcome (the copy's install epoch
+    /// moved and its join epoch was reset) is a rejoin: on every relay of
+    /// every route of the group, what was owed or parked below the copy's
+    /// standing floor retires as before this copy, never as coverage, and the
+    /// group gets one notice. The Welcome time alone never retires anything;
+    /// it only bounds what a rejoin retires. Any other copy, and an unknown one
+    /// (a record migration 0153 could not decode), settles silently. A suspended
+    /// copy settles nothing until it recovers or is replaced, and an ended
+    /// group nothing at all. Each copy settles once: storage records it in the
+    /// same transaction, so a restart raises no second notice. A relay that
+    /// joins a rejoined copy's route later, or returns to it, retires below
+    /// the rejoin's floor once at the first turn that carries it. A changed copy
+    /// marks [`AppClient::recovery_copy_settled`], so the account worker
+    /// announces the notice it raised or cleared. A failed write
+    /// returns the error to the runner's local-failure backoff and the next
+    /// turn tries again.
+    pub(crate) fn settle_recovery_rejoins(
+        &mut self,
+        app: &SqliteAppStorage,
+        now: u64,
+    ) -> StorageResult<()> {
+        let current = self.current_coverage_routes();
+        let mut groups = BTreeMap::<&[u8], Vec<&CurrentRoute>>::new();
+        for route in &current {
+            if let Some(group_id) = &route.group_id {
+                groups.entry(group_id).or_default().push(route);
+            }
+        }
+        for (group_id, routes) in groups {
+            let carried = routes
+                .iter()
+                .map(|current| {
+                    let mut relays = current.required.clone();
+                    relays.extend(current.best_effort.iter().cloned());
+                    (current.route.clone(), relays)
+                })
+                .collect::<Vec<_>>();
+            let group = match self
+                .engine_storage
+                .get_group(&cgka_traits::GroupId::new(group_id.to_vec()))
+            {
+                Ok(group) => group,
+                Err(StorageError::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
+            let install = group.local_copy_install_epoch.0;
+            if group.is_terminal()
+                || self
+                    .settled_recovery_copies
+                    .get(group_id)
+                    .is_some_and(|settled| settled.0 == install && settled.1 == carried)
+            {
+                continue;
+            }
+            match app.recovery_copy(group_id)? {
+                Some(RecoveryCopy::Settled(settled)) if settled == install => {
+                    let relays = app.retire_before_recovery_copy(group_id, &carried)?;
+                    if relays > 0 {
+                        tracing::info!(target: TARGET, method = "settle_recovery_rejoins",
+                            relays,
+                            "rejoined group's history before its copy retired on a later relay");
+                    }
+                }
+                Some(RecoveryCopy::Unknown) => app.record_recovery_copy(group_id, install)?,
+                _ if group.unrecoverable => continue,
+                _ if group.join_epoch.0 == 0 && install > 0 => {
+                    let floor = self.standing_floor(routes[0], now)?;
+                    if app.settle_recovery_rejoin(&RecoveryRejoin {
+                        group_id,
+                        install_epoch: install,
+                        routes: &carried,
+                        floor_seconds: floor,
+                        now_seconds: now,
+                    })? {
+                        self.recovery_copy_settled = true;
+                        tracing::info!(target: TARGET, method = "settle_recovery_rejoins",
+                            routes = carried.len(),
+                            "rejoined group's history before its new copy retired");
+                    }
+                }
+                _ => {
+                    app.record_recovery_copy(group_id, install)?;
+                    self.recovery_copy_settled = true;
+                }
+            }
+            self.settled_recovery_copies
+                .insert(group_id.to_vec(), (install, carried));
+        }
+        Ok(())
+    }
+
     /// Whether the ledger proves `group_id`'s history up to `now` on every
     /// relay that certifies it (mdk#2628 item 3.6b-2): the group has a current
     /// route, and on each of its routes nothing is staged, the route has a
     /// goal and at least one required relay, and each required relay covers
     /// that goal through its owed second, as the recovery runner reads it.
-    /// Parked and retired spans stay owed, so a route whose recovery gave up
-    /// is never proved.
+    /// Parked, dismissed and route-gone spans stay owed, so a route whose
+    /// recovery gave up is never proved; what a rejoin retired as before this
+    /// copy is not this copy's to prove (mdk#2660 row 11).
     pub(crate) async fn group_history_proved(
         &self,
         group_id: &[u8],
@@ -773,7 +871,7 @@ impl AppClient {
             for relay in &current.required {
                 let until = checked_until.min(tails.owed_until(&current.route, relay, now));
                 if !app
-                    .recovery_coverage_debt(&current.route, std::slice::from_ref(relay), until)?
+                    .recovery_copy_debt(&current.route, relay, until)?
                     .is_empty()
                 {
                     return Ok(false);
@@ -826,7 +924,7 @@ impl AppClient {
         routes: &[TransportReconciliationRoute],
         floor: u64,
     ) -> cgka_traits::storage::StorageResult<()> {
-        app.widen_recovery_coverage_goals(routes, floor)?;
+        app.widen_recovery_coverage_goals(routes, floor, storage_sqlite::CopyFloorReason::Clamp)?;
         self.wake_recovery_runner();
         Ok(())
     }
@@ -835,8 +933,10 @@ impl AppClient {
     /// or for a group route whose copy has a Welcome time, that time less the
     /// clock-skew allowance when it is later. The Welcome time is only a hint
     /// (`Group::local_copy_welcome_created_at`): it starts goals and never
-    /// retires, un-covers or drops debt, so loss, released receipts and
-    /// explicit repair keep their own floors, and a goal already lower stays.
+    /// retires, un-covers or drops debt by itself, so loss, released receipts
+    /// and explicit repair keep their own floors, and a goal already lower
+    /// stays. Only a rejoin retires below this floor
+    /// ([`Self::settle_recovery_rejoins`]).
     /// A Welcome time after `now` (the joining clock ran fast) is ignored, even
     /// one inside the allowance, or the goal would start minutes ago and never
     /// owe the window.

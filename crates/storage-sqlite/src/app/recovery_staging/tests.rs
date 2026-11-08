@@ -180,8 +180,12 @@ fn loss_since_the_mark_is_not_recorded_as_coverage() {
     let app = storage.app_storage();
     let route = group(1);
     let mark = app.recovery_coverage_mark().unwrap();
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), 50)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        50,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     let staged = stage(&app, &route, RELAY, &[delivery(60)], range(0, 100), mark);
     assert_eq!(staged.staged, 1);
     assert_eq!(
@@ -423,8 +427,12 @@ fn staging_trims_the_units_parked_spans() {
         max_event_bytes_per_hour: 256 << 20,
         recheck_after_cooldown_seconds: 3_600,
     };
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 100)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&route),
+        NOW - 100,
+        crate::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     app.begin_recovery_unit_attempt(&route, RELAY, None, NOW)
         .unwrap();
     app.settle_recovery_unit(&route, RELAY, RecoveryUnitOutcome::NoProgress, &policy, NOW)
@@ -453,8 +461,12 @@ fn a_crash_between_staging_and_settling_refetches_nothing() {
     {
         let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = storage.app_storage();
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 0)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            0,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         app.begin_recovery_unit_attempt(&route, RELAY, None, NOW)
             .unwrap();
         let mark = app.recovery_coverage_mark().unwrap();
