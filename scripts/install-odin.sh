@@ -51,7 +51,8 @@ trap 'rm -rf "$work"' EXIT
 archive="$work/$asset"
 download() {
   curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-    --connect-timeout 15 --max-time 120 --retry 4 --retry-all-errors --retry-max-time 120 \
+    --connect-timeout 15 --max-time 600 --speed-limit 1024 --speed-time 30 \
+    --retry 4 --retry-all-errors --retry-max-time 120 \
     --output "$archive" "$@"
 }
 
