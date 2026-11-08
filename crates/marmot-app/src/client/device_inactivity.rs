@@ -265,8 +265,15 @@ impl AppClient {
                 DeviceStatusV1::Inactive
                     if age >= REMOVE_INACTIVE_AFTER_SECS && !entry.settings.keep_while_inactive =>
                 {
+                    // No one chose this removal, so it carries no human action.
                     return self
-                        .commit_device_removal(&group_id, &exchange.roster, slot, now)
+                        .commit_device_removal(
+                            &group_id,
+                            &exchange.roster,
+                            slot,
+                            now,
+                            marmot_forensics::AuditEventContext::default(),
+                        )
                         .await;
                 }
                 _ => {}

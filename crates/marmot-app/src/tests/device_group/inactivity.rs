@@ -323,7 +323,8 @@ async fn a_remainder_since_the_last_restart_restarts_every_clock() {
 
 /// A sibling still marked `inactive` is removed at 90 days with the
 /// removal Commit a user's removal makes, unless "keep while inactive" is
-/// on. Nothing is recorded for it, so its slot is left alone.
+/// on. Nothing is recorded for it, so its slot is left alone, and the audit
+/// log does not name it a user's action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inactive_sibling_is_removed_at_ninety_days_unless_kept() {
     let (mut devices, group) = settled_linked_devices().await;
@@ -358,6 +359,30 @@ async fn an_inactive_sibling_is_removed_at_ninety_days_unless_kept() {
         .update_linked_device_settings(&laptop_slot, None, None, Some(false))
         .await
         .unwrap();
+    // Reopened with the audit log on, which a client reads when it opens.
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    } = devices;
+    drop(phone);
+    phone_app
+        .set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    let phone = phone_app.client("alice").await.unwrap();
+    let mut devices = Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    };
     devices.phone.run_due_maintenance().await.unwrap();
     let roster = roster(&devices.phone, &group);
     assert!(!roster.devices.contains_key(&slot_of(&devices.laptop)));
@@ -366,6 +391,14 @@ async fn an_inactive_sibling_is_removed_at_ninety_days_unless_kept() {
         RejectedSlotReasonV1::Removed
     );
     assert_eq!(removal::pending_removals(&devices.phone_app), 0);
+    // No one chose the removal, so the audit log names no user action.
+    let rows = crate::tests::recorded_audit_rows(&devices.phone_app);
+    assert!(rows.iter().any(|row| row["event"]["type"] == "send_entry"));
+    assert!(
+        rows.iter().all(|row| {
+            row["event"]["record_context"]["human_action"]["origin"] != "local_user"
+        })
+    );
 }
 
 /// A device whose recovery gave up on a Commit it missed in its device

@@ -964,9 +964,23 @@ impl AppClient {
         device_slot(&lifecycle.stable_slot_id)
     }
 
+    /// The audit context of an unlink this device's user asked for.
+    pub(crate) fn user_unlink_audit_context() -> marmot_forensics::AuditEventContext {
+        Self::local_human_action_context(
+            "unlink_device",
+            vec!["members"],
+            vec![DEVICE_ROSTER_COMPONENT_ID],
+            Some(1),
+        )
+    }
+
     /// Remove the leaf `leaf_signature_key` from the device group and its
     /// roster entry in one commit, as `operations` say: undoing a failed link
     /// (D40) or removing a device (3.6b).
+    #[cfg(any(
+        feature = "unreleased-device-pairing",
+        all(test, feature = "test-policy-overrides")
+    ))]
     pub(crate) async fn unlink_device_from_group(
         &mut self,
         group_id: &GroupId,
@@ -977,12 +991,7 @@ impl AppClient {
             group_id,
             leaf_signature_key,
             operations,
-            Self::local_human_action_context(
-                "unlink_device",
-                vec!["members"],
-                vec![DEVICE_ROSTER_COMPONENT_ID],
-                Some(1),
-            ),
+            Self::user_unlink_audit_context(),
         )
         .await
     }
@@ -1002,7 +1011,7 @@ impl AppClient {
         .await
     }
 
-    async fn unlink_device_from_group_with_context(
+    pub(super) async fn unlink_device_from_group_with_context(
         &mut self,
         group_id: &GroupId,
         leaf_signature_key: Vec<u8>,

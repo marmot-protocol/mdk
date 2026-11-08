@@ -271,7 +271,13 @@ impl AppClient {
                 )?;
             }
             return self
-                .commit_device_removal(group_id, roster, &slot, removal.requested_at)
+                .commit_device_removal(
+                    group_id,
+                    roster,
+                    &slot,
+                    removal.requested_at,
+                    Self::user_unlink_audit_context(),
+                )
                 .await;
         }
         // Not listed: removed, its `removed` record has expired since, or a
@@ -398,13 +404,15 @@ impl AppClient {
     /// One commit in the device group that removes the device in `slot`:
     /// its leaf, read from device tags, and its entry, recording the slot as
     /// `removed` at `requested_at`. Sent only while the group can take a
-    /// commit from this device; otherwise a later pass retries.
+    /// commit from this device; otherwise a later pass retries. `audit_context`
+    /// names the user's removal as theirs; an automatic one carries none.
     pub(super) async fn commit_device_removal(
         &mut self,
         group_id: &GroupId,
         roster: &DeviceRosterV1,
         slot: &DeviceSlotId,
         requested_at: u64,
+        audit_context: marmot_forensics::AuditEventContext,
     ) -> Result<(), AppError> {
         if !self.group_quiet(group_id)? {
             return Ok(());
@@ -439,7 +447,12 @@ impl AppClient {
             ),
         ];
         match self
-            .unlink_device_from_group(group_id, leaf_signature_key, operations)
+            .unlink_device_from_group_with_context(
+                group_id,
+                leaf_signature_key,
+                operations,
+                audit_context,
+            )
             .await
         {
             Ok(()) => {
