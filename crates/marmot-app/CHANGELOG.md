@@ -6,7 +6,7 @@
   Leave (mdk#3014). It sends the engine's `StepDownAndLeave`, which records the leave first and then stages the
   step-down and the SelfRemove, so a step-down that is refused, left unresolved or lost to another branch is staged
   again instead of leaving the account demoted with no leave. The Leave call now returns once the leave is recorded,
-  before the step-down is published. Ordinary builds still refuse an admin's Leave or Decline until the host demotes
+  or queued behind sends made before it, and before the step-down is published. Ordinary builds still refuse an admin's Leave or Decline until the host demotes
   the account.
 
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.

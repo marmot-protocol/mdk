@@ -11,8 +11,8 @@
 //! the earliest sends that went ahead, which it could no longer decrypt.
 //!
 //! The same order holds for every other intent kind that queues behind a
-//! waiting row: a leave, an invite and a removal go out after a queued
-//! message, and a message after a queued group change.
+//! waiting row: a leave (an admin's too), an invite and a removal go out
+//! after a queued message, and a message after a queued group change.
 
 use super::*;
 
@@ -365,7 +365,7 @@ impl Published {
                 self.welcomes.extend(welcomes);
                 (msg, "commit")
             }
-            SendResult::Queued { .. } => return,
+            SendResult::Queued { .. } | SendResult::LeaveRequested { .. } => return,
             other => panic!("unexpected send result: {other:?}"),
         };
         if let Some((_, intent_id)) = engine.regenerated_queued_intent_for_message(&msg.id) {
@@ -541,6 +541,77 @@ async fn a_leave_behind_a_queued_message_goes_out_after_it() {
     );
     assert_eq!(published.kinds, vec!["message", "proposal"]);
     assert!(leave_queued, "the leave waits behind the queued message");
+}
+
+/// So does an admin's leave (mdk#3014). Recorded at once, its leave request
+/// would hold the queue until the removal discarded the message, so it waits
+/// behind the message, and the drain records it after preparing the message.
+/// The step-down follows from that request.
+#[tokio::test]
+async fn an_admins_leave_behind_a_queued_message_goes_out_after_it() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let group_id = three_member_group(&mut alice, &mut carol, &mut bob).await;
+    let epoch = carol.epoch(&group_id).unwrap().0;
+    queue_message(&mut carol, &group_id, "sent before stepping down").await;
+
+    let step_down_and_leave = || SendIntent::StepDownAndLeave {
+        group_id: group_id.clone(),
+    };
+    let leave = carol.send(step_down_and_leave()).await.unwrap();
+    assert!(
+        matches!(leave, SendResult::Queued { .. }),
+        "the leave waits behind the queued message: {leave:?}"
+    );
+    assert!(!carol.leave_in_progress(&group_id).unwrap());
+    assert_eq!(
+        carol.send(step_down_and_leave()).await.unwrap(),
+        leave,
+        "asking again returns the queued leave"
+    );
+
+    let drained = carol.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(
+            drained.as_slice(),
+            [
+                SendResult::ApplicationMessage { .. },
+                SendResult::LeaveRequested { .. }
+            ]
+        ),
+        "the message, then the recorded leave: {drained:?}"
+    );
+    let mut published = Published::default();
+    for result in drained {
+        published.take(&mut carol, &group_id, result).await;
+    }
+    assert!(carol.leave_in_progress(&group_id).unwrap());
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "the drain retires the leave it recorded"
+    );
+
+    carol.advance_convergence(&group_id).await.unwrap();
+    let mut staged = carol.drain_auto_publish();
+    assert_eq!(staged.len(), 1, "the step-down");
+    let step_down = staged.remove(0);
+    carol.confirm_published(step_down.pending).await.unwrap();
+    published.messages.push(route(step_down.msg, &group_id));
+    carol.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(carol.drain_auto_proposals().len(), 1, "the SelfRemove");
+
+    assert_eq!(
+        read(&mut alice, &group_id, &published.messages).await,
+        vec![
+            format!("sent before stepping down@{epoch}"),
+            format!("-> {}", epoch + 1)
+        ],
+        "alice reads the message carol sent before stepping down"
+    );
 }
 
 /// An invite made while a message waits in the queue is committed after it,

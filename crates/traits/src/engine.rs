@@ -306,7 +306,10 @@ pub enum SendIntent {
     /// SelfRemove, re-driving either if it does not land. Refused with
     /// [`crate::error::EngineError::AdminDepletion`] for the last active
     /// admin. A non-admin's call is a [`SendIntent::Leave`], and a call on a
-    /// group that already has a leave request returns that request.
+    /// group that already has a leave request returns that request. An
+    /// admin's call made while an intent queued earlier still waits is
+    /// queued behind it ([`SendResult::Queued`]), and the drain records the
+    /// request when it reaches it.
     StepDownAndLeave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.
     ///

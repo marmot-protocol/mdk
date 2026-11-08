@@ -722,6 +722,15 @@ pub(crate) enum LeaveRedrive {
     SteppedDown,
 }
 
+/// Where an admin's leave reaches `do_request_admin_leave`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdminLeaveEntry {
+    /// A send, which queues behind an intent queued earlier.
+    Send,
+    /// The drain preparing that queued leave.
+    Prepare,
+}
+
 /// What an `UpdateAppComponents` Commit does with proposals pending in the
 /// OpenMLS proposal store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -965,10 +974,13 @@ impl<S: StorageProvider> Engine<S> {
         }
         // So is an admin's leave: the request is recorded before anything is
         // published, in any epoch state, and the leave re-drive stages its
-        // step-down and SelfRemove. Anyone else sends an ordinary Leave.
+        // step-down and SelfRemove. Behind an intent queued earlier it queues
+        // instead. Anyone else sends an ordinary Leave.
         let intent = match intent {
             SendIntent::StepDownAndLeave { group_id } => {
-                if let Some(requested) = self.do_request_admin_leave(&group_id)? {
+                if let Some(requested) =
+                    self.do_request_admin_leave(&group_id, AdminLeaveEntry::Send)?
+                {
                     return Ok(requested);
                 }
                 SendIntent::Leave { group_id }
@@ -1401,12 +1413,13 @@ impl<S: StorageProvider> Engine<S> {
                     self.queued_intent_by_pending
                         .insert(*pending, (record.group_id.clone(), record.id.clone()));
                 }
-                // The settled state already holds the change, and with nothing
+                // The settled state already holds the change, or the durable
+                // leave request now holds an admin's leave, and with nothing
                 // to publish no confirmation will retire the record. Kept, it
                 // would wait forever and hold every later send behind it. If
                 // the delete fails, the record stays for the next drain to
                 // retire: failing this one would drop what it has prepared.
-                SendResult::NoChange { .. } => {
+                SendResult::NoChange { .. } | SendResult::LeaveRequested { .. } => {
                     if self
                         .storage
                         .delete_queued_outbound_intent(&record.id)
@@ -1424,7 +1437,6 @@ impl<S: StorageProvider> Engine<S> {
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
                 | SendResult::DisbandRequested { .. }
-                | SendResult::LeaveRequested { .. }
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);

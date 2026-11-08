@@ -80,9 +80,10 @@ impl AppClient {
     }
 
     /// Whether this Leave first takes its account off the admin list (D99),
-    /// through the engine's `StepDownAndLeave`. Sign-out never does. With device groups off an admin's Leave is
-    /// refused here, before any choice, push token removal or departure, as
-    /// before 0.15: the host demotes first (mdk#3014 interim).
+    /// through the engine's `StepDownAndLeave`. Sign-out never does. With
+    /// device groups off an admin's Leave is refused here, before any choice,
+    /// push token removal or departure, as before 0.15: the host demotes
+    /// first (mdk#3014 interim).
     pub(super) fn leave_steps_admin_down(
         &self,
         group_id: &GroupId,

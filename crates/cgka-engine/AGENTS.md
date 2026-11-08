@@ -343,7 +343,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   durable is the torn two-send leave this replaces. The last active admin is refused with `AdminDepletion` and
   nothing is written; a non-admin's call becomes `SendIntent::Leave`; a call on a group that already has a request
   returns it. Plain `Leave` from an admin stays `AdminCannotSelfRemove`, so only callers that opt in get the step-down.
-  Pinned by `invite_leave::admin_leave` and marmot-app's `rival_branch_leave` and `linked_device_chats` admin leaves.
+  A call made while an intent queued earlier still awaits preparation queues behind it instead (mdk#2842), and the
+  drain records the request when it reaches that row and retires it: a request recorded first would hold the drain to
+  the leave, and the removal would discard the earlier intent unsent. Pinned by `invite_leave::admin_leave`,
+  `queued_send_order`, and marmot-app's `rival_branch_leave` and `linked_device_chats` admin leaves.
 - **A leave request owns its admin step-down (mdk#3014).** While a durable `LeaveRequest` exists, `next_leave_step`
   decides the next step on a `Stable` epoch: an account the selected branch makes an admin again stages a step-down
   (`stage_leave_step_down`: the selected branch's admin list minus itself, never the lost Commit's bytes, and only

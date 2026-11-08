@@ -133,12 +133,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
     is queued behind them, so the sender's generations follow its send order and a member reading the history in
     `created_at` order decrypts every message (mdk#2842). Each other intent kind keeps that order behind a queued
-    row: a member's leave goes out after its queued message, an invite or a removal is committed after the
-    committer's queued message (the invitee never reads it, the removed member does), and a message made behind a
-    queued group change is encrypted after it. Also an epoch-pinned send behind a queued one is refused, not queued;
-    a drained intent awaiting its outcome holds no later send; and a queued change the settled state already holds is
-    retired at drain, so it holds no later send. The device-group refusals behind a queued row are in
-    `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
+    row: a member's leave goes out after its queued message, and so does an admin's `StepDownAndLeave`, whose leave
+    request the drain records only on reaching it; an invite or a removal is committed after the committer's queued
+    message (the invitee never reads it, the removed member does), and a message made behind a queued group change is
+    encrypted after it. Also an epoch-pinned send behind a queued one is refused, not queued; a drained intent awaiting
+    its outcome holds no later send; and a queued change the settled state already holds is retired at drain, so it
+    holds no later send. The device-group refusals behind a queued row are in `account_devices/link_device.rs` and
+    `account_devices/device_roster.rs`.
 
   `queued_send_order::a_leave_behind_a_queued_message_goes_out_after_it` also owns the Leaving gate that closes
   within one drain: the prepared App/Leave prefix returns while a later accepted app stays queued.

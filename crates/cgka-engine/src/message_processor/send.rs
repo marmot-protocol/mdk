@@ -4,7 +4,7 @@
 //! convergence inputs before any OpenMLS mutation.
 
 use super::route_wrapped_group_message;
-use super::{LeaveRedrive, LeaveStep, PendingProposals};
+use super::{AdminLeaveEntry, LeaveRedrive, LeaveStep, OutboundQueueReason, PendingProposals};
 use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -158,10 +158,11 @@ impl<S: StorageProvider> Engine<S> {
                     .await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
-            // `do_send` answers this before anything is queued; kept whole
-            // here so no path can send it as a plain Leave from an admin.
+            // The drain reaching an admin's leave that `do_send` queued behind
+            // earlier intents. Kept whole so no path can send it as a plain
+            // Leave from an admin.
             SendIntent::StepDownAndLeave { group_id } => {
-                match self.do_request_admin_leave(&group_id)? {
+                match self.do_request_admin_leave(&group_id, AdminLeaveEntry::Prepare)? {
                     Some(requested) => Ok(requested),
                     None => self.do_send_leave(group_id).await,
                 }
@@ -1112,9 +1113,16 @@ impl<S: StorageProvider> Engine<S> {
     /// refused, possibly exposed or superseded is staged again rather than
     /// leaving the account demoted with no leave. `None` when this account
     /// is not an active admin: the caller sends an ordinary Leave.
+    ///
+    /// A send made while an intent queued earlier still waits for the drain
+    /// is queued behind it instead, as a Leave is (mdk#2842). Recorded now,
+    /// the request would hold the drain to the leave, and the removal would
+    /// discard the earlier intent unsent. The drain records the request when
+    /// it reaches the queued leave.
     pub(crate) fn do_request_admin_leave(
         &mut self,
         group_id: &GroupId,
+        entry: AdminLeaveEntry,
     ) -> Result<Option<SendResult>, EngineError> {
         if let Some(request) = self.load_leave_request_state(group_id)? {
             self.schedule_pending_convergence_group(group_id);
@@ -1130,6 +1138,30 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::AdminDepletion {
                 group_id: group_id.clone(),
             });
+        }
+        if entry == AdminLeaveEntry::Send
+            && self.has_queued_intent_awaiting_preparation(group_id)?
+        {
+            let queued = self
+                .storage
+                .list_queued_outbound_intents(group_id)?
+                .into_iter()
+                .find(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }));
+            if let Some(record) = queued {
+                return Ok(Some(SendResult::Queued {
+                    group_id: group_id.clone(),
+                    intent_id: record.id,
+                }));
+            }
+            let queued = self.queue_outbound_intent(
+                group_id.clone(),
+                SendIntent::StepDownAndLeave {
+                    group_id: group_id.clone(),
+                },
+                0,
+            )?;
+            OutboundQueueReason::EarlierIntentQueued.trace();
+            return Ok(Some(queued));
         }
         let request = LeaveRequest {
             group_id: group_id.clone(),
