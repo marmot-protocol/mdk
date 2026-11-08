@@ -7222,11 +7222,13 @@ fn daemon_execute_failures_preserve_admission_state_and_output_channels() {
                         .set_nonblocking(false)
                         .expect("blocking daemon fixture stream");
                     stream.set_read_timeout(Some(POLL_TIMEOUT)).unwrap();
+                    // Read one newline-terminated frame, as wnd does; the
+                    // client does not half-close after sending it.
                     let mut request = Vec::new();
-                    stream
-                        .read_to_end(&mut request)
+                    BufReader::new(&stream)
+                        .read_until(b'\n', &mut request)
                         .expect("read complete execute request");
-                    assert!(!request.is_empty());
+                    assert!(request.ends_with(b"\n"));
                     if failure == "busy" {
                         stream.write_all(b"{\"error\":{\"code\":\"server_busy\",\"message\":\"daemon connection capacity is busy\"}}\n").expect("busy frame");
                     }

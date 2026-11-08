@@ -1917,14 +1917,11 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(socket).expect("bind daemon socket");
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon request");
-            let mut request = Vec::new();
-            use tokio::io::AsyncReadExt;
-            stream
-                .read_to_end(&mut request)
+            let request = crate::daemon::read_daemon_request(&mut stream)
                 .await
                 .expect("read daemon request");
             assert!(
-                !request.is_empty(),
+                matches!(request, crate::daemon::DaemonRequest::Execute { .. }),
                 "client must send an execute request before daemon disappears"
             );
             // Drop without writing a response. This simulates a daemon crash after
