@@ -19,8 +19,14 @@
 //!   (`deleted_through`), even while it shows a newer version, so a relay that
 //!   kept an older version cannot restore it. Rows that carry a deletion time
 //!   are evicted after other rows, but never the row just written.
-//! - Once a refresh has verified events, one follow-up query asks their author
-//!   for deletions the first query could not attribute.
+//! - The first query goes to the reference's relay hints and the directory
+//!   relays. When it finishes without the target, one supplementary query goes
+//!   to the deployment's discovery indexers and the author's NIP-65 write
+//!   relays (`naddr` author, or an `nevent` author hint): cached, else read
+//!   from the indexers. A hit on the first query adds no round trip.
+//! - Once a refresh has verified events, one follow-up query asks their author,
+//!   on every relay this refresh queried, for deletions the first query could
+//!   not attribute.
 //! - Not-found results and fetch failures are never stored. A fetch where a
 //!   relay did not complete may admit what it found, but never confirms a row,
 //!   and an event-ID row it admits is rechecked after 30 minutes.
@@ -40,10 +46,13 @@ use cgka_traits::storage::StorageError;
 use nostr::event::Event;
 use nostr::nips::nip01::Coordinate;
 use nostr::nips::nip19::{FromBech32, Nip19};
-use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
+use nostr::prelude::{EventId, Filter, Kind, PublicKey, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use transport_nostr_peeler::NostrTransportEvent;
 
+use super::published_records::relay_list_state_from_event;
 use super::resources::{DirectoryAccount, DirectoryResources};
+use super::search::SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR;
 use super::{Directory, unix_now_seconds};
 
 /// Maximum references in one cached batch read.
@@ -65,6 +74,11 @@ const MAX_COOLDOWN_ENTRIES: usize = 256;
 const TOUCH_INTERVAL_SECONDS: u64 = 60 * 60;
 const MAX_HINT_RELAYS: usize = 2;
 const MAX_QUERY_RELAYS: usize = 6;
+/// Endpoints in the supplementary query: every discovery indexer first, then
+/// author write relays in the room left.
+const MAX_SUPPLEMENTARY_RELAYS: usize = 8;
+/// Kind-10002 events read for one author's relay list.
+const MAX_AUTHOR_RELAY_LIST_EVENTS: usize = 4;
 const MAX_FETCHED_EVENTS: usize = 64;
 /// Limit on the unattributed kind-5 query for an event ID. A full answer may
 /// hide the author's deletion behind other keys' requests.
@@ -101,6 +115,19 @@ enum Target {
 struct Reference {
     target: Target,
     relay_hints: Vec<TransportEndpoint>,
+    /// An `nevent` author. Like relay hints it only routes queries: it never
+    /// decides which event is admitted or which deletions count.
+    author_hint: Option<PublicKey>,
+}
+
+impl Reference {
+    /// Whose NIP-65 write relays the supplementary query may ask.
+    fn routing_author(&self) -> Option<PublicKey> {
+        match &self.target {
+            Target::Coordinate(coordinate) => Some(coordinate.public_key),
+            Target::EventId(_) => self.author_hint,
+        }
+    }
 }
 
 fn is_replaceable(kind: Kind) -> bool {
@@ -143,6 +170,7 @@ fn parse_reference(raw: &str) -> Option<Reference> {
         return Some(Reference {
             target: Target::EventId(EventId::from_hex(raw).ok()?),
             relay_hints: Vec::new(),
+            author_hint: None,
         });
     }
     let hints = |relays: &[RelayUrl]| {
@@ -155,10 +183,12 @@ fn parse_reference(raw: &str) -> Option<Reference> {
         Nip19::EventId(id) => Some(Reference {
             target: Target::EventId(id),
             relay_hints: Vec::new(),
+            author_hint: None,
         }),
         Nip19::Event(event) => Some(Reference {
             target: Target::EventId(event.event_id),
             relay_hints: hints(&event.relays),
+            author_hint: event.author,
         }),
         Nip19::Coordinate(naddr) => {
             let kind = naddr.coordinate.kind;
@@ -167,6 +197,7 @@ fn parse_reference(raw: &str) -> Option<Reference> {
             supported.then(|| Reference {
                 target: Target::Coordinate(naddr.coordinate.clone()),
                 relay_hints: hints(&naddr.relays),
+                author_hint: None,
             })
         }
         _ => None,
@@ -313,6 +344,36 @@ fn follow_up_deletions(target: &Target, stored: Option<&Event>, fetched: &[Event
             }
             vec![deletions(coordinate.public_key).events(versions).limit(8)]
         }
+    }
+}
+
+/// Verified events from one or more public-event reads, and whether every
+/// relay in every read finished.
+#[derive(Debug)]
+struct Fetched {
+    events: Vec<Event>,
+    complete: bool,
+}
+
+impl Fetched {
+    fn new(events: Vec<Event>, complete: bool) -> Self {
+        Self { events, complete }
+    }
+
+    /// Add another read's events, once each, and its completeness.
+    fn merge(&mut self, other: Fetched) {
+        let mut seen = self
+            .events
+            .iter()
+            .map(|event| event.id)
+            .collect::<HashSet<_>>();
+        self.events.extend(
+            other
+                .events
+                .into_iter()
+                .filter(|event| seen.insert(event.id)),
+        );
+        self.complete &= other.complete;
     }
 }
 
@@ -675,10 +736,15 @@ impl<R: DirectoryResources> Directory<R> {
 
     /// Refresh one reference from relays when it is missing or stale, then
     /// return its local state. A failed or empty fetch keeps prior content.
+    ///
+    /// `discovery_indexers` are the deployment's public indexers, used only by
+    /// the supplementary query when the first one misses. They are empty on a
+    /// neutral deployment, which then never dials an indexer.
     pub async fn resolve_public_event_preview(
         &self,
         account: &DirectoryAccount,
         reference: &str,
+        discovery_indexers: &[TransportEndpoint],
     ) -> Result<PublicEventPreviewRead, DirectoryError> {
         let read = |preview| PublicEventPreviewRead {
             reference: reference.to_owned(),
@@ -712,18 +778,12 @@ impl<R: DirectoryResources> Directory<R> {
         let stored_event = stored
             .as_ref()
             .and_then(|stored| stored.row.event.as_deref());
-        let relays = self.public_event_query_relays(parsed.relay_hints);
-        let fetched = self
-            .relay_plane
-            .fetch_public_events(
-                relays.clone(),
-                parsed.target.filters(stored_event),
-                MAX_FETCHED_EVENTS,
-            )
+        let (fetched, relays) = self
+            .fetch_public_event_reference(&parsed, stored_event, discovery_indexers)
             .await;
         // One follow-up asks the verified author about deletions the first
-        // query could not attribute. If it does not finish, nothing it should
-        // have covered is confirmed.
+        // query could not attribute, on every relay queried so far. If it does
+        // not finish, nothing it should have covered is confirmed.
         let fetched = match fetched {
             Ok(mut fetched) => {
                 let filters = follow_up_deletions(&parsed.target, stored_event, &fetched.events);
@@ -733,10 +793,7 @@ impl<R: DirectoryResources> Directory<R> {
                         .fetch_public_events(relays, filters, MAX_FETCHED_EVENTS)
                         .await
                     {
-                        Ok(more) => {
-                            fetched.events.extend(more.events);
-                            fetched.complete &= more.complete;
-                        }
+                        Ok(more) => fetched.merge(Fetched::new(more.events, more.complete)),
                         Err(_) => fetched.complete = false,
                     }
                 }
@@ -806,6 +863,165 @@ impl<R: DirectoryResources> Directory<R> {
                 relays.push(relay);
             }
         }
+        relays
+    }
+
+    /// The first query, then, only when it finished without the target, one
+    /// supplementary query to the discovery indexers and the author's write
+    /// relays. Returns the merged fetch and every relay queried, for the
+    /// deletion follow-up.
+    ///
+    /// The merged fetch is complete only when every query it took was. A
+    /// supplementary query that fails or stays partial never confirms absence,
+    /// and neither does skipping an author route whose relay list could not be
+    /// read in full.
+    async fn fetch_public_event_reference(
+        &self,
+        parsed: &Reference,
+        stored_event: Option<&Event>,
+        discovery_indexers: &[TransportEndpoint],
+    ) -> (Result<Fetched, String>, Vec<TransportEndpoint>) {
+        let filters = parsed.target.filters(stored_event);
+        let relays = self.public_event_query_relays(parsed.relay_hints.clone());
+        let first = self
+            .relay_plane
+            .fetch_public_events(relays.clone(), filters.clone(), MAX_FETCHED_EVENTS)
+            .await
+            .map(|read| Fetched::new(read.events, read.complete));
+        if first.as_ref().is_ok_and(|first| {
+            first
+                .events
+                .iter()
+                .any(|event| parsed.target.matches(event))
+        }) {
+            return (first, relays);
+        }
+
+        let (author_relays, author_route_complete) = self
+            .public_event_author_relays(parsed.routing_author(), discovery_indexers)
+            .await;
+        let supplementary =
+            self.public_event_supplementary_relays(&relays, discovery_indexers, author_relays);
+        let mut queried = relays;
+        let merged = if supplementary.is_empty() {
+            first
+        } else {
+            let more = self
+                .relay_plane
+                .fetch_public_events(supplementary.clone(), filters, MAX_FETCHED_EVENTS)
+                .await
+                .map(|read| Fetched::new(read.events, read.complete));
+            queried.extend(supplementary);
+            match (first, more) {
+                (Ok(mut first), Ok(more)) => {
+                    first.merge(more);
+                    Ok(first)
+                }
+                (Ok(mut only), Err(_)) | (Err(_), Ok(mut only)) => {
+                    only.complete = false;
+                    Ok(only)
+                }
+                (Err(error), Err(_)) => Err(error),
+            }
+        };
+        let merged = merged.map(|mut merged| {
+            merged.complete &= author_route_complete;
+            merged
+        });
+        (merged, queried)
+    }
+
+    /// Safe NIP-65 write relays for `author`, and whether the relay list read
+    /// finished. A cached list is used as it is; otherwise one kind-10002 read
+    /// goes to the discovery indexers only. A failed or partial read skips the
+    /// author route: it reports no relays and is not complete. Nothing read
+    /// here is cached, and the inbox list (kind 10050) is never consulted.
+    async fn public_event_author_relays(
+        &self,
+        author: Option<PublicKey>,
+        discovery_indexers: &[TransportEndpoint],
+    ) -> (Vec<TransportEndpoint>, bool) {
+        let Some(author) = author else {
+            return (Vec::new(), true);
+        };
+        let author_hex = author.to_hex();
+        if let Ok(cached) = self.cached_relay_list_status(&author_hex)
+            && cached.nip65.created_at > 0
+        {
+            return (
+                self.safe_author_write_relays(cached.nip65.write_relays),
+                true,
+            );
+        }
+        let indexers = self
+            .relay_plane
+            .retain_safe_discovered_endpoints(discovery_indexers.to_vec(), "public event indexer");
+        if indexers.is_empty() {
+            return (Vec::new(), true);
+        }
+        let filter = Filter::new()
+            .kind(Kind::RelayList)
+            .author(author)
+            .limit(MAX_AUTHOR_RELAY_LIST_EVENTS);
+        let read = self
+            .relay_plane
+            .fetch_public_events(indexers, vec![filter], MAX_AUTHOR_RELAY_LIST_EVENTS)
+            .await;
+        let read = match read {
+            Ok(read) if read.complete => read,
+            _ => return (Vec::new(), false),
+        };
+        let newest = read
+            .events
+            .iter()
+            .filter(|event| event.kind == Kind::RelayList && event.pubkey == author)
+            .max_by_key(|event| (event.created_at, std::cmp::Reverse(event.id)));
+        let write_relays = newest
+            .and_then(|event| NostrTransportEvent::from_nostr_event(event).ok())
+            .and_then(|event| relay_list_state_from_event(&event))
+            .map(|state| state.write_relays)
+            .unwrap_or_default();
+        (self.safe_author_write_relays(write_relays), true)
+    }
+
+    /// An author's write relays are their own published data: each one passes
+    /// the discovered-endpoint safety rule, and one bad entry drops only itself.
+    fn safe_author_write_relays(&self, relays: Vec<String>) -> Vec<TransportEndpoint> {
+        self.relay_plane.retain_safe_discovered_endpoints(
+            relays.into_iter().map(TransportEndpoint).collect(),
+            "public event author write relay",
+        )
+    }
+
+    /// The supplementary query's endpoints: every safe discovery indexer, then
+    /// at most four author write relays in the room left, at most eight in
+    /// all. Endpoints the first query already asked are skipped, so an
+    /// author's relay that duplicates one does not use up a slot.
+    pub(crate) fn public_event_supplementary_relays(
+        &self,
+        queried: &[TransportEndpoint],
+        discovery_indexers: &[TransportEndpoint],
+        author_relays: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let queried = self
+            .relay_plane
+            .retain_safe_discovered_endpoints(queried.to_vec(), "public event queried relay");
+        let fresh = |relays: Vec<TransportEndpoint>, context| {
+            self.relay_plane
+                .retain_safe_discovered_endpoints(relays, context)
+                .into_iter()
+                .filter(|relay| !queried.contains(relay))
+                .collect::<Vec<_>>()
+        };
+        let mut relays = fresh(discovery_indexers.to_vec(), "public event indexer");
+        relays.truncate(MAX_SUPPLEMENTARY_RELAYS);
+        let room = MAX_SUPPLEMENTARY_RELAYS - relays.len();
+        let author_relays = fresh(author_relays, "public event author write relay")
+            .into_iter()
+            .filter(|relay| !relays.contains(relay))
+            .take(SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR.min(room))
+            .collect::<Vec<_>>();
+        relays.extend(author_relays);
         relays
     }
 

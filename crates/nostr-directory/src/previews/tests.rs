@@ -108,6 +108,55 @@ fn references_parse_to_canonical_targets() {
 }
 
 #[test]
+fn authors_route_queries_but_never_change_identity() {
+    let keys = Keys::generate();
+    let claimed = Keys::generate().public_key();
+    let note = signed(&keys, 1, 10, "hi", Vec::new());
+
+    // Bare IDs and `note1` carry no author.
+    for raw in [note.id.to_hex(), note.id.to_bech32().unwrap()] {
+        let parsed = parse_reference(&raw).unwrap();
+        assert!(parsed.relay_hints.is_empty());
+        assert_eq!(parsed.routing_author(), None, "{raw}");
+    }
+    // An `nevent` author is kept as a routing hint only: the target and cache
+    // key are the same as for the bare ID, whoever it names.
+    let nevent = Nip19Event::new(note.id)
+        .author(claimed)
+        .to_bech32()
+        .unwrap();
+    let parsed = parse_reference(&nevent).unwrap();
+    assert_eq!(parsed.routing_author(), Some(claimed));
+    assert_eq!(parsed.target, Target::EventId(note.id));
+    assert_eq!(
+        parsed.target.cache_key(),
+        format!("event:{}", note.id.to_hex())
+    );
+    // The author hint never admits the claimed author's own events.
+    let claimed_event = signed(&Keys::generate(), 1, 10, "hi", Vec::new());
+    assert!(!parsed.target.matches(&claimed_event));
+    assert!(parsed.target.matches(&note));
+    // An `naddr` routes by its coordinate author.
+    let parsed = parse_reference(&naddr(&coordinate(&keys, 30023, "entry"))).unwrap();
+    assert_eq!(parsed.routing_author(), Some(keys.public_key()));
+}
+
+#[test]
+fn merged_reads_keep_each_event_once_and_completeness_of_all() {
+    let keys = Keys::generate();
+    let a = signed(&keys, 1, 10, "a", Vec::new());
+    let b = signed(&keys, 1, 11, "b", Vec::new());
+    let mut merged = Fetched::new(vec![a.clone()], true);
+    merged.merge(Fetched::new(vec![a.clone(), b.clone()], true));
+    assert_eq!(merged.events, vec![a.clone(), b.clone()]);
+    assert!(merged.complete);
+    merged.merge(Fetched::new(Vec::new(), false));
+    assert!(!merged.complete);
+    merged.merge(Fetched::new(Vec::new(), true));
+    assert!(!merged.complete, "one partial read keeps the merge partial");
+}
+
+#[test]
 fn event_id_admission_requires_exact_match_and_author_deletion() {
     let keys = Keys::generate();
     let note = signed(&keys, 1, 10, "note", Vec::new());
