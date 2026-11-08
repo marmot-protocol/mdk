@@ -2400,6 +2400,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         pending_chat_relist: false,
         pending_mark_read: false,
         loading_chat: None,
+        timeline_load_generation: 0,
         searching_users: None,
         searching_messages: None,
         loading_group_detail: None,
@@ -2413,7 +2414,19 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         group_diagnostics: None,
         input: Input::default(),
         streaming: None,
+        pending_invite_notices: Default::default(),
+        invite_notice_revision: 0,
+        view_status_action: None,
+        user_search_request: None,
+        message_search_request: None,
+        group_detail_request: None,
+        invites_request: None,
         status: String::new(),
+        status_ownership: StatusOwnership::default(),
+        flick_status_owner: None,
+        stream_status_owner: None,
+        daemon_start_status_owner: None,
+        daemon_notice: DaemonNotice::default(),
         popup: None,
         pending_full_repaint: false,
         group_detail: None,
@@ -2430,10 +2443,13 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
 /// child's recorder. Do not fold the marker: it must not change UI state.
 fn finish_queued_effects(app: &mut TuiApp) {
     const MARKER: &str = "test-fifo-completion-marker";
-    app.effects.enqueue(Effect::MarkRead {
-        account: "aa".repeat(32),
-        group: MARKER.to_owned(),
-    });
+    app.enqueue_effect(
+        Effect::MarkRead {
+            account: "aa".repeat(32),
+            group: MARKER.to_owned(),
+        },
+        FeedbackPermission::Silent,
+    );
     loop {
         let done = app
             .effects
@@ -3031,6 +3047,32 @@ fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
         assert!(requested.ends_with("stream compose-append --stream-id stream-197 queued"));
         assert!(requested.contains(&format!("--account {account_id}")));
     }
+    // Automatic retry feedback remains owned by typed text across retries;
+    // a newer editing instruction revokes feedback without discarding the flush.
+    let (_retry_dir, retry_client) =
+        test_json_client(r#"{"ok":false,"error":{"message":"retry offline"}}"#);
+    app.client = retry_client;
+    app.handle_streaming_key(char_key('x')).unwrap();
+    app.streaming.as_mut().unwrap().last_flush = Instant::now() - STREAM_APPEND_FLUSH_INTERVAL;
+    app.tick();
+    assert_eq!(app.status, "stream append failed: retry offline");
+    let (_again_dir, again_client) =
+        test_json_client(r#"{"ok":false,"error":{"message":"still offline"}}"#);
+    app.client = again_client;
+    app.streaming.as_mut().unwrap().last_flush = Instant::now() - STREAM_APPEND_FLUSH_INTERVAL;
+    app.tick();
+    assert_eq!(app.status, "stream append failed: still offline");
+    app.handle_streaming_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    let (_ready_dir, ready_client) = test_json_client(r#"{"ok":true,"result":{}}"#);
+    app.client = ready_client;
+    app.streaming.as_mut().unwrap().last_flush = Instant::now() - STREAM_APPEND_FLUSH_INTERVAL;
+    app.tick();
+    assert_eq!(
+        app.status,
+        "stream editing is append-only in this preview; Esc cancels"
+    );
+    assert!(app.streaming.as_ref().unwrap().pending_text.is_empty());
 }
 
 #[test]
@@ -3886,6 +3928,24 @@ fn a_failed_mark_read_re_arms_for_the_next_tick() {
     app.pending_mark_read = true;
 
     app.tick();
+    // A real feed result is folded before the queued child's completion. Its
+    // idle notice must not revoke that child's background error eligibility.
+    let (tx, rx) = mpsc::channel();
+    app.chat_subscription = Some(ChatSubscription {
+        account_id: account_id.clone(),
+        include_archived: false,
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Result(
+        serde_json::json!({"type":"chat","chat":{
+            "group_id":group_id,"profile":{"name":"renamed while marking read"},"unread_count":3
+        }}),
+    ))
+    .unwrap();
+    assert!(app.drain_chat_subscription());
+    assert_eq!(app.chats[0].name, "renamed while marking read");
+    assert_eq!(app.status, "live chat update: chats=1");
     // The mark-read runs off-loop; folding its failed result re-arms the flag.
     app.settle_effects(1);
 
@@ -3955,6 +4015,8 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     // Establish ownership through the real full-result writer,
                     // then move selection away without changing the loaded rows.
                     app.apply_effect_done(EffectDone {
+                        request_id: RequestId::default(),
+                        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                         effect: Effect::Relist {
                             account: list_owner.clone(),
                             include_archived: false,
@@ -3965,6 +4027,8 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     app.selected_account = 1 - app.selected_account;
                     app.status = "current context".to_owned();
                     app.apply_effect_done(EffectDone {
+                        request_id: RequestId::default(),
+                        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                         effect: Effect::MarkRead {
                             account: account_a.clone(),
                             group: group.clone(),
@@ -4127,10 +4191,13 @@ fn chat_list_b_after_failed_return_to_a_with_daemon(
         // A background list recovery adopts B's rows without replacing A's
         // loaded pane. Foreground switching now correctly clears A's pane.
         app.selected_account = 1;
-        app.effects.enqueue(Effect::Relist {
-            account: b.clone(),
-            include_archived: false,
-        });
+        app.enqueue_effect(
+            Effect::Relist {
+                account: b.clone(),
+                include_archived: false,
+            },
+            app.background_feedback(),
+        );
         app.settle_effects(1);
     }
     assert_eq!(app.chats[0].name, "B list");
@@ -4184,6 +4251,8 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     app.status = "draft saved".to_owned();
 
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4263,6 +4332,8 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     let current_group_child = app.group_state_subscription.as_ref().unwrap().child.id();
     app.status = "draft saved".to_owned();
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a,
             include_archived: false,
@@ -4328,9 +4399,12 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     );
     app.refresh_messages().expect("open the recovered A chat");
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: foreground_account.clone(),
             group,
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({"messages":[{
             "message_id":"A recovered row","direction":"received","from":"peer",
@@ -4369,8 +4443,14 @@ fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
             if login {
                 app.screen = Screen::Login(LoginMode::NsecEntry);
             }
-            app.status = "current prompt".to_owned();
+            app.set_status(if login {
+                "current prompt".to_owned()
+            } else {
+                String::new()
+            });
             app.apply_effect_done(EffectDone {
+                request_id: RequestId::default(),
+                feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                 effect: Effect::Relist {
                     account: a.clone(),
                     include_archived: false,
@@ -4410,6 +4490,8 @@ fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
             }
             app.client = client;
             app.apply_effect_done(EffectDone {
+                request_id: RequestId::default(),
+                feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                 effect: Effect::Relist {
                     account: a.clone(),
                     include_archived: false,
@@ -4451,6 +4533,8 @@ fn relist_feed_recovery_respects_daemon_and_local_signing_lifecycle() {
         }
         let status = app.status.clone();
         app.apply_effect_done(EffectDone {
+            request_id: RequestId::default(),
+            feedback: FeedbackPermission::Background(app.status_ownership.owner()),
             effect: Effect::Relist {
                 account: a.clone(),
                 include_archived: false,
@@ -4502,7 +4586,14 @@ fn chat_feed_mutations_follow_loaded_data_owner_after_a_failed_account_switch() 
                 "A feed must not merge into B's retained list"
             );
         }
-        // Result scoping must not hide lifecycle/error handling.
+        // Newer foreground feedback survives errors, while lifecycle cleanup
+        // and idle error reporting remain independent of the retained line.
+        let foreground = app.status.clone();
+        tx.send(SubscriptionEvent::Error("older feed error".to_owned()))
+            .unwrap();
+        assert!(app.drain_chat_subscription());
+        assert_eq!(app.status, foreground);
+        app.set_status(String::new());
         tx.send(SubscriptionEvent::Error("feed offline".to_owned()))
             .expect("error");
         tx.send(SubscriptionEvent::Ended).expect("end");
@@ -4564,6 +4655,8 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
     let retained = app.chats.clone();
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4573,6 +4666,8 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     assert_eq!(app.chats, retained);
     assert_eq!(app.chats_account_id.as_deref(), Some(b.as_str()));
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4586,6 +4681,8 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
     for (producer, expected) in [(b, 5), (a, 0)] {
         app.apply_effect_done(EffectDone {
+            request_id: RequestId::default(),
+            feedback: FeedbackPermission::Background(app.status_ownership.owner()),
             effect: Effect::MarkRead {
                 account: producer,
                 group: group.clone(),
@@ -4639,6 +4736,8 @@ fn complete_relist_can_recover_an_initial_failed_load_without_an_owner() {
     assert_eq!(app.chats[0].name, "initial retry");
     assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::MarkRead { account: a, group },
         result: Ok(vec![
             serde_json::json!({"unread_count":0,"has_unread":false}),
@@ -4690,6 +4789,8 @@ fn a_search_completion_settles_after_its_chat_feed_removes_the_loaded_pane() {
     let group = "cc".repeat(32);
     let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4753,7 +4854,7 @@ fn group_diagnostic_completions_belong_to_the_loaded_account_and_group() {
             app.messages_group_id = Some(pane_group.to_owned());
             let previous = GroupDiagnostics::unavailable(pane_group, "current diagnostics");
             app.group_diagnostics = Some(previous.clone());
-            app.apply_effect_done(EffectDone {
+            app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::Silent,
                 effect: Effect::GroupDiagnostics { account: account_a.clone(), group: group.clone() },
                 result: if fails { Err("diagnostics failed".to_owned()) } else {
                     Ok(vec![serde_json::json!({"group":{"group_id":group},"mls":{"epoch":7,"member_count":2}})])
@@ -4782,7 +4883,10 @@ fn group_detail_completions_do_not_replace_a_new_accounts_same_group_view() {
             app.screen = Screen::GroupDetail;
             app.loading_group_detail = Some(group.clone());
             app.status = LOADING_GROUP_DETAIL_STATUS.to_owned();
+            let request_id = *app.group_detail_request.get_or_insert(RequestId::default());
             app.apply_effect_done(EffectDone {
+                request_id,
+                feedback: FeedbackPermission::View(app.status_ownership.owner()),
                 effect: Effect::LoadGroupDetail {
                     account: account_a.clone(),
                     group: group.clone(),
@@ -4822,7 +4926,8 @@ fn user_search_completions_preserve_a_new_accounts_identical_query() {
         for fails in [false, true] {
             let mut app = test_tui_app(test_unused_client(), selected);
             app.open_user_search(Some("alice".to_owned()));
-            app.apply_effect_done(EffectDone {
+            let request_id = *app.user_search_request.get_or_insert(RequestId::default());
+            app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
                 effect: Effect::UserSearch { account: account_a.clone(), query: "alice".to_owned() },
                 result: if fails { Err("search failed".to_owned()) } else { Ok(vec![
                     serde_json::json!({"users":[{"account_id_hex":"dd","npub":"npubdd","radius":1,"matched_field":"name","match_quality":"exact"}]}),
@@ -4875,7 +4980,10 @@ fn message_search_completions_preserve_a_new_panes_identical_query() {
             app.messages_group_id = Some(pane_group.to_owned());
             app.open_message_search(Some("hello".to_owned()))
                 .expect("open search");
-            app.apply_effect_done(EffectDone {
+            let request_id = *app
+                .message_search_request
+                .get_or_insert(RequestId::default());
+            app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
                 effect: Effect::MessageSearch { account: account_a.clone(), group: group.clone(), query: "hello".to_owned() },
                 result: if fails { Err("search failed".to_owned()) } else {
                     Ok(vec![serde_json::json!({"messages":[{"message_id":"hit","direction":"received","from":"d","plaintext":"hello","timeline_at":1,"received_at":1}],"has_more_before":true})])
@@ -4922,16 +5030,22 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
         app.messages_group_id = Some(group.clone());
         app.open_message_search(Some("hello".to_owned()))
             .expect("search A pane");
+        let search_status_owner = app.status_ownership.owner();
         app.selected_account = 1;
         app.chats = vec![projected_chat(&group, "general", 0, Some(10))];
-        app.begin_timeline_load(account_b.clone(), group.clone());
+        app.begin_timeline_load(account_b.clone(), group.clone(), app.view_feedback());
         // A's search completes first in the worker's FIFO, after opening B
         // cleared the pane but before B's timeline has loaded.
         assert!(app.messages_account_id.is_none());
         // Unlike the replacement-query table, no B search has been submitted.
         let current_status = app.status.clone();
         assert!(rendered_buffer(&mut app).contains("searching..."));
+        let request_id = *app
+            .message_search_request
+            .get_or_insert(RequestId::default());
         app.apply_effect_done(EffectDone {
+            request_id,
+            feedback: FeedbackPermission::View(search_status_owner),
             effect: Effect::MessageSearch {
                 account: account_a.clone(),
                 group: group.clone(),
@@ -4965,9 +5079,12 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
             "completed work cannot leave the search spinner stranded"
         );
         app.apply_effect_done(EffectDone {
+            request_id: RequestId::default(),
+            feedback: FeedbackPermission::View(search_status_owner),
             effect: Effect::LoadTimeline {
                 account: account_b.clone(),
                 group: group.clone(),
+                generation: app.timeline_load_generation,
             },
             result: Ok(vec![
                 serde_json::json!({"messages":[],"has_more_before":false}),
@@ -5001,6 +5118,8 @@ fn mark_read_failure_keeps_the_badge_honest() {
     // A failed mark-read folds honestly: it never zeroes the badge locally and
     // re-arms so the next tick retries.
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::MarkRead {
             account: account_id,
             group: group_id,
@@ -7868,11 +7987,15 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     let switches_account = pane_account == Some(account_b.as_str());
                     if switches_account {
                         app.selected_account = 1;
-                        app.apply_effect_done(EffectDone {
+                        app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                             effect: Effect::Relist { account: account_b.clone(), include_archived: false },
                             result: Ok(vec![serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"general"}}]})]),
                         });
-                        app.begin_timeline_load(account_b.clone(), group.clone());
+                        app.begin_timeline_load(
+                            account_b.clone(),
+                            group.clone(),
+                            app.view_feedback(),
+                        );
                         assert!(app.messages_account_id.is_none());
                     }
                     if switches_account {
@@ -7881,7 +8004,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                             .recv_timeout(Duration::from_secs(5))
                             .expect("B timeline completed on the actual worker");
                         assert!(
-                            matches!(&done.effect, Effect::LoadTimeline {account, group: target}
+                            matches!(&done.effect, Effect::LoadTimeline {account, group: target, ..}
                             if account == &account_b && target == &group)
                         );
                         app.apply_effect_done(done);
@@ -7896,7 +8019,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         app.messages_account_id = pane_account.map(str::to_owned);
                         app.messages_group_id = pane_group.map(str::to_owned);
                     }
-                    app.apply_effect_done(EffectDone {
+                    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                         effect: Effect::Relist { account: app.selected_account_row().unwrap().account_id.clone(), include_archived: false },
                         result: Ok(vec![serde_json::json!({"chats":[{"group_id":selected_group,"profile":{"name":"general"}}]})]),
                     });
@@ -7905,7 +8028,10 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     }
                     let previous_len = app.timeline.len();
 
+                    let request_id = *app.group_detail_request.get_or_insert(RequestId::default());
                     app.apply_effect_done(EffectDone {
+                        request_id,
+                        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
                         effect,
                         result: match completion {
                             "with-id" => Ok(vec![
@@ -7919,7 +8045,13 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     // Observe the completion itself before the FIFO fence folds
                     // any eligible follow-up load; the recorder then proves its
                     // presence or absence without a timing window.
-                    let loading_on_completion = app.loading_chat.clone();
+                    let loading_on_completion = app.loading_chat.as_ref().map(|pending| {
+                        (
+                            pending.account.clone(),
+                            pending.group.clone(),
+                            pending.generation,
+                        )
+                    });
                     let completion_status = app.status.clone();
                     finish_queued_effects(&mut app);
                     let recorded =
@@ -7943,7 +8075,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     assert_eq!(
                         loading_on_completion
                             .as_ref()
-                            .map(|(account, group)| (account.as_str(), group.as_str())),
+                            .map(|(account, group, _)| (account.as_str(), group.as_str())),
                         (same_pane && selection_matches && completion == "without-id")
                             .then_some((account_a.as_str(), group.as_str())),
                         "only a matching-pane no-ID completion may reload the timeline"
@@ -8091,6 +8223,21 @@ fn load_older_messages_prepends_a_page_and_updates_the_cursor() {
         "page reported no more"
     );
     assert!(!app.timeline_scroll.loading_older, "in-flight flag cleared");
+    assert_eq!(app.status, "loaded 1 older message(s)");
+    let (tx, rx) = mpsc::channel();
+    app.chat_subscription = Some(ChatSubscription {
+        account_id: account_id.to_owned(),
+        include_archived: false,
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Error("history feed offline".to_owned()))
+        .unwrap();
+    assert!(app.drain_chat_subscription());
+    assert_eq!(
+        app.status, "chat subscription failed: history feed offline",
+        "ordinary history completion leaves idle feedback"
+    );
 }
 
 #[test]
@@ -8393,7 +8540,13 @@ fn messages_pane_shows_loading_while_an_open_chat_load_is_in_flight() {
     let mut app = test_tui_app(test_unused_client(), &account_id);
     app.focus = Focus::Messages;
     // An open-chat load is in flight and the pane has not yet folded any rows.
-    app.loading_chat = Some((account_id.clone(), "bb".repeat(32)));
+    app.timeline_load_generation = 1;
+    app.loading_chat = Some(PendingTimeline {
+        account: account_id.clone(),
+        group: "bb".repeat(32),
+        generation: app.timeline_load_generation,
+        feedback: FeedbackPermission::Silent,
+    });
     assert!(app.timeline.is_empty());
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -10864,7 +11017,13 @@ fn messages_pane_renders_the_three_empty_states() {
     app.screen = Screen::Main;
 
     // Loading a chat's timeline off the event loop.
-    app.loading_chat = Some((account_id.clone(), "gg".repeat(32)));
+    app.timeline_load_generation = 1;
+    app.loading_chat = Some(PendingTimeline {
+        account: account_id.clone(),
+        group: "gg".repeat(32),
+        generation: app.timeline_load_generation,
+        feedback: FeedbackPermission::Silent,
+    });
     assert!(rendered_buffer(&mut app).contains("loading messages..."));
 
     // Settled, no chat loaded.
@@ -12718,7 +12877,9 @@ fn flick_j_schedules_a_debounced_preview_and_fires_after_the_quiet_window() {
     app.tick();
     assert_eq!(app.flick_countdown, None, "the countdown cleared");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str()),
         "the highlighted chat's timeline load fired"
     );
@@ -12819,7 +12980,9 @@ fn rapid_flick_coalesces_to_one_load_of_the_final_selection() {
         app.tick();
     }
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
     app.settle_effects(1);
@@ -12869,7 +13032,9 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
         app.tick();
     }
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
     app.settle_effects(1); // fold the flick preview load
@@ -12914,8 +13079,10 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     app.activate_focus()
         .expect("open the same group as another account");
     assert_eq!(
-        app.loading_chat.as_ref(),
-        Some(&(other_account.clone(), group_b.clone()))
+        app.loading_chat
+            .as_ref()
+            .map(|pending| (&pending.account, &pending.group)),
+        Some((&other_account, &group_b))
     );
     assert!(app.timeline.is_empty());
     app.settle_effects(1);
@@ -12930,8 +13097,10 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     app.flick_countdown = Some(1);
     app.tick();
     assert_eq!(
-        app.loading_chat.as_ref(),
-        Some(&(account_id.clone(), group_b.clone()))
+        app.loading_chat
+            .as_ref()
+            .map(|pending| (&pending.account, &pending.group)),
+        Some((&account_id, &group_b))
     );
     app.settle_effects(1);
     finish_queued_effects(&mut app);
@@ -12968,7 +13137,9 @@ fn enter_supersedes_a_pending_flick_preview() {
     );
     assert_eq!(app.focus, Focus::Messages, "Enter moves focus to messages");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
 }
@@ -12999,6 +13170,8 @@ fn a_stale_group_detail_load_after_leaving_is_dropped() {
     app.loading_group_detail = None;
 
     app.apply_effect_done(EffectDone {
+        request_id: app.group_detail_request.unwrap_or_default(),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: "cc".repeat(32),
@@ -13033,7 +13206,10 @@ fn open_group_detail_reports_loading_then_settles_on_fold() {
     assert_eq!(app.screen, Screen::GroupDetail);
 
     // Folding the completed load clears the in-flight status.
+    let request_id = *app.group_detail_request.get_or_insert(RequestId::default());
     app.apply_effect_done(EffectDone {
+        request_id,
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: group_id.clone(),
@@ -13071,7 +13247,15 @@ fn invites_load_reports_loading_then_opens_the_picker() {
     // A second press while one is in flight does not double-queue.
     app.open_invites().expect("no double-queue");
 
-    app.apply_effect_done(EffectDone {
+    let request_id = app
+        .invites_request
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13117,7 +13301,15 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
     app.loading_invites = true;
     app.selected_account = 1;
 
-    app.apply_effect_done(EffectDone {
+    let request_id = app
+        .invites_request
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_a.clone(),
         },
@@ -13163,7 +13355,15 @@ fn an_invites_fold_over_an_image_popup_reopens_through_the_close_funnel() {
 
     // The invites load (queued before the image was opened) now lands.
     app.loading_invites = true;
-    app.apply_effect_done(EffectDone {
+    let request_id = app
+        .invites_request
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13202,7 +13402,15 @@ fn an_invites_fold_while_on_the_profile_screen_does_not_open_the_picker() {
     app.screen = Screen::Profile;
     app.loading_invites = true;
 
-    app.apply_effect_done(EffectDone {
+    let request_id = app
+        .invites_request
+        .get_or_insert_with(|| PendingInvites {
+            account: String::new(),
+            request: RequestId::default(),
+            notice_revision: None,
+        })
+        .request;
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13253,7 +13461,10 @@ fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
     app.user_search = Some(UserSearchView::default());
     app.searching_users = Some("ali".to_owned());
 
+    let request_id = *app.user_search_request.get_or_insert(RequestId::default());
     app.apply_effect_done(EffectDone {
+        request_id,
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::UserSearch {
             account: account_id,
             query: "ali".to_owned(),
@@ -13581,7 +13792,8 @@ fn a_stale_user_search_result_for_a_superseded_query_is_dropped() {
     // The pending search is for "bob"; an "alice" result is a superseded query.
     app.searching_users = Some("bob".to_owned());
 
-    app.apply_effect_done(EffectDone {
+    let request_id = *app.user_search_request.get_or_insert(RequestId::default());
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -13628,7 +13840,8 @@ fn leaving_a_search_in_flight_drops_a_late_result_from_the_reopened_screen() {
 
     // The abandoned "alice" search now completes; its result must not land in the
     // fresh screen.
-    app.apply_effect_done(EffectDone {
+    let request_id = *app.user_search_request.get_or_insert(RequestId::default());
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -14338,52 +14551,375 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
 }
 
 #[cfg(unix)]
+fn group_return_child_script(
+    calls: &std::path::Path,
+    first_members: &std::path::Path,
+    detail_gate: &TestCommandGate,
+    detail_fails: bool,
+    follow_gate: Option<&TestCommandGate>,
+    follow_fails: bool,
+) -> String {
+    let alice = "aa".repeat(32);
+    let bob = "bb".repeat(32);
+    let initial = serde_json::json!({"ok":true,"result":{
+        "members":[{"member_id":alice,"npub":"npubself"}]
+    }});
+    let refreshed = if detail_fails {
+        serde_json::json!({"ok":false,"error":{"message":"detail offline"}})
+    } else {
+        serde_json::json!({"ok":true,"result":{
+            "members":[{"member_id":alice,"npub":"npubself"},
+                {"member_id":bob,"npub":"npubbob"}]
+        }})
+    };
+    let detail = serde_json::json!({"ok":true,"result":{
+        "admins":[{"admin_id":alice,"npub":"npubself"}],
+        "relays":["wss://relay.example"],
+        "profile":{"name":"Ops Room","description":"actual detail result"},
+        "self_membership":"member"
+    }});
+    let search = serde_json::json!({"ok":true,"result":{"users":[{
+        "account_id_hex":bob,"npub":"npubbob","radius":1,
+        "matched_field":"name","match_quality":"exact",
+        "profile":{"display_name":"Bob"}
+    }]}});
+    let follow = if follow_fails {
+        serde_json::json!({"ok":false,"error":{"message":"follow offline"}})
+    } else {
+        serde_json::json!({"ok":true,"result":{}})
+    };
+    let follow_script = follow_gate.map_or_else(String::new, TestCommandGate::script);
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+         *' groups members '*)\nif mkdir '{}' 2>/dev/null; then\n\
+         printf '%s\\n' '{initial}'\nelse\n{}printf '%s\\n' '{refreshed}'\nfi;;\n\
+         *' groups admins '*|*' groups relays '*|*' groups show '*) printf '%s\\n' '{detail}';;\n\
+         *' users search '*) printf '%s\\n' '{search}';;\n\
+         *' follows list '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"follows\":[]}}}}';;\n\
+         *' follows add '*)\n{follow_script}printf '%s\\n' '{follow}';;\n\
+         *' groups add-members '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"published\":2}}}}';;\n\
+         *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+        calls.display(),
+        first_members.display(),
+        detail_gate.script(),
+    )
+}
+
+#[cfg(unix)]
+fn open_real_group_origin_search_for_return(client: WnClient) -> TuiApp {
+    let account = "aa".repeat(32);
+    let mut app = test_tui_app(client, &account);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat("g1", "Ops Room")];
+    app.handle_key(char_key('g')).unwrap();
+    finish_queued_effects(&mut app);
+    let view = app.group_detail.as_ref().expect("real initial detail");
+    assert_eq!(view.members.len(), 1);
+    assert_eq!(view.members[0].member_id, account);
+    assert!(view.members[0].is_admin && view.members[0].is_self);
+    app.handle_key(char_key('a')).unwrap();
+    for ch in "Bob".chars() {
+        app.handle_key(char_key(ch)).unwrap();
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    finish_queued_effects(&mut app);
+    assert_eq!(app.screen, Screen::UserSearch);
+    let search = app.user_search.as_ref().expect("actual search view");
+    assert_eq!(search.focus, UserSearchFocus::Results);
+    assert_eq!(search.results.len(), 1);
+    assert_eq!(search.results[0].pubkey, "bb".repeat(32));
+    assert_eq!(
+        search.purpose,
+        UserSearchPurpose::AddToGroup {
+            group_id: "g1".to_owned(),
+            group_name: "Ops Room".to_owned(),
+        }
+    );
+    app
+}
+
+#[cfg(unix)]
 #[test]
 fn adding_a_found_user_from_group_detail_adds_them_and_returns_to_the_group() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let (exe, args_file) =
-        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
-    let client = WnClient {
-        exe,
-        home: None,
-        socket: None,
-        relay: None,
-        discovery_relays: Vec::new(),
-        default_account_relays: Vec::new(),
-        secret_store: None,
-        keychain_service: None,
-    };
-    let mut app = app_on_group_detail(client);
-    app.handle_key(char_key('a')).expect("a on group detail");
-    app.user_search.as_mut().expect("search view").results =
-        vec![search_result_row("npubbob", "Bob")];
-    app.user_search.as_mut().expect("search view").focus = UserSearchFocus::Results;
-    app.handle_key(char_key('a')).expect("a on the result");
-
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .expect("confirm the add");
-
-    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let mut observations = Vec::new();
+    for detail_fails in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let exe = dir.path().join("wn-add-and-return");
+        let calls = dir.path().join("calls");
+        write_fake_wn(
+            &exe,
+            &group_return_child_script(
+                &calls,
+                &dir.path().join("first-members"),
+                &gate,
+                detail_fails,
+                None,
+                false,
+            ),
+        );
+        let client = WnClient {
+            exe,
+            ..test_unused_client()
+        };
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let mut app = open_real_group_origin_search_for_return(client);
+            app.handle_key(char_key('a')).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            // Preserve every original pre-fold assertion: real add argv below,
+            // the return target, cleared search, pending reload, and add ack.
+            ui_tx
+                .send((
+                    app.screen == Screen::GroupDetail,
+                    app.user_search.is_none(),
+                    app.loading_group_detail.as_deref() == Some("g1"),
+                    app.status.clone(),
+                ))
+                .unwrap();
+            if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                return None;
+            }
+            finish_queued_effects(&mut app);
+            let view = app
+                .group_detail
+                .as_ref()
+                .expect("retained/refreshed detail");
+            let members = view
+                .members
+                .iter()
+                .map(|row| row.member_id.clone())
+                .collect::<Vec<_>>();
+            let folded_status = app.status.clone();
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            Some((
+                folded_status,
+                app.status.clone(),
+                members,
+                app.screen == Screen::Main && app.group_detail.is_none(),
+            ))
+        });
+        gate.wait_until_entered();
+        let before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+        gate.release();
+        finish_tx.send(before_release.is_ok()).unwrap();
+        let after = worker
+            .join()
+            .unwrap()
+            .expect("real returned detail result folded");
+        let before = before_release.expect("add confirmation returned before detail child release");
+        let recorded = std::fs::read_to_string(calls).unwrap();
+        let expected_members = if detail_fails {
+            vec!["aa".repeat(32)]
+        } else {
+            vec!["aa".repeat(32), "bb".repeat(32)]
+        };
+        observations.push((
+            detail_fails,
+            before.3.clone(),
+            after.0.clone(),
+            after.1.clone(),
+            before.0
+                && before.1
+                && before.2
+                && before.3 == "added member(s); published=2"
+                && after.0 == before.3
+                && after.1 == before.3
+                && after.2 == expected_members
+                && after.3
+                && recorded
+                    .lines()
+                    .filter(|line| {
+                        line.contains(&format!("groups add-members g1 {}", "bb".repeat(32)))
+                    })
+                    .count()
+                    == 1
+                && recorded
+                    .lines()
+                    .filter(|line| line.contains(" groups members "))
+                    .count()
+                    == 2,
+        ));
+    }
     assert!(
-        recorded.contains(&format!("groups add-members g1 {}", "bb".repeat(32))),
-        "the member is added to the group the search was opened for; got:\n{recorded}"
+        observations.iter().all(|row| row.4),
+        "detail success/error must fold without replacing the actual completed add: {observations:?}"
     );
-    // Back where the flow started, not on the main view: the point of adding
-    // from group detail is to see the member land in that list.
-    assert_eq!(app.screen, Screen::GroupDetail);
-    assert!(app.user_search.is_none(), "the search view is cleared");
-    assert_eq!(
-        app.loading_group_detail.as_deref(),
-        Some("g1"),
-        "the group detail reloads so the new member shows"
-    );
-    // The add published, so the status must report that and not be displaced by
-    // the return that follows it. A completed add reported as anything else
-    // would send the user to re-add a member who is already in the group.
+}
+
+#[cfg(unix)]
+#[test]
+fn returning_from_group_search_preserves_mutation_feedback_and_reports_foreground_errors() {
+    let mut observations = Vec::new();
+    // Mutation success/error each survives detail success/error. The no-follow
+    // context must instead admit its own foreground detail error.
+    for (follow, follow_fails, detail_fails) in [
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, true, true),
+        (false, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let follow_dir = dir.path().join("follow");
+        let detail_dir = dir.path().join("detail");
+        std::fs::create_dir(&follow_dir).unwrap();
+        std::fs::create_dir(&detail_dir).unwrap();
+        let mut follow_gate = TestCommandGate::new(&follow_dir);
+        let mut detail_gate = TestCommandGate::new(&detail_dir);
+        let exe = dir.path().join("wn-follow-and-return");
+        let calls = dir.path().join("calls");
+        write_fake_wn(
+            &exe,
+            &group_return_child_script(
+                &calls,
+                &dir.path().join("first-members"),
+                &detail_gate,
+                detail_fails,
+                follow.then_some(&follow_gate),
+                follow_fails,
+            ),
+        );
+        let client = WnClient {
+            exe,
+            relay: Some("wss://relay.example".to_owned()),
+            ..test_unused_client()
+        };
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (fold_tx, fold_rx) = mpsc::channel::<bool>();
+        let (folded_tx, folded_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let mut app = open_real_group_origin_search_for_return(client);
+            if follow {
+                app.handle_key(char_key('f')).unwrap();
+            }
+            if follow && !follow_fails && !detail_fails {
+                // Editing query data is passive presentation: invalidate its
+                // results without cancelling the pending follow's feedback.
+                app.handle_key(char_key('i')).unwrap();
+                app.handle_key(char_key('!')).unwrap();
+                let search = app.user_search.as_ref().unwrap();
+                assert_eq!(search.query.value(), "Bob!");
+                assert!(search.results.is_empty());
+            }
+            continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            returned_tx
+                .send((
+                    app.status.clone(),
+                    app.screen == Screen::GroupDetail,
+                    app.user_search.is_none(),
+                    app.loading_group_detail.as_deref() == Some("g1"),
+                ))
+                .unwrap();
+            if !fold_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                return None;
+            }
+            if follow {
+                // Search was fully fenced before f. This is the actual FollowUser
+                // FIFO completion; the later detail child stays physically gated.
+                app.settle_effects(1);
+            }
+            folded_tx.send(app.status.clone()).unwrap();
+            if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                return None;
+            }
+            finish_queued_effects(&mut app);
+            let view = app
+                .group_detail
+                .as_ref()
+                .expect("retained/refreshed roster");
+            let members = view
+                .members
+                .iter()
+                .map(|row| row.member_id.clone())
+                .collect::<Vec<_>>();
+            let settled_status = app.status.clone();
+            let main_status = if follow {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                Some((
+                    app.status.clone(),
+                    app.screen == Screen::Main && app.group_detail.is_none(),
+                ))
+            } else {
+                None
+            };
+            Some((settled_status, members, main_status))
+        });
+        if follow {
+            follow_gate.wait_until_entered();
+        }
+        continue_tx.send(()).unwrap();
+        let returned = returned_rx.recv_timeout(Duration::from_secs(5));
+        follow_gate.release();
+        fold_tx.send(returned.is_ok()).unwrap();
+        detail_gate.wait_until_entered();
+        let folded = folded_rx.recv_timeout(Duration::from_secs(5));
+        detail_gate.release();
+        finish_tx.send(folded.is_ok()).unwrap();
+        let final_state = worker
+            .join()
+            .unwrap()
+            .expect("returned result folded through real FIFO");
+        let before = returned.expect("Esc returned before the pending child was released");
+        let intermediate = folded.expect("follow folded before detail child release");
+        let expected = if !follow {
+            "error: detail offline"
+        } else if follow_fails {
+            "error: follow offline"
+        } else {
+            "followed Bob"
+        };
+        let expected_members = if detail_fails {
+            vec!["aa".repeat(32)]
+        } else {
+            vec!["aa".repeat(32), "bb".repeat(32)]
+        };
+        let recorded = std::fs::read_to_string(calls).unwrap();
+        let mutation_feedback_ok = !follow
+            || (before.0 == "following Bob..."
+                && intermediate == expected
+                && final_state
+                    .2
+                    .as_ref()
+                    .is_some_and(|(status, main)| status == expected && *main));
+        observations.push((
+            follow,
+            follow_fails,
+            detail_fails,
+            before.0,
+            intermediate,
+            final_state.0.clone(),
+            before.1
+                && before.2
+                && before.3
+                && mutation_feedback_ok
+                && final_state.0 == expected
+                && final_state.1 == expected_members
+                && recorded
+                    .lines()
+                    .filter(|line| line.contains(" follows add "))
+                    .count()
+                    == usize::from(follow)
+                && recorded
+                    .lines()
+                    .filter(|line| line.contains(" groups members "))
+                    .count()
+                    == 2,
+        ));
+    }
     assert!(
-        app.status.contains("added member(s)"),
-        "the completed add is what the status reports; got: {:?}",
-        app.status
+        observations.iter().all(|row| row.6),
+        "return refresh permissions preserve newer mutations while foreground errors remain visible: {observations:?}"
     );
 }
 
@@ -14558,7 +15094,7 @@ fn queued_mutations_run_in_fifo_order_off_the_event_loop() {
     };
     let (continue_tx, continue_rx) = mpsc::channel();
     let (ui_tx, ui_rx) = mpsc::channel();
-    let (finish_tx, finish_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel::<bool>();
     let worker = thread::spawn(move || {
         let mut app = test_tui_app(client, &account_id);
         app.messages_account_id = Some(account_id);
@@ -14581,7 +15117,10 @@ fn queued_mutations_run_in_fifo_order_off_the_event_loop() {
             .expect("UI observation completed")
         {
             app.settle_effects(1);
-            assert_eq!(app.status, "reacted 1");
+            assert_eq!(
+                app.status, "reacting...",
+                "the second request still owns feedback"
+            );
             app.settle_effects(1);
             assert_eq!(app.status, "reacted 2");
         }
@@ -14626,6 +15165,8 @@ fn react_reports_in_flight_then_final_status_via_the_fold() {
     assert_eq!(app.status, "reacting...", "in-flight feedback is honest");
 
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::React {
             account: account_id,
             group: "bb".repeat(32),
@@ -14643,6 +15184,7 @@ fn open_chat_load_maps_to_the_timeline_page_argv() {
     let effect = Effect::LoadTimeline {
         account: "aa".repeat(32),
         group: "bb".repeat(32),
+        generation: 1,
     };
     assert_eq!(
         effect.calls(),
@@ -14680,7 +15222,9 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     app.refresh_messages().expect("kickoff");
     assert_eq!(app.status, "loading chat...", "honest in-flight feedback");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_id.as_str())
     );
     assert!(
@@ -14689,9 +15233,12 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     );
 
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_id.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [{
@@ -14711,7 +15258,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     assert!(app.timeline_scroll.has_more_before);
     assert!(app.timeline_scroll.is_pinned());
     assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
-    assert_eq!(app.loading_chat, None, "the load is settled");
+    assert!(app.loading_chat.is_none(), "the load is settled");
     assert_eq!(app.status, "loaded 1 message(s)");
 }
 
@@ -14741,18 +15288,22 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
 
     app.selected_chat = 0;
     app.refresh_messages().expect("open A");
+    let generation_a = app.timeline_load_generation;
     app.selected_chat = 1;
     app.refresh_messages().expect("open B");
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
 
     // A's late result arrives after the user moved to B.
-    app.apply_effect_done(EffectDone {
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_a.clone(),
+            generation: generation_a,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [{"message_id":"stale","direction":"received","from":"x","plaintext":"old","timeline_at":1,"received_at":1}],
@@ -14769,15 +15320,18 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
         "the pane never adopts the stale chat"
     );
     assert_eq!(
-        app.loading_chat.as_ref().map(|(_, group)| group.as_str()),
+        app.loading_chat
+            .as_ref()
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
 
     // B's result lands and is accepted.
-    app.apply_effect_done(EffectDone {
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_b.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [{"message_id":"fresh","direction":"received","from":"x","plaintext":"new","timeline_at":9,"received_at":9}],
@@ -14798,7 +15352,7 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
     app.chats = vec![flick_chat(&group_a, "a")];
     app.selected_chat = 0;
 
-    app.begin_timeline_load(account_a.clone(), group_a.clone());
+    app.begin_timeline_load(account_a.clone(), group_a.clone(), app.view_feedback());
 
     // Switch to a public-only account: refresh_chats takes its early return,
     // clearing the pane without queueing a superseding load.
@@ -14813,9 +15367,12 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
     assert!(app.messages_group_id.is_none());
 
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_a.clone(),
             group: group_a.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({"messages": []})]),
     });
@@ -14878,6 +15435,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         .unwrap();
         assert!(app.drain_message_subscription());
         app.refresh_messages().expect("reload A");
+        let generation_a = app.timeline_load_generation;
         assert_eq!(timeline_ids(&app.timeline), vec!["old-account-row"]);
         assert!(rendered_buffer(&mut app).contains("initial account stream"));
 
@@ -14913,17 +15471,23 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         }))).is_err();
         app.drain_message_subscription();
         app.apply_effect_done(EffectDone {
+            request_id: RequestId::default(),
+            feedback: FeedbackPermission::View(app.status_ownership.owner()),
             effect: Effect::LoadTimeline {
                 account: account_a.clone(),
                 group: group.clone(),
+                generation: generation_a,
             },
             result: Ok(vec![serde_json::json!({"messages":[]})]),
         });
         let pending_survives_old_result = app.loading_chat.is_some();
         app.apply_effect_done(EffectDone {
+            request_id: RequestId::default(),
+            feedback: FeedbackPermission::View(app.status_ownership.owner()),
             effect: Effect::LoadTimeline {
                 account: target_account.clone(),
                 group: target_group.clone(),
+                generation: app.timeline_load_generation,
             },
             result: Ok(vec![serde_json::json!({"messages":[{
                 "message_id":"new-owner-row","direction":"received","from":"peer",
@@ -15072,7 +15636,7 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
     }
     assert_eq!(app.chats[0].name, "B joined room");
     app.refresh_messages().unwrap();
-    app.apply_effect_done(EffectDone {effect:Effect::LoadTimeline {account:account_b.clone(), group}, result:Ok(vec![serde_json::json!({"messages":[{
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
         "message_id":"B row","direction":"received","from":"peer","plaintext":"B timeline","timeline_at":2,"received_at":2
     }]})])});
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -15216,17 +15780,24 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     app.messages_group_id = Some(group_id.clone());
     app.timeline = vec![timeline_row("m1", 100), timeline_row("m2", 200)];
     // A same-chat reload is in flight (its group matches the loaded pane).
-    app.loading_chat = Some((account_id.clone(), group_id.clone()));
+    app.timeline_load_generation = 1;
+    app.loading_chat = Some(PendingTimeline {
+        account: account_id.clone(),
+        group: group_id.clone(),
+        generation: app.timeline_load_generation,
+        feedback: app.view_feedback(),
+    });
 
     // Between enqueue and fold, the live timeline subscription folds in a newer
     // message.
     app.timeline.push(timeline_row("m3", 300));
 
     // The reload page returns only what was materialized at enqueue time (m1, m2).
-    app.apply_effect_done(EffectDone {
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_id.clone(),
+            generation: app.timeline_load_generation,
         },
         result: Ok(vec![serde_json::json!({
             "messages": [
@@ -15285,6 +15856,8 @@ fn sending_reports_in_flight_then_folds_an_optimistic_row() {
     );
 
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::SendMessage {
             account: account_id,
             group: group_id,
@@ -15315,6 +15888,8 @@ fn an_optimistic_send_row_for_a_chat_the_user_left_is_dropped() {
     app.messages_group_id = Some("bb".repeat(32));
 
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::SendMessage {
             account: account_id,
             group: "cc".repeat(32),
@@ -15354,6 +15929,8 @@ fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
     app.send_reply("re: hi".to_owned()).expect("kickoff");
     assert_eq!(app.status, "sending reply...");
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect,
         result: Ok(vec![
             serde_json::json!({"published": 1, "message_ids": ["r1"]}),
@@ -15494,10 +16071,13 @@ fn the_launch_daemon_auto_start_does_not_stall_the_first_user_action() {
         continue_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("daemon child entered");
-        app.effects.enqueue(Effect::MarkRead {
-            account: account_id,
-            group: "g1".to_owned(),
-        });
+        app.enqueue_effect(
+            Effect::MarkRead {
+                account: account_id,
+                group: "g1".to_owned(),
+            },
+            FeedbackPermission::Silent,
+        );
         let done = app.effects.recv_timeout(Duration::from_secs(5));
         ui_tx
             .send(done.map(|done| (done.effect, done.result)))
@@ -15528,6 +16108,7 @@ fn launch_with_no_daemon_and_no_relay_source_surfaces_one_honest_status() {
     app.daemon = DaemonView::default();
 
     app.autostart_daemon_if_needed(None);
+    app.tick();
 
     assert_eq!(app.status, DAEMON_AUTOSTART_NO_RELAYS_STATUS);
     // The status must point at the only path that actually gives the daemon a
@@ -15573,9 +16154,11 @@ fn a_failed_daemon_auto_start_reports_and_leaves_the_session_up() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.daemon = DaemonView::default();
     // The in-flight sentinel the auto-start sets before its thread reports.
-    app.status = STARTING_DAEMON_STATUS.to_owned();
+    app.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
+    app.daemon_start_status_owner = Some(app.status_ownership.owner());
 
     app.fold_daemon_start(Err("daemon did not become ready".to_owned()));
+    app.tick();
 
     assert_eq!(
         app.status,
@@ -15607,7 +16190,7 @@ fn a_daemon_auto_start_fold_keeps_a_users_in_flight_status() {
     app.chat_subscription = Some(test_chat_subscription(&account_id, false));
     app.message_subscription = Some(test_message_subscription(&account_id));
     app.notification_subscription = Some(test_notification_subscription(&account_id));
-    app.status = "sending...".to_owned();
+    app.set_status("sending...".to_owned());
 
     app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
 
@@ -15633,7 +16216,8 @@ fn a_daemon_auto_start_fold_replaces_its_own_in_flight_sentinel() {
     app.chat_subscription = Some(test_chat_subscription(&account_id, false));
     app.message_subscription = Some(test_message_subscription(&account_id));
     app.notification_subscription = Some(test_notification_subscription(&account_id));
-    app.status = STARTING_DAEMON_STATUS.to_owned();
+    app.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
+    app.daemon_start_status_owner = Some(app.status_ownership.owner());
 
     app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
 
@@ -15837,6 +16421,8 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     // but there is no view to badge — and nothing crashes.
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -15855,6 +16441,8 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
         view.results[0].pubkey = "cc".to_owned();
     }
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -15873,6 +16461,8 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     let mut app = user_search_app_with_selected_result(test_unused_client());
     app.accounts[0].account_id = "dd".repeat(32);
     app.apply_effect_done(EffectDone {
+        request_id: RequestId::default(),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -16463,4 +17053,2421 @@ fn slash_management_commands_forward_the_selected_owner_and_requested_options() 
         expected.extend(command);
         assert_eq!(recorded.lines().collect::<Vec<_>>(), expected, "{input}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn timeline_completion_keeps_a_newer_command_status_and_folds_its_page() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    for origin in ["refresh", "start", "composer"] {
+        for outcome in ["success", "page-error", "subscription-error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let page = if outcome == "page-error" {
+                serde_json::json!({"ok":false,"error":{"message":"timeline offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"loaded-row","direction":"received","from":"peer",
+                    "plaintext":"loaded page body","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            let ack = serde_json::json!({"ok":true,"result":{
+                "stream_id":"dd".repeat(32),"published":2
+            }});
+            let exe = dir.path().join("wn-status");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}'\n;;\n\
+                 *' stream start '*|*' stream compose-open '*) printf '%s\\n' '{ack}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    gate.script()
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = outcome == "subscription-error";
+            app.chats = vec![flick_chat(&group, "Room")];
+            let immediate = match origin {
+                "refresh" => {
+                    app.refresh_messages().unwrap();
+                    "loading chat..."
+                }
+                "start" => {
+                    app.input
+                        .set_value("/stream start --quic-candidate quic://127.0.0.1:4451");
+                    app.submit_input().unwrap();
+                    "started stream ddddddd...dddddddd; published=2"
+                }
+                "composer" => {
+                    app.input
+                        .set_value("/stream --quic-candidate quic://127.0.0.1:4451");
+                    app.submit_input().unwrap();
+                    "now streaming ddddddd...dddddddd; type text and press Enter to finish"
+                }
+                _ => unreachable!(),
+            };
+            gate.wait_until_entered();
+            assert_eq!(
+                app.status, immediate,
+                "the action completes before page release"
+            );
+            if outcome == "subscription-error" {
+                // The page child is already running; subsequent actual feed
+                // acquisitions encounter an unavailable command executable.
+                app.client.exe = dir.path().join("unavailable-wn");
+            }
+            gate.release();
+            finish_queued_effects(&mut app);
+            // A successful page fold enqueues diagnostics/mark-read after the
+            // first marker. Complete those children before dropping the fixture.
+            finish_queued_effects(&mut app);
+            assert!(app.loading_chat.is_none());
+            if outcome == "page-error" {
+                assert!(app.timeline.is_empty());
+            } else {
+                assert_eq!(timeline_ids(&app.timeline), vec!["loaded-row"]);
+                assert_eq!(app.messages_account_id.as_deref(), Some(account.as_str()));
+                assert_eq!(app.messages_group_id.as_deref(), Some(group.as_str()));
+            }
+            if origin != "refresh" {
+                assert_eq!(app.status, immediate, "{origin}: {outcome}");
+            } else {
+                match outcome {
+                    "success" => assert_eq!(app.status, "loaded 1 message(s)"),
+                    "page-error" => assert_eq!(app.status, "error: timeline offline"),
+                    "subscription-error" => assert!(
+                        app.status.starts_with("message subscription failed: ")
+                            || app.status.starts_with("timeline subscription failed: "),
+                        "ordinary loads must surface their actual feed failure"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+    // Ambient drains and a provisional acquisition failure belong to this
+    // request; neither is a newer command or prompt that can own its feedback.
+    let mut observed = Vec::new();
+    for origin in [
+        "chat-update",
+        "dispatch-error",
+        "chat-update-start",
+        "chat-update-composer",
+    ] {
+        for outcome in ["success", "page-error", "subscription-error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut page_gate = TestCommandGate::new(dir.path());
+            let chat_dir = dir.path().join("chat");
+            std::fs::create_dir(&chat_dir).unwrap();
+            let mut chat_gate = TestCommandGate::new(&chat_dir);
+            let page = if outcome == "page-error" {
+                serde_json::json!({"ok":false,"error":{"message":"timeline offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"loaded-row","direction":"received","from":"peer",
+                    "plaintext":"loaded page body","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            let chat = serde_json::json!({"ok":true,"result":{
+                "type":"chat","chat":{"group_id":group,
+                    "profile":{"name":"Changed room"},"unread_count":3}
+            }});
+            let exe = dir.path().join("wn-status");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}'\n;;\n\
+                 *' chats subscribe '*)\n{}printf '%s\\n' '{chat}'\nexec sleep 60;;\n\
+                 *' stream start '*|*' stream compose-open '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"stream_id\":\"dddd\",\"published\":2}}}}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    page_gate.script(),
+                    chat_gate.script(),
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe: exe.clone(),
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = true;
+            app.chats = vec![flick_chat(&group, "Room")];
+            if origin.starts_with("chat-update") {
+                app.ensure_chat_subscription(&account).unwrap();
+                chat_gate.wait_until_entered();
+            } else {
+                // The real FIFO worker already owns its valid client clone.
+                // Only the foreground acquisition encounters a missing child.
+                app.client.exe = dir.path().join("unavailable-wn");
+            }
+            let retained = if origin == "chat-update-start" || origin == "chat-update-composer" {
+                app.input.set_value(if origin == "chat-update-start" {
+                    "/stream start --quic-candidate quic://127.0.0.1:4451"
+                } else {
+                    "/stream --quic-candidate quic://127.0.0.1:4451"
+                });
+                app.submit_input().unwrap();
+                Some(app.status.clone())
+            } else {
+                app.refresh_messages().unwrap();
+                None
+            };
+            page_gate.wait_until_entered();
+            assert!(
+                app.loading_chat.is_some(),
+                "dispatch returned before release"
+            );
+            let dispatch_status = app.status.clone();
+            if origin == "dispatch-error" {
+                assert!(
+                    app.message_subscription.is_none(),
+                    "initial feed spawn failed"
+                );
+            }
+            if origin.starts_with("chat-update") {
+                if outcome == "subscription-error" {
+                    // The chat drain also tries a real group-feed acquisition.
+                    app.client.exe = dir.path().join("unavailable-wn");
+                }
+                chat_gate.release();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.chats[0].name != "Changed room" {
+                    assert!(Instant::now() < deadline, "chat child update did not drain");
+                    app.tick();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(app.chats[0].projection.unread_count, 3);
+                assert!(app.loading_chat.is_some(), "chat update preceded page fold");
+            }
+            let pending_status = app.status.clone();
+            app.client.exe = if outcome == "subscription-error" {
+                dir.path().join("unavailable-wn")
+            } else {
+                exe
+            };
+            page_gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.loading_chat.is_some() {
+                assert!(Instant::now() < deadline, "page child did not fold on tick");
+                app.tick();
+                thread::sleep(Duration::from_millis(1));
+            }
+            finish_queued_effects(&mut app);
+            finish_queued_effects(&mut app);
+            let feedback = retained.as_deref().unwrap_or(match outcome {
+                "success" => "loaded 1 message(s)",
+                "page-error" => "error: timeline offline",
+                "subscription-error" if origin == "dispatch-error" => {
+                    "message subscription failed: "
+                }
+                "subscription-error" => "timeline subscription failed: ",
+                _ => unreachable!(),
+            });
+            let rows_folded = if outcome == "page-error" {
+                app.timeline.is_empty() && app.messages_group_id.is_none()
+            } else {
+                timeline_ids(&app.timeline) == vec!["loaded-row"]
+                    && app.messages_account_id.as_deref() == Some(account.as_str())
+                    && app.messages_group_id.as_deref() == Some(group.as_str())
+            };
+            let visible = rendered_buffer(&mut app).contains(feedback.trim());
+            let healed = origin != "dispatch-error"
+                || outcome != "success"
+                || app.message_subscription.is_some();
+            observed.push((
+                origin,
+                outcome,
+                dispatch_status,
+                pending_status,
+                app.status.clone(),
+                rows_folded && healed && visible && app.status.starts_with(feedback),
+            ));
+        }
+    }
+    assert!(
+        observed.iter().all(|row| row.5),
+        "ambient updates and this request's acquisition must preserve completion feedback: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn older_send_cannot_steal_a_newer_chat_loads_feedback() {
+    let account = "aa".repeat(32);
+    let group_a = "cc".repeat(16);
+    let group_b = "dd".repeat(16);
+    let mut observed = Vec::new();
+    for outcome in [
+        "success",
+        "page-error",
+        "subscription-error",
+        "no-id-refresh",
+        "newer-command-before-preview",
+        "no-id-pending-success",
+        "no-id-pending-error",
+        "ambient-before-preview-error",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut send_gate = TestCommandGate::new(dir.path());
+        let page_dir = dir.path().join("page");
+        std::fs::create_dir(&page_dir).unwrap();
+        let mut page_gate = TestCommandGate::new(&page_dir);
+        let page = if matches!(
+            outcome,
+            "page-error" | "no-id-pending-error" | "ambient-before-preview-error"
+        ) {
+            serde_json::json!({"ok":false,"error":{"message":"new chat offline"}})
+        } else {
+            serde_json::json!({"ok":true,"result":{"messages":[{
+                "message_id":"new-page-row","direction":"received","from":"peer",
+                "plaintext":"new chat body","timeline_at":2,"received_at":2
+            }],"has_more_before":false}})
+        };
+        let send = if outcome.starts_with("no-id-") {
+            serde_json::json!({"ok":true,"result":{"published":2}})
+        } else {
+            serde_json::json!({"ok":true,"result":{"message_ids":["sent-id"],"published":2}})
+        };
+        let exe = dir.path().join("wn-ordered-status");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in\n\
+             *' messages send '*)\n{}printf '%s\\n' '{send}';;\n\
+             *' messages timeline list '*)\nif mkdir '{}' 2>/dev/null; then\n{}fi\nprintf '%s\\n' '{page}';;\n\
+             *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+             *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                send_gate.script(),
+                page_dir.join("first").display(),
+                page_gate.script()
+            ),
+        );
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &account,
+        );
+        app.daemon.running = outcome == "subscription-error";
+        app.chats = vec![
+            flick_chat(&group_a, "Chat A"),
+            flick_chat(&group_b, "Chat B"),
+        ];
+        app.messages_account_id = Some(account.clone());
+        app.messages_group_id = Some(group_a.clone());
+        app.send_message("outgoing body".to_owned()).unwrap();
+        send_gate.wait_until_entered();
+        if outcome.starts_with("no-id-pending-") {
+            app.refresh_messages().unwrap();
+        } else if outcome != "no-id-refresh" {
+            app.focus = Focus::Chats;
+            app.move_selection(1);
+            if outcome == "ambient-before-preview-error" {
+                let (tx, rx) = mpsc::channel();
+                app.chat_subscription = Some(ChatSubscription {
+                    account_id: account.clone(),
+                    include_archived: false,
+                    child: test_sleep_child(),
+                    rx,
+                });
+                tx.send(SubscriptionEvent::Error("ambient notice".to_owned()))
+                    .unwrap();
+                assert!(app.drain_chat_subscription());
+            }
+            if outcome == "newer-command-before-preview" {
+                app.run_slash_command(SlashCommand::Diagnostics).unwrap();
+            }
+            for _ in 0..FLICK_PREVIEW_DEBOUNCE_TICKS {
+                app.tick();
+            }
+            assert_eq!(
+                app.status,
+                if outcome == "newer-command-before-preview" {
+                    "diagnostics panel on"
+                } else {
+                    "loading chat..."
+                },
+                "navigation returned before send release"
+            );
+        }
+        send_gate.release();
+        // The no-ID completion itself queues its subordinate page.
+        if outcome == "no-id-refresh" {
+            app.settle_effects(1);
+        }
+        page_gate.wait_until_entered();
+        if outcome != "no-id-refresh" {
+            app.tick();
+        }
+        let pending = app.status.clone();
+        if outcome == "subscription-error" {
+            app.client.exe = dir.path().join("unavailable-wn");
+        }
+        page_gate.release();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        let correct = match outcome {
+            "newer-command-before-preview" => {
+                app.status == "diagnostics panel on"
+                    && timeline_ids(&app.timeline) == vec!["new-page-row"]
+            }
+            "page-error" | "no-id-pending-error" | "ambient-before-preview-error" => {
+                app.status == "error: new chat offline" && app.timeline.is_empty()
+            }
+            "subscription-error" => {
+                app.status.starts_with("timeline subscription failed: ")
+                    && timeline_ids(&app.timeline) == vec!["new-page-row"]
+            }
+            "no-id-refresh" => {
+                app.status == "sent message; published=2"
+                    && timeline_ids(&app.timeline) == vec!["new-page-row"]
+            }
+            _ => {
+                app.status == "loaded 1 message(s)"
+                    && timeline_ids(&app.timeline) == vec!["new-page-row"]
+            }
+        };
+        observed.push((outcome, pending, app.status.clone(), correct));
+    }
+    assert!(
+        observed.iter().all(|row| row.3),
+        "action order and causal refresh feedback: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_autostart_cannot_supersede_the_first_timeline_feedback() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observed = Vec::new();
+    for page_error in [false, true] {
+        for daemon_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut page_gate = TestCommandGate::new(dir.path());
+            let daemon_dir = dir.path().join("daemon");
+            std::fs::create_dir(&daemon_dir).unwrap();
+            let mut daemon_gate = TestCommandGate::new(&daemon_dir);
+            let catalog = serde_json::json!({"ok":true,"result":{
+                "accounts":[{"account_id":account,"npub":"npub1alice","local_signing":true}],
+                "chats":[{"group_id":group,"profile":{"name":"First chat"}}]
+            }});
+            let page = if page_error {
+                serde_json::json!({"ok":false,"error":{"message":"first page offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"first-row","direction":"received","from":"peer",
+                    "plaintext":"first page body","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            let exe = dir.path().join("wn-startup");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+                 *' daemon start '*)\n{}printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true}}}}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{catalog}';;\nesac\n",
+                    page_gate.script(),
+                    daemon_gate.script()
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account,
+            );
+            app.daemon.running = false;
+            app.start().unwrap();
+            page_gate.wait_until_entered();
+            app.autostart_daemon_if_needed(Some("wss://relay.example".to_owned()));
+            daemon_gate.wait_until_entered();
+            if daemon_first {
+                daemon_gate.release();
+                let result = app.recv_daemon_autostart();
+                app.fold_daemon_start(result);
+            }
+            page_gate.release();
+            finish_queued_effects(&mut app);
+            finish_queued_effects(&mut app);
+            if !daemon_first {
+                daemon_gate.release();
+                let result = app.recv_daemon_autostart();
+                app.fold_daemon_start(result);
+            }
+            let expected = if page_error {
+                "error: first page offline"
+            } else {
+                "loaded 1 message(s)"
+            };
+            observed.push((
+                page_error,
+                daemon_first,
+                app.status.clone(),
+                app.status == expected,
+            ));
+            assert!(app.daemon.running, "startup still adopts daemon resources");
+            assert_eq!(app.timeline.is_empty(), page_error);
+        }
+    }
+    assert!(
+        observed.iter().all(|row| row.3),
+        "background startup cannot own foreground load feedback: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn same_account_group_reloads_fold_the_newest_real_page() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observed = Vec::new();
+    for (first_error, second_error, subscription_error) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let row = |id: &str, at: u64| {
+            serde_json::json!({
+                "message_id":id,"direction":"received","from":"peer",
+                "plaintext":id,"timeline_at":at,"received_at":at
+            })
+        };
+        let page = |error: bool, newer: bool| {
+            if error {
+                serde_json::json!({"ok":false,"error":{"message":if newer {"new page offline"} else {"old page offline"}}})
+            } else {
+                let rows = if newer {
+                    vec![row("old-row", 1), row("new-row", 2)]
+                } else {
+                    vec![row("old-row", 1)]
+                };
+                serde_json::json!({"ok":true,"result":{"messages":rows,"has_more_before":false}})
+            }
+        };
+        let catalog = serde_json::json!({"ok":true,"result":{
+            "accounts":[{"account_id":account,"npub":"npub1alice","local_signing":true}],
+            "chats":[{"group_id":group,"profile":{"name":"Room"}}]
+        }});
+        let first = page(first_error, false);
+        let second = page(second_error, true);
+        let calls = dir.path().join("pages");
+        let all_calls = dir.path().join("all-calls");
+        let exe = dir.path().join("wn-pages");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+             *' messages timeline list '*)\n\
+             printf 'page\\n' >> '{}'\n\
+             if mkdir '{}' 2>/dev/null; then\n{}printf '%s\\n' '{first}'\n\
+             else printf '%s\\n' '{second}'; fi;;\n\
+             *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+             *) printf '%s\\n' '{catalog}';;\nesac\n",
+                all_calls.display(),
+                calls.display(),
+                dir.path().join("first").display(),
+                gate.script()
+            ),
+        );
+        let mut app = test_tui_app(
+            WnClient {
+                exe,
+                ..test_unused_client()
+            },
+            &account,
+        );
+        app.daemon.running = subscription_error;
+        app.chats = vec![flick_chat(&group, "Room")];
+        app.input.set_value("/refresh");
+        app.submit_input().expect("dispatch refresh");
+        gate.wait_until_entered();
+        app.input.set_value("/refresh");
+        app.submit_input().expect("dispatch refresh");
+        assert_eq!(
+            app.status, "loading chat...",
+            "second request returns before the old page is released"
+        );
+        if subscription_error {
+            app.client.exe = dir.path().join("unavailable-wn");
+        }
+        gate.release();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap().lines().count(),
+            2,
+            "both real page children completed"
+        );
+        let recorded = std::fs::read_to_string(all_calls).unwrap();
+        let current_followups = usize::from(!second_error);
+        assert_eq!(
+            recorded
+                .lines()
+                .filter(|line| line.contains("chats mark-read")
+                    && !line.contains("test-fifo-completion-marker"))
+                .count(),
+            current_followups,
+            "only the newest successful page may mark read"
+        );
+        assert_eq!(
+            recorded
+                .lines()
+                .filter(|line| line.contains("groups show"))
+                .count(),
+            current_followups,
+            "only the newest successful page may fetch diagnostics"
+        );
+        let correct = if second_error {
+            app.status == "error: new page offline"
+        } else {
+            timeline_ids(&app.timeline).contains(&"new-row")
+                && rendered_buffer(&mut app).contains("new-row")
+                && app.messages_account_id.as_deref() == Some(account.as_str())
+                && app.messages_group_id.as_deref() == Some(group.as_str())
+                && if subscription_error {
+                    app.status.starts_with("timeline subscription failed: ")
+                } else {
+                    app.status == "loaded 2 message(s)"
+                }
+        };
+        observed.push((
+            first_error,
+            second_error,
+            subscription_error,
+            timeline_ids(&app.timeline)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            app.status.clone(),
+            correct,
+        ));
+    }
+    assert!(
+        observed.iter().all(|row| row.5),
+        "the newest requested page must own the final view/feedback: {observed:?}"
+    );
+}
+
+// Identical reissues are distinct requests even when every target value matches.
+#[cfg(unix)]
+#[test]
+fn same_target_reads_do_not_consume_their_replacement_request() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observations = Vec::new();
+    // Repeated Enter and leave/reopen are independently reachable ABA cases.
+    // Group detail uses its actual Esc -> g path, not an invented pending slot.
+    for (family, reopen) in [
+        ("users", false),
+        ("users", true),
+        ("messages", false),
+        ("messages", true),
+        ("detail", true),
+        ("invites", true),
+    ] {
+        for old_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut old_gate = TestCommandGate::new(dir.path());
+            let next_dir = dir.path().join("next");
+            std::fs::create_dir(&next_dir).unwrap();
+            let mut new_gate = TestCommandGate::new(&next_dir);
+            let old_args = dir.path().join("old-args");
+            let new_args = dir.path().join("new-args");
+            let calls = dir.path().join("request-calls");
+            let payload = |new: bool| {
+                let label = if new { "New request" } else { "Old request" };
+                serde_json::json!({"ok":true,"result":{
+                    "users":[{"account_id_hex":if new {"22".repeat(32)} else {"11".repeat(32)},
+                        "npub":if new {"npub-new-request"} else {"npub-old-request"},
+                        "radius":0,"matched_field":"name","match_quality":"exact",
+                        "profile":{"display_name":label}}],
+                    "messages":[{"message_id":if new {"new-message"} else {"old-message"},
+                        "direction":"received","from":"peer","plaintext":label,
+                        "timeline_at":2,"received_at":2}],
+                    "has_more_before":false,"has_more_after":false,
+                    "profile":{"name":label,"description":"request identity"},
+                    "members":[{"member_id":account_a,"npub":"npubself"}],
+                    "admins":[{"admin_id":account_a,"npub":"npubself"}],
+                    "relays":[],"follows":[],"chats":[],
+                    "invites":[{"group_id":if new {"ee".repeat(16)} else {"dd".repeat(16)},
+                        "profile":{"name":label},"pending_confirmation":true}]
+                }})
+            };
+            let old_success = payload(false);
+            let old_response = if old_fails {
+                serde_json::json!({"ok":false,"error":{"message":"old request failed"}})
+            } else {
+                old_success.clone()
+            };
+            let new_response = payload(true);
+            let pattern = match family {
+                "users" => "*' users search '*",
+                "messages" => "*' messages timeline search '*",
+                "detail" => "*' groups members '*",
+                "invites" => "*' groups invites '*",
+                _ => unreachable!(),
+            };
+            let exe = dir.path().join("wn-request-identity");
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+                 {pattern})\n\
+                 printf 'request\\n' >> '{calls}'\n\
+                 if mkdir '{first}' 2>/dev/null; then\n\
+                   printf '%s\\n' \"$@\" > '{old_args}'\n\
+                   {old_gate}\n\
+                   printf '%s\\n' '{old_response}'\n\
+                 elif mkdir '{second}' 2>/dev/null; then\n\
+                   printf '%s\\n' \"$@\" > '{new_args}'\n\
+                   {new_gate}\n\
+                   printf '%s\\n' '{new_response}'\n\
+                 else\n\
+                   printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}'\n\
+                 fi;;\n\
+                 *)\n\
+                 if test -e '{new_entered}'; then\n\
+                   printf '%s\\n' '{new_response}'\n\
+                 else\n\
+                   printf '%s\\n' '{old_success}'\n\
+                 fi;;\n\
+                 esac\n",
+                    calls = calls.display(),
+                    first = dir.path().join("first").display(),
+                    second = dir.path().join("second").display(),
+                    old_args = old_args.display(),
+                    new_args = new_args.display(),
+                    old_gate = old_gate.script(),
+                    new_gate = new_gate.script(),
+                    new_entered = new_gate.entered.display(),
+                ),
+            );
+            let mut app = test_tui_app(
+                WnClient {
+                    exe,
+                    ..test_unused_client()
+                },
+                &account_a,
+            );
+            app.daemon.running = false;
+            app.focus = Focus::Chats;
+            app.chats = vec![flick_chat(&group, "Request room")];
+            app.messages_account_id = Some(account_a.clone());
+            app.messages_group_id = Some(group.clone());
+            if family == "invites" {
+                app.accounts.push(AccountRow {
+                    account_id: account_b.clone(),
+                    npub: "npub1bob".into(),
+                    display_name: None,
+                    local_signing: true,
+                });
+            }
+            match family {
+                "users" => app.open_user_search(Some("same-query".into())),
+                "messages" => app.open_message_search(Some("same-query".into())).unwrap(),
+                "detail" => app.handle_key(char_key('g')).unwrap(),
+                "invites" => app.handle_key(char_key('I')).unwrap(),
+                _ => unreachable!(),
+            }
+            old_gate.wait_until_entered();
+
+            // Every action below must RETURN while the old physical child is held.
+            if family == "invites" {
+                // The synchronous accepted B-empty-list path is real; no selection
+                // or pending-request fabrication. A's blocked request must not
+                // deduplicate an explicit B request.
+                app.select_account_by_selector(&account_b).unwrap();
+                app.handle_key(char_key('I')).unwrap();
+            } else if reopen {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                match family {
+                    "users" => app.open_user_search(Some("same-query".into())),
+                    "messages" => app.open_message_search(Some("same-query".into())).unwrap(),
+                    "detail" => app.handle_key(char_key('g')).unwrap(),
+                    _ => unreachable!(),
+                }
+            } else {
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+            }
+            let loading = match family {
+                "users" | "messages" => "searching...",
+                "detail" => "loading group detail...",
+                "invites" => "loading invites...",
+                _ => unreachable!(),
+            };
+            let issued = app.status == loading;
+            if family == "invites" && !issued {
+                // Baseline2902 deduplicates B against A. Record the actual visible
+                // refusal; do not wait for a second child that was never queued.
+                old_gate.release();
+                finish_queued_effects(&mut app);
+                observations.push((family, reopen, old_fails, false, false));
+                continue;
+            }
+            // A same-account repeat of B must still deduplicate. A faulty third
+            // request is counted and returns promptly in the fake, never hangs.
+            if family == "invites" {
+                app.handle_key(char_key('I')).unwrap();
+            }
+            old_gate.release();
+            // FIFO entry of B fences all calls of A (including follows snapshot
+            // or four group-detail calls). Only A can fold while B remains held.
+            new_gate.wait_until_entered();
+            app.tick();
+            let kept_pending = match family {
+                "users" => {
+                    app.searching_users.is_some()
+                        && app.user_search.as_ref().unwrap().results.is_empty()
+                }
+                "messages" => {
+                    app.searching_messages.is_some()
+                        && app.message_search.as_ref().unwrap().results.is_empty()
+                }
+                "detail" => app.loading_group_detail.is_some() && app.group_detail.is_none(),
+                "invites" => app.popup.is_none(),
+                _ => unreachable!(),
+            } && app.status == loading
+                && !rendered_buffer(&mut app).contains("Old request");
+            new_gate.release();
+            finish_queued_effects(&mut app);
+            let latest_applied = match family {
+                "users" => {
+                    app.searching_users.is_none()
+                        && app.user_search.as_ref().unwrap().results.len() == 1
+                        && app.user_search.as_ref().unwrap().results[0].npub == "npub-new-request"
+                }
+                "messages" => {
+                    app.searching_messages.is_none()
+                        && app.message_search.as_ref().unwrap().results.len() == 1
+                        && app.message_search.as_ref().unwrap().results[0].message_id
+                            == "new-message"
+                }
+                "detail" => app
+                    .group_detail
+                    .as_ref()
+                    .is_some_and(|view| view.name == "New request"),
+                "invites" => {
+                    matches!(
+                        app.popup,
+                        Some(Popup::Picker {
+                            purpose: PickerPurpose::Invites,
+                            ..
+                        })
+                    ) && app.status == "1 pending invite(s)"
+                }
+                _ => unreachable!(),
+            } && rendered_buffer(&mut app).contains("New request");
+
+            let command: Vec<String> = match family {
+                "users" => vec!["users".into(), "search".into(), "same-query".into()],
+                "messages" => vec![
+                    "messages".into(),
+                    "timeline".into(),
+                    "search".into(),
+                    "same-query".into(),
+                    "--group".into(),
+                    group.clone(),
+                    "--limit".into(),
+                    TUI_MESSAGE_SEARCH_LIMIT.to_string(),
+                ],
+                "detail" => vec!["groups".into(), "members".into(), group.clone()],
+                "invites" => vec!["groups".into(), "invites".into()],
+                _ => unreachable!(),
+            };
+            for (path, account) in [
+                (&old_args, &account_a),
+                (
+                    &new_args,
+                    if family == "invites" {
+                        &account_b
+                    } else {
+                        &account_a
+                    },
+                ),
+            ] {
+                let mut expected = vec!["--json".to_owned(), "--account".into(), account.clone()];
+                expected.extend(command.clone());
+                assert_eq!(
+                    std::fs::read_to_string(path)
+                        .unwrap()
+                        .lines()
+                        .collect::<Vec<_>>(),
+                    expected.iter().map(String::as_str).collect::<Vec<_>>(),
+                    "{family}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(calls).unwrap().lines().count(),
+                2,
+                "only the two issued reads run; duplicate invites remains coalesced"
+            );
+            observations.push((
+                family,
+                reopen,
+                old_fails,
+                issued && kept_pending,
+                latest_applied,
+            ));
+        }
+    }
+    assert!(
+        observations
+            .iter()
+            .all(|(_, _, _, pending, latest)| *pending && *latest),
+        "superseded read consumed/repopulated its replacement: {observations:?}"
+    );
+}
+
+// Passive navigation must preserve a still-running foreground request’s feedback.
+
+#[cfg(unix)]
+#[test]
+fn cursor_history_cannot_consume_a_pending_sends_feedback() {
+    for (history_fails, send_fails) in [(false, true), (true, true), (false, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let exe = dir.path().join("wn-history-during-send");
+        let history = if history_fails {
+            serde_json::json!({"ok":false,"error":{"message":"history offline"}})
+        } else {
+            serde_json::json!({"ok":true,"result":{"messages":[{
+                "message_id":"old","direction":"received","from":"peer",
+                "plaintext":"older row","timeline_at":50,"received_at":50
+            }],"has_more_before":false}})
+        };
+        let send = if send_fails {
+            serde_json::json!({"ok":false,"error":{"message":"send offline"}})
+        } else {
+            serde_json::json!({"ok":true,"result":{"message_ids":["sent-id"],"published":2}})
+        };
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages send '*)\n{}printf '%s\\n' '{send}';;\n\
+                 *' messages timeline list '*) printf '%s\\n' '{history}';;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                gate.script(),
+            ),
+        );
+        let client = WnClient {
+            exe,
+            ..test_unused_client()
+        };
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let account = "aa".repeat(32);
+            let group = "cc".repeat(16);
+            let mut app = test_tui_app(client, &account);
+            app.daemon.running = false;
+            app.chats = vec![flick_chat(&group, "Room")];
+            app.messages_account_id = Some(account);
+            app.messages_group_id = Some(group);
+            app.timeline = vec![timeline_row("new", 100)];
+            app.timeline_scroll.has_more_before = true;
+            app.focus = Focus::Messages;
+            app.send_message("pending body".to_owned()).unwrap();
+            continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            // Use the actual cursor-key front door, not a direct status write.
+            app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+                .unwrap();
+            let ids = timeline_ids(&app.timeline)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            ui_tx
+                .send((app.status.clone(), ids, app.timeline_scroll.loading_older))
+                .unwrap();
+            if finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                finish_queued_effects(&mut app);
+                assert_eq!(
+                    app.status,
+                    if send_fails {
+                        "error: send offline"
+                    } else {
+                        "sent message; published=2"
+                    },
+                    "cursor-triggered history must not revoke the pending send's terminal feedback",
+                );
+            }
+        });
+        gate.wait_until_entered();
+        continue_tx.send(()).unwrap();
+        let before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+        // Always release before asserting or joining, including a broken UI path.
+        gate.release();
+        finish_tx.send(before_release.is_ok()).unwrap();
+        worker.join().unwrap();
+        let (status, ids, loading) =
+            before_release.expect("cursor history completed before send release");
+        assert_eq!(
+            status, "sending...",
+            "passive history must not replace retained in-flight feedback"
+        );
+        assert_eq!(
+            ids,
+            if history_fails {
+                vec!["new"]
+            } else {
+                vec!["old", "new"]
+            }
+        );
+        assert!(
+            !loading,
+            "history completion/error releases its own paging flag"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn canceled_flicks_and_the_account_picker_keep_the_active_pages_feedback() {
+    for mode in [
+        "same-pane",
+        "same-pending-target",
+        "picker-before-result",
+        "picker-after-result",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let exe = dir.path().join("wn-canceled-navigation");
+        let first_page = dir.path().join("first-page");
+        let args_file = dir.path().join("calls");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\nif mkdir '{}' 2>/dev/null; then\n{}fi\n\
+                 printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"active page offline\"}}}}';;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                args_file.display(),
+                first_page.display(),
+                gate.script(),
+            ),
+        );
+        let client = WnClient {
+            exe,
+            ..test_unused_client()
+        };
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let account = "aa".repeat(32);
+            let group_a = "cc".repeat(16);
+            let group_b = "dd".repeat(16);
+            let mut app = test_tui_app(client, &account);
+            app.daemon.running = false;
+            app.accounts.push(AccountRow {
+                account_id: "bb".repeat(32),
+                npub: "npub1bob".to_owned(),
+                display_name: None,
+                local_signing: true,
+            });
+            app.chats = vec![flick_chat(&group_a, "A"), flick_chat(&group_b, "B")];
+            app.messages_account_id = Some(account);
+            app.messages_group_id = Some(group_a);
+            app.timeline = vec![timeline_row("A-row", 100)];
+            app.selected_chat = if mode == "same-pane" { 0 } else { 1 };
+            app.focus = Focus::Chats;
+            app.refresh_messages().unwrap();
+            let generation = app.timeline_load_generation;
+            continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            if mode == "same-pane" {
+                // A page is a same-pane reload; B -> A settles back on that pane.
+                app.handle_key(char_key('j')).unwrap();
+                app.handle_key(char_key('k')).unwrap();
+            } else if mode == "same-pending-target" {
+                // B's genuine pending first page cleared A; A -> B must recognize
+                // the already pending B target even though the pane is empty.
+                app.handle_key(char_key('k')).unwrap();
+                app.handle_key(char_key('j')).unwrap();
+            } else {
+                app.handle_key(char_key('k')).unwrap();
+                app.handle_key(char_key('A')).unwrap();
+                app.handle_key(char_key('j')).unwrap(); // picker-local highlight only
+            }
+            for _ in 0..FLICK_PREVIEW_DEBOUNCE_TICKS {
+                app.tick();
+            }
+            if mode == "picker-before-result" {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+            }
+            ui_tx
+                .send((
+                    app.status.clone(),
+                    app.timeline_load_generation == generation,
+                    app.loading_chat.is_some(),
+                    app.selected_account == 0,
+                ))
+                .unwrap();
+            if finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                finish_queued_effects(&mut app);
+                if mode == "picker-after-result" {
+                    // The actual page failure folds while the picker is visible.
+                    // Esc must reveal the latest live Main feedback, not restore
+                    // a stale pre-picker string or silently drop the failure.
+                    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                        .unwrap();
+                }
+                assert_eq!(app.screen, Screen::Main);
+                assert_eq!(app.status, "error: active page offline", "{mode}");
+                assert!(app.loading_chat.is_none());
+                assert_eq!(app.selected_account, 0, "Esc discards picker navigation");
+                assert_eq!(
+                    timeline_ids(&app.timeline),
+                    if mode == "same-pane" {
+                        vec!["A-row"]
+                    } else {
+                        vec![]
+                    },
+                    "the genuinely cleared different-chat pane needs the actual failure feedback",
+                );
+            }
+        });
+        gate.wait_until_entered();
+        continue_tx.send(()).unwrap();
+        let before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+        gate.release();
+        finish_tx.send(before_release.is_ok()).unwrap();
+        worker.join().unwrap();
+        let (status, same_request, pending, same_account) =
+            before_release.expect("navigation completed before page release");
+        assert_eq!(
+            status, LOADING_TIMELINE_STATUS,
+            "{mode}: no canceled intent may clear the active request's status"
+        );
+        assert!(same_request && pending && same_account, "{mode}");
+        let calls = std::fs::read_to_string(&args_file).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains(" messages timeline list "))
+                .count(),
+            1,
+            "{mode}: canceled/no-op flicks cannot create a replacement read: {calls}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn invite_notices_wait_for_available_main_feedback() {
+    let account = "aa".repeat(32);
+    for context in [
+        "command",
+        "empty-account",
+        "detail",
+        "profile",
+        "users",
+        "users-follow",
+    ] {
+        let response = serde_json::json!({"ok":true,"result":{
+            "accounts":[{"account_id_hex":account,"npub":"npub1alice","local_signing":true}],
+            "chats":[],"members":[],"admins":[],"relays":[],"users":[{"account_id_hex":"22".repeat(32),"npub":"npub-peer","radius":0,"matched_field":"name","match_quality":"exact","profile":{"display_name":"Peer"}}],"follows":[],
+            "profile":{"name":"Room"}
+        }})
+        .to_string();
+        let (_dir, client) = test_json_client(&response);
+        let mut app = test_tui_app(client, &account);
+        app.daemon.running = false;
+        app.chats = vec![flick_chat("cc", "Room")];
+        match context {
+            "command" => app.run_slash_command(SlashCommand::Diagnostics).unwrap(),
+            "empty-account" => app.refresh_chats().unwrap(),
+            "detail" => {
+                app.open_group_detail().unwrap();
+                finish_queued_effects(&mut app);
+            }
+            "profile" => app.open_profile().unwrap(),
+            "users" | "users-follow" => {
+                app.open_user_search(Some("same".into()));
+                finish_queued_effects(&mut app);
+            }
+            _ => unreachable!(),
+        }
+        if context == "users-follow" {
+            app.follow_search_result();
+            finish_queued_effects(&mut app);
+            assert!(app.status.starts_with("followed "));
+        }
+        let before = app.status.clone();
+        let (tx, rx) = mpsc::channel();
+        app.notification_subscription = Some(NotificationSubscription {
+            account_id: account.clone(),
+            child: test_sleep_child(),
+            rx,
+        });
+        for (key, name) in [
+            ("invite:1", "One"),
+            ("invite:1", "One"),
+            ("invite:2", "Two"),
+        ] {
+            tx.send(SubscriptionEvent::Result(serde_json::json!({
+                "type":"notification","account_id":account,
+                "notification":{"trigger":"GroupInvite","group_name":name,"notification_key":key}
+            })))
+            .unwrap();
+        }
+        assert!(app.drain_notification_subscription());
+        if context != "empty-account" {
+            app.tick();
+            assert_eq!(app.status, before, "{context}: occupied feedback wins");
+            match context {
+                "detail" | "profile" | "users" | "users-follow" => app
+                    .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap(),
+                "command" => app.refresh_chats().unwrap(),
+                _ => unreachable!(),
+            }
+        }
+        if context == "users-follow" {
+            assert_eq!(
+                app.status, before,
+                "leaving a read view preserves a newer mutation acknowledgement"
+            );
+            app.refresh_chats().unwrap();
+        }
+        app.tick();
+        assert_eq!(
+            app.status, "new group invites — press I to view invites",
+            "{context}: queued notices survive receipt deduplication"
+        );
+        assert!(rendered_buffer(&mut app).contains("press I to view invites"));
+        app.run_slash_command(SlashCommand::Diagnostics).unwrap();
+        let acknowledgement = app.status.clone();
+        // A daemon-down refresh correctly releases the old notification feed.
+        // Reconnect the actual receiver before delivering its duplicate event.
+        let (tx, rx) = mpsc::channel();
+        app.notification_subscription = Some(NotificationSubscription {
+            account_id: account.clone(),
+            child: test_sleep_child(),
+            rx,
+        });
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type":"notification","account_id":account,
+            "notification":{"trigger":"GroupInvite","group_name":"One","notification_key":"invite:1"}
+        }))).unwrap();
+        app.tick();
+        assert_eq!(
+            app.status, acknowledgement,
+            "already delivered duplicates do not replay"
+        );
+        app.refresh_chats().unwrap();
+        app.tick();
+        assert!(
+            app.status.contains("no chats"),
+            "delivered notices are consumed exactly once"
+        );
+    }
+    {
+        for outcome in ["success", "failure", "new-during-success"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let exe = dir.path().join("wn-invite-notice-ack");
+            let listing = if outcome == "failure" {
+                serde_json::json!({"ok":false,"error":{"message":"invite list offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"invites":[]}})
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\ncase \" $* \" in\n\
+             *' groups invites '*)\n{}printf '%s\\n' '{listing}';;\n\
+             *) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[]}}}}';;\n\
+             esac\n",
+                    gate.script(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (issued_tx, issued_rx) = mpsc::channel();
+            let (continue_tx, continue_rx) = mpsc::channel::<bool>();
+            let (during_tx, during_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let worker = thread::spawn(move || {
+                let account = "aa".repeat(32);
+                let mut app = test_tui_app(client, &account);
+                app.daemon.running = false;
+                app.focus = Focus::Chats;
+                app.run_slash_command(SlashCommand::Diagnostics).unwrap();
+                let retained = app.status.clone();
+                let (notice_tx, rx) = mpsc::channel();
+                app.notification_subscription = Some(NotificationSubscription {
+                    account_id: account.clone(),
+                    child: test_sleep_child(),
+                    rx,
+                });
+                for (key, name) in [
+                    ("invite:ack-before-one", "Before one"),
+                    ("invite:ack-before-two", "Before two"),
+                ] {
+                    notice_tx
+                        .send(SubscriptionEvent::Result(serde_json::json!({
+                            "type":"notification","account_id":account,
+                            "notification":{"trigger":"GroupInvite","group_name":name,
+                                "notification_key":key}
+                        })))
+                        .unwrap();
+                }
+                app.tick();
+                assert_eq!(
+                    app.status, retained,
+                    "preexisting notices are queued behind retained command feedback"
+                );
+
+                // This must return while the physical groups-invites child is held.
+                app.handle_key(char_key('I')).unwrap();
+                issued_tx.send(app.status.clone()).unwrap();
+                if continue_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    if outcome == "new-during-success" {
+                        notice_tx
+                            .send(SubscriptionEvent::Result(serde_json::json!({
+                                "type":"notification","account_id":account,
+                                "notification":{"trigger":"GroupInvite","group_name":"During list",
+                                    "notification_key":"invite:ack-during-three"}
+                            })))
+                            .unwrap();
+                        app.tick();
+                    }
+                    during_tx.send(app.status.clone()).unwrap();
+                }
+                if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return;
+                }
+                finish_queued_effects(&mut app);
+                let terminal = if outcome == "failure" {
+                    "error: invite list offline"
+                } else {
+                    "0 pending invite(s)"
+                };
+                assert_eq!(app.status, terminal, "{outcome}: actual I outcome");
+                assert!(rendered_buffer(&mut app).contains(terminal));
+
+                // Close the real successful empty-list card, then make Main idle via
+                // the actual empty-chat refresh. No feedback/token state is seeded.
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                app.refresh_chats().unwrap();
+                app.tick();
+                if outcome == "success" {
+                    assert!(
+                        app.status.contains("no chats"),
+                        "successful I acknowledges the already queued notices: {}",
+                        app.status
+                    );
+                    assert!(!rendered_buffer(&mut app).contains("press I to view invites"));
+                } else {
+                    assert_eq!(
+                        app.status, "new group invites — press I to view invites",
+                        "{outcome}: failed I preserves old notices; successful I preserves a newer arrival"
+                    );
+                    assert!(rendered_buffer(&mut app).contains("press I to view invites"));
+                }
+                // Both kinds of retained notice are presented once, not replayed.
+                app.refresh_chats().unwrap();
+                app.tick();
+                assert!(
+                    app.status.contains("no chats"),
+                    "{outcome}: consumed exactly once"
+                );
+            });
+            gate.wait_until_entered();
+            let issued = issued_rx.recv_timeout(Duration::from_secs(5));
+            continue_tx.send(issued.is_ok()).unwrap();
+            let during = if issued.is_ok() {
+                Some(during_rx.recv_timeout(Duration::from_secs(5)))
+            } else {
+                None
+            };
+            let can_finish = issued.is_ok() && during.as_ref().is_some_and(Result::is_ok);
+            // Release before asserting/joining even if a broken foreground blocks.
+            gate.release();
+            finish_tx.send(can_finish).unwrap();
+            worker.join().unwrap();
+            assert_eq!(
+                issued.expect("I returned before list-child release"),
+                "loading invites..."
+            );
+            assert_eq!(
+                during
+                    .unwrap()
+                    .expect("notice drain returned while list child held"),
+                "loading invites...",
+                "{outcome}: occupied list feedback survives the arrival"
+            );
+        }
+    }
+}
+
+// Feedback-free UI actions keep the active request status authority.
+#[cfg(unix)]
+#[test]
+fn no_feedback_main_actions_preserve_the_pending_operations_terminal_feedback() {
+    let mut observed = Vec::new();
+    for ui in [
+        "control",
+        "empty-enter",
+        "whitespace-enter",
+        "react-prefill",
+        "delete-prefill",
+        "ready-image",
+        "logout-submit",
+        "help-submit",
+    ] {
+        for outcome in ["send-success", "send-error", "page-error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let exe = dir.path().join("wn-no-feedback");
+            let args_file = dir.path().join("calls");
+            let send = if outcome == "send-error" {
+                serde_json::json!({"ok":false,"error":{"message":"send offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"message_ids":["sent-id"],"published":2}})
+            };
+            let send_gate = if outcome.starts_with("send-") {
+                gate.script()
+            } else {
+                String::new()
+            };
+            let page_gate = if outcome == "page-error" {
+                gate.script()
+            } else {
+                String::new()
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' messages send '*)\n{send_gate}printf '%s\\n' '{send}';;\n\
+                 *' messages timeline list '*)\n{page_gate}printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"page offline\"}}}}';;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    args_file.display(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let (ui_tx, ui_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let worker = thread::spawn(move || {
+                let account = "aa".repeat(32);
+                let group = "cc".repeat(16);
+                let mut app = test_tui_app(client, &account);
+                app.daemon.running = false;
+                app.chats = vec![flick_chat(&group, "Room")];
+                app.messages_account_id = Some(account);
+                app.messages_group_id = Some(group);
+                let mut row = timeline_row("existing-row", 100);
+                if ui == "ready-image" {
+                    row.attachments = vec![image_attachment("cafebabe")];
+                    app.media = media_with_ready_image("cafebabe");
+                }
+                app.timeline = vec![row];
+                if outcome == "page-error" {
+                    // A genuine same-chat reload preserves the selected row,
+                    // so image/prefill keys are valid while its child is pending.
+                    app.refresh_messages().unwrap();
+                } else {
+                    app.send_message("pending body".to_owned()).unwrap();
+                }
+                continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let action_ok = match ui {
+                    "control" => true,
+                    "empty-enter" | "whitespace-enter" => {
+                        app.focus = Focus::Composer;
+                        app.input
+                            .set_value(if ui == "empty-enter" { "" } else { " \t " });
+                        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                            .unwrap();
+                        app.input.is_empty() && app.popup.is_none()
+                    }
+                    "react-prefill" | "delete-prefill" => {
+                        app.focus = Focus::Messages;
+                        app.input.clear();
+                        app.handle_key(char_key(if ui == "react-prefill" { 'r' } else { 'd' }))
+                            .unwrap();
+                        app.focus == Focus::Composer
+                            && app.input.value()
+                                == if ui == "react-prefill" {
+                                    "/react "
+                                } else {
+                                    "/delete"
+                                }
+                    }
+                    "ready-image" => {
+                        app.focus = Focus::Messages;
+                        app.handle_key(char_key('o')).unwrap();
+                        matches!(app.popup, Some(Popup::Image { .. }))
+                    }
+                    "logout-submit" | "help-submit" => {
+                        // Exercise submit_input too: removing the popup leaf's
+                        // claim cannot repair a generic claim in slash dispatch.
+                        app.focus = Focus::Composer;
+                        app.input.set_value(if ui == "logout-submit" {
+                            "/logout"
+                        } else {
+                            "/help"
+                        });
+                        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                            .unwrap();
+                        app.input.is_empty()
+                            && if ui == "logout-submit" {
+                                matches!(
+                                    app.popup,
+                                    Some(Popup::Text {
+                                        purpose: TextPurpose::ConfirmLogout { .. },
+                                        ..
+                                    })
+                                )
+                            } else {
+                                matches!(app.popup, Some(Popup::Card { .. }))
+                            }
+                    }
+                    _ => unreachable!(),
+                };
+                ui_tx.send((action_ok, app.status.clone())).unwrap();
+                if finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    finish_queued_effects(&mut app);
+                    Some((
+                        app.status.clone(),
+                        app.loading_chat.is_none(),
+                        timeline_ids(&app.timeline)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            gate.wait_until_entered();
+            continue_tx.send(()).unwrap();
+            let ui_before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+            gate.release();
+            finish_tx.send(ui_before_release.is_ok()).unwrap();
+            let final_state = worker.join().unwrap();
+            let (action_ok, before) =
+                ui_before_release.expect("UI action completed before child release");
+            let (after, settled, ids) =
+                final_state.expect("released operation was folded through FIFO");
+            let expected = match outcome {
+                "send-success" => "sent message; published=2",
+                "send-error" => "error: send offline",
+                "page-error" => "error: page offline",
+                _ => unreachable!(),
+            };
+            let expected_pending = if outcome == "page-error" {
+                LOADING_TIMELINE_STATUS
+            } else {
+                "sending..."
+            };
+            let calls = std::fs::read_to_string(&args_file).unwrap();
+            let sends = calls
+                .lines()
+                .filter(|line| line.contains(" messages send "))
+                .count();
+            let pages = calls
+                .lines()
+                .filter(|line| line.contains(" messages timeline list "))
+                .count();
+            let model_ok = ids.contains(&"existing-row".to_owned())
+                && ids.contains(&"sent-id".to_owned()) == (outcome == "send-success");
+            observed.push((
+                ui,
+                outcome,
+                before.clone(),
+                after.clone(),
+                action_ok
+                    && before == expected_pending
+                    && after == expected
+                    && settled
+                    && model_ok
+                    && sends == usize::from(outcome.starts_with("send-"))
+                    && pages == usize::from(outcome == "page-error"),
+            ));
+        }
+    }
+    assert!(
+        observed.iter().all(|row| row.4),
+        "no-feedback UI actions preserve actual pending terminal feedback: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_search_profile_card_preserves_the_pending_follows_feedback() {
+    // Supported UI path: real user search -> f -> Enter profile card. Do not
+    // invent a Main send/page under Search: entering Search already supersedes
+    // Main feedback. The async follow is the genuine pending action on this view.
+    let mut observed = Vec::new();
+    for fails in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let exe = dir.path().join("wn-card-during-follow");
+        let args_file = dir.path().join("calls");
+        let peer = "bb".repeat(32);
+        let search = serde_json::json!({"ok":true,"result":{"users":[{
+            "account_id_hex":peer,"npub":"npub1bob","radius":1,
+            "matched_field":"name","match_quality":"exact",
+            "profile":{"display_name":"Bob"}
+        }]}});
+        let follow = if fails {
+            serde_json::json!({"ok":false,"error":{"message":"follow offline"}})
+        } else {
+            serde_json::json!({"ok":true,"result":{}})
+        };
+        let card = serde_json::json!({"ok":true,"result":{"user":{
+            "npub":"npub1bob","profile":{"display_name":"Bob"}
+        }}});
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+             *' users search '*) printf '%s\\n' '{search}';;\n\
+             *' follows add '*)\n{}printf '%s\\n' '{follow}';;\n\
+             *' users show '*) printf '%s\\n' '{card}';;\n\
+             *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                args_file.display(),
+                gate.script(),
+            ),
+        );
+        let client = WnClient {
+            exe,
+            relay: Some("wss://relay.example".to_owned()),
+            ..test_unused_client()
+        };
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let mut app = test_tui_app(client, &"aa".repeat(32));
+            app.daemon.running = false;
+            app.open_user_search(Some("Bob".to_owned()));
+            finish_queued_effects(&mut app);
+            assert_eq!(
+                app.user_search.as_ref().unwrap().focus,
+                UserSearchFocus::Results
+            );
+            app.handle_key(char_key('f')).unwrap();
+            continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            ui_tx
+                .send((
+                    matches!(app.popup, Some(Popup::Card { ref title, .. }) if title == "Profile"),
+                    app.status.clone(),
+                ))
+                .unwrap();
+            if finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                finish_queued_effects(&mut app);
+                Some((
+                    app.status.clone(),
+                    app.user_search.as_ref().unwrap().results[0].following,
+                ))
+            } else {
+                None
+            }
+        });
+        gate.wait_until_entered();
+        continue_tx.send(()).unwrap();
+        let ui_before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+        gate.release();
+        finish_tx.send(ui_before_release.is_ok()).unwrap();
+        let after = worker
+            .join()
+            .unwrap()
+            .expect("follow folded through the real FIFO");
+        let (card_open, before) = ui_before_release.expect("card opened before follow release");
+        let expected = if fails {
+            "error: follow offline"
+        } else {
+            "followed Bob"
+        };
+        let calls = std::fs::read_to_string(args_file).unwrap();
+        observed.push((
+            fails,
+            before.clone(),
+            after.0.clone(),
+            card_open
+                && before == "following Bob..."
+                && after.0 == expected
+                && after.1 == !fails
+                && calls
+                    .lines()
+                    .filter(|line| line.contains(" follows add "))
+                    .count()
+                    == 1
+                && calls
+                    .lines()
+                    .filter(|line| line.contains(" users show "))
+                    .count()
+                    == 1,
+        ));
+    }
+    assert!(
+        observed.iter().all(|row| row.3),
+        "successful profile-card opening cannot strand the actual pending follow: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_empty_chat_refresh_cancels_the_same_accounts_pending_page_and_followups() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observations = Vec::new();
+    for list_fails in [false, true] {
+        for page_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let exe = dir.path().join("wn-empty-list-during-page");
+            let calls = dir.path().join("calls");
+            let first_list = dir.path().join("first-list");
+            let timeline_entered = dir.path().join("timeline-entered");
+            let group_entered = dir.path().join("group-entered");
+            let accounts = serde_json::json!({"ok":true,"result":{"accounts":[{
+                "account_id":account,"npub":"npub1alice","local_signing":true
+            }]}});
+            let nonempty = serde_json::json!({"ok":true,"result":{"chats":[{
+                "group_id":group,"profile":{"name":"Room"}
+            }]}});
+            let refreshed = if list_fails {
+                serde_json::json!({"ok":false,"error":{"message":"chat list offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"chats":[]}})
+            };
+            let page = if page_fails {
+                serde_json::json!({"ok":false,"error":{"message":"old page offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"old-page-row","direction":"received","from":"peer",
+                    "plaintext":"original pending page","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' account list '*) printf '%s\\n' '{accounts}';;\n\
+                 *' chats list '*)\nif mkdir '{}' 2>/dev/null; then\n\
+                 printf '%s\\n' '{nonempty}'\nelse printf '%s\\n' '{refreshed}'; fi;;\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+                 *' messages timeline subscribe '*) printf entered > '{}'; exec sleep 60;;\n\
+                 *' groups subscribe-state '*) printf entered > '{}'; exec sleep 60;;\n\
+                 *' subscribe '*|*' subscribe-archived '*) exec sleep 60;;\n\
+                 *' daemon status '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true}}}}';;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    calls.display(),
+                    first_list.display(),
+                    gate.script(),
+                    timeline_entered.display(),
+                    group_entered.display(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let (ui_tx, ui_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let expected_account = account.clone();
+            let expected_group = group.clone();
+            let worker = thread::spawn(move || {
+                // The existing fixture models a running daemon, so re-adoption
+                // would have real eligible group subscription/mark-read effects.
+                // start() loads the real account/list and dispatches its first page.
+                let mut app = test_tui_app(client, &expected_account);
+                app.start().unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                app.focus = Focus::Composer;
+                app.input.set_value("/refresh");
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+                ui_tx
+                    .send((
+                        app.status.clone(),
+                        app.chats.is_empty(),
+                        app.loading_chat.is_none(),
+                        app.timeline.is_empty(),
+                        app.messages_group_id.is_none(),
+                        app.screen == Screen::Main,
+                        app.selected_account_row().map(|row| row.account_id.clone())
+                            == Some(expected_account.clone()),
+                    ))
+                    .unwrap();
+                if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return None;
+                }
+                // First fence may precede work enqueued by folding the page;
+                // second fence consumes all those real diagnostic/read followups.
+                finish_queued_effects(&mut app);
+                finish_queued_effects(&mut app);
+                if list_fails && !page_fails {
+                    // Positive control: await produced child-entry markers, not
+                    // a timing delay. Both real per-group subscriptions must run.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !timeline_entered.exists() || !group_entered.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "legitimate page subscriptions never entered"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let empty_state = app.chats.is_empty()
+                    && app.timeline.is_empty()
+                    && app.loading_chat.is_none()
+                    && app.messages_account_id.as_deref() == Some(expected_account.as_str())
+                    && app.messages_group_id.is_none()
+                    && app.timeline_subscription.is_none()
+                    && app.group_state_subscription.is_none()
+                    && app.group_diagnostics.is_none();
+                let control_state = app.chats.len() == 1
+                    && app.loading_chat.is_none()
+                    && if page_fails {
+                        app.timeline.is_empty()
+                            && app.messages_group_id.is_none()
+                            && app.timeline_subscription.is_none()
+                            && app.group_state_subscription.is_none()
+                            && app.group_diagnostics.is_none()
+                    } else {
+                        timeline_ids(&app.timeline) == vec!["old-page-row"]
+                            && app.messages_account_id.as_deref() == Some(expected_account.as_str())
+                            && app.messages_group_id.as_deref() == Some(expected_group.as_str())
+                            && app.timeline_subscription.as_ref().is_some_and(|sub| {
+                                sub.account_id == expected_account && sub.group_id == expected_group
+                            })
+                            && app.group_state_subscription.as_ref().is_some_and(|sub| {
+                                sub.account_id == expected_account && sub.group_id == expected_group
+                            })
+                            && app
+                                .group_diagnostics
+                                .as_ref()
+                                .is_some_and(|diag| diag.group_id == expected_group)
+                    };
+                let account_feed = app
+                    .message_subscription
+                    .as_ref()
+                    .is_some_and(|sub| sub.account_id == expected_account);
+                Some((app.status.clone(), empty_state, control_state, account_feed))
+                // Dropping this app kills/waits its owned subscription children
+                // before the parent reads the command recorder after join.
+            });
+            gate.wait_until_entered();
+            continue_tx.send(()).unwrap();
+            let before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+            gate.release();
+            finish_tx.send(before_release.is_ok()).unwrap();
+            let after = worker
+                .join()
+                .unwrap()
+                .expect("actual page and followups were folded");
+            let before =
+                before_release.expect("keyed refresh returned before the original page release");
+            let recorded = std::fs::read_to_string(calls).unwrap();
+            let count = |needle: &str| {
+                recorded
+                    .lines()
+                    .filter(|line| line.contains(needle))
+                    .count()
+            };
+            let mark_reads = recorded
+                .lines()
+                .filter(|line| {
+                    line.contains(" chats mark-read ")
+                        && !line.contains("test-fifo-completion-marker")
+                })
+                .count();
+            let legitimate_page = list_fails && !page_fails;
+            let before_ok = before.1 == !list_fails
+                && before.2 == !list_fails
+                && before.3
+                && before.4
+                && before.5
+                && before.6
+                && if list_fails {
+                    before.0 == "error: chat list offline"
+                } else {
+                    before.0.contains("no chats")
+                };
+            observations.push((
+                list_fails,
+                page_fails,
+                before.0.clone(),
+                after.0.clone(),
+                before_ok
+                    && after.0 == before.0
+                    && after.3
+                    && if list_fails { after.2 } else { after.1 }
+                    && count(" account list") == 2
+                    && count(" chats list") == 2
+                    && count(" messages timeline list ") == 1
+                    && mark_reads == usize::from(legitimate_page)
+                    && count(" messages timeline subscribe ") == usize::from(legitimate_page)
+                    && count(" groups subscribe-state ") == usize::from(legitimate_page)
+                    && count(" groups show ") == 0,
+                before,
+                after,
+                (
+                    count(" account list"),
+                    count(" chats list"),
+                    count(" messages timeline list "),
+                    mark_reads,
+                    count(" messages timeline subscribe "),
+                    count(" groups subscribe-state "),
+                    count(" groups show "),
+                ),
+            ));
+        }
+    }
+    assert!(
+        observations.iter().all(|row| row.4),
+        "empty successful list cancels old model work; failed list preserves legitimate work: {observations:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_daemon_guidance_waits_for_idle_main_and_is_consumed_once() {
+    use clap::Parser;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Hold {
+        PageError,
+        NewerAction,
+        // A real daemon-status child observes another process having started it.
+        // This is valid even when this TUI was launched without relay sources.
+        ManualDaemonReady,
+        ManualStop,
+        LateManualStop,
+    }
+
+    let mut cases = Vec::new();
+    for picker in [false, true] {
+        for start_fails in [false, true] {
+            for hold in [Hold::PageError, Hold::NewerAction] {
+                cases.push((picker, start_fails, hold));
+            }
+        }
+    }
+    // No need to repeat both picker routes for the obsolete-guidance contrast.
+    for start_fails in [false, true] {
+        cases.push((false, start_fails, Hold::ManualDaemonReady));
+        cases.push((false, start_fails, Hold::ManualStop));
+    }
+
+    cases.push((false, true, Hold::LateManualStop));
+    let mut warnings = Vec::new();
+    for (picker, start_fails, hold) in cases {
+        let context = format!("picker={picker}, start_fails={start_fails}, hold={hold:?}");
+        let dir = tempfile::tempdir().expect("startup fixture directory");
+        let mut page_gate = TestCommandGate::new(dir.path());
+        let daemon_dir = dir.path().join("daemon");
+        std::fs::create_dir(&daemon_dir).unwrap();
+        let mut daemon_gate = TestCommandGate::new(&daemon_dir);
+        let page_seen = dir.path().join("first-page-entered");
+        let page_error = dir.path().join("page-error");
+        let daemon_ready = dir.path().join("daemon-ready");
+        if !matches!(hold, Hold::NewerAction) {
+            std::fs::write(&page_error, b"offline").unwrap();
+        }
+        let account_a = "aa".repeat(32);
+        let account_b = "bb".repeat(32);
+        let group = "cc".repeat(16);
+        let mut accounts = vec![serde_json::json!({
+            "account_id":account_a, "npub":"npub1startup-a", "local_signing":true
+        })];
+        if picker {
+            accounts.push(serde_json::json!({
+                "account_id":account_b, "npub":"npub1startup-b", "local_signing":true
+            }));
+        }
+        let catalog = serde_json::json!({"ok":true,"result":{
+            "accounts":accounts,
+            "chats":[{"group_id":group,"profile":{"name":"Startup chat"}}]
+        }});
+        let page = serde_json::json!({"ok":true,"result":{
+            "messages":[{"message_id":"startup-page-row","direction":"received",
+                "from":"startup-peer","plaintext":"Startup page body",
+                "timeline_at":3,"received_at":3}],"has_more_before":false
+        }});
+        let exe = dir.path().join("wn-startup-guidance");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n\
+                   if [ ! -e '{seen}' ]; then\n\
+                     : > '{seen}'\n{page_gate}\
+                   fi\n\
+                   if [ -e '{page_error}' ]; then\n\
+                     printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"startup page offline\"}}}}'\n\
+                   else printf '%s\\n' '{page}'; fi;;\n\
+                 *' daemon start '*)\n{daemon_gate}\
+                   printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"startup daemon unreachable\"}}}}';;\n\
+                 *' daemon status '*)\n\
+                   if [ -e '{daemon_ready}' ]; then\n\
+                     printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true}}}}'\n\
+                   else printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":false}}}}'; fi;;\n\
+                 *' daemon stop '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":false}}}}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{catalog}';;\nesac\n",
+                seen = page_seen.display(),
+                page_gate = page_gate.script(),
+                page_error = page_error.display(),
+                daemon_gate = daemon_gate.script(),
+                daemon_ready = daemon_ready.display(),
+            ),
+        );
+        let args = if start_fails {
+            vec![
+                "wn",
+                "tui",
+                "--discovery-relays",
+                "wss://startup-relay.example",
+            ]
+        } else {
+            vec!["wn", "tui"]
+        };
+        let mut app = TuiApp::new(Cli::try_parse_from(args).unwrap()).unwrap();
+        // Replace only the real subprocess boundary, keeping constructor/startup state.
+        app.client.exe = exe;
+        app.effects = EffectRunner::spawn(app.client.clone());
+        app.start()
+            .expect("actual startup routes its native account-list result");
+        if picker {
+            assert_eq!(
+                app.screen,
+                Screen::Login(LoginMode::AccountSelect),
+                "{context}"
+            );
+        } else {
+            assert_eq!(app.screen, Screen::Main, "{context}");
+            page_gate.wait_until_entered();
+        }
+
+        // Match run(): start() first, then autostart, then user events/ticks.
+        app.autostart_daemon_if_needed(None);
+        if start_fails {
+            daemon_gate.wait_until_entered();
+        } else {
+            assert!(
+                app.daemon_autostart.is_none(),
+                "no child without relay sources: {context}"
+            );
+        }
+        if picker {
+            app.handle_key(char_key('j'))
+                .expect("move to second native account");
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("commit picker while any startup child is still held");
+            assert_eq!(app.screen, Screen::Main, "{context}");
+            page_gate.wait_until_entered();
+            assert_eq!(
+                app.selected_account_row().unwrap().account_id,
+                account_b,
+                "{context}"
+            );
+        }
+        assert_eq!(
+            app.status, LOADING_TIMELINE_STATUS,
+            "startup guidance cannot replace loading: {context}"
+        );
+        if matches!(hold, Hold::NewerAction) {
+            // This foreground action returns while the real page/start children are held.
+            app.run_slash_command(SlashCommand::Diagnostics).unwrap();
+            assert_eq!(app.status, "diagnostics panel on", "{context}");
+        }
+        if start_fails && !matches!(hold, Hold::LateManualStop) {
+            daemon_gate.release();
+            let result = app.recv_daemon_autostart();
+            assert!(result.is_err(), "the actual start child failed: {context}");
+            app.fold_daemon_start(result);
+        }
+        let provisional = if matches!(hold, Hold::NewerAction) {
+            "diagnostics panel on"
+        } else {
+            LOADING_TIMELINE_STATUS
+        };
+        assert_eq!(
+            app.status, provisional,
+            "failed startup cannot supersede its foreground: {context}"
+        );
+        page_gate.release();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        let retained = if matches!(hold, Hold::NewerAction) {
+            "diagnostics panel on"
+        } else {
+            "error: startup page offline"
+        };
+        assert_eq!(
+            app.status, retained,
+            "page completion settles its own feedback only: {context}"
+        );
+        app.tick();
+        app.tick();
+        assert_eq!(
+            app.status, retained,
+            "guidance waits behind retained feedback: {context}"
+        );
+        assert!(
+            !app.daemon.running,
+            "degraded startup remains honest: {context}"
+        );
+
+        if matches!(hold, Hold::ManualDaemonReady) {
+            // Another process may start a daemon even when this TUI lacks relays.
+            // The user's actual status command adopts that positive child result.
+            std::fs::write(&daemon_ready, b"running").unwrap();
+            app.run_slash_command(SlashCommand::DaemonStatus).unwrap();
+            assert!(
+                app.daemon.running,
+                "the manual command adopted readiness: {context}"
+            );
+            assert_eq!(app.status, "daemon running", "{context}");
+        }
+        if matches!(hold, Hold::ManualStop | Hold::LateManualStop) {
+            app.run_slash_command(SlashCommand::DaemonStop).unwrap();
+            assert_eq!(
+                app.status, "daemon stopped",
+                "explicit stop resolves startup guidance: {context}"
+            );
+            if matches!(hold, Hold::LateManualStop) {
+                daemon_gate.release();
+                let result = app.recv_daemon_autostart();
+                assert!(result.is_err());
+                app.fold_daemon_start(result);
+                assert_eq!(
+                    app.status, "daemon stopped",
+                    "late startup failure cannot replace manual stop: {context}"
+                );
+            }
+        }
+        if page_error.exists() {
+            std::fs::remove_file(&page_error).unwrap();
+        }
+        app.run_slash_command(SlashCommand::Refresh).unwrap();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        assert_eq!(
+            app.status, "loaded 1 message(s)",
+            "a real healthy refresh releases feedback: {context}"
+        );
+        app.tick();
+        let warning = if start_fails {
+            "daemon start failed: startup daemon unreachable"
+        } else {
+            DAEMON_AUTOSTART_NO_RELAYS_STATUS
+        };
+        if matches!(
+            hold,
+            Hold::ManualDaemonReady | Hold::ManualStop | Hold::LateManualStop
+        ) {
+            warnings.push((
+                context.clone(),
+                app.status.clone(),
+                app.status == "loaded 1 message(s)",
+            ));
+        } else {
+            warnings.push((context.clone(), app.status.clone(), app.status == warning));
+            // A new genuine idle presentation distinguishes consumption from
+            // repeatedly assigning the same warning string every tick.
+            app.run_slash_command(SlashCommand::Refresh).unwrap();
+            finish_queued_effects(&mut app);
+            finish_queued_effects(&mut app);
+            assert_eq!(app.status, "loaded 1 message(s)", "{context}");
+        }
+        app.tick();
+        app.tick();
+        assert_eq!(
+            app.status, "loaded 1 message(s)",
+            "consumed/obsolete guidance never replays: {context}"
+        );
+        assert_eq!(
+            app.timeline[0].message_id, "startup-page-row",
+            "page model still folds: {context}"
+        );
+        assert!(app.running, "{context}");
+    }
+    assert!(
+        warnings.iter().all(|row| row.2),
+        "deferred startup outcomes are delivered once and explicit daemon control resolves obsolete guidance: {warnings:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn live_chat_removal_settles_only_its_pending_pages_feedback_and_releases_invite_notices() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let invite_text = "invited to Incoming — press I to view invites";
+    let mut observations = Vec::new();
+    for page_fails in [false, true] {
+        for newer_action in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let chat_dir = dir.path().join("chat");
+            let notice_dir = dir.path().join("notice");
+            std::fs::create_dir(&chat_dir).unwrap();
+            std::fs::create_dir(&notice_dir).unwrap();
+            let mut page_gate = TestCommandGate::new(dir.path());
+            let mut chat_gate = TestCommandGate::new(&chat_dir);
+            let mut notice_gate = TestCommandGate::new(&notice_dir);
+            let exe = dir.path().join("wn-live-removal-feedback");
+            let calls = dir.path().join("calls");
+            let removed = dir.path().join("removed");
+            let accounts = serde_json::json!({"ok":true,"result":{"accounts":[{
+                "account_id":account,"npub":"npub1alice","local_signing":true
+            }]}});
+            let initial = serde_json::json!({"ok":true,"result":{"chats":[{
+                "group_id":group,"profile":{"name":"Room"},"archived":false
+            }]}});
+            // subscribe_chats sends an archived update even with
+            // include_archived=false, allowing clients to remove its prior row.
+            let removal = serde_json::json!({"ok":true,"result":{"type":"chat","chat":{
+                "group_id":group,"profile":{"name":"Room"},"archived":true
+            }}});
+            let invite = serde_json::json!({"ok":true,"result":{
+                "type":"notification","account_id":account,"notification":{
+                    "trigger":"GroupInvite","group_name":"Incoming",
+                    "notification_key":format!("invite:{account}:pending-cancel")
+                }
+            }});
+            let page = if page_fails {
+                serde_json::json!({"ok":false,"error":{"message":"canceled page offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"canceled-row","direction":"received","from":"peer",
+                    "plaintext":"must not return","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' account list '*) printf '%s\\n' '{accounts}';;\n\
+                 *' chats list '*) if test -e '{}'; then\n\
+                 printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[]}}}}'\n\
+                 else printf '%s\\n' '{initial}'; fi;;\n\
+                 *' chats subscribe '*)\n{}printf removed > '{}'\n\
+                 printf '%s\\n' '{removal}'; exec sleep 60;;\n\
+                 *' notifications subscribe '*)\n{}printf '%s\\n' '{invite}'; exec sleep 60;;\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+                 *' subscribe '*|*' subscribe-archived '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    calls.display(),
+                    removed.display(),
+                    chat_gate.script(),
+                    removed.display(),
+                    notice_gate.script(),
+                    page_gate.script(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (notice_tx, notice_rx) = mpsc::channel();
+            let (before_tx, before_rx) = mpsc::channel();
+            let (cancel_tx, cancel_rx) = mpsc::channel::<bool>();
+            let (canceled_tx, canceled_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let expected_account = account.clone();
+            let worker = thread::spawn(move || {
+                let mut app = test_tui_app(client, &expected_account);
+                app.start().unwrap();
+                notice_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if newer_action {
+                    app.focus = Focus::Composer;
+                    app.input.set_value("/diagnostics");
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                        .unwrap();
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.pending_invite_notices.contains_key(&expected_account) {
+                    app.drain_notification_subscription();
+                    assert!(
+                        Instant::now() < deadline,
+                        "actual invite child was not drained"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                app.tick();
+                before_tx
+                    .send((
+                        app.status.clone(),
+                        app.pending_invite_notices.contains_key(&expected_account),
+                    ))
+                    .unwrap();
+                if !cancel_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return None;
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.chats.is_empty() {
+                    app.drain_chat_subscription();
+                    assert!(
+                        Instant::now() < deadline,
+                        "actual archived chat row was not drained"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let canceled_status = app.status.clone();
+                app.tick(); // ordinary idle-Main notice delivery, with page still physically held
+                canceled_tx
+                    .send((
+                        canceled_status,
+                        app.status.clone(),
+                        app.pending_invite_notices.contains_key(&expected_account),
+                        app.loading_chat.is_none()
+                            && app.messages_group_id.is_none()
+                            && app.timeline.is_empty()
+                            && app.timeline_subscription.is_none()
+                            && app.group_state_subscription.is_none()
+                            && app.group_diagnostics.is_none(),
+                    ))
+                    .unwrap();
+                if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return None;
+                }
+                finish_queued_effects(&mut app);
+                finish_queued_effects(&mut app);
+                let after_page = app.status.clone();
+                let empty_state = app.chats.is_empty()
+                    && app.timeline.is_empty()
+                    && app.loading_chat.is_none()
+                    && app.messages_group_id.is_none()
+                    && app.timeline_subscription.is_none()
+                    && app.group_state_subscription.is_none()
+                    && app.group_diagnostics.is_none();
+                if newer_action {
+                    // A genuine later successful empty refresh releases the
+                    // retained diagnostics action; no direct feedback reset.
+                    app.focus = Focus::Composer;
+                    app.input.set_value("/refresh");
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                        .unwrap();
+                    app.tick();
+                }
+                let delivered = app.status.clone();
+                let notice_consumed = !app.pending_invite_notices.contains_key(&expected_account);
+                app.tick();
+                Some((
+                    after_page,
+                    empty_state,
+                    delivered,
+                    notice_consumed,
+                    app.status.clone(),
+                    app.message_subscription
+                        .as_ref()
+                        .is_some_and(|sub| sub.account_id == expected_account),
+                ))
+                // Drop kills/waits all owned subscription children before join returns.
+            });
+            page_gate.wait_until_entered();
+            chat_gate.wait_until_entered();
+            notice_gate.wait_until_entered();
+            notice_gate.release();
+            notice_tx.send(()).unwrap();
+            let before = before_rx.recv_timeout(Duration::from_secs(5));
+            chat_gate.release();
+            cancel_tx.send(before.is_ok()).unwrap();
+            let canceled = canceled_rx.recv_timeout(Duration::from_secs(5));
+            page_gate.release();
+            finish_tx.send(canceled.is_ok()).unwrap();
+            let after = worker
+                .join()
+                .unwrap()
+                .expect("canceled page and real FIFO followups folded");
+            let before = before.expect("invite/newer action drained before chat removal release");
+            let canceled =
+                canceled.expect("chat cancellation and notice tick returned before page release");
+            let initial_feedback = if newer_action {
+                "diagnostics panel on"
+            } else {
+                LOADING_TIMELINE_STATUS
+            };
+            let expected_after_cancel = if newer_action {
+                "diagnostics panel on"
+            } else {
+                invite_text
+            };
+            let recorded = std::fs::read_to_string(calls).unwrap();
+            let count = |needle: &str| {
+                recorded
+                    .lines()
+                    .filter(|line| line.contains(needle))
+                    .count()
+            };
+            let actual_marks = recorded
+                .lines()
+                .filter(|line| {
+                    line.contains(" chats mark-read ")
+                        && !line.contains("test-fifo-completion-marker")
+                })
+                .count();
+            let feedback_ok = if newer_action {
+                canceled.0 == "diagnostics panel on" && canceled.2
+            } else {
+                canceled.0 != LOADING_TIMELINE_STATUS && !canceled.2
+            };
+            let correct = before.0 == initial_feedback
+                && before.1
+                && feedback_ok
+                && canceled.1 == expected_after_cancel
+                && canceled.3
+                && after.0 == expected_after_cancel
+                && after.1
+                && after.2 == invite_text
+                && after.3
+                && after.4 == invite_text
+                && after.5
+                && count(" account list") == 1 + usize::from(newer_action)
+                && count(" chats list") == 1 + usize::from(newer_action)
+                && count(" messages timeline list ") == 1
+                && count(" messages timeline subscribe ") == 0
+                && count(" groups subscribe-state ") == 0
+                && count(" groups show ") == 0
+                && actual_marks == 0;
+            observations.push((page_fails, newer_action, before, canceled, after, correct));
+        }
+    }
+    assert!(
+        observations.iter().all(|row| row.5),
+        "live cancellation releases its own provisional feedback and preserves newer actions: {observations:?}"
+    );
 }

@@ -73,9 +73,13 @@ pub(crate) enum Effect {
     },
     /// Load (or reload) the materialized timeline page for a chat — the
     /// open-chat / flick-through load. Stale results (a newer open superseded
-    /// this one) are dropped at fold time by comparing `group` to the pane's
-    /// pending target.
-    LoadTimeline { account: String, group: String },
+    /// this one) are dropped at fold time by comparing account, group and generation
+    /// to the pane's pending request. Generation remains local to the TUI.
+    LoadTimeline {
+        account: String,
+        group: String,
+        generation: u64,
+    },
     /// Mark the loaded chat read up to its newest message and fold the returned
     /// projection into its row, clearing the badge without waiting for a push.
     MarkRead { account: String, group: String },
@@ -198,7 +202,7 @@ impl Effect {
                     message_id.clone(),
                 ],
             }],
-            Effect::LoadTimeline { account, group } => vec![WnCall {
+            Effect::LoadTimeline { account, group, .. } => vec![WnCall {
                 account: Some(account.clone()),
                 args: vec![
                     "messages".to_owned(),
