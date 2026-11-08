@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `SendIntent` gains `StepDownAndLeave { group_id }` and `SendResult` gains `LeaveRequested { request }` (mdk#3014):
+  an admin's Leave that records the leave request first and leaves the step-down and SelfRemove to the engine.
+  Exhaustive matches need them. Neither is persisted in a queued intent; no schema or wire change.
+
 - `LeaveRequest` gains `blocked: Option<LeaveBlockReason>` (`#[serde(default)]`; one reason, `LastActiveAdmin`), and
   `EngineError` gains `LeaveNotBlocked { group_id }` (kind `leave_not_blocked`) for a Cancel asked of a leave that is
   not blocked (mdk#3014). Struct literals and exhaustive matches need them. Stored requests without the field read as

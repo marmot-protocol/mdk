@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- An admin's Leave records the leave before anything is published (mdk#3014). New `SendIntent::StepDownAndLeave`:
+  from an admin with another active admin it writes the durable `LeaveRequest` and returns the new
+  `SendResult::LeaveRequested` without staging anything, and the leave re-drive stages the step-down and then the
+  SelfRemove, staging either again if it is refused or lost. The last active admin is refused with `AdminDepletion`,
+  and a non-admin's call is a plain `Leave`. Plain `Leave` from an admin is still refused with `AdminCannotSelfRemove`.
+  No wire or schema change.
+
 - A blocked leave is visible and can be cancelled (mdk#3014). When the selected branch makes a leaving account the
   last active admin, the leave re-drive records `LeaveRequest::blocked = Some(LastActiveAdmin)` and clears it as soon
   as the leave can move forward again; nothing retries meanwhile. New `Engine::leave_blocked`, and

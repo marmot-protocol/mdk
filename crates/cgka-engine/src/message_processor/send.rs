@@ -158,6 +158,14 @@ impl<S: StorageProvider> Engine<S> {
                     .await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
+            // `do_send` answers this before anything is queued; kept whole
+            // here so no path can send it as a plain Leave from an admin.
+            SendIntent::StepDownAndLeave { group_id } => {
+                match self.do_request_admin_leave(&group_id)? {
+                    Some(requested) => Ok(requested),
+                    None => self.do_send_leave(group_id).await,
+                }
+            }
             SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
             SendIntent::UpdateAppComponents { group_id, updates } => match pending_proposals {
                 PendingProposals::Consume => {
@@ -1096,6 +1104,47 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         Ok(SendResult::Proposal { msg })
+    }
+
+    /// Record an admin's leave before anything is published (mdk#3014). The
+    /// leave re-drive then stages the step-down and, once that state is
+    /// canonical, the SelfRemove (`next_leave_step`), so a step-down that is
+    /// refused, possibly exposed or superseded is staged again rather than
+    /// leaving the account demoted with no leave. `None` when this account
+    /// is not an active admin: the caller sends an ordinary Leave.
+    pub(crate) fn do_request_admin_leave(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<SendResult>, EngineError> {
+        if let Some(request) = self.load_leave_request_state(group_id)? {
+            self.schedule_pending_convergence_group(group_id);
+            return Ok(Some(SendResult::LeaveRequested { request }));
+        }
+        let authority = self.capture_group_authority_facts(group_id)?;
+        if !authority.is_admin {
+            return Ok(None);
+        }
+        // member-departure.md, "Behavior": the last active admin designates
+        // another admin before leaving.
+        if authority.admin_count < 2 {
+            return Err(EngineError::AdminDepletion {
+                group_id: group_id.clone(),
+            });
+        }
+        let request = LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: self.convergence_now_ms(),
+            last_proposed_epoch: None,
+            blocked: None,
+        };
+        self.put_leave_request_state(&request)?;
+        self.schedule_pending_convergence_group(group_id);
+        tracing::info!(
+            target: "cgka_engine::leave_request",
+            method = "do_request_admin_leave",
+            "admin leave request recorded"
+        );
+        Ok(Some(SendResult::LeaveRequested { request }))
     }
 
     pub(crate) async fn prepare_self_remove_proposal(

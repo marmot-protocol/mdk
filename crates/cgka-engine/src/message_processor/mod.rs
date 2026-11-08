@@ -963,6 +963,18 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(&intent, SendIntent::Disband { .. }) {
             return self.do_request_disband(group_id);
         }
+        // So is an admin's leave: the request is recorded before anything is
+        // published, in any epoch state, and the leave re-drive stages its
+        // step-down and SelfRemove. Anyone else sends an ordinary Leave.
+        let intent = match intent {
+            SendIntent::StepDownAndLeave { group_id } => {
+                if let Some(requested) = self.do_request_admin_leave(&group_id)? {
+                    return Ok(requested);
+                }
+                SendIntent::Leave { group_id }
+            }
+            intent => intent,
+        };
         if let Some(reason) = self.outbound_queue_reason(&group_id, &intent).await? {
             if matches!(&intent, SendIntent::RecoverMembers { .. }) {
                 return Err(EngineError::GroupRecoveryUnsettled { group_id });
@@ -1179,7 +1191,11 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        if !matches!(intent, SendIntent::Leave { .. }) && self.leave_in_progress(&group_id)? {
+        if !matches!(
+            intent,
+            SendIntent::Leave { .. } | SendIntent::StepDownAndLeave { .. }
+        ) && self.leave_in_progress(&group_id)?
+        {
             if matches!(intent, SendIntent::RecoverMembers { .. }) {
                 return Err(EngineError::GroupRecoveryUnsettled { group_id });
             }
@@ -1408,6 +1424,7 @@ impl<S: StorageProvider> Engine<S> {
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
                 | SendResult::DisbandRequested { .. }
+                | SendResult::LeaveRequested { .. }
                 | SendResult::Queued { .. } => {}
             }
             drained.push(result);
@@ -4449,6 +4466,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::AddOwnAccountDevices { group_id, .. }
         | SendIntent::RemoveOwnAccountDevices { group_id, .. }
         | SendIntent::Leave { group_id }
+        | SendIntent::StepDownAndLeave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::ReplaceDeviceEntry { group_id, .. }
@@ -4497,6 +4515,7 @@ pub(crate) fn is_fair_scheduled_intent(
         }
         SendIntent::AppMessage { .. }
         | SendIntent::Leave { .. }
+        | SendIntent::StepDownAndLeave { .. }
         | SendIntent::SelfUpdate { .. } => false,
     }
 }

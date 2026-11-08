@@ -1481,7 +1481,9 @@ impl<S: StorageProvider> Engine<S> {
         let mut rows = Vec::new();
 
         let main = match result {
-            SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => None,
+            SendResult::NoChange { .. }
+            | SendResult::DisbandRequested { .. }
+            | SendResult::LeaveRequested { .. } => None,
             SendResult::ApplicationMessage { msg, .. } => {
                 Some((msg, MessageArtifactKind::ApplicationMessage))
             }

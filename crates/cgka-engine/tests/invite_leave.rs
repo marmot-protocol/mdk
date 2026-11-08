@@ -41,6 +41,8 @@ use tls_codec::{Deserialize as _, Serialize as _};
 mod support;
 use support::proof_signer;
 
+#[path = "invite_leave/admin_leave.rs"]
+mod admin_leave;
 #[path = "invite_leave/recovery_batch.rs"]
 mod recovery_batch;
 

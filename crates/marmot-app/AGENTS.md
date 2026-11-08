@@ -528,8 +528,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Invitation decisions (`client/invitation_decisions.rs`, mdk#2628 4.3b/D96) are explicit per-admission intent, never
   inferred from archive/leave/delete snapshots. Explicit UserLeave (D99) records the current identified admission's
   Decline before departure effects when trusted device-group sync applies. Last-active-admin account refusal precedes
-  that write; a coadmin UserLeave demotes its account before ordinary native SelfRemove only while
-  `MarmotApp::admin_leave_steps_down` is true. Otherwise every admin UserLeave, Decline included, is refused before any
+  that write; a coadmin UserLeave sends `SendIntent::StepDownAndLeave`, whose engine-recorded leave steps the account
+  down before its SelfRemove, only while `MarmotApp::admin_leave_steps_down` is true. Never send the step-down from the
+  app ahead of a Leave: nothing durable holds the leave between the two. Otherwise every admin UserLeave, Decline included, is refused before any
   decision write, token removal or publish, and the host calls `self_demote_admin` first (mdk#3014 interim). Unknown
   admission, no trusted device group and held MAX skip a new decision. Sign-out stays leaf-only; received Decline reuses owed work without
   a new version. Preserve the existing pending-projection guard before any received application or saved-row adoption.

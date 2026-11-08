@@ -295,7 +295,19 @@ pub enum SendIntent {
         expected: Box<DeviceEntryV1>,
     },
     /// Leave the group via MIP-03 SelfRemove.
+    ///
+    /// Refused with [`crate::error::EngineError::AdminCannotSelfRemove`] while
+    /// this account is an active admin; see [`SendIntent::StepDownAndLeave`].
     Leave { group_id: GroupId },
+    /// Leave the group, first stepping down as admin when this account is
+    /// one. An admin's call records the durable leave request and publishes
+    /// nothing: it returns [`SendResult::LeaveRequested`], and the engine
+    /// stages the step-down and then, once that state is canonical, the
+    /// SelfRemove, re-driving either if it does not land. Refused with
+    /// [`crate::error::EngineError::AdminDepletion`] for the last active
+    /// admin. A non-admin's call is a [`SendIntent::Leave`], and a call on a
+    /// group that already has a leave request returns that request.
+    StepDownAndLeave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.
     ///
     /// The engine forces an update path and deliberately leaves the proposal
@@ -456,6 +468,13 @@ pub enum SendResult {
     /// mandatory convergence gate permit it.
     DisbandRequested {
         request: crate::storage::DisbandRequest,
+    },
+    /// The leave request is durable and nothing is published yet. The engine
+    /// stages this account's step-down as admin and then its SelfRemove from
+    /// the request, as convergence allows (see
+    /// [`SendIntent::StepDownAndLeave`]).
+    LeaveRequested {
+        request: crate::storage::LeaveRequest,
     },
     /// Pure application message — publish once, no state advance.
     ApplicationMessage {
