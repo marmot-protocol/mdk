@@ -517,7 +517,7 @@ async fn notification_lag_uncovers_each_route_from_its_own_floor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_copys_welcome_time_starts_only_its_standing_goal() {
     use cgka_traits::storage::GroupStorage;
-    let fixture = fixture().await;
+    let mut fixture = fixture().await;
     clear_coverage_goals(&fixture.client);
     let app = fixture.storage.app_storage();
     let now = unix_now_seconds();

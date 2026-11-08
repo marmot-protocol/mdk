@@ -1441,6 +1441,35 @@ async fn caught_up(bob: &AppRuntimeProbe, trace_from: u64) -> TestResult<bool> {
         && status.notices.is_empty())
 }
 
+/// Wall-clock milliseconds since the Unix epoch, the clock notices park on.
+fn unix_ms() -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    now.map_or(0, |elapsed| {
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Each notice as its route's label (`groups` maps group hex to a label; no
+/// group is the inbox) and when it parked, in seconds after `since_unix_ms`
+/// (negative: before). No notice or group ids.
+fn notices_view(
+    status: &marmot_app::AccountRecoveryStatus,
+    groups: &BTreeMap<String, &str>,
+    since_unix_ms: u64,
+) -> Value {
+    let view = status.notices.iter().map(|notice| {
+        let cause = serde_json::to_value(notice.cause).ok();
+        let route = notice.group_id_hex.as_ref().map_or("inbox", |hex| {
+            groups.get(hex).copied().unwrap_or("other_group")
+        });
+        let parked = notice
+            .parked_at_ms
+            .map(|ms| (ms as f64 - since_unix_ms as f64) / 1e3);
+        json!({"cause": cause, "route": route, "parked_after_start_seconds": parked})
+    });
+    json!(view.collect::<Vec<_>>())
+}
+
 /// Run a proof journey with bob in this process and his recovery runner
 /// owning debt, under the watchdog; save its report, close every runtime, and
 /// return the report or the journey's error.
@@ -1811,6 +1840,7 @@ async fn stalled_relay_loop_case(case: LoopCase) {
 pub(super) async fn owed_history() {
     let report = run_proof("runner-owed-history", async |subject, out| {
         let started = Instant::now();
+        let started_unix_ms = unix_ms();
         let clients = clients();
         let pair = clients[..2].to_vec();
         let busy = create(subject, "busy", &clients).await?;
@@ -1835,6 +1865,12 @@ pub(super) async fn owed_history() {
         .await?;
         tokio::time::sleep(QUIET_AGE).await;
         note(started, "groups created, quiet group aged");
+        let group_labels = BTreeMap::from([
+            (hex::encode(busy.as_slice()), "busy"),
+            (hex::encode(quiet.as_slice()), "quiet"),
+        ]);
+        let status_before_restart = bob.account_recovery_status().await?;
+        let trace_setup = runner_trace::now_ms();
 
         // The owed backlog, while bob is stopped.
         subject.set_online("bob", false).await?;
@@ -1912,7 +1948,9 @@ pub(super) async fn owed_history() {
         // interruption returns once the relay is back; only what follows
         // counts as the reconnect's re-proof.
         let reconnect_clocks = relay_clocks(subject).await?;
-        let reconnect_sessions = next_sessions(subject).await?;
+        // Over every connection since the restart: endpoint 1's survives the
+        // cut, so counting only connections opened after it misses its bytes.
+        let before_reconnect = bob_traffic(subject, &restart_sessions).await?;
         subject.interrupt_relay("reconnect", "relay:shared", OUTAGE_MS).await?;
         let reconnected = Instant::now();
         let trace_reconnect = runner_trace::now_ms();
@@ -1931,7 +1969,8 @@ pub(super) async fn owed_history() {
         let resweep_result = wait_for("the reconnect's re-sweep", left, resweeps).await;
         let resweep_seconds = reconnected.elapsed().as_secs_f64();
         let after_reconnect = history_since(subject, &reconnect_clocks).await?;
-        let reconnect_traffic = bob_traffic(subject, &reconnect_sessions).await?;
+        let reconnect_traffic =
+            traffic_delta(&bob_traffic(subject, &restart_sessions).await?, &before_reconnect);
         let reconnect_trace = runner_trace::since(trace_reconnect);
         let outage_trace = trace_between(trace_cut, trace_reconnect);
         let quiet_exact = holds_exactly(&bob, &quiet, &quiet_expected).await?;
@@ -1988,7 +2027,10 @@ pub(super) async fn owed_history() {
                 "runner": runner_summary(&reconnect_trace),
                 "runner_during_outage": runner_summary(&outage_trace),
             },
+            "status_before_restart": status_summary(&status_before_restart),
+            "notices_before_restart": notices_view(&status_before_restart, &group_labels, started_unix_ms),
             "status_at_end": status_summary(&status),
+            "notices_at_end": notices_view(&status, &group_labels, started_unix_ms),
         });
         let history = json!({
             "restart": labeled(&after_restart, &labels),
@@ -1997,6 +2039,7 @@ pub(super) async fn owed_history() {
         });
         save(out, "history.json", &history)?;
         save(out, "runner-trace.json", &runner_trace::since(trace_restart))?;
+        save(out, "runner-trace-setup.json", &trace_between(0, trace_setup))?;
         let failure = |what: &str| Err::<Value, _>(format!("{what}: {proof}").into());
         if drained.is_none() || !busy_exact {
             return failure("the owed group did not finish exactly within the deadline");

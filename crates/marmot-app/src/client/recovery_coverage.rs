@@ -497,16 +497,26 @@ impl AppClient {
     /// rise to it. A capture the relays never answered then fences nothing
     /// older than the window. The process's first debt turn prunes, then one
     /// each time the floor has moved [`RUNNER_RETENTION_PRUNE_STEP_SECS`].
+    ///
+    /// The floor is the one as of the runner's previous debt turn, or of the
+    /// open before its first ([`AppClient::runner_prune_clock`]); a turn
+    /// whose prune failed does not count. A goal seeded since then at its own
+    /// retention floor (by the open, a replay or an epoch gap) keeps the
+    /// seconds that have slid out of the window since: no relay was asked for
+    /// them yet, so they are not unproven history, and the debt turn sweeps
+    /// them with the rest of the goal instead of this prune parking them
+    /// (mdk#3040).
     pub(crate) fn prune_runner_retention(
         &mut self,
         app: &SqliteAppStorage,
         now: u64,
     ) -> cgka_traits::storage::StorageResult<()> {
-        let floor = retention_floor(now);
+        let floor = retention_floor(self.runner_prune_clock.min(now));
         if self
             .runner_pruned_floor
             .is_some_and(|pruned| floor < pruned.saturating_add(RUNNER_RETENTION_PRUNE_STEP_SECS))
         {
+            self.runner_prune_clock = now;
             return Ok(());
         }
         let certifying = self
@@ -516,6 +526,7 @@ impl AppClient {
             .collect::<Vec<_>>();
         app.prune_recovery_coverage(floor, &certifying)?;
         self.runner_pruned_floor = Some(floor);
+        self.runner_prune_clock = now;
         Ok(())
     }
 }
@@ -818,13 +829,18 @@ impl AppClient {
     /// gap as debt. Widen the ledger directly: an IncrementalHistory request
     /// would also give the old comparison owner work in the hybrid. The
     /// runner's first routing-change turn retries a failed best-effort write.
-    pub(crate) fn record_open_coverage_goals(&self) {
+    /// The runner's first prune takes its floor from the same clock reading,
+    /// so what slides out of the window before it stays owed for the sweep
+    /// rather than parked.
+    pub(crate) fn record_open_coverage_goals(&mut self) {
+        let now = unix_now_seconds();
+        self.runner_prune_clock = now;
         let current = self.current_coverage_routes();
         let result = self.coverage_storage().and_then(|storage| {
             self.widen_standing_goals(
                 &storage.app_storage(),
                 &current.iter().collect::<Vec<_>>(),
-                unix_now_seconds(),
+                now,
             )
         });
         if let Err(error) = result {

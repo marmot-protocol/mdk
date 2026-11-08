@@ -561,7 +561,7 @@ in `marmot-app` fills it from facts the owner already has:
 | A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
 | An explicit history request | Every current route's goal widens to the retained window |
 | A pending epoch gap | The group's routes' goals widen to their standing floors |
-| Every settlement, and the recovery runner's first debt turn in a process and then each hour of floor movement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder |
+| Every settlement, and the recovery runner's first debt turn in a process and then each hour of floor movement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder. The runner prunes to the floor as of its previous debt turn, or of the open before its first (a turn whose prune failed does not count), so the seconds of a goal seeded since then at its own retention floor are swept, never parked before a debt turn could read them |
 
 **Standing floors.** The Welcome time is a soft signal (`Group::local_copy_welcome_created_at`):
 an application message carries its sender's compose time, so one composed offline before the
@@ -587,8 +587,11 @@ routes before selecting debt.
 and loss whose floor is unknown or older than the window, is parked rather than dropped: each
 route keeps one remainder, the earliest and latest such second, under a park revision from the
 same counter as unit parks. It is never fetched and never coverage, and only a dismissal clears
-it. A route's notice revision is the newest among its broken units' parks and its remainder, so
-dismissing the notice clears both. Each prune also settles every route below its floor: a later
+it. Debt counts as overtaken only once a debt turn could have read it: the seconds between a
+goal seeded at the retention floor (an account open seeds the inbox there) and a later floor
+were never asked of a relay, so the runner's prune lags one debt turn and the sweep fetches
+them (mdk#3040). A route's notice revision is the newest among its broken units' parks and its
+remainder, so dismissing the notice clears both. Each prune also settles every route below its floor: a later
 prune parks only from there up, because it no longer holds the coverage below. Widening a goal
 back below that floor therefore parks nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
 to its own. Pre-conversion shadow mode performed no sweeps, so routes could accumulate
