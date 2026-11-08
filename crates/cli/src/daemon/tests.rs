@@ -92,6 +92,75 @@ async fn daemon_one_shot_response_timeout_includes_shutdown() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+/// mdk#2628 (D66): a daemon answers as soon as it has read a request's
+/// newline, and may close before the client does anything more. On macOS such
+/// a socket still yields the buffered answer, but rejects a half-close with
+/// `ENOTCONN`.
+#[tokio::test]
+async fn daemon_request_returns_the_answer_of_a_daemon_that_already_closed() {
+    struct ClosedDaemonSocket {
+        received: Vec<u8>,
+        answer: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncWrite for ClosedDaemonSocket {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.received.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::NotConnected.into()))
+        }
+    }
+
+    impl tokio::io::AsyncRead for ClosedDaemonSocket {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.answer).poll_read(cx, buf)
+        }
+    }
+
+    let ack = CliOutput {
+        code: 0,
+        stdout: serde_json::to_string(&DaemonShutdownAck { pid: 4242 }).expect("ack json"),
+        stderr: String::new(),
+    };
+    let mut answer = Vec::new();
+    assert!(write_daemon_output_within(&mut answer, &ack, Duration::from_secs(1)).await);
+    let mut daemon = ClosedDaemonSocket {
+        received: Vec::new(),
+        answer: std::io::Cursor::new(answer),
+    };
+    let frame = encode_daemon_request(&DaemonRequest::Shutdown).expect("encode stop request");
+
+    let output = exchange_daemon_request(&mut daemon, &frame)
+        .await
+        .expect("the daemon's answer is the result");
+
+    assert_eq!(daemon.received, *frame);
+    assert_eq!(output.code, 0);
+    let ack: DaemonShutdownAck = serde_json::from_str(&output.stdout).expect("stop ack");
+    assert_eq!(ack.pid, 4242);
+}
+
 #[tokio::test]
 async fn run_server_validates_relays_before_creating_runtime_artifacts() {
     let home = tempfile::tempdir().expect("tempdir");

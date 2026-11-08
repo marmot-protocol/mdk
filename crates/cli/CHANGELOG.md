@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- On macOS, report a daemon request by the daemon's answer even when the daemon closes the connection right after
+  answering. `wn daemon stop` could report `daemon_unavailable` (`Socket is not connected (os error 57)`) for a stop
+  the daemon had accepted, and other one-shot requests could report a lost answer or unknown command state (#2628).
+
 - `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
   with its device group and should be reset and linked again (experimental device-group builds).
 

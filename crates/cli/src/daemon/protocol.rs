@@ -548,9 +548,24 @@ pub(crate) async fn send_request(
                 socket: socket.to_owned(),
                 source,
             })?;
-    stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
+    exchange_daemon_request(&mut stream, &bytes).await
+}
 
+/// Write one request frame, then read the daemon's whole answer.
+///
+/// The client does not half-close its write side. The daemon reads only up to
+/// the frame's newline, so it may answer and close before a half-close runs,
+/// and on macOS `shutdown` on a Unix socket whose peer has closed fails with
+/// `ENOTCONN` even though the answer is already readable. `wn daemon stop`
+/// reported such a stop as failed (mdk#2628, D66).
+pub(crate) async fn exchange_daemon_request<S>(
+    stream: &mut S,
+    frame: &[u8],
+) -> Result<CliOutput, DaemonClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(frame).await?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     if response.is_empty() {
