@@ -313,6 +313,8 @@ mod migration_0149_history_deliveries;
 mod migration_0150_epoch_gap_retries;
 #[path = "migrations/0151_recovery_unit_saturated_second.rs"]
 mod migration_0151_recovery_unit_saturated_second;
+#[path = "migrations/0152_reopened_epoch_gaps.rs"]
+mod migration_0152_reopened_epoch_gaps;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
 #[path = "migrations/0161_small_state.rs"]
@@ -1285,6 +1287,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0151_recovery_unit_saturated_second",
         suspend_foreign_keys: &[],
         apply: migration_0151_recovery_unit_saturated_second::apply,
+    },
+    Migration {
+        version: 152,
+        name: "0152_reopened_epoch_gaps",
+        suspend_foreign_keys: &[],
+        apply: migration_0152_reopened_epoch_gaps::apply,
     },
     Migration {
         version: 160,

@@ -30,6 +30,10 @@ const A: [u8; 32] = [0xA1; 32];
 const B: [u8; 32] = [0xB1; 32];
 /// A route the account has left.
 const C: [u8; 32] = [0xC1; 32];
+/// The route of the group whose epoch gap the old owner certified.
+const D: [u8; 32] = [0xD1; 32];
+/// That certified epoch gap.
+const CERTIFIED_GAP: u8 = 0xE5;
 const R1: &str = "wss://r1.example";
 const R2: &str = "wss://r2.example";
 /// How the old owner's scope plans spelled the same relays.
@@ -167,13 +171,35 @@ fn untouched_rows() -> String {
     )
 }
 
+/// An epoch gap 0.14.0's owner satisfied (mdk#3059): its frozen scope on the
+/// group's route was certified by every required relay, while the group's
+/// engine stayed at the stalled epoch.
+fn certified_gap_rows() -> String {
+    format!(
+        "INSERT INTO cgka_groups (id, epoch, record) VALUES (x'0d', 5, x'00');
+         INSERT INTO account_recovery_obligations (id, demand_key, cause, group_id, stalled_epoch,
+             predicate, revision, created_at_ms, updated_at_ms, state, eligibility)
+         VALUES ({}, 'epoch:0d', 1, x'0d', 5, 0, 3, 1000, 2500, 1, 0);
+         {}",
+        id(CERTIFIED_GAP),
+        scope(
+            CERTIFIED_GAP,
+            0,
+            Some((D, 0x0D)),
+            (W + 100, NOW - 50),
+            &payload(&[PLAN_R1], &[PLAN_R1], false)
+        ),
+    )
+}
+
 /// The 0.14.0 rows: a pending queue loss bounded inside the window (beside a
 /// retired and a legacy-retired generation), a parked notification loss, a
 /// parked explicit repair that froze no scope, a dismissed incremental
-/// history, a pending native replay, and another account's satisfied queue
-/// loss whose evidence the plane acknowledged.
+/// history, a pending native replay, another account's satisfied queue loss
+/// whose evidence the plane acknowledged, and a certified epoch gap.
 fn v0_14_0_rows() -> String {
     let mut sql = untouched_rows();
+    sql.push_str(&certified_gap_rows());
     sql.push_str(&format!(
         "INSERT INTO account_recovery_obligations (id, demand_key, cause, account_label,
              marker_token, pending_since, dropped_count, predicate, created_at_ms, updated_at_ms,
@@ -440,18 +466,46 @@ fn rows(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
     rows
 }
 
-/// The obligations the conversion must leave as they were, with their scopes.
+/// The obligations the conversion must leave as they were, with their scopes:
+/// every epoch gap but the certified one, maintenance and the known event.
 fn untouched(store: &SqliteAccountStorage) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
     let conn = store.lock().unwrap();
+    let certified = id(CERTIFIED_GAP);
     (
         rows(
             &conn,
-            "SELECT * FROM account_recovery_obligations WHERE cause IN (1, 2, 4)",
+            &format!(
+                "SELECT * FROM account_recovery_obligations
+                 WHERE cause IN (1, 2, 4) AND id != {certified}"
+            ),
         ),
         rows(
             &conn,
-            "SELECT s.* FROM account_recovery_scopes s JOIN account_recovery_obligations o
-             ON o.id = s.obligation_id WHERE o.cause IN (1, 2, 4)",
+            &format!(
+                "SELECT s.* FROM account_recovery_scopes s JOIN account_recovery_obligations o
+                 ON o.id = s.obligation_id WHERE o.cause IN (1, 2, 4) AND o.id != {certified}"
+            ),
+        ),
+    )
+}
+
+/// The certified gap's obligation columns the conversion may change, and its
+/// scopes whole.
+fn certified_gap(store: &SqliteAccountStorage) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+    let conn = store.lock().unwrap();
+    let certified = id(CERTIFIED_GAP);
+    (
+        rows(
+            &conn,
+            &format!(
+                "SELECT state, eligibility, revision, incomplete_reason, parked_at_ms,
+                     created_at_ms, updated_at_ms, stalled_epoch, demand_key
+                 FROM account_recovery_obligations WHERE id = {certified}"
+            ),
+        ),
+        rows(
+            &conn,
+            &format!("SELECT * FROM account_recovery_scopes WHERE obligation_id = {certified}"),
         ),
     )
 }
@@ -553,11 +607,12 @@ fn a_v0_14_0_database_converts_every_row_kind() {
     convert(&store).unwrap();
 
     assert!(!app.recovery_conversion_pending().unwrap());
-    // Epoch gaps, maintenance and known events are left with their scopes.
+    // Pending and parked epoch gaps, maintenance and known events are left
+    // with their scopes; the certified epoch gap stays, reopened.
     assert_eq!(untouched(&store), untouched_before);
     let mut left = causes(&store);
     left.sort_unstable();
-    assert_eq!(left, vec![1, 1, 2, 4]);
+    assert_eq!(left, vec![1, 1, 1, 2, 4]);
     assert_eq!(scope_count(&store), 0);
     assert_eq!(orphan_scopes(&store), 0);
 
@@ -672,6 +727,7 @@ fn a_v0_14_0_database_converts_every_row_kind() {
     );
     assert_eq!((report.shadow_ranges, report.shadow_remainders), (0, 0));
     assert_eq!(report.units_broken, 5);
+    assert_eq!(report.epoch_gaps_reopened, 1);
     assert!(app.recovery_conversion_notices_changed().unwrap());
     app.acknowledge_recovery_conversion_report().unwrap();
     app.acknowledge_recovery_conversion_notices().unwrap();
@@ -986,12 +1042,77 @@ fn a_pending_explicit_repair_rearms_every_unit_last() {
     );
 }
 
+/// 0.14.0's owner satisfied an epoch gap once its relays answered for the
+/// gap's window, never once the engine left the stalled epoch (mdk#3059), and
+/// nothing the runner reads sees a satisfied row. The conversion reopens it as
+/// pending, ready demand at its next revision, keeping its epoch, creation time
+/// and scopes, so the runner visits it; once its visits run out it parks with
+/// the "history may be incomplete" notice like any gap the runner arms.
+#[test]
+fn a_certified_epoch_gap_reopens_as_ready_demand_that_parks_visibly() {
+    let store = v0_14_0();
+    let app = store.app_storage();
+    let mut gap_id = [0_u8; 16];
+    gap_id[15] = CERTIFIED_GAP;
+    let gap = |app: &SqliteAppStorage| {
+        app.pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.ticket.id == gap_id)
+    };
+    assert!(
+        gap(&app).is_none(),
+        "the runner never reads a satisfied gap"
+    );
+    let (_, scopes_before) = certified_gap(&store);
+
+    convert(&store).unwrap();
+
+    let (after, scopes_after) = certified_gap(&store);
+    assert_eq!(
+        after,
+        vec![vec![
+            Value::Integer(0),
+            Value::Integer(RecoveryEligibility::Ready as i64),
+            Value::Integer(4),
+            Value::Null,
+            Value::Null,
+            Value::Integer(1000),
+            Value::Integer(i64::try_from(NOW * 1000).unwrap()),
+            Value::Integer(5),
+            Value::Text("epoch:0d".into()),
+        ]],
+        "pending and ready at its next revision, its epoch and creation kept"
+    );
+    assert_eq!(scopes_after, scopes_before, "its scopes stay");
+    let demand = gap(&app).expect("the runner reads the reopened gap");
+    assert_eq!(demand.cause, RecoveryCause::EpochGap);
+    assert_eq!(demand.eligibility, RecoveryEligibility::Ready);
+    assert_eq!(demand.group_id.as_deref(), Some(&[0x0d][..]));
+    assert_eq!(demand.stalled_epoch, Some(5));
+
+    // The runner's first visit begins on it, and its last visit parks it.
+    assert!(
+        app.begin_recovery_epoch_gap_retry(demand.ticket, &[(group(D), W)], NOW)
+            .unwrap()
+    );
+    assert!(
+        app.finish_recovery_epoch_gap_retry(demand.ticket, 1, NOW, 0, true)
+            .unwrap()
+    );
+    let parked = app.parked_group_recovery_obligations(&[0x0d]).unwrap();
+    assert_eq!(parked.len(), 1);
+    assert!(parked[0].ticket == demand.ticket);
+    assert_eq!(parked[0].cause, RecoveryCause::EpochGap);
+    assert_eq!(parked[0].parked_at_ms, Some(NOW * 1000));
+}
+
 /// The step marker and the disposition codes persist across builds: the
 /// marker counts the steps run, in this order, and each count is stored under
-/// its disposition's number (0 pending, 1 parked, 2 dismissed, 3 settled). A
-/// build that reorders the steps or renumbers a disposition resumes a
-/// half-converted database at the wrong step or reports its counts under the
-/// wrong heading.
+/// its disposition's number (0 pending, 1 parked, 2 dismissed, 3 settled),
+/// beside the epoch gaps the last step reopened. A build that reorders the
+/// steps or renumbers a disposition resumes a half-converted database at the
+/// wrong step or reports its counts under the wrong heading.
 #[test]
 fn each_step_stores_its_marker_and_counts_by_value() {
     let store = v0_14_0();
@@ -1001,10 +1122,12 @@ fn each_step_stores_its_marker_and_counts_by_value() {
     for _ in 0..6 {
         app.convert_recovery_steps(&input(&routes), 1).unwrap();
         let conn = store.lock().unwrap();
-        let step: i64 = conn
-            .query_row("SELECT step FROM account_recovery_conversion", [], |row| {
-                row.get(0)
-            })
+        let marker: (i64, i64) = conn
+            .query_row(
+                "SELECT step, epoch_gaps_reopened FROM account_recovery_conversion",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
         let counts = conn
             .prepare(
@@ -1024,13 +1147,14 @@ fn each_step_stores_its_marker_and_counts_by_value() {
             .unwrap();
         drop(conn);
         let loss = app.converted_recovery_loss().unwrap().len();
-        seen.push((step, goal(&store, &group(B)), counts, loss));
+        seen.push((marker, goal(&store, &group(B)), counts, loss));
     }
     // Quarantine starts B's standing goal, Dismissed counts the incremental
     // history, Loss converts both causes' loss and lowers the goal to the
     // queue loss's bound, Parked counts the explicit repair and the
     // notification loss and lowers it to the repair's window, Pending counts
-    // the queue loss and the native replay, Settled the satisfied loss.
+    // the queue loss and the native replay, Settled the satisfied loss and
+    // the reopened epoch gap.
     let (dismissed, parked) = ((5, 2, 1), [(3, 1, 1), (6, 1, 1)]);
     let after_parked = vec![parked[0], dismissed, parked[1]];
     let after_pending = vec![(0, 0, 1), parked[0], dismissed, parked[1], (7, 0, 1)];
@@ -1039,12 +1163,12 @@ fn each_step_stores_its_marker_and_counts_by_value() {
     assert_eq!(
         seen,
         vec![
-            (1, Some(W + 20_000), vec![], 0),
-            (2, Some(W + 20_000), vec![dismissed], 0),
-            (3, Some(W + 500), vec![dismissed], 2),
-            (4, Some(W), after_parked, 2),
-            (5, Some(W), after_pending, 2),
-            (6, Some(W), settled, 2),
+            ((1, 0), Some(W + 20_000), vec![], 0),
+            ((2, 0), Some(W + 20_000), vec![dismissed], 0),
+            ((3, 0), Some(W + 500), vec![dismissed], 2),
+            ((4, 0), Some(W), after_parked, 2),
+            ((5, 0), Some(W), after_pending, 2),
+            ((6, 1), Some(W), settled, 2),
         ]
     );
 }

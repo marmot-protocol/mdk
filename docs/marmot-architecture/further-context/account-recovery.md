@@ -932,7 +932,10 @@ reading all history successfully does not. Suspended groups receive no visits, a
 holds behind an event the engine refused; a visit does not finish while its group's fetched history still waits for
 admission. A resource refusal arms an ordinary gap and never holds it in a wait of its own, so a repeated refusal
 changes neither the visit budget nor its backoff. A gap an upgraded account's old owner left waiting for capacity or a
-capability is visited like any other. These visits are unfenced.
+capability is visited like any other. So is one it certified: the old owner satisfied a gap once its relays answered
+for the gap's window, never once the engine left the stalled epoch, and a group still stalled there arms nothing
+again. Conversion reopens every satisfied epoch gap as pending at its next revision (mdk#3059), and the host drops one
+before any visit once its group has moved past that epoch or left the account. These visits are unfenced.
 Healthy routes retain the six-hour NIP-77-only periodic policy.
 
 
@@ -1100,8 +1103,10 @@ the old owner):
 - The `runner_owns_debt` gate itself, its test builders, and the simulator's old-owner seats,
   control mode, scorecard variant and upgrade journey. Old-owner comparisons run from the frozen
   old-owner build (623500b48). Conversion stays owned by the storage tests over released
-  fixtures and by a marmot-app reopen over a rewound conversion marker, which converts an old
-  queue loss before the runner's first attempt and has the runner cover it.
+  fixtures and by marmot-app reopens over a rewound conversion marker: one converts an old
+  queue loss before the runner's first attempt and has the runner cover it, and one reopens
+  the epoch gaps the old owner certified, which the runner visits only while their group is
+  still stalled (mdk#3059).
 - The old owner's execution storage (rows 9–10): the startup comparison slot
   (`request_bounded_comparison`, its waiters and `RecoveryRequest`), qualified-stagnation
   escalation and its stall samples, account-wide retry pacing and reservations with
@@ -1126,9 +1131,6 @@ Still to delete:
 - The epoch-stall detector's fruitless-completion count and its threshold (A10): nothing has
   produced a count since the stall samples went, so only evidence a 0.14.0 process persisted
   can restore one.
-- An epoch gap the old owner certified (state 1) while the engine stayed stalled: the runner
-  reads only pending rows, so it never revisits one, and a same-epoch re-arm does not reopen
-  it. Conversion fixes it before the #2660 release (mdk#3059).
 - Data-dead APIs no production code calls since row 8: the maintenance REQ API
   (`install_group_maintenance_*`) and the window acquisition scopes (`AccountInboxWindow`,
   `GroupWindow`, `GroupsWindow`). The storage `SubscriptionReplay` APIs went in rows 9–10.

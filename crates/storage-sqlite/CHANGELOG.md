@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Upgrade conversion reopens the epoch gaps the old owner certified (mdk#3059). It satisfied a gap once its relays
+  answered for the gap's window, never once the engine left the stalled epoch, and the runner reads only pending gaps,
+  so a group still stalled at a certified gap's epoch was never revisited and never showed a notice. The last step now
+  turns every satisfied epoch gap into pending, ready demand at its next revision, clearing its park and reason and
+  keeping its epoch, creation time and scopes, in the step's transaction. Migration 0152 adds
+  `account_recovery_conversion.epoch_gaps_reopened`, the count of them; a database that converted before it reopened
+  none. **Breaking:** `RecoveryConversionReport` adds `epoch_gaps_reopened`.
+
 - Migration 0180 preserves original removal validation separately from source authority, so damaged tags cannot turn
   an invalid removal into a valid one (#3016). Validated removals retain their effect through pruning. Uncertain legacy
   removals preserve only already-hidden targets and cannot hide new targets; verified repair remains tracked in #3017.
