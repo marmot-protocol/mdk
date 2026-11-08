@@ -174,6 +174,10 @@ c_mirror! {
         /// `has_leave_requested_at_ms`.
         copy leave_request_pending: bool,
         opt_copy has_leave_requested_at_ms/leave_requested_at_ms: u64,
+        /// The pending leave is blocked: this account is the last active
+        /// admin. Offer `marmot_cancel_leave`. Only true while
+        /// `leave_request_pending`.
+        copy leave_blocked: bool,
     }
 }
 

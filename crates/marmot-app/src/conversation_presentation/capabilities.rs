@@ -11,6 +11,10 @@ pub struct ConversationAuthority {
     pub admin_count: usize,
     pub pending_confirmation: bool,
     pub leave_request_pending: bool,
+    /// The outstanding leave is blocked: this account is the last active
+    /// admin on the selected branch (mdk#3014). Read with
+    /// `leave_request_pending` from the same engine row.
+    pub leave_blocked: bool,
     pub lifecycle: AppGroupLifecycleState,
     pub unrecoverable: bool,
     pub disbanding: bool,
@@ -49,6 +53,10 @@ pub struct ConversationCapabilities {
     pub can_edit_group: bool,
     pub can_leave: bool,
     pub requires_self_demote_before_leave: bool,
+    /// Offer Cancel on a blocked leave. The chat still reads as `Leaving`;
+    /// only the user's Cancel makes it joined again. `cancel_leave` rechecks
+    /// that the leave is blocked.
+    pub can_cancel_leave: bool,
     pub can_enable_disbanding: bool,
     pub can_disband: bool,
 }
@@ -108,6 +116,7 @@ impl ConversationAuthority {
             can_leave: ordinary
                 && (!admin || (self.admin_leave_steps_down && self.admin_count > 1)),
             requires_self_demote_before_leave: departs_as_admin && !self.admin_leave_steps_down,
+            can_cancel_leave: participation == P::Leaving && self.leave_blocked,
             can_enable_disbanding: manage
                 && self.lifecycle == AppGroupLifecycleState::Stable
                 && !self.disbanding_enabled

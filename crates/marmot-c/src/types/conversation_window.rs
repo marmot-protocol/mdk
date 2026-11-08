@@ -37,6 +37,8 @@ copy can_leave: bool,
 copy requires_self_demote_before_leave: bool,
 copy can_enable_disbanding: bool,
 copy can_disband: bool,
+/// Offer Cancel on a blocked leave (`marmot_cancel_leave`).
+copy can_cancel_leave: bool,
 } }
 c_mirror! { MarmotConversationHeader from ConversationHeaderFfi {
 rec selected: MarmotConversationPresentation,

@@ -64,6 +64,17 @@ pub enum EngineError {
     #[error("leave already requested for the current epoch")]
     LeaveAlreadyRequested { group_id: GroupId },
 
+    /// Cancel was asked for a leave that is not blocked: no leave request, an
+    /// epoch that is not `Stable`, or a selected branch on which the leave can
+    /// still move forward.
+    ///
+    /// Only a blocked leave can be cancelled. A leave that is not blocked has
+    /// a SelfRemove any member can commit, so clearing the local request would
+    /// not stop the departure. Routine input, decided under the same lock as
+    /// the durable read and write; callers should show the leave's progress.
+    #[error("leave is not blocked")]
+    LeaveNotBlocked { group_id: GroupId },
+
     /// MIP-03 §150 — a commit that would result in zero admins is rejected
     /// before construction. Used when an inbound SelfRemove from the only
     /// admin would deplete admins on commit.
@@ -362,6 +373,7 @@ impl EngineError {
             EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
             EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
             EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
+            EngineError::LeaveNotBlocked { .. } => "leave_not_blocked",
             EngineError::AdminDepletion { .. } => "admin_depletion",
             EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
             EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",

@@ -332,6 +332,11 @@ pub enum MarmotKitError {
     /// `GroupManagementStateFfi::leave_request_pending` before offering Leave.
     #[error("a leave request is already pending for group {group_id_hex}")]
     LeaveAlreadyRequested { group_id_hex: String },
+    // Plain comment: this enum's UniFFI metadata is near its buffer limit
+    // (see `EmojiSetChanged`). `cancel_leave` found no blocked leave; show
+    // the leave's progress instead.
+    #[error("the leave for group {group_id_hex} is not blocked")]
+    LeaveNotBlocked { group_id_hex: String },
     #[error("operation would remove the last admin from group {group_id_hex}")]
     WouldRemoveLastAdmin { group_id_hex: String },
     #[error("group {group_id_hex} cannot enable disbanding until all members support it")]
@@ -907,6 +912,11 @@ impl MarmotKitError {
             EngineError::LeaveAlreadyRequested { group_id } => Self::LeaveAlreadyRequested {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            // Cancel is decided under the engine lock; the display flag can
+            // be stale, so the refusal is typed rather than `Runtime`.
+            EngineError::LeaveNotBlocked { group_id } => Self::LeaveNotBlocked {
+                group_id_hex: hex::encode(group_id.as_slice()),
+            },
             EngineError::AdminDepletion { group_id } => Self::WouldRemoveLastAdmin {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
@@ -1340,6 +1350,20 @@ mod tests {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
             }
             other => panic!("expected LeaveAlreadyRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leave_not_blocked_crosses_ffi_as_typed_variant() {
+        let group_id = cgka_traits::GroupId::new(vec![0x12; 16]);
+        let ffi = MarmotKitError::from_engine_error(&EngineError::LeaveNotBlocked {
+            group_id: group_id.clone(),
+        });
+        match ffi {
+            MarmotKitError::LeaveNotBlocked { group_id_hex } => {
+                assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+            }
+            other => panic!("expected LeaveNotBlocked, got {other:?}"),
         }
     }
 

@@ -2544,6 +2544,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::AdminCannotSelfRemove { .. }
         | EngineError::AdminDepletion { .. }
         | EngineError::LeaveAlreadyRequested { .. }
+        | EngineError::LeaveNotBlocked { .. }
         // A refused epoch-pinned application message is a typed policy answer
         // to caller input (the pinned epoch), not a protocol failure.
         | EngineError::AppMessageEpochMismatch { .. }
@@ -2624,6 +2625,7 @@ fn observe_engine_error(error: &EngineError) -> String {
             "admin_policy"
         }
         EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
+        EngineError::LeaveNotBlocked { .. } => "leave_not_blocked",
         EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
         EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",

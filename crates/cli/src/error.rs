@@ -962,6 +962,11 @@ fn engine_error_json(err: &EngineError) -> Value {
             "message": err.to_string(),
             "group_id": hex::encode(group_id.as_slice()),
         }),
+        EngineError::LeaveNotBlocked { group_id } => json!({
+            "code": "leave_not_blocked",
+            "message": err.to_string(),
+            "group_id": hex::encode(group_id.as_slice()),
+        }),
         EngineError::DisbandingNotEnabled { group_id } => json!({
             "code": "disbanding_not_enabled",
             "message": err.to_string(),

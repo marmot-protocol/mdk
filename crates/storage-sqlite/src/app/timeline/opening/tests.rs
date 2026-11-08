@@ -961,6 +961,7 @@ fn account_capture_tracks_only_its_groups_durable_leave_request() {
         group_id: id,
         requested_at_ms: 123,
         last_proposed_epoch: None,
+        blocked: None,
     };
     store.put_leave_request(&request(other)).unwrap();
     assert!(

@@ -336,15 +336,22 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   `SelfUpdate` refused every tick (the field's `UseAfterEviction` loop). A group with `leave_in_progress` or
   `disbanding_in_progress` refuses the same `SelfUpdate`, but its obligation *waits* rather than fails: the removal
   ends it through the terminal verdict, and a reorg or acknowledged disband failure must find its rotation still owed.
-- **A leave request owns its admin step-down (mdk#3014).** While a durable `LeaveRequest` exists, `owed_leave_step`
+- **A leave request owns its admin step-down (mdk#3014).** While a durable `LeaveRequest` exists, `next_leave_step`
   decides the next step on a `Stable` epoch: an account the selected branch makes an admin again stages a step-down
   (`stage_leave_step_down`: the selected branch's admin list minus itself, never the lost Commit's bytes, and only
   that update: proposals pending in the store stay there) while another active admin remains, and proposes its
-  SelfRemove only once it is not an admin. The last active admin owes nothing. `leave_redrive_owed` is the scheduler's
-  level signal and hydration schedules a group with a restored request; the drain runs the step.
+  SelfRemove only once it is not an admin. The last active admin's leave is blocked: the re-drive records
+  `LeaveRequest::blocked`, stages nothing and arms no wake, and clears the marker once the leave can move again.
+  Only `cancel_leave` clears a blocked request, on a `Stable`, settled group (no unresolved convergence input), after
+  re-checking the branch rather than the marker. It reads everything before its one durable step, clearing the
+  request, and then restores the SelfRemove auto-commit schedules a leaving account dropped without another fallible
+  call. `leave_redrive_owed` is the scheduler's level signal, true also while the stored marker disagrees with the
+  branch, and hydration schedules a group with a restored request; the drain runs the step.
   `prepare_superseded_own_commit` leaves a leaving account's lost pure step-down (`is_pure_self_step_down`) to this
   re-drive and neither re-queues nor reports it; a commit that changed anything else keeps ordinary supersession.
-  Pinned by `invite_leave::the_last_admins_leave_request_owes_no_step`,
+  Pinned by `invite_leave::the_last_admins_leave_is_blocked_until_cancelled`,
+  `invite_leave::cancel_refuses_a_leave_that_can_still_finish`,
+  `record_write_atomicity::a_blocked_leave_retries_its_marker_and_cancel_after_storage_faults`,
   `invite_leave::a_restored_leave_request_that_owes_a_self_remove_wakes_its_group`,
   `invite_leave::a_leave_step_down_excludes_an_authentic_stored_peer_proposal` and marmot-app's `rival_branch_leave`
   tests.

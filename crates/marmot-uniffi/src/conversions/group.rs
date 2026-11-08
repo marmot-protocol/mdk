@@ -126,6 +126,10 @@ pub struct AppGroupRecordFfi {
     /// When the local account asked to leave, in milliseconds since the Unix
     /// epoch; `null` when no leave is pending.
     pub leave_requested_at_ms: Option<u64>,
+    /// The pending leave is blocked: this account is the group's last active
+    /// admin, so the leave cannot finish. Keep rendering it as leaving, and
+    /// offer `Marmot::cancel_leave`. Only true while `leave_request_pending`.
+    pub leave_blocked: bool,
     /// Hide/disable the message composer while this is true. It includes both
     /// this account's durable request and another admin's authenticated
     /// terminal candidate awaiting convergence.
@@ -177,6 +181,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             self_membership: value.self_membership.into(),
             leave_request_pending: value.leave_requested_at_ms.is_some(),
             leave_requested_at_ms: value.leave_requested_at_ms,
+            leave_blocked: value.leave_blocked,
             disbanding: value.disbanding,
             disband_request: value.disband_request.map(Into::into),
             disbanded: value.disbanded,
@@ -423,6 +428,13 @@ pub struct GroupManagementStateFfi {
     /// When the local account asked to leave, in milliseconds since the Unix
     /// epoch; `null` when no leave is pending.
     pub leave_requested_at_ms: Option<u64>,
+    /// The pending leave is blocked: this account is the group's last active
+    /// admin, so the leave cannot finish. Show "Can't leave: you're the only
+    /// admin" with a Cancel action while `can_cancel_leave` holds.
+    pub leave_blocked: bool,
+    /// Whether to offer Cancel on the blocked leave (`Marmot::cancel_leave`),
+    /// which makes the chat joined again. The command rechecks the state.
+    pub can_cancel_leave: bool,
     pub lifecycle_state: GroupLifecycleStateFfi,
     pub disbanding_enabled: bool,
     /// Whether terminal convergence currently blocks all ordinary outbound
@@ -609,6 +621,7 @@ pub(crate) fn group_management_state_ffi(
         admin_count,
         pending_confirmation: details.group.pending_confirmation,
         leave_request_pending: details.group.leave_request_pending,
+        leave_blocked: details.group.leave_blocked,
         lifecycle: match details.mls_state.lifecycle_state {
             GroupLifecycleStateFfi::Stable => AppGroupLifecycleState::Stable,
             GroupLifecycleStateFfi::PendingPublish => AppGroupLifecycleState::PendingPublish,
@@ -648,6 +661,8 @@ pub(crate) fn group_management_state_ffi(
         requires_self_demote_before_leave: capabilities.requires_self_demote_before_leave,
         leave_request_pending: authority.leave_request_pending,
         leave_requested_at_ms: details.group.leave_requested_at_ms,
+        leave_blocked: authority.leave_blocked,
+        can_cancel_leave: capabilities.can_cancel_leave,
         lifecycle_state: details.mls_state.lifecycle_state,
         disbanding_enabled: details.mls_state.disbanding_enabled,
         disbanding: details.mls_state.disbanding,

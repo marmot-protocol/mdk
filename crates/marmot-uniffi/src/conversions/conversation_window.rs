@@ -62,6 +62,8 @@ pub struct ConversationCapabilitiesFfi {
     pub can_edit_group: bool,
     pub can_leave: bool,
     pub requires_self_demote_before_leave: bool,
+    /// Offer Cancel on a blocked leave (`Marmot::cancel_leave`).
+    pub can_cancel_leave: bool,
     pub can_enable_disbanding: bool,
     pub can_disband: bool,
 }
@@ -78,6 +80,7 @@ impl From<app::conversation_presentation::ConversationCapabilities>
             can_edit_group: v.can_edit_group,
             can_leave: v.can_leave,
             requires_self_demote_before_leave: v.requires_self_demote_before_leave,
+            can_cancel_leave: v.can_cancel_leave,
             can_enable_disbanding: v.can_enable_disbanding,
             can_disband: v.can_disband,
         }

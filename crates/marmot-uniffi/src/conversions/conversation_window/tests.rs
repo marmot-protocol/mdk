@@ -693,6 +693,7 @@ fn assert_conversation_debug_redacts(mut draft: SelectedMessageDraftFfi) {
         can_edit_group: true,
         can_leave: true,
         requires_self_demote_before_leave: false,
+        can_cancel_leave: false,
         can_enable_disbanding: true,
         can_disband: true,
     };

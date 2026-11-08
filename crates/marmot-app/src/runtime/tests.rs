@@ -2232,6 +2232,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         muted: false,
         muted_until_ms: None,
         leave_requested_at_ms: None,
+        leave_blocked: false,
     }
 }
 

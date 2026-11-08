@@ -2763,6 +2763,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
                 requested_at_ms: self.convergence_now_ms(),
                 last_proposed_epoch: Some(group.epoch),
+                blocked: None,
             };
             self.storage.put_leave_request(&request)?;
             return Ok(Some(request));
@@ -2794,6 +2795,17 @@ impl<S: StorageProvider> Engine<S> {
         Ok(self.leaving_groups.contains(group_id)
             || self.leave_requests.contains_key(group_id)
             || self.storage.leave_request(group_id)?.is_some())
+    }
+
+    pub(crate) fn put_leave_request_state(
+        &mut self,
+        request: &LeaveRequest,
+    ) -> Result<(), StorageError> {
+        self.storage.put_leave_request(request)?;
+        self.leave_requests
+            .insert(request.group_id.clone(), request.clone());
+        self.leaving_groups.insert(request.group_id.clone());
+        Ok(())
     }
 
     pub(crate) fn clear_leave_request_state(

@@ -13,6 +13,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   answering. `wn daemon stop` could report `daemon_unavailable` (`Socket is not connected (os error 57)`) for a stop
   the daemon had accepted, and other one-shot requests could report a lost answer or unknown command state (#2628).
 
+- JSON errors gain the code `leave_not_blocked` for a Cancel of a leave that is not blocked (mdk#3014).
+- `wn groups management` JSON gains `leave_blocked`, true while this account's leave cannot finish because it is
+  the chat's last active admin (mdk#3014).
+
 - `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
   with its device group and should be reset and linked again (experimental device-group builds).
 - `wn groups management` reports `requires_self_demote_before_leave` for an admin again, including an admin invitee,

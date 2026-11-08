@@ -185,7 +185,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
     write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
     (mdk#2694), and a queued `NoChange` whose retirement fails waits for the next drain while the pass keeps what it
-    prepared (mdk#2842). `a_failed_retryable_transition_keeps_the_row_and_its_account_capacity` owns a rejected
+    prepared (mdk#2842). A blocked leave's failed marker write stays owed and a Cancel whose read fails keeps the
+    request for a retry (mdk#3014). `a_failed_retryable_transition_keeps_the_row_and_its_account_capacity` owns a rejected
     `Retryable` write after a peeler fault retaining the row and its charged account capacity;
     `deferred_release_keeps_refusal_when_group_lookup_is_unavailable` owns an unavailable group lookup preserving
     the release refusal while freeing the row (mdk#3176, mdk#3179). Normal old-copy release stays in

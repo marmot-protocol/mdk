@@ -3261,6 +3261,24 @@ impl AppClient {
             .await
     }
 
+    /// Cancel a blocked leave on this device (mdk#3014, D116). The engine
+    /// re-checks that the leave is blocked and refuses anything else with
+    /// `LeaveNotBlocked`. Leave records `Left` once its SelfRemove publishes,
+    /// but a blocked leave never removed this account, so the chat reads as
+    /// joined again. Work queued before the leave drains on the next pass.
+    ///
+    /// The engine step is the durable one. Membership is then restored the
+    /// way a reopen repairs a departed copy whose leaf is still active
+    /// (`reconcile_canonical_self_membership`), so if this write fails the
+    /// next account open finishes it.
+    pub fn cancel_leave(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        self.ensure_group(group_id)?;
+        self.runtime.cancel_leave(group_id)?;
+        self.pending_convergence_groups.insert(group_id.clone());
+        self.reconcile_canonical_self_membership(group_id)?;
+        Ok(())
+    }
+
     async fn leave_group_for_reason(
         &mut self,
         group_id: &GroupId,

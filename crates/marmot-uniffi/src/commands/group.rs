@@ -870,6 +870,21 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Cancel this account's blocked leave, on this device only. Offer it
+    /// while `GroupManagementStateFfi::can_cancel_leave` holds: the leave is
+    /// blocked because this account is the group's last active admin. The
+    /// chat reads as joined again, and the account can send. Any other state
+    /// returns `MarmotKitError::LeaveNotBlocked`. With experimental device
+    /// groups on, the account's other devices keep their own blocked leaves.
+    pub async fn cancel_leave(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<(), MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self.runtime.cancel_leave(&account_ref, &group_id).await?)
+    }
+
     /// Reset a group on this account-device, without sending an
     /// MLS leave or disband. Erases local history and protocol state, cancels
     /// group work, and rejects old welcomes. A valid Welcome whose authenticated
@@ -1886,6 +1901,7 @@ mod tests {
             admin_count: usize::from(self_admin) + usize::from(other_admin),
             pending_confirmation: false,
             leave_request_pending: false,
+            leave_blocked: false,
             lifecycle: if unrecoverable {
                 marmot_app::AppGroupLifecycleState::Unrecoverable
             } else {
@@ -1907,6 +1923,8 @@ mod tests {
             requires_self_demote_before_leave: capabilities.requires_self_demote_before_leave,
             leave_request_pending: authority.leave_request_pending,
             leave_requested_at_ms: None,
+            leave_blocked: authority.leave_blocked,
+            can_cancel_leave: capabilities.can_cancel_leave,
             lifecycle_state: authority.lifecycle.into(),
             disbanding_enabled: authority.disbanding_enabled,
             disbanding: authority.disbanding,

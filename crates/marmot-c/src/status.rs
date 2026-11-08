@@ -226,6 +226,9 @@ pub enum MarmotStatus {
     /// The emoji set install was cancelled through its control, or the
     /// runtime is shutting down or closing. Nothing was stored.
     EmojiSetInstallCancelled = 128,
+    /// `marmot_cancel_leave` found no blocked leave: no leave, an unsettled
+    /// epoch, or a leave that can still finish. Show the leave's progress.
+    LeaveNotBlocked = 129,
 }
 
 thread_local! {
@@ -371,6 +374,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         }
         MarmotKitError::AccountCatchUp { .. } => MarmotStatus::AccountCatchUp,
         MarmotKitError::LeaveAlreadyRequested { .. } => MarmotStatus::LeaveAlreadyRequested,
+        MarmotKitError::LeaveNotBlocked { .. } => MarmotStatus::LeaveNotBlocked,
         MarmotKitError::DisbandingUnsupportedMembers { .. } => {
             MarmotStatus::DisbandingUnsupportedMembers
         }
@@ -580,6 +584,9 @@ mod tests {
             MarmotKitError::LeaveAlreadyRequested {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::LeaveNotBlocked {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::WouldRemoveLastAdmin {
                 group_id_hex: "aa".into(),
             },
@@ -699,7 +706,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            119,
+            120,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(MarmotStatus::GroupInviteNotPending as i32, 61);
@@ -769,6 +776,12 @@ mod tests {
                 group_id_hex: "aa".into(),
             }) as i32,
             117
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::LeaveNotBlocked {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            129
         );
         assert_eq!(
             status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {

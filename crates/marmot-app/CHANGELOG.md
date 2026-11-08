@@ -8,6 +8,12 @@
   device's login does, becomes ready instead of failing with `account worker startup timed out at account_state`. A
   startup that stops progressing still fails after 45 s.
 
+- A leave that the selected branch blocks (this account is the last active admin) is shown and can be cancelled
+  (mdk#3014, D116). `AppGroupRecord` and `ChatListRow` gain `leave_blocked`; the chat still reads as `Leaving`.
+  `ConversationAuthority` gains `leave_blocked` and `ConversationCapabilities` gains `can_cancel_leave`; struct
+  literals need them. New `MarmotAppRuntime::cancel_leave` cancels the leave on this device only, refused with
+  `LeaveNotBlocked` otherwise; the chat reads as joined again and queued work drains. A shared Decline is untouched.
+
 - The account's devices mark and remove inactive devices (mdk#2628 item 3.6b-2), behind the device-group gates. A
   device caught up with its device group marks a sibling `Inactive` about 30 days after it last heard from it, and
   removes one still marked without **Keep while inactive** at about 90 days, leaving its KeyPackage slot. Time counts

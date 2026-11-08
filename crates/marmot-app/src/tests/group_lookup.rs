@@ -76,6 +76,7 @@ async fn keyed_group_matches_list() {
             group_id: group_id.clone(),
             requested_at_ms: 42,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
     for status in [

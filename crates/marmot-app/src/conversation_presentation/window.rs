@@ -275,6 +275,7 @@ impl MarmotApp {
                 can_edit_group: false,
                 can_leave: false,
                 requires_self_demote_before_leave: false,
+                can_cancel_leave: false,
                 can_enable_disbanding: false,
                 can_disband: false,
             };
@@ -578,6 +579,7 @@ mod budget_tests {
             admin_count: 1,
             pending_confirmation: true,
             leave_request_pending: false,
+            leave_blocked: false,
             lifecycle: AppGroupLifecycleState::Stable,
             unrecoverable: false,
             disbanding: false,

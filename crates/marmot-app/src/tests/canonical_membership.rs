@@ -552,6 +552,7 @@ fn can_send(client: &AppClient, group: &GroupId) -> bool {
         admin_count: facts.admin_count,
         pending_confirmation: false,
         leave_request_pending: client.runtime.session().leave_in_progress(group).unwrap(),
+        leave_blocked: false,
         lifecycle: authority.lifecycle.into(),
         unrecoverable: facts.unrecoverable,
         disbanding: authority.disbanding,

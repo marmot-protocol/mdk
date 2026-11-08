@@ -975,6 +975,23 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub async fn cancel_leave(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CancelLeave {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn forget_group_local(
         &self,
         account_ref: &str,

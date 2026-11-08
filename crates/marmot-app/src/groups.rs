@@ -205,6 +205,13 @@ pub struct AppGroupRecord {
     /// only way a cold launch can rediscover it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leave_requested_at_ms: Option<u64>,
+    /// The outstanding leave is blocked: the selected branch makes this
+    /// account the group's last active admin, so nothing it sends can finish
+    /// the leave, and only a user Cancel (`cancel_leave`) clears it (mdk#3014).
+    /// Derived with `leave_requested_at_ms` from the same engine row, and only
+    /// ever true while that is `Some`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leave_blocked: bool,
     /// Whether ordinary outbound work is gated by a local request or an
     /// authenticated inbound disband candidate awaiting convergence.
     #[serde(default)]
@@ -790,6 +797,15 @@ impl std::fmt::Debug for AppGroupRecord {
 }
 
 impl AppGroupRecord {
+    /// Stamp the read-time leave fields from this group's durable request.
+    pub(crate) fn stamp_leave_request(
+        &mut self,
+        request: Option<&cgka_traits::storage::LeaveRequest>,
+    ) {
+        self.leave_requested_at_ms = request.map(|request| request.requested_at_ms);
+        self.leave_blocked = request.is_some_and(|request| request.blocked.is_some());
+    }
+
     pub(crate) fn new(
         group_id_hex: String,
         nostr_routing: AppGroupNostrRoutingComponent,
@@ -822,6 +838,7 @@ impl AppGroupRecord {
             presentation_member_ids_hex: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
+            leave_blocked: false,
             disbanding: false,
             disband_request: None,
             disbanded: false,

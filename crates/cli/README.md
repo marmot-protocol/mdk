@@ -314,9 +314,9 @@ and legacy `group update` keep working. `groups add-members ... --admin <member>
 grants admin to an invitee inside the same invite commit. An `--admin` that is not one of the invitees fails with
 `initial_admin_not_invited` before anything is published. Invite results carry an `initial_admins` list.
 `groups management` mirrors the MarmotKit management state (`is_self_admin`, `can_invite`, `can_leave`,
-`requires_self_demote_before_leave`, `can_enable_disbanding`, `can_disband`, `disbanding_blockers`, per-member
-`member_actions`). Leave hints use the shared core capability selector and remain advisory; the command rechecks
-current authority. `can_leave` is false for unaccepted invitations and unrecoverable groups.
+`requires_self_demote_before_leave`, `leave_blocked`, `can_enable_disbanding`, `can_disband`, `disbanding_blockers`,
+per-member `member_actions`). Leave hints use the shared core capability selector and remain advisory; the command
+rechecks current authority. `can_leave` is false for unaccepted invitations and unrecoverable groups.
 `requires_self_demote_before_leave` is true for an admin, including an admin invitee: `groups leave` and
 `groups decline` refuse an admin with `admin_policy` before anything is written or published, until `groups self-demote`;
 the last admin promotes another account first. TUI `L` shows an admin why it cannot leave yet instead of confirming. A

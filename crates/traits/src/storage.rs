@@ -647,13 +647,27 @@ pub trait OutboundFanoutStorage {
 ///
 /// MLS SelfRemove proposals are epoch-bound, but the product intent is not:
 /// once a user asks to leave, the engine keeps trying until a commit actually
-/// removes the local member or a future explicit cancel/recovery flow clears
-/// the request.
+/// removes the local member, a reorg restores the membership, or the user
+/// cancels a blocked leave.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaveRequest {
     pub group_id: GroupId,
     pub requested_at_ms: u64,
     pub last_proposed_epoch: Option<EpochId>,
+    /// Why the leave cannot move forward on the selected branch, if it
+    /// cannot. Set and cleared by the engine's leave re-drive; while set, the
+    /// request stays, nothing retries, and only a user Cancel clears it.
+    #[serde(default)]
+    pub blocked: Option<LeaveBlockReason>,
+}
+
+/// Why a durable leave request cannot move forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaveBlockReason {
+    /// The selected branch makes this account the group's last active admin.
+    /// An admin steps down before its SelfRemove, and the last one cannot.
+    LastActiveAdmin,
 }
 
 pub trait LeaveRequestStorage {

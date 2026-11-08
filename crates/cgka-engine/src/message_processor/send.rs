@@ -4,7 +4,7 @@
 //! convergence inputs before any OpenMLS mutation.
 
 use super::route_wrapped_group_message;
-use super::{LeaveRedrive, OwedLeaveStep, PendingProposals};
+use super::{LeaveRedrive, LeaveStep, PendingProposals};
 use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -15,7 +15,7 @@ use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::OwnApplicationConvergenceStamp;
 use cgka_traits::peeler::GroupMessageMetadata;
-use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
+use cgka_traits::storage::{LeaveBlockReason, LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
@@ -1084,6 +1084,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id: group_id.clone(),
             requested_at_ms,
             last_proposed_epoch: None,
+            blocked: None,
         });
         request.last_proposed_epoch = Some(proposed_epoch);
         self.record_sent_openmls_message_with_leave_request(
@@ -1210,13 +1211,27 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(LeaveRedrive::Idle);
         }
-        match self.owed_leave_step(group_id, &request, group.epoch)? {
-            None => return Ok(LeaveRedrive::Idle),
-            Some(OwedLeaveStep::StepDown) => {
+        let step = self.next_leave_step(group_id, &request, group.epoch)?;
+        // The marker follows the selected branch: set while nothing this
+        // client sends can move the leave forward, and cleared as soon as
+        // something can.
+        if request.blocked != step.blocked() {
+            request.blocked = step.blocked();
+            self.put_leave_request_state(&request)?;
+            tracing::info!(
+                target: "cgka_engine::leave_request",
+                method = "auto_repropose_leave_request",
+                blocked = request.blocked.is_some(),
+                "durable leave request block state changed"
+            );
+        }
+        match step {
+            LeaveStep::AwaitingCommit | LeaveStep::Blocked(_) => return Ok(LeaveRedrive::Idle),
+            LeaveStep::StepDown => {
                 self.stage_leave_step_down(group_id).await?;
                 return Ok(LeaveRedrive::SteppedDown);
             }
-            Some(OwedLeaveStep::SelfRemove) => {}
+            LeaveStep::SelfRemove => {}
         }
 
         let (msg, proposal_bytes, proposed_epoch) =
@@ -1233,25 +1248,34 @@ impl<S: StorageProvider> Engine<S> {
         Ok(LeaveRedrive::Proposed)
     }
 
-    /// What a durable leave request owes next on a `Stable` epoch, if
-    /// anything. An admin leaves the admin list before its SelfRemove
-    /// (member-departure.md, "Behavior"). A selected branch that dropped the
-    /// step-down makes the account an admin again, at whatever epoch the
-    /// SelfRemove was last proposed: it steps down again while another active
-    /// admin remains (mdk#3014), and the SelfRemove follows once that Commit
-    /// is applied and the epoch is stable again. The last active admin cannot
-    /// step down, so nothing here moves its leave forward.
-    pub(crate) fn owed_leave_step(
+    /// Where a durable leave request stands on a `Stable` epoch. An admin
+    /// leaves the admin list before its SelfRemove (member-departure.md,
+    /// "Behavior"). A selected branch that dropped the step-down makes the
+    /// account an admin again, at whatever epoch the SelfRemove was last
+    /// proposed: it steps down again while another active admin remains
+    /// (mdk#3014), and the SelfRemove follows once that Commit is applied and
+    /// the epoch is stable again. The last active admin cannot step down, so
+    /// its leave is blocked until the selected branch changes or the user
+    /// cancels it.
+    pub(crate) fn next_leave_step(
         &mut self,
         group_id: &GroupId,
         request: &LeaveRequest,
         epoch: EpochId,
-    ) -> Result<Option<OwedLeaveStep>, EngineError> {
+    ) -> Result<LeaveStep, EngineError> {
         let authority = self.capture_group_authority_facts(group_id)?;
         if authority.is_admin {
-            return Ok((authority.admin_count >= 2).then_some(OwedLeaveStep::StepDown));
+            return Ok(if authority.admin_count >= 2 {
+                LeaveStep::StepDown
+            } else {
+                LeaveStep::Blocked(LeaveBlockReason::LastActiveAdmin)
+            });
         }
-        Ok((request.last_proposed_epoch != Some(epoch)).then_some(OwedLeaveStep::SelfRemove))
+        Ok(if request.last_proposed_epoch == Some(epoch) {
+            LeaveStep::AwaitingCommit
+        } else {
+            LeaveStep::SelfRemove
+        })
     }
 
     /// Stage the Commit that takes this account off the admin list for a

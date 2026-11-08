@@ -17,8 +17,8 @@ use cgka_traits::ingest::{IngestOutcome, LocalIngestState, PeeledContent, Peeled
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, LeaveRequestStorage,
-    MessageStorage, OutboundIntentStorage, StorageProvider,
+    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, LeaveBlockReason,
+    LeaveRequestStorage, MessageStorage, OutboundIntentStorage, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -1607,6 +1607,7 @@ async fn recovery_departure_refusal() {
                     group_id: group_id.clone(),
                     requested_at_ms: 1,
                     last_proposed_epoch: None,
+                    blocked: None,
                 })
                 .unwrap();
         }
@@ -2738,6 +2739,7 @@ async fn removed_device_copy_drops_its_leave_request_through_its_sibling_leaf() 
                 group_id: group_id.clone(),
                 requested_at_ms: 1,
                 last_proposed_epoch: None,
+                blocked: None,
             })
             .unwrap();
         current_device_on(b"bob", bob_sibling_storage.clone())
@@ -3842,6 +3844,7 @@ async fn realization_with_pending_leave_request_attributes_member_left() {
             group_id: group_id.clone(),
             requested_at_ms: 1,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
 
@@ -6003,6 +6006,7 @@ async fn a_restored_leave_request_that_owes_a_self_remove_wakes_its_group() {
             group_id: group_id.clone(),
             requested_at_ms: 0,
             last_proposed_epoch: Some(cgka_traits::EpochId(epoch.0 - 1)),
+            blocked: None,
         })
         .unwrap();
 
@@ -6017,11 +6021,13 @@ async fn a_restored_leave_request_that_owes_a_self_remove_wakes_its_group() {
     assert!(!bob.leave_redrive_owed(&group_id).unwrap());
 }
 
-/// The last active admin cannot step down (mdk#3014), so its leave request
-/// owes nothing: a drain stages no step-down or SelfRemove for it and the
-/// runtime keeps no wake armed.
+/// The last active admin cannot step down (mdk#3014), so its leave is
+/// blocked: a drain stages no step-down or SelfRemove, the runtime keeps no
+/// wake armed once the request records why (and keeps one until it does).
+/// Only Cancel clears it, on a settled group, and the account can send again
+/// afterwards.
 #[tokio::test]
-async fn the_last_admins_leave_request_owes_no_step() {
+async fn the_last_admins_leave_is_blocked_until_cancelled() {
     let (mut alice, alice_storage) = build_with_storage(b"alice");
     let mut bob = build_client(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -6036,22 +6042,144 @@ async fn the_last_admins_leave_request_owes_no_step() {
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated { pending, .. } = create else {
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = create
+    else {
         unreachable!()
     };
     alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
     alice_storage
         .put_leave_request(&cgka_traits::storage::LeaveRequest {
             group_id: group_id.clone(),
             requested_at_ms: 0,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
 
-    assert!(!alice.leave_redrive_owed(&group_id).unwrap());
+    assert!(
+        alice.leave_redrive_owed(&group_id).unwrap(),
+        "a marker not yet recorded keeps a wake owed"
+    );
     alice.advance_convergence(&group_id).await.unwrap();
     assert!(alice.drain_auto_publish().is_empty(), "no step-down");
     assert!(alice.drain_auto_proposals().is_empty(), "no SelfRemove");
+    assert_eq!(
+        alice.leave_blocked(&group_id).unwrap(),
+        Some(LeaveBlockReason::LastActiveAdmin)
+    );
+    assert_eq!(
+        alice_storage
+            .leave_request(&group_id)
+            .unwrap()
+            .and_then(|request| request.blocked),
+        Some(LeaveBlockReason::LastActiveAdmin),
+        "the marker is durable"
+    );
+    assert!(!alice.leave_redrive_owed(&group_id).unwrap());
+
+    // An unresolved commit could still change who the admins are, so Cancel
+    // waits for the group to settle.
+    let SendResult::GroupEvolution { msg, pending, .. } = bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("ordinary leaf update")
+    };
+    bob.confirm_published(pending).await.unwrap();
+    alice.ingest(msg).await.unwrap();
+    assert!(alice.has_pending_convergence_inputs(&group_id).unwrap());
+    assert!(matches!(
+        alice.cancel_leave(&group_id),
+        Err(EngineError::LeaveNotBlocked { .. })
+    ));
+    assert!(alice.leave_in_progress(&group_id).unwrap());
+    converge_buffered_commit(&mut alice, &group_id);
+
+    alice.cancel_leave(&group_id).unwrap();
+    assert!(!alice.leave_in_progress(&group_id).unwrap());
+    assert_eq!(alice_storage.leave_request(&group_id).unwrap(), None);
+    alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"still here"),
+            expected_epoch: None,
+        })
+        .await
+        .expect("a cancelled leave no longer gates sends");
+}
+
+/// Cancel is only for a blocked leave (mdk#3014), and it re-checks the
+/// selected branch rather than trusting the stored marker: a member's
+/// SelfRemove can be committed by anyone, so clearing its request would not
+/// stop the departure. The re-drive clears a marker the branch no longer
+/// supports.
+#[tokio::test]
+async fn cancel_refuses_a_leave_that_can_still_finish() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "member leave".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = create
+    else {
+        unreachable!()
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let not_blocked = |result: Result<(), EngineError>| matches!(result, Err(EngineError::LeaveNotBlocked { group_id: ref g }) if *g == group_id);
+
+    assert!(not_blocked(bob.cancel_leave(&group_id)), "no leave");
+
+    // A marker left from another branch, on a member that is no admin here.
+    bob_storage
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 0,
+            last_proposed_epoch: None,
+            blocked: Some(LeaveBlockReason::LastActiveAdmin),
+        })
+        .unwrap();
+    assert!(
+        not_blocked(bob.cancel_leave(&group_id)),
+        "the branch, not the marker, decides"
+    );
+    assert!(bob.leave_in_progress(&group_id).unwrap());
+
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        bob.drain_auto_proposals().len(),
+        1,
+        "the SelfRemove goes out"
+    );
+    assert_eq!(bob.leave_blocked(&group_id).unwrap(), None);
+    assert_eq!(
+        bob_storage
+            .leave_request(&group_id)
+            .unwrap()
+            .and_then(|request| request.blocked),
+        None
+    );
+    assert!(not_blocked(bob.cancel_leave(&group_id)));
+    assert!(bob.leave_in_progress(&group_id).unwrap());
 }
 
 #[tokio::test]
@@ -6996,6 +7124,7 @@ async fn a_leave_step_down_excludes_an_authentic_stored_peer_proposal() {
             group_id: gid.clone(),
             requested_at_ms: 0,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
 

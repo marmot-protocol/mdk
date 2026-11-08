@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `ChatListRow` gains `leave_blocked`, read with `leave_requested_at_ms` from the engine's leave request (mdk#3014).
+  `SqliteAccountStorage::pending_leave_requests` now returns each group's whole `LeaveRequest`. No schema change.
+
 - Migration 0201 adds the inactivity clock for marking and removing inactive siblings (mdk#2628 item 3.6b-2):
   `device_activity` gains `clock_from` and `marked_inactive`, and the new single-row `device_inactivity_clock` keeps
   this device's last caught-up pass and last restart. `note_device_active` restarts a sibling's clock when it reads a

@@ -2489,6 +2489,18 @@ impl MarmotAppRuntime {
         self.accounts.leave_group(account_ref, group_id).await
     }
 
+    /// Cancel this account's blocked leave on this device (mdk#3014). Only a
+    /// leave the engine finds blocked is cancelled; any other state returns
+    /// `EngineError::LeaveNotBlocked`. The chat reads as joined again. A
+    /// shared Decline written by Leave with device groups on is untouched.
+    pub async fn cancel_leave(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        self.accounts.cancel_leave(account_ref, group_id).await
+    }
+
     pub async fn forget_group_local(
         &self,
         account_ref: &str,

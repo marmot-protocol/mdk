@@ -79,7 +79,7 @@ pub(crate) const BRANCH_REVIVAL_ORIGINS_SQL: &str = "SELECT DISTINCT app_events.
 /// A conversation's archive and admin state, and whether the engine holds a
 /// pending leave request (`?2`) or a disband tombstone for it.
 pub(crate) const CONVERSATION_GROUP_STATE_SQL: &str = "SELECT archived, admin_keys_hex,
-             EXISTS(SELECT 1 FROM cgka_leave_requests WHERE group_id = ?2),
+             (SELECT record FROM cgka_leave_requests WHERE group_id = ?2),
              EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?2)
          FROM account_groups WHERE group_id_hex = ?1";
 

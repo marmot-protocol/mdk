@@ -270,6 +270,10 @@ c_mirror! {
         copy disbanded: bool,
         opt_str welcomer_account_id_hex,
         opt_str via_welcome_message_id_hex,
+        /// The pending leave is blocked: this account is the last active
+        /// admin. Keep rendering it as leaving and offer
+        /// `marmot_cancel_leave`. Only true while `leave_request_pending`.
+        copy leave_blocked: bool,
     }
 }
 
@@ -384,6 +388,11 @@ c_mirror! {
         str_vec disbanding_blockers/disbanding_blockers_len,
         opt_rec disband_request: MarmotDisbandRequest,
         vec member_actions/member_actions_len: MarmotGroupMemberActionState,
+        /// The pending leave is blocked: this account is the last active
+        /// admin, so the leave cannot finish.
+        copy leave_blocked: bool,
+        /// Offer Cancel on the blocked leave (`marmot_cancel_leave`).
+        copy can_cancel_leave: bool,
     }
 }
 
@@ -620,6 +629,7 @@ mod tests {
             disbanded: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
+            leave_blocked: true,
         }
     }
 
@@ -634,6 +644,7 @@ mod tests {
         let mirror: MarmotAppGroupRecord = record().into();
         assert!(mirror.has_leave_requested_at_ms);
         assert_eq!(mirror.leave_requested_at_ms, 1_700_000_000_123);
+        assert!(mirror.leave_blocked);
         assert!(mirror.encrypted_media.has_version);
         assert_eq!(
             mirror.encrypted_media.version,

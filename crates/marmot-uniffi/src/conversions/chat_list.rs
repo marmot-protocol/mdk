@@ -263,6 +263,10 @@ pub struct ChatListRowFfi {
     /// When the local account asked to leave, in milliseconds since the Unix
     /// epoch; `null` when no leave is pending.
     pub leave_requested_at_ms: Option<u64>,
+    /// The pending leave is blocked: this account is the group's last active
+    /// admin, so the leave cannot finish until the user cancels it
+    /// (`Marmot::cancel_leave`). Only true while `leave_request_pending`.
+    pub leave_blocked: bool,
 }
 
 impl From<ChatListRow> for ChatListRowFfi {
@@ -301,6 +305,7 @@ impl From<ChatListRow> for ChatListRowFfi {
             muted_until_ms: value.muted_until_ms,
             leave_request_pending: value.leave_requested_at_ms.is_some(),
             leave_requested_at_ms: value.leave_requested_at_ms,
+            leave_blocked: value.leave_blocked,
         }
     }
 }
@@ -579,6 +584,7 @@ mod tests {
             muted: false,
             muted_until_ms: None,
             leave_requested_at_ms: None,
+            leave_blocked: false,
         }
     }
 
@@ -665,6 +671,7 @@ mod tests {
         // whole window this field exists to cover.
         let ffi = ChatListRowFfi::from(ChatListRow {
             leave_requested_at_ms: Some(1_700_000_000_123),
+            leave_blocked: false,
             ..sample_row()
         });
 

@@ -1687,6 +1687,7 @@ fn group_management_json(
         admin_count,
         pending_confirmation: group.pending_confirmation,
         leave_request_pending,
+        leave_blocked: group.leave_blocked,
         lifecycle: mls.lifecycle_state,
         unrecoverable: group.unrecoverable || mls.unrecoverable,
         disbanding: mls.disbanding,
@@ -1729,6 +1730,7 @@ fn group_management_json(
         "requires_self_demote_before_leave": leave.requires_self_demote_before_leave,
         "leave_request_pending": leave_request_pending,
         "leave_requested_at_ms": group.leave_requested_at_ms,
+        "leave_blocked": group.leave_blocked,
         "lifecycle_state": mls.lifecycle_state,
         "disbanding_enabled": mls.disbanding_enabled,
         "disbanding": mls.disbanding,
@@ -2232,6 +2234,12 @@ mod tests {
         assert_eq!(pending["can_leave"], false);
         assert_eq!(pending["leave_request_pending"], true);
         assert_eq!(pending["leave_requested_at_ms"], 19);
+        assert_eq!(pending["leave_blocked"], false);
+        group.leave_blocked = true;
+        let blocked = group_management_json(&member, &group, &members, &mls, false);
+        assert_eq!(blocked["leave_blocked"], true);
+        assert_eq!(blocked["can_leave"], false);
+        group.leave_blocked = false;
         group.leave_requested_at_ms = None;
         group.admin_policy.admins = vec![me.clone()];
         let last = group_management_json(&me, &group, &members, &mls, false);
