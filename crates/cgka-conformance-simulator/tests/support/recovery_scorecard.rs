@@ -618,7 +618,9 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
     let cold_reopen_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
     let alice_final = alice.clone();
-    let telemetry_before = serde_json::to_value(&subject.performance_snapshots()?["bob"])?;
+    let snapshots = subject.performance_snapshots()?;
+    let telemetry_before = serde_json::to_value(&snapshots["bob"])?;
+    let alice_before = serde_json::to_value(&snapshots["alice"])?;
     let (stop, stop_watch) = (
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
@@ -698,7 +700,9 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
     tokio::time::sleep(Duration::from_secs(5)).await;
     stop_watch.store(true, Ordering::Relaxed);
     let seen = watcher.await?;
-    let telemetry_after = serde_json::to_value(&subject.performance_snapshots()?["bob"])?;
+    let snapshots = subject.performance_snapshots()?;
+    let telemetry_after = serde_json::to_value(&snapshots["bob"])?;
+    let alice_after = serde_json::to_value(&snapshots["alice"])?;
     let measured = subject.relay_traffic(&mark, true).await?;
     let own = subject.client_traffic("bob", &mark).await?;
     tokio::time::sleep(IDLE_WINDOW).await;
@@ -764,12 +768,17 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         .collect::<Vec<_>>();
     slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
     slowest.truncate(5);
-    live_visibility["slowest"] = json!(slowest.iter().map(|(sample, visible_ms)| json!({
-        "sent_at_seconds": sample.at,
-        "visible_ms": visible_ms,
-        "send_ms": sample.ms,
-        "after_send_ms": visible_ms - sample.ms,
-    })).collect::<Vec<_>>());
+    live_visibility["slowest"] = json!(
+        slowest
+            .iter()
+            .map(|(sample, visible_ms)| json!({
+                "sent_at_seconds": sample.at,
+                "visible_ms": visible_ms,
+                "send_ms": sample.ms,
+                "after_send_ms": visible_ms - sample.ms,
+            }))
+            .collect::<Vec<_>>()
+    );
     let not_visible = sent.count() as u64 - live_visibility["n"].as_u64().unwrap_or(0);
     live_visibility["not_visible"] = json!(not_visible);
     live_visibility["sends"] = latencies(&live_sends);
@@ -817,6 +826,9 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         "runner_history_requests_after_restart": bobs.iter().map(Vec::len).sum::<usize>(),
         "idle_window": {"seconds": IDLE_WINDOW.as_secs(), "relays": idle.collect::<Vec<_>>()},
         "telemetry": {"before": telemetry_before, "after": telemetry_after},
+        // What alice's runtime did while she sent the live messages, which
+        // explains a slow send.
+        "alice_runtime_operations": operation_deltas(&alice_before, &alice_after),
     }))
 }
 
@@ -877,6 +889,54 @@ fn targets(report: &Value) -> Value {
     ])
 }
 
+/// Each runtime operation that started, finished or was in flight during
+/// the measured phase: its counts' deltas, the time its finished runs took,
+/// and what was in flight at either end.
+fn operation_deltas(before: &Value, after: &Value) -> Value {
+    const COUNTS: [&str; 5] = ["started", "completed", "failures", "timeouts", "cancelled"];
+    let operations = |snapshot: &Value| {
+        let operations = snapshot["runtime_operations"]
+            .as_array()
+            .into_iter()
+            .flatten();
+        operations
+            .map(|operation| (operation["operation"].to_string(), operation.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = operations(before);
+    let changed = operations(after).into_iter().filter_map(|(name, after)| {
+        let earlier = before.get(&name);
+        let delta = |field: &str| {
+            let was = earlier
+                .and_then(|operation| operation[field].as_u64())
+                .unwrap_or(0);
+            after[field].as_u64().unwrap_or(0).saturating_sub(was)
+        };
+        let deltas = COUNTS.map(|field| (field, delta(field)));
+        let in_flight = after["in_flight"].as_u64().unwrap_or(0);
+        let was_in_flight = earlier
+            .and_then(|operation| operation["in_flight"].as_u64())
+            .unwrap_or(0);
+        (deltas.iter().any(|(_, count)| *count > 0) || in_flight + was_in_flight > 0).then(|| {
+            let mut row = serde_json::Map::new();
+            row.insert("operation".into(), after["operation"].clone());
+            for (field, count) in deltas {
+                row.insert(field.into(), json!(count));
+            }
+            row.insert("in_flight_before".into(), json!(was_in_flight));
+            row.insert("in_flight_after".into(), json!(in_flight));
+            let sum = |operation: &Value| operation["duration_ms"]["sum_ms"].as_u64().unwrap_or(0);
+            let was = earlier.map_or(0, sum);
+            row.insert(
+                "duration_sum_ms".into(),
+                json!(sum(&after).saturating_sub(was)),
+            );
+            Value::Object(row)
+        })
+    });
+    json!(changed.collect::<Vec<_>>())
+}
+
 /// Aggregate telemetry deltas over the measured phase. The public API has no
 /// recovery-attempt counter; these and upstream REQ/NEG-OPEN counts are proxies.
 fn telemetry_deltas(before: &Value, after: &Value) -> Value {
@@ -913,7 +973,10 @@ fn print_table(report: &Value) {
     );
     let live = &report["live_visibility_ms"];
     for (name, row) in [
-        ("status: group_recovery_status", &report["status_command_ms"]),
+        (
+            "status: group_recovery_status",
+            &report["status_command_ms"],
+        ),
         ("send: bob, healthy group", &report["send_ms"]),
         ("send: alice, live group", &live["sends"]),
         ("live visibility: from alice's send", live),

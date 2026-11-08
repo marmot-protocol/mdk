@@ -96,7 +96,8 @@ under `MDK_APP_JOURNEY_ARTIFACTS`, plus a printed table, records:
 - status command (`group_recovery_status`) and send latency p50/p95/max;
 - alice's live send latency and live-message visibility twice: from the start of her send, and from its return,
   which is bob's own share (negative when he saw the message before her call returned). The slowest five from the
-  start are listed with their start offset, her send time and bob's share;
+  start are listed with their start offset, her send time and bob's share. Alice's runtime operations that ran
+  during the measured phase are listed with their counts, timeouts and time taken;
 - commit-applied and decrypted times;
 - per-relay bytes, and EVENT frames split into re-downloaded held history, novel events and the missing commit;
 - each endpoint's EVENT copies and bytes split by cause (`download_split`):
