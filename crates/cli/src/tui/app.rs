@@ -51,6 +51,17 @@ pub(crate) struct StatusOwnership {
     pub(super) retained: bool,
 }
 
+/// One-shot launch guidance waits for an idle Main frame. A delivered outcome
+/// or a successful explicit daemon control resolves it, including a late launch
+/// failure arriving after a manual stop. This is independent of status authority.
+#[derive(Default)]
+pub(crate) enum DaemonNotice {
+    #[default]
+    Waiting,
+    Pending(String),
+    Resolved,
+}
+
 pub(crate) struct PendingInviteNotice {
     pub(crate) revision: u64,
     pub(crate) text: String,
@@ -157,6 +168,7 @@ pub(crate) struct TuiApp {
     pub(crate) flick_status_owner: Option<u64>,
     pub(crate) stream_status_owner: Option<StatusOwner>,
     pub(crate) daemon_start_status_owner: Option<StatusOwner>,
+    pub(crate) daemon_notice: DaemonNotice,
     /// The one open modal, or none. While set it captures every key (routed at
     /// the top of `handle_key`) and overlays whatever screen is showing.
     pub(crate) popup: Option<Popup>,
@@ -441,6 +453,7 @@ impl TuiApp {
             flick_status_owner: None,
             stream_status_owner: None,
             daemon_start_status_owner: None,
+            daemon_notice: DaemonNotice::default(),
             popup: None,
             pending_full_repaint: false,
             group_detail: None,
@@ -672,7 +685,13 @@ impl TuiApp {
                 }
             },
         );
-        changed |= self.deliver_pending_invite_notice();
+        // At most one retained notice per frame: ambient writes do not retain
+        // the line, so delivering both here would immediately hide the first.
+        if self.deliver_daemon_notice() {
+            changed = true;
+        } else {
+            changed |= self.deliver_pending_invite_notice();
+        }
         changed
     }
 
@@ -720,7 +739,7 @@ impl TuiApp {
                 .then_some(self.status_ownership.owner());
             self.set_drain_status(STARTING_DAEMON_STATUS.to_owned());
         } else {
-            self.set_drain_status(DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned());
+            self.queue_daemon_notice(DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned());
         }
     }
 

@@ -2233,6 +2233,9 @@ impl TuiApp {
     /// `daemon.running` each frame.
     fn adopt_daemon_view(&mut self, result: &Value) -> bool {
         self.daemon = parse_daemon_view(result);
+        if self.daemon.running {
+            self.daemon_notice = DaemonNotice::Resolved;
+        }
         // A currently owned daemon result may report its acquisition failures.
         // A stale result still adopts resources without releasing newer feedback.
         if self.status_is_owned() {
@@ -2252,21 +2255,47 @@ impl TuiApp {
     /// surface the failure on the status line. Either way the session stays up.
     ///
     /// The independently running launch request carries its own status claim.
-    /// Adoption always updates resources; only an owned result updates feedback,
-    /// and acquisition failures take precedence over the readiness sentence.
+    /// Success always adopts resources; only idle owned feedback reports its
+    /// readiness sentence. Failed launch guidance waits for an idle Main tick.
     pub(crate) fn fold_daemon_start(&mut self, result: Result<Value, String>) {
-        self.with_feedback(
-            self.daemon_start_status_owner
-                .map_or(FeedbackPermission::Silent, FeedbackPermission::Background),
-            |app| match result {
-                Ok(value) => {
+        match result {
+            Ok(value) => self.with_feedback(
+                self.daemon_start_status_owner
+                    .map_or(FeedbackPermission::Silent, FeedbackPermission::Background),
+                |app| {
                     if !app.adopt_daemon_view(&value) {
                         app.set_drain_status(daemon_status_sentence(&app.daemon));
                     }
-                }
-                Err(err) => app.set_drain_status(format!("daemon start failed: {err}")),
-            },
-        );
+                },
+            ),
+            Err(err) => self.queue_daemon_notice(format!("daemon start failed: {err}")),
+        }
+    }
+
+    /// Denied immediate feedback does not discard the only actionable launch
+    /// outcome. Delivery is on tick, after foreground work settles, rather than
+    /// borrowing a newer action's feedback permission.
+    pub(super) fn queue_daemon_notice(&mut self, notice: String) {
+        if !self.daemon.running && !matches!(self.daemon_notice, DaemonNotice::Resolved) {
+            self.daemon_notice = DaemonNotice::Pending(notice);
+        }
+    }
+
+    pub(super) fn deliver_daemon_notice(&mut self) -> bool {
+        if self.screen != Screen::Main
+            || self.status_ownership.retained
+            || !self.ambient_feedback_is_owned()
+            || !matches!(self.daemon_notice, DaemonNotice::Pending(_))
+        {
+            return false;
+        }
+        let DaemonNotice::Pending(notice) =
+            std::mem::replace(&mut self.daemon_notice, DaemonNotice::Resolved)
+        else {
+            unreachable!("pending notice checked above");
+        };
+        self.set_drain_status(notice);
+        true
     }
 
     pub(crate) fn refresh_daemon_status(&mut self) -> TuiResult<()> {
@@ -2291,6 +2320,7 @@ impl TuiApp {
         self.begin_status_action();
         let result = self.client.run_json(None, &["daemon", "stop"])?;
         self.daemon = parse_daemon_view(&result);
+        self.daemon_notice = DaemonNotice::Resolved;
         self.chat_subscription = None;
         self.message_subscription = None;
         self.group_state_subscription = None;
@@ -2984,9 +3014,10 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Clear the messages pane: drop the loaded timeline rows, reset the scroll
-    /// model to its pinned default, and stop the per-group timeline subscription.
+    /// Clear the messages pane, canceling any pending page before it can adopt
+    /// a removed group, acquire resources, or enqueue a forward-only mark-read.
     pub(crate) fn clear_timeline_pane(&mut self) {
+        self.loading_chat = None;
         self.timeline.clear();
         self.timeline_scroll = TimelineScroll::default();
         self.timeline_subscription = None;

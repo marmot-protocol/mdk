@@ -2426,6 +2426,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         flick_status_owner: None,
         stream_status_owner: None,
         daemon_start_status_owner: None,
+        daemon_notice: DaemonNotice::default(),
         popup: None,
         pending_full_repaint: false,
         group_detail: None,
@@ -16098,6 +16099,7 @@ fn launch_with_no_daemon_and_no_relay_source_surfaces_one_honest_status() {
     app.daemon = DaemonView::default();
 
     app.autostart_daemon_if_needed(None);
+    app.tick();
 
     assert_eq!(app.status, DAEMON_AUTOSTART_NO_RELAYS_STATUS);
     // The status must point at the only path that actually gives the daemon a
@@ -16147,6 +16149,7 @@ fn a_failed_daemon_auto_start_reports_and_leaves_the_session_up() {
     app.daemon_start_status_owner = Some(app.status_ownership.owner());
 
     app.fold_daemon_start(Err("daemon did not become ready".to_owned()));
+    app.tick();
 
     assert_eq!(
         app.status,
@@ -18729,5 +18732,492 @@ fn opening_a_search_profile_card_preserves_the_pending_follows_feedback() {
     assert!(
         observed.iter().all(|row| row.3),
         "successful profile-card opening cannot strand the actual pending follow: {observed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_empty_chat_refresh_cancels_the_same_accounts_pending_page_and_followups() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let mut observations = Vec::new();
+    for list_fails in [false, true] {
+        for page_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = TestCommandGate::new(dir.path());
+            let exe = dir.path().join("wn-empty-list-during-page");
+            let calls = dir.path().join("calls");
+            let first_list = dir.path().join("first-list");
+            let timeline_entered = dir.path().join("timeline-entered");
+            let group_entered = dir.path().join("group-entered");
+            let accounts = serde_json::json!({"ok":true,"result":{"accounts":[{
+                "account_id":account,"npub":"npub1alice","local_signing":true
+            }]}});
+            let nonempty = serde_json::json!({"ok":true,"result":{"chats":[{
+                "group_id":group,"profile":{"name":"Room"}
+            }]}});
+            let refreshed = if list_fails {
+                serde_json::json!({"ok":false,"error":{"message":"chat list offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"chats":[]}})
+            };
+            let page = if page_fails {
+                serde_json::json!({"ok":false,"error":{"message":"old page offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"old-page-row","direction":"received","from":"peer",
+                    "plaintext":"original pending page","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' account list '*) printf '%s\\n' '{accounts}';;\n\
+                 *' chats list '*)\nif mkdir '{}' 2>/dev/null; then\n\
+                 printf '%s\\n' '{nonempty}'\nelse printf '%s\\n' '{refreshed}'; fi;;\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+                 *' messages timeline subscribe '*) printf entered > '{}'; exec sleep 60;;\n\
+                 *' groups subscribe-state '*) printf entered > '{}'; exec sleep 60;;\n\
+                 *' subscribe '*|*' subscribe-archived '*) exec sleep 60;;\n\
+                 *' daemon status '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true}}}}';;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    calls.display(),
+                    first_list.display(),
+                    gate.script(),
+                    timeline_entered.display(),
+                    group_entered.display(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let (ui_tx, ui_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let expected_account = account.clone();
+            let expected_group = group.clone();
+            let worker = thread::spawn(move || {
+                // The existing fixture models a running daemon, so re-adoption
+                // would have real eligible group subscription/mark-read effects.
+                // start() loads the real account/list and dispatches its first page.
+                let mut app = test_tui_app(client, &expected_account);
+                app.start().unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                app.focus = Focus::Composer;
+                app.input.set_value("/refresh");
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap();
+                ui_tx
+                    .send((
+                        app.status.clone(),
+                        app.chats.is_empty(),
+                        app.loading_chat.is_none(),
+                        app.timeline.is_empty(),
+                        app.messages_group_id.is_none(),
+                        app.screen == Screen::Main,
+                        app.selected_account_row().map(|row| row.account_id.clone())
+                            == Some(expected_account.clone()),
+                    ))
+                    .unwrap();
+                if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return None;
+                }
+                // First fence may precede work enqueued by folding the page;
+                // second fence consumes all those real diagnostic/read followups.
+                finish_queued_effects(&mut app);
+                finish_queued_effects(&mut app);
+                if list_fails && !page_fails {
+                    // Positive control: await produced child-entry markers, not
+                    // a timing delay. Both real per-group subscriptions must run.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !timeline_entered.exists() || !group_entered.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "legitimate page subscriptions never entered"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let empty_state = app.chats.is_empty()
+                    && app.timeline.is_empty()
+                    && app.loading_chat.is_none()
+                    && app.messages_account_id.as_deref() == Some(expected_account.as_str())
+                    && app.messages_group_id.is_none()
+                    && app.timeline_subscription.is_none()
+                    && app.group_state_subscription.is_none()
+                    && app.group_diagnostics.is_none();
+                let control_state = app.chats.len() == 1
+                    && app.loading_chat.is_none()
+                    && if page_fails {
+                        app.timeline.is_empty()
+                            && app.messages_group_id.is_none()
+                            && app.timeline_subscription.is_none()
+                            && app.group_state_subscription.is_none()
+                            && app.group_diagnostics.is_none()
+                    } else {
+                        timeline_ids(&app.timeline) == vec!["old-page-row"]
+                            && app.messages_account_id.as_deref() == Some(expected_account.as_str())
+                            && app.messages_group_id.as_deref() == Some(expected_group.as_str())
+                            && app.timeline_subscription.as_ref().is_some_and(|sub| {
+                                sub.account_id == expected_account && sub.group_id == expected_group
+                            })
+                            && app.group_state_subscription.as_ref().is_some_and(|sub| {
+                                sub.account_id == expected_account && sub.group_id == expected_group
+                            })
+                            && app
+                                .group_diagnostics
+                                .as_ref()
+                                .is_some_and(|diag| diag.group_id == expected_group)
+                    };
+                let account_feed = app
+                    .message_subscription
+                    .as_ref()
+                    .is_some_and(|sub| sub.account_id == expected_account);
+                Some((app.status.clone(), empty_state, control_state, account_feed))
+                // Dropping this app kills/waits its owned subscription children
+                // before the parent reads the command recorder after join.
+            });
+            gate.wait_until_entered();
+            continue_tx.send(()).unwrap();
+            let before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+            gate.release();
+            finish_tx.send(before_release.is_ok()).unwrap();
+            let after = worker
+                .join()
+                .unwrap()
+                .expect("actual page and followups were folded");
+            let before =
+                before_release.expect("keyed refresh returned before the original page release");
+            let recorded = std::fs::read_to_string(calls).unwrap();
+            let count = |needle: &str| {
+                recorded
+                    .lines()
+                    .filter(|line| line.contains(needle))
+                    .count()
+            };
+            let mark_reads = recorded
+                .lines()
+                .filter(|line| {
+                    line.contains(" chats mark-read ")
+                        && !line.contains("test-fifo-completion-marker")
+                })
+                .count();
+            let legitimate_page = list_fails && !page_fails;
+            let before_ok = before.1 == !list_fails
+                && before.2 == !list_fails
+                && before.3
+                && before.4
+                && before.5
+                && before.6
+                && if list_fails {
+                    before.0 == "error: chat list offline"
+                } else {
+                    before.0.contains("no chats")
+                };
+            observations.push((
+                list_fails,
+                page_fails,
+                before.0.clone(),
+                after.0.clone(),
+                before_ok
+                    && after.0 == before.0
+                    && after.3
+                    && if list_fails { after.2 } else { after.1 }
+                    && count(" account list") == 2
+                    && count(" chats list") == 2
+                    && count(" messages timeline list ") == 1
+                    && mark_reads == usize::from(legitimate_page)
+                    && count(" messages timeline subscribe ") == usize::from(legitimate_page)
+                    && count(" groups subscribe-state ") == usize::from(legitimate_page)
+                    && count(" groups show ") == 0,
+                before,
+                after,
+                (
+                    count(" account list"),
+                    count(" chats list"),
+                    count(" messages timeline list "),
+                    mark_reads,
+                    count(" messages timeline subscribe "),
+                    count(" groups subscribe-state "),
+                    count(" groups show "),
+                ),
+            ));
+        }
+    }
+    assert!(
+        observations.iter().all(|row| row.4),
+        "empty successful list cancels old model work; failed list preserves legitimate work: {observations:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_daemon_guidance_waits_for_idle_main_and_is_consumed_once() {
+    use clap::Parser;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Hold {
+        PageError,
+        NewerAction,
+        // A real daemon-status child observes another process having started it.
+        // This is valid even when this TUI was launched without relay sources.
+        ManualDaemonReady,
+        ManualStop,
+        LateManualStop,
+    }
+
+    let mut cases = Vec::new();
+    for picker in [false, true] {
+        for start_fails in [false, true] {
+            for hold in [Hold::PageError, Hold::NewerAction] {
+                cases.push((picker, start_fails, hold));
+            }
+        }
+    }
+    // No need to repeat both picker routes for the obsolete-guidance contrast.
+    for start_fails in [false, true] {
+        cases.push((false, start_fails, Hold::ManualDaemonReady));
+        cases.push((false, start_fails, Hold::ManualStop));
+    }
+
+    cases.push((false, true, Hold::LateManualStop));
+    let mut warnings = Vec::new();
+    for (picker, start_fails, hold) in cases {
+        let context = format!("picker={picker}, start_fails={start_fails}, hold={hold:?}");
+        let dir = tempfile::tempdir().expect("startup fixture directory");
+        let mut page_gate = TestCommandGate::new(dir.path());
+        let daemon_dir = dir.path().join("daemon");
+        std::fs::create_dir(&daemon_dir).unwrap();
+        let mut daemon_gate = TestCommandGate::new(&daemon_dir);
+        let page_seen = dir.path().join("first-page-entered");
+        let page_error = dir.path().join("page-error");
+        let daemon_ready = dir.path().join("daemon-ready");
+        if !matches!(hold, Hold::NewerAction) {
+            std::fs::write(&page_error, b"offline").unwrap();
+        }
+        let account_a = "aa".repeat(32);
+        let account_b = "bb".repeat(32);
+        let group = "cc".repeat(16);
+        let mut accounts = vec![serde_json::json!({
+            "account_id":account_a, "npub":"npub1startup-a", "local_signing":true
+        })];
+        if picker {
+            accounts.push(serde_json::json!({
+                "account_id":account_b, "npub":"npub1startup-b", "local_signing":true
+            }));
+        }
+        let catalog = serde_json::json!({"ok":true,"result":{
+            "accounts":accounts,
+            "chats":[{"group_id":group,"profile":{"name":"Startup chat"}}]
+        }});
+        let page = serde_json::json!({"ok":true,"result":{
+            "messages":[{"message_id":"startup-page-row","direction":"received",
+                "from":"startup-peer","plaintext":"Startup page body",
+                "timeline_at":3,"received_at":3}],"has_more_before":false
+        }});
+        let exe = dir.path().join("wn-startup-guidance");
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in\n\
+                 *' messages timeline list '*)\n\
+                   if [ ! -e '{seen}' ]; then\n\
+                     : > '{seen}'\n{page_gate}\
+                   fi\n\
+                   if [ -e '{page_error}' ]; then\n\
+                     printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"startup page offline\"}}}}'\n\
+                   else printf '%s\\n' '{page}'; fi;;\n\
+                 *' daemon start '*)\n{daemon_gate}\
+                   printf '%s\\n' '{{\"ok\":false,\"error\":{{\"message\":\"startup daemon unreachable\"}}}}';;\n\
+                 *' daemon status '*)\n\
+                   if [ -e '{daemon_ready}' ]; then\n\
+                     printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true}}}}'\n\
+                   else printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":false}}}}'; fi;;\n\
+                 *' daemon stop '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":false}}}}';;\n\
+                 *' subscribe '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{catalog}';;\nesac\n",
+                seen = page_seen.display(),
+                page_gate = page_gate.script(),
+                page_error = page_error.display(),
+                daemon_gate = daemon_gate.script(),
+                daemon_ready = daemon_ready.display(),
+            ),
+        );
+        let args = if start_fails {
+            vec![
+                "wn",
+                "tui",
+                "--discovery-relays",
+                "wss://startup-relay.example",
+            ]
+        } else {
+            vec!["wn", "tui"]
+        };
+        let mut app = TuiApp::new(Cli::try_parse_from(args).unwrap()).unwrap();
+        // Replace only the real subprocess boundary, keeping constructor/startup state.
+        app.client.exe = exe;
+        app.effects = EffectRunner::spawn(app.client.clone());
+        app.start()
+            .expect("actual startup routes its native account-list result");
+        if picker {
+            assert_eq!(
+                app.screen,
+                Screen::Login(LoginMode::AccountSelect),
+                "{context}"
+            );
+        } else {
+            assert_eq!(app.screen, Screen::Main, "{context}");
+            page_gate.wait_until_entered();
+        }
+
+        // Match run(): start() first, then autostart, then user events/ticks.
+        app.autostart_daemon_if_needed(None);
+        if start_fails {
+            daemon_gate.wait_until_entered();
+        } else {
+            assert!(
+                app.daemon_autostart.is_none(),
+                "no child without relay sources: {context}"
+            );
+        }
+        if picker {
+            app.handle_key(char_key('j'))
+                .expect("move to second native account");
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("commit picker while any startup child is still held");
+            assert_eq!(app.screen, Screen::Main, "{context}");
+            page_gate.wait_until_entered();
+            assert_eq!(
+                app.selected_account_row().unwrap().account_id,
+                account_b,
+                "{context}"
+            );
+        }
+        assert_eq!(
+            app.status, LOADING_TIMELINE_STATUS,
+            "startup guidance cannot replace loading: {context}"
+        );
+        if matches!(hold, Hold::NewerAction) {
+            // This foreground action returns while the real page/start children are held.
+            app.run_slash_command(SlashCommand::Diagnostics).unwrap();
+            assert_eq!(app.status, "diagnostics panel on", "{context}");
+        }
+        if start_fails && !matches!(hold, Hold::LateManualStop) {
+            daemon_gate.release();
+            let result = app.recv_daemon_autostart();
+            assert!(result.is_err(), "the actual start child failed: {context}");
+            app.fold_daemon_start(result);
+        }
+        let provisional = if matches!(hold, Hold::NewerAction) {
+            "diagnostics panel on"
+        } else {
+            LOADING_TIMELINE_STATUS
+        };
+        assert_eq!(
+            app.status, provisional,
+            "failed startup cannot supersede its foreground: {context}"
+        );
+        page_gate.release();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        let retained = if matches!(hold, Hold::NewerAction) {
+            "diagnostics panel on"
+        } else {
+            "error: startup page offline"
+        };
+        assert_eq!(
+            app.status, retained,
+            "page completion settles its own feedback only: {context}"
+        );
+        app.tick();
+        app.tick();
+        assert_eq!(
+            app.status, retained,
+            "guidance waits behind retained feedback: {context}"
+        );
+        assert!(
+            !app.daemon.running,
+            "degraded startup remains honest: {context}"
+        );
+
+        if matches!(hold, Hold::ManualDaemonReady) {
+            // Another process may start a daemon even when this TUI lacks relays.
+            // The user's actual status command adopts that positive child result.
+            std::fs::write(&daemon_ready, b"running").unwrap();
+            app.run_slash_command(SlashCommand::DaemonStatus).unwrap();
+            assert!(
+                app.daemon.running,
+                "the manual command adopted readiness: {context}"
+            );
+            assert_eq!(app.status, "daemon running", "{context}");
+        }
+        if matches!(hold, Hold::ManualStop | Hold::LateManualStop) {
+            app.run_slash_command(SlashCommand::DaemonStop).unwrap();
+            assert_eq!(
+                app.status, "daemon stopped",
+                "explicit stop resolves startup guidance: {context}"
+            );
+            if matches!(hold, Hold::LateManualStop) {
+                daemon_gate.release();
+                let result = app.recv_daemon_autostart();
+                assert!(result.is_err());
+                app.fold_daemon_start(result);
+                assert_eq!(
+                    app.status, "daemon stopped",
+                    "late startup failure cannot replace manual stop: {context}"
+                );
+            }
+        }
+        if page_error.exists() {
+            std::fs::remove_file(&page_error).unwrap();
+        }
+        app.run_slash_command(SlashCommand::Refresh).unwrap();
+        finish_queued_effects(&mut app);
+        finish_queued_effects(&mut app);
+        assert_eq!(
+            app.status, "loaded 1 message(s)",
+            "a real healthy refresh releases feedback: {context}"
+        );
+        app.tick();
+        let warning = if start_fails {
+            "daemon start failed: startup daemon unreachable"
+        } else {
+            DAEMON_AUTOSTART_NO_RELAYS_STATUS
+        };
+        if matches!(
+            hold,
+            Hold::ManualDaemonReady | Hold::ManualStop | Hold::LateManualStop
+        ) {
+            warnings.push((
+                context.clone(),
+                app.status.clone(),
+                app.status == "loaded 1 message(s)",
+            ));
+        } else {
+            warnings.push((context.clone(), app.status.clone(), app.status == warning));
+            // A new genuine idle presentation distinguishes consumption from
+            // repeatedly assigning the same warning string every tick.
+            app.run_slash_command(SlashCommand::Refresh).unwrap();
+            finish_queued_effects(&mut app);
+            finish_queued_effects(&mut app);
+            assert_eq!(app.status, "loaded 1 message(s)", "{context}");
+        }
+        app.tick();
+        app.tick();
+        assert_eq!(
+            app.status, "loaded 1 message(s)",
+            "consumed/obsolete guidance never replays: {context}"
+        );
+        assert_eq!(
+            app.timeline[0].message_id, "startup-page-row",
+            "page model still folds: {context}"
+        );
+        assert!(app.running, "{context}");
+    }
+    assert!(
+        warnings.iter().all(|row| row.2),
+        "deferred startup outcomes are delivered once and explicit daemon control resolves obsolete guidance: {warnings:?}"
     );
 }

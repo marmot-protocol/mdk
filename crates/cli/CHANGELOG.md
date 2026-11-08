@@ -16,7 +16,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   still permit live notices, and background refreshes continue updating the pane. Scrolling and cancelled
   navigation preserve pending feedback; repeated searches admit only their newest request, and invite notices
   wait until the status line is available. Returning from member search refreshes the roster without hiding an
-  add or follow result; ordinary view refresh failures remain visible (#3139, #3154).
+  add or follow result; ordinary view refresh failures remain visible. Startup failures wait for idle feedback,
+  and empty chat-list refreshes cancel pending pages before they can restore a removed chat (#3139, #3154).
 
 - Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
   retained panes under a different account's list. Start the adopted account's live feed even when its page
