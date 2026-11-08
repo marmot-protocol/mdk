@@ -9,6 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
+  with its device group and should be reset and linked again (experimental device-group builds).
+
 - Keep the newest overlapping TUI timeline refresh for the same chat, including page errors; stale
   completions cannot consume the newer request or apply its subscriptions and followups.
 - Preserve TUI command acknowledgements, prompts and load errors using explicit feedback permissions. Older
@@ -17,14 +20,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   navigation preserve pending feedback; repeated searches admit only their newest request, and invite notices
   wait until the status line is available. Returning from member search refreshes the roster without hiding an
   add or follow result; ordinary view refresh failures remain visible. Startup failures wait for idle feedback,
-  and empty chat-list refreshes cancel pending pages before they can restore a removed chat (#3139, #3154).
+  and removing a chat cancels its pending page and settles its loading feedback (#3139, #3154).
 
 - Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
   retained panes under a different account's list. Start the adopted account's live feed even when its page
   fails; same-account navigation and feed reconnects preserve the feed and observed previews (#2441).
-
-- `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
-  with its device group and should be reset and linked again (experimental device-group builds).
 
 - Recover TUI chat and notification feeds for the selected account when a background chat-list retry succeeds
   after a failed account switch, while preserving the open conversation and matching live subscriptions (#2968).

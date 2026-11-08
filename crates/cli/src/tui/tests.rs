@@ -8045,7 +8045,13 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     // Observe the completion itself before the FIFO fence folds
                     // any eligible follow-up load; the recorder then proves its
                     // presence or absence without a timing window.
-                    let loading_on_completion = app.loading_chat.clone();
+                    let loading_on_completion = app.loading_chat.as_ref().map(|pending| {
+                        (
+                            pending.account.clone(),
+                            pending.group.clone(),
+                            pending.generation,
+                        )
+                    });
                     let completion_status = app.status.clone();
                     finish_queued_effects(&mut app);
                     let recorded =
@@ -8535,11 +8541,12 @@ fn messages_pane_shows_loading_while_an_open_chat_load_is_in_flight() {
     app.focus = Focus::Messages;
     // An open-chat load is in flight and the pane has not yet folded any rows.
     app.timeline_load_generation = 1;
-    app.loading_chat = Some((
-        account_id.clone(),
-        "bb".repeat(32),
-        app.timeline_load_generation,
-    ));
+    app.loading_chat = Some(PendingTimeline {
+        account: account_id.clone(),
+        group: "bb".repeat(32),
+        generation: app.timeline_load_generation,
+        feedback: FeedbackPermission::Silent,
+    });
     assert!(app.timeline.is_empty());
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -11011,11 +11018,12 @@ fn messages_pane_renders_the_three_empty_states() {
 
     // Loading a chat's timeline off the event loop.
     app.timeline_load_generation = 1;
-    app.loading_chat = Some((
-        account_id.clone(),
-        "gg".repeat(32),
-        app.timeline_load_generation,
-    ));
+    app.loading_chat = Some(PendingTimeline {
+        account: account_id.clone(),
+        group: "gg".repeat(32),
+        generation: app.timeline_load_generation,
+        feedback: FeedbackPermission::Silent,
+    });
     assert!(rendered_buffer(&mut app).contains("loading messages..."));
 
     // Settled, no chat loaded.
@@ -12871,7 +12879,7 @@ fn flick_j_schedules_a_debounced_preview_and_fires_after_the_quiet_window() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str()),
         "the highlighted chat's timeline load fired"
     );
@@ -12974,7 +12982,7 @@ fn rapid_flick_coalesces_to_one_load_of_the_final_selection() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
     app.settle_effects(1);
@@ -13026,7 +13034,7 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
     app.settle_effects(1); // fold the flick preview load
@@ -13073,7 +13081,7 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(account, group, _)| (account, group)),
+            .map(|pending| (&pending.account, &pending.group)),
         Some((&other_account, &group_b))
     );
     assert!(app.timeline.is_empty());
@@ -13091,7 +13099,7 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(account, group, _)| (account, group)),
+            .map(|pending| (&pending.account, &pending.group)),
         Some((&account_id, &group_b))
     );
     app.settle_effects(1);
@@ -13131,7 +13139,7 @@ fn enter_supersedes_a_pending_flick_preview() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
 }
@@ -15216,7 +15224,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_id.as_str())
     );
     assert!(
@@ -15250,7 +15258,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
     assert!(app.timeline_scroll.has_more_before);
     assert!(app.timeline_scroll.is_pinned());
     assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
-    assert_eq!(app.loading_chat, None, "the load is settled");
+    assert!(app.loading_chat.is_none(), "the load is settled");
     assert_eq!(app.status, "loaded 1 message(s)");
 }
 
@@ -15286,7 +15294,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
 
@@ -15314,7 +15322,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     assert_eq!(
         app.loading_chat
             .as_ref()
-            .map(|(_, group, _)| group.as_str()),
+            .map(|pending| pending.group.as_str()),
         Some(group_b.as_str())
     );
 
@@ -15773,11 +15781,12 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     app.timeline = vec![timeline_row("m1", 100), timeline_row("m2", 200)];
     // A same-chat reload is in flight (its group matches the loaded pane).
     app.timeline_load_generation = 1;
-    app.loading_chat = Some((
-        account_id.clone(),
-        group_id.clone(),
-        app.timeline_load_generation,
-    ));
+    app.loading_chat = Some(PendingTimeline {
+        account: account_id.clone(),
+        group: group_id.clone(),
+        generation: app.timeline_load_generation,
+        feedback: app.view_feedback(),
+    });
 
     // Between enqueue and fold, the live timeline subscription folds in a newer
     // message.
@@ -19219,5 +19228,246 @@ fn startup_daemon_guidance_waits_for_idle_main_and_is_consumed_once() {
     assert!(
         warnings.iter().all(|row| row.2),
         "deferred startup outcomes are delivered once and explicit daemon control resolves obsolete guidance: {warnings:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn live_chat_removal_settles_only_its_pending_pages_feedback_and_releases_invite_notices() {
+    let account = "aa".repeat(32);
+    let group = "cc".repeat(16);
+    let invite_text = "invited to Incoming — press I to view invites";
+    let mut observations = Vec::new();
+    for page_fails in [false, true] {
+        for newer_action in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let chat_dir = dir.path().join("chat");
+            let notice_dir = dir.path().join("notice");
+            std::fs::create_dir(&chat_dir).unwrap();
+            std::fs::create_dir(&notice_dir).unwrap();
+            let mut page_gate = TestCommandGate::new(dir.path());
+            let mut chat_gate = TestCommandGate::new(&chat_dir);
+            let mut notice_gate = TestCommandGate::new(&notice_dir);
+            let exe = dir.path().join("wn-live-removal-feedback");
+            let calls = dir.path().join("calls");
+            let removed = dir.path().join("removed");
+            let accounts = serde_json::json!({"ok":true,"result":{"accounts":[{
+                "account_id":account,"npub":"npub1alice","local_signing":true
+            }]}});
+            let initial = serde_json::json!({"ok":true,"result":{"chats":[{
+                "group_id":group,"profile":{"name":"Room"},"archived":false
+            }]}});
+            // subscribe_chats sends an archived update even with
+            // include_archived=false, allowing clients to remove its prior row.
+            let removal = serde_json::json!({"ok":true,"result":{"type":"chat","chat":{
+                "group_id":group,"profile":{"name":"Room"},"archived":true
+            }}});
+            let invite = serde_json::json!({"ok":true,"result":{
+                "type":"notification","account_id":account,"notification":{
+                    "trigger":"GroupInvite","group_name":"Incoming",
+                    "notification_key":format!("invite:{account}:pending-cancel")
+                }
+            }});
+            let page = if page_fails {
+                serde_json::json!({"ok":false,"error":{"message":"canceled page offline"}})
+            } else {
+                serde_json::json!({"ok":true,"result":{"messages":[{
+                    "message_id":"canceled-row","direction":"received","from":"peer",
+                    "plaintext":"must not return","timeline_at":2,"received_at":2
+                }],"has_more_before":false}})
+            };
+            write_fake_wn(
+                &exe,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+                 *' account list '*) printf '%s\\n' '{accounts}';;\n\
+                 *' chats list '*) if test -e '{}'; then\n\
+                 printf '%s\\n' '{{\"ok\":true,\"result\":{{\"chats\":[]}}}}'\n\
+                 else printf '%s\\n' '{initial}'; fi;;\n\
+                 *' chats subscribe '*)\n{}printf removed > '{}'\n\
+                 printf '%s\\n' '{removal}'; exec sleep 60;;\n\
+                 *' notifications subscribe '*)\n{}printf '%s\\n' '{invite}'; exec sleep 60;;\n\
+                 *' messages timeline list '*)\n{}printf '%s\\n' '{page}';;\n\
+                 *' subscribe '*|*' subscribe-archived '*|*' subscribe-state '*) exec sleep 60;;\n\
+                 *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+                    calls.display(),
+                    removed.display(),
+                    chat_gate.script(),
+                    removed.display(),
+                    notice_gate.script(),
+                    page_gate.script(),
+                ),
+            );
+            let client = WnClient {
+                exe,
+                ..test_unused_client()
+            };
+            let (notice_tx, notice_rx) = mpsc::channel();
+            let (before_tx, before_rx) = mpsc::channel();
+            let (cancel_tx, cancel_rx) = mpsc::channel::<bool>();
+            let (canceled_tx, canceled_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+            let expected_account = account.clone();
+            let worker = thread::spawn(move || {
+                let mut app = test_tui_app(client, &expected_account);
+                app.start().unwrap();
+                notice_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                if newer_action {
+                    app.focus = Focus::Composer;
+                    app.input.set_value("/diagnostics");
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                        .unwrap();
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.pending_invite_notices.contains_key(&expected_account) {
+                    app.drain_notification_subscription();
+                    assert!(
+                        Instant::now() < deadline,
+                        "actual invite child was not drained"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                app.tick();
+                before_tx
+                    .send((
+                        app.status.clone(),
+                        app.pending_invite_notices.contains_key(&expected_account),
+                    ))
+                    .unwrap();
+                if !cancel_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return None;
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !app.chats.is_empty() {
+                    app.drain_chat_subscription();
+                    assert!(
+                        Instant::now() < deadline,
+                        "actual archived chat row was not drained"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let canceled_status = app.status.clone();
+                app.tick(); // ordinary idle-Main notice delivery, with page still physically held
+                canceled_tx
+                    .send((
+                        canceled_status,
+                        app.status.clone(),
+                        app.pending_invite_notices.contains_key(&expected_account),
+                        app.loading_chat.is_none()
+                            && app.messages_group_id.is_none()
+                            && app.timeline.is_empty()
+                            && app.timeline_subscription.is_none()
+                            && app.group_state_subscription.is_none()
+                            && app.group_diagnostics.is_none(),
+                    ))
+                    .unwrap();
+                if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    return None;
+                }
+                finish_queued_effects(&mut app);
+                finish_queued_effects(&mut app);
+                let after_page = app.status.clone();
+                let empty_state = app.chats.is_empty()
+                    && app.timeline.is_empty()
+                    && app.loading_chat.is_none()
+                    && app.messages_group_id.is_none()
+                    && app.timeline_subscription.is_none()
+                    && app.group_state_subscription.is_none()
+                    && app.group_diagnostics.is_none();
+                if newer_action {
+                    // A genuine later successful empty refresh releases the
+                    // retained diagnostics action; no direct feedback reset.
+                    app.focus = Focus::Composer;
+                    app.input.set_value("/refresh");
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                        .unwrap();
+                    app.tick();
+                }
+                let delivered = app.status.clone();
+                let notice_consumed = !app.pending_invite_notices.contains_key(&expected_account);
+                app.tick();
+                Some((
+                    after_page,
+                    empty_state,
+                    delivered,
+                    notice_consumed,
+                    app.status.clone(),
+                    app.message_subscription
+                        .as_ref()
+                        .is_some_and(|sub| sub.account_id == expected_account),
+                ))
+                // Drop kills/waits all owned subscription children before join returns.
+            });
+            page_gate.wait_until_entered();
+            chat_gate.wait_until_entered();
+            notice_gate.wait_until_entered();
+            notice_gate.release();
+            notice_tx.send(()).unwrap();
+            let before = before_rx.recv_timeout(Duration::from_secs(5));
+            chat_gate.release();
+            cancel_tx.send(before.is_ok()).unwrap();
+            let canceled = canceled_rx.recv_timeout(Duration::from_secs(5));
+            page_gate.release();
+            finish_tx.send(canceled.is_ok()).unwrap();
+            let after = worker
+                .join()
+                .unwrap()
+                .expect("canceled page and real FIFO followups folded");
+            let before = before.expect("invite/newer action drained before chat removal release");
+            let canceled =
+                canceled.expect("chat cancellation and notice tick returned before page release");
+            let initial_feedback = if newer_action {
+                "diagnostics panel on"
+            } else {
+                LOADING_TIMELINE_STATUS
+            };
+            let expected_after_cancel = if newer_action {
+                "diagnostics panel on"
+            } else {
+                invite_text
+            };
+            let recorded = std::fs::read_to_string(calls).unwrap();
+            let count = |needle: &str| {
+                recorded
+                    .lines()
+                    .filter(|line| line.contains(needle))
+                    .count()
+            };
+            let actual_marks = recorded
+                .lines()
+                .filter(|line| {
+                    line.contains(" chats mark-read ")
+                        && !line.contains("test-fifo-completion-marker")
+                })
+                .count();
+            let feedback_ok = if newer_action {
+                canceled.0 == "diagnostics panel on" && canceled.2
+            } else {
+                canceled.0 != LOADING_TIMELINE_STATUS && !canceled.2
+            };
+            let correct = before.0 == initial_feedback
+                && before.1
+                && feedback_ok
+                && canceled.1 == expected_after_cancel
+                && canceled.3
+                && after.0 == expected_after_cancel
+                && after.1
+                && after.2 == invite_text
+                && after.3
+                && after.4 == invite_text
+                && after.5
+                && count(" account list") == 1 + usize::from(newer_action)
+                && count(" chats list") == 1 + usize::from(newer_action)
+                && count(" messages timeline list ") == 1
+                && count(" messages timeline subscribe ") == 0
+                && count(" groups subscribe-state ") == 0
+                && count(" groups show ") == 0
+                && actual_marks == 0;
+            observations.push((page_fails, newer_action, before, canceled, after, correct));
+        }
+    }
+    assert!(
+        observations.iter().all(|row| row.5),
+        "live cancellation releases its own provisional feedback and preserves newer actions: {observations:?}"
     );
 }

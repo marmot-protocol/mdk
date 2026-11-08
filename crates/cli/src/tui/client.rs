@@ -648,9 +648,7 @@ impl TuiApp {
                 && !self
                     .loading_chat
                     .as_ref()
-                    .is_some_and(|(pending_account, pending_group, _)| {
-                        pending_account == &account && pending_group == &group
-                    })
+                    .is_some_and(|pending| pending.account == account && pending.group == group)
             {
                 // A page already queued for this pane runs after this send on
                 // the FIFO worker. Keep its newer generation/feedback claim;
@@ -2505,6 +2503,9 @@ impl TuiApp {
             let generation = app.timeline_load_generation;
             // Any explicit or fired load supersedes a pending flick-through preview.
             app.flick_countdown = None;
+            // An owned replacement publishes its new phase before old-request
+            // cancellation, so that cancellation cannot revoke the new writer.
+            app.set_status(LOADING_TIMELINE_STATUS.to_owned());
             app.adopt_message_account(&account_id);
             if app.messages_account_id.as_deref() != Some(account_id.as_str())
                 || app.messages_group_id.as_deref() != Some(group_id.as_str())
@@ -2517,7 +2518,6 @@ impl TuiApp {
                 app.group_state_subscription = None;
                 app.group_diagnostics = None;
             }
-            app.loading_chat = Some((account_id.clone(), group_id.clone(), generation));
             // The account-wide feed belongs to the adopted live account even if
             // this group's page fails. Same-account loads reuse its existing child.
             // Acquisition is provisional here: the fold retries and reports its
@@ -2525,14 +2525,20 @@ impl TuiApp {
             if app.daemon.running {
                 let _ = app.ensure_message_subscription(&account_id);
             }
-            app.set_status(LOADING_TIMELINE_STATUS.to_owned());
+            let feedback = app.view_feedback();
+            app.loading_chat = Some(PendingTimeline {
+                account: account_id.clone(),
+                group: group_id.clone(),
+                generation,
+                feedback,
+            });
             app.enqueue_effect(
                 Effect::LoadTimeline {
                     account: account_id,
                     group: group_id,
                     generation,
                 },
-                app.view_feedback(),
+                feedback,
             );
         });
     }
@@ -2558,13 +2564,9 @@ impl TuiApp {
         generation: u64,
         result: Result<Vec<Value>, String>,
     ) {
-        if !self.loading_chat.as_ref().is_some_and(
-            |(pending_account, pending_group, pending_generation)| {
-                pending_account == &account
-                    && pending_group == &group
-                    && *pending_generation == generation
-            },
-        ) {
+        if !self.loading_chat.as_ref().is_some_and(|pending| {
+            pending.account == account && pending.group == group && pending.generation == generation
+        }) {
             // A newer load (an explicit open or a fired preview) already claimed
             // the pane; leave `loading_chat` pointing at that pending target so
             // this stale fold cannot cancel it.
@@ -3017,7 +3019,11 @@ impl TuiApp {
     /// Clear the messages pane, canceling any pending page before it can adopt
     /// a removed group, acquire resources, or enqueue a forward-only mark-read.
     pub(crate) fn clear_timeline_pane(&mut self) {
-        self.loading_chat = None;
+        if let Some(pending) = self.loading_chat.take() {
+            // Never borrow the current action: only the canceled page may
+            // release its own provisional feedback. Newer actions stay retained.
+            self.with_feedback(pending.feedback, |app| app.set_status(String::new()));
+        }
         self.timeline.clear();
         self.timeline_scroll = TimelineScroll::default();
         self.timeline_subscription = None;

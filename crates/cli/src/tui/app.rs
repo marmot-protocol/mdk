@@ -42,6 +42,15 @@ pub(crate) struct StatusOwner {
     revision: u64,
 }
 
+/// A pending page carries both model admission and the exact permission that
+/// published its loading phase. Cancellation may settle only that phase.
+pub(crate) struct PendingTimeline {
+    pub(crate) account: String,
+    pub(crate) group: String,
+    pub(crate) generation: u64,
+    pub(crate) feedback: FeedbackPermission,
+}
+
 #[derive(Default)]
 pub(crate) struct StatusOwnership {
     next_action: u64,
@@ -125,7 +134,7 @@ pub(crate) struct TuiApp {
     /// flick-through timeline load. Only that target's result can settle the
     /// pending load; a later open supersedes an earlier one that has not landed
     /// yet. `None` when the pane is settled.
-    pub(crate) loading_chat: Option<(String, String, u64)>,
+    pub(crate) loading_chat: Option<PendingTimeline>,
     /// Monotonic identity for timeline requests, including repeated opens of the same chat.
     pub(crate) timeline_load_generation: u64,
     /// Target of the outstanding user search. Query/account eligibility is
@@ -1196,7 +1205,7 @@ impl TuiApp {
             || self
                 .loading_chat
                 .as_ref()
-                .is_some_and(|(account, group, _)| account == &account_id && group == &group_id)
+                .is_some_and(|pending| pending.account == account_id && pending.group == group_id)
         {
             return;
         }
