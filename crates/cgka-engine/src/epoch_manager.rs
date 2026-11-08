@@ -82,6 +82,14 @@ impl EpochManager {
         self.states.get(group_id)
     }
 
+    pub(crate) fn unrecoverable_group_ids(&self) -> Vec<GroupId> {
+        self.states
+            .iter()
+            .filter(|(_, state)| matches!(state, EpochState::Unrecoverable { .. }))
+            .map(|(group_id, _)| group_id.clone())
+            .collect()
+    }
+
     /// Drop a group's in-memory epoch entry: the retraction path for the
     /// session-open cheap pass's provisional `Stable` seed (mdk#1161).
     ///
