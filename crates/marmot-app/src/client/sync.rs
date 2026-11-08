@@ -3394,17 +3394,18 @@ impl AppClient {
                 }
             })
             .await;
-        let recovery_control = if let Some(slot) = &client.audit_v5_peel_slot {
-            let (recovery, completion) = slot.lock().unwrap().take();
+        let private_control = if let Some(slot) = &client.audit_v5_peel_slot {
+            let (private_control, completion) = slot.lock().unwrap().take();
             if let (Some(probe), Some(completion)) = (&mut client.audit_v5_probe, completion) {
                 probe.unwrapped(completion);
             }
-            recovery
+            private_control
         } else {
             false
         };
         if let (Some(probe), Some(receive), Ok(effects)) =
             (&mut client.audit_v5_probe, probe_receive, &ingest)
+            && !private_control
             && matches!(effects.outcome, IngestOutcome::Processed)
         {
             // The event is journaled in the join transaction. Only this
@@ -3449,7 +3450,7 @@ impl AppClient {
         }
         if let Some(observation) = observation {
             let outcome = match &ingest {
-                _ if recovery_control => None,
+                _ if private_control => None,
                 Ok(effects) => match &effects.outcome {
                     IngestOutcome::Processed => Some("success"),
                     // Authenticated control is neither an invitation metric nor
@@ -4499,6 +4500,17 @@ impl AppClient {
         cancelled: &(dyn Fn() -> bool + Sync),
         spawned: Option<&mut super::recovery_runner::host::SpawnedRunner>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        if !cancelled() {
+            // Explicit Repair authorizes a fresh finite rejoin episode before
+            // handing history acquisition to the account's runner.
+            self.retry_parked_rejoins().map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
+        }
         if self.repairs_through_runner(spawned.as_deref()) {
             return self
                 .repair_full_history_through_runner(cancelled, FULL_HISTORY_REPAIR_TIMEOUT, spawned)

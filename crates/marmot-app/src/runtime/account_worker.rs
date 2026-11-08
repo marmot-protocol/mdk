@@ -4720,12 +4720,6 @@ fn account_worker_command_future<'a>(
                         account_label,
                         &summary,
                     );
-                    publish_client_pending_projection_updates(
-                        client,
-                        events,
-                        account_id_hex,
-                        account_label,
-                    );
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("repair_full_history");
                     }
@@ -4760,9 +4754,14 @@ fn account_worker_command_future<'a>(
                     .err()
                     .map(AccountCatchUpFailure::classification),
             );
-            // Announce a parked or reopened obligation before the caller
-            // re-reads the notices.
-            publish_account_level_changes(client, events, account_id_hex, account_label);
+            // Repair can rearm a group even when history remains incomplete.
+            // Publish those changes before the caller re-reads its status.
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
             let _ = respond.send(result);
             true
         }),
@@ -8002,6 +8001,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(feature = "test-policy-overrides")]
+    mod automatic_group_recovery_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;
     mod publication_progress_tests;

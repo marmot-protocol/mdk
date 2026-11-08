@@ -1476,6 +1476,12 @@ runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`; cov
 parks emit `HistoryNoticeCauseFfi::UnprovenHistory` without attributing the original reason
 history was owed. Other cause labels preserve compatibility; keep exhaustive switches.
 
+Durably and natively `Unrecoverable` copies start authenticated automatic rejoin in the existing account workers.
+Hosts use the existing Repair action to rearm an eligible parked episode; restarting alone does not reset its budget.
+A reachable eligible admin and eventual delivery are required. Usable forks still need explicit replacement
+consent, and pruned epoch secrets are not restored. See the
+[automatic rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy).
+
 While unresolved epoch-gap recovery covers a group's current local epoch, the group may
 have moved past this device. Group changes (invite, remove, admin changes, profile, image,
 retention, disbanding and app components) then fail with `MarmotKitError::GroupCatchingUp`:
