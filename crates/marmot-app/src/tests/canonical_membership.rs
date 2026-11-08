@@ -1945,3 +1945,7 @@ async fn invite_needs_no_pending_welcome_row() {
             .is_empty()
     );
 }
+
+#[cfg(feature = "test-policy-overrides")]
+#[path = "canonical_membership/rival_branch_leave.rs"]
+mod rival_branch_leave;
