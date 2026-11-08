@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- `MarmotDeviceLinkSnapshot` appends `device_group_stalled` (`bool`): this device can no longer catch up with its
+  device group; offer `marmot_reset_device_group_for_repair`. Rebuild against the matching header and library.
+
 - Emoji set changes (breaking; the emoji set ABI has not shipped). `marmot_install_emoji_set` takes
   `expected_event_id_hex` and a `MarmotEmojiSetInstallControl` (`marmot_emoji_set_install_control_new`, `_cancel`,
   `_is_cancelled`, `_progress` writing a `MarmotEmojiSetInstallProgress`, `_free`); `marmot_fetch_emoji_set_asset`

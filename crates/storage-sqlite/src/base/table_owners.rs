@@ -168,6 +168,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("device_group_messages", Side::App),
     ("device_groups", Side::App),
     ("device_heartbeat_sent", Side::App),
+    ("device_inactivity_clock", Side::App),
     ("device_links", Side::App),
     ("device_removals", Side::App),
     ("device_renames", Side::App),

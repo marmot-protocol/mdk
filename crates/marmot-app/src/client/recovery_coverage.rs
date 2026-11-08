@@ -739,6 +739,71 @@ impl AppClient {
         settled
     }
 
+    /// Whether the ledger proves `group_id`'s history up to `now` on every
+    /// relay that certifies it (mdk#2628 item 3.6b-2): the group has a current
+    /// route, and on each of its routes nothing is staged, the route has a
+    /// goal and at least one required relay, and each required relay covers
+    /// that goal through its owed second, as the recovery runner reads it.
+    /// Parked and retired spans stay owed, so a route whose recovery gave up
+    /// is never proved.
+    pub(crate) async fn group_history_proved(
+        &self,
+        group_id: &[u8],
+        now: u64,
+    ) -> Result<bool, AppError> {
+        let routes = self
+            .current_coverage_routes()
+            .into_iter()
+            .filter(|current| current.group_id.as_deref() == Some(group_id))
+            .collect::<Vec<_>>();
+        if routes.is_empty() {
+            return Ok(false);
+        }
+        let app = self.coverage_storage()?.app_storage();
+        let staged = app.staged_recovery_routes()?;
+        let tails = self.recovery_runner_live_tails(&app, now).await;
+        for current in &routes {
+            if current.required.is_empty()
+                || staged.contains(&current.route)
+                || app.recovery_coverage_goal(&current.route)?.is_none()
+            {
+                return Ok(false);
+            }
+            let checked_until = current.goal_until.map_or(now, |until| until.min(now));
+            for relay in &current.required {
+                let until = checked_until.min(tails.owed_until(&current.route, relay, now));
+                if !app
+                    .recovery_coverage_debt(&current.route, std::slice::from_ref(relay), until)?
+                    .is_empty()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The last second of `group_id`'s history that a parked remainder on one
+    /// of its current routes still owes: debt the retention floor overtook,
+    /// which [`Self::group_history_proved`] does not read, since it lasts
+    /// until a user dismisses it.
+    pub(crate) fn group_parked_until(&self, group_id: &[u8]) -> Result<Option<u64>, AppError> {
+        let routes = self
+            .current_coverage_routes()
+            .into_iter()
+            .filter(|current| current.group_id.as_deref() == Some(group_id))
+            .map(|current| current.route)
+            .collect::<Vec<_>>();
+        Ok(self
+            .coverage_storage()?
+            .app_storage()
+            .recovery_coverage_remainders()?
+            .into_iter()
+            .filter(|remainder| routes.contains(&remainder.route))
+            .map(|remainder| remainder.range.until_seconds)
+            .max())
+    }
+
     /// Whether the group's local copy is Unrecoverable, which suspends its
     /// recovery (mdk#2660 section 6). A group whose record cannot be read is
     /// not suspended.

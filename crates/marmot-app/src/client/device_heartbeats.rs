@@ -74,12 +74,12 @@ fn heartbeat_is_recent(sent_at: u64, now: u64) -> bool {
 }
 
 impl AppClient {
-    /// One heartbeat pass; a failure waits for the next one.
-    pub(crate) async fn device_heartbeat_upkeep(&mut self, held: &[GroupId]) {
+    /// One heartbeat pass as of `now`; a failure waits for the next one.
+    pub(crate) async fn device_heartbeat_upkeep(&mut self, held: &[GroupId], now: u64) {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
             return;
         }
-        if let Err(error) = self.try_device_heartbeat_upkeep(held).await {
+        if let Err(error) = self.try_device_heartbeat_upkeep(held, now).await {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "device_heartbeat_upkeep",
@@ -89,11 +89,14 @@ impl AppClient {
         }
     }
 
-    async fn try_device_heartbeat_upkeep(&mut self, held: &[GroupId]) -> Result<(), AppError> {
+    async fn try_device_heartbeat_upkeep(
+        &mut self,
+        held: &[GroupId],
+        now: u64,
+    ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        let now = unix_now_seconds();
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let siblings: Vec<(String, u64)> = exchange
             .roster
@@ -204,6 +207,8 @@ mod tests {
             linked_at: 1,
             first_seen_at,
             last_active_at,
+            clock_from: None,
+            marked_inactive: false,
         }
     }
 

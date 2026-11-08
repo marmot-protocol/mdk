@@ -348,6 +348,7 @@ fn retire_device_sync_preparations(
         DELETE FROM sibling_welcome_resends;
         DELETE FROM device_activity;
         DELETE FROM device_heartbeat_sent;
+        DELETE FROM device_inactivity_clock;
         UPDATE small_state_items SET unsent = 1 WHERE unsent = 0;
         UPDATE invitation_decisions SET unsent = 1 WHERE unsent = 0;",
     )

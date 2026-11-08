@@ -521,7 +521,8 @@ list on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`; see the [shared settings and reco
 worker and returns another owned snapshot. Treat `move_id` as opaque. The status enum appends `MARMOT_LINKED_DEVICE_STATUS_MOVED`.
 See the [shared move guidance](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
 `marmot_reset_device_group_for_repair` is the explicit local reset action; free its returned snapshot with
-`marmot_device_link_snapshot_free`. Follow the [shared reset and admission limits](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing).
+`marmot_device_link_snapshot_free`. Offer it when `MarmotDeviceLinkSnapshot.device_group_stalled` is set (rebuild
+against the matching header/library: the field is appended). Follow the [shared reset and admission limits](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing).
 The additive `MarmotUnrecognizedSignIn.previously_linked_here` is qualified local context; rebuild against the matching
 header/library. See [shared sign-in guidance](../marmot-uniffi/README.md#unrecognized-sign-ins).
 

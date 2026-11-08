@@ -262,6 +262,10 @@ pub struct DeviceLinkSnapshotFfi {
     pub new_device: Option<NewDeviceLinkStateFfi>,
     pub prompts: Vec<DeviceLinkPromptFfi>,
     pub moves: Vec<DeviceGroupMoveViewFfi>,
+    /// This device can no longer catch up with its device group; offer
+    /// `reset_device_group_for_repair` followed by fresh pairing.
+    #[uniffi(default = false)]
+    pub device_group_stalled: bool,
 }
 
 impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
@@ -270,6 +274,7 @@ impl From<DeviceLinkSnapshot> for DeviceLinkSnapshotFfi {
             new_device: value.new_device.map(Into::into),
             prompts: value.prompts.into_iter().map(Into::into).collect(),
             moves: value.moves.into_iter().map(Into::into).collect(),
+            device_group_stalled: value.device_group_stalled,
         }
     }
 }

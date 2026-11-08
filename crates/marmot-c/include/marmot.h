@@ -3480,6 +3480,9 @@ typedef struct MarmotDeviceGroupMoveView {
 /**
  * Linking as this device shows it. `new_device` is NULL unless this
  * device asked to be linked; `prompts` lists the sign-ins it can link.
+ * `device_group_stalled` says this device can no longer catch up with
+ * its device group: offer `marmot_reset_device_group_for_repair`
+ * followed by fresh pairing.
  */
 typedef struct MarmotDeviceLinkSnapshot {
   struct MarmotNewDeviceLinkState *new_device;
@@ -3487,6 +3490,7 @@ typedef struct MarmotDeviceLinkSnapshot {
   uintptr_t prompts_len;
   struct MarmotDeviceGroupMoveView *moves;
   uintptr_t moves_len;
+  bool device_group_stalled;
 } MarmotDeviceLinkSnapshot;
 
 /**

@@ -644,6 +644,26 @@ impl SqliteAppStorage {
         since.map(i64_to_u64).transpose()
     }
 
+    /// Whether automatic recovery gave up on an epoch gap open at
+    /// `local_epoch` or above in this group: its obligation parked once its
+    /// return visits ran out, or the user retired its notice. Nothing fetches
+    /// the missing Commit again without new evidence or an explicit repair.
+    pub fn epoch_gap_recovery_given_up(
+        &self,
+        group_id: &[u8],
+        local_epoch: u64,
+    ) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+                 WHERE cause = 1 AND group_id = ?1 AND stalled_epoch >= ?2
+                     AND ((state = 0 AND eligibility = 4) OR state = 2))",
+                params![group_id, u64_to_i64(local_epoch)?],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Consume only the exact epochs one completed replay served. A newer arm
     /// written concurrently remains pending.
     pub fn clear_epoch_backfill_intents(
