@@ -556,6 +556,7 @@ impl AppClient {
                 shadow_ranges = report.shadow_ranges,
                 shadow_remainders = report.shadow_remainders,
                 units_broken = report.units_broken,
+                epoch_gaps_reopened = report.epoch_gaps_reopened,
                 "recovery conversion complete");
             for (cause, counts) in report.obligations {
                 tracing::debug!(target: "marmot_app::recovery_runner", method = "conversion",

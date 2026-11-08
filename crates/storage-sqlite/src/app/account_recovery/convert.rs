@@ -9,8 +9,11 @@
 //! obligations it converted with their scopes and counts them by cause and
 //! disposition. Obligations of the causes the runner owns are converted:
 //! queue and notification loss, explicit and incremental history, and native
-//! replay. Epoch-gap, known-event and maintenance obligations stay with the old
-//! owner, untouched.
+//! replay. Epoch-gap obligations stay as the runner's own epoch-gap demand:
+//! pending and parked ones untouched, and satisfied ones reopened as pending,
+//! because the old owner certified an epoch gap from its relays' answers
+//! without the engine advancing (mdk#3059). Known-event and maintenance
+//! obligations stay untouched.
 //!
 //! Nothing here records coverage: goals widen, coverage only goes, and parked
 //! and retired spans are never coverage. The conversion is one-way; nothing
@@ -99,6 +102,12 @@ pub struct RecoveryConversionReport {
     pub shadow_remainders: u64,
     /// Units broken for parked obligations.
     pub units_broken: u64,
+    /// Epoch gaps the old owner certified, reopened as pending and ready: its
+    /// certificate never proved the engine left the stalled epoch, and a
+    /// group still stalled there never arms the gap again by itself. The
+    /// runner visits each one; one whose group has moved past its epoch is
+    /// dropped before any visit, as every resolved gap is.
+    pub epoch_gaps_reopened: u64,
 }
 
 /// The steps, in order. Each depends on the ones before it: dismissals leave
@@ -118,7 +127,7 @@ enum Step {
     Parked,
     /// Pending obligations go; a pending explicit repair re-arms every unit.
     Pending,
-    /// Satisfied obligations go.
+    /// Satisfied obligations go, and satisfied epoch gaps reopen as pending.
     Settled,
 }
 
@@ -226,7 +235,7 @@ fn run_step_tx(
         Step::Loss => loss_tx(conn, input),
         Step::Parked => parked_tx(conn, input, current),
         Step::Pending => pending_tx(conn, input),
-        Step::Settled => delete_converted_tx(conn, "state = 1", Disposition::Settled).map(|_| ()),
+        Step::Settled => settled_tx(conn, input),
     }?;
     conn.execute_cached(
         "UPDATE account_recovery_conversion SET step = step + 1,
@@ -673,6 +682,34 @@ fn pending_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> Storage
     delete_converted_tx(conn, filter, Disposition::Pending).map(|_| ())
 }
 
+/// Satisfied obligations of the converted causes go: nothing is owed. A
+/// satisfied epoch gap instead becomes pending and ready again, at its next
+/// revision, as a released receipt reopens one. The old owner satisfied a gap
+/// once its relays answered for the gap's window, never once the engine left
+/// the stalled epoch, and a group still stalled there arms nothing again: its
+/// stall evidence, restored before this step runs, keeps the detector to paced
+/// re-assessment at that epoch. So the runner visits the gap like any epoch
+/// gap it arms, the host drops it first when the group has moved past its
+/// epoch, and a gap whose visits run out parks with its notice. Its scopes,
+/// its epoch and its creation time stay as they are.
+fn settled_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageResult<()> {
+    delete_converted_tx(conn, "state = 1", Disposition::Settled)?;
+    let reopened = conn
+        .execute_cached(
+            "UPDATE account_recovery_obligations
+             SET state = 0, eligibility = ?1, revision = revision + 1,
+                 incomplete_reason = NULL, parked_at_ms = NULL, updated_at_ms = ?2
+             WHERE cause = ?3 AND state = 1",
+            params![
+                RecoveryEligibility::Ready as i64,
+                milliseconds(sqlite_integer(input.now_seconds)?)?,
+                RecoveryCause::EpochGap as i64,
+            ],
+        )
+        .storage()?;
+    add_count_tx(conn, "epoch_gaps_reopened", reopened as u64)
+}
+
 /// The converted loss not reclaimed yet, by account label and cause.
 fn converted_loss_tx(conn: &Connection) -> StorageResult<Vec<RecoveryConvertedLoss>> {
     let rows = conn
@@ -717,9 +754,9 @@ fn converted_loss_tx(conn: &Connection) -> StorageResult<Vec<RecoveryConvertedLo
 }
 
 fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
-    let (shadow_ranges, shadow_remainders, units_broken) = conn
+    let (shadow_ranges, shadow_remainders, units_broken, epoch_gaps_reopened) = conn
         .query_row_cached(
-            "SELECT shadow_ranges, shadow_remainders, units_broken
+            "SELECT shadow_ranges, shadow_remainders, units_broken, epoch_gaps_reopened
              FROM account_recovery_conversion WHERE singleton = 1",
             [],
             |row| {
@@ -727,6 +764,7 @@ fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
@@ -768,6 +806,7 @@ fn report_tx(conn: &Connection) -> StorageResult<RecoveryConversionReport> {
         shadow_ranges: i64_to_u64(shadow_ranges)?,
         shadow_remainders: i64_to_u64(shadow_remainders)?,
         units_broken: i64_to_u64(units_broken)?,
+        epoch_gaps_reopened: i64_to_u64(epoch_gaps_reopened)?,
     })
 }
 

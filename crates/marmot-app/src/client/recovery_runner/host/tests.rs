@@ -2029,3 +2029,164 @@ async fn an_upgraded_accounts_old_loss_converts_before_the_runner_covers_it() {
     assert!(charged(&storage) > before);
     assert!(client.history_notices().unwrap().is_empty());
 }
+
+/// An upgraded account whose old owner certified epoch gaps (mdk#3059): it
+/// satisfied each once its relays answered for the gap's window, never once
+/// the engine left the stalled epoch. One group is still at its gap's epoch,
+/// with the stall evidence the 0.14.0 process persisted when it armed, so the
+/// restored detector only re-assesses at that epoch and arms nothing again.
+/// Conversion reopens the gaps; the runner visits the stalled group's with no
+/// higher epoch, no released receipt and no inventory change behind it. The
+/// host drops a gap whose group has moved past its epoch, and one whose group
+/// the account has left, before any visit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_accounts_certified_epoch_gap_is_visited_only_while_its_group_is_stalled() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    crate::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        relay.url().await.to_string(),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut client = app.client("alice").await.unwrap();
+    let stalled = client.create_group("stalled", &[]).await.unwrap();
+    let recovered = client.create_group("recovered", &[]).await.unwrap();
+    let left = client.create_group("left", &[]).await.unwrap();
+    client
+        .update_group_profile(&recovered, Some("moved on"), None)
+        .await
+        .unwrap();
+    let epoch = |client: &AppClient, group: &cgka_traits::GroupId| {
+        client.group_mls_state(group).unwrap().epoch
+    };
+    let stalled_epoch = epoch(&client, &stalled);
+    let recovered_epoch = epoch(&client, &recovered);
+    assert!(
+        recovered_epoch > 0,
+        "the recovered group moved past its gap"
+    );
+    crate::tests::make_group_terminal(&client, &left, false);
+    let storage = app.account_storage("alice").unwrap().app_storage();
+
+    // What a 0.14.0 build leaves: each gap satisfied, the stalled group's
+    // stall evidence, and a conversion it never ran (the open above
+    // converted before these rows existed, so its marker is rewound).
+    let now = unix_now_seconds();
+    let gaps = [
+        (&stalled, stalled_epoch, [0x51_u8; 16]),
+        (&recovered, recovered_epoch - 1, [0x52; 16]),
+        (&left, epoch(&client, &left), [0x53; 16]),
+    ];
+    let faults = fault_connection(&client);
+    for (group, stalled_at, id) in &gaps {
+        faults
+            .execute(
+                "INSERT INTO account_recovery_obligations (id, demand_key, cause, group_id,
+                     stalled_epoch, created_at_ms, updated_at_ms, state)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, 1)",
+                rusqlite::params![
+                    id.as_slice(),
+                    format!("epoch:{}", hex::encode(group.as_slice())),
+                    group.as_slice(),
+                    i64::try_from(*stalled_at).unwrap(),
+                    i64::try_from(now * 1000).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+    faults
+        .execute(
+            "INSERT INTO app_epoch_stall_evidence (group_id, stalled_epoch,
+                 fruitless_completions, fruitless_reported, last_arm_at_ms, updated_at)
+             VALUES (?1, ?2, 0, 0, ?3, ?4)",
+            rusqlite::params![
+                stalled.as_slice(),
+                i64::try_from(stalled_epoch).unwrap(),
+                i64::try_from(now * 1000).unwrap(),
+                i64::try_from(now).unwrap(),
+            ],
+        )
+        .unwrap();
+    // Every gap the runner begins a visit on.
+    faults
+        .execute_batch(
+            "CREATE TABLE test_gap_visits (obligation_id BLOB NOT NULL);
+             CREATE TRIGGER test_log_gap_visit AFTER INSERT ON account_recovery_epoch_gap_retries
+             BEGIN INSERT INTO test_gap_visits VALUES (NEW.obligation_id); END;",
+        )
+        .unwrap();
+    assert!(
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| demand.cause != RecoveryCause::EpochGap),
+        "the runner never reads a satisfied gap"
+    );
+    app.relay_plane
+        .deactivate_account_context(client.adapter.account_id())
+        .await
+        .unwrap();
+    faults
+        .execute(
+            "UPDATE account_recovery_conversion SET step = 0 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    drop(client);
+
+    let mut client = app.client("alice").await.unwrap();
+    assert!(client.has_in_place_recovery_runner());
+    assert!(!storage.recovery_conversion_pending().unwrap());
+    assert!(
+        client
+            .epoch_stall
+            .has_signalled_at(&stalled, cgka_traits::EpochId(stalled_epoch)),
+        "the restored evidence leaves no arm at the stalled epoch"
+    );
+    let gap = storage
+        .pending_recovery_demands()
+        .unwrap()
+        .into_iter()
+        .find(|demand| demand.group_id.as_deref() == Some(stalled.as_slice()))
+        .expect("conversion reopened the stalled group's gap");
+    assert_eq!(gap.eligibility, storage_sqlite::RecoveryEligibility::Ready);
+    assert_eq!(gap.ticket.revision, 2);
+
+    client
+        .run_recovery_runner_pass()
+        .await
+        .expect("an in-place runner");
+
+    let visited = faults
+        .prepare("SELECT obligation_id FROM test_gap_visits")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visited, vec![vec![0x51_u8; 16]], "only the stalled gap");
+    assert_eq!(
+        storage
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .filter(|demand| demand.cause == RecoveryCause::EpochGap)
+            .map(|demand| demand.group_id)
+            .collect::<Vec<_>>(),
+        vec![Some(stalled.as_slice().to_vec())],
+        "the host dropped the recovered and the left group's gaps"
+    );
+    assert_eq!(
+        storage
+            .recovery_epoch_gap_retry(gap.ticket)
+            .unwrap()
+            .map(|retry| retry.visits),
+        Some(1)
+    );
+    assert_eq!(epoch(&client, &stalled), stalled_epoch);
+}

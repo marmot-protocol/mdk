@@ -337,7 +337,9 @@ runner supplies validated facts and owns execution policy. Design:
 - **Upgrade conversion (`account_recovery/convert.rs`, migration 0136, mdk#2660 phase 4).**
   `convert_recovery_obligations` turns the old owner's queue-loss, notification-loss, explicit, incremental and
   native-replay obligations into ledger debt and runner retry state, once, before the runner first starts.
-  Epoch-gap, known-event and maintenance obligations stay. The caller passes what storage does not have: every
+  Epoch-gap, known-event and maintenance obligations stay, except a satisfied epoch gap: the old owner satisfied one
+  once its relays answered, never once the engine left the stalled epoch, so the last step reopens it as pending and
+  ready at its next revision, with its scopes (mdk#3059). The caller passes what storage does not have: every
   current route (the inbox included, so routing is hydrated) with its required relays and standing floor, the
   ledger's spelling of a relay a stored scope names, the retention floor and the time. Each step is one transaction
   that also advances the marker (`recovery_conversion_pending`), so a crash leaves every row intact or converted and
@@ -348,9 +350,9 @@ runner supplies validated facts and owns execution policy. Design:
   charges it (a generation that named its routes reaches only those, from their bounds; any other reaches every route
   from its floor), parks what lies below the window, and counts as imported; parked rows break their routes' required relays that still owe history,
   under one revision per route (one notice), keeping the earliest park time; a pending explicit repair re-arms every
-  unit; satisfied rows go. Converted rows are deleted with their scopes, with no third state, and nothing becomes
-  coverage. `recovery_conversion_report` keeps the counts by cause and disposition until
-  `acknowledge_recovery_conversion_report`, and `recovery_conversion_notices_changed` asks for one announcement of
+  unit; satisfied rows go and satisfied epoch gaps reopen. Converted rows are deleted with their scopes, with no third
+  state, and nothing becomes coverage. `recovery_conversion_report` keeps the counts by cause and disposition, and the
+  reopened epoch gaps (`epoch_gaps_reopened`, migration 0152), until `acknowledge_recovery_conversion_report`, and `recovery_conversion_notices_changed` asks for one announcement of
   the changed "history may be incomplete" notices. Converted loss evidence stays, imported and with no obligation;
   `converted_recovery_loss` lists it by account and cause until the worker has finished the relay plane's overflow
   recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
