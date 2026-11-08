@@ -83,6 +83,7 @@ pub(crate) mod delivery_spill;
 pub(crate) mod device_group;
 mod device_group_moves;
 pub(crate) mod device_heartbeats;
+pub(crate) mod device_inactivity;
 pub(crate) mod device_pairing;
 mod device_removal;
 mod device_renames;
@@ -1602,6 +1603,7 @@ impl AppClient {
         .await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
+        self.device_inactivity_upkeep(&held).await;
         finish_maintenance_step(app_passes, marmot_observability::Outcome::Success);
         let session =
             self.maintenance_step(crate::RuntimePerformanceOperation::WorkerMaintenanceSession);

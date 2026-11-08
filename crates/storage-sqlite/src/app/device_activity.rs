@@ -1,5 +1,5 @@
-//! Heartbeats in the device group (mdk#2628 item 3.6, D35). See migration
-//! 0143.
+//! Heartbeats in the device group (mdk#2628 item 3.6, D35) and the
+//! inactivity clock (item 3.6b-2, D67, D95). See migrations 0143 and 0201.
 //!
 //! For each sibling the trusted roster lists, this device keeps when it first
 //! found that sibling's entry there and the newest time one of its heartbeats
@@ -9,6 +9,11 @@
 //! starts the row afresh, whether or not this device saw the slot leave. It
 //! also keeps when it last sent its own heartbeat, and in which device
 //! group, across restarts.
+//!
+//! For marking and removing inactive siblings each row also keeps when this
+//! device last restarted that sibling's clock and whether the roster last
+//! marked it `inactive`, and one row keeps this device's last caught-up pass
+//! and its last restart of every clock.
 
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
@@ -28,6 +33,24 @@ pub struct DeviceActivityRecord {
     /// The newest time one of its heartbeats counted for, in Unix seconds;
     /// `None` until one has.
     pub last_active_at: Option<u64>,
+    /// When this device last restarted the sibling's inactivity clock: when
+    /// it read a heartbeat that moved `last_active_at` later, or saw the
+    /// sibling clear its own `inactive` mark. `None` until either happened.
+    pub clock_from: Option<u64>,
+    /// The roster marked the sibling `inactive` the last time this device
+    /// looked.
+    pub marked_inactive: bool,
+}
+
+/// This device's inactivity clock (D67(6)): its last maintenance pass that
+/// found it caught up with its device group, and when it last restarted
+/// every sibling's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceInactivityClock {
+    /// In Unix seconds.
+    pub caught_up_at: u64,
+    /// In Unix seconds.
+    pub restarted_at: u64,
 }
 
 /// The heartbeat this device last sent.
@@ -45,7 +68,8 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT slot_id_hex, linked_at, first_seen_at, last_active_at
+                "SELECT slot_id_hex, linked_at, first_seen_at, last_active_at, clock_from,
+                        marked_inactive
                  FROM device_activity ORDER BY slot_id_hex ASC",
             )
             .storage()?;
@@ -56,20 +80,26 @@ impl SqliteAppStorage {
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, bool>(5)?,
                 ))
             })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         rows.into_iter()
-            .map(|(slot_id_hex, linked_at, first_seen_at, last_active_at)| {
-                Ok(DeviceActivityRecord {
-                    slot_id_hex,
-                    linked_at: i64_to_u64(linked_at)?,
-                    first_seen_at: i64_to_u64(first_seen_at)?,
-                    last_active_at: last_active_at.map(i64_to_u64).transpose()?,
-                })
-            })
+            .map(
+                |(slot_id_hex, linked_at, first_seen_at, last_active_at, clock_from, marked)| {
+                    Ok(DeviceActivityRecord {
+                        slot_id_hex,
+                        linked_at: i64_to_u64(linked_at)?,
+                        first_seen_at: i64_to_u64(first_seen_at)?,
+                        last_active_at: last_active_at.map(i64_to_u64).transpose()?,
+                        clock_from: clock_from.map(i64_to_u64).transpose()?,
+                        marked_inactive: marked,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -114,7 +144,9 @@ impl SqliteAppStorage {
                      ON CONFLICT(slot_id_hex) DO UPDATE SET
                         linked_at = excluded.linked_at,
                         first_seen_at = excluded.first_seen_at,
-                        last_active_at = NULL
+                        last_active_at = NULL,
+                        clock_from = NULL,
+                        marked_inactive = 0
                      WHERE linked_at != excluded.linked_at",
                     params![slot, u64_to_i64(*linked_at)?, now],
                 )
@@ -126,7 +158,9 @@ impl SqliteAppStorage {
     }
 
     /// Count a heartbeat dated `active_at` of the sibling whose entry is
-    /// `slot_id_hex` linked at `linked_at`. Last activity only moves forward.
+    /// `slot_id_hex` linked at `linked_at`, read `now`. Last activity only
+    /// moves forward; when it does, the sibling's inactivity clock restarts
+    /// `now`, when the heartbeat was read rather than when it was sent (D95).
     /// An entry not tracked yet, a slot's first or one linked again, is first
     /// seen `now`.
     pub fn note_device_active(
@@ -139,8 +173,9 @@ impl SqliteAppStorage {
         // Every right-hand side reads the row as it was before this update.
         self.lock()?
             .execute_cached(
-                "INSERT INTO device_activity (slot_id_hex, linked_at, first_seen_at, last_active_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO device_activity
+                    (slot_id_hex, linked_at, first_seen_at, last_active_at, clock_from)
+                 VALUES (?1, ?2, ?3, ?4, ?3)
                  ON CONFLICT(slot_id_hex) DO UPDATE SET
                     linked_at = excluded.linked_at,
                     first_seen_at = CASE WHEN linked_at = excluded.linked_at
@@ -148,12 +183,90 @@ impl SqliteAppStorage {
                     last_active_at = CASE WHEN linked_at = excluded.linked_at
                         THEN MAX(COALESCE(last_active_at, excluded.last_active_at),
                                  excluded.last_active_at)
-                        ELSE excluded.last_active_at END",
+                        ELSE excluded.last_active_at END,
+                    clock_from = CASE
+                        WHEN linked_at != excluded.linked_at THEN excluded.clock_from
+                        WHEN last_active_at IS NULL
+                            OR excluded.last_active_at > last_active_at
+                            THEN excluded.clock_from
+                        ELSE clock_from END,
+                    marked_inactive = CASE WHEN linked_at = excluded.linked_at
+                        THEN marked_inactive ELSE 0 END",
                 params![
                     slot_id_hex,
                     u64_to_i64(linked_at)?,
                     u64_to_i64(now)?,
                     u64_to_i64(active_at)?
+                ],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    /// Note whether the roster marks the sibling whose entry is `slot_id_hex`
+    /// linked at `linked_at` as `inactive`. A mark this device saw cleared
+    /// restarts the sibling's clock `now`: only the sibling itself clears
+    /// it, so it is running. Returns whether a clear was seen. An entry this
+    /// device does not track is left alone.
+    pub fn note_device_marked_inactive(
+        &self,
+        slot_id_hex: &str,
+        linked_at: u64,
+        marked: bool,
+        now: u64,
+    ) -> StorageResult<bool> {
+        let conn = self.lock()?;
+        if marked {
+            conn.execute_cached(
+                "UPDATE device_activity SET marked_inactive = 1
+                 WHERE slot_id_hex = ?1 AND linked_at = ?2",
+                params![slot_id_hex, u64_to_i64(linked_at)?],
+            )
+            .storage()?;
+            return Ok(false);
+        }
+        let cleared = conn
+            .execute_cached(
+                "UPDATE device_activity SET marked_inactive = 0, clock_from = ?3
+                 WHERE slot_id_hex = ?1 AND linked_at = ?2 AND marked_inactive = 1",
+                params![slot_id_hex, u64_to_i64(linked_at)?, u64_to_i64(now)?],
+            )
+            .storage()?;
+        Ok(cleared != 0)
+    }
+
+    /// This device's inactivity clock, once a caught-up pass has started it.
+    pub fn device_inactivity_clock(&self) -> StorageResult<Option<DeviceInactivityClock>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT caught_up_at, restarted_at FROM device_inactivity_clock
+                 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .storage()?
+            .map(|(caught_up_at, restarted_at)| {
+                Ok(DeviceInactivityClock {
+                    caught_up_at: i64_to_u64(caught_up_at)?,
+                    restarted_at: i64_to_u64(restarted_at)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Keep `clock` as this device's inactivity clock.
+    pub fn put_device_inactivity_clock(&self, clock: &DeviceInactivityClock) -> StorageResult<()> {
+        self.lock()?
+            .execute_cached(
+                "INSERT INTO device_inactivity_clock (singleton, caught_up_at, restarted_at)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                    caught_up_at = excluded.caught_up_at,
+                    restarted_at = excluded.restarted_at",
+                params![
+                    u64_to_i64(clock.caught_up_at)?,
+                    u64_to_i64(clock.restarted_at)?
                 ],
             )
             .storage()?;
@@ -211,11 +324,22 @@ mod tests {
         first_seen_at: u64,
         last_active_at: Option<u64>,
     ) -> DeviceActivityRecord {
+        clocked(slot, first_seen_at, last_active_at, None)
+    }
+
+    fn clocked(
+        slot: &str,
+        first_seen_at: u64,
+        last_active_at: Option<u64>,
+        clock_from: Option<u64>,
+    ) -> DeviceActivityRecord {
         DeviceActivityRecord {
             slot_id_hex: slot.into(),
             linked_at: 1,
             first_seen_at,
             last_active_at,
+            clock_from,
+            marked_inactive: false,
         }
     }
 
@@ -243,9 +367,9 @@ mod tests {
         assert_eq!(
             store.device_activity().unwrap(),
             vec![
-                activity("aa", 100, Some(150)),
+                clocked("aa", 100, Some(150), Some(300)),
                 activity("bb", 100, None),
-                activity("cc", 300, Some(250)),
+                clocked("cc", 300, Some(250), Some(300)),
             ]
         );
 
@@ -264,9 +388,9 @@ mod tests {
         assert_eq!(
             store.device_activity().unwrap(),
             vec![
-                activity("aa", 100, Some(150)),
+                clocked("aa", 100, Some(150), Some(300)),
                 activity("bb", 500, None),
-                activity("cc", 300, Some(250)),
+                clocked("cc", 300, Some(250), Some(300)),
             ]
         );
     }
@@ -298,15 +422,102 @@ mod tests {
                     linked_at: 7,
                     first_seen_at: 300,
                     last_active_at: None,
+                    clock_from: None,
+                    marked_inactive: false,
                 },
                 DeviceActivityRecord {
                     slot_id_hex: "bb".into(),
                     linked_at: 9,
                     first_seen_at: 400,
                     last_active_at: Some(350),
+                    clock_from: Some(400),
+                    marked_inactive: false,
                 },
             ]
         );
+    }
+
+    /// A heartbeat restarts the sibling's inactivity clock when it is read,
+    /// and only when it moves last activity later (D95). A late one dated
+    /// before the last activity restarts nothing.
+    #[test]
+    fn a_heartbeat_restarts_the_inactivity_clock_when_it_is_read() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .track_device_activity(&siblings(&["aa"]), 100)
+            .unwrap();
+        store.note_device_active("aa", 1, 150, 900).unwrap();
+        store.note_device_active("aa", 1, 140, 1_000).unwrap();
+        assert_eq!(
+            store.device_activity().unwrap(),
+            vec![clocked("aa", 100, Some(150), Some(900))]
+        );
+        store.note_device_active("aa", 1, 160, 1_100).unwrap();
+        assert_eq!(
+            store.device_activity().unwrap(),
+            vec![clocked("aa", 100, Some(160), Some(1_100))]
+        );
+    }
+
+    /// Seeing a sibling's `inactive` mark cleared restarts its clock once;
+    /// a mark on a later entry of the slot starts afresh.
+    #[test]
+    fn a_cleared_mark_restarts_the_inactivity_clock_once() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .track_device_activity(&siblings(&["aa"]), 100)
+            .unwrap();
+        assert!(
+            !store
+                .note_device_marked_inactive("aa", 1, false, 200)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .note_device_marked_inactive("aa", 1, true, 300)
+                .unwrap()
+        );
+        assert!(store.device_activity().unwrap()[0].marked_inactive);
+        assert!(
+            store
+                .note_device_marked_inactive("aa", 1, false, 400)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .note_device_marked_inactive("aa", 1, false, 500)
+                .unwrap()
+        );
+        assert_eq!(
+            store.device_activity().unwrap(),
+            vec![clocked("aa", 100, None, Some(400))]
+        );
+
+        store
+            .note_device_marked_inactive("aa", 1, true, 600)
+            .unwrap();
+        store
+            .track_device_activity(&[("aa".into(), 2)], 700)
+            .unwrap();
+        assert_eq!(
+            store.device_activity().unwrap(),
+            vec![DeviceActivityRecord {
+                linked_at: 2,
+                ..activity("aa", 700, None)
+            }]
+        );
+    }
+
+    #[test]
+    fn a_device_keeps_its_inactivity_clock() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        assert_eq!(store.device_inactivity_clock().unwrap(), None);
+        let clock = DeviceInactivityClock {
+            caught_up_at: 200,
+            restarted_at: 100,
+        };
+        store.put_device_inactivity_clock(&clock).unwrap();
+        assert_eq!(store.device_inactivity_clock().unwrap(), Some(clock));
     }
 
     #[test]

@@ -395,6 +395,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   sibling in the tree this device holds when it reads it (one from an earlier epoch counts for no device), never read
   its content, and date it `min(created_at, now)`. Judge `inactive` locally for the Devices screen; never write the
   roster's `inactive` status from it.
+- Marking and removing inactive siblings (mdk#2628 item 3.6b-2) live in `src/client/device_inactivity.rs`, on their own
+  clock. Act only on a pass that finds this device caught up: `group_quiet`, recoverable, no epoch gap open at the
+  current epoch, and `group_history_proved` (ledger debt per required relay up to its live tail, parked spans included;
+  never `recovery_unit_debt` or the runner's in-memory catching-up flag). Mark and clear with status-only
+  `edit_device_roster_entry` edits (`rename_id` unchanged). Remove with `commit_device_removal` and never write a
+  `device_removals` row: that row is permanent and re-committed after a lost fork, while D94 re-decides. At most one
+  Commit per pass. The stall flag on `DeviceLinkSnapshot` changes hosts hear about only through the pairing drive's view
+  comparison.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
   `MarmotAppConfig::dev_device_groups` is set with explicit `dev-device-groups` capability or policy tests). The Welcome peeler opens each gift wrap to the account once and hands

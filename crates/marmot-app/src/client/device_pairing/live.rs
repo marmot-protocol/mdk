@@ -2171,6 +2171,7 @@ impl AppClient {
             new_device,
             prompts,
             moves: self.device_group_move_views()?,
+            device_group_stalled: self.device_group_stalled()?,
         })
     }
 }

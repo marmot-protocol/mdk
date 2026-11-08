@@ -399,7 +399,7 @@ impl AppClient {
     /// its leaf, read from device tags, and its entry, recording the slot as
     /// `removed` at `requested_at`. Sent only while the group can take a
     /// commit from this device; otherwise a later pass retries.
-    async fn commit_device_removal(
+    pub(super) async fn commit_device_removal(
         &mut self,
         group_id: &GroupId,
         roster: &DeviceRosterV1,

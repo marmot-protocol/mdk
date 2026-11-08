@@ -204,6 +204,8 @@ mod tests {
             linked_at: 1,
             first_seen_at,
             last_active_at,
+            clock_from: None,
+            marked_inactive: false,
         }
     }
 

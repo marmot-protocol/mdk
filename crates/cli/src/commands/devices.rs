@@ -184,7 +184,7 @@ fn snapshot_json(snapshot: DeviceLinkSnapshot) -> Value {
         })).collect::<Vec<_>>();
         json!({"move_id":movement.move_id,"state":state,"old_siblings":old_siblings,"overridden_rejection_slots":movement.overridden_rejection_slots})
     }).collect::<Vec<_>>();
-    json!({"new_device":new_device,"prompts":prompts,"moves":moves})
+    json!({"new_device":new_device,"prompts":prompts,"moves":moves,"device_group_stalled":snapshot.device_group_stalled})
 }
 
 fn snapshot_plain(snapshot: &Value) -> String {
@@ -224,6 +224,12 @@ fn snapshot_plain(snapshot: &Value) -> String {
         {
             lines.push("a confirmed destination link overrode an earlier rejection".to_owned());
         }
+    }
+    if snapshot["device_group_stalled"].as_bool() == Some(true) {
+        lines.push(
+            "this device can no longer catch up with its device group: reset it and link again"
+                .to_owned(),
+        );
     }
     if lines.is_empty() {
         "no device link in progress".to_owned()
@@ -310,6 +316,7 @@ mod tests {
                 },
             ],
             moves: Vec::new(),
+            device_group_stalled: false,
         });
         assert!(
             json["prompts"][0]["device_label"] == device_label,

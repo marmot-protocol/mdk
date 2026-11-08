@@ -245,11 +245,15 @@ c_mirror! {
 c_mirror! {
     /// Linking as this device shows it. `new_device` is NULL unless this
     /// device asked to be linked; `prompts` lists the sign-ins it can link.
+    /// `device_group_stalled` says this device can no longer catch up with
+    /// its device group: offer `marmot_reset_device_group_for_repair`
+    /// followed by fresh pairing.
     MarmotDeviceLinkSnapshot from DeviceLinkSnapshotFfi,
     free marmot_device_link_snapshot_free {
         opt_rec new_device: MarmotNewDeviceLinkState,
         vec prompts/prompts_len: MarmotDeviceLinkPrompt,
         vec moves/moves_len: MarmotDeviceGroupMoveView,
+        copy device_group_stalled: bool,
     }
 }
 
@@ -296,6 +300,7 @@ mod tests {
                 new_device: Some(new_device),
                 prompts: Vec::new(),
                 moves: Vec::new(),
+                device_group_stalled: false,
             }));
             unsafe {
                 assert!(!(*snapshot).new_device.is_null());
@@ -362,11 +367,13 @@ mod tests {
                 }],
                 overridden_rejection_slots: vec!["cd".repeat(32)],
             }],
+            device_group_stalled: true,
         }));
         unsafe {
             assert!((*snapshot).new_device.is_null());
             assert_eq!((*snapshot).prompts_len, 10);
             assert_eq!((*snapshot).moves_len, 1);
+            assert!((*snapshot).device_group_stalled);
             for (expected, prompt) in
                 std::slice::from_raw_parts((*snapshot).prompts, (*snapshot).prompts_len)
                     .iter()

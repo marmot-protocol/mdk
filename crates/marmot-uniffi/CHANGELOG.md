@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `DeviceLinkSnapshotFfi` gains `device_group_stalled` (default `false`): this device can no longer catch up with its
+  device group; offer `reset_device_group_for_repair`. Devices now mark and remove inactive siblings themselves
+  (mdk#2628 item 3.6b-2). Experimental device-group builds only. Regenerate bindings.
+
 - Emoji set changes (breaking; no host has shipped against the emoji set API).
   `install_emoji_set(account_ref, coordinate, expected_event_id_hex, control)` binds the install to the version the
   user was shown and takes a new `EmojiSetInstallControlFfi` (`cancel()`, `is_cancelled()`, `progress()` returning

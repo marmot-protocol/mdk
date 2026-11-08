@@ -1135,6 +1135,14 @@ the device group this device trusts, for a Devices screen:
 - `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
   or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
   `Inactive` is the roster's own mark.
+- The account's devices mark and remove inactive devices themselves. A device counts time only while it is caught up
+  with its device group, and restarts every count after more than 24 hours without being caught up. About 30 days
+  after a sibling was last heard from, a caught-up device marks it `Inactive`: show "Remove" and "Keep" for a device
+  whose `status` is `Inactive` and whose `keep_while_inactive` is off. About 90 days after, a device still marked
+  `Inactive` without **Keep while inactive** is removed as by `remove_linked_device`, except that its KeyPackage slot
+  is left on the relays. A marked device that is running clears its own mark. A device catches up only about 30 days
+  back: one that comes back later can't, and is removed at 90 days like one that never came back
+  (`device_group_stalled` below).
 - The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
   without explicit experimental device-group intent.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
@@ -1169,7 +1177,7 @@ three or more devices, it can race another sibling's gap filling and cause extra
 consumption, or Commits and convergence passes; selected-parent presence checks and ordinary branch selection still
 apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
-is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
+stops automatic removal of an `Inactive` device; it does not stop the mark, explicit removal or sign-out.
 
 Automatic chat Adds can wait for compatible private KeyPackages. Packages can satisfy stock time checks while
 lacking a required chat capability; when they cover ordinary stock need, that mismatch alone sends no new request.
@@ -1192,6 +1200,11 @@ choice. To apply it again, edit the device once it is listed in the selected ros
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
 
 ### Explicit local device-group reset before fresh pairing
+
+`DeviceLinkSnapshotFfi.device_group_stalled` says this device can no longer catch up with its device group: automatic
+recovery gave up on a change it missed, or its copy is unrecoverable. It cannot see or clear an `Inactive` mark, and
+its siblings remove it about 90 days after they last heard from it. Offer the reset below, then fresh pairing. Re-read
+on `DeviceLinkChanged`, which fires when it changes.
 
 In an experimental device-group build, offer `reset_device_group_for_repair(account_ref)` only after the user chooses
 to discard this device's local hidden device-group copy. It keeps account credentials, the stable device slot and

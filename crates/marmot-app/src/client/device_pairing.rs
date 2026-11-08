@@ -199,6 +199,12 @@ pub struct DeviceLinkSnapshot {
     pub new_device: Option<NewDeviceLinkState>,
     pub prompts: Vec<DeviceLinkPrompt>,
     pub moves: Vec<DeviceGroupMoveView>,
+    /// This device can no longer catch up with its device group: automatic
+    /// recovery gave up on a Commit it missed, or its copy is unrecoverable.
+    /// It cannot see or clear an `inactive` mark, and its siblings remove it
+    /// 90 days after they last heard from it. Offer
+    /// [`DeviceLinkOp::ResetForRepair`] followed by fresh pairing.
+    pub device_group_stalled: bool,
 }
 
 impl DeviceLinkSnapshot {

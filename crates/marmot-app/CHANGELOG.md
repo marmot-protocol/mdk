@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The account's devices mark and remove inactive devices (mdk#2628 item 3.6b-2), behind the device-group gates. A
+  device caught up with its device group marks a sibling `Inactive` about 30 days after it last heard from it, and
+  removes one still marked without **Keep while inactive** at about 90 days, leaving its KeyPackage slot. Time counts
+  only while the device is caught up, restarting after more than 24 hours without. A marked device that runs clears its
+  own mark. `DeviceLinkSnapshot` gains `device_group_stalled`: this device can no longer catch up with its device
+  group and should be offered `reset_device_group_for_repair`. Additive.
+
 - Emoji set image downloads are bound to the version the user was shown (breaking; the emoji set API has not
   shipped). `install_emoji_set` takes `expected_event_id_hex` and an `&EmojiSetInstallControl`;
   `fetch_emoji_set_asset` takes `expected_event_id_hex`. Another stored version fails with the new

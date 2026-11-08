@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Migration 0201 adds the inactivity clock for marking and removing inactive siblings (mdk#2628 item 3.6b-2):
+  `device_activity` gains `clock_from` and `marked_inactive`, and the new single-row `device_inactivity_clock` keeps
+  this device's last caught-up pass and last restart. `note_device_active` restarts a sibling's clock when it reads a
+  heartbeat that moves its activity later; new `note_device_marked_inactive`, `device_inactivity_clock`,
+  `put_device_inactivity_clock` and `epoch_gap_recovery_given_up`. The device-group reset wipe clears the clock.
+
 - Upgrade conversion reopens the epoch gaps the old owner certified (mdk#3059). It satisfied a gap once its relays
   answered for the gap's window, never once the engine left the stalled epoch, and the runner reads only pending gaps,
   so a group still stalled at a certified gap's epoch was never revisited and never showed a notice. The last step now

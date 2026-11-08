@@ -377,6 +377,8 @@ mod migration_0179_chat_list_kind;
 mod migration_0180_removal_validation;
 #[path = "migrations/0200_chat_list_search_text.rs"]
 mod migration_0200_chat_list_search_text;
+#[path = "migrations/0201_device_inactivity_clock.rs"]
+mod migration_0201_device_inactivity_clock;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1425,6 +1427,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0200_chat_list_search_text",
         suspend_foreign_keys: &[],
         apply: migration_0200_chat_list_search_text::apply,
+    },
+    Migration {
+        version: 201,
+        name: "0201_device_inactivity_clock",
+        suspend_foreign_keys: &[],
+        apply: migration_0201_device_inactivity_clock::apply,
     },
 ];
 

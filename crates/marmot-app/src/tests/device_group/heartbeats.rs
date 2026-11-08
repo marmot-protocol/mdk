@@ -7,16 +7,16 @@ use super::*;
 use crate::client::device_heartbeats::{HEARTBEAT_INTERVAL_SECS, INACTIVE_AFTER_SECS};
 use storage_sqlite::DeviceHeartbeatSent;
 
-fn devices_storage(client: &AppClient) -> storage_sqlite::SqliteAppStorage {
+pub(super) fn devices_storage(client: &AppClient) -> storage_sqlite::SqliteAppStorage {
     client.app.account_storage("alice").unwrap().app_storage()
 }
 
-fn heartbeat_sent(client: &AppClient) -> Option<DeviceHeartbeatSent> {
+pub(super) fn heartbeat_sent(client: &AppClient) -> Option<DeviceHeartbeatSent> {
     devices_storage(client).device_heartbeat_sent().unwrap()
 }
 
 /// Make `client`'s last heartbeat an hour and a minute old.
-fn age_heartbeat(client: &AppClient) {
+pub(super) fn age_heartbeat(client: &AppClient) {
     let mut sent = heartbeat_sent(client).expect("a heartbeat was sent");
     sent.sent_at -= HEARTBEAT_INTERVAL_SECS + 60;
     devices_storage(client)
@@ -25,7 +25,7 @@ fn age_heartbeat(client: &AppClient) {
 }
 
 /// The device in `slot` as `reader` lists it.
-fn listed_slot(reader: &mut AppClient, slot: &str) -> LinkedDevice {
+pub(super) fn listed_slot(reader: &mut AppClient, slot: &str) -> LinkedDevice {
     reader
         .linked_devices()
         .unwrap()
@@ -35,12 +35,12 @@ fn listed_slot(reader: &mut AppClient, slot: &str) -> LinkedDevice {
 }
 
 /// `device` as `reader` lists it.
-fn listed(reader: &mut AppClient, device: &AppClient) -> LinkedDevice {
+pub(super) fn listed(reader: &mut AppClient, device: &AppClient) -> LinkedDevice {
     listed_slot(reader, &own_slot(device))
 }
 
 /// `device`'s entry as `reader`'s roster holds it: its slot and `linked_at`.
-fn entry_of(reader: &mut AppClient, device: &AppClient) -> (String, u64) {
+pub(super) fn entry_of(reader: &mut AppClient, device: &AppClient) -> (String, u64) {
     (own_slot(device), listed(reader, device).linked_at)
 }
 
