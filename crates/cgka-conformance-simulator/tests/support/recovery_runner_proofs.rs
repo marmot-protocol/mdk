@@ -2702,17 +2702,27 @@ const EPOCH_ROUNDS: usize = 6;
 /// Messages per sender per round, far inside the ratchet's 100-generation
 /// out-of-order window, so a same-second burst cannot lose any (#3036).
 const ROUND_MESSAGES_PER_SENDER: usize = 30;
+/// How long an attempt on a relay that never answers holds the runner before
+/// it ends unreachable: marmot-app's crate-private `RUNNER_REQUEST_TIMEOUT`.
+const RUNNER_REQUEST_TIMEOUT_MS: f64 = 5_000.0;
+/// The longest bob may wait from his restart to his first open. The stalled
+/// endpoint still owes the group's history, so nothing is admitted until its
+/// unreachable verdict takes it off the admission frontier: one request
+/// timeout, plus 2 s for the restart and the healthy endpoint's proof.
+const FIRST_OPEN_MS: f64 = RUNNER_REQUEST_TIMEOUT_MS + 2_000.0;
 /// The longest bob may go without opening an owed message once he opened the
-/// first: half the runner's 10-second quantum deadline, so one stalled
-/// quantum, or a held group's backoff, between two opens fails it.
-const USEFUL_ADVANCE_GAP_MS: f64 = 5_000.0;
+/// first: one request timeout, so a single stalled attempt between two opens
+/// fails it.
+const USEFUL_ADVANCE_GAP_MS: f64 = RUNNER_REQUEST_TIMEOUT_MS;
 const MULTI_EPOCH_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// Useful local progress (#1945): bob owes a backlog spread over six epochs
-/// while endpoint 1 never answers history, so each of its attempts runs to
-/// the quantum deadline. Once he opens the first owed message he must keep
-/// opening them, at most [`USEFUL_ADVANCE_GAP_MS`] apart. A useful advance is
-/// an owed message newly shown in his timeline, never an admission turn or a
+/// while endpoint 1 never answers history, so each of its attempts holds the
+/// runner for the request timeout and ends unreachable. A stalled relay may
+/// delay the first open by one request timeout ([`FIRST_OPEN_MS`]) and must
+/// never stall the opens once they have begun: bob keeps opening owed
+/// messages at most [`USEFUL_ADVANCE_GAP_MS`] apart. A useful advance is an
+/// owed message newly shown in his timeline, never an admission turn or a
 /// quantum, so a runner that spins on work opening nothing cannot pass.
 pub(super) async fn multi_epoch_progress() {
     let report = run_proof("runner-multi-epoch-progress", async |subject, out| {
@@ -2817,7 +2827,9 @@ pub(super) async fn multi_epoch_progress() {
         subject.stall_relay_history(1, false).await?;
         let exact = holds_exactly(&bob, &group, &expected).await?;
         let bob_epoch = bob.epoch(&group).await?;
-        save(out, "runner-trace.json", &runner_trace::since(trace_restart))?;
+        // Admission turns included, to place the first open against the
+        // stalled endpoint's verdict.
+        save(out, "runner-trace.json", &runner_trace::between(trace_restart, u64::MAX))?;
         save(out, "history.json", &labeled(&history, &BTreeMap::new()))?;
         save(out, "opened.json", &opened)?;
         let native = native_pages(&history);
@@ -2835,6 +2847,7 @@ pub(super) async fn multi_epoch_progress() {
             "timeline_exact": exact,
             "timeline": timeline_view(&bob, &group, &expected).await?,
             "first_open_seconds": first_open,
+            "first_open_limit_ms": FIRST_OPEN_MS,
             "last_open_seconds": last_open,
             "useful_advances": advances.len(),
             "useful_advance_gap_ms": gap_view,
@@ -2863,8 +2876,11 @@ pub(super) async fn multi_epoch_progress() {
         if native.iter().any(|pages| *pages > 0) {
             return failure("native backward paging supplied history");
         }
+        if first_open.is_none_or(|seconds| seconds * 1e3 >= FIRST_OPEN_MS) {
+            return failure("bob's first owed message waited longer than one request timeout plus 2 s");
+        }
         if gap_view["max"].as_f64().is_some_and(|ms| ms >= USEFUL_ADVANCE_GAP_MS) {
-            return failure("bob went 5 s or more without opening an owed message");
+            return failure("bob went one request timeout or more without opening an owed message");
         }
         Ok(json!({"proof": proof}))
     })

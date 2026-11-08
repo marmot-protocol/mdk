@@ -208,15 +208,20 @@ also records packed live group REQs through EOSE, including raw counts, so the f
 - `public_app_runner_opens_multi_epoch_history_while_a_relay_stalls` checks useful local progress (#1945).
   - While bob is stopped, three senders publish six rounds of 90 messages, and alice renames the group between
     rounds. That is 540 owed messages over six epochs, with at most 30 per sender per round (#3036).
-  - Endpoint 1 never answers history from bob's restart on, so each of its attempts runs to the runner's 10-second
-    quantum deadline.
+  - Endpoint 1 never answers history from bob's restart on, so each of its attempts holds the runner for the
+    5-second request timeout and ends unreachable.
   - Bob's timeline is read every 100 ms. A useful advance is an owed message newly shown; admission turns and
     quanta count for nothing, so a runner that spins on work opening nothing cannot pass.
   - It asserts that all 540 show exactly once, that bob reaches alice's epoch, and that endpoint 1 was asked and
-    withheld history. Once the first message shows, consecutive useful advances must stay under 5 seconds apart:
-    half the quantum deadline, so one stalled quantum or held-group backoff between two opens fails it.
+    withheld history.
+  - A stalled relay may delay the start by one request timeout and never stalls the opens once begun. Endpoint 1
+    still owes the history at the restart, so nothing is admitted until its unreachable verdict takes it off the
+    admission frontier. The first open must come within one request timeout plus 2 seconds of the restart. After
+    that, consecutive useful advances must stay under one request timeout apart, so a single stalled attempt
+    between two opens fails it.
   - The report gives the time to the first open, the largest gaps, bob's epochs as they changed, and the runner's
-    attempts, admission pacing and status-command latency while opening.
+    attempts, admission pacing and status-command latency while opening. Its runner trace includes admission
+    turns.
 - `public_app_runner_orders_six_thousand_backlog_messages_before_live_input` retains the captured three-sender
   6,000-event admission-order failure. Live subscription traffic competes with older recovery. It requires every
   owed/live message exactly once, zero native paging and the exact timeline after closing/reopening Bob. The

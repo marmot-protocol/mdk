@@ -38,8 +38,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
     that never answers history, and 5,000 owed events through a restart, an idle window and a
     reconnect, with fairness asserted while the backlog is admitted. They also cover a six-epoch backlog opened
-    while a relay stalls, with the spacing between opened messages bounded, and counted/empty per-REQ fences across
-    two restarts. Upgrade conversion before the first quantum
+    while a relay stalls, with the wait for the first open and the spacing between opened messages bounded, and
+    counted/empty per-REQ fences across two restarts. Upgrade conversion before the first quantum
     is owned by marmot-app's host tests.
     The named 6,000-event ordered-backlog regression retains the captured three-sender failure, competing live
     input, exact visible history and full account reopen. Failed proofs preserve their stopped fixture privately.
