@@ -836,6 +836,22 @@ where
         Ok(self.session.own_account_leaf_claims(group_id, roster)?)
     }
 
+    /// This account's leaves in `group_id` of its device in `slot`, each
+    /// with the lifetime of the KeyPackage its Add built it from while it is
+    /// still that leaf (mdk#3042). See
+    /// [`cgka_engine::engine::Engine::own_device_leaves`].
+    pub fn own_device_leaves(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &cgka_traits::app_components::DeviceSlotId,
+        tag_signature_key: Option<&[u8]>,
+    ) -> AccountResult<Vec<cgka_traits::app_components::OwnDeviceLeaf>> {
+        Ok(self
+            .session
+            .own_device_leaves(group_id, roster, slot, tag_signature_key)?)
+    }
+
     /// This account's other leaves in `group_id`, by signature key, whose
     /// device tag reads under `leaf_tag_key` as one of `keys`: tag signature
     /// keys this device remembers a roster listing. See

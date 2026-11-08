@@ -1197,6 +1197,13 @@ On the editing device, new automatic Adds and history transfers wait for a diffe
 settle. Existing history debt keeps its original expiry; once ready, a history setting that is off discards that debt.
 This does not recall deliveries already handed off or change what another device sends before it learns the edit.
 
+A linked device added to a chat with a private KeyPackage that expired before it opened the Welcome can never join
+that copy. Once that device has been heard from for an hour after the expiry, a sibling removes its unused leaf
+and gap filling adds it again, so the chat shows a removal and an Add of the same account's device. **Bring chat
+history** applies to that Add as to any other. A device that joined but never updated its leaf in the chat is
+treated the same way. A device not heard from since the expiry keeps its leaf, and a restart of the sibling that
+would remove it starts that hour again.
+
 A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit

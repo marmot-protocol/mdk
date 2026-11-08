@@ -3,22 +3,36 @@
 //! Claims suppress competing attempts for ten minutes; they never authorize
 //! membership. They are intentionally local transient state. The selected
 //! tree is checked again by the engine when an Add actually stages.
+//!
+//! A chat holding a sibling only by Add leaves it never used, whose
+//! KeyPackages expired, holds a copy the sibling can never open (mdk#3042).
+//! Once the sibling has been active for an hour after that expiry, the
+//! claimant retires those leaves with a same-account Remove, and the chat is
+//! then missing the sibling like any other. The wait is memory-only.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
+use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1};
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{EpochId, GroupId};
 use serde::{Deserialize, Serialize};
 
 use super::AppClient;
 use super::device_group::Exchange;
+use super::device_removal::OwnLeafRemoval;
 use super::private_key_packages::PrivateKeyPackageSelection;
 use crate::{AppError, unix_now_seconds};
 
 const TARGET: &str = "marmot_app::client::sibling_chat_gaps";
 pub(crate) const KIND_GAP_FILL_CLAIM: u64 = 458;
 const CLAIM_LIFETIME_SECS: u64 = 600;
+/// How long a sibling must be seen active after its unused Add leaf's
+/// KeyPackage expired before that leaf is retired (mdk#3042): this device
+/// sees one of its heartbeats dated after the expiry, then another dated at
+/// least this much later. A device that opens a Welcome rotates its leaf
+/// through its post-join maintenance within minutes of being active, so a
+/// leaf still unused after this long is one it cannot open.
+const UNUSED_ADD_ACTIVITY_SECS: u64 = 60 * 60;
 const MAX_CLAIM_CONTENT_BYTES: usize = 32_768;
 
 type Gap = (GroupId, DeviceSlotId);
@@ -131,6 +145,16 @@ struct GapSiblings {
     first_error: Option<AppError>,
 }
 
+/// A chat holding a sibling only by leaves an Add built from its
+/// KeyPackages, which it has not used (mdk#3042).
+struct UnusedAdd {
+    /// The latest `not_after` of those KeyPackages.
+    until: u64,
+    /// The first last-activity date this device read for the sibling after
+    /// `until`, if any.
+    active_after: Option<u64>,
+}
+
 /// Only changed or due chats are examined. Routine device-group commits
 /// with unchanged admission inputs never reload every chat's MLS tree.
 #[derive(Default)]
@@ -139,6 +163,7 @@ pub(crate) struct SiblingChatGaps {
     due: HashMap<GroupId, u64>,
     claims: HashMap<Gap, BTreeMap<DeviceSlotId, u64>>,
     waiting_for_stock: HashSet<Gap>,
+    unused_adds: HashMap<Gap, UnusedAdd>,
 }
 
 impl SiblingChatGaps {
@@ -156,6 +181,7 @@ impl SiblingChatGaps {
         {
             self.claims.clear();
             self.waiting_for_stock.clear();
+            self.unused_adds.clear();
         }
         self.eligibility = Some(eligibility);
         true
@@ -211,6 +237,51 @@ impl SiblingChatGaps {
             .iter()
             .find_map(|(slot, expiry)| (slot < own && *expiry > now).then_some(*expiry))
     }
+
+    /// Whether the unused Add leaves of `gap`, whose KeyPackages lived until
+    /// `until`, are to be retired, given the sibling's last activity. Its
+    /// first activity read after `until` starts the wait; activity at least
+    /// [`UNUSED_ADD_ACTIVITY_SECS`] later ends it. Kept in memory: a restart,
+    /// or a changed `until`, starts the wait again.
+    fn unused_add_expired(
+        &mut self,
+        gap: &Gap,
+        until: u64,
+        last_active: Option<u64>,
+        now: u64,
+    ) -> bool {
+        let entry = self.unused_adds.entry(gap.clone()).or_insert(UnusedAdd {
+            until,
+            active_after: None,
+        });
+        if entry.until != until {
+            *entry = UnusedAdd {
+                until,
+                active_after: None,
+            };
+        }
+        let Some(active) = last_active.filter(|active| *active > until && now > until) else {
+            return false;
+        };
+        match entry.active_after {
+            None => {
+                entry.active_after = Some(active);
+                false
+            }
+            Some(first) => active >= first.saturating_add(UNUSED_ADD_ACTIVITY_SECS),
+        }
+    }
+
+    /// Forget `gap`'s own claim once the work it covered went out, so the
+    /// Add that follows claims afresh.
+    fn release_own_claim(&mut self, gap: &Gap, own: &DeviceSlotId) {
+        if let Some(claims) = self.claims.get_mut(gap) {
+            claims.remove(own);
+            if claims.is_empty() {
+                self.claims.remove(gap);
+            }
+        }
+    }
 }
 
 impl AppClient {
@@ -236,6 +307,21 @@ impl AppClient {
         // or readiness changes are detected by the effective snapshot below.
         if self.is_device_group(group).ok() == Some(false) {
             self.sibling_chat_gaps.schedule(group.clone(), 0);
+        }
+    }
+
+    /// A heartbeat from `slot` counted: recheck the chats holding it only by
+    /// unused Add leaves (mdk#3042).
+    pub(super) fn sibling_gap_activity(&mut self, slot: &DeviceSlotId) {
+        let chats: Vec<_> = self
+            .sibling_chat_gaps
+            .unused_adds
+            .keys()
+            .filter(|(_, sibling)| sibling == slot)
+            .map(|(chat, _)| chat.clone())
+            .collect();
+        for chat in chats {
+            self.sibling_chat_gaps.schedule(chat, 0);
         }
     }
 
@@ -309,27 +395,70 @@ impl AppClient {
         Ok(siblings)
     }
 
-    fn gap_is_missing(
-        &self,
+    /// What gap filling does for `slot` in `chat`: nothing (`None`), add it
+    /// (`Some` of no leaves), or first retire the listed leaves and then add
+    /// it. A chat holds the sibling when one of this account's leaves there
+    /// carries its tag or has its tag signature key. A chat holding it only
+    /// by unused Add leaves whose KeyPackages expired, while the sibling has
+    /// been active since ([`SiblingChatGaps::unused_add_expired`]), holds a
+    /// copy the sibling can never open: those leaves are retired (mdk#3042).
+    fn gap_repair(
+        &mut self,
         exchange: &Exchange,
-        chat: &GroupId,
-        slot: DeviceSlotId,
-    ) -> Result<bool, AppError> {
+        gap: &Gap,
+    ) -> Result<Option<Vec<Vec<u8>>>, AppError> {
+        let (chat, slot) = gap;
         if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
-            return Ok(false);
+            self.sibling_chat_gaps.unused_adds.remove(gap);
+            return Ok(None);
         }
-        let key = exchange
-            .roster
-            .devices
-            .get(&slot)
-            .and_then(|entry| entry.tag_signature_key.as_deref());
-        Ok(!self
-            .runtime
-            .own_account_leaf_claims(chat, &exchange.roster)?
+        let entry = exchange.roster.devices.get(slot);
+        let leaves = self.runtime.own_device_leaves(
+            chat,
+            &exchange.roster,
+            slot,
+            entry.and_then(|entry| entry.tag_signature_key.as_deref()),
+        )?;
+        if leaves.is_empty() {
+            self.sibling_chat_gaps.unused_adds.remove(gap);
+            return Ok(Some(Vec::new()));
+        }
+        let mut until = 0;
+        let mut keys = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            let Some(not_after) = leaf.add_not_after else {
+                self.sibling_chat_gaps.unused_adds.remove(gap);
+                return Ok(None);
+            };
+            until = until.max(not_after);
+            keys.push(leaf.signature_key);
+        }
+        let last_active = match entry {
+            Some(entry) => self.sibling_last_active(slot, entry.linked_at)?,
+            None => None,
+        };
+        Ok(self
+            .sibling_chat_gaps
+            .unused_add_expired(gap, until, last_active, unix_now_seconds())
+            .then_some(keys))
+    }
+
+    /// The newest date a heartbeat from the roster entry `slot` linked at
+    /// `linked_at` counted for.
+    fn sibling_last_active(
+        &self,
+        slot: &DeviceSlotId,
+        linked_at: u64,
+    ) -> Result<Option<u64>, AppError> {
+        let slot_hex = hex::encode(slot);
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_activity()?
             .into_iter()
-            .any(|(held, claim)| {
-                claim == DeviceTagClaim::Device(slot) || key == Some(held.as_slice())
-            }))
+            .find(|activity| activity.slot_id_hex == slot_hex && activity.linked_at == linked_at)
+            .and_then(|activity| activity.last_active_at))
     }
 
     pub(super) fn receive_gap_fill_claim(
@@ -422,6 +551,7 @@ impl AppClient {
             self.sibling_chat_gaps.due.clear();
             self.sibling_chat_gaps.claims.clear();
             self.sibling_chat_gaps.waiting_for_stock.clear();
+            self.sibling_chat_gaps.unused_adds.clear();
             return Ok(());
         }
         let changed = self
@@ -450,6 +580,9 @@ impl AppClient {
         self.sibling_chat_gaps
             .waiting_for_stock
             .retain(|(chat, target)| known.contains(chat) && eligible.contains(target));
+        self.sibling_chat_gaps
+            .unused_adds
+            .retain(|(chat, target), _| known.contains(chat) && eligible.contains(target));
         self.sibling_chat_gaps
             .due
             .retain(|chat, _| known.contains(chat));
@@ -507,11 +640,11 @@ impl AppClient {
         let mut first_error = None;
         for slot in siblings {
             let gap = (chat.clone(), *slot);
-            if !self.gap_is_missing(exchange, chat, *slot)? {
+            let Some(retire) = self.gap_repair(exchange, &gap)? else {
                 self.sibling_chat_gaps.claims.remove(&gap);
                 self.sibling_chat_gaps.waiting_for_stock.remove(&gap);
                 continue;
-            }
+            };
             if *budget == 0 {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 break;
@@ -531,15 +664,19 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
-            match self.next_private_key_package_for_chat(chat, slot, selection) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    self.sibling_chat_gaps.waiting_for_stock.insert(gap);
-                    continue;
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
+            // Retiring unused leaves spends no KeyPackage, and the engine
+            // refuses an Add while they hold the sibling's place.
+            if retire.is_empty() {
+                match self.next_private_key_package_for_chat(chat, slot, selection) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        self.sibling_chat_gaps.waiting_for_stock.insert(gap);
+                        continue;
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
                 }
             }
             let Some(content) = Claim::content(exchange.own_slot, *slot, chat) else {
@@ -583,7 +720,7 @@ impl AppClient {
                 || !self.group_quiet(&current.group_id)?
                 || !self.invitation_allows_sibling_add(chat)?
                 || !self.group_quiet(chat)?
-                || !self.gap_is_missing(&current, chat, *slot)?
+                || self.gap_repair(&current, &gap)?.as_ref() != Some(&retire)
             {
                 continue;
             }
@@ -592,6 +729,22 @@ impl AppClient {
                 first_error.get_or_insert(error);
             }
             if !current_siblings.ready.contains(slot) {
+                continue;
+            }
+            if !retire.is_empty() {
+                // The Add follows once the Remove confirms and the chat
+                // finds the sibling missing, under a claim of its own.
+                *budget -= 1;
+                match self.remove_own_account_leaves(chat, retire).await? {
+                    OwnLeafRemoval::Sent => {
+                        self.sibling_chat_gaps
+                            .release_own_claim(&gap, &exchange.own_slot);
+                        self.sibling_chat_gaps.unused_adds.remove(&gap);
+                        self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                    }
+                    OwnLeafRemoval::Busy => self.sibling_chat_gaps.schedule(chat.clone(), 0),
+                    OwnLeafRemoval::Unsupported => {}
+                }
                 continue;
             }
             // Sending the claim may have advanced local effects. Select

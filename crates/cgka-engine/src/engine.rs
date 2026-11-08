@@ -204,6 +204,29 @@ pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// The lifetime of the KeyPackage `leaf` was built from, while it is still
+/// the leaf an Add put in the tree; `None` once an Update or Commit replaced
+/// it. RFC 9420 section 7.2: source discriminants are KeyPackage=1,
+/// Update=2, Commit=3, and only a KeyPackage source carries a `Lifetime`.
+/// This fork exposes the source accessor but not its enum path, so the
+/// source is read from its TLS encoding rather than from Debug text.
+fn add_leaf_lifetime(
+    leaf: &openmls::prelude::LeafNode,
+) -> Result<Option<openmls::prelude::Lifetime>, EngineError> {
+    use tls_codec::Deserialize as _;
+    let source = leaf
+        .leaf_node_source()
+        .tls_serialize_detached()
+        .map_err(|_| EngineError::Other("selected leaf source unavailable".into()))?;
+    match source.split_first() {
+        Some((1, lifetime)) => openmls::prelude::Lifetime::tls_deserialize_exact(lifetime)
+            .map(Some)
+            .map_err(|_| EngineError::Other("selected leaf lifetime unavailable".into())),
+        Some((2 | 3, _)) => Ok(None),
+        _ => Err(EngineError::Other("unknown selected leaf source".into())),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledSelfRemoveAutoCommit {
     pub(crate) group_id: GroupId,
@@ -4208,21 +4231,58 @@ impl<S: StorageProvider> Engine<S> {
                 {
                     continue;
                 }
-                // RFC 9420 section 7.2: source discriminants are KeyPackage=1,
-                // Update=2, Commit=3. This fork exposes the source accessor but
-                // not its enum path. Serialize that source only, using its
-                // typed TLS discriminator rather than inspecting Debug text.
-                let source = leaf
-                    .leaf_node_source()
-                    .tls_serialize_detached()
-                    .map_err(|_| EngineError::Other("selected leaf source unavailable".into()))?;
-                match source.first() {
-                    Some(1) => {}
-                    Some(2 | 3) => return Ok(true),
-                    _ => return Err(EngineError::Other("unknown selected leaf source".into())),
+                if add_leaf_lifetime(leaf)?.is_none() {
+                    return Ok(true);
                 }
             }
             Ok(false)
+        })
+    }
+
+    /// The leaves in `group_id`'s current tree of this account's device in
+    /// `slot`, as gap filling finds it present (mdk#3042): each other leaf of
+    /// this account whose device tag reads as `slot` against `roster`, the
+    /// device group's current roster, or whose signature key is
+    /// `tag_signature_key`, the key that device tags with, as an untagged
+    /// leaf from an invite before its link is. This device's own leaf is
+    /// left out. Each says whether it is still the leaf its Add built from
+    /// the device's KeyPackage, and until when that KeyPackage lived. The
+    /// read is advisory and authorizes no commit.
+    pub fn own_device_leaves(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &cgka_traits::app_components::DeviceSlotId,
+        tag_signature_key: Option<&[u8]>,
+    ) -> Result<Vec<cgka_traits::app_components::OwnDeviceLeaf>, EngineError> {
+        self.with_live_mls_group(group_id, |group| {
+            let own_leaf = group.own_leaf_index();
+            let mut leaves = Vec::new();
+            for member in group.members() {
+                if member.index == own_leaf
+                    || !openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                        .is_ok_and(|credential| {
+                            credential.identity() == self.identity.self_id().as_slice()
+                        })
+                {
+                    continue;
+                }
+                let leaf = group
+                    .public_group()
+                    .leaf(member.index)
+                    .ok_or_else(|| EngineError::Other("selected member leaf unavailable".into()))?;
+                if crate::device_tag::device_tag_claim(leaf, roster)
+                    != DeviceTagClaim::Device(*slot)
+                    && tag_signature_key != Some(member.signature_key.as_slice())
+                {
+                    continue;
+                }
+                leaves.push(cgka_traits::app_components::OwnDeviceLeaf {
+                    add_not_after: add_leaf_lifetime(leaf)?.map(|lifetime| lifetime.not_after()),
+                    signature_key: member.signature_key,
+                });
+            }
+            Ok(leaves)
         })
     }
 

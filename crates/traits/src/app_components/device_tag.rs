@@ -46,6 +46,17 @@ pub enum DeviceTagClaim {
     Unclaimed,
 }
 
+/// One leaf of another device of this account in a group (mdk#3042).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnDeviceLeaf {
+    /// The leaf's signature key, which a same-account Remove names it by.
+    pub signature_key: Vec<u8>,
+    /// While the leaf is still the one an Add built from the device's
+    /// KeyPackage, that KeyPackage's `Lifetime.not_after`, in Unix seconds.
+    /// `None` once the device has updated or committed in the group.
+    pub add_not_after: Option<u64>,
+}
+
 pub fn encode_device_tag_v1(tag: &DeviceTagV1) -> Result<Vec<u8>, String> {
     validate_vector(&tag.sealed, "device tag sealed content")?;
     let mut out = tag.nonce.to_vec();

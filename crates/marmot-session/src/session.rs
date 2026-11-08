@@ -1070,6 +1070,19 @@ impl AccountDeviceSession {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::own_device_leaves`].
+    pub fn own_device_leaves(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &cgka_traits::app_components::DeviceSlotId,
+        tag_signature_key: Option<&[u8]>,
+    ) -> SessionResult<Vec<cgka_traits::app_components::OwnDeviceLeaf>> {
+        Ok(self
+            .engine
+            .own_device_leaves(group_id, roster, slot, tag_signature_key)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
     pub fn own_account_leaves_tagged_by(
         &self,
