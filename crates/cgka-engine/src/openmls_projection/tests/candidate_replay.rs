@@ -319,10 +319,14 @@ async fn genuine_non_protocol_bodies_keep_their_projection_choices() {
     }
 }
 
-#[tokio::test]
-async fn candidate_probe_preserves_a_real_proposal_rejection() {
-    let (_root, storage, group_id, commits) = encrypted_replay_graph_fixture(2, 1, 1).await;
-    assert_eq!(commits.len(), 1);
+/// Seal a genuine self-update proposal from the observer's live group state,
+/// then restore that state: the probe's inputs stay exactly as they were.
+/// Marmot admits no standalone Update, so the proposal is refused wherever it
+/// authenticates.
+fn observer_self_update_proposal(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+) -> TransportMessage {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -352,11 +356,11 @@ async fn candidate_probe_preserves_a_real_proposal_rejection() {
     .unwrap();
     // Restore group-scoped proposal/own-leaf state after authoring genuine bytes.
     // The unreferenced global leaf key is not part of the probe's inputs.
-    let before = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    let before = storage.group_replay_state_fingerprint(group_id).unwrap();
     assert!(before.is_some());
     let proposal = {
         let authoring = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
-            &storage,
+            storage,
             group_id.clone(),
             crate::snapshot_guard::RewindSite::Replay,
             "projection-proposal-authoring",
@@ -375,31 +379,57 @@ async fn candidate_probe_preserves_a_real_proposal_rejection() {
     };
     drop(group);
     assert_eq!(
-        storage.group_replay_state_fingerprint(&group_id).unwrap(),
+        storage.group_replay_state_fingerprint(group_id).unwrap(),
         before
     );
-    let proposal = transport_message(
+    transport_message(
         &proposal,
         TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
         },
-    );
-    let digests = [super::project_mls_message(&commits[0].payload)
-        .unwrap()
-        .message_digest];
-    let mut budget = super::ReplayBudget::for_pass(1, V1_MAX_REWIND_COMMITS);
-    let result = super::probe_candidate_path(
-        &storage,
-        &group_id,
-        commits,
+    )
+}
+
+/// Probe a path of `commits` with `pending_proposals` spliced in by epoch.
+fn probe_path(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    commits: &[TransportMessage],
+    pending_proposals: &[TransportMessage],
+) -> super::CandidatePathProbeResult {
+    let digests: Vec<_> = commits
+        .iter()
+        .map(|commit| {
+            super::project_mls_message(&commit.payload)
+                .unwrap()
+                .message_digest
+        })
+        .collect();
+    let mut budget = super::ReplayBudget::for_pass(commits.len(), V1_MAX_REWIND_COMMITS);
+    super::probe_candidate_path(
+        storage,
+        group_id,
+        commits.to_vec(),
         &digests,
-        std::slice::from_ref(&proposal),
+        pending_proposals,
         &super::PrevalidatedOwnCommits::default(),
         &mut budget,
         ReplayProfilePolicy::default(),
     )
-    .unwrap();
-    match result {
+    .unwrap()
+}
+
+#[tokio::test]
+async fn candidate_probe_preserves_a_real_proposal_rejection() {
+    let (_root, storage, group_id, commits) = encrypted_replay_graph_fixture(2, 1, 1).await;
+    assert_eq!(commits.len(), 1);
+    let proposal = observer_self_update_proposal(&storage, &group_id);
+    match probe_path(
+        &storage,
+        &group_id,
+        &commits,
+        std::slice::from_ref(&proposal),
+    ) {
         super::CandidatePathProbeResult::RejectedProposal {
             message_id,
             category,
@@ -412,6 +442,61 @@ async fn candidate_probe_preserves_a_real_proposal_rejection() {
         }
         other => panic!("a real proposal rejection must remain typed: {other:?}"),
     }
+}
+
+/// mdk#3226: past a fork, branches share epoch numbers but not epoch state.
+/// A pending proposal sealed at one branch's tip reaches the rival path at
+/// the same epoch, fails sender/membership-tag authentication there, and is
+/// that branch's evidence. It must not fail the rival path: that made the
+/// rival's commit terminal and stranded the device on its own branch.
+#[tokio::test]
+async fn a_proposal_sealed_on_a_rival_branch_does_not_fail_this_path() {
+    let (_root, storage, group_id, commits) = encrypted_replay_graph_fixture(2, 2, 1).await;
+    let [rival, sealing_branch] = <[TransportMessage; 2]>::try_from(commits).unwrap();
+    let fork_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    // Seal the proposal at the sealing branch's tip, then return to the fork.
+    let proposal = {
+        let on_branch = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+            &storage,
+            group_id.clone(),
+            crate::snapshot_guard::RewindSite::Replay,
+            "rival-branch-proposal",
+        )
+        .unwrap();
+        adopt_branch(&storage, &group_id, &sealing_branch);
+        let proposal = observer_self_update_proposal(&storage, &group_id);
+        on_branch.commit().unwrap();
+        proposal
+    };
+    assert_eq!(storage.get_group(&group_id).unwrap().epoch.0, fork_epoch);
+    let pending = std::slice::from_ref(&proposal);
+
+    match probe_path(&storage, &group_id, std::slice::from_ref(&rival), pending) {
+        super::CandidatePathProbeResult::Materialized(Some(candidate)) => {
+            assert_eq!(candidate.tip_epoch, fork_epoch + 1);
+            assert_eq!(
+                candidate.commit_message_ids,
+                vec![hex::encode(rival.id.as_slice())]
+            );
+            assert!(
+                candidate
+                    .observations
+                    .contains(&super::OpenMlsReplayObservation::Ignored {
+                        message_id: hex::encode(proposal.id.as_slice()),
+                        kind: super::OpenMlsContentKind::Proposal,
+                    })
+            );
+        }
+        other => {
+            panic!("the rival path must materialize past another branch's proposal: {other:?}")
+        }
+    }
+    // Where the proposal authenticates it is judged as before.
+    assert!(matches!(
+        probe_path(&storage, &group_id, std::slice::from_ref(&sealing_branch), pending),
+        super::CandidatePathProbeResult::RejectedProposal { message_id, .. }
+            if message_id == hex::encode(proposal.id.as_slice())
+    ));
 }
 
 // --- Graph fixtures ------------------------------------------------------

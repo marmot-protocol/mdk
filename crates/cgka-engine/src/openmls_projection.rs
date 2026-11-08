@@ -3978,6 +3978,33 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         category,
                     });
                 }
+                // A pending proposal reaches a candidate path by its source
+                // epoch alone (`candidate_paths_with_pending_replay_messages`),
+                // and the branches past a fork share epoch numbers, not epoch
+                // state. A proposal sealed under another branch's state fails
+                // here on sender or membership-tag authentication, the errors
+                // that depend on the parent state (the direct seam routes the
+                // same errors into convergence). It is that branch's evidence,
+                // as the Application arm treats a witness, and says nothing
+                // about this path's commits: failing the path made its commit
+                // terminal and stranded a device holding its own SelfRemove on
+                // a losing branch (mdk#3226). A proposal this path
+                // authenticates is stored below and stays live evidence
+                // (#963); a classified rejection stays `RejectedProposal`.
+                // The selected apply replays only proposals a selected commit
+                // consumed, so there any failure still fails the apply.
+                if accepted.is_none()
+                    && crate::app_components::is_parent_dependent_process_message_error(
+                        &err,
+                        ContentType::Proposal,
+                    )
+                {
+                    observations.push(OpenMlsReplayObservation::Ignored {
+                        message_id,
+                        kind: projection.kind,
+                    });
+                    continue;
+                }
                 return Err(replay_error("process_message", err));
             }
             Err(err) if projection.kind == OpenMlsContentKind::Application => {

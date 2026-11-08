@@ -8,6 +8,12 @@
 
 ### Fixed
 
+- A pending proposal sealed on one branch no longer invalidates a rival branch's commit at the same epoch
+  (mdk#3226). Candidate replay records a proposal that fails sender or membership-tag authentication as that
+  branch's evidence and keeps judging the path's own commits, so a device that left on a branch that then loses
+  (it holds its own SelfRemove) reaches the selected branch instead of staying there in `Leaving`. Selected-branch
+  apply and every other proposal failure are unchanged. No wire or schema change.
+
 - Filter sibling-Welcome origin checks to the device-group carriers being settled, so an unrelated retirement
   failure cannot block a healthy publication. Additive Engine/session/runtime queries preserve the full-query API;
   group and Sent-row scans and their errors still span storage. No wire or schema change.
