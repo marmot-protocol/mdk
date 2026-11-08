@@ -196,6 +196,13 @@ if (!inside) {
     reserve,
     watchdogMs: 100,
   };
+  try {
+    // Reserve ownership before the launcher inspects any result files.
+    await mkdir(output);
+  } catch (error) {
+    console.error(error);
+    process.exit(2);
+  }
   const child = Bun.spawn(
     [
       "systemd-run",
@@ -323,7 +330,6 @@ if (!affinity) {
 }
 const runtimeCpu = Number(affinity[1]);
 const affinityArgs = ["taskset", "-c", String(runtimeCpu)];
-await mkdir(output); // Deliberately no recursive/exist-ok: never overwrite an earlier run.
 await mkdir(join(output, "logs"));
 const eventsPath = join(output, "events.jsonl");
 await writeFile(eventsPath, "");
