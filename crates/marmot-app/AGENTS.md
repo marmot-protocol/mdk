@@ -359,7 +359,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   that expiry and another dated at least `UNUSED_ADD_ACTIVITY_SECS` later have counted, from the claimant under its
   live claim, with one same-account Remove that spends no stock and counts against the pass budget; gap filling
   then adds the sibling under a fresh claim. Any leaf of the sibling that updated or committed keeps the chat
-  present. Keep the wait memory-only; a restart or a changed expiry starts it again.
+  present. While the wait runs, keep the gap's live claims and stock waiters: another device may have finished its
+  wait first. A chat refusing sibling Adds only for `AccountLeaves` still retires, since the Remove frees the place;
+  the Add after it runs its own refusal check. Keep the wait memory-only; a restart or a changed expiry starts it
+  again.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history

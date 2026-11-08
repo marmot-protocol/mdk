@@ -12,8 +12,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1};
+use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1, OwnDeviceLeaf};
 use cgka_traits::engine::GroupEvent;
+use cgka_traits::error::SiblingAddRefusal;
 use cgka_traits::{EpochId, GroupId};
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +156,23 @@ struct UnusedAdd {
     active_after: Option<u64>,
 }
 
+/// What gap filling does for one sibling in one chat (mdk#3042).
+#[derive(Debug, PartialEq, Eq)]
+enum GapRepair {
+    /// The chat holds the sibling, or takes no Add of it: nothing to do,
+    /// and claims and stock waiters for it are dropped.
+    Present,
+    /// The chat holds the sibling only by unused Add leaves whose
+    /// KeyPackages expired, and the sibling has not yet been active long
+    /// enough since. Claims and stock waiters stay, so a device that
+    /// finished its wait first keeps the others deferring to its claim.
+    Waiting,
+    /// The chat lacks the sibling: add it.
+    Add,
+    /// Retire these unused Add leaves, by signature key, then add it.
+    Retire(Vec<Vec<u8>>),
+}
+
 /// Only changed or due chats are examined. Routine device-group commits
 /// with unchanged admission inputs never reload every chat's MLS tree.
 #[derive(Default)]
@@ -236,6 +254,66 @@ impl SiblingChatGaps {
             .get(gap)?
             .iter()
             .find_map(|(slot, expiry)| (slot < own && *expiry > now).then_some(*expiry))
+    }
+
+    /// Decide [`GapRepair`] for `gap` from the chat's own refusal of a
+    /// sibling Add, the sibling's leaves there, its last activity and the
+    /// time. A chat refusing only because it holds as many of this
+    /// account's leaves as it may still retires unused leaves, since that
+    /// frees the place the Add after it needs; the Add runs its own check.
+    fn repair(
+        &mut self,
+        gap: &Gap,
+        refusal: Option<SiblingAddRefusal>,
+        leaves: Vec<OwnDeviceLeaf>,
+        last_active: Option<u64>,
+        now: u64,
+    ) -> GapRepair {
+        let repair = self.decide_repair(gap, refusal, leaves, last_active, now);
+        if repair == GapRepair::Present {
+            self.claims.remove(gap);
+            self.waiting_for_stock.remove(gap);
+        }
+        repair
+    }
+
+    /// Only a chat holding the sibling by unused Add leaves keeps its
+    /// [`UnusedAdd`] entry, so the sibling's heartbeats wake that chat.
+    fn decide_repair(
+        &mut self,
+        gap: &Gap,
+        refusal: Option<SiblingAddRefusal>,
+        leaves: Vec<OwnDeviceLeaf>,
+        last_active: Option<u64>,
+        now: u64,
+    ) -> GapRepair {
+        let retirable = refusal.is_none_or(|refusal| refusal == SiblingAddRefusal::AccountLeaves);
+        // The latest expiry, when every leaf is still its unused Add leaf.
+        let unused_until = if retirable && !leaves.is_empty() {
+            leaves.iter().try_fold(0, |until, leaf| {
+                leaf.add_not_after.map(|not_after| until.max(not_after))
+            })
+        } else {
+            None
+        };
+        let Some(until) = unused_until else {
+            self.unused_adds.remove(gap);
+            return if refusal.is_none() && leaves.is_empty() {
+                GapRepair::Add
+            } else {
+                GapRepair::Present
+            };
+        };
+        let keys = leaves.into_iter().map(|leaf| leaf.signature_key).collect();
+        if self.unused_add_expired(gap, until, last_active, now) {
+            GapRepair::Retire(keys)
+        } else if now > until {
+            GapRepair::Waiting
+        } else {
+            // Kept in `unused_adds` so the sibling's first heartbeat after
+            // `until` wakes the chat.
+            GapRepair::Present
+        }
     }
 
     /// Whether the unused Add leaves of `gap`, whose KeyPackages lived until
@@ -395,52 +473,34 @@ impl AppClient {
         Ok(siblings)
     }
 
-    /// What gap filling does for `slot` in `chat`: nothing (`None`), add it
-    /// (`Some` of no leaves), or first retire the listed leaves and then add
-    /// it. A chat holds the sibling when one of this account's leaves there
-    /// carries its tag or has its tag signature key. A chat holding it only
-    /// by unused Add leaves whose KeyPackages expired, while the sibling has
-    /// been active since ([`SiblingChatGaps::unused_add_expired`]), holds a
-    /// copy the sibling can never open: those leaves are retired (mdk#3042).
-    fn gap_repair(
-        &mut self,
-        exchange: &Exchange,
-        gap: &Gap,
-    ) -> Result<Option<Vec<Vec<u8>>>, AppError> {
+    /// What gap filling does for `slot` in `chat` ([`GapRepair`]). A chat
+    /// holds the sibling when one of this account's leaves there carries its
+    /// tag or has its tag signature key. A chat holding it only by unused
+    /// Add leaves whose KeyPackages expired, while the sibling has been
+    /// active since ([`SiblingChatGaps::unused_add_expired`]), holds a copy
+    /// the sibling can never open: those leaves are retired (mdk#3042).
+    fn gap_repair(&mut self, exchange: &Exchange, gap: &Gap) -> Result<GapRepair, AppError> {
         let (chat, slot) = gap;
-        if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
-            self.sibling_chat_gaps.unused_adds.remove(gap);
-            return Ok(None);
-        }
+        let refusal = self.runtime.chat_sibling_add_refusal(chat)?;
         let entry = exchange.roster.devices.get(slot);
-        let leaves = self.runtime.own_device_leaves(
-            chat,
-            &exchange.roster,
-            slot,
-            entry.and_then(|entry| entry.tag_signature_key.as_deref()),
-        )?;
-        if leaves.is_empty() {
-            self.sibling_chat_gaps.unused_adds.remove(gap);
-            return Ok(Some(Vec::new()));
-        }
-        let mut until = 0;
-        let mut keys = Vec::with_capacity(leaves.len());
-        for leaf in leaves {
-            let Some(not_after) = leaf.add_not_after else {
-                self.sibling_chat_gaps.unused_adds.remove(gap);
-                return Ok(None);
-            };
-            until = until.max(not_after);
-            keys.push(leaf.signature_key);
-        }
+        let leaves = if refusal.is_none_or(|refusal| refusal == SiblingAddRefusal::AccountLeaves) {
+            self.runtime.own_device_leaves(
+                chat,
+                &exchange.roster,
+                slot,
+                entry.and_then(|entry| entry.tag_signature_key.as_deref()),
+            )?
+        } else {
+            Vec::new()
+        };
+        let unused = !leaves.is_empty() && leaves.iter().all(|leaf| leaf.add_not_after.is_some());
         let last_active = match entry {
-            Some(entry) => self.sibling_last_active(slot, entry.linked_at)?,
-            None => None,
+            Some(entry) if unused => self.sibling_last_active(slot, entry.linked_at)?,
+            _ => None,
         };
         Ok(self
             .sibling_chat_gaps
-            .unused_add_expired(gap, until, last_active, unix_now_seconds())
-            .then_some(keys))
+            .repair(gap, refusal, leaves, last_active, unix_now_seconds()))
     }
 
     /// The newest date a heartbeat from the roster entry `slot` linked at
@@ -640,10 +700,11 @@ impl AppClient {
         let mut first_error = None;
         for slot in siblings {
             let gap = (chat.clone(), *slot);
-            let Some(retire) = self.gap_repair(exchange, &gap)? else {
-                self.sibling_chat_gaps.claims.remove(&gap);
-                self.sibling_chat_gaps.waiting_for_stock.remove(&gap);
-                continue;
+            let repair = self.gap_repair(exchange, &gap)?;
+            let retire = match &repair {
+                GapRepair::Present | GapRepair::Waiting => continue,
+                GapRepair::Add => Vec::new(),
+                GapRepair::Retire(keys) => keys.clone(),
             };
             if *budget == 0 {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
@@ -720,7 +781,7 @@ impl AppClient {
                 || !self.group_quiet(&current.group_id)?
                 || !self.invitation_allows_sibling_add(chat)?
                 || !self.group_quiet(chat)?
-                || self.gap_repair(&current, &gap)?.as_ref() != Some(&retire)
+                || self.gap_repair(&current, &gap)? != repair
             {
                 continue;
             }
@@ -881,5 +942,82 @@ mod tests {
         assert!(Claim::decode(CLAIM, 100, 700).unwrap().is_none());
         assert!(Claim::decode(CLAIM, 201, 200).unwrap().is_none());
         assert!(Claim::decode(CLAIM, u64::MAX, u64::MAX).unwrap().is_none());
+    }
+
+    /// mdk#3042: a sibling held only by unused Add leaves whose KeyPackages
+    /// expired is retired after an hour of its activity since, even in a
+    /// chat holding as many of this account's leaves as it may. While that
+    /// wait runs, live claims stay, so a device that finished its wait
+    /// first keeps the others deferring to its claim.
+    #[test]
+    fn expired_unused_add_leaves_are_retired_after_an_hour_of_activity() {
+        let mut state = SiblingChatGaps::default();
+        let gap = (GroupId::new(vec![1, 2, 3]), [0x22; 32]);
+        let unused = || {
+            vec![OwnDeviceLeaf {
+                signature_key: vec![7; 32],
+                add_not_after: Some(1_000),
+            }]
+        };
+        let full = Some(SiblingAddRefusal::AccountLeaves);
+        assert_eq!(
+            state.repair(&gap, full, unused(), None, 900),
+            GapRepair::Present,
+            "an unexpired Add leaf holds the sibling"
+        );
+        state.retain_claim(Claim::decode(CLAIM, 1_100, 1_100).unwrap().unwrap());
+        assert_eq!(
+            state.repair(&gap, full, unused(), None, 1_100),
+            GapRepair::Waiting,
+            "no activity since the expiry"
+        );
+        assert_eq!(
+            state.repair(&gap, full, unused(), Some(1_050), 1_100),
+            GapRepair::Waiting,
+            "the first activity since starts the hour"
+        );
+        assert_eq!(
+            state.lower_claim_until(&gap, &[0x33; 32], 1_100),
+            Some(1_700),
+            "waiting keeps a lower claimant's claim"
+        );
+        assert_eq!(
+            state.repair(&gap, full, unused(), Some(4_649), 4_700),
+            GapRepair::Waiting
+        );
+        assert_eq!(
+            state.repair(&gap, full, unused(), Some(4_650), 4_700),
+            GapRepair::Retire(vec![vec![7; 32]])
+        );
+        assert_eq!(
+            state.repair(
+                &gap,
+                Some(SiblingAddRefusal::ChatRelays),
+                unused(),
+                Some(4_650),
+                4_700
+            ),
+            GapRepair::Present,
+            "a chat taking no sibling Add retires nothing"
+        );
+        assert_eq!(
+            state.repair(&gap, full, Vec::new(), None, 4_700),
+            GapRepair::Present
+        );
+        assert_eq!(
+            state.repair(&gap, None, Vec::new(), None, 4_700),
+            GapRepair::Add
+        );
+
+        state.retain_claim(Claim::decode(CLAIM, 4_700, 4_700).unwrap().unwrap());
+        let updated = vec![OwnDeviceLeaf {
+            signature_key: vec![7; 32],
+            add_not_after: None,
+        }];
+        assert_eq!(
+            state.repair(&gap, None, updated, Some(4_650), 4_700),
+            GapRepair::Present
+        );
+        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 4_700), None);
     }
 }
