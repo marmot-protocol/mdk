@@ -32,13 +32,14 @@
 //!   already issued, handed over again, and this device never keeps one it
 //!   has used (mdk#2628 D42).
 //! - Held KeyPackages meet that need only if they can serve the chats gap
-//!   filling left waiting on the sibling (mdk#2883). A waiting chat that can
-//!   use none of them keeps the request due while the sibling's leaf in the
-//!   device group advertises everything the chat requires, which the engine
-//!   reads against the chat's own requirements. The answer stops counting the
-//!   sibling's earlier KeyPackages and issues fresh ones, whose hand-off wakes
-//!   the waiting chat; the older ones stay for chats they fit. A sibling whose
-//!   leaf lacks a requirement is not asked on that chat's behalf.
+//!   filling left waiting on the sibling, while gap filling would add it now
+//!   (mdk#2883). A waiting chat that can use none of them keeps the request
+//!   due while the sibling's leaf in the device group advertises everything
+//!   the chat requires, which the engine reads against the chat's own
+//!   requirements. The answer stops counting the sibling's earlier
+//!   KeyPackages and issues fresh ones, whose hand-off wakes the waiting
+//!   chat; the older ones stay for chats they fit. A sibling whose leaf lacks
+//!   a requirement is not asked on that chat's behalf.
 //! - A sibling Welcome (461) adds this device to a chat with one of the
 //!   KeyPackages it issued (3.5b). It is read like a hand-off, and also only
 //!   when its relays are valid and its KeyPackage is one this device issued
@@ -763,18 +764,24 @@ impl AppClient {
     /// (mdk#2883). Held stock then does not meet the need: a request makes
     /// the sibling issue fresh KeyPackages, and its client builds them with
     /// at least what its leaf advertises. A sibling that cannot serve the
-    /// chat is not asked on its behalf. A chat whose reads fail counts as not
-    /// waiting, so the others and ordinary stock requests go on; gap filling
-    /// reports that chat.
+    /// chat is not asked on its behalf, nor is one gap filling would not add
+    /// now. A chat whose reads fail counts as not waiting, so the others and
+    /// ordinary stock requests go on; gap filling reports that chat.
     fn compatible_stock_wanted(
-        &self,
+        &mut self,
         exchange: &Exchange,
         sibling: &DeviceSlotId,
         now: u64,
     ) -> bool {
-        let mut selection = PrivateKeyPackageSelection::default();
         let mut first_error = None;
-        for chat in self.chats_waiting_for_private_stock(sibling) {
+        let chats = self
+            .chats_waiting_for_private_stock(exchange, sibling)
+            .unwrap_or_else(|error| {
+                first_error = Some(error);
+                Vec::new()
+            });
+        let mut selection = PrivateKeyPackageSelection::default();
+        for chat in chats {
             match self.chat_wants_compatible_stock(&chat, exchange, sibling, now, &mut selection) {
                 Ok(true) => return true,
                 Ok(false) => {}

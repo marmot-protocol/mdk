@@ -253,9 +253,16 @@ impl AppClient {
     }
 
     /// The chats this device's gap filling last found no private KeyPackage
-    /// from `slot` for, in id order. Upkeep reads them to tell whether held
-    /// stock can serve them (mdk#2883).
-    pub(super) fn chats_waiting_for_private_stock(&self, slot: &DeviceSlotId) -> Vec<GroupId> {
+    /// from `slot` for, in id order, while `slot` is ready for gap filling's
+    /// Adds. Upkeep reads them to tell whether held stock can serve them
+    /// (mdk#2883). A waiter kept through a local settings hold, or for a
+    /// sibling no longer eligible, asks for nothing, like gap filling's own
+    /// stock requests.
+    pub(super) fn chats_waiting_for_private_stock(
+        &mut self,
+        exchange: &Exchange,
+        slot: &DeviceSlotId,
+    ) -> Result<Vec<GroupId>, AppError> {
         let mut chats: Vec<_> = self
             .sibling_chat_gaps
             .waiting_for_stock
@@ -263,8 +270,11 @@ impl AppClient {
             .filter(|(_, sibling)| sibling == slot)
             .map(|(chat, _)| chat.clone())
             .collect();
+        if chats.is_empty() || !self.gap_siblings(exchange)?.ready.contains(slot) {
+            return Ok(Vec::new());
+        }
         chats.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-        chats
+        Ok(chats)
     }
 
     fn gap_siblings(&mut self, exchange: &Exchange) -> Result<GapSiblings, AppError> {

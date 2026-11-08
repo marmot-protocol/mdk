@@ -3437,15 +3437,14 @@ async fn founding_add_reaches_compatible_private_stock_behind_older_stock() {
     compatible_private_stock_reaches_the_chat(true).await;
 }
 
-/// A chat that finds only time-usable stock lacking what it requires keeps
-/// its demand (mdk#2883): upkeep asks the sibling, whose device-group leaf
-/// advertises the requirement, at the usual hourly pace, and the sibling's
-/// ordinary answer completes the waiting Add while the older stock stays for
-/// chats it fits.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
-    use cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID;
-    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+/// A retention chat on `phone`, linked `laptop`, and the phone holding only
+/// one time-usable KeyPackage from the laptop that lacks retention, with no
+/// stock need recorded: the chat, the device group and that KeyPackage's ref.
+async fn hold_only_stock_lacking_retention(
+    relay: &ScriptedPushRelayClient,
+    phone: &mut Device,
+    laptop: &mut Device,
+) -> (GroupId, GroupId, String) {
     let chat = phone
         .client
         .create_group_with_options(
@@ -3458,10 +3457,10 @@ async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
         )
         .await
         .unwrap();
-    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
-    hold_key_packages(&relay, &mut phone, &mut laptop).await;
-    // Held stock settles the first request's need, so this test's request
-    // is not paced behind it.
+    let group = link(relay, phone, laptop, "Laptop").await;
+    hold_key_packages(relay, phone, laptop).await;
+    // Held stock settles the first request's need, so a later request is
+    // not paced behind it.
     phone.client.sibling_key_package_upkeep(&[]).await;
     let issuer = laptop.slot_hex();
     let template = laptop
@@ -3472,7 +3471,7 @@ async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
         .into_iter()
         .find(|record| hex::encode(record.recipient_slot) == phone.slot_hex())
         .unwrap();
-    let older = older_private_package_without_retention(&laptop, &phone, &group, &template);
+    let older = older_private_package_without_retention(laptop, phone, &group, &template);
     let older_ref = marmot_session::key_package_metadata(&older)
         .unwrap()
         .key_package_ref_hex;
@@ -3480,13 +3479,29 @@ async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
     storage
         .delete_received_private_key_packages_from(&issuer)
         .unwrap();
-    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![older]).await;
+    hand_over_stock(relay, phone, laptop, &group, vec![older]).await;
     let held = storage
         .received_private_key_packages_from(&issuer, crate::unix_now_seconds())
         .unwrap();
     assert_eq!(held.len(), 1);
     assert!(held[0].usable_at(crate::unix_now_seconds()));
     assert_eq!(storage.private_key_package_need(&issuer).unwrap(), None);
+    (chat, group, older_ref)
+}
+
+/// A chat that finds only time-usable stock lacking what it requires keeps
+/// its demand (mdk#2883): upkeep asks the sibling, whose device-group leaf
+/// advertises the requirement, at the usual hourly pace, and the sibling's
+/// ordinary answer completes the waiting Add while the older stock stays for
+/// chats it fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
+    use cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID;
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let (chat, group, older_ref) =
+        hold_only_stock_lacking_retention(&relay, &mut phone, &mut laptop).await;
+    let issuer = laptop.slot_hex();
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
 
     // The request time is written before the send and put back when the
     // publication reaches no one, so a request time means it went out.
@@ -3539,6 +3554,33 @@ async fn a_compatibility_miss_asks_the_sibling_for_stock_it_can_use() {
     deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
     laptop.client.run_due_maintenance().await.unwrap();
     assert!(joined(&laptop, &chat));
+}
+
+/// A chat left waiting for compatible stock asks nothing while gap filling
+/// would not add the sibling now (mdk#2883): here, while this device's
+/// opt-out from "add to all my chats" is lost to a longer branch and its
+/// intention still waits to settle. The waiter stays for once it settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compatibility_miss_asks_nothing_while_a_settings_edit_waits() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let (_, group, _) = hold_only_stock_lacking_retention(&relay, &mut phone, &mut laptop).await;
+    let issuer = laptop.slot_hex();
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    phone.client.run_due_maintenance().await.unwrap();
+    assert!(
+        storage
+            .private_key_package_need(&issuer)
+            .unwrap()
+            .and_then(|need| need.requested_at)
+            .is_some(),
+        "the chat waits on the laptop's stock"
+    );
+    storage.delete_private_key_package_need(&issuer).unwrap();
+
+    lose_gap_opt_out(&relay, &mut phone, &mut laptop, &group).await;
+    assert_eq!(held_from(&phone, &laptop), 1, "no compatible stock arrived");
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    assert_eq!(storage.private_key_package_need(&issuer).unwrap(), None);
 }
 
 /// The shared app preference runs after compatibility filtering. Repeated
