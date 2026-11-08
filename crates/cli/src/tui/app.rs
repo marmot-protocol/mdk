@@ -17,16 +17,23 @@ impl Drop for BracketedPasteGuard {
     }
 }
 
-/// Status authority is separate from model/result admission. Every foreground
-/// user action allocates an identity; presentation writes only advance that
-/// action’s feedback phase. Async continuations carry both. Passive navigation
-/// and ambient updates never acquire an action. Retained feedback blocks notices.
+/// Requests declare their feedback permission separately from result admission.
+/// Silent work still updates models, subscriptions, and retry state. Background
+/// work may report only on an idle Main line; view and action work retain their
+/// own feedback until another user intent supersedes it.
+#[derive(Clone, Copy)]
+pub(crate) enum FeedbackPermission {
+    Action(StatusOwner),
+    View(StatusOwner),
+    Background(StatusOwner),
+    Silent,
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) enum StatusScope {
     #[default]
-    Foreground,
-    /// None carries model/resource work without authority over foreground feedback.
-    Completion(Option<StatusOwner>),
+    UserInput,
+    Granted(FeedbackPermission),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -228,9 +235,9 @@ impl StatusOwnership {
 
 impl TuiApp {
     /// Only semantic foreground entry points acquire feedback authority. Helpers
-    /// invoked by a completion preserve its causal owner, including stale/None.
+    /// invoked by a continuation cannot promote its explicit permission.
     pub(super) fn begin_status_action(&mut self) {
-        if matches!(self.status_ownership.scope, StatusScope::Foreground) {
+        if matches!(self.status_ownership.scope, StatusScope::UserInput) {
             let action = self.status_ownership.reserve_action();
             self.activate_status_action(action);
         }
@@ -239,16 +246,15 @@ impl TuiApp {
     /// Secondary-view read feedback may be dismissed on exit, while a newer
     /// mutation acknowledgement/prompt continues to own the line on Main.
     pub(super) fn begin_view_action(&mut self) {
-        self.begin_status_action();
-        self.view_status_action = Some(self.status_ownership.action);
+        if matches!(self.status_ownership.scope, StatusScope::UserInput) {
+            self.begin_status_action();
+            self.view_status_action = Some(self.status_ownership.action);
+        }
     }
 
     fn dismiss_view_feedback(&mut self) {
-        if !self.status_ownership.retained
-            || self.view_status_action == Some(self.status_ownership.action)
-        {
-            self.set_status(String::new());
-        }
+        let feedback = self.return_view_feedback();
+        self.with_feedback(feedback, |app| app.set_status(String::new()));
         self.view_status_action = None;
     }
 
@@ -264,9 +270,9 @@ impl TuiApp {
         self.set_status(status);
     }
 
-    /// A completion may keep writing only while its captured revision owns the
-    /// line. Updating its own revision permits multiple writes in one fold, but
-    /// revokes an earlier child refresh once its parent writes an acknowledgement.
+    /// A writer must have the appropriate permission as well as the current
+    /// action/revision. Advancing a presentation phase keeps only this writer's
+    /// permission current, never a previously dispatched request's permission.
     pub(crate) fn set_status(&mut self, status: String) {
         if !self.status_is_owned() {
             return;
@@ -276,42 +282,107 @@ impl TuiApp {
             .revision
             .checked_add(1)
             .expect("status revision exhausted");
-        if matches!(self.status_ownership.scope, StatusScope::Completion(_)) {
-            self.status_ownership.scope =
-                StatusScope::Completion(Some(self.status_ownership.owner()));
-        }
+        let owner = self.status_ownership.owner();
+        self.status_ownership.scope = match self.status_ownership.scope {
+            StatusScope::Granted(FeedbackPermission::Action(_)) => {
+                StatusScope::Granted(FeedbackPermission::Action(owner))
+            }
+            StatusScope::Granted(FeedbackPermission::View(_)) => {
+                StatusScope::Granted(FeedbackPermission::View(owner))
+            }
+            scope => scope,
+        };
         self.status_ownership.retained = !status.is_empty();
         self.status = status;
     }
 
     pub(super) fn status_is_owned(&self) -> bool {
         match self.status_ownership.scope {
-            StatusScope::Foreground => true,
-            StatusScope::Completion(owner) => owner == Some(self.status_ownership.owner()),
+            StatusScope::UserInput => true,
+            StatusScope::Granted(
+                FeedbackPermission::Action(owner) | FeedbackPermission::View(owner),
+            ) => owner == self.status_ownership.owner(),
+            StatusScope::Granted(
+                FeedbackPermission::Background(_) | FeedbackPermission::Silent,
+            ) => false,
         }
     }
 
-    pub(super) fn with_status_owner<R>(
+    pub(super) fn ambient_feedback_is_owned(&self) -> bool {
+        match self.status_ownership.scope {
+            StatusScope::Granted(FeedbackPermission::Background(owner)) => {
+                owner == self.status_ownership.owner()
+            }
+            _ => self.status_is_owned(),
+        }
+    }
+
+    /// Explicit action producers cannot promote a view, background or silent
+    /// continuation to foreground authority.
+    pub(super) fn action_feedback(&self) -> FeedbackPermission {
+        match self.status_ownership.scope {
+            StatusScope::UserInput => FeedbackPermission::Action(self.status_ownership.owner()),
+            StatusScope::Granted(FeedbackPermission::Action(owner)) => {
+                FeedbackPermission::Action(owner)
+            }
+            _ => FeedbackPermission::Silent,
+        }
+    }
+
+    /// Called by an explicit read intent, or by a continuation already holding
+    /// a view permission. Mutation-triggered refreshes pass Silent instead.
+    pub(super) fn view_feedback(&self) -> FeedbackPermission {
+        match self.status_ownership.scope {
+            StatusScope::UserInput => FeedbackPermission::View(self.status_ownership.owner()),
+            StatusScope::Granted(FeedbackPermission::View(owner)) => {
+                FeedbackPermission::View(owner)
+            }
+            _ => FeedbackPermission::Silent,
+        }
+    }
+
+    /// Returning through a view is passive navigation. It can transfer that
+    /// view's feedback, but cannot borrow a newer mutation's action identity.
+    pub(super) fn return_view_feedback(&self) -> FeedbackPermission {
+        if !self.status_ownership.retained
+            || self.view_status_action == Some(self.status_ownership.action)
+        {
+            self.view_feedback()
+        } else {
+            FeedbackPermission::Silent
+        }
+    }
+
+    pub(super) fn background_feedback(&self) -> FeedbackPermission {
+        match self.status_ownership.scope {
+            StatusScope::UserInput => FeedbackPermission::Background(self.status_ownership.owner()),
+            StatusScope::Granted(
+                FeedbackPermission::Action(owner)
+                | FeedbackPermission::View(owner)
+                | FeedbackPermission::Background(owner),
+            ) => FeedbackPermission::Background(owner),
+            StatusScope::Granted(FeedbackPermission::Silent) => FeedbackPermission::Silent,
+        }
+    }
+
+    pub(super) fn with_feedback<R>(
         &mut self,
-        owner: Option<StatusOwner>,
+        permission: FeedbackPermission,
         fold: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let previous = std::mem::replace(
             &mut self.status_ownership.scope,
-            StatusScope::Completion(owner),
+            StatusScope::Granted(permission),
         );
         let result = fold(self);
         self.status_ownership.scope = previous;
         result
     }
 
-    pub(super) fn enqueue_effect(&self, effect: Effect) -> RequestId {
-        // Preserve absent or stale authority through causal child work.
-        let owner = match self.status_ownership.scope {
-            StatusScope::Foreground => Some(self.status_ownership.owner()),
-            StatusScope::Completion(owner) => owner,
-        };
-        self.effects.enqueue(effect, owner)
+    /// Every producer chooses a permission. The queue never infers authority
+    /// from whichever action happens to own the status line when it is called.
+    pub(super) fn enqueue_effect(&self, effect: Effect, feedback: FeedbackPermission) -> RequestId {
+        self.effects.enqueue(effect, feedback)
     }
 
     pub(crate) fn new(cli: Cli) -> TuiResult<Self> {
@@ -541,10 +612,13 @@ impl TuiApp {
                 .selected_account_row()
                 .filter(|account| account.local_signing)
             {
-                self.enqueue_effect(Effect::Relist {
-                    account: account.account_id.clone(),
-                    include_archived: self.show_archived_chats,
-                });
+                self.enqueue_effect(
+                    Effect::Relist {
+                        account: account.account_id.clone(),
+                        include_archived: self.show_archived_chats,
+                    },
+                    self.background_feedback(),
+                );
             }
             changed = true;
         }
@@ -558,10 +632,13 @@ impl TuiApp {
                 self.messages_account_id.clone(),
                 self.messages_group_id.clone(),
             ) {
-                self.enqueue_effect(Effect::MarkRead {
-                    account: account_id,
-                    group: group_id,
-                });
+                self.enqueue_effect(
+                    Effect::MarkRead {
+                        account: account_id,
+                        group: group_id,
+                    },
+                    self.background_feedback(),
+                );
             }
             changed = true;
         }
@@ -579,18 +656,22 @@ impl TuiApp {
             }
             changed = true;
         }
-        self.with_status_owner(self.stream_status_owner, |app| {
-            match app.flush_stream_append_if_due(now) {
-                Ok(flushed) => changed |= flushed,
-                Err(err) => {
-                    app.set_status(format!("stream append failed: {err}"));
-                    changed = true;
+        self.with_feedback(
+            self.stream_status_owner
+                .map_or(FeedbackPermission::Silent, FeedbackPermission::Action),
+            |app| {
+                match app.flush_stream_append_if_due(now) {
+                    Ok(flushed) => changed |= flushed,
+                    Err(err) => {
+                        app.set_status(format!("stream append failed: {err}"));
+                        changed = true;
+                    }
                 }
-            }
-            if app.status_is_owned() {
-                app.stream_status_owner = Some(app.status_ownership.owner());
-            }
-        });
+                if app.status_is_owned() {
+                    app.stream_status_owner = Some(app.status_ownership.owner());
+                }
+            },
+        );
         changed |= self.deliver_pending_invite_notice();
         changed
     }
@@ -1105,12 +1186,9 @@ impl TuiApp {
         let owner = reserved.filter(|action| *action > self.status_ownership.action);
         if let Some(action) = owner {
             self.activate_status_action(action);
-            let claim = self.status_ownership.owner();
-            self.with_status_owner(Some(claim), |app| {
-                app.begin_timeline_load(account_id, group_id)
-            });
+            self.begin_timeline_load(account_id, group_id, self.view_feedback());
         } else {
-            self.with_status_owner(None, |app| app.begin_timeline_load(account_id, group_id));
+            self.begin_timeline_load(account_id, group_id, FeedbackPermission::Silent);
         }
     }
 
@@ -1527,12 +1605,16 @@ impl TuiApp {
         self.refresh_chats()
     }
 
-    pub(crate) fn select_chat_by_group_id(&mut self, group_id: &str) -> TuiResult<()> {
+    pub(crate) fn select_chat_by_group_id(
+        &mut self,
+        group_id: &str,
+        feedback: FeedbackPermission,
+    ) -> TuiResult<()> {
         let Some(index) = self.chats.iter().position(|chat| chat.group_id == group_id) else {
             return Ok(());
         };
         self.selected_chat = index;
-        self.refresh_messages()
+        self.refresh_messages_with_feedback(feedback)
     }
 
     pub(crate) fn selected_account_row(&self) -> Option<&AccountRow> {
@@ -1676,7 +1758,9 @@ impl TuiApp {
                     // its confirmation instead of replacing it: a completed add
                     // reported as an error would send the user to re-add a member
                     // who is already in the group.
-                    if let Err(err) = self.return_to_group_detail(&group_id) {
+                    if let Err(err) =
+                        self.return_to_group_detail(&group_id, FeedbackPermission::Silent)
+                    {
                         self.set_status(format!(
                             "{}; group detail refresh failed: {err}",
                             self.status
@@ -1684,7 +1768,7 @@ impl TuiApp {
                     }
                     return Ok(());
                 }
-                self.select_chat_by_group_id(&group_id)?;
+                self.select_chat_by_group_id(&group_id, FeedbackPermission::Silent)?;
                 self.reveal_chat_from_search();
                 Ok(())
             }
@@ -2026,8 +2110,8 @@ impl TuiApp {
         // match(es)") described the query that just went away.
         self.searching_messages = None;
         self.message_search_request = None;
-        self.begin_view_action();
-        self.set_status(String::new());
+        let feedback = self.return_view_feedback();
+        self.with_feedback(feedback, |app| app.set_status(String::new()));
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
@@ -2109,18 +2193,14 @@ impl TuiApp {
     /// query field or the result list handles the key per the screen's focus.
     pub(crate) fn handle_user_search_key(&mut self, key: KeyEvent) -> TuiResult<()> {
         if key.code == KeyCode::Esc {
-            // A search opened from group detail goes back there rather than to the
-            // main view, so `Esc` undoes the step that opened it. The refresh that
-            // return schedules can fail its account precondition, and a key handler
-            // reports rather than propagates: a `?` here would leave `run()` and end
-            // the session over a status-line error. One assignment covers both
-            // outcomes so the report cannot be overwritten by the settled status.
+            // Passive return may retain the view's authority, never a newer
+            // follow/add action. The return operation owns both its initial
+            // presentation and the queued read under that same permission.
             if let Some(group_id) = self.search_add_target().map(str::to_owned) {
-                let status = match self.return_to_group_detail(&group_id) {
-                    Ok(()) => "group detail".to_owned(),
-                    Err(err) => format!("error: {err}"),
-                };
-                self.set_status(status);
+                let feedback = self.return_view_feedback();
+                if let Err(err) = self.return_to_group_detail(&group_id, feedback) {
+                    self.with_feedback(feedback, |app| app.set_status(format!("error: {err}")));
+                }
                 return Ok(());
             }
             self.leave_screen();
@@ -2177,8 +2257,8 @@ impl TuiApp {
         }
         self.searching_users = None;
         self.user_search_request = None;
-        self.begin_view_action();
-        self.set_status(String::new());
+        let feedback = self.return_view_feedback();
+        self.with_feedback(feedback, |app| app.set_status(String::new()));
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the

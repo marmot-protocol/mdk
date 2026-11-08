@@ -2442,10 +2442,13 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
 /// child's recorder. Do not fold the marker: it must not change UI state.
 fn finish_queued_effects(app: &mut TuiApp) {
     const MARKER: &str = "test-fifo-completion-marker";
-    app.enqueue_effect(Effect::MarkRead {
-        account: "aa".repeat(32),
-        group: MARKER.to_owned(),
-    });
+    app.enqueue_effect(
+        Effect::MarkRead {
+            account: "aa".repeat(32),
+            group: MARKER.to_owned(),
+        },
+        FeedbackPermission::Silent,
+    );
     loop {
         let done = app
             .effects
@@ -4012,7 +4015,7 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     // then move selection away without changing the loaded rows.
                     app.apply_effect_done(EffectDone {
                         request_id: RequestId::default(),
-                        status_owner: Some(app.status_ownership.owner()),
+                        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                         effect: Effect::Relist {
                             account: list_owner.clone(),
                             include_archived: false,
@@ -4024,7 +4027,7 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     app.status = "current context".to_owned();
                     app.apply_effect_done(EffectDone {
                         request_id: RequestId::default(),
-                        status_owner: Some(app.status_ownership.owner()),
+                        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                         effect: Effect::MarkRead {
                             account: account_a.clone(),
                             group: group.clone(),
@@ -4187,10 +4190,13 @@ fn chat_list_b_after_failed_return_to_a_with_daemon(
         // A background list recovery adopts B's rows without replacing A's
         // loaded pane. Foreground switching now correctly clears A's pane.
         app.selected_account = 1;
-        app.enqueue_effect(Effect::Relist {
-            account: b.clone(),
-            include_archived: false,
-        });
+        app.enqueue_effect(
+            Effect::Relist {
+                account: b.clone(),
+                include_archived: false,
+            },
+            app.background_feedback(),
+        );
         app.settle_effects(1);
     }
     assert_eq!(app.chats[0].name, "B list");
@@ -4245,7 +4251,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
 
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4326,7 +4332,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     app.status = "draft saved".to_owned();
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a,
             include_archived: false,
@@ -4393,7 +4399,7 @@ fn relist_recovery_realigns_the_live_account_feeds() {
     app.refresh_messages().expect("open the recovered A chat");
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: foreground_account.clone(),
             group,
@@ -4443,7 +4449,7 @@ fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
             });
             app.apply_effect_done(EffectDone {
                 request_id: RequestId::default(),
-                status_owner: Some(app.status_ownership.owner()),
+                feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                 effect: Effect::Relist {
                     account: a.clone(),
                     include_archived: false,
@@ -4484,7 +4490,7 @@ fn relist_feed_spawn_failure_preserves_the_matching_feed_and_can_recover() {
             app.client = client;
             app.apply_effect_done(EffectDone {
                 request_id: RequestId::default(),
-                status_owner: Some(app.status_ownership.owner()),
+                feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                 effect: Effect::Relist {
                     account: a.clone(),
                     include_archived: false,
@@ -4527,7 +4533,7 @@ fn relist_feed_recovery_respects_daemon_and_local_signing_lifecycle() {
         let status = app.status.clone();
         app.apply_effect_done(EffectDone {
             request_id: RequestId::default(),
-            status_owner: Some(app.status_ownership.owner()),
+            feedback: FeedbackPermission::Background(app.status_ownership.owner()),
             effect: Effect::Relist {
                 account: a.clone(),
                 include_archived: false,
@@ -4649,7 +4655,7 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     let retained = app.chats.clone();
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4660,7 +4666,7 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     assert_eq!(app.chats_account_id.as_deref(), Some(b.as_str()));
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4675,7 +4681,7 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     for (producer, expected) in [(b, 5), (a, 0)] {
         app.apply_effect_done(EffectDone {
             request_id: RequestId::default(),
-            status_owner: Some(app.status_ownership.owner()),
+            feedback: FeedbackPermission::Background(app.status_ownership.owner()),
             effect: Effect::MarkRead {
                 account: producer,
                 group: group.clone(),
@@ -4730,7 +4736,7 @@ fn complete_relist_can_recover_an_initial_failed_load_without_an_owner() {
     assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::MarkRead { account: a, group },
         result: Ok(vec![
             serde_json::json!({"unread_count":0,"has_unread":false}),
@@ -4783,7 +4789,7 @@ fn a_search_completion_settles_after_its_chat_feed_removes_the_loaded_pane() {
     let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::Relist {
             account: a.clone(),
             include_archived: false,
@@ -4847,7 +4853,7 @@ fn group_diagnostic_completions_belong_to_the_loaded_account_and_group() {
             app.messages_group_id = Some(pane_group.to_owned());
             let previous = GroupDiagnostics::unavailable(pane_group, "current diagnostics");
             app.group_diagnostics = Some(previous.clone());
-            app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),
+            app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::Silent,
                 effect: Effect::GroupDiagnostics { account: account_a.clone(), group: group.clone() },
                 result: if fails { Err("diagnostics failed".to_owned()) } else {
                     Ok(vec![serde_json::json!({"group":{"group_id":group},"mls":{"epoch":7,"member_count":2}})])
@@ -4879,7 +4885,7 @@ fn group_detail_completions_do_not_replace_a_new_accounts_same_group_view() {
             let request_id = *app.group_detail_request.get_or_insert(RequestId::default());
             app.apply_effect_done(EffectDone {
                 request_id,
-                status_owner: Some(app.status_ownership.owner()),
+                feedback: FeedbackPermission::View(app.status_ownership.owner()),
                 effect: Effect::LoadGroupDetail {
                     account: account_a.clone(),
                     group: group.clone(),
@@ -4920,7 +4926,7 @@ fn user_search_completions_preserve_a_new_accounts_identical_query() {
             let mut app = test_tui_app(test_unused_client(), selected);
             app.open_user_search(Some("alice".to_owned()));
             let request_id = *app.user_search_request.get_or_insert(RequestId::default());
-            app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+            app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
                 effect: Effect::UserSearch { account: account_a.clone(), query: "alice".to_owned() },
                 result: if fails { Err("search failed".to_owned()) } else { Ok(vec![
                     serde_json::json!({"users":[{"account_id_hex":"dd","npub":"npubdd","radius":1,"matched_field":"name","match_quality":"exact"}]}),
@@ -4976,7 +4982,7 @@ fn message_search_completions_preserve_a_new_panes_identical_query() {
             let request_id = *app
                 .message_search_request
                 .get_or_insert(RequestId::default());
-            app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+            app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
                 effect: Effect::MessageSearch { account: account_a.clone(), group: group.clone(), query: "hello".to_owned() },
                 result: if fails { Err("search failed".to_owned()) } else {
                     Ok(vec![serde_json::json!({"messages":[{"message_id":"hit","direction":"received","from":"d","plaintext":"hello","timeline_at":1,"received_at":1}],"has_more_before":true})])
@@ -5026,7 +5032,7 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
         let search_status_owner = app.status_ownership.owner();
         app.selected_account = 1;
         app.chats = vec![projected_chat(&group, "general", 0, Some(10))];
-        app.begin_timeline_load(account_b.clone(), group.clone());
+        app.begin_timeline_load(account_b.clone(), group.clone(), app.view_feedback());
         // A's search completes first in the worker's FIFO, after opening B
         // cleared the pane but before B's timeline has loaded.
         assert!(app.messages_account_id.is_none());
@@ -5038,7 +5044,7 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
             .get_or_insert(RequestId::default());
         app.apply_effect_done(EffectDone {
             request_id,
-            status_owner: Some(search_status_owner),
+            feedback: FeedbackPermission::View(search_status_owner),
             effect: Effect::MessageSearch {
                 account: account_a.clone(),
                 group: group.clone(),
@@ -5073,7 +5079,7 @@ fn a_message_search_settles_its_own_request_when_the_loaded_pane_changes() {
         );
         app.apply_effect_done(EffectDone {
             request_id: RequestId::default(),
-            status_owner: Some(search_status_owner),
+            feedback: FeedbackPermission::View(search_status_owner),
             effect: Effect::LoadTimeline {
                 account: account_b.clone(),
                 group: group.clone(),
@@ -5112,7 +5118,7 @@ fn mark_read_failure_keeps_the_badge_honest() {
     // re-arms so the next tick retries.
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Background(app.status_ownership.owner()),
         effect: Effect::MarkRead {
             account: account_id,
             group: group_id,
@@ -7980,11 +7986,15 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     let switches_account = pane_account == Some(account_b.as_str());
                     if switches_account {
                         app.selected_account = 1;
-                        app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),
+                        app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                             effect: Effect::Relist { account: account_b.clone(), include_archived: false },
                             result: Ok(vec![serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"general"}}]})]),
                         });
-                        app.begin_timeline_load(account_b.clone(), group.clone());
+                        app.begin_timeline_load(
+                            account_b.clone(),
+                            group.clone(),
+                            app.view_feedback(),
+                        );
                         assert!(app.messages_account_id.is_none());
                     }
                     if switches_account {
@@ -8008,7 +8018,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         app.messages_account_id = pane_account.map(str::to_owned);
                         app.messages_group_id = pane_group.map(str::to_owned);
                     }
-                    app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),
+                    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::Background(app.status_ownership.owner()),
                         effect: Effect::Relist { account: app.selected_account_row().unwrap().account_id.clone(), include_archived: false },
                         result: Ok(vec![serde_json::json!({"chats":[{"group_id":selected_group,"profile":{"name":"general"}}]})]),
                     });
@@ -8020,7 +8030,7 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     let request_id = *app.group_detail_request.get_or_insert(RequestId::default());
                     app.apply_effect_done(EffectDone {
                         request_id,
-                        status_owner: Some(app.status_ownership.owner()),
+                        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
                         effect,
                         result: match completion {
                             "with-id" => Ok(vec![
@@ -13152,7 +13162,7 @@ fn a_stale_group_detail_load_after_leaving_is_dropped() {
 
     app.apply_effect_done(EffectDone {
         request_id: app.group_detail_request.unwrap_or_default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: "cc".repeat(32),
@@ -13190,7 +13200,7 @@ fn open_group_detail_reports_loading_then_settles_on_fold() {
     let request_id = *app.group_detail_request.get_or_insert(RequestId::default());
     app.apply_effect_done(EffectDone {
         request_id,
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: group_id.clone(),
@@ -13236,7 +13246,7 @@ fn invites_load_reports_loading_then_opens_the_picker() {
             notice_revision: None,
         })
         .request;
-    app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13290,7 +13300,7 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
             notice_revision: None,
         })
         .request;
-    app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_a.clone(),
         },
@@ -13344,7 +13354,7 @@ fn an_invites_fold_over_an_image_popup_reopens_through_the_close_funnel() {
             notice_revision: None,
         })
         .request;
-    app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13391,7 +13401,7 @@ fn an_invites_fold_while_on_the_profile_screen_does_not_open_the_picker() {
             notice_revision: None,
         })
         .request;
-    app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -13445,7 +13455,7 @@ fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
     let request_id = *app.user_search_request.get_or_insert(RequestId::default());
     app.apply_effect_done(EffectDone {
         request_id,
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::UserSearch {
             account: account_id,
             query: "ali".to_owned(),
@@ -13774,7 +13784,7 @@ fn a_stale_user_search_result_for_a_superseded_query_is_dropped() {
     app.searching_users = Some("bob".to_owned());
 
     let request_id = *app.user_search_request.get_or_insert(RequestId::default());
-    app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -13822,7 +13832,7 @@ fn leaving_a_search_in_flight_drops_a_late_result_from_the_reopened_screen() {
     // The abandoned "alice" search now completes; its result must not land in the
     // fresh screen.
     let request_id = *app.user_search_request.get_or_insert(RequestId::default());
-    app.apply_effect_done(EffectDone { request_id, status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id, feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -14532,52 +14542,375 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
 }
 
 #[cfg(unix)]
+fn group_return_child_script(
+    calls: &std::path::Path,
+    first_members: &std::path::Path,
+    detail_gate: &TestCommandGate,
+    detail_fails: bool,
+    follow_gate: Option<&TestCommandGate>,
+    follow_fails: bool,
+) -> String {
+    let alice = "aa".repeat(32);
+    let bob = "bb".repeat(32);
+    let initial = serde_json::json!({"ok":true,"result":{
+        "members":[{"member_id":alice,"npub":"npubself"}]
+    }});
+    let refreshed = if detail_fails {
+        serde_json::json!({"ok":false,"error":{"message":"detail offline"}})
+    } else {
+        serde_json::json!({"ok":true,"result":{
+            "members":[{"member_id":alice,"npub":"npubself"},
+                {"member_id":bob,"npub":"npubbob"}]
+        }})
+    };
+    let detail = serde_json::json!({"ok":true,"result":{
+        "admins":[{"admin_id":alice,"npub":"npubself"}],
+        "relays":["wss://relay.example"],
+        "profile":{"name":"Ops Room","description":"actual detail result"},
+        "self_membership":"member"
+    }});
+    let search = serde_json::json!({"ok":true,"result":{"users":[{
+        "account_id_hex":bob,"npub":"npubbob","radius":1,
+        "matched_field":"name","match_quality":"exact",
+        "profile":{"display_name":"Bob"}
+    }]}});
+    let follow = if follow_fails {
+        serde_json::json!({"ok":false,"error":{"message":"follow offline"}})
+    } else {
+        serde_json::json!({"ok":true,"result":{}})
+    };
+    let follow_script = follow_gate.map_or_else(String::new, TestCommandGate::script);
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in\n\
+         *' groups members '*)\nif mkdir '{}' 2>/dev/null; then\n\
+         printf '%s\\n' '{initial}'\nelse\n{}printf '%s\\n' '{refreshed}'\nfi;;\n\
+         *' groups admins '*|*' groups relays '*|*' groups show '*) printf '%s\\n' '{detail}';;\n\
+         *' users search '*) printf '%s\\n' '{search}';;\n\
+         *' follows list '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"follows\":[]}}}}';;\n\
+         *' follows add '*)\n{follow_script}printf '%s\\n' '{follow}';;\n\
+         *' groups add-members '*) printf '%s\\n' '{{\"ok\":true,\"result\":{{\"published\":2}}}}';;\n\
+         *) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}';;\nesac\n",
+        calls.display(),
+        first_members.display(),
+        detail_gate.script(),
+    )
+}
+
+#[cfg(unix)]
+fn open_real_group_origin_search_for_return(client: WnClient) -> TuiApp {
+    let account = "aa".repeat(32);
+    let mut app = test_tui_app(client, &account);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat("g1", "Ops Room")];
+    app.handle_key(char_key('g')).unwrap();
+    finish_queued_effects(&mut app);
+    let view = app.group_detail.as_ref().expect("real initial detail");
+    assert_eq!(view.members.len(), 1);
+    assert_eq!(view.members[0].member_id, account);
+    assert!(view.members[0].is_admin && view.members[0].is_self);
+    app.handle_key(char_key('a')).unwrap();
+    for ch in "Bob".chars() {
+        app.handle_key(char_key(ch)).unwrap();
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    finish_queued_effects(&mut app);
+    assert_eq!(app.screen, Screen::UserSearch);
+    let search = app.user_search.as_ref().expect("actual search view");
+    assert_eq!(search.focus, UserSearchFocus::Results);
+    assert_eq!(search.results.len(), 1);
+    assert_eq!(search.results[0].pubkey, "bb".repeat(32));
+    assert_eq!(
+        search.purpose,
+        UserSearchPurpose::AddToGroup {
+            group_id: "g1".to_owned(),
+            group_name: "Ops Room".to_owned(),
+        }
+    );
+    app
+}
+
+#[cfg(unix)]
 #[test]
 fn adding_a_found_user_from_group_detail_adds_them_and_returns_to_the_group() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let (exe, args_file) =
-        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
-    let client = WnClient {
-        exe,
-        home: None,
-        socket: None,
-        relay: None,
-        discovery_relays: Vec::new(),
-        default_account_relays: Vec::new(),
-        secret_store: None,
-        keychain_service: None,
-    };
-    let mut app = app_on_group_detail(client);
-    app.handle_key(char_key('a')).expect("a on group detail");
-    app.user_search.as_mut().expect("search view").results =
-        vec![search_result_row("npubbob", "Bob")];
-    app.user_search.as_mut().expect("search view").focus = UserSearchFocus::Results;
-    app.handle_key(char_key('a')).expect("a on the result");
-
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        .expect("confirm the add");
-
-    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let mut observations = Vec::new();
+    for detail_fails in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gate = TestCommandGate::new(dir.path());
+        let exe = dir.path().join("wn-add-and-return");
+        let calls = dir.path().join("calls");
+        write_fake_wn(
+            &exe,
+            &group_return_child_script(
+                &calls,
+                &dir.path().join("first-members"),
+                &gate,
+                detail_fails,
+                None,
+                false,
+            ),
+        );
+        let client = WnClient {
+            exe,
+            ..test_unused_client()
+        };
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let mut app = open_real_group_origin_search_for_return(client);
+            app.handle_key(char_key('a')).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            // Preserve every original pre-fold assertion: real add argv below,
+            // the return target, cleared search, pending reload, and add ack.
+            ui_tx
+                .send((
+                    app.screen == Screen::GroupDetail,
+                    app.user_search.is_none(),
+                    app.loading_group_detail.as_deref() == Some("g1"),
+                    app.status.clone(),
+                ))
+                .unwrap();
+            if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                return None;
+            }
+            finish_queued_effects(&mut app);
+            let view = app
+                .group_detail
+                .as_ref()
+                .expect("retained/refreshed detail");
+            let members = view
+                .members
+                .iter()
+                .map(|row| row.member_id.clone())
+                .collect::<Vec<_>>();
+            let folded_status = app.status.clone();
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            Some((
+                folded_status,
+                app.status.clone(),
+                members,
+                app.screen == Screen::Main && app.group_detail.is_none(),
+            ))
+        });
+        gate.wait_until_entered();
+        let before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+        gate.release();
+        finish_tx.send(before_release.is_ok()).unwrap();
+        let after = worker
+            .join()
+            .unwrap()
+            .expect("real returned detail result folded");
+        let before = before_release.expect("add confirmation returned before detail child release");
+        let recorded = std::fs::read_to_string(calls).unwrap();
+        let expected_members = if detail_fails {
+            vec!["aa".repeat(32)]
+        } else {
+            vec!["aa".repeat(32), "bb".repeat(32)]
+        };
+        observations.push((
+            detail_fails,
+            before.3.clone(),
+            after.0.clone(),
+            after.1.clone(),
+            before.0
+                && before.1
+                && before.2
+                && before.3 == "added member(s); published=2"
+                && after.0 == before.3
+                && after.1 == before.3
+                && after.2 == expected_members
+                && after.3
+                && recorded
+                    .lines()
+                    .filter(|line| {
+                        line.contains(&format!("groups add-members g1 {}", "bb".repeat(32)))
+                    })
+                    .count()
+                    == 1
+                && recorded
+                    .lines()
+                    .filter(|line| line.contains(" groups members "))
+                    .count()
+                    == 2,
+        ));
+    }
     assert!(
-        recorded.contains(&format!("groups add-members g1 {}", "bb".repeat(32))),
-        "the member is added to the group the search was opened for; got:\n{recorded}"
+        observations.iter().all(|row| row.4),
+        "detail success/error must fold without replacing the actual completed add: {observations:?}"
     );
-    // Back where the flow started, not on the main view: the point of adding
-    // from group detail is to see the member land in that list.
-    assert_eq!(app.screen, Screen::GroupDetail);
-    assert!(app.user_search.is_none(), "the search view is cleared");
-    assert_eq!(
-        app.loading_group_detail.as_deref(),
-        Some("g1"),
-        "the group detail reloads so the new member shows"
-    );
-    // The add published, so the status must report that and not be displaced by
-    // the return that follows it. A completed add reported as anything else
-    // would send the user to re-add a member who is already in the group.
+}
+
+#[cfg(unix)]
+#[test]
+fn returning_from_group_search_preserves_mutation_feedback_and_reports_foreground_errors() {
+    let mut observations = Vec::new();
+    // Mutation success/error each survives detail success/error. The no-follow
+    // context must instead admit its own foreground detail error.
+    for (follow, follow_fails, detail_fails) in [
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, true, true),
+        (false, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let follow_dir = dir.path().join("follow");
+        let detail_dir = dir.path().join("detail");
+        std::fs::create_dir(&follow_dir).unwrap();
+        std::fs::create_dir(&detail_dir).unwrap();
+        let mut follow_gate = TestCommandGate::new(&follow_dir);
+        let mut detail_gate = TestCommandGate::new(&detail_dir);
+        let exe = dir.path().join("wn-follow-and-return");
+        let calls = dir.path().join("calls");
+        write_fake_wn(
+            &exe,
+            &group_return_child_script(
+                &calls,
+                &dir.path().join("first-members"),
+                &detail_gate,
+                detail_fails,
+                follow.then_some(&follow_gate),
+                follow_fails,
+            ),
+        );
+        let client = WnClient {
+            exe,
+            relay: Some("wss://relay.example".to_owned()),
+            ..test_unused_client()
+        };
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (fold_tx, fold_rx) = mpsc::channel::<bool>();
+        let (folded_tx, folded_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
+        let worker = thread::spawn(move || {
+            let mut app = open_real_group_origin_search_for_return(client);
+            if follow {
+                app.handle_key(char_key('f')).unwrap();
+            }
+            if follow && !follow_fails && !detail_fails {
+                // Editing query data is passive presentation: invalidate its
+                // results without cancelling the pending follow's feedback.
+                app.handle_key(char_key('i')).unwrap();
+                app.handle_key(char_key('!')).unwrap();
+                let search = app.user_search.as_ref().unwrap();
+                assert_eq!(search.query.value(), "Bob!");
+                assert!(search.results.is_empty());
+            }
+            continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            returned_tx
+                .send((
+                    app.status.clone(),
+                    app.screen == Screen::GroupDetail,
+                    app.user_search.is_none(),
+                    app.loading_group_detail.as_deref() == Some("g1"),
+                ))
+                .unwrap();
+            if !fold_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                return None;
+            }
+            if follow {
+                // Search was fully fenced before f. This is the actual FollowUser
+                // FIFO completion; the later detail child stays physically gated.
+                app.settle_effects(1);
+            }
+            folded_tx.send(app.status.clone()).unwrap();
+            if !finish_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                return None;
+            }
+            finish_queued_effects(&mut app);
+            let view = app
+                .group_detail
+                .as_ref()
+                .expect("retained/refreshed roster");
+            let members = view
+                .members
+                .iter()
+                .map(|row| row.member_id.clone())
+                .collect::<Vec<_>>();
+            let settled_status = app.status.clone();
+            let main_status = if follow {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                Some((
+                    app.status.clone(),
+                    app.screen == Screen::Main && app.group_detail.is_none(),
+                ))
+            } else {
+                None
+            };
+            Some((settled_status, members, main_status))
+        });
+        if follow {
+            follow_gate.wait_until_entered();
+        }
+        continue_tx.send(()).unwrap();
+        let returned = returned_rx.recv_timeout(Duration::from_secs(5));
+        follow_gate.release();
+        fold_tx.send(returned.is_ok()).unwrap();
+        detail_gate.wait_until_entered();
+        let folded = folded_rx.recv_timeout(Duration::from_secs(5));
+        detail_gate.release();
+        finish_tx.send(folded.is_ok()).unwrap();
+        let final_state = worker
+            .join()
+            .unwrap()
+            .expect("returned result folded through real FIFO");
+        let before = returned.expect("Esc returned before the pending child was released");
+        let intermediate = folded.expect("follow folded before detail child release");
+        let expected = if !follow {
+            "error: detail offline"
+        } else if follow_fails {
+            "error: follow offline"
+        } else {
+            "followed Bob"
+        };
+        let expected_members = if detail_fails {
+            vec!["aa".repeat(32)]
+        } else {
+            vec!["aa".repeat(32), "bb".repeat(32)]
+        };
+        let recorded = std::fs::read_to_string(calls).unwrap();
+        let mutation_feedback_ok = !follow
+            || (before.0 == "following Bob..."
+                && intermediate == expected
+                && final_state
+                    .2
+                    .as_ref()
+                    .is_some_and(|(status, main)| status == expected && *main));
+        observations.push((
+            follow,
+            follow_fails,
+            detail_fails,
+            before.0,
+            intermediate,
+            final_state.0.clone(),
+            before.1
+                && before.2
+                && before.3
+                && mutation_feedback_ok
+                && final_state.0 == expected
+                && final_state.1 == expected_members
+                && recorded
+                    .lines()
+                    .filter(|line| line.contains(" follows add "))
+                    .count()
+                    == usize::from(follow)
+                && recorded
+                    .lines()
+                    .filter(|line| line.contains(" groups members "))
+                    .count()
+                    == 2,
+        ));
+    }
     assert!(
-        app.status.contains("added member(s)"),
-        "the completed add is what the status reports; got: {:?}",
-        app.status
+        observations.iter().all(|row| row.6),
+        "return refresh permissions preserve newer mutations while foreground errors remain visible: {observations:?}"
     );
 }
 
@@ -14752,7 +15085,7 @@ fn queued_mutations_run_in_fifo_order_off_the_event_loop() {
     };
     let (continue_tx, continue_rx) = mpsc::channel();
     let (ui_tx, ui_rx) = mpsc::channel();
-    let (finish_tx, finish_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel::<bool>();
     let worker = thread::spawn(move || {
         let mut app = test_tui_app(client, &account_id);
         app.messages_account_id = Some(account_id);
@@ -14824,7 +15157,7 @@ fn react_reports_in_flight_then_final_status_via_the_fold() {
 
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::React {
             account: account_id,
             group: "bb".repeat(32),
@@ -14892,7 +15225,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
 
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_id.clone(),
@@ -14957,7 +15290,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     );
 
     // A's late result arrives after the user moved to B.
-    app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_a.clone(),
@@ -14985,7 +15318,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     );
 
     // B's result lands and is accepted.
-    app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_b.clone(),
@@ -15010,7 +15343,7 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
     app.chats = vec![flick_chat(&group_a, "a")];
     app.selected_chat = 0;
 
-    app.begin_timeline_load(account_a.clone(), group_a.clone());
+    app.begin_timeline_load(account_a.clone(), group_a.clone(), app.view_feedback());
 
     // Switch to a public-only account: refresh_chats takes its early return,
     // clearing the pane without queueing a superseding load.
@@ -15026,7 +15359,7 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
 
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_a.clone(),
             group: group_a.clone(),
@@ -15130,7 +15463,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         app.drain_message_subscription();
         app.apply_effect_done(EffectDone {
             request_id: RequestId::default(),
-            status_owner: Some(app.status_ownership.owner()),
+            feedback: FeedbackPermission::View(app.status_ownership.owner()),
             effect: Effect::LoadTimeline {
                 account: account_a.clone(),
                 group: group.clone(),
@@ -15141,7 +15474,7 @@ fn a_same_group_load_for_another_account_keeps_its_pane_and_pending_owner() {
         let pending_survives_old_result = app.loading_chat.is_some();
         app.apply_effect_done(EffectDone {
             request_id: RequestId::default(),
-            status_owner: Some(app.status_ownership.owner()),
+            feedback: FeedbackPermission::View(app.status_ownership.owner()),
             effect: Effect::LoadTimeline {
                 account: target_account.clone(),
                 group: target_group.clone(),
@@ -15294,7 +15627,7 @@ fn an_empty_account_refresh_cannot_reuse_another_accounts_stream_preview() {
     }
     assert_eq!(app.chats[0].name, "B joined room");
     app.refresh_messages().unwrap();
-    app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),effect:Effect::LoadTimeline {account:account_b.clone(), group, generation: app.timeline_load_generation}, result:Ok(vec![serde_json::json!({"messages":[{
         "message_id":"B row","direction":"received","from":"peer","plaintext":"B timeline","timeline_at":2,"received_at":2
     }]})])});
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -15450,7 +15783,7 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     app.timeline.push(timeline_row("m3", 300));
 
     // The reload page returns only what was materialized at enqueue time (m1, m2).
-    app.apply_effect_done(EffectDone { request_id: RequestId::default(), status_owner: Some(app.status_ownership.owner()),
+    app.apply_effect_done(EffectDone { request_id: RequestId::default(), feedback: FeedbackPermission::View(app.status_ownership.owner()),
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_id.clone(),
@@ -15514,7 +15847,7 @@ fn sending_reports_in_flight_then_folds_an_optimistic_row() {
 
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::SendMessage {
             account: account_id,
             group: group_id,
@@ -15546,7 +15879,7 @@ fn an_optimistic_send_row_for_a_chat_the_user_left_is_dropped() {
 
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::SendMessage {
             account: account_id,
             group: "cc".repeat(32),
@@ -15587,7 +15920,7 @@ fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
     assert_eq!(app.status, "sending reply...");
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect,
         result: Ok(vec![
             serde_json::json!({"published": 1, "message_ids": ["r1"]}),
@@ -15728,10 +16061,13 @@ fn the_launch_daemon_auto_start_does_not_stall_the_first_user_action() {
         continue_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("daemon child entered");
-        app.enqueue_effect(Effect::MarkRead {
-            account: account_id,
-            group: "g1".to_owned(),
-        });
+        app.enqueue_effect(
+            Effect::MarkRead {
+                account: account_id,
+                group: "g1".to_owned(),
+            },
+            FeedbackPermission::Silent,
+        );
         let done = app.effects.recv_timeout(Duration::from_secs(5));
         ui_tx
             .send(done.map(|done| (done.effect, done.result)))
@@ -16074,7 +16410,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -16094,7 +16430,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     }
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -16114,7 +16450,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     app.accounts[0].account_id = "dd".repeat(32);
     app.apply_effect_done(EffectDone {
         request_id: RequestId::default(),
-        status_owner: Some(app.status_ownership.owner()),
+        feedback: FeedbackPermission::Action(app.status_ownership.owner()),
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -17631,7 +17967,7 @@ fn cursor_history_cannot_consume_a_pending_sends_feedback() {
         };
         let (continue_tx, continue_rx) = mpsc::channel();
         let (ui_tx, ui_rx) = mpsc::channel();
-        let (finish_tx, finish_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
         let worker = thread::spawn(move || {
             let account = "aa".repeat(32);
             let group = "cc".repeat(16);
@@ -17729,7 +18065,7 @@ fn canceled_flicks_and_the_account_picker_keep_the_active_pages_feedback() {
         };
         let (continue_tx, continue_rx) = mpsc::channel();
         let (ui_tx, ui_rx) = mpsc::channel();
-        let (finish_tx, finish_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
         let worker = thread::spawn(move || {
             let account = "aa".repeat(32);
             let group_a = "cc".repeat(16);
@@ -18134,7 +18470,7 @@ fn no_feedback_main_actions_preserve_the_pending_operations_terminal_feedback() 
             };
             let (continue_tx, continue_rx) = mpsc::channel();
             let (ui_tx, ui_rx) = mpsc::channel();
-            let (finish_tx, finish_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel::<bool>();
             let worker = thread::spawn(move || {
                 let account = "aa".repeat(32);
                 let group = "cc".repeat(16);
@@ -18324,7 +18660,7 @@ fn opening_a_search_profile_card_preserves_the_pending_follows_feedback() {
         };
         let (continue_tx, continue_rx) = mpsc::channel();
         let (ui_tx, ui_rx) = mpsc::channel();
-        let (finish_tx, finish_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<bool>();
         let worker = thread::spawn(move || {
             let mut app = test_tui_app(client, &"aa".repeat(32));
             app.daemon.running = false;

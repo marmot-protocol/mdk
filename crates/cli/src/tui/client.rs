@@ -255,7 +255,7 @@ pub(crate) struct RequestId(u64);
 pub(crate) struct EffectDone {
     pub(crate) request_id: RequestId,
     pub(crate) effect: Effect,
-    pub(crate) status_owner: Option<StatusOwner>,
+    pub(crate) feedback: FeedbackPermission,
     pub(crate) result: Result<Vec<Value>, String>,
 }
 
@@ -281,27 +281,27 @@ pub(crate) struct EffectDone {
 /// reached the relay); a read (a load) merely wastes the moment it takes to
 /// exit. Neither warrants tracking and reaping children across shutdown.
 pub(crate) struct EffectRunner {
-    tx: mpsc::Sender<(RequestId, Effect, Option<StatusOwner>)>,
+    tx: mpsc::Sender<(RequestId, Effect, FeedbackPermission)>,
     rx: Receiver<EffectDone>,
     next_request: std::cell::Cell<u64>,
 }
 
 impl EffectRunner {
     pub(crate) fn spawn(client: WnClient) -> Self {
-        let (tx, effect_rx) = mpsc::channel::<(RequestId, Effect, Option<StatusOwner>)>();
+        let (tx, effect_rx) = mpsc::channel::<(RequestId, Effect, FeedbackPermission)>();
         let (done_tx, rx) = mpsc::channel::<EffectDone>();
         thread::spawn(move || {
             // `recv` returns `Err` once the app drops its `tx` (shutdown), so the
             // worker exits cleanly. Effects run strictly one at a time in the
             // order received.
-            while let Ok((request_id, effect, status_owner)) = effect_rx.recv() {
+            while let Ok((request_id, effect, feedback)) = effect_rx.recv() {
                 let result = run_effect(&client, &effect);
                 if done_tx
                     .send(EffectDone {
                         request_id,
                         effect,
                         result,
-                        status_owner,
+                        feedback,
                     })
                     .is_err()
                 {
@@ -319,7 +319,7 @@ impl EffectRunner {
     /// Queue an effect to run off the event loop. The send only fails if the
     /// worker is gone, which happens only at shutdown; a dropped effect then
     /// simply never folds, which is correct while tearing down.
-    pub(crate) fn enqueue(&self, effect: Effect, owner: Option<StatusOwner>) -> RequestId {
+    pub(crate) fn enqueue(&self, effect: Effect, feedback: FeedbackPermission) -> RequestId {
         let next = self
             .next_request
             .get()
@@ -327,7 +327,7 @@ impl EffectRunner {
             .expect("effect request exhausted");
         self.next_request.set(next);
         let request_id = RequestId(next);
-        let _ = self.tx.send((request_id, effect, owner));
+        let _ = self.tx.send((request_id, effect, feedback));
         request_id
     }
 
@@ -391,7 +391,7 @@ impl TuiApp {
             request_id,
             effect,
             result,
-            status_owner,
+            feedback,
         } = done;
         // Request admission precedes consuming a pending slot. Mutations and
         // background projections always fold through their own model guards;
@@ -416,7 +416,7 @@ impl TuiApp {
         {
             return;
         }
-        self.with_status_owner(status_owner, |app| app.fold_effect(effect, result));
+        self.with_feedback(feedback, |app| app.fold_effect(effect, result));
     }
 
     fn fold_effect(&mut self, effect: Effect, result: Result<Vec<Value>, String>) {
@@ -550,7 +550,7 @@ impl TuiApp {
         self.begin_status_action();
         let effect = self.resolve_send_message(text)?;
         self.set_status("sending...".to_owned());
-        self.enqueue_effect(effect);
+        self.enqueue_effect(effect, self.action_feedback());
         Ok(())
     }
 
@@ -572,7 +572,7 @@ impl TuiApp {
         self.begin_status_action();
         let effect = self.resolve_reply(text)?;
         self.set_status("sending reply...".to_owned());
-        self.enqueue_effect(effect);
+        self.enqueue_effect(effect, self.action_feedback());
         Ok(())
     }
 
@@ -656,7 +656,7 @@ impl TuiApp {
                 // the FIFO worker. Keep its newer generation/feedback claim;
                 // an older no-ID completion needs no additional recovery read.
                 // Also never redirect pending navigation to another account/chat.
-                let _ = self.refresh_messages();
+                let _ = self.refresh_messages_with_feedback(FeedbackPermission::Silent);
             }
         }
         self.set_status(status);
@@ -679,7 +679,7 @@ impl TuiApp {
         self.begin_status_action();
         let effect = self.resolve_react(emoji)?;
         self.set_status("reacting...".to_owned());
-        self.enqueue_effect(effect);
+        self.enqueue_effect(effect, self.action_feedback());
         Ok(())
     }
 
@@ -699,7 +699,7 @@ impl TuiApp {
         self.begin_status_action();
         let effect = self.resolve_unreact()?;
         self.set_status("removing reaction...".to_owned());
-        self.enqueue_effect(effect);
+        self.enqueue_effect(effect, self.action_feedback());
         Ok(())
     }
 
@@ -719,7 +719,7 @@ impl TuiApp {
         self.begin_status_action();
         let effect = self.resolve_delete()?;
         self.set_status("deleting...".to_owned());
-        self.enqueue_effect(effect);
+        self.enqueue_effect(effect, self.action_feedback());
         Ok(())
     }
 
@@ -771,7 +771,7 @@ impl TuiApp {
         let group_id = self.message_group_id()?;
         let args = media_upload_send_args(group_id, file_path, caption);
         let result = self.client.run_json(Some(&account_id), &args)?;
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         let file_name = result
             .get("attachments")
             .and_then(Value::as_array)
@@ -824,7 +824,7 @@ impl TuiApp {
             flushed_bytes: 0,
         });
         self.input.clear();
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         upsert_live_stream_preview(
             &mut self.live_stream_previews,
             LiveStreamPreview {
@@ -974,7 +974,7 @@ impl TuiApp {
             Some(streaming.group_id.as_str()),
             &streaming.stream_id,
         );
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         self.refresh_daemon_status()?;
         let chunk_count = result
             .get("chunk_count")
@@ -1024,7 +1024,7 @@ impl TuiApp {
             name.clone(),
         ]);
         let result = self.client.run_json(Some(&account_id), &args)?;
-        self.refresh_accounts()?;
+        self.refresh_accounts_with_feedback(FeedbackPermission::Silent)?;
         let label = result
             .get("profile")
             .and_then(profile_display_name_from_value)
@@ -1042,9 +1042,9 @@ impl TuiApp {
         let result = self.client.run_json(Some(&account_id), &args)?;
         let group_id = value_string(&result, "group_id");
         let member_count = all_members.len();
-        self.refresh_chats()?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         if let Some(group_id) = group_id.as_deref() {
-            self.select_chat_by_group_id(group_id)?;
+            self.select_chat_by_group_id(group_id, FeedbackPermission::Silent)?;
         }
         self.set_status(
             group_id
@@ -1070,7 +1070,7 @@ impl TuiApp {
         args.extend(members);
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("added member(s)", &result);
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -1084,7 +1084,7 @@ impl TuiApp {
         args.extend(members);
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("removed member(s)", &result);
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -1096,33 +1096,41 @@ impl TuiApp {
         let group_id = self.require_selected_group()?;
         self.group_detail = None;
         self.set_status(LOADING_GROUP_DETAIL_STATUS.to_owned());
-        self.load_group_detail(&group_id)?;
+        self.load_group_detail(&group_id, self.view_feedback())?;
         self.screen = Screen::GroupDetail;
         Ok(())
     }
 
-    /// Return from a search opened by group-detail `a` to that group's detail,
-    /// refreshing it so a membership change made from the search is visible. The
-    /// cached view renders at once, so the refresh only shows if it changed
-    /// something. The status is left as the caller set it, because it carries the
-    /// outcome of whatever the search just did.
-    ///
-    /// Falls back to the main view when the group-detail view is gone: a disband
-    /// or a leave can clear it while the search is open, and returning to a
-    /// screen with nothing to show would strand the reader on a loading notice.
-    pub(crate) fn return_to_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
-        // Dropping the in-flight anchor makes a late search result a no-op at fold
-        // time, so the screen we return to cannot be repopulated by the abandoned
-        // query — the same guard `leave_screen` applies on `Esc`.
-        self.searching_users = None;
-        self.user_search = None;
-        if self.group_detail.is_none() {
-            self.screen = Screen::Main;
-            self.focus = Focus::Chats;
-            return Ok(());
-        }
-        self.screen = Screen::GroupDetail;
-        self.load_group_detail(group_id)
+    /// Return through the cached group and refresh its model. The caller must
+    /// choose view feedback or silent mutation follow-up explicitly. Initial
+    /// navigation feedback and the read share the same permission; neither can
+    /// invalidate or inherit an unrelated mutation's terminal result.
+    pub(crate) fn return_to_group_detail(
+        &mut self,
+        group_id: &str,
+        feedback: FeedbackPermission,
+    ) -> TuiResult<()> {
+        self.with_feedback(feedback, |app| {
+            app.searching_users = None;
+            app.user_search = None;
+            if app.group_detail.is_none() {
+                app.screen = Screen::Main;
+                app.focus = Focus::Chats;
+                app.set_status(String::new());
+                return Ok(());
+            }
+            app.screen = Screen::GroupDetail;
+            app.set_status("group detail".to_owned());
+            // Capture after the initial presentation so the read can settle it.
+            match app.load_group_detail(group_id, app.view_feedback()) {
+                Ok(()) => Ok(()),
+                Err(err) if matches!(feedback, FeedbackPermission::Silent) => Err(err),
+                Err(err) => {
+                    app.set_status(format!("error: {err}"));
+                    Ok(())
+                }
+            }
+        })
     }
 
     /// Load (or reload) the group-detail view off the event loop: members with
@@ -1130,13 +1138,20 @@ impl TuiApp {
     /// (`groups relays`), and name/description (`groups show`). The member
     /// selection is preserved and clamped across reloads so a membership change
     /// never jumps the cursor.
-    pub(crate) fn load_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
+    pub(crate) fn load_group_detail(
+        &mut self,
+        group_id: &str,
+        feedback: FeedbackPermission,
+    ) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         self.loading_group_detail = Some(group_id.to_owned());
-        self.group_detail_request = Some(self.enqueue_effect(Effect::LoadGroupDetail {
-            account: account_id,
-            group: group_id.to_owned(),
-        }));
+        self.group_detail_request = Some(self.enqueue_effect(
+            Effect::LoadGroupDetail {
+                account: account_id,
+                group: group_id.to_owned(),
+            },
+            feedback,
+        ));
         Ok(())
     }
 
@@ -1194,14 +1209,14 @@ impl TuiApp {
         );
         view.selected = previous.min(view.members.len().saturating_sub(1));
         self.group_detail = Some(view);
-        // A mutation’s final acknowledgement advances its feedback phase, so
-        // an older child refresh can update the view without replacing it.
+        // Silent mutation follow-ups update the roster without permission to
+        // replace the action result; an explicit view read may settle its line.
         self.set_status("group detail".to_owned());
     }
 
     fn reload_group_detail_if_active(&mut self, group_id: &str) -> TuiResult<()> {
         if matches!(self.screen, Screen::GroupDetail) {
-            self.load_group_detail(group_id)?;
+            self.load_group_detail(group_id, FeedbackPermission::Silent)?;
         }
         Ok(())
     }
@@ -1215,7 +1230,7 @@ impl TuiApp {
         )?;
         let status = publish_status("renamed group", &result);
         self.reload_group_detail_if_active(group_id)?;
-        self.refresh_chats()?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -1275,7 +1290,7 @@ impl TuiApp {
             .run_json(Some(&account_id), &["groups", "leave", group_id])?;
         let status = publish_status("left group", &result);
         self.leave_group_detail();
-        self.refresh_chats()?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -1299,7 +1314,9 @@ impl TuiApp {
         // `/refresh` as the retry.
         self.client.run_json(None, &["logout", account_id])?;
         let logged_out = format!("logged out {}", shorten(&terminal_safe_text(npub), 18));
-        let status = match self.refresh_or_return_to_login() {
+        let status = match self.with_feedback(FeedbackPermission::Silent, |app| {
+            app.refresh_or_return_to_login()
+        }) {
             Ok(()) => logged_out,
             Err(err) => {
                 format!("{logged_out}; account list reload failed ({err}) — /refresh to retry")
@@ -1324,9 +1341,12 @@ impl TuiApp {
         self.begin_status_action();
         self.loading_invites = true;
         self.set_status("loading invites...".to_owned());
-        let request = self.enqueue_effect(Effect::LoadInvites {
-            account: account_id.clone(),
-        });
+        let request = self.enqueue_effect(
+            Effect::LoadInvites {
+                account: account_id.clone(),
+            },
+            self.view_feedback(),
+        );
         let notice_revision = self
             .pending_invite_notices
             .get(&account_id)
@@ -1427,8 +1447,8 @@ impl TuiApp {
         let account_id = self.require_selected_local_account()?;
         self.client
             .run_json(Some(&account_id), &["groups", "accept", group_id])?;
-        self.refresh_chats()?;
-        self.select_chat_by_group_id(group_id)?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
+        self.select_chat_by_group_id(group_id, FeedbackPermission::Silent)?;
         if self.screen == Screen::GroupDetail {
             self.leave_group_detail();
         }
@@ -1441,7 +1461,7 @@ impl TuiApp {
         let account_id = self.require_selected_local_account()?;
         self.client
             .run_json(Some(&account_id), &["groups", "decline", group_id])?;
-        self.refresh_chats()?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(format!("declined invite {}", shorten(group_id, 18)));
         Ok(())
     }
@@ -1557,11 +1577,14 @@ impl TuiApp {
         }
         self.searching_messages = Some((account_id.clone(), group.clone(), query.clone()));
         self.set_status("searching...".to_owned());
-        self.message_search_request = Some(self.enqueue_effect(Effect::MessageSearch {
-            account: account_id,
-            group,
-            query,
-        }));
+        self.message_search_request = Some(self.enqueue_effect(
+            Effect::MessageSearch {
+                account: account_id,
+                group,
+                query,
+            },
+            self.view_feedback(),
+        ));
         Ok(())
     }
 
@@ -1650,10 +1673,13 @@ impl TuiApp {
         }
         self.searching_users = Some(query.clone());
         self.set_status("searching...".to_owned());
-        self.user_search_request = Some(self.enqueue_effect(Effect::UserSearch {
-            account: account_id,
-            query,
-        }));
+        self.user_search_request = Some(self.enqueue_effect(
+            Effect::UserSearch {
+                account: account_id,
+                query,
+            },
+            self.view_feedback(),
+        ));
         Ok(())
     }
 
@@ -1761,7 +1787,7 @@ impl TuiApp {
                 relay,
             }
         };
-        self.enqueue_effect(effect);
+        self.enqueue_effect(effect, self.action_feedback());
     }
 
     /// Fold a search-screen follow/unfollow: report the outcome, then badge the
@@ -1867,7 +1893,7 @@ impl TuiApp {
         ]);
         self.client.run_json(Some(&account_id), &args)?;
         self.load_profile()?;
-        self.refresh_accounts()?;
+        self.refresh_accounts_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(format!("updated {}", field.label()));
         Ok(())
     }
@@ -1953,8 +1979,8 @@ impl TuiApp {
         }
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("updated chat", &result);
-        self.refresh_chats()?;
-        self.select_chat_by_group_id(&group_id)?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
+        self.select_chat_by_group_id(&group_id, FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -1966,7 +1992,7 @@ impl TuiApp {
         let verb = if archived { "archive" } else { "unarchive" };
         self.client
             .run_json(Some(&account_id), &["chats", verb, &group_id])?;
-        self.refresh_chats()?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(if archived {
             format!("archived chat {}", shorten(&group_id, 18))
         } else {
@@ -2014,7 +2040,7 @@ impl TuiApp {
     pub(crate) fn set_archived_chat_visibility(&mut self, include: bool) -> TuiResult<()> {
         self.begin_status_action();
         self.show_archived_chats = include;
-        self.refresh_chats()?;
+        self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(if include {
             "showing archived chats".to_owned()
         } else {
@@ -2048,7 +2074,7 @@ impl TuiApp {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        self.refresh_accounts()?;
+        self.refresh_accounts_with_feedback(FeedbackPermission::Silent)?;
         if let Some(selector) = selector.as_deref()
             && let Some(index) = selected_account_index(&self.accounts, Some(selector))
         {
@@ -2060,7 +2086,7 @@ impl TuiApp {
             // account's subscriptions. Calling it unconditionally avoids the
             // partial-clear drift where a public-only login left stale send
             // targets pointing at the previous account/chat (issue #196).
-            self.refresh_chats()?;
+            self.refresh_chats_with_feedback(FeedbackPermission::Silent)?;
         }
 
         let signing = if local_signing {
@@ -2100,7 +2126,7 @@ impl TuiApp {
             &format!("started stream {}", shorten(&stream_id, 18)),
             &result,
         );
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -2160,7 +2186,7 @@ impl TuiApp {
             &format!("finished stream {}", shorten(&stream_id, 18)),
             &result,
         );
-        self.refresh_messages()?;
+        self.refresh_messages_with_feedback(FeedbackPermission::Silent)?;
         self.set_status(status);
         Ok(())
     }
@@ -2229,14 +2255,18 @@ impl TuiApp {
     /// Adoption always updates resources; only an owned result updates feedback,
     /// and acquisition failures take precedence over the readiness sentence.
     pub(crate) fn fold_daemon_start(&mut self, result: Result<Value, String>) {
-        self.with_status_owner(self.daemon_start_status_owner, |app| match result {
-            Ok(value) => {
-                if !app.adopt_daemon_view(&value) {
-                    app.set_drain_status(daemon_status_sentence(&app.daemon));
+        self.with_feedback(
+            self.daemon_start_status_owner
+                .map_or(FeedbackPermission::Silent, FeedbackPermission::Background),
+            |app| match result {
+                Ok(value) => {
+                    if !app.adopt_daemon_view(&value) {
+                        app.set_drain_status(daemon_status_sentence(&app.daemon));
+                    }
                 }
-            }
-            Err(err) => app.set_drain_status(format!("daemon start failed: {err}")),
-        });
+                Err(err) => app.set_drain_status(format!("daemon start failed: {err}")),
+            },
+        );
     }
 
     pub(crate) fn refresh_daemon_status(&mut self) -> TuiResult<()> {
@@ -2306,85 +2336,105 @@ impl TuiApp {
     }
 
     pub(crate) fn refresh_accounts(&mut self) -> TuiResult<()> {
-        self.load_accounts()?;
-        if self.accounts.is_empty() {
-            return Ok(());
-        }
-        self.refresh_chats()
+        self.begin_status_action();
+        self.refresh_accounts_with_feedback(self.view_feedback())
+    }
+
+    pub(super) fn refresh_accounts_with_feedback(
+        &mut self,
+        feedback: FeedbackPermission,
+    ) -> TuiResult<()> {
+        self.with_feedback(feedback, |app| {
+            app.load_accounts()?;
+            if app.accounts.is_empty() {
+                return Ok(());
+            }
+            app.refresh_chats_with_feedback(app.view_feedback())
+        })
     }
 
     pub(crate) fn refresh_chats(&mut self) -> TuiResult<()> {
-        let Some(account) = self.selected_account_row().cloned() else {
-            self.chats.clear();
-            self.chats_account_id = None;
-            self.clear_timeline_pane();
-            self.messages_account_id = None;
-            self.messages_group_id = None;
-            self.chat_subscription = None;
-            self.message_subscription = None;
-            self.group_state_subscription = None;
-            self.notification_subscription = None;
-            self.group_diagnostics = None;
-            self.set_status("no account selected".to_owned());
-            return Ok(());
-        };
-        if !account.local_signing {
-            self.chats.clear();
-            self.chats_account_id = None;
-            self.clear_timeline_pane();
-            self.messages_account_id = None;
-            self.messages_group_id = None;
-            self.chat_subscription = None;
-            self.message_subscription = None;
-            self.group_state_subscription = None;
-            self.notification_subscription = None;
-            self.group_diagnostics = None;
-            self.set_status(
-                "selected account is public-only; choose a local signing account".to_owned(),
-            );
-            return Ok(());
-        }
+        self.begin_status_action();
+        self.refresh_chats_with_feedback(self.view_feedback())
+    }
 
-        let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
-        let mut args = vec!["chats".to_owned(), "list".to_owned()];
-        if self.show_archived_chats {
-            args.push("--include-archived".to_owned());
-        }
-        let result = self.client.run_json(Some(&account.account_id), &args)?;
-        self.chats = result
-            .get("chats")
-            .and_then(Value::as_array)
-            .map(|chats| chats.iter().filter_map(parse_chat).collect())
-            .unwrap_or_default();
-        self.chats_account_id = Some(account.account_id.clone());
-        sort_chats_by_activity(&mut self.chats);
-        self.selected_chat =
-            selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
-        if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
-            self.set_status(format!("chat subscription failed: {err}"));
-        }
-        if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
-            self.set_status(format!("notification subscription failed: {err}"));
-        }
-        if self.chats.is_empty() {
-            self.clear_timeline_pane();
-            self.messages_account_id = Some(account.account_id.clone());
-            self.messages_group_id = None;
-            self.group_state_subscription = None;
-            if let Err(err) = self.ensure_message_subscription(&account.account_id) {
-                self.set_status(format!("message subscription failed: {err}"));
+    pub(super) fn refresh_chats_with_feedback(
+        &mut self,
+        feedback: FeedbackPermission,
+    ) -> TuiResult<()> {
+        self.with_feedback(feedback, |app| {
+            let Some(account) = app.selected_account_row().cloned() else {
+                app.chats.clear();
+                app.chats_account_id = None;
+                app.clear_timeline_pane();
+                app.messages_account_id = None;
+                app.messages_group_id = None;
+                app.chat_subscription = None;
+                app.message_subscription = None;
+                app.group_state_subscription = None;
+                app.notification_subscription = None;
+                app.group_diagnostics = None;
+                app.set_status("no account selected".to_owned());
+                return Ok(());
+            };
+            if !account.local_signing {
+                app.chats.clear();
+                app.chats_account_id = None;
+                app.clear_timeline_pane();
+                app.messages_account_id = None;
+                app.messages_group_id = None;
+                app.chat_subscription = None;
+                app.message_subscription = None;
+                app.group_state_subscription = None;
+                app.notification_subscription = None;
+                app.group_diagnostics = None;
+                app.set_status(
+                    "selected account is public-only; choose a local signing account".to_owned(),
+                );
                 return Ok(());
             }
-            self.finish_timeline_status(
-                format!(
-                    "loaded account {}; no chats",
-                    shorten(&account_display_label(&account), 18)
-                ),
-                false,
-            );
-            return Ok(());
-        }
-        self.refresh_messages()
+
+            let previous_group_id = app.selected_chat_row().map(|chat| chat.group_id.clone());
+            let mut args = vec!["chats".to_owned(), "list".to_owned()];
+            if app.show_archived_chats {
+                args.push("--include-archived".to_owned());
+            }
+            let result = app.client.run_json(Some(&account.account_id), &args)?;
+            app.chats = result
+                .get("chats")
+                .and_then(Value::as_array)
+                .map(|chats| chats.iter().filter_map(parse_chat).collect())
+                .unwrap_or_default();
+            app.chats_account_id = Some(account.account_id.clone());
+            sort_chats_by_activity(&mut app.chats);
+            app.selected_chat =
+                selected_chat_index(&app.chats, previous_group_id.as_deref()).unwrap_or(0);
+            if let Err(err) = app.ensure_chat_subscription(&account.account_id) {
+                app.set_status(format!("chat subscription failed: {err}"));
+            }
+            if let Err(err) = app.ensure_notification_subscription(&account.account_id) {
+                app.set_status(format!("notification subscription failed: {err}"));
+            }
+            if app.chats.is_empty() {
+                app.clear_timeline_pane();
+                app.messages_account_id = Some(account.account_id.clone());
+                app.messages_group_id = None;
+                app.group_state_subscription = None;
+                if let Err(err) = app.ensure_message_subscription(&account.account_id) {
+                    app.set_status(format!("message subscription failed: {err}"));
+                    return Ok(());
+                }
+                app.finish_timeline_status(
+                    format!(
+                        "loaded account {}; no chats",
+                        shorten(&account_display_label(&account), 18)
+                    ),
+                    false,
+                );
+                return Ok(());
+            }
+            app.refresh_messages_with_feedback(app.view_feedback())
+        })
     }
 
     /// Load (or reload) the selected chat's timeline off the event loop. Resolves
@@ -2393,48 +2443,67 @@ impl TuiApp {
     /// mark-read, and diagnostics are folded in when the result lands.
     pub(crate) fn refresh_messages(&mut self) -> TuiResult<()> {
         self.begin_status_action();
-        let account_id = self.require_selected_local_account()?;
-        let group_id = self.require_selected_group()?;
-        self.begin_timeline_load(account_id, group_id);
-        Ok(())
+        self.refresh_messages_with_feedback(self.view_feedback())
+    }
+
+    pub(super) fn refresh_messages_with_feedback(
+        &mut self,
+        feedback: FeedbackPermission,
+    ) -> TuiResult<()> {
+        self.with_feedback(feedback, |app| {
+            let account_id = app.require_selected_local_account()?;
+            let group_id = app.require_selected_group()?;
+            app.begin_timeline_load(account_id, group_id, app.view_feedback());
+            Ok(())
+        })
     }
 
     /// Reset the pane to a loading state (only when switching to a different
     /// account/group, so a same-chat reload never flashes empty), tag the pending
     /// target for the stale guard, and queue the timeline load.
-    pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
-        self.timeline_load_generation = self
-            .timeline_load_generation
-            .checked_add(1)
-            .expect("timeline load generation exhausted");
-        let generation = self.timeline_load_generation;
-        // Any explicit or fired load supersedes a pending flick-through preview.
-        self.flick_countdown = None;
-        self.adopt_message_account(&account_id);
-        if self.messages_account_id.as_deref() != Some(account_id.as_str())
-            || self.messages_group_id.as_deref() != Some(group_id.as_str())
-        {
-            // Drop the prior chat's pane and its per-group subscriptions so their
-            // drains cannot pollute the pane while the new chat loads.
-            self.clear_timeline_pane();
-            self.messages_account_id = None;
-            self.messages_group_id = None;
-            self.group_state_subscription = None;
-            self.group_diagnostics = None;
-        }
-        self.loading_chat = Some((account_id.clone(), group_id.clone(), generation));
-        // The account-wide feed belongs to the adopted live account even if
-        // this group's page fails. Same-account loads reuse its existing child.
-        // Acquisition is provisional here: the fold retries and reports its
-        // final outcome, so this attempt must not replace the request's claim.
-        if self.daemon.running {
-            let _ = self.ensure_message_subscription(&account_id);
-        }
-        self.set_status(LOADING_TIMELINE_STATUS.to_owned());
-        self.enqueue_effect(Effect::LoadTimeline {
-            account: account_id,
-            group: group_id,
-            generation,
+    pub(crate) fn begin_timeline_load(
+        &mut self,
+        account_id: String,
+        group_id: String,
+        feedback: FeedbackPermission,
+    ) {
+        self.with_feedback(feedback, |app| {
+            app.timeline_load_generation = app
+                .timeline_load_generation
+                .checked_add(1)
+                .expect("timeline load generation exhausted");
+            let generation = app.timeline_load_generation;
+            // Any explicit or fired load supersedes a pending flick-through preview.
+            app.flick_countdown = None;
+            app.adopt_message_account(&account_id);
+            if app.messages_account_id.as_deref() != Some(account_id.as_str())
+                || app.messages_group_id.as_deref() != Some(group_id.as_str())
+            {
+                // Drop the prior chat's pane and its per-group subscriptions so their
+                // drains cannot pollute the pane while the new chat loads.
+                app.clear_timeline_pane();
+                app.messages_account_id = None;
+                app.messages_group_id = None;
+                app.group_state_subscription = None;
+                app.group_diagnostics = None;
+            }
+            app.loading_chat = Some((account_id.clone(), group_id.clone(), generation));
+            // The account-wide feed belongs to the adopted live account even if
+            // this group's page fails. Same-account loads reuse its existing child.
+            // Acquisition is provisional here: the fold retries and reports its
+            // final outcome, so this attempt must not replace the request's claim.
+            if app.daemon.running {
+                let _ = app.ensure_message_subscription(&account_id);
+            }
+            app.set_status(LOADING_TIMELINE_STATUS.to_owned());
+            app.enqueue_effect(
+                Effect::LoadTimeline {
+                    account: account_id,
+                    group: group_id,
+                    generation,
+                },
+                app.view_feedback(),
+            );
         });
     }
 
@@ -2567,12 +2636,18 @@ impl TuiApp {
         // Capture followups after final feedback so a matching mark-read failure
         // remains eligible while an ordinary successful page is idle.
         if !self.daemon.running || self.group_state_subscription.is_none() {
-            self.enqueue_effect(Effect::GroupDiagnostics {
-                account: account.clone(),
-                group: group.clone(),
-            });
+            self.enqueue_effect(
+                Effect::GroupDiagnostics {
+                    account: account.clone(),
+                    group: group.clone(),
+                },
+                FeedbackPermission::Silent,
+            );
         }
-        self.enqueue_effect(Effect::MarkRead { account, group });
+        self.enqueue_effect(
+            Effect::MarkRead { account, group },
+            self.background_feedback(),
+        );
     }
 
     /// Fold a completed mark-read: apply the returned projection to the chat's
@@ -3009,7 +3084,9 @@ impl TuiApp {
     /// Ambient notices replace only idle Main feedback. Queued background work
     /// must also match its captured revision; state and retry handling are separate.
     pub(crate) fn set_drain_status(&mut self, status: String) {
-        if self.screen == Screen::Main && !self.status_ownership.retained && self.status_is_owned()
+        if self.screen == Screen::Main
+            && !self.status_ownership.retained
+            && self.ambient_feedback_is_owned()
         {
             // Background feedback changes presentation, never foreground order.
             self.status = status;
@@ -3017,7 +3094,9 @@ impl TuiApp {
     }
 
     pub(crate) fn deliver_pending_invite_notice(&mut self) -> bool {
-        if self.screen != Screen::Main || self.status_ownership.retained || !self.status_is_owned()
+        if self.screen != Screen::Main
+            || self.status_ownership.retained
+            || !self.ambient_feedback_is_owned()
         {
             return false;
         }
