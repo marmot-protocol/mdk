@@ -17,7 +17,9 @@ MDK that host is [`marmot-app`](../marmot-app), which re-exports the directory's
   discovery, and every valid, fresh KeyPackage of each account (one per device, at most 20), skipping those the
   account asked to delete, with bounded recovery when the first relays don't answer.
 - **Search.** Streaming web-of-trust search with optional Open Ranking discovery, and network-free search over cached
-  data.
+  data. Cached search filters public fields in SQL, resolves the newest profiles across stores, and ranks matches
+  before decoding at most the requested limit of profiles (10,000 maximum). Unicode lowercase matching treats
+  punctuation literally. Streaming search uses the same local query before relay work.
 - **Public event previews.** Verified previews of `nostr:` references in messages, stored in the directory cache.
 - **The sync worker.** Keeps relay subscriptions current for known users and hands block-list events back to the app.
 - **The cache schema.** The per-account SQLCipher cache's tables, frozen schemas and numbered migrations.
