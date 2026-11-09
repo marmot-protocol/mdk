@@ -451,12 +451,21 @@ pub(crate) enum AccountWorkerCommand {
     },
     LeaveGroup {
         group_id: GroupId,
-        for_sign_out: bool,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     CancelLeave {
         group_id: GroupId,
         respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    /// Stage 1 of `sign_out_and_wipe` for one chat (mdk#2818).
+    LeaveGroupForSignOut {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::client::sign_out::SignOutLeave, AppError>>,
+    },
+    /// Where an admin's sign-out leave from one chat stands (mdk#2818).
+    SignOutAdminLeave {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::client::sign_out::SignOutAdminLeave, AppError>>,
     },
     ForgetGroupLocal {
         group_id: GroupId,
@@ -5423,16 +5432,8 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
-        AccountWorkerCommand::LeaveGroup {
-            group_id,
-            for_sign_out,
-            respond,
-        } => Box::pin(async move {
-            let result = if for_sign_out {
-                client.leave_group_for_sign_out(&group_id).await
-            } else {
-                client.leave_group(&group_id).await
-            };
+        AccountWorkerCommand::LeaveGroup { group_id, respond } => Box::pin(async move {
+            let result = client.leave_group(&group_id).await;
             // Drain the kind-1210 "member left" row this commit queued. Sibling
             // mutators (invite/remove/profile) already flush
             // `pending_projection_updates`; without this the live timeline stays
@@ -5469,6 +5470,25 @@ fn account_worker_command_future<'a>(
                     &group_id,
                 );
             }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::LeaveGroupForSignOut { group_id, respond } => Box::pin(async move {
+            let result = client.leave_group_for_sign_out(&group_id).await;
+            // As `LeaveGroup`: drain the queued "member left" row and
+            // re-render the chat whatever the outcome.
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_app_runtime_group_state_updated(
+                events,
+                account_id_hex,
+                account_label,
+                &group_id,
+            );
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
@@ -5641,6 +5661,11 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::SignOutThroughSiblingsStep { respond } => Box::pin(async move {
             let result = client.sign_out_through_siblings_step().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SignOutAdminLeave { group_id, respond } => Box::pin(async move {
+            let result = client.sign_out_admin_leave(&group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

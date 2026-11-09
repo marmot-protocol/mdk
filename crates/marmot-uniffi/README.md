@@ -1342,17 +1342,22 @@ signing out too (mdk#2628):
   that those devices may still list this one until the user removes it from one of them.
 - The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
 
-Signing out is device-only and does not submit an account-wide Leave decision or automatically demote the account.
-An active-admin account cannot self-remove, even with another admin present, so this device's leaf can remain in an
-admin chat. A separate admin-policy change affects the account on all its devices. Before the account can leave the
-chat entirely, another account must be an active admin; an eligible sibling can still remove this device while the
-account remains an admin. This limit also applies without linked devices.
+Signing out is device-only and does not submit an account-wide Leave decision. An active admin cannot self-remove, so
+in a chat the account administers with another account, where none of its other devices has a leaf, signing out steps
+the account down first and then leaves (mdk#2818), with or without linked devices. One wait of about 30 seconds covers
+all such chats; show progress. Each counts in `groups_left` only once this device sees its removal; otherwise
+`group_leave_failures` says why: the step-down was not accepted in time, the account is off the admin list but its
+removal was not seen in time (it stays a member), or the account became the chat's last admin. A blocked leave ends
+that chat's wait. A chat this device was already leaving gets nothing new and joins the same wait. It keeps its leaf,
+and reports the chat, where the account is the last admin, where another of the account's devices stays in the chat,
+and once its device group removed it during the sign-out. An eligible sibling can still
+remove this device while the account remains an admin.
 
 Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
 roster entry already carrying its tag signature key. Removal also needs a chat that supports same-account device
 removal and the required tagged leaves;
-`groups_left_to_siblings` is a handoff, not a completed-removal receipt. `groups_left` counts successful local leave
-calls, not confirmed membership removal. The call still attempts local account deletion after remote leave
+`groups_left_to_siblings` is a handoff, not a completed-removal receipt. Outside admin chats, `groups_left` counts
+successful local leave calls, not confirmed membership removal. The call still attempts local account deletion after remote leave
 failures. Show the chats in `group_leave_failures` and check `local_cleanup.completed` independently; local cleanup
 completion does not establish that this device left every chat.
 

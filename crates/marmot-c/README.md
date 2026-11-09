@@ -561,7 +561,8 @@ With a linked device that is not signing out too, `marmot_sign_out_and_wipe` fir
 to take this one out, which can block for about 30 seconds, and leaves them the chats they can.
 `MarmotWipeOutcome.groups_left_to_siblings` counts those chats, and `siblings_not_reached` says it could not ask
 them in time, so it tried to leave every chat itself, reporting any it could not in `group_leave_failures`; tell the
-user. See the
+user. In a chat the account administers with another account, it steps the account down first and can block about
+30 seconds more for its removal. See the
 [shared contract](../marmot-uniffi/README.md#signing-out-with-linked-devices).
 
 `marmot_key_package_refresh_overdue` blocks on the account worker, reads local state only, and writes whether this

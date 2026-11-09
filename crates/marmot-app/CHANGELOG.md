@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Signing out leaves a chat its account administers with another account (mdk#2818). Where none of the account's other
+  devices is in the chat, `sign_out_and_wipe` sends the engine's `StepDownAndLeave`, whether or not device groups are
+  on: the leave is recorded, then the engine steps the account down and leaves. One wait of about 30 seconds covers all
+  such chats, and each counts in `groups_left` only once this device sees the commit that removes it. Otherwise
+  `group_leave_failures` reports why: the step-down was not accepted in time, the removal was not seen in time, or the
+  account became the last admin. A blocked leave ends that chat's wait. A chat this device was already leaving gets
+  nothing new and joins the same wait. Such a chat reads as `Left` only once its removal is seen. A chat the account is
+  the last admin of, one another of its devices stays in, and every admin chat of a device removed during the sign-out
+  keep its leaf and are reported with that reason.
+
 - With experimental device groups on, an admin's User Leave or Decline no longer sends its own step-down before the
   Leave (mdk#3014). It sends the engine's `StepDownAndLeave`, which records the leave first and then stages the
   step-down and the SelfRemove, so a step-down that is refused, left unresolved or lost to another branch is staged

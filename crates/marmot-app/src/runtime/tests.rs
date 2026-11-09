@@ -805,6 +805,46 @@ async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() 
     runtime.shutdown().await;
 }
 
+/// Signing out on a single device keeps its leaf in a chat its account is
+/// the last admin of: the account cannot step down there, and an admin's
+/// SelfRemove is refused. The wipe reports the chat with that reason, sends
+/// nothing to it, and still wipes (mdk#2818).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wipe_keeps_a_chat_its_account_is_the_last_admin_of() {
+    let root = tempfile::tempdir().unwrap();
+    AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    runtime.reconcile_accounts().await.unwrap();
+    let group = runtime
+        .create_group("alice", "sole admin", &[], None)
+        .await
+        .unwrap();
+    let attempted = relay.attempted_events().len();
+
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert_eq!(outcome.groups_left, 0);
+    assert_eq!(
+        outcome.group_leave_failures,
+        [GroupLeaveFailure {
+            group_id_hex: hex::encode(group.as_slice()),
+            reason: "account is the chat's last admin".to_owned(),
+        }]
+    );
+    assert!(outcome.local_cleanup.completed);
+    assert!(
+        relay.attempted_events()[attempted..]
+            .iter()
+            .all(|event| event.kind != 445),
+        "nothing goes to the kept chat"
+    );
+    runtime.shutdown().await;
+}
+
 #[test]
 fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() {
     let request = AccountSetupRequest {

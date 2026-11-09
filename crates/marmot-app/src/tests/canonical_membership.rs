@@ -1948,5 +1948,8 @@ async fn invite_needs_no_pending_welcome_row() {
 }
 
 #[cfg(feature = "test-policy-overrides")]
+#[path = "canonical_membership/admin_sign_out.rs"]
+mod admin_sign_out;
+#[cfg(feature = "test-policy-overrides")]
 #[path = "canonical_membership/rival_branch_leave.rs"]
 mod rival_branch_leave;

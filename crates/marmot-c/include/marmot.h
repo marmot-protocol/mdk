@@ -2399,7 +2399,10 @@ typedef struct MarmotLocalCleanupReport {
  */
 typedef struct MarmotWipeOutcome {
   /**
-   * Active MLS groups whose local leave call succeeded, not confirmed removal.
+   * Active MLS groups whose local leave call succeeded, not confirmed removal,
+   * except a chat whose leave the sign-out waits for (an admin chat the
+   * account steps down in, or one this device was already leaving), which
+   * counts only once this device sees its removal (mdk#2818).
    * A chat this device is no longer in, its copy removed or disbanded, is
    * neither counted nor reported as a failure.
    */

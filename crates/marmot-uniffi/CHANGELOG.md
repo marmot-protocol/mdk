@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `sign_out_and_wipe` leaves a chat the account administers with another account, where none of its other devices is in
+  (mdk#2818): it steps the account down first and counts the chat in `groups_left` only once it sees its removal,
+  waiting up to about 30 seconds more for all such chats. A chat this device was already leaving waits the same way.
+  Otherwise `group_leave_failures` says why. No API change.
+
 - `TimelineMessageQueryFfi` adds `sender`, inclusive `since`, exclusive `until`, integer `attachment_type`
   (`0` Any, `1` Image, `2` Video, `3` Audio, `4` File, `5` Attachment), `search_wall_clock`, and
   `cursor_group_id`. Filters combine before the page limit; explicit wall-clock order supports deterministic
