@@ -58,6 +58,23 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrRelayClient` is intentionally small so tests can use an in-memory client and production can use
 `NostrSdkRelayClient` behind the `sdk` feature.
 
+`NostrSdkRelayClient::relay_liveness()` reads the account-local physical pool without network I/O.
+Its `RelayLiveness` rows expose `Unknown`, `Connecting`, `Connected`, or `Offline`, independently of message traffic.
+The caller adds configured endpoints absent from the pool as `Unknown`. Subscribe to `liveness_changes()` before
+reading: its monotonic generation coalesces changes, rather than retaining every transition. A multi-account root's
+watch also wakes for child relay changes, account registration, and account removal.
+
+Clients built with `from_builder` record `last_attempt_unix` when the transport starts connecting and retain the
+SDK error category in `last_error` on connection failure. Raw error text is never retained. A new attempt clears the
+previous error. The SDK's outer connect timeout exposes no error to the transport hook. Opaque clients passed to
+`new` instead timestamp status notifications that reveal a new SDK attempt count and have no retained connection
+errors; attempts before monitor attachment have no timestamp. Relay URLs and errors are local presentation data,
+not logs or telemetry.
+
+After the relay plane's safety check, `reconnect_relay(endpoint)` restarts one existing relay or registers it in the
+account's retained READ pool. It returns the next observed attempt's current status, including `Connecting`, within
+five seconds. It does not claim a successful connection, replace an existing relay object, or run a retry loop.
+
 Public DTO ingress verifies the event signature and id/content binding before delivery, including reconciliation
 and acquired replay pages. SDK notifications carry event ids authenticated by the pinned SDK. Its verification
 cache is keyed by id, so later copies may contain altered bytes: a buffered copy reuses only the held body's

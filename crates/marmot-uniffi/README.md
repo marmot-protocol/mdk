@@ -213,6 +213,32 @@ are not credentials. Never log message bodies, asset references, keys, account/g
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
 
+### Relay liveness
+
+`accountRelayLiveness(accountRef)` reads one row per configured relay, keyed by canonical URL.
+Root URLs omit the trailing slash; path trailing slashes retain their endpoint identity.
+The rows combine the account's cached NIP-65 read/write, inbox, default, and bootstrap lists.
+`RelayStatusFfi` has `Unknown`, `Connecting`, `Connected`, and `Offline` variants for host localization.
+State comes from that account's receive/history pool, not another account's sockets, transient publication pools,
+or successful message delivery. A configured relay absent from this pool is `Unknown`; reads never dial.
+
+`subscribeRelayLiveness(accountRef)` returns a `RelayLivenessSubscription` with a one-shot initial `snapshot()`
+and complete replacement lists from `next()`. Updates cover socket transitions, account-pool replacement,
+and cached relay-list changes without polling. Slow readers may skip intermediate states.
+Snapshot production runs on MDK's runtime; cancellation does not consume an update.
+`close()` wakes pending receives and stops this observer without disconnecting relays.
+Runtime shutdown ends receives; read failures propagate through `MarmotKitError`.
+
+`lastAttemptUnix` is a session-local Unix-seconds timestamp, and `lastError` is an optional, bounded SDK
+connection-error category rather than raw transport text. A new attempt clears the previous error.
+Details unavailable from the SDK, including an externally cancelled dial, remain absent.
+The rows are private settings data: do not log them or send their URLs through diagnostics exports.
+
+`reconnectRelay(accountRef, url)` accepts only a relay configured for that account and applies the normal
+dial-safety policy. The account needs an active relay pool. It starts a connection attempt and waits up to
+five seconds for the next observed attempt state, which may still be `Connecting`; the watch reports the outcome.
+Neither `Connected` nor a successful reconnect return proves subscription readiness or message delivery.
+
 ### Markdown rendering
 
 Render the typed Markdown tokens on message, timeline and reply-preview records.

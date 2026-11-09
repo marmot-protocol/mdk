@@ -15,6 +15,7 @@ per feature.
 - [Integration documentation](#integration-documentation)
 - [Lifecycle and teardown](#lifecycle-and-teardown)
 - [Onboarding relay repair](#onboarding-relay-repair)
+- [Relay liveness](#relay-liveness)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction),
   [experimental device-group test builds](#experimental-device-group-test-builds), [local sends](#local-sends),
@@ -34,6 +35,28 @@ per feature.
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
 - [Smoke test and example](#smoke-test-and-example)
 - [Regenerating the header](#regenerating-the-header)
+
+## Relay liveness
+
+Connection states and privacy follow the [shared relay contract](../marmot-uniffi/README.md#relay-liveness).
+
+`marmot_account_relay_liveness` returns an owned `MarmotRelayLivenessList`;
+`marmot_reconnect_relay` returns an owned `MarmotRelayLiveness`. Release them with
+`marmot_relay_liveness_list_free` and `marmot_relay_liveness_free`, respectively.
+The list owns every URL and optional error string. `has_last_attempt_unix` distinguishes
+an absent attempt timestamp from zero; a NULL `last_error` means no error is recorded.
+
+`marmot_subscribe_relay_liveness` creates a `MarmotRelayLivenessSubscription`.
+Its `snapshot` and blocking `next` return owned lists; callback lists are borrowed
+only until the callback returns. Updates carry the latest complete snapshot and may
+coalesce. `snapshot` takes the initial snapshot once; later calls return an empty
+list. The relay callback additionally receives a `MarmotStatus`: OK accompanies a
+list, CLOSED accompanies terminal NULL, and a mapped error status accompanies
+terminal NULL on failure. Blocking `next` returns the same error status directly.
+`close` wakes pending reads without
+freeing the handle; release it with `marmot_relay_liveness_subscription_free` before
+freeing its client. Callback cancellation and context lifetime follow the generic
+subscription rules below.
 
 ## What you get
 

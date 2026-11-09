@@ -36,8 +36,8 @@ use transport_nostr_adapter::{
 };
 
 pub use transport_nostr_adapter::{
-    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, ReplayAdmissionStatus, ReplayFence, ReplayFencePlan,
-    ReplayFenceTicket,
+    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, RelayLiveness, RelayLivenessStatus,
+    ReplayAdmissionStatus, ReplayFence, ReplayFencePlan, ReplayFenceTicket,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -1858,6 +1858,42 @@ impl MarmotRelayPlane {
             );
         }
         RelayPlaneHealth::from_directory(directory, account_delivery)
+    }
+
+    /// Wake local relay-state readers on status or account-pool changes.
+    pub fn relay_liveness_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .map(NostrSdkRelayClient::liveness_changes)
+    }
+
+    /// Reconnect within the account's own pool after applying the dial policy.
+    pub async fn reconnect_relay(
+        &self,
+        account_id: &MemberId,
+        endpoint: TransportEndpoint,
+    ) -> Result<RelayLiveness, TransportAdapterError> {
+        if self.inner.transport.shutting_down.load(Ordering::SeqCst) {
+            return Err(TransportAdapterError::Subscription(
+                "relay plane is shutting down".into(),
+            ));
+        }
+        let endpoint = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(vec![endpoint], "relay reconnect")
+            .map_err(TransportAdapterError::Subscription)?
+            .pop()
+            .expect("one sanitized relay endpoint");
+        let client = self
+            .account_history_relay_client(account_id)
+            .await
+            .ok_or_else(|| {
+                TransportAdapterError::Subscription("account relay pool is unavailable".into())
+            })?;
+        client.reconnect_relay(&endpoint).await
     }
 
     /// Snapshot the device-local relay telemetry for local inspection.

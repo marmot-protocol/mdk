@@ -7,6 +7,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add account relay liveness snapshots, single-relay reconnect, and a closeable
+  subscription with blocking reads and callbacks. `MarmotRelayLivenessList` owns
+  its records and strings; free it with `marmot_relay_liveness_list_free`.
+  Free reconnect results with `marmot_relay_liveness_free` and subscription handles
+  with `marmot_relay_liveness_subscription_free`. Callback snapshots are borrowed;
+  this callback receives an explicit status to distinguish errors from close.
+  Rebuild consumers against the matching generated header and library.
+
 - Remove the unused direct `libc` dependency. C allocation and release paths
   continue to use Rust `CString` and `Box`.
 

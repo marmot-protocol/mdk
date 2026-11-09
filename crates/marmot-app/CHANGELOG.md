@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add account-scoped relay liveness snapshots, event-driven subscriptions, and safety-checked per-relay reconnects
+  (mdk#329). Configured relays without a pool entry remain `Unknown`; aggregate health is unchanged.
+
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
 
 - A starting account worker is given up on after 45 s without startup progress, not after 45 s in total

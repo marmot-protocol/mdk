@@ -844,6 +844,16 @@ typedef enum MarmotPushRegistrationShareStatus {
 } MarmotPushRegistrationShareStatus;
 
 /**
+ * Observed connection state of a configured relay.
+ */
+typedef enum MarmotRelayStatus {
+  MARMOT_RELAY_STATUS_UNKNOWN,
+  MARMOT_RELAY_STATUS_CONNECTING,
+  MARMOT_RELAY_STATUS_CONNECTED,
+  MARMOT_RELAY_STATUS_OFFLINE,
+} MarmotRelayStatus;
+
+/**
  * Storage-verified origin of a kind-1210 row.
  */
 typedef enum MarmotGroupSystemEventProvenance {
@@ -1841,6 +1851,11 @@ typedef struct MarmotOnboardingSubscription MarmotOnboardingSubscription;
  * This fallible stream uses blocking next so storage errors retain their typed status.
  */
 typedef struct MarmotPresentedChatListSubscription MarmotPresentedChatListSubscription;
+
+/**
+ * Latest complete relay snapshot for one account; updates may coalesce.
+ */
+typedef struct MarmotRelayLivenessSubscription MarmotRelayLivenessSubscription;
 
 /**
  * Where the next page of attachments starts. Borrowed from its page.
@@ -3664,6 +3679,28 @@ typedef struct MarmotGroupPushDebugInfo {
   struct MarmotGroupPushTokenDebugEntry *tokens;
   uintptr_t tokens_len;
 } MarmotGroupPushDebugInfo;
+
+/**
+ * One configured relay's observed connection state.
+ */
+typedef struct MarmotRelayLiveness {
+  char *url;
+  enum MarmotRelayStatus status;
+  bool has_last_attempt_unix;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_attempt_unix;
+  char *last_error;
+} MarmotRelayLiveness;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotRelayLivenessList {
+  struct MarmotRelayLiveness *items;
+  uintptr_t len;
+} MarmotRelayLivenessList;
 
 /**
  * Relay-telemetry export settings. Also a borrowed input to
@@ -7052,6 +7089,14 @@ typedef struct MarmotPresentedChatListUpdate {
   struct MarmotPresentedChatListSnapshot snapshot;
 } MarmotPresentedChatListUpdate;
 
+/**
+ * OK carries a borrowed list. Terminal error or CLOSED carries NULL.
+ * The list is valid only during the callback and must not be freed.
+ */
+typedef void (*MarmotRelayLivenessCallback)(const struct MarmotRelayLivenessList *item,
+                                            MarmotStatus status,
+                                            void *user_data);
+
 typedef struct MarmotBlockListSnapshot {
   uint64_t revision;
   struct MarmotBlockedUser *users;
@@ -9997,6 +10042,34 @@ MarmotStatus marmot_group_push_debug_info(const struct MarmotClient *client,
 MarmotStatus marmot_account_relay_lists(const struct MarmotClient *client,
                                         const char *account_ref,
                                         struct MarmotAccountRelayLists **out);
+
+/**
+ * Configured relay connection states. Free with `marmot_relay_liveness_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_relay_liveness(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           struct MarmotRelayLivenessList **out);
+
+/**
+ * Reconnect one configured relay and return its next observed state.
+ * Free with `marmot_relay_liveness_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reconnect_relay(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *url,
+                                    struct MarmotRelayLiveness **out);
 
 /**
  * Current relay-telemetry export settings. Free with
@@ -13888,6 +13961,67 @@ MarmotStatus marmot_presented_chat_list_subscription_next(const struct MarmotPre
 void marmot_presented_chat_list_subscription_free(struct MarmotPresentedChatListSubscription *sub);
 
 /**
+ * Receive a complete snapshot; zero timeout waits indefinitely.
+ * Timeout, close and errors leave out NULL. Free successful results with
+ * `marmot_relay_liveness_list_free`.
+ * # Safety
+ * Subscription must remain live throughout the call; out must be writable.
+ */
+MarmotStatus marmot_relay_liveness_subscription_next(const struct MarmotRelayLivenessSubscription *sub,
+                                                     uint32_t timeout_ms,
+                                                     struct MarmotRelayLivenessList **out);
+
+/**
+ * Install a callback. Errors terminate the pump with NULL and the mapped status;
+ * natural close terminates it with NULL and CLOSED. Do not mix with blocking next.
+ * # Safety
+ * Subscription and callback must be valid. user_data must outlive all callbacks;
+ * clear/free request cancellation without waiting for an executing callback.
+ */
+MarmotStatus marmot_relay_liveness_subscription_set_callback(const struct MarmotRelayLivenessSubscription *sub,
+                                                             MarmotRelayLivenessCallback callback,
+                                                             void *user_data);
+
+/**
+ * Request callback cancellation without waiting; no terminal callback is guaranteed.
+ * # Safety
+ * Subscription must be live; callback context must outlive any executing callback.
+ */
+MarmotStatus marmot_relay_liveness_subscription_clear_callback(const struct MarmotRelayLivenessSubscription *sub);
+
+/**
+ * Free before its client. NULL is a no-op; callback cancellation does not wait.
+ * # Safety
+ * Subscription must be NULL or library-owned with no active calls.
+ */
+void marmot_relay_liveness_subscription_free(struct MarmotRelayLivenessSubscription *sub);
+
+/**
+ * Subscribe to one account's configured relay connection states.
+ * # Safety
+ * Client, account string and output pointer must be valid.
+ */
+MarmotStatus marmot_subscribe_relay_liveness(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             struct MarmotRelayLivenessSubscription **out_sub);
+
+/**
+ * Take the initial complete snapshot once; subsequent calls return an empty list.
+ * Free the result with `marmot_relay_liveness_list_free`.
+ * # Safety
+ * Subscription and output pointer must be valid.
+ */
+MarmotStatus marmot_relay_liveness_subscription_snapshot(const struct MarmotRelayLivenessSubscription *sub,
+                                                         struct MarmotRelayLivenessList **out);
+
+/**
+ * Close the watch without freeing its handle. Pending reads wake as closed.
+ * # Safety
+ * Subscription must be a live handle.
+ */
+MarmotStatus marmot_relay_liveness_subscription_close(const struct MarmotRelayLivenessSubscription *sub);
+
+/**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_block_list_snapshot_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
  *
  * # Safety
@@ -15390,6 +15524,25 @@ void marmot_push_registration_sync_result_free(struct MarmotPushRegistrationSync
  * this library.
  */
 void marmot_group_push_debug_info_free(struct MarmotGroupPushDebugInfo *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_relay_liveness_free(struct MarmotRelayLiveness *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_relay_liveness_list_free(struct MarmotRelayLivenessList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

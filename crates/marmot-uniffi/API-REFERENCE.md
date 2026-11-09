@@ -3697,7 +3697,7 @@ pub fn telemetry_install_id(&self) -> Result<String, MarmotKitError>
 
 Consent-bound random OTLP identifier, stable until revocation. Requires a current combined grant; never use this value in product events.
 
-[Source](src/commands/relay.rs#L61)
+[Source](src/commands/relay.rs#L98)
 
 ### `Marmot::set_relay_telemetry_runtime_config`
 
@@ -3709,7 +3709,7 @@ pub async fn set_relay_telemetry_runtime_config( &self, config: RelayTelemetryRu
 
 Supply non-persisted OTLP runtime metadata: optional metrics URL override, bearer token from the host app's build-time secret, and resource attributes from the platform shell.
 
-[Source](src/commands/relay.rs#L68)
+[Source](src/commands/relay.rs#L105)
 
 ### `Marmot::set_relay_telemetry_settings`
 
@@ -3721,7 +3721,7 @@ pub async fn set_relay_telemetry_settings( &self, settings: RelayTelemetrySettin
 
 Deprecated consent control. Use `set_usage_diagnostics_consent` instead. Enable requires a combined grant; disable revokes both exporters. This compatibility setter still updates the telemetry interval.
 
-[Source](src/commands/relay.rs#L80)
+[Source](src/commands/relay.rs#L117)
 
 </details>
 
@@ -4834,7 +4834,7 @@ pub fn snapshot(&self) -> Vec<AppGroupRecordFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L58)
+[Source](src/subscriptions.rs#L60)
 
 ### `ChatsSubscription::next`
 
@@ -4846,7 +4846,7 @@ pub async fn next(&self) -> Option<AppGroupRecordFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L63)
+[Source](src/subscriptions.rs#L65)
 
 ### `ChatListSubscription::snapshot`
 
@@ -4858,7 +4858,7 @@ pub fn snapshot(&self) -> Vec<ChatListRowFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L99)
+[Source](src/subscriptions.rs#L101)
 
 ### `ChatListSubscription::next`
 
@@ -4870,7 +4870,7 @@ pub async fn next(&self) -> Option<ChatListRowFfi>
 
 Legacy row-only update stream.
 
-[Source](src/subscriptions.rs#L114)
+[Source](src/subscriptions.rs#L116)
 
 ### `ChatListSubscription::next_update`
 
@@ -4882,7 +4882,7 @@ pub async fn next_update(&self) -> Option<ChatListSubscriptionUpdateFfi>
 
 Typed update stream, including atomic full-list replacement snapshots.
 
-[Source](src/subscriptions.rs#L139)
+[Source](src/subscriptions.rs#L141)
 
 ### `MessagesSubscription::snapshot`
 
@@ -4894,7 +4894,7 @@ pub fn snapshot(&self) -> Vec<AppMessageRecordFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L167)
+[Source](src/subscriptions.rs#L169)
 
 ### `MessagesSubscription::next`
 
@@ -4906,7 +4906,7 @@ pub async fn next(&self) -> Option<MessageUpdateFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L172)
+[Source](src/subscriptions.rs#L174)
 
 ### `TimelineMessagesSubscription::snapshot`
 
@@ -4918,7 +4918,7 @@ pub fn snapshot(&self) -> Option<TimelinePageFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L263)
+[Source](src/subscriptions.rs#L265)
 
 ### `TimelineMessagesSubscription::next`
 
@@ -4930,7 +4930,7 @@ pub async fn next(&self) -> Option<TimelinePageFfi>
 
 Await the next live update and return the resulting authoritative window. Windowing (ordering, dedup, head-anchoring while scrolled back, and the cap) is owned by the runtime, so this returns exactly the bounded window pagination operates on — render it directly. Use `next_update`(Self::next_update) instead to receive the raw delta.
 
-[Source](src/subscriptions.rs#L273)
+[Source](src/subscriptions.rs#L275)
 
 ### `TimelineMessagesSubscription::next_update`
 
@@ -4942,7 +4942,7 @@ pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi>
 
 Consume raw timeline deltas or a replacement page. Use either next or next_update, not both; the host maintains delta ordering and bounds.
 
-[Source](src/subscriptions.rs#L283)
+[Source](src/subscriptions.rs#L285)
 
 ### `TimelineMessagesSubscription::paginate_backwards`
 
@@ -4954,7 +4954,7 @@ pub async fn paginate_backwards(&self, count: u32) -> Result<TimelinePageFfi, Ma
 
 Extend the materialized window toward older history by up to `count` messages and return the new window. The returned page is already sorted, deduplicated, capped, and carries correct `has_more_before` / `has_more_after` flags — render it directly; no client-side merging or windowing is required. The store read runs off the caller thread and uses a different lock than `next()`, so a host driving `next()` on a background task can paginate without blocking (and this never blocks the UI thread, unlike the synchronous `Marmot::timeline_messages`).
 
-[Source](src/subscriptions.rs#L296)
+[Source](src/subscriptions.rs#L298)
 
 ### `TimelineMessagesSubscription::paginate_forwards`
 
@@ -4966,7 +4966,7 @@ pub async fn paginate_forwards(&self, count: u32) -> Result<TimelinePageFfi, Mar
 
 Extend the materialized window toward the live head by up to `count` messages and return the new window. Reaching the head re-anchors the window (`has_more_after` becomes false). Same windowing/threading guarantees as `paginate_backwards`(Self::paginate_backwards).
 
-[Source](src/subscriptions.rs#L305)
+[Source](src/subscriptions.rs#L307)
 
 ### `GroupStateSubscription::snapshot`
 
@@ -4978,7 +4978,7 @@ pub fn snapshot(&self) -> Option<AppGroupRecordFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L330)
+[Source](src/subscriptions.rs#L332)
 
 ### `GroupStateSubscription::next`
 
@@ -4990,7 +4990,7 @@ pub async fn next(&self) -> Option<AppGroupRecordFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L335)
+[Source](src/subscriptions.rs#L337)
 
 ### `EventsSubscription::next`
 
@@ -5002,7 +5002,7 @@ pub async fn next(&self) -> Option<MarmotEventFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L362)
+[Source](src/subscriptions.rs#L364)
 
 ### `NotificationsSubscription::next`
 
@@ -5014,7 +5014,7 @@ pub async fn next(&self) -> Option<NotificationUpdateFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L385)
+[Source](src/subscriptions.rs#L387)
 
 ### `UserSearchSubscription::next_update`
 
@@ -5026,7 +5026,7 @@ pub async fn next_update(&self) -> Option<UserSearchUpdateFfi>
 
 Await the next step of the search, or `None` once it is over.
 
-[Source](src/subscriptions.rs#L445)
+[Source](src/subscriptions.rs#L447)
 
 ### `AgentStreamSubscription::stream_id_hex`
 
@@ -5038,7 +5038,7 @@ pub fn stream_id_hex(&self) -> String
 
 The resolved stream id this watch is following (hex).
 
-[Source](src/subscriptions.rs#L455)
+[Source](src/subscriptions.rs#L457)
 
 ### `AgentStreamSubscription::next`
 
@@ -5050,7 +5050,7 @@ pub async fn next(&self) -> Option<AgentStreamUpdateFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L460)
+[Source](src/subscriptions.rs#L462)
 
 ### `PresentedChatListSubscription::snapshot`
 
@@ -5062,7 +5062,7 @@ pub fn snapshot(&self) -> Option<crate::conversions::PresentedChatListUpdateFfi>
 
 Take the initial snapshot once, with generation and sequence zero.
 
-[Source](src/subscriptions.rs#L494)
+[Source](src/subscriptions.rs#L496)
 
 ### `PresentedChatListSubscription::next`
 
@@ -5074,7 +5074,7 @@ pub async fn next( &self, ) -> Result<Option<crate::conversions::PresentedChatLi
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L498)
+[Source](src/subscriptions.rs#L500)
 
 </details>
 
@@ -5385,7 +5385,7 @@ pub async fn next(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
 
 Wait for the next aggregate progress or availability revision; `None` means the worker closed. This receive is cancellation-safe. Closing the observer does not cancel restore; use the named operation command.
 
-[Source](src/subscriptions.rs#L534)
+[Source](src/subscriptions.rs#L536)
 
 ### `BackupRestoreSubscription::snapshot`
 
@@ -5395,7 +5395,7 @@ pub fn snapshot(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
 
 Take the initial status exactly once; later calls return `None`. Use `next` for changes or `backupRestoreStatus` for a fresh read. This observer owns neither recovery words nor the operation.
 
-[Source](src/subscriptions.rs#L530)
+[Source](src/subscriptions.rs#L532)
 
 ### `Marmot::backup_history_availability`
 
@@ -5643,3 +5643,76 @@ Reads the account's own kind-10030 emoji list and the kind-30030 sets its `a` ta
 [Source](src/commands/emoji_set.rs#L84)
 
 </details>
+
+## Relay liveness
+
+### `Marmot::account_relay_liveness`
+
+```rust
+pub async fn account_relay_liveness( &self, account_ref: String, ) -> Result<Vec<conversions::RelayLivenessFfi>, MarmotKitError>
+```
+
+Read every configured relay's canonical URL and current account-pool state without dialing.
+Missing pool entries are `Unknown`. Attempt times and bounded connection-error categories are session-local and
+optional. See the [state and privacy contract](README.md#relay-liveness); aggregate `relay_health` is unchanged.
+
+[Source](src/commands/relay.rs#L60)
+
+### `Marmot::reconnect_relay`
+
+```rust
+pub async fn reconnect_relay( &self, account_ref: String, url: String, ) -> Result<conversions::RelayLivenessFfi, MarmotKitError>
+```
+
+Reconnect one configured relay in the account's active receive/history pool after the normal dial-safety check.
+Wait up to five seconds for the next observed attempt state, which may be `Connecting` rather than a successful
+connection. Use the liveness subscription for the eventual outcome; this does not establish message delivery.
+
+[Source](src/commands/relay.rs#L84)
+
+### `Marmot::subscribe_relay_liveness`
+
+```rust
+pub async fn subscribe_relay_liveness( &self, account_ref: String, ) -> Result<std::sync::Arc<crate::RelayLivenessSubscription>, MarmotKitError>
+```
+
+Open an account-scoped observer before reading its initial snapshot. Take `snapshot()` once, then apply each
+`next()` list as a complete replacement. Updates follow socket, account-pool, and configured-list changes without
+polling and may coalesce intermediate states. Close the observer when leaving the settings screen.
+
+[Source](src/commands/relay.rs#L74)
+
+### `RelayLivenessSubscription::close`
+
+```rust
+pub fn close(&self)
+```
+
+Stop this observer and wake pending receives with `None`. Future receives also return `None`.
+The call does not disconnect the account's relays; release the foreign handle separately.
+
+[Source](src/subscriptions/relay_liveness.rs#L44)
+
+### `RelayLivenessSubscription::next`
+
+```rust
+pub async fn next(&self) -> Result<Option<Vec<RelayLivenessFfi>>, MarmotKitError>
+```
+
+Wait for a complete replacement list. Slow consumers may skip intermediate states; cancellation does not consume
+an update. `None` ends the stream after close or runtime shutdown. A read failure propagates as `MarmotKitError`
+and ends this observer. Snapshot production runs on MDK's runtime, not the calling host thread.
+
+[Source](src/subscriptions/relay_liveness.rs#L35)
+
+### `RelayLivenessSubscription::snapshot`
+
+```rust
+pub fn snapshot(&self) -> Vec<RelayLivenessFfi>
+```
+
+Take the initial list once; subsequent calls return an empty list. An empty first list is valid for an account
+without configured relay entries. This method does not consume a later update or initiate a connection.
+
+[Source](src/subscriptions/relay_liveness.rs#L29)
+

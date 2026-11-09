@@ -18,6 +18,8 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
 - Fetches directory events by author and kind, and keeps the directory subscriptions the app asks for
   (`directory.rs`).
 - Filters every relay endpoint through `RelaySafetyPolicy` (`safety.rs`) before any connect.
+- Exposes account-pool liveness wakeups and safety-checked reconnects. The app joins observed pool state to its
+  configured relay lists; relay settings never resolve telemetry's opaque relay indices.
 
 ## What this crate does not do
 

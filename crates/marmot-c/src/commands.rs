@@ -98,7 +98,8 @@ use crate::types::push::{
 };
 use crate::types::relay::{
     MarmotAccountRelayLists, MarmotRelayEndpointClassificationList, MarmotRelayHealth,
-    MarmotRelayTelemetryRuntimeConfig, MarmotRelayTelemetrySettings,
+    MarmotRelayLiveness, MarmotRelayLivenessList, MarmotRelayTelemetryRuntimeConfig,
+    MarmotRelayTelemetrySettings,
 };
 use crate::types::sign_in::{MarmotSignInResponse, MarmotUnrecognizedSignInList};
 use crate::types::sticker::{
@@ -1155,6 +1156,13 @@ c_cmd! {
     /// The account's full relay-list state. Free with
     /// `marmot_account_relay_lists_free`.
     sync fn marmot_account_relay_lists(account_ref: str) -> rec(MarmotAccountRelayLists) = account_relay_lists;
+
+    /// Configured relay connection states. Free with `marmot_relay_liveness_list_free`.
+    async fn marmot_account_relay_liveness(account_ref: str) -> rec(MarmotRelayLivenessList) = account_relay_liveness;
+
+    /// Reconnect one configured relay and return its next observed state.
+    /// Free with `marmot_relay_liveness_free`.
+    async fn marmot_reconnect_relay(account_ref: str, url: str) -> rec(MarmotRelayLiveness) = reconnect_relay;
 
     /// Current relay-telemetry export settings. Free with
     /// `marmot_relay_telemetry_settings_free`.

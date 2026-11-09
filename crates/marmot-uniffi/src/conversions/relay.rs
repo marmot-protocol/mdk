@@ -186,6 +186,48 @@ impl From<RelayEndpointClassification> for RelayEndpointClassificationFfi {
     }
 }
 
+/// Stable connection states for localized relay settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RelayStatusFfi {
+    Unknown,
+    Connecting,
+    Connected,
+    Offline,
+}
+
+impl From<marmot_app::RelayLivenessStatus> for RelayStatusFfi {
+    fn from(value: marmot_app::RelayLivenessStatus) -> Self {
+        match value {
+            marmot_app::RelayLivenessStatus::Unknown => Self::Unknown,
+            marmot_app::RelayLivenessStatus::Connecting => Self::Connecting,
+            marmot_app::RelayLivenessStatus::Connected => Self::Connected,
+            marmot_app::RelayLivenessStatus::Offline => Self::Offline,
+        }
+    }
+}
+
+/// Session-local state of one configured relay. Details can be unavailable.
+#[derive(Clone, uniffi::Record)]
+pub struct RelayLivenessFfi {
+    pub url: String,
+    pub status: RelayStatusFfi,
+    pub last_attempt_unix: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+redact!(RelayLivenessFfi);
+
+impl From<marmot_app::RelayLiveness> for RelayLivenessFfi {
+    fn from(value: marmot_app::RelayLiveness) -> Self {
+        Self {
+            url: value.url,
+            status: value.status.into(),
+            last_attempt_unix: value.last_attempt_unix,
+            last_error: value.last_error,
+        }
+    }
+}
+
 /// Live relay-plane connection health for the diagnostics view.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RelayHealthFfi {

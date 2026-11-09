@@ -2,13 +2,35 @@
 
 use marmot_uniffi::conversions::{
     AccountRelayListsFfi, MissingRelayListKindFfi, RelayEndpointClassificationFfi,
-    RelayEndpointPolicyFfi, RelayHealthFfi, RelayListFfi, RelayTelemetryResourceFfi,
-    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
+    RelayEndpointPolicyFfi, RelayHealthFfi, RelayListFfi, RelayLivenessFfi, RelayStatusFfi,
+    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
 };
 
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{c_bool, optional_str, required_str};
+
+c_enum! {
+    /// Observed connection state of a configured relay.
+    MarmotRelayStatus from RelayStatusFfi {
+        Unknown,
+        Connecting,
+        Connected,
+        Offline,
+    }
+}
+
+c_mirror! {
+    /// One configured relay's observed connection state.
+    MarmotRelayLiveness from RelayLivenessFfi,
+    free marmot_relay_liveness_free,
+    list(MarmotRelayLivenessList, marmot_relay_liveness_list_free) {
+        str url,
+        copy status: MarmotRelayStatus,
+        opt_copy has_last_attempt_unix/last_attempt_unix: u64,
+        opt_str last_error,
+    }
+}
 
 c_mirror! {
     /// One published relay list (`kind` is the Nostr event kind).

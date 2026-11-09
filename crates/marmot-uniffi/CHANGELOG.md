@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `account_relay_liveness`, `subscribe_relay_liveness`, and `reconnect_relay` (mdk#329), with
+  `RelayLivenessFfi`, stable `RelayStatusFfi`, and a closeable `RelayLivenessSubscription`.
+  Rows include session-local attempt times and available connection-error categories. Additive; aggregate health
+  remains unchanged.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
   `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
   finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New

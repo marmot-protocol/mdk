@@ -191,8 +191,9 @@ pub use runtime::{
     RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
     RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
     RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
-    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    RuntimeRelayLivenessSubscription, RuntimeSharedServices, RuntimeTimelineMessageUpdate,
+    RuntimeTimelineMessagesSubscription, SignOutOptions, SignOutOutcome, StreamStartView,
+    TimelineWindowHandle, WipeOutcome,
 };
 pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
@@ -367,8 +368,9 @@ pub use storage_sqlite::{
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 pub use transport_nostr::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
-    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayLiveness, RelayLivenessStatus,
+    RelayPlaneHealth, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+    retired_relay_hosts,
 };
 #[cfg(test)]
 use transport_nostr_adapter::parse_nip65_relay_set;

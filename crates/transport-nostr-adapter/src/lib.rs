@@ -107,8 +107,9 @@ pub use relay_list::{
 pub use sdk_client::{
     NostrReconciliationEndpointFailure, NostrReconciliationFailure, NostrReconciliationItem,
     NostrReconciliationProgress, NostrReconciliationSummary, NostrSdkNotification,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
-    dispatch_sdk_replay, sdk_subscription_refusal, sign_transport_event_for_publish,
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayLiveness,
+    RelayLivenessStatus, RelayRegistrationOutcome, dispatch_sdk_replay, sdk_subscription_refusal,
+    sign_transport_event_for_publish,
 };
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,

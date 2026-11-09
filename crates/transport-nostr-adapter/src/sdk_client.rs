@@ -4,7 +4,7 @@ use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use nostr_sdk::prelude::{
     SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::{EventSendStatus, RelayNotification};
+use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
@@ -960,6 +961,57 @@ static SDK_READER_EPOCH: AtomicU64 = AtomicU64::new(1);
 static SDK_MONITOR_ID: AtomicU64 = AtomicU64::new(1);
 static SDK_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// A relay's socket state, independent of message traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayLivenessStatus {
+    Unknown,
+    Connecting,
+    Connected,
+    Offline,
+}
+
+impl From<RelayStatus> for RelayLivenessStatus {
+    fn from(status: RelayStatus) -> Self {
+        match status {
+            RelayStatus::Initialized => Self::Unknown,
+            RelayStatus::Pending | RelayStatus::Connecting => Self::Connecting,
+            RelayStatus::Connected => Self::Connected,
+            RelayStatus::Disconnected
+            | RelayStatus::Terminated
+            | RelayStatus::Banned
+            | RelayStatus::Sleeping
+            | RelayStatus::Shutdown => Self::Offline,
+        }
+    }
+}
+
+/// Local presentation data. Relay URLs must not enter logs or telemetry.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayLiveness {
+    pub url: String,
+    pub status: RelayLivenessStatus,
+    /// Unix seconds of the latest transport connect attempt. Opaque clients use
+    /// the time a status notification reveals a new SDK attempt count.
+    pub last_attempt_unix: Option<u64>,
+    /// The SDK error category from the latest failed transport connect.
+    /// Unavailable for opaque clients supplied to `NostrSdkRelayClient::new`.
+    pub last_error: Option<String>,
+}
+
+impl std::fmt::Debug for RelayLiveness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayLiveness")
+            .field("url", &"<redacted>")
+            .field("status", &self.status)
+            .field("last_attempt_unix", &self.last_attempt_unix)
+            .field(
+                "last_error",
+                &self.last_error.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 fn next_reader_epoch() -> u64 {
     SDK_READER_EPOCH.fetch_add(1, Ordering::SeqCst)
 }
@@ -978,6 +1030,9 @@ struct RelayFrontier {
     connections_seen: usize,
     /// [`connection_stamp`] for the latest connection it saw open.
     connected_at: Option<u64>,
+    last_attempt_unix: Option<u64>,
+    attempts_observed: usize,
+    last_error: Option<String>,
     monitor: JoinHandle<()>,
 }
 
@@ -1062,10 +1117,63 @@ struct SdkNotificationFrontier {
     /// Each monitored relay's latest connection seen opening, by URL
     /// ([`NostrSdkRelayClient::relay_connections`]).
     connections: watch::Sender<BTreeMap<String, u64>>,
+    liveness: Arc<watch::Sender<u64>>,
     loss: watch::Sender<Option<NostrNotificationLoss>>,
     subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
     owed: Arc<OwedSubscriptions>,
     state: StdMutex<FrontierState>,
+}
+
+#[derive(Clone)]
+struct LivenessTransport {
+    transport: HintTransport,
+    frontier: Arc<OnceLock<Weak<SdkNotificationFrontier>>>,
+}
+
+type LivenessConnectFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<(WebSocketSink, WebSocketStream), nostr_sdk::error::Error>>
+            + Send
+            + 'a,
+    >,
+>;
+
+impl std::fmt::Debug for LivenessTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LivenessTransport").finish_non_exhaustive()
+    }
+}
+
+impl WebSocketTransport for LivenessTransport {
+    fn support_ping(&self) -> bool {
+        self.transport.support_ping()
+    }
+
+    fn connect<'a>(
+        &'a self,
+        url: &'a nostr_sdk::prelude::Url,
+        proxy: Option<std::net::SocketAddr>,
+    ) -> LivenessConnectFuture<'a> {
+        Box::pin(async move {
+            let endpoint = RelayUrl::parse(url.as_str()).ok();
+            if let (Some(frontier), Some(endpoint)) =
+                (self.frontier.get().and_then(Weak::upgrade), &endpoint)
+            {
+                frontier.connect_attempt(endpoint, None);
+            }
+            let result = self.transport.connect(url, proxy).await;
+            if let (Some(frontier), Some(endpoint), Err(error)) = (
+                self.frontier.get().and_then(Weak::upgrade),
+                &endpoint,
+                &result,
+            ) {
+                // Error Display/source can contain URLs and handshake data.
+                // The SDK's finite error-kind vocabulary contains neither.
+                frontier.connect_attempt(endpoint, Some(error.kind().to_string()));
+            }
+            result
+        })
+    }
 }
 
 impl Drop for SdkNotificationFrontier {
@@ -1085,6 +1193,7 @@ impl SdkNotificationFrontier {
         loss: watch::Sender<Option<NostrNotificationLoss>>,
         subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
         owed: Arc<OwedSubscriptions>,
+        liveness: Arc<watch::Sender<u64>>,
     ) -> Self {
         let (sender, receiver) = broadcast::channel(SDK_NOTIFICATION_CAPACITY);
         let reader = next_reader_epoch();
@@ -1092,6 +1201,7 @@ impl SdkNotificationFrontier {
             sender,
             cutovers: watch::channel(reader).0,
             connections: watch::channel(BTreeMap::new()).0,
+            liveness,
             loss,
             subscription_floors,
             owed,
@@ -1106,6 +1216,28 @@ impl SdkNotificationFrontier {
                 scope: NostrNotificationLossScope::SharedReceiver,
             }),
         }
+    }
+
+    fn liveness_changed(&self) {
+        self.liveness.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
+    }
+
+    fn connect_attempt(&self, endpoint: &RelayUrl, error: Option<String>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.shutdown {
+            return;
+        }
+        let Some(entry) = state.relays.get_mut(endpoint) else {
+            return;
+        };
+        if error.is_none() {
+            entry.last_attempt_unix = Some(NostrTimestamp::now().as_secs());
+            entry.attempts_observed = entry.relay.stats().attempts();
+        }
+        entry.last_error = error;
+        self.liveness_changed();
     }
 
     fn record_gap(&self, skipped: u64, scope: NostrNotificationLossScope) {
@@ -1164,6 +1296,7 @@ impl SdkNotificationFrontier {
         }
         entry.connections_seen = connections_seen;
         entry.connected_at = connection_stamp(relay, connections_seen);
+        self.liveness_changed();
         self.cutover_locked(&mut state, skipped);
         true
     }
@@ -1187,7 +1320,7 @@ impl SdkNotificationFrontier {
 
     fn monitor_shutdown(self: &Arc<Self>, client: &Client) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.shutdown_monitor.is_some() {
+        if state.shutdown || state.shutdown_monitor.is_some() {
             return;
         }
         // This receiver is shutdown-only. Transport payloads never cross the
@@ -1210,6 +1343,7 @@ impl SdkNotificationFrontier {
                     .unwrap_or_else(PoisonError::into_inner);
                 state.shutdown = true;
                 state.disconnect_all(&frontier.sender);
+                frontier.liveness_changed();
                 for relay in state.relays.values() {
                     relay.monitor.abort();
                 }
@@ -1273,6 +1407,7 @@ impl SdkNotificationFrontier {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = state.relays.remove(endpoint) {
             entry.monitor.abort();
+            self.liveness_changed();
         }
         self.connections
             .send_if_modified(|open| open.remove(&endpoint.to_string()).is_some());
@@ -1296,6 +1431,7 @@ impl SdkNotificationFrontier {
         // Count before subscribing: every `Connected` received afterwards is
         // a later connection.
         let connections_seen = relay.stats().success();
+        let attempts_observed = relay.stats().attempts();
         // Subscribe synchronously, before the caller can issue connect/REQ.
         let mut notifications = relay.notifications_with_gaps();
         let connected = relay.status() == RelayStatus::Connected;
@@ -1347,6 +1483,15 @@ impl SdkNotificationFrontier {
                         };
                         if entry.monitor_id != monitor_id {
                             return;
+                        }
+                        if let RelayNotification::RelayStatus { .. } = &notification {
+                            let attempts = relay.stats().attempts();
+                            if attempts > entry.attempts_observed {
+                                entry.last_attempt_unix = Some(NostrTimestamp::now().as_secs());
+                                entry.attempts_observed = attempts;
+                                entry.last_error = None;
+                            }
+                            frontier.liveness_changed();
                         }
                         let payload = match notification {
                             RelayNotification::RelayStatus {
@@ -1422,9 +1567,13 @@ impl SdkNotificationFrontier {
                 connected,
                 connections_seen,
                 connected_at,
+                last_attempt_unix: None,
+                attempts_observed,
+                last_error: None,
                 monitor,
             },
         );
+        self.liveness_changed();
     }
 }
 
@@ -1965,6 +2114,10 @@ pub async fn dispatch_sdk_replay(
 
 impl NostrSdkRelayClient {
     pub fn new(client: Client) -> Self {
+        Self::new_with_liveness(client, Arc::new(watch::channel(0).0))
+    }
+
+    fn new_with_liveness(client: Client, liveness: Arc<watch::Sender<u64>>) -> Self {
         let notification_loss_tx = watch::channel(None).0;
         let subscription_floors = Arc::new(StdMutex::new(SubscriptionFloors::default()));
         let owed = Arc::new(OwedSubscriptions::default());
@@ -1972,6 +2125,7 @@ impl NostrSdkRelayClient {
             notification_loss_tx.clone(),
             subscription_floors.clone(),
             owed.clone(),
+            liveness,
         ));
         Self {
             publish_relay_cache: Arc::new(PublishRelayCache {
@@ -2072,11 +2226,12 @@ impl NostrSdkRelayClient {
         let builder = process_proxy::nostr_builder(Ok(proxy)).authenticator(
             nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
         );
-        let mut context = Self::from_builder(builder);
+        let mut context = Self::from_builder_with_liveness(builder, self.frontier.liveness.clone());
         context.signer = Some(SdkSigner(signer));
         context.frontier.set_account(&account_id);
         context.account_id = Some(account_id.clone());
         clients.insert(account_id, context.clone());
+        self.frontier.liveness_changed();
         Ok(context)
     }
 
@@ -2150,11 +2305,25 @@ impl NostrSdkRelayClient {
     /// Preserves the builder's authenticator, database, transport, admission
     /// policy and gossip callback. Use [`Self::new`] for an already-built custom client.
     pub fn from_builder(builder: ClientBuilder) -> Self {
+        Self::from_builder_with_liveness(builder, Arc::new(watch::channel(0).0))
+    }
+
+    fn from_builder_with_liveness(
+        builder: ClientBuilder,
+        liveness: Arc<watch::Sender<u64>>,
+    ) -> Self {
         let gossip = builder.gossip.clone();
         let authenticator_available = builder.authenticator.is_some();
         let eose_hints = Arc::new(EoseHints::default());
         let transport = HintTransport::new(builder.websocket_transport.clone(), eose_hints.clone());
-        let mut client = Self::new(builder.websocket_transport(transport).build());
+        let observer = Arc::new(OnceLock::new());
+        let transport = LivenessTransport {
+            transport,
+            frontier: observer.clone(),
+        };
+        let mut client =
+            Self::new_with_liveness(builder.websocket_transport(transport).build(), liveness);
+        let _ = observer.set(Arc::downgrade(&client.frontier));
         client.publication = SdkPublication::OwnedRelay {
             gossip,
             authenticator_available,
@@ -2165,6 +2334,129 @@ impl NostrSdkRelayClient {
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Coalescing generation changes for this context and, on a root, all accounts.
+    /// Subscribe before reading a snapshot to avoid missing an intervening change.
+    pub fn liveness_changes(&self) -> watch::Receiver<u64> {
+        self.frontier.liveness.subscribe()
+    }
+
+    /// Snapshot of physical pool relays. This performs no network I/O.
+    /// Configured relays not yet in the pool belong to the caller's snapshot.
+    pub async fn relay_liveness(&self) -> Vec<RelayLiveness> {
+        if self.require_account_context {
+            return Vec::new();
+        }
+        let _lifecycle = self.publish_relay_cache.lifecycle.lock().await;
+        let relays = self.client.relays().await;
+        self.frontier.monitor_shutdown(&self.client);
+        for relay in relays.values() {
+            self.frontier.attach(relay, RelayMonitorAttach::Existing);
+        }
+        let state = self
+            .frontier
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        relays
+            .into_iter()
+            .map(|(url, relay)| {
+                let entry = state.relays.get(&url);
+                RelayLiveness {
+                    url: url.to_string(),
+                    status: relay.status().into(),
+                    last_attempt_unix: entry.and_then(|entry| entry.last_attempt_unix),
+                    last_error: entry.and_then(|entry| entry.last_error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Restart one relay after the caller's safety check. A missing relay joins
+    /// this account's retained READ pool. Returns the next observed attempt's
+    /// current status, which may still be `Connecting`, within five seconds.
+    pub async fn reconnect_relay(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<RelayLiveness, TransportAdapterError> {
+        let failure = |message: &str| TransportAdapterError::Subscription(message.to_owned());
+        if self.require_account_context {
+            return Err(failure("account context required for relay reconnect"));
+        }
+        let endpoint =
+            RelayUrl::parse(endpoint.as_str()).map_err(|_| failure("invalid relay endpoint"))?;
+        timeout(SDK_RELAY_CONNECT_WAIT, async {
+            if self
+                .frontier
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .shutdown
+            {
+                return Err(failure("relay client is closed"));
+            }
+            self.add_acquisition_relay(&endpoint)
+                .await
+                .map_err(|_| failure("reconnect relay unavailable"))?;
+            let mut changes = self.liveness_changes();
+            let previous_attempts = {
+                let _lifecycle = self.publish_relay_cache.lifecycle.lock().await;
+                let state = self
+                    .frontier
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if state.shutdown {
+                    return Err(failure("relay client is closed"));
+                }
+                let entry = state
+                    .relays
+                    .get(&endpoint)
+                    .ok_or_else(|| failure("reconnect relay unavailable"))?;
+                if matches!(
+                    entry.relay.status(),
+                    RelayStatus::Banned | RelayStatus::Shutdown
+                ) {
+                    return Err(failure("relay cannot reconnect"));
+                }
+                let attempts = entry.relay.stats().attempts();
+                entry.relay.disconnect();
+                entry.relay.connect();
+                attempts
+            };
+            loop {
+                changes.borrow_and_update();
+                {
+                    let state = self
+                        .frontier
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if state.shutdown {
+                        return Err(failure("relay client is closed"));
+                    }
+                    let entry = state
+                        .relays
+                        .get(&endpoint)
+                        .ok_or_else(|| failure("reconnect relay unavailable"))?;
+                    if entry.attempts_observed > previous_attempts {
+                        return Ok(RelayLiveness {
+                            url: endpoint.to_string(),
+                            status: entry.relay.status().into(),
+                            last_attempt_unix: entry.last_attempt_unix,
+                            last_error: entry.last_error.clone(),
+                        });
+                    }
+                }
+                changes
+                    .changed()
+                    .await
+                    .map_err(|_| failure("relay observer is closed"))?;
+            }
+        })
+        .await
+        .map_err(|_| failure("relay reconnect observation timed out"))?
     }
 
     /// Each relay of this pool that has connected since its monitor attached,
@@ -2359,6 +2651,7 @@ impl NostrSdkRelayClient {
                 .unwrap_or_else(PoisonError::into_inner);
             state.shutdown = true;
             state.disconnect_all(&self.frontier.sender);
+            self.frontier.liveness_changed();
             let _ = self.frontier.sender.send(NostrSdkNotification::Shutdown);
             let mut monitors = std::mem::take(&mut state.relays)
                 .into_values()
@@ -2434,6 +2727,7 @@ impl NostrSdkRelayClient {
     pub async fn remove_account(&self, account_id: &MemberId) {
         let client = self.account_clients.write().await.remove(account_id);
         if let Some(client) = client {
+            self.frontier.liveness_changed();
             client.shutdown().await;
         }
     }
@@ -2447,6 +2741,9 @@ impl NostrSdkRelayClient {
             .drain()
             .map(|(_, client)| client)
             .collect::<Vec<_>>();
+        if !clients.is_empty() {
+            self.frontier.liveness_changed();
+        }
         for client in clients {
             client.shutdown().await;
         }
@@ -7065,6 +7362,11 @@ mod tests {
         Disconnect,
     }
 
+    enum FirstHandshake {
+        Accept,
+        Reject,
+    }
+
     struct ReplayWire {
         endpoint: TransportEndpoint,
         sender: mpsc::Sender<ReplayWireCmd>,
@@ -7080,12 +7382,21 @@ mod tests {
 
     impl ReplayWire {
         async fn new() -> Self {
+            Self::with_first_handshake(FirstHandshake::Accept).await
+        }
+
+        async fn with_first_handshake(first: FirstHandshake) -> Self {
+            let mut fail_first = matches!(first, FirstHandshake::Reject);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
             let (sender, mut commands) = mpsc::channel(64);
             let (received_tx, received) = mpsc::channel(64);
             let server = tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
+                    if std::mem::take(&mut fail_first) {
+                        drop(stream);
+                        continue;
+                    }
                     let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                     loop {
                         tokio::select! {
@@ -7845,12 +8156,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn liveness_failed_reconnect() {
+        let wire = ReplayWire::with_first_handshake(FirstHandshake::Reject).await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let mut changes = sdk.liveness_changes();
+        assert!(sdk.relay_liveness().await.is_empty());
+        let started = NostrTimestamp::now().as_secs();
+        let first = sdk.reconnect_relay(&wire.endpoint).await.unwrap();
+        assert!(matches!(
+            first.status,
+            RelayLivenessStatus::Connecting | RelayLivenessStatus::Offline
+        ));
+        let failed = timeout(Duration::from_secs(2), async {
+            loop {
+                changes.borrow_and_update();
+                let snapshot = sdk.relay_liveness().await;
+                if let Some(row) = snapshot.into_iter().find(|row| {
+                    row.status == RelayLivenessStatus::Offline && row.last_error.is_some()
+                }) {
+                    return row;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the real failed websocket handshake is observed");
+        assert_eq!(
+            failed.url,
+            RelayUrl::parse(wire.endpoint.as_str()).unwrap().to_string()
+        );
+        assert!(failed.last_attempt_unix.unwrap() >= started);
+        assert_eq!(failed.last_error.as_deref(), Some("transport error"));
+        let diagnostic = format!("{failed:?}");
+        assert!(!diagnostic.contains(&failed.url));
+        assert!(!diagnostic.contains("transport error"));
+        let attempts = sdk
+            .client()
+            .relay(wire.endpoint.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .stats()
+            .attempts();
+        let retried = sdk.reconnect_relay(&wire.endpoint).await.unwrap();
+        assert!(matches!(
+            retried.status,
+            RelayLivenessStatus::Connecting | RelayLivenessStatus::Connected
+        ));
+        timeout(Duration::from_secs(2), async {
+            loop {
+                changes.borrow_and_update();
+                let snapshot = sdk.relay_liveness().await;
+                if snapshot[0].status == RelayLivenessStatus::Connected {
+                    assert_eq!(snapshot[0].last_error, None);
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("manual reconnect establishes the next websocket");
+        let relay = sdk
+            .client()
+            .relay(wire.endpoint.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(relay.stats().attempts() > attempts);
+        drop(changes);
+        let mut replacement = sdk.liveness_changes();
+        replacement.borrow_and_update();
+        sdk.shutdown().await;
+        assert!(replacement.has_changed().unwrap());
+        assert!(matches!(sdk.reconnect_relay(&wire.endpoint).await,
+            Err(TransportAdapterError::Subscription(message)) if message == "relay client is closed"));
+    }
+
+    #[tokio::test]
+    async fn liveness_account_replacement() {
+        let wire = ReplayWire::new().await;
+        let root = NostrSdkRelayClient::multi_account();
+        let mut changes = root.liveness_changes();
+        let alice_keys = Arc::new(Keys::generate());
+        let alice_id = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+        let alice = root
+            .register_account(alice_id.clone(), alice_keys.clone())
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        let bob = Keys::generate();
+        let bob_id = MemberId::new(bob.public_key().to_bytes().to_vec());
+        let bob = root.register_account(bob_id, Arc::new(bob)).await.unwrap();
+        changes.borrow_and_update();
+        alice.reconnect_relay(&wire.endpoint).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                changes.borrow_and_update();
+                if alice.relay_liveness().await[0].status == RelayLivenessStatus::Connected {
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the root watch observes its child's relay connection");
+        assert!(bob.relay_liveness().await.is_empty());
+        changes.borrow_and_update();
+        root.remove_account(&alice_id).await;
+        assert!(changes.has_changed().unwrap());
+        assert!(root.account_relay_client(&alice_id).await.is_none());
+        changes.borrow_and_update();
+        let replacement = root.register_account(alice_id, alice_keys).await.unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(replacement.relay_liveness().await.is_empty());
+        changes.borrow_and_update();
+        replacement.reconnect_relay(&wire.endpoint).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                changes.borrow_and_update();
+                if replacement.relay_liveness().await[0].status == RelayLivenessStatus::Connected {
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the original root watch follows the replacement account pool");
+        assert!(bob.relay_liveness().await.is_empty());
+        root.shutdown_accounts().await;
+        root.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liveness_receiver_drop() {
+        let wire = ReplayWire::new().await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        sdk.client()
+            .add_relay(wire.endpoint.as_str())
+            .await
+            .unwrap();
+        let initial = sdk.relay_liveness().await;
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].status, RelayLivenessStatus::Unknown);
+        assert_eq!(initial[0].last_attempt_unix, None);
+        assert_eq!(initial[0].last_error, None);
+        assert_eq!(
+            sdk.client()
+                .relay(wire.endpoint.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .stats()
+                .attempts(),
+            0
+        );
+        sdk.reconnect_relay(&wire.endpoint).await.unwrap();
+        let mut changes = sdk.liveness_changes();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                changes.borrow_and_update();
+                if sdk.relay_liveness().await[0].status == RelayLivenessStatus::Connected {
+                    break;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the fixture websocket completes before the client is dropped");
+        let frontier = Arc::downgrade(&sdk.frontier);
+        changes.borrow_and_update();
+        drop(sdk);
+        timeout(Duration::from_secs(2), async {
+            while changes.changed().await.is_ok() {}
+        })
+        .await
+        .expect("a watch receiver retains neither the client nor its monitors");
+        assert!(frontier.upgrade().is_none());
+    }
+
+    #[tokio::test]
     async fn a_detached_relay_leaves_the_connection_feed() {
         let wire = ReplayWire::new().await;
         let (sdk, url, connections) = connected_feed(&wire).await;
+        let mut liveness = sdk.liveness_changes();
+        liveness.borrow_and_update();
         sdk.client().remove_relay(url.clone()).await.unwrap();
         sdk.frontier.detach(&url);
         assert!(connections.borrow().is_empty());
+        assert!(liveness.has_changed().unwrap());
+        assert!(sdk.relay_liveness().await.is_empty());
         sdk.shutdown().await;
     }
 

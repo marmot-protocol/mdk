@@ -560,3 +560,98 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     assert_eq!(retained.retained_since, Some(crate::history_floor(stamp)));
     app.relay_plane.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_liveness_account_watch() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise(),
+    );
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let subscription = runtime
+        .subscribe_relay_liveness(&alice.label)
+        .await
+        .unwrap();
+    assert!(subscription.snapshot.is_empty());
+
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec!["wss://relay.example/".into()];
+    lists.nip65.read_relays = vec!["wss://read.example/path/".into()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec!["wss://relay.example".into()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let rows = timeout(Duration::from_secs(2), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>(),
+        vec!["wss://read.example/path/", "wss://relay.example"]
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.status == crate::RelayLivenessStatus::Unknown
+                && row.last_attempt_unix.is_none()
+                && row.last_error.is_none())
+    );
+    assert!(
+        runtime
+            .account_relay_liveness(&bob.label)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        matches!(runtime.reconnect_relay(&bob.label, "wss://relay.example").await,
+        Err(crate::AppError::Transport(TransportAdapterError::Subscription(detail)))
+            if detail == "relay is not configured for this account")
+    );
+
+    // A cancelled receive must not consume the next configured-list replacement.
+    {
+        let receive = subscription.recv();
+        tokio::pin!(receive);
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+    }
+    lists.nip65.created_at += 1;
+    lists.nip65.relays = vec!["wss://replacement.example".into()];
+    lists.nip65.read_relays.clear();
+    lists.inbox.created_at += 1;
+    lists.inbox.relays.clear();
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let rows = timeout(Duration::from_secs(2), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>(),
+        vec!["wss://replacement.example"]
+    );
+    lists.inbox.created_at += 1;
+    lists.inbox.relays = vec!["wss://127.0.0.1".into()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    assert!(
+        matches!(runtime.reconnect_relay(&alice.label, "wss://127.0.0.1").await,
+        Err(crate::AppError::Transport(TransportAdapterError::Subscription(detail)))
+            if detail == "relay reconnect: relay endpoint host is not a public address")
+    );
+    runtime.shutdown().await;
+    assert!(subscription.recv().await.unwrap().is_none());
+}
