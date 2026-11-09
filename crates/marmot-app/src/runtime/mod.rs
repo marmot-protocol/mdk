@@ -2061,9 +2061,10 @@ impl MarmotAppRuntime {
     /// Once admitted to the worker, cancellation detaches the caller without
     /// cancelling creation or retained Welcome delivery. Retry re-reads canonical
     /// state and repairs a missing projection before creating anything. A matching
-    /// canonical group that cannot hydrate causes an error, not a new group. Concurrent
-    /// starts on this account converge locally; simultaneous starts by different
-    /// accounts can create separate groups, each with both participants as admins.
+    /// canonical group eligible for reuse that cannot hydrate causes an error, not
+    /// a new group. Same-account starts converge locally. Simultaneous starts by
+    /// different accounts can create separate groups, each with both participants
+    /// as admins.
     /// See [`Self::pending_welcome_deliveries`] for delivery failures.
     pub async fn start_direct_conversation(
         &self,

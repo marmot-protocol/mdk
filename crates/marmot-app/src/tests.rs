@@ -22599,6 +22599,82 @@ async fn direct_retry_blocks_quarantine() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_retry_skips_removed() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise().with_dev_fail_create_local_projection(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let group_id = {
+        let mut peer = app.client("bob").await.unwrap();
+        peer.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        alice
+            .create_group("", &[&bob.account_id_hex])
+            .await
+            .unwrap()
+    };
+    let storage = app.account_storage("alice").unwrap();
+    let mut removed = storage.get_group(&group_id).unwrap();
+    assert_ne!(
+        removed.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy
+    );
+    removed.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    removed.removed = true;
+    storage.put_group(&removed).unwrap();
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(app.groups("alice").unwrap().is_empty());
+    assert!(!alice.runtime.ensure_group_hydrated(&group_id).unwrap());
+    assert_eq!(alice.runtime.quarantined_groups().len(), 1);
+    assert_eq!(alice.runtime.quarantined_groups()[0].0, group_id);
+    assert!(
+        alice
+            .reusable_direct_group(&bob.account_id_hex)
+            .unwrap()
+            .is_none()
+    );
+    drop(alice);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let created = runtime
+        .start_direct_conversation("alice", &bob.account_id_hex)
+        .await
+        .unwrap();
+    assert_ne!(created, group_id);
+    assert_eq!(
+        runtime
+            .start_direct_conversation("alice", &bob.account_id_hex)
+            .await
+            .unwrap(),
+        created
+    );
+    assert_eq!(
+        storage
+            .list_group_records()
+            .unwrap()
+            .into_iter()
+            .map(|group| group.id)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([group_id, created])
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let dir = tempfile::tempdir().unwrap();

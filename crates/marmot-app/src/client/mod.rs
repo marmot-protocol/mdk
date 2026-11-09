@@ -2056,10 +2056,12 @@ impl AppClient {
             let group = self
                 .stored_group(&group_id)?
                 .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
-            if group
-                .required_capabilities
-                .app_components
-                .contains(cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID)
+            if group.removed
+                || group.disbanded.is_some()
+                || group
+                    .required_capabilities
+                    .app_components
+                    .contains(cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID)
                 || !group.name.trim().is_empty()
             {
                 continue;

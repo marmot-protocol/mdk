@@ -10,8 +10,9 @@
   including after a lost response or projection failure. Recovery restores
   only missing direct projections for the requested peer and announces the
   repaired row. Device groups and unrelated groups remain untouched.
-  A matching quarantined canonical group blocks creation on repeated retries,
-  even without a projection. Generic creation and existing
+  A matching quarantined group still eligible for reuse blocks creation on
+  repeated retries, even without a projection. Removed and disbanded copies
+  do not block a fresh direct. Generic creation and existing
   conversations retain their current admin semantics.
 
 ## 0.15.0 - 2026-11-09
