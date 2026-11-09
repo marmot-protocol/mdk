@@ -142,6 +142,28 @@ fn authors_route_queries_but_never_change_identity() {
 }
 
 #[test]
+fn read_buffers_hold_every_relay_answering_every_filter() {
+    let relays = |count: usize| {
+        (0..count)
+            .map(|index| TransportEndpoint(format!("wss://relay{index}.example")))
+            .collect::<Vec<_>>()
+    };
+    let id = Keys::generate();
+    let note = signed(&id, 1, 10, "hi", Vec::new());
+    let filters = Target::EventId(note.id).filters(None);
+    let per_relay = 1 + EVENT_DELETION_QUERY_LIMIT;
+    // The supplementary query's largest fan-out: eight relays.
+    assert_eq!(read_capacity(&relays(8), &filters), 8 * per_relay);
+    assert_eq!(read_capacity(&relays(1), &filters), per_relay);
+    assert_eq!(read_capacity(&[], &filters), per_relay);
+    let unlimited = [Filter::new().kind(Kind::TextNote)];
+    assert_eq!(
+        read_capacity(&relays(2), &unlimited),
+        2 * MAX_FETCHED_EVENTS
+    );
+}
+
+#[test]
 fn merged_reads_keep_each_event_once_and_completeness_of_all() {
     let keys = Keys::generate();
     let a = signed(&keys, 1, 10, "a", Vec::new());

@@ -81,6 +81,8 @@ const MAX_SUPPLEMENTARY_RELAYS: usize = 8;
 /// Kind-10002 versions each indexer returns for one author's relay list: the
 /// newest. The read's shared buffer holds one per indexer it asks.
 const AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER: usize = 1;
+/// Replies one relay may send for a filter without a limit. Every preview
+/// filter sets one; this only bounds a filter that might not.
 const MAX_FETCHED_EVENTS: usize = 64;
 /// Limit on the unattributed kind-5 query for an event ID. A full answer may
 /// hide the author's deletion behind other keys' requests.
@@ -347,6 +349,20 @@ fn follow_up_deletions(target: &Target, stored: Option<&Event>, fetched: &[Event
             vec![deletions(coordinate.public_key).events(versions).limit(8)]
         }
     }
+}
+
+/// A read's shared event buffer, sized so every relay can answer every filter
+/// up to its limit. The buffer bounds the whole read, not each relay: when it
+/// fills, collection stops, outstanding requests are cancelled and the read is
+/// truncated. A smaller buffer would let replies from some relays, such as
+/// deletion markers anyone can publish, crowd out the target another relay
+/// holds. Relays and limits are both bounded, so the product is too.
+fn read_capacity(relays: &[TransportEndpoint], filters: &[Filter]) -> usize {
+    let per_relay = filters
+        .iter()
+        .map(|filter| filter.limit.unwrap_or(MAX_FETCHED_EVENTS))
+        .sum::<usize>();
+    relays.len().max(1).saturating_mul(per_relay)
 }
 
 /// The first spelling of each relay in `relays`, skipping relays in `exclude`.
@@ -807,9 +823,10 @@ impl<R: DirectoryResources> Directory<R> {
             Ok(mut fetched) => {
                 let filters = follow_up_deletions(&parsed.target, stored_event, &fetched.events);
                 if !filters.is_empty() {
+                    let max_events = read_capacity(&relays, &filters);
                     match self
                         .relay_plane
-                        .fetch_public_events(relays, filters, MAX_FETCHED_EVENTS)
+                        .fetch_public_events(relays, filters, max_events)
                         .await
                     {
                         Ok(more) => fetched.merge(Fetched::new(more.events, more.complete)),
@@ -904,7 +921,11 @@ impl<R: DirectoryResources> Directory<R> {
         let relays = self.public_event_query_relays(parsed.relay_hints.clone());
         let first = self
             .relay_plane
-            .fetch_public_events(relays.clone(), filters.clone(), MAX_FETCHED_EVENTS)
+            .fetch_public_events(
+                relays.clone(),
+                filters.clone(),
+                read_capacity(&relays, &filters),
+            )
             .await
             .map(|read| Fetched::new(read.events, read.complete));
         if first.as_ref().is_ok_and(|first| {
@@ -927,7 +948,11 @@ impl<R: DirectoryResources> Directory<R> {
         } else {
             let more = self
                 .relay_plane
-                .fetch_public_events(supplementary.clone(), filters, MAX_FETCHED_EVENTS)
+                .fetch_public_events(
+                    supplementary.clone(),
+                    filters.clone(),
+                    read_capacity(&supplementary, &filters),
+                )
                 .await
                 .map(|read| Fetched::new(read.events, read.complete));
             queried.extend(supplementary);
@@ -989,27 +1014,32 @@ impl<R: DirectoryResources> Directory<R> {
         if indexers.is_empty() {
             return (Vec::new(), true);
         }
-        // `max_events` bounds the whole read, not each relay, and a read that
-        // fills it counts as truncated. Room for every indexer's reply keeps
-        // distinct current versions on different indexers from looking like a
-        // partial read; a relay that ignores the limit still does.
-        let max_events = indexers.len() * AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER;
-        let filter = Filter::new()
-            .kind(Kind::RelayList)
-            .author(author)
-            .limit(AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER);
+        // Room for every indexer's reply keeps distinct current versions on
+        // different indexers from looking like a partial read; a relay that
+        // ignores the limit still does.
+        let filters = vec![
+            Filter::new()
+                .kind(Kind::RelayList)
+                .author(author)
+                .limit(AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER),
+        ];
+        let max_events = read_capacity(&indexers, &filters);
         let read = self
             .relay_plane
-            .fetch_public_events(indexers, vec![filter], max_events)
+            .fetch_public_events(indexers, filters, max_events)
             .await;
         let read = match read {
             Ok(read) if read.complete => read,
             _ => return (Vec::new(), false),
         };
+        // As everywhere in the directory, a version dated past the allowed
+        // clock skew is not current and cannot outrank one that is.
+        let max_created_at = self.directory_freshness().max_created_at;
         let newest = read
             .events
             .iter()
             .filter(|event| event.kind == Kind::RelayList && event.pubkey == author)
+            .filter(|event| event.created_at.as_secs() <= max_created_at)
             .max_by_key(|event| (event.created_at, std::cmp::Reverse(event.id)));
         let write_relays = newest
             .and_then(|event| NostrTransportEvent::from_nostr_event(event).ok())

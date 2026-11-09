@@ -924,3 +924,51 @@ async fn neutral_deployments_never_dial_indexers() {
     assert_uncached(&runtime, &reference);
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// A relay-list version dated past the allowed clock skew is not current: it
+/// never outranks the current version, as everywhere else in the directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn future_dated_relay_lists_never_pick_the_write_relays() {
+    let operational = MockRelay::run().await.unwrap();
+    let current = MockRelay::run().await.unwrap();
+    let future = MockRelay::run().await.unwrap();
+    let author_relay = MockRelay::run().await.unwrap();
+    let author = Keys::generate();
+    let now = Timestamp::now().as_secs();
+    let note = signed(
+        &author,
+        1,
+        now - 1_000,
+        "only on the write relay",
+        Vec::new(),
+    );
+    publish(&author_relay, &[&note]).await;
+    publish(
+        &current,
+        &[&relay_list(&author, now - 500, &url(&author_relay).await)],
+    )
+    .await;
+    publish(
+        &future,
+        &[&relay_list(
+            &author,
+            now + 86_400,
+            "wss://elsewhere.example",
+        )],
+    )
+    .await;
+
+    let dir = alice_home();
+    let app = app_with_indexers(
+        dir.path(),
+        vec![url(&operational).await],
+        vec![url(&current).await, url(&future).await],
+    );
+    let runtime = app.runtime();
+    let resolved = runtime
+        .resolve_public_event_preview("alice", &nevent_by(note.id, &author))
+        .await
+        .unwrap();
+    assert_eq!(present_json(&resolved), note);
+    runtime.shutdown_and_close().await.unwrap();
+}
