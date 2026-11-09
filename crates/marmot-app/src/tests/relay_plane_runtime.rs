@@ -562,6 +562,138 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_socket_watch() {
+    async fn wait_for_status(
+        subscription: &crate::RuntimeRelayLivenessSubscription,
+        url: &str,
+        status: crate::RelayLivenessStatus,
+    ) -> crate::RelayLiveness {
+        timeout(Duration::from_secs(5), async {
+            let mut rows = subscription.snapshot.clone();
+            loop {
+                if let Some(row) = rows
+                    .iter()
+                    .find(|row| row.url == url && row.status == status)
+                {
+                    return row.clone();
+                }
+                rows = subscription
+                    .recv()
+                    .await
+                    .unwrap()
+                    .expect("live relay watch");
+            }
+        })
+        .await
+        .expect("the runtime observes the socket's status")
+    }
+
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let canonical = url.trim_end_matches('/').to_owned();
+    let slash_url = format!("{canonical}/");
+    let dir = tempfile::tempdir().unwrap();
+    let alice = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        slash_url.clone(),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![slash_url.clone()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec![slash_url];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let subscription = runtime
+        .subscribe_relay_liveness(&alice.label)
+        .await
+        .unwrap();
+    assert_eq!(subscription.snapshot.len(), 1);
+    assert_eq!(subscription.snapshot[0].url, canonical);
+    assert_eq!(
+        subscription.snapshot[0].status,
+        crate::RelayLivenessStatus::Unknown
+    );
+
+    // Use the app's tracked production transport and its account receive pool,
+    // not the separate plane that MarmotApp::client would construct.
+    let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
+    client.prepare_transport().await.unwrap();
+    let connected = wait_for_status(
+        &subscription,
+        &canonical,
+        crate::RelayLivenessStatus::Connected,
+    )
+    .await;
+    assert!(connected.last_attempt_unix.is_some());
+    assert_eq!(connected.last_error, None);
+
+    // Add a configured-only URL after activation so it never joins the pool.
+    lists.nip65.created_at += 1;
+    lists.nip65.write_relays = vec!["wss://configured-only.example".into()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let rows = runtime.account_relay_liveness(&alice.label).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().find(|row| row.url == canonical),
+        Some(&connected)
+    );
+    let absent = rows
+        .iter()
+        .find(|row| row.url == "wss://configured-only.example")
+        .unwrap();
+    assert_eq!(absent.status, crate::RelayLivenessStatus::Unknown);
+    assert_eq!(absent.last_attempt_unix, None);
+    assert_eq!(absent.last_error, None);
+    drop(subscription);
+
+    // A host reconnects using the canonical row URL, not its slash-spelled
+    // configuration, even when that account socket is already Connected.
+    let retried = runtime
+        .reconnect_relay(&alice.label, &connected.url)
+        .await
+        .unwrap();
+    assert_eq!(retried.url, canonical);
+    assert!(retried.last_attempt_unix.is_some());
+    assert!(matches!(
+        retried.status,
+        crate::RelayLivenessStatus::Connecting | crate::RelayLivenessStatus::Connected
+    ));
+    let subscription = runtime
+        .subscribe_relay_liveness(&alice.label)
+        .await
+        .unwrap();
+    let reconnected = wait_for_status(
+        &subscription,
+        &canonical,
+        crate::RelayLivenessStatus::Connected,
+    )
+    .await;
+    assert!(reconnected.last_attempt_unix.is_some());
+    assert_eq!(reconnected.last_error, None);
+
+    relay.shutdown();
+    let offline = wait_for_status(
+        &subscription,
+        &canonical,
+        crate::RelayLivenessStatus::Offline,
+    )
+    .await;
+    assert!(offline.last_attempt_unix.is_some());
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_liveness_account_watch() {
     let dir = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(dir.path());
@@ -594,8 +726,10 @@ async fn relay_liveness_account_watch() {
         .unwrap()
         .unwrap()
         .unwrap();
+    let mut urls = rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>();
+    urls.sort_unstable();
     assert_eq!(
-        rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>(),
+        urls,
         vec!["wss://read.example/path/", "wss://relay.example"]
     );
     assert!(

@@ -2342,18 +2342,18 @@ impl NostrSdkRelayClient {
         self.frontier.liveness.subscribe()
     }
 
-    /// Snapshot of physical pool relays. This performs no network I/O.
+    /// Snapshot of physical READ pool relays, without I/O or monitor attachment.
     /// Configured relays not yet in the pool belong to the caller's snapshot.
     pub async fn relay_liveness(&self) -> Vec<RelayLiveness> {
         if self.require_account_context {
             return Vec::new();
         }
         let _lifecycle = self.publish_relay_cache.lifecycle.lock().await;
-        let relays = self.client.relays().await;
-        self.frontier.monitor_shutdown(&self.client);
-        for relay in relays.values() {
-            self.frontier.attach(relay, RelayMonitorAttach::Existing);
-        }
+        let relays = self
+            .client
+            .relays()
+            .with_capabilities(RelayCapabilities::READ)
+            .await;
         let state = self
             .frontier
             .state
@@ -2530,7 +2530,13 @@ impl NostrSdkRelayClient {
             if let Some(cache) = reader.relay_cache.take() {
                 // A removed relay must not reattach from a stale pool snapshot.
                 let _lifecycle = cache.lifecycle.lock().await;
-                for relay in cache.client.relays().await.into_values() {
+                for relay in cache
+                    .client
+                    .relays()
+                    .with_capabilities(RelayCapabilities::READ)
+                    .await
+                    .into_values()
+                {
                     reader.frontier.attach(&relay, RelayMonitorAttach::Existing);
                 }
             }
@@ -8153,6 +8159,109 @@ mod tests {
         .await
         .expect("the relay connects");
         (sdk, url, connections)
+    }
+
+    #[tokio::test]
+    async fn liveness_publish_isolation() {
+        for owned_relay in [false, true] {
+            let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+            let url = relay.url().await;
+            let endpoint = TransportEndpoint(url.to_string());
+            let sdk = if owned_relay {
+                NostrSdkRelayClient::from_builder(Client::builder())
+            } else {
+                NostrSdkRelayClient::new(Client::default())
+            };
+            let outcome = sdk
+                .publish_event(&[endpoint], &signed_group_event_dto(), 1)
+                .await
+                .unwrap();
+            assert_eq!(outcome.accepted.len(), 1);
+            let writer = sdk.client().relay(&url).await.unwrap().unwrap();
+            assert!(!writer.capabilities().can_read());
+            assert_eq!(writer.status(), RelayStatus::Connected);
+            assert_eq!(sdk.relay_health().await.total_relays, 1);
+
+            let mut changes = sdk.liveness_changes();
+            changes.borrow_and_update();
+            let snapshot = sdk.relay_liveness().await;
+            assert!(
+                !changes.has_changed().unwrap(),
+                "reading liveness must not register a publication socket as a receive source"
+            );
+            assert!(
+                snapshot.is_empty(),
+                "WRITE-only sockets are not receive liveness"
+            );
+            let connections = sdk.relay_connections();
+            assert!(connections.borrow().is_empty());
+            let mut notifications = sdk.notifications();
+            assert!(
+                futures::poll!(notifications.next()).is_pending(),
+                "opening the receive feed must not synthesize a publication replay boundary"
+            );
+            assert!(!changes.has_changed().unwrap());
+            assert!(connections.borrow().is_empty());
+            assert!(!writer.capabilities().can_read());
+            assert!(writer.subscriptions().await.is_empty());
+            sdk.shutdown().await;
+            relay.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_root_alias_reconnect() {
+        for original_has_slash in [true, false] {
+            let mut wire = ReplayWire::new().await;
+            let slash = TransportEndpoint(format!("{}/", wire.endpoint.as_str()));
+            let (original, alias) = if original_has_slash {
+                (slash, wire.endpoint.clone())
+            } else {
+                (wire.endpoint.clone(), slash)
+            };
+            let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+            let keys = Keys::generate();
+            let subscription = NostrSubscription::AccountInbox {
+                account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
+                endpoints: vec![original.clone()],
+                since: None,
+                attempt: SubscriptionAttempt::INITIAL,
+            };
+            let id = subscription.subscription_id();
+            sdk.subscribe(subscription).await.unwrap();
+            assert_eq!(wire.recv_kind("REQ").await[1], id);
+            let physical = sdk
+                .client()
+                .relay(original.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(physical.status(), RelayStatus::Connected);
+            let attempts = physical.stats().attempts();
+            let subscriptions = physical.subscriptions().await;
+
+            let result = sdk.reconnect_relay(&alias).await.unwrap();
+            assert!(matches!(
+                result.status,
+                RelayLivenessStatus::Connecting | RelayLivenessStatus::Connected
+            ));
+            assert_eq!(
+                sdk.client().relays().await.len(),
+                1,
+                "root aliases share one socket"
+            );
+            assert!(
+                physical.stats().attempts() > attempts,
+                "manual reconnect restarts the existing physical relay"
+            );
+            assert_eq!(physical.subscriptions().await, subscriptions);
+            assert_eq!(
+                wire.recv_kind("REQ").await[1],
+                id,
+                "the live REQ is restored"
+            );
+            sdk.shutdown().await;
+        }
     }
 
     #[tokio::test]

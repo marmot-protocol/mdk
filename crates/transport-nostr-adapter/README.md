@@ -58,7 +58,8 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrRelayClient` is intentionally small so tests can use an in-memory client and production can use
 `NostrSdkRelayClient` behind the `sdk` feature.
 
-`NostrSdkRelayClient::relay_liveness()` reads the account-local physical pool without network I/O.
+`NostrSdkRelayClient::relay_liveness()` reads the account-local physical READ pool without network I/O or monitor
+attachment. WRITE-only publication sockets appear in neither liveness snapshots nor the transport receive feed.
 Its `RelayLiveness` rows expose `Unknown`, `Connecting`, `Connected`, or `Offline`, independently of message traffic.
 The caller adds configured endpoints absent from the pool as `Unknown`. Subscribe to `liveness_changes()` before
 reading: its monotonic generation coalesces changes, rather than retaining every transition. A multi-account root's
