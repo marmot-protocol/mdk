@@ -167,6 +167,25 @@ pub(crate) enum TimelineWindowEdge {
     Newer,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TimelineOrder {
+    GroupCanonical,
+    WallClock,
+    SearchWallClock,
+}
+
+impl TimelineOrder {
+    fn from_query(query: &TimelineMessageQuery) -> Self {
+        if query.group_id_hex.is_some() && !query.search_wall_clock {
+            Self::GroupCanonical
+        } else if query.search_wall_clock && query.group_id_hex.is_none() {
+            Self::SearchWallClock
+        } else {
+            Self::WallClock
+        }
+    }
+}
+
 /// Internal signal from a timeline subscription's background task to
 /// [`RuntimeTimelineMessagesSubscription::recv`]. `Projection` carries a
 /// delta-applicable update; `Refresh` asks the subscription to re-materialize
@@ -334,14 +353,13 @@ impl TimelineWindowHandle {
         }
         let mut window = self.lock();
         let limit = window.window_limit;
-        let canonical_group_order =
-            window.base_query.group_id_hex.is_some() && !window.base_query.search_wall_clock;
+        let order = TimelineOrder::from_query(&window.base_query);
         merge_timeline_window_with_order(
             &mut window.page,
             older,
             TimelineWindowEdge::Older,
             limit,
-            canonical_group_order,
+            order,
         );
         window.bump_generation();
         Ok(window.page.clone())
@@ -382,14 +400,13 @@ impl TimelineWindowHandle {
         }
         let mut window = self.lock();
         let limit = window.window_limit;
-        let canonical_group_order =
-            window.base_query.group_id_hex.is_some() && !window.base_query.search_wall_clock;
+        let order = TimelineOrder::from_query(&window.base_query);
         merge_timeline_window_with_order(
             &mut window.page,
             newer,
             TimelineWindowEdge::Newer,
             limit,
-            canonical_group_order,
+            order,
         );
         window.bump_generation();
         Ok(window.page.clone())
@@ -400,9 +417,8 @@ impl TimelineWindowHandle {
     fn apply_projection(&self, update: &AppProjectionUpdate) {
         let mut window = self.lock();
         let limit = window.window_limit;
-        let canonical_group_order =
-            window.base_query.group_id_hex.is_some() && !window.base_query.search_wall_clock;
-        apply_projection_to_window(&mut window.page, update, limit, canonical_group_order);
+        let order = TimelineOrder::from_query(&window.base_query);
+        apply_projection_to_window(&mut window.page, update, limit, order);
         window.bump_generation();
     }
 
@@ -542,11 +558,11 @@ impl RuntimeTimelineMessagesSubscription {
 
 fn timeline_record_order_key(
     message: &TimelineMessageRecord,
-    canonical_group_order: bool,
+    order: TimelineOrder,
 ) -> (u8, u64, u8, u64, &str, &str) {
-    if canonical_group_order {
+    if matches!(order, TimelineOrder::GroupCanonical) {
         let (class, primary, phase, at, id) = message.canonical_order_key();
-        (class, primary, phase, at, id, &message.group_id_hex)
+        (class, primary, phase, at, id, "")
     } else {
         (
             0,
@@ -554,17 +570,20 @@ fn timeline_record_order_key(
             0,
             0,
             &message.message_id_hex,
-            &message.group_id_hex,
+            if matches!(order, TimelineOrder::SearchWallClock) {
+                &message.group_id_hex
+            } else {
+                ""
+            },
         )
     }
 }
 
 /// Sort a timeline by the same group-canonical or global wall-clock order used
 /// by its storage query.
-fn sort_timeline_records(messages: &mut [TimelineMessageRecord], canonical_group_order: bool) {
+fn sort_timeline_records(messages: &mut [TimelineMessageRecord], order: TimelineOrder) {
     messages.sort_by(|left, right| {
-        timeline_record_order_key(left, canonical_group_order)
-            .cmp(&timeline_record_order_key(right, canonical_group_order))
+        timeline_record_order_key(left, order).cmp(&timeline_record_order_key(right, order))
     });
 }
 
@@ -576,13 +595,13 @@ pub(crate) fn merge_timeline_window_with_order(
     incoming: TimelinePage,
     edge: TimelineWindowEdge,
     limit: usize,
-    canonical_group_order: bool,
+    order: TimelineOrder,
 ) {
     let mut messages = std::mem::take(&mut window.messages);
     for message in incoming.messages {
         upsert_window_message(&mut messages, message);
     }
-    sort_timeline_records(&mut messages, canonical_group_order);
+    sort_timeline_records(&mut messages, order);
     match edge {
         TimelineWindowEdge::Older => {
             // The older side now reflects whatever the store reported. The
@@ -616,15 +635,14 @@ pub(crate) fn apply_projection_to_window(
     window: &mut TimelinePage,
     update: &AppProjectionUpdate,
     limit: usize,
-    canonical_group_order: bool,
+    order: TimelineOrder,
 ) {
     let anchored = !window.has_more_after;
     // A detached window must suppress anything sorting strictly after its
     // query-order upper bound. Own only the ids so delta application can
     // mutate the window without cloning the newest record's payload.
     let newest_order = window.messages.last().filter(|_| !anchored).map(|newest| {
-        let (class, primary, phase, at, id, group) =
-            timeline_record_order_key(newest, canonical_group_order);
+        let (class, primary, phase, at, id, group) = timeline_record_order_key(newest, order);
         (class, primary, phase, at, id.to_owned(), group.to_owned())
     });
     if update.timeline_changes.is_empty() {
@@ -634,7 +652,7 @@ pub(crate) fn apply_projection_to_window(
                 message.clone(),
                 anchored,
                 newest_order.as_ref(),
-                canonical_group_order,
+                order,
             );
         }
     } else {
@@ -646,7 +664,7 @@ pub(crate) fn apply_projection_to_window(
                         (**message).clone(),
                         anchored,
                         newest_order.as_ref(),
-                        canonical_group_order,
+                        order,
                     );
                 }
                 TimelineMessageChange::Remove { message_id_hex, .. } => {
@@ -658,7 +676,7 @@ pub(crate) fn apply_projection_to_window(
             }
         }
     }
-    sort_timeline_records(&mut window.messages, canonical_group_order);
+    sort_timeline_records(&mut window.messages, order);
     // Live growth only ever adds at or below the head, so trim the oldest rows
     // on overflow; the head boundary (`has_more_after`) is preserved.
     if window.messages.len() > limit {
@@ -680,7 +698,7 @@ fn insert_live_message(
     message: TimelineMessageRecord,
     anchored: bool,
     newest_order: Option<&(u8, u64, u8, u64, String, String)>,
-    canonical_group_order: bool,
+    order: TimelineOrder,
 ) {
     if let Some(existing) = messages.iter_mut().find(|existing| {
         existing.group_id_hex == message.group_id_hex
@@ -690,7 +708,7 @@ fn insert_live_message(
         return;
     }
     let within_window = newest_order.is_some_and(|newest| {
-        timeline_record_order_key(&message, canonical_group_order)
+        timeline_record_order_key(&message, order)
             <= (
                 newest.0,
                 newest.1,

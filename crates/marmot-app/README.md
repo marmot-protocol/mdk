@@ -373,7 +373,7 @@ event journal.
   (the default), `Image`, `Video`, `Audio`, `File`, and `Attachment` (any attachment).
   Group queries retain canonical chat order unless `search_wall_clock` is true. With that flag, searches order by
   `(timeline_at, message_id_hex, group_id_hex)`; account-wide search cursors also require `cursor_group_id`.
-  Default account-wide queries retain their timestamp/message-id cursors.
+  Default account-wide queries and windows retain timestamp/message-id ordering and cursors.
   Subscription windows retain filters and ordering through paging and live refreshes, use each
   edge row's group for cursors, and preserve a scrolled-back window's inclusive upper bound. Filtered and explicit
   wall-clock windows refresh from storage instead of applying unfiltered projection deltas.
