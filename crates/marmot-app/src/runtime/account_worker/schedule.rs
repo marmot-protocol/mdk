@@ -1,7 +1,6 @@
-//! The account worker's own deadlines (mdk#2923 step B). Recovery and
-//! post-join work, and the attachment, avatar and presentation passes, run
-//! when an event wakes them or a deadline comes, not on every maintenance
-//! tick. Recovery and post-join re-arm at [`RETRY_WHILE_OWED`], the tick's
+//! The account worker's own deadlines (mdk#2923 step B). Every job the
+//! maintenance tick used to run, other than session maintenance, runs when
+//! an event wakes it or a deadline comes, not on every maintenance tick. Recovery and post-join re-arm at [`RETRY_WHILE_OWED`], the tick's
 //! old cadence, while they still have work, and with none they rest until a
 //! wake. A pass arms the deadline its data gives (see [`Schedule::arm`]).
 //!
@@ -30,15 +29,39 @@ pub(super) enum Job {
     AvatarPass,
     /// The chat presentation pass.
     PresentationPass,
+    /// Publishing app-owned local submissions (its own wake and retry).
+    LocalSubmission,
+    /// The content-report backfill, until it finishes.
+    ContentBackfill,
+    /// Legacy message promotion, until it finishes.
+    LegacyPromotion,
+    /// Device pairing timers, while pairing state exists.
+    DevicePairing,
+    /// The one-time compaction and the housekeeping batch.
+    Housekeeping,
+    /// The KeyPackage maintenance catch-up.
+    KeyPackageCatchUp,
+    /// Push join windows, owed announces and repair asks.
+    Push,
+    /// History uploads, fetches, backup passes and restores.
+    HistoryDispatch,
 }
 
 impl Job {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 13] = [
         Self::Recovery,
         Self::PostJoin,
         Self::AttachmentPass,
         Self::AvatarPass,
         Self::PresentationPass,
+        Self::LocalSubmission,
+        Self::ContentBackfill,
+        Self::LegacyPromotion,
+        Self::DevicePairing,
+        Self::Housekeeping,
+        Self::KeyPackageCatchUp,
+        Self::Push,
+        Self::HistoryDispatch,
     ];
 
     pub(super) const fn as_str(self) -> &'static str {
@@ -48,6 +71,14 @@ impl Job {
             Self::AttachmentPass => "attachment_pass",
             Self::AvatarPass => "avatar_pass",
             Self::PresentationPass => "presentation_pass",
+            Self::LocalSubmission => "local_submission",
+            Self::ContentBackfill => "content_backfill",
+            Self::LegacyPromotion => "legacy_promotion",
+            Self::DevicePairing => "device_pairing",
+            Self::Housekeeping => "housekeeping",
+            Self::KeyPackageCatchUp => "key_package_catch_up",
+            Self::Push => "push",
+            Self::HistoryDispatch => "history_dispatch",
         }
     }
 
@@ -131,6 +162,12 @@ impl Schedule {
             .min()
     }
 
+    /// Whether `job` has a wake or a deadline pending.
+    pub(super) fn pending(&self, job: Job) -> bool {
+        let state = self.get(job);
+        state.woken || state.deadline.is_some()
+    }
+
     /// Whether `job` should run now.
     pub(super) fn due(&self, job: Job, now: Instant) -> bool {
         let state = self.get(job);
@@ -169,8 +206,10 @@ mod tests {
         let mut schedule = Schedule::opened();
         assert_eq!(schedule.next_at(now), Some(now));
         assert!(Job::ALL.into_iter().all(|job| schedule.due(job, now)));
-        for pass in [Job::AttachmentPass, Job::AvatarPass, Job::PresentationPass] {
-            schedule.arm(pass, None);
+        for job in Job::ALL {
+            if !matches!(job, Job::Recovery | Job::PostJoin) {
+                schedule.arm(job, None);
+            }
         }
 
         schedule.ran(Job::Recovery, true, now);

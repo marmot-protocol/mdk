@@ -366,6 +366,8 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
         beside
     });
     assert_eq!(withdrawn.unwrap(), 1);
+    // The withdrawal wakes the worker's KeyPackage catch-up (mdk#2923).
+    assert!(laptop.key_package_lifecycle_changed);
     for refused in [beside.0, beside.1] {
         assert!(
             matches!(
