@@ -3909,13 +3909,11 @@ async fn a_ready_worker_completes_one_span_per_startup_stage() {
 
 /// The maintenance phases every completed tick passes through, in tick order
 /// (mdk#2923). The key-package catch-up runs only when one is due.
-const MAINTENANCE_TICK_PHASES: [RuntimeOp; 11] = [
+const MAINTENANCE_TICK_PHASES: [RuntimeOp; 9] = [
     RuntimeOp::WorkerMaintenanceContentBackfill,
     RuntimeOp::WorkerMaintenanceLegacyPromotion,
     RuntimeOp::WorkerMaintenanceCompaction,
     RuntimeOp::WorkerMaintenancePush,
-    RuntimeOp::WorkerMaintenanceRecovery,
-    RuntimeOp::WorkerMaintenancePostJoin,
     RuntimeOp::WorkerMaintenanceDue,
     RuntimeOp::WorkerMaintenanceAppPasses,
     RuntimeOp::WorkerMaintenanceSession,
@@ -4107,7 +4105,7 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     .await
     .expect("the first maintenance tick completes");
     settle((1, 1)).await;
-    const COUNTED: [RuntimeOp; 8] = [
+    const COUNTED: [RuntimeOp; 12] = [
         RuntimeOp::WorkerMaintenance,
         RuntimeOp::StorageWriteBegin,
         RuntimeOp::WorkerMaintenanceHousekeepingBatch,
@@ -4116,6 +4114,10 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         RuntimeOp::WorkerAttachmentPass,
         RuntimeOp::WorkerPresentationPass,
         RuntimeOp::StorageSessionWriteBegin,
+        RuntimeOp::WatchdogMissedWakeRecovery,
+        RuntimeOp::WatchdogMissedWakePostJoin,
+        RuntimeOp::WorkerMaintenancePostJoin,
+        RuntimeOp::WorkerMaintenanceRecovery,
     ];
     let snapshot = || COUNTED.map(count);
     // Settle one more tick, which may still finish startup work.
@@ -4138,6 +4140,15 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         "an idle tick takes no session-storage writer transaction"
     );
     assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
+    assert_eq!(
+        (delta(8), delta(9)),
+        (0, 0),
+        "the watchdog found no missed wake"
+    );
+    assert_eq!(delta(10), 0, "no post-join work, so post-join rests");
+    // With no relays the replay generation never authorizes, so recovery
+    // keeps its 15 s cadence; since mdk#3238 a repeat pass writes nothing.
+    assert_eq!(delta(11), 3, "recovery still runs once per tick offline");
     assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");
     assert_eq!(delta(4), 0, "no staged upload spawns no promotion");
     // Each tick still sets its passes due (per-account wakes are step 2).

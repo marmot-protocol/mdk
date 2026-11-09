@@ -18,6 +18,13 @@ const LEASE_SECONDS: u64 = 3 * 60;
 const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
 /// Compaction attempts that may roll back under one worker ownership.
 const MAX_COMPACTION_ROLLBACKS: u32 = 3;
+/// How long a rolled-back compaction waits before the next attempt, after
+/// the first and the second rollback; the third ends the attempts for this
+/// ownership. A cause that persists, such as another connection holding the
+/// database or a full volume, no longer spends every attempt 15 s apart
+/// (mdk#2923).
+const COMPACTION_RETRY_SPACING: [Duration; 2] =
+    [Duration::from_secs(60), Duration::from_secs(10 * 60)];
 /// Rows, then file names, per media sweep batch.
 const MEDIA_SWEEP_BATCH: usize = 256;
 /// How often the "Keep media" sweep runs after worker start. Its windows are
@@ -70,6 +77,8 @@ pub(super) struct Admission {
     /// worker ownership, so a failure that repeats cannot rebuild the
     /// in-memory copy every tick.
     compaction_rollbacks: u32,
+    /// A rolled-back compaction is not attempted again before this.
+    compaction_retry_at: Option<std::time::Instant>,
     /// This worker settled the WAL truncate an earlier process may have left
     /// owed (recorded nowhere): set only once a maintenance pass tried it,
     /// so a pass that failed before that leaves it for the next one.
@@ -500,6 +509,9 @@ pub(super) async fn compact_if_due(
 ) {
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
         || admission.compaction_attempted
+        || admission
+            .compaction_retry_at
+            .is_some_and(|at| std::time::Instant::now() < at)
         || !admission
             .compaction_due
             .load(std::sync::atomic::Ordering::Acquire)
@@ -556,9 +568,17 @@ impl Admission {
             CompactionAttempt::RolledBack => {
                 self.compaction_rollbacks += 1;
                 self.compaction_attempted = self.compaction_rollbacks >= MAX_COMPACTION_ROLLBACKS;
-                // A rollback is not the idle path: check again on the next
-                // tick, not after the hourly recheck.
-                self.latches.recheck_due = None;
+                // Check again once the spacing has passed, not on the next
+                // tick and not only at the hourly recheck.
+                if let Some(spacing) = COMPACTION_RETRY_SPACING
+                    .get(self.compaction_rollbacks as usize - 1)
+                    .filter(|_| !self.compaction_attempted)
+                {
+                    let at = std::time::Instant::now() + *spacing;
+                    self.compaction_retry_at = Some(at);
+                    self.latches.recheck_due =
+                        Some(self.latches.recheck_due.map_or(at, |due| due.min(at)));
+                }
             }
             CompactionAttempt::NotDue => {}
         }

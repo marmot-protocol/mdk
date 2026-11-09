@@ -118,6 +118,10 @@ operations! {
     WorkerMaintenanceSession => "worker_maintenance_session",
     WorkerMaintenanceEffects => "worker_maintenance_effects",
     WorkerMaintenanceHistoryDispatch => "worker_maintenance_history_dispatch",
+    // A job the worker's schedule drives had work with no wake or deadline
+    // pending, found by the maintenance tick's watchdog (mdk#2923 step B).
+    WatchdogMissedWakeRecovery => "watchdog_missed_wake_recovery",
+    WatchdogMissedWakePostJoin => "watchdog_missed_wake_post_join",
     WorkerPresentationPass => "worker_presentation_pass",
     WorkerAvatarPass => "worker_avatar_pass",
     WorkerAttachmentPass => "worker_attachment_pass",

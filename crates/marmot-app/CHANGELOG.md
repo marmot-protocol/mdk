@@ -78,6 +78,15 @@
 
 ### Changed
 
+- Recovery and post-join work run on the account worker's own schedule, not on every maintenance tick (mdk#2923
+  step B). Each runs once when the worker opens, then when an event wakes it (a receive, a convergence pass, a new
+  replay generation, a join, maintenance pausing or resuming) and again 15 s later while it still has work. An
+  account with nothing owed runs neither. While the adapter is inactive (offline, or no relays) the replay generation
+  never authorizes, so recovery keeps its 15 s cadence; since mdk#3238 a repeat pass writes nothing. The tick checks as a
+  watchdog that no job with work lacks a wake or deadline; a miss is counted as `watchdog_missed_wake_recovery` or
+  `watchdog_missed_wake_post_join`, logged once per job per worker, and the job runs. A rolled-back compaction now
+  waits 1 minute, then 10 minutes, before its next attempt, instead of retrying on the next tick.
+
 - Account-scoped work wakes only that account's worker (mdk#2923 step B). A chat-list, message, avatar or attachment
   change for one account no longer runs every other account's presentation, avatar and attachment passes; shared
   profile and directory changes and attachment controls still wake every account. The 15 s maintenance tick still

@@ -4,6 +4,7 @@
 mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
+mod schedule;
 
 pub(crate) use read_queue::{
     ReadClass, ReadReply, WorkerLane, WorkerReply, WorkerUnit, WorkerUnitGauge,
@@ -1777,6 +1778,10 @@ async fn run_app_runtime_account_worker(
     let mut avatar_due = true;
     let mut attachment_due = true;
     let mut attachment_admission = attachments::Admission::default();
+    // Recovery and post-join work run on their own wakes and deadlines;
+    // the tick only checks that none was missed (mdk#2923 step B).
+    let mut schedule = schedule::Schedule::opened();
+    let mut maintenance_paused = client.runtime.maintenance_is_paused();
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
@@ -1810,6 +1815,20 @@ async fn run_app_runtime_account_worker(
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
+        }
+        // Re-arm the schedule from whichever path ran the recovery seam or
+        // the post-join advance since the last turn, and wake post-join
+        // when maintenance pauses or resumes.
+        let now = TokioInstant::now();
+        if client.runtime.maintenance_is_paused() != maintenance_paused {
+            maintenance_paused = !maintenance_paused;
+            schedule.wake(schedule::Job::PostJoin);
+        }
+        if let Some(owed) = client.recovery_seam_owed.take() {
+            schedule.ran(schedule::Job::Recovery, owed, now);
+        }
+        if std::mem::take(&mut client.post_join_advanced) {
+            schedule.ran(schedule::Job::PostJoin, client.post_join_owed(), now);
         }
         if recovery_runner.is_none() && client.recovery_runner_due() {
             // A successful paced preparation retry starts the runner here,
@@ -1934,6 +1953,7 @@ async fn run_app_runtime_account_worker(
             );
         }
         let ready_command = ready_command_index(&pending, &media_http);
+        let scheduled_at = schedule.next_at(TokioInstant::now());
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2376,6 +2396,12 @@ async fn run_app_runtime_account_worker(
                         account_error_message("native replay synchronization failed", &error),
                     );
                 }
+                // The watch moves on every replay change: a new generation,
+                // native progress, a fence armed or pruned, an EOSE. Each can
+                // change what the recovery seam owes, and only the seam
+                // imports replay loss, so each runs it once. A repeat pass on
+                // an inactive adapter returns early (mdk#3238).
+                schedule.wake(schedule::Job::Recovery);
                 publish_account_level_changes(
                     &mut client, &events, &account_id_hex, &account_label,
                 );
@@ -2747,6 +2773,11 @@ async fn run_app_runtime_account_worker(
                         recovery_runner = client.spawn_recovery_runner().await;
                         recovery_catching_up =
                             client.routing.subscribe_recovery_runner_catching_up();
+                        // The new client owes what a fresh open owes: run
+                        // every job once, as at startup, so none waits for
+                        // the watchdog or counts as a missed wake.
+                        schedule = schedule::Schedule::opened();
+                        maintenance_paused = client.runtime.maintenance_is_paused();
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2841,6 +2872,27 @@ async fn run_app_runtime_account_worker(
             () = admission_retry.wait() => { continue 'worker; }
             _ = tokio::task::yield_now(), if admission_retry.ready() && native_progress => {
                 continue 'worker;
+            }
+            () = sleep_until_scheduled(scheduled_at), if scheduled_at.is_some() && !lifecycle.is_stopping() => {
+                // These jobs ran inside the tick before, so reads queued behind
+                // them still count as waiting behind maintenance.
+                let _unit = unit.enter(WorkerUnit::Maintenance);
+                let now = TokioInstant::now();
+                let context = EpochBackfillReportContext {
+                    events: &events,
+                    account_id_hex: &account_id_hex,
+                    account_label: &account_label,
+                    shared: &shared,
+                };
+                if schedule.due(schedule::Job::Recovery, now) {
+                    let owed = run_scheduled_recovery(&mut client, context).await;
+                    schedule.ran(schedule::Job::Recovery, owed, TokioInstant::now());
+                }
+                if schedule.due(schedule::Job::PostJoin, now) {
+                    let owed = run_scheduled_post_join(&mut client, context).await;
+                    client.post_join_advanced = false;
+                    schedule.ran(schedule::Job::PostJoin, owed, TokioInstant::now());
+                }
             }
             _ = maintenance_tick.tick() => {
                 local_submission_due = true;
@@ -2998,23 +3050,47 @@ async fn run_app_runtime_account_worker(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
                 );
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceRecovery);
-                let selection = match refresh_recovery_at_seam(
-                    &mut client,
-                    EpochBackfillReportContext {
+                // The watchdog: a scheduled job with work but no wake or
+                // deadline pending was missed. Count it and run it now.
+                for job in schedule::Job::ALL {
+                    let owed = match job {
+                        schedule::Job::Recovery => client.recovery_owed(),
+                        schedule::Job::PostJoin => client.post_join_owed(),
+                    };
+                    let Some(first) = schedule.missed(job, owed, TokioInstant::now()) else {
+                        continue;
+                    };
+                    telemetry.record_runtime(
+                        match job {
+                            schedule::Job::Recovery => RuntimeOp::WatchdogMissedWakeRecovery,
+                            schedule::Job::PostJoin => RuntimeOp::WatchdogMissedWakePostJoin,
+                        },
+                        Duration::ZERO,
+                        TelemetryOutcome::Success,
+                    );
+                    if first {
+                        tracing::warn!(target: "marmot_app::runtime", method = "maintenance_watchdog",
+                            job = job.as_str(), "scheduled job had work with no wake pending");
+                    }
+                    let context = EpochBackfillReportContext {
                         events: &events,
                         account_id_hex: &account_id_hex,
                         account_label: &account_label,
                         shared: &shared,
-                    },
-                )
-                .await
-                {
-                    Ok(()) => TelemetryOutcome::Success,
-                    Err(_) => TelemetryOutcome::Failure,
-                };
-                step.finish(selection);
-                finish_periodic_maintenance_after_recovery(
+                    };
+                    let owed = match job {
+                        schedule::Job::Recovery => {
+                            run_scheduled_recovery(&mut client, context).await
+                        }
+                        schedule::Job::PostJoin => {
+                            let owed = run_scheduled_post_join(&mut client, context).await;
+                            client.post_join_advanced = false;
+                            owed
+                        }
+                    };
+                    schedule.ran(job, owed, TokioInstant::now());
+                }
+                finish_periodic_maintenance(
                     &mut client,
                     &events,
                     &account_id_hex,
@@ -3068,8 +3144,66 @@ async fn refresh_recovery_at_seam(
     report_pending_epoch_backfill_result(client, result, backfill_armed, observation, context)
 }
 
-/// Keep the domain maintenance continuation after the recovery outcome.
-async fn finish_periodic_maintenance_after_recovery(
+/// Run the recovery seam for the worker's schedule, timed as
+/// `worker_maintenance_recovery`. Whether it still has work afterwards; a
+/// failure counts as work, so it retries (mdk#2923).
+async fn run_scheduled_recovery(
+    client: &mut AppClient,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let step = context
+        .shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceRecovery);
+    let result = refresh_recovery_at_seam(client, context).await;
+    step.finish(if result.is_ok() {
+        TelemetryOutcome::Success
+    } else {
+        TelemetryOutcome::Failure
+    });
+    // The seam's own answer, from the reads it already made.
+    let owed = client.recovery_seam_owed.take();
+    result.is_err() || owed.unwrap_or_else(|| client.recovery_owed())
+}
+
+/// Advance post-join history collection for the worker's schedule, timed as
+/// `worker_maintenance_post_join`. Whether it still has work afterwards; a
+/// failure counts as work, so it retries (mdk#2923).
+async fn run_scheduled_post_join(
+    client: &mut AppClient,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let step = context
+        .shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenancePostJoin);
+    let post_join = client.advance_post_join_maintenance_subscriptions().await;
+    step.finish_app(&post_join);
+    let failed = post_join.is_err();
+    if let Err(err) = post_join {
+        publish_app_runtime_account_error(
+            Emit::Quiescent(client),
+            context.events,
+            context.account_id_hex,
+            context.account_label,
+            account_error_message("post-join maintenance subscription failed", &err),
+        );
+    }
+    failed || client.post_join_owed()
+}
+
+/// Sleeps until the schedule's next job, or forever when every job rests.
+async fn sleep_until_scheduled(at: Option<TokioInstant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The periodic tick's session and app maintenance (`run_due_maintenance`).
+async fn finish_periodic_maintenance(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -3079,18 +3213,6 @@ async fn finish_periodic_maintenance_after_recovery(
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     let telemetry = shared.observer.performance();
-    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePostJoin);
-    let post_join = client.advance_post_join_maintenance_subscriptions().await;
-    step.finish_app(&post_join);
-    if let Err(err) = post_join {
-        publish_app_runtime_account_error(
-            Emit::Quiescent(client),
-            events,
-            account_id_hex,
-            account_label,
-            account_error_message("post-join maintenance subscription failed", &err),
-        );
-    }
     let backlog_permit = shared.observer.product().permit();
     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceDue);
     let due = client.run_due_maintenance().await;
@@ -8075,6 +8197,7 @@ impl KeyPackageMaintenanceCatchUpOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
 struct EpochBackfillReportContext<'a> {
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,

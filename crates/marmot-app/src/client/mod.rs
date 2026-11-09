@@ -1061,6 +1061,13 @@ pub struct AppClient {
     /// retry re-armed the pass and before any attempt could park it again.
     #[cfg(test)]
     pub(crate) fail_next_convergence_retry_advance: bool,
+    /// The full recovery seam ran, from any path, since the account worker
+    /// last looked, and whether it left work; the worker's schedule re-arms
+    /// from it (mdk#2923). The seam answers from the reads it already made.
+    pub(crate) recovery_seam_owed: Option<bool>,
+    /// Post-join collection advanced, from any path, since the account
+    /// worker last looked (mdk#2923).
+    pub(crate) post_join_advanced: bool,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1777,6 +1784,7 @@ impl AppClient {
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
+        self.post_join_advanced = true;
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
             || self.runtime.maintenance_is_paused()
         {

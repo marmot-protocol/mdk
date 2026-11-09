@@ -2393,6 +2393,8 @@ impl MarmotApp {
             fail_next_terminal_recovery_retire: false,
             #[cfg(test)]
             fail_next_convergence_retry_advance: false,
+            recovery_seam_owed: None,
+            post_join_advanced: false,
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]

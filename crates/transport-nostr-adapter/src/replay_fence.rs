@@ -201,6 +201,11 @@ impl AccountReplayCoverage {
         })
     }
 
+    /// Move the fence ticket, and tell the owner through the replay watch:
+    /// a moved ticket is an observation it must answer. The replay
+    /// supervisor admits boundaries without a send of its own, and an idle
+    /// owner runs no periodic pass that would notice otherwise (mdk#3333,
+    /// mdk#2923).
     fn next_fence_ticket(&mut self) -> u64 {
         let ticket = self
             .changes
@@ -209,6 +214,7 @@ impl AccountReplayCoverage {
             .checked_add(1)
             .expect("fence ticket exhausted");
         self.fence_ticket = ticket;
+        self.changes.tx.send_replace(self.wire_generation);
         ticket
     }
 
@@ -939,6 +945,35 @@ mod tests {
         assert_eq!(held_from(&coverage, 0), None);
         assert_eq!(released(&mut coverage), vec![(0, 150)]);
         assert_eq!(coverage.fence_ticket, 0);
+    }
+
+    /// Admitting a boundary's armings, as the replay supervisor does with no
+    /// send of its own, moves the fence ticket, and the owner's replay watch
+    /// hears of it (mdk#3333): an idle owner has no periodic pass to notice
+    /// otherwise.
+    #[tokio::test]
+    async fn admitting_a_fence_wakes_the_replay_watch() {
+        let (mut coverage, id, _) = fenced_coverage(true);
+        let (tx, _rx) = mpsc::channel(8);
+        coverage.record_stored_event(&id, RelayIndex(1), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(1));
+        let endpoint = &coverage.endpoint_deadlines[&id][&RelayIndex(1)];
+        let (serial, count) = (endpoint.serial, endpoint.count_id);
+        let mut changes = coverage.changes.tx.subscribe();
+        changes.mark_unchanged();
+        let before = coverage.fence_ticket;
+
+        coverage.admit_fence_armings(&[(id.clone(), RelayIndex(1), serial, count)]);
+        assert_ne!(coverage.fence_ticket, before);
+        assert!(changes.has_changed().unwrap(), "the owner is told");
     }
 
     /// A counted reply leaves `[since, oldest seen]` unproven, so it holds

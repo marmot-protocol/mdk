@@ -47,6 +47,14 @@ fn duration_ms(value: Duration) -> StorageResult<u64> {
 }
 
 impl AccountRecoveryOwner {
+    /// The last replay generation a synchronization saw is authorized. A new
+    /// generation arrives on the adapter's replay watch, which wakes the
+    /// worker, so this needs no adapter read.
+    fn replay_settled(&self) -> bool {
+        self.replay_observed_generation
+            .is_some_and(|generation| self.native_replay_authorizes(generation))
+    }
+
     pub(super) fn native_replay_authorizes(&self, generation: u64) -> bool {
         self.replay_generation == Some(generation) && self.replay_complete
     }
@@ -324,6 +332,58 @@ impl AppClient {
                     .recovery_admitted_endpoints(&route.endpoints)
                     .is_empty()
             })
+    }
+
+    /// Whether the recovery seam still has work to repeat: a buffered
+    /// epoch-gap arm write, an unauthorized replay generation, delivery loss
+    /// that blocks the cursor, or an epoch-backfill intent or recovery demand
+    /// the ledger holds. The account worker repeats the seam on a deadline
+    /// while this holds and lets it rest when it does not (mdk#2923). Memory
+    /// and two reads, no writer; a failed read counts as owed.
+    ///
+    /// While the adapter is inactive (offline, or no relays) the replay
+    /// generation never authorizes, so this stays true, and the worker keeps
+    /// the tick's 15 s cadence for the seam; since mdk#3238 a repeat pass
+    /// returns early and writes nothing.
+    pub(crate) fn recovery_owed(&self) -> bool {
+        self.recovery_owed_given(None)
+    }
+
+    /// [`Self::recovery_owed`], given whether the ledger holds a recovery
+    /// demand when the caller has just read it.
+    pub(crate) fn recovery_owed_given(&self, demands: Option<bool>) -> bool {
+        if self.history_recovery.has_buffered_epoch_gap_arms()
+            || !self.recovery_owner.replay_settled()
+            || self.delivery_loss_blocks_cursor()
+        {
+            return true;
+        }
+        self.app
+            .account_storage(&self.state.label)
+            .and_then(|storage| {
+                let app = storage.app_storage();
+                Ok(!app.pending_epoch_backfill_intents()?.is_empty()
+                    || match demands {
+                        Some(demands) => demands,
+                        None => !app.pending_recovery_demands()?.is_empty(),
+                    })
+            })
+            .unwrap_or(true)
+    }
+
+    /// Whether post-join history collection has work: a collection in
+    /// progress, or a group whose post-join fetch or catch-up is still open.
+    /// One read; a failed read counts as owed (mdk#2923). Nothing is owed
+    /// while cursors are frozen or maintenance is paused, since the advance
+    /// then holds and fetches nothing.
+    pub(crate) fn post_join_owed(&self) -> bool {
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.runtime.maintenance_is_paused()
+        {
+            return false;
+        }
+        self.history_recovery.has_post_join_collections()
+            || self.engine_storage.post_join_work_owed().unwrap_or(true)
     }
 
     /// Flush recovery observations at a recovery seam: synchronize native

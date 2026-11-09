@@ -52,6 +52,9 @@
 
 ### Changed
 
+- New `SqliteAccountStorage::post_join_work_owed`: whether any group has a post-join history fetch without a
+  completion, or a post-join obligation in catch-up or its EOSE timeout, in one read (mdk#2923).
+
 - `delete_expired_received_private_key_packages` only reads when nothing has expired (mdk#2923).
 
 ## 0.16.0 - 2026-11-12

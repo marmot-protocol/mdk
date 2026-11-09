@@ -815,17 +815,6 @@ impl AppClient {
         }
     }
 
-    /// Whether recovery debt or a buffered recovery observation is pending.
-    fn recovery_pending(&self) -> Result<bool, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        Ok(!self
-            .history_recovery
-            .state
-            .pending_recovery_arm_writes
-            .is_empty()
-            || !storage.pending_recovery_demands()?.is_empty())
-    }
-
     /// The recovery seam of the receive path and the worker: flush recovery
     /// observations (see [`Self::refresh_account_recovery`]), and report
     /// pending recovery debt `Deferred` to the recovery runner, which owns
@@ -834,12 +823,23 @@ impl AppClient {
     pub(crate) async fn refresh_pending_recovery(
         &mut self,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
+        // Owed until it finishes: a seam that fails retries.
+        self.recovery_seam_owed = Some(true);
         self.drop_settled_epoch_backfill_intents();
         self.refresh_account_recovery().await?;
-        Ok(if self.recovery_pending()? {
-            EpochBackfillRunOutcome::Deferred
-        } else {
-            EpochBackfillRunOutcome::NotPending
-        })
+        let demands = !self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .pending_recovery_demands()?
+            .is_empty();
+        self.recovery_seam_owed = Some(self.recovery_owed_given(Some(demands)));
+        Ok(
+            if self.history_recovery.has_buffered_epoch_gap_arms() || demands {
+                EpochBackfillRunOutcome::Deferred
+            } else {
+                EpochBackfillRunOutcome::NotPending
+            },
+        )
     }
 }
