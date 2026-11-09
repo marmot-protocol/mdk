@@ -2011,7 +2011,8 @@ async fn run_app_runtime_account_worker(
             done = media_http_rx.recv() => {
                 match done {
                     Some(done) => {
-                        complete_media_http(&mut client, done, &shared, &media_http).await;
+                        let history_unsettled =
+                            complete_media_http(&mut client, done, &shared, &media_http).await;
                         // Ordinary transfers return the same credits used by
                         // restore; resume only after completion released one.
                         dispatch_backup_restore(&mut client, &media_http);
@@ -2034,8 +2035,19 @@ async fn run_app_runtime_account_worker(
                         avatar_due = true;
                         attachment_due = true;
                         // A slot freed, and a history transfer may have
-                        // finished or backed off.
-                        schedule.wake(schedule::Job::HistoryDispatch);
+                        // finished or backed off. One that failed and could
+                        // not record its deferral is still due now: retry it
+                        // in 15 s, never in a tight loop. A later completion
+                        // wakes dispatch and may retry it sooner; it is still
+                        // never more than once per completion.
+                        if history_unsettled {
+                            schedule.arm(
+                                schedule::Job::HistoryDispatch,
+                                Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED),
+                            );
+                        } else {
+                            schedule.wake(schedule::Job::HistoryDispatch);
+                        }
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -4684,12 +4696,16 @@ fn prepared_group_image_upload_is_in_flight(
         .unwrap_or(false)
 }
 
+/// Settle one media completion on the worker. Returns whether it was a
+/// history upload or fetch that failed without settling: its deferral was not
+/// written, so it is still due now, and the caller retries it later rather
+/// than at once (mdk#2923).
 async fn complete_media_http(
     client: &mut AppClient,
     done: MediaHttpDone,
     shared: &RuntimeSharedServices,
     media_http: &MediaHttpContext,
-) {
+) -> bool {
     let MediaHttpDone {
         permit,
         completion,
@@ -4706,12 +4722,12 @@ async fn complete_media_http(
                 .history_blobs
                 .upload
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // A failure waits for the next maintenance pass, so a deferral
+            // A failure waits for the retry the caller arms, so a deferral
             // that could not be written never turns into a tight retry loop.
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
-            return;
+            return !settled;
         }
         MediaHttpCompletion::HistoryFetch(outcome) => {
             let settled = client.finish_history_fetch(outcome);
@@ -4720,12 +4736,12 @@ async fn complete_media_http(
                 .history_blobs
                 .fetch
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // A failure waits for the next maintenance pass, so a deferral
+            // A failure waits for the retry the caller arms, so a deferral
             // that could not be written never turns into a tight retry loop.
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
-            return;
+            return !settled;
         }
         MediaHttpCompletion::BackupRestore(outcome) => {
             client.finish_backup_restore(outcome);
@@ -4735,7 +4751,7 @@ async fn complete_media_http(
                 .restore
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             dispatch_backup_restore(client, media_http);
-            return;
+            return false;
         }
         MediaHttpCompletion::BackupPass(outcome) => {
             client.finish_backup_pass(outcome).await;
@@ -4744,7 +4760,7 @@ async fn complete_media_http(
             if let Some(completion) = completion {
                 completion.send_replace(true);
             }
-            return;
+            return false;
         }
         MediaHttpCompletion::Attachment {
             job,
@@ -4787,7 +4803,7 @@ async fn complete_media_http(
                         cancellation: None,
                     });
                 });
-                return;
+                return false;
             }
             if attachments::complete_acquired(client, &job, result).is_err() {
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
@@ -4825,7 +4841,7 @@ async fn complete_media_http(
                             cancellation: None,
                         });
                     });
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     if let Ok(storage) = client.app.account_storage(&client.state.label) {
@@ -4942,6 +4958,7 @@ async fn complete_media_http(
         }
     }
     drop(permit);
+    false
 }
 
 /// Publish A before a long unit takes the client, and a receiver of what
