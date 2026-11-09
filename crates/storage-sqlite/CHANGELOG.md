@@ -31,6 +31,10 @@
   read it without loading the body; the media catalog keeps a staged file a
   draft owns through the sweep.
 
+### Changed
+
+- `delete_expired_received_private_key_packages` only reads when nothing has expired (mdk#2923).
+
 ### Fixed
 
 - NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) project their parent and media, and accept author-only

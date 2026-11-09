@@ -33,6 +33,13 @@
   upload trims the file name; both versions canonicalize the media type)
   instead of comparing the strings literally (#3431).
 
+- Account-scoped work wakes only that account's worker (mdk#2923 step B). A chat-list, message, avatar or attachment
+  change for one account no longer runs every other account's presentation, avatar and attachment passes; shared
+  profile and directory changes and attachment controls still wake every account. The 15 s maintenance tick still
+  sets every pass due. The expired private KeyPackage discard reads first and opens no writer transaction when
+  nothing has expired, so an idle tick no longer writes the session database. New runtime operation
+  `storage_session_write_begin` counts writer transactions on the engine's session connection.
+
 ### Fixed
 
 - Interactive onboarding keeps a single-device acknowledgment when Continue follows a pause of more than five

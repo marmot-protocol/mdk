@@ -6677,7 +6677,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .invalidate(label);
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(label);
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
@@ -6698,7 +6698,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .invalidate(&delta.label);
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(&delta.label);
         Ok(())
     }
 
@@ -6729,7 +6729,7 @@ impl MarmotApp {
                 &classifier,
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(&delta.label);
         self.hydrate_chat_list_row(Some(&mut row));
 
         // Only the created row belongs on the response tail. Preserve any
@@ -6761,7 +6761,7 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(label);
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -7478,7 +7478,7 @@ impl MarmotApp {
         })?;
         if message.direction == "sent" {
             // The worker promotes the message's staged uploads.
-            self.presentation_signals.wake();
+            self.presentation_signals.wake_account(label);
         }
         Ok(update)
     }
@@ -7538,7 +7538,7 @@ impl MarmotApp {
         })?;
         if message.direction == "sent" {
             // The worker promotes the message's staged uploads.
-            self.presentation_signals.wake();
+            self.presentation_signals.wake_account(label);
         }
         Ok(update)
     }
@@ -7592,7 +7592,7 @@ impl MarmotApp {
                 .transpose()
         })?;
         // The worker promotes the message's staged uploads.
-        self.presentation_signals.wake();
+        self.presentation_signals.wake_account(label);
         if update.is_some()
             && let Some(observation) = observation
         {

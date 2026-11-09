@@ -131,6 +131,7 @@ operations! {
     StorageConnectionWait => "storage_connection_wait",
     StorageTransaction => "storage_transaction",
     StorageWriteBegin => "storage_write_begin",
+    StorageSessionWriteBegin => "storage_session_write_begin",
     ProjectionCheckpoint => "projection_checkpoint",
     ProjectionCheckpointSkipped => "projection_checkpoint_skipped",
     ProjectionCheckpointSkippedInvalidated => "projection_checkpoint_skipped_invalidated",
