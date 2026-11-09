@@ -636,7 +636,9 @@ invited into them. Building from source needs the Odin compiler (mdk#3214).
     this. Elsewhere a rejection was a generic engine or account error.
   - `WipeOutcome` failure reasons now follow the error's kind. An engine
     storage failure reads `local storage error`, an unknown engine group
-    `unknown local group`, and any other engine failure `session error`,
+    `unknown local group`, the admin refusals `AdminDepletion` and
+    `AdminCannotSelfRemove` `account is the chat's last admin` and `account is
+    an admin of the chat`, and any other engine failure `session error`,
     whichever layer reported it. Account failures outside the engine still
     read `account error`. The `error_code` logged when a read-marker update
     fails follows the same rule: `read_marker_failed:storage`,

@@ -95,8 +95,10 @@ clients older than 0.15 cannot be invited into it. See the
     a KeyPackage or a group change, arrived as `Runtime`.
   - Wipe outcome `reason` strings follow the same rule. An engine storage
     failure reads `local storage error`, an unknown engine group `unknown
-    local group`, and any other engine failure `session error`. Account
-    failures outside the engine still read `account error`.
+    local group`, the admin refusals `AdminDepletion` and
+    `AdminCannotSelfRemove` `account is the chat's last admin` and `account is
+    an admin of the chat`, and any other engine failure `session error`.
+    Account failures outside the engine still read `account error`.
 
 - A blocked leave is shown and can be cancelled (mdk#3014). `leave_blocked`
   on `AppGroupRecordFfi`, `ChatListRowFfi` and `GroupManagementStateFfi`

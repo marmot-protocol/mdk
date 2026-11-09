@@ -255,8 +255,10 @@ them.
     an identity proof, returned `MARMOT_STATUS_RUNTIME`.
   - Wipe outcome reasons follow the same rule. An engine storage failure reads
     `local storage error`, an unknown engine group `unknown local group`, and
-    any other engine failure `session error`. Account failures outside the
-    engine still read `account error`.
+    the admin refusals `AdminDepletion` and `AdminCannotSelfRemove` `account is
+    the chat's last admin` and `account is an admin of the chat`, and any other
+    engine failure `session error`. Account failures outside the engine still
+    read `account error`.
 
 - `marmot_client_new_with_client_name` and `MarmotClientOptions.client_name`
   leave out a name longer than 64 bytes once trimmed instead of publishing it;
