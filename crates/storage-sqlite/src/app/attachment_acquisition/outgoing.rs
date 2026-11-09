@@ -313,6 +313,20 @@ impl SqliteAppStorage {
         if limit == 0 || limit > 64 {
             return Err(invalid("invalid outgoing attachment recovery limit"));
         }
+        // An idle account has no staged uploads: answer that without a
+        // writer, which every maintenance tick would otherwise take
+        // (mdk#2923). Recovery pages every upload, so any one is work.
+        let any: bool = self
+            .lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM outgoing_attachment_uploads)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !any {
+            return Ok(0);
+        }
         let owners = self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let cursor: (String,String,Vec<u8>) = conn.query_row(
@@ -383,6 +397,19 @@ impl SqliteAppStorage {
     pub fn prune_attachment_uploads(&self, now: u64, limit: usize) -> StorageResult<usize> {
         if limit == 0 || limit > 64 {
             return Err(invalid("invalid outgoing attachment cleanup limit"));
+        }
+        // Only an owned or expired upload can be removed: with none, answer
+        // without a writer (mdk#2923).
+        let candidate: bool = self
+            .lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM outgoing_attachment_uploads u WHERE u.expires_at<=?1 OR EXISTS(SELECT 1 FROM outgoing_attachment_upload_owners o WHERE o.token=u.token))",
+                [i64::try_from(now).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !candidate {
+            return Ok(0);
         }
         self.connection.with_transaction(|| {
             let conn=self.lock()?;

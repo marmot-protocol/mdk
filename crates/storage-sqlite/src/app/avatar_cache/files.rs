@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::sync::Mutex;
 
+use crate::base::connection::CachedSql;
 use cgka_traits::storage::StorageResult;
 use media_store::{
     CatalogResult, Category, ExistingOutcome, FileId, Presence, PublishTarget, ReadyOutcome,
@@ -345,6 +346,19 @@ pub enum DatabaseAvatarBody {
 }
 
 impl SqliteAppStorage {
+    /// Whether any avatar image is still held in the database. Production
+    /// writes avatars as files, so once none is left nothing adds one
+    /// (mdk#2923). A read.
+    pub fn has_database_held_avatars(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM avatar_assets WHERE bytes IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Up to `limit` images still held in the database, smallest first.
     pub fn database_held_avatars(&self, limit: usize) -> StorageResult<Vec<DatabaseAvatar>> {
         let conn = self.lock()?;

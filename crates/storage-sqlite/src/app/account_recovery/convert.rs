@@ -845,6 +845,11 @@ impl SqliteAppStorage {
         input: &RecoveryConversionInput<'_>,
         limit: usize,
     ) -> StorageResult<()> {
+        // Every loss synchronization asks: once the conversion is done,
+        // answer without a writer (mdk#2923).
+        if !self.recovery_conversion_pending()? {
+            return Ok(());
+        }
         let current = input.current()?;
         for _ in 0..limit {
             let done = self.connection.with_transaction(|| {
@@ -879,6 +884,26 @@ impl SqliteAppStorage {
         input: &RecoveryConversionInput<'_>,
     ) -> StorageResult<bool> {
         input.current()?;
+        // Most synchronizations find no new or grown loss: answer that
+        // without a writer (mdk#2923). A pending conversion still reports
+        // its error below.
+        {
+            let conn = self.lock()?;
+            if step_tx(&conn)? == DONE {
+                let fresh: bool = conn
+                    .query_row_cached(
+                        "SELECT EXISTS(SELECT 1 FROM account_delivery_loss_evidence
+                         WHERE account_label = ?1
+                             AND (imported_count IS NULL OR dropped_count > imported_count))",
+                        params![label],
+                        |row| row.get(0),
+                    )
+                    .storage()?;
+                if !fresh {
+                    return Ok(false);
+                }
+            }
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if step_tx(&conn)? != DONE {

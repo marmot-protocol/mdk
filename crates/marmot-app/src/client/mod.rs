@@ -1025,6 +1025,10 @@ pub struct AppClient {
     /// the chat list, as a save would have: another runtime may have changed
     /// the projection (mdk#2923).
     pub(crate) observed_commit_version: Option<i64>,
+    /// The opened database (its [`storage_sqlite::SqliteAppStorage::connection_serial`])
+    /// whose content-report backfill this client saw complete. Nothing
+    /// reopens it, so maintenance stops asking (mdk#2923 §4).
+    pub(crate) content_report_backfill_done: Option<u64>,
     /// Runs at every transport-cursor seal, before and after, so a test can
     /// land a delivery on either side of the decision.
     #[cfg(test)]

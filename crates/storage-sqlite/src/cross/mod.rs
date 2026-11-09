@@ -6,6 +6,7 @@
 pub(crate) mod authority;
 pub(crate) mod groups;
 mod handles;
+pub(crate) mod media_cleanup;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod migrated_template;
 pub(crate) mod outbound;

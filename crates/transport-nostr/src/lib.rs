@@ -139,6 +139,37 @@ struct MarmotRelayPlaneInner {
     account_publish_clients: std::sync::Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>,
 }
 
+/// The router and notification forwarders own clones of `transport` and each waits on a channel only `transport`
+/// can close, so they would keep the transport, its SDK clients and their preallocated caches alive for the life
+/// of the process after the last plane handle is gone. A plane dropped without [`MarmotRelayPlane::shutdown`]
+/// (every short-lived `MarmotApp`, such as one per `wnd` Execute request) leaked several MB that way.
+///
+/// Every task slot is locked only through a `&MarmotRelayPlane` (`spawn_router`, `set_transport_signer`, account
+/// retirement, `shutdown`), and that borrow keeps this inner alive, so no slot can be held here and `try_lock`
+/// always succeeds. The router and forwarders hold `transport` but never lock the slots.
+impl Drop for MarmotRelayPlaneInner {
+    fn drop(&mut self) {
+        let transport = &self.transport;
+        transport.shutting_down.store(true, Ordering::SeqCst);
+        for slot in [
+            &transport.router,
+            &transport.notification_forwarder,
+            &transport.directory_notification_forwarder,
+        ] {
+            if let Ok(mut slot) = slot.try_lock()
+                && let Some(handle) = slot.take()
+            {
+                handle.abort();
+            }
+        }
+        if let Ok(mut forwarders) = transport.account_notification_forwarders.try_lock() {
+            for (_, handle) in forwarders.drain() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,

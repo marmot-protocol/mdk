@@ -722,3 +722,24 @@ fn closing_the_store_stops_staged_reads() {
         Err(MediaError::Closed)
     ));
 }
+
+/// A best-effort unlink that fails leaves a file only the sweep removes, and
+/// the store says so once; a file that is simply absent owes nothing
+/// (mdk#2923).
+#[test]
+fn a_failed_best_effort_unlink_owes_a_sweep_once() {
+    let (_harness, store) = fixture();
+    let absent = FileId([4; 16]);
+    store.unlink_released(&[absent]);
+    assert!(
+        !store.take_sweep_owed(),
+        "nothing was there to leave behind"
+    );
+
+    let blocked = FileId([5; 16]);
+    // A non-empty directory where the file would be cannot be unlinked.
+    std::fs::create_dir_all(store.path(&blocked).join("held")).unwrap();
+    store.unlink_released(&[blocked]);
+    assert!(store.take_sweep_owed());
+    assert!(!store.take_sweep_owed(), "reported once");
+}

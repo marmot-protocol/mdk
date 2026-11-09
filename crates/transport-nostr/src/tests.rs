@@ -6997,3 +6997,102 @@ async fn directory_wire_rejects_forgery_when_verified_ids_outlive_seen_state() {
     server.abort();
     let _ = server.await;
 }
+
+/// A plane dropped without its explicit shutdown must not stay alive through
+/// its own router and forwarder tasks. `wnd` builds one `MarmotApp` (and so one
+/// plane with three SDK clients) per Execute request and drops it; before this,
+/// each request kept ~3 MB and its relay connections until the process exited.
+/// Freeing the transport is enough to close them: an SDK pool shuts down when
+/// it drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_last_plane_handle_releases_its_transport() {
+    use futures::SinkExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+    let (subscribed, is_subscribed) = tokio::sync::oneshot::channel();
+    let relay = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if request[0] == "REQ" {
+                break request[1].as_str().unwrap().to_owned();
+            }
+        };
+        socket
+            .send(Message::Text(
+                serde_json::json!(["EOSE", subscription]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        subscribed.send(()).unwrap();
+        // Resolves once the plane's client closes the connection.
+        while let Some(Ok(message)) = socket.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+
+    let plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let keys = nostr::prelude::Keys::generate();
+    let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+    plane
+        .set_transport_signer(&account_id, Arc::new(keys.clone()))
+        .await
+        .unwrap();
+    plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: vec![endpoint],
+                watched_user_count: 1,
+                batches: vec![DirectorySyncBatch {
+                    subscription_id: "dropped_plane".into(),
+                    authors: vec![keys.public_key().to_hex()],
+                    kinds: vec![0],
+                    since: None,
+                }],
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), is_subscribed)
+        .await
+        .expect("the plane subscribes at the relay")
+        .unwrap();
+    let transport = Arc::downgrade(&plane.inner.transport);
+    assert!(
+        plane.inner.transport.router.lock().await.is_some(),
+        "construction inside a runtime spawns the router this test is about"
+    );
+    assert!(
+        plane
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await
+            .contains_key(&account_id),
+        "the signer starts the account forwarder this test is about"
+    );
+
+    drop(plane);
+    timeout(Duration::from_secs(5), async {
+        while transport.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the router and forwarders kept a dropped plane's transport alive");
+    timeout(Duration::from_secs(5), relay)
+        .await
+        .expect("a dropped plane kept its relay connection open")
+        .unwrap();
+}

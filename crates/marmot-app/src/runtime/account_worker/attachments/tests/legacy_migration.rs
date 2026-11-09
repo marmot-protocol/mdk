@@ -131,6 +131,61 @@ async fn a_rolled_back_compaction_is_tried_again_later() {
     test_free_space::clear(dir.path());
 }
 
+/// The compaction check runs on every batch while a migration is owed, not
+/// only on the hourly recheck: the batch that moves a legacy body frees its
+/// pages, then sees them, so the compaction follows on that tick instead of
+/// up to an hour later (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tick_that_finishes_the_migration_flags_the_compaction() {
+    use std::sync::atomic::Ordering;
+    let body = vec![7u8; 4 << 20];
+    let (dir, client, storage, _reference) = offline_fixture_with(&body).await;
+    let app_storage = storage.app_storage();
+    app_storage.make_non_incremental_for_test().unwrap();
+    // A legacy body large enough that moving it leaves the database
+    // mostly free pages.
+    let now = crate::unix_now_seconds();
+    admit_demands(&app_storage, now, false).unwrap();
+    let asset = app_storage
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
+    let job = app_storage
+        .claim_attachment_acquisition(&asset, now, now + 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        app_storage
+            .complete_attachment_acquisition(&job, &body, now, u64::MAX / 2)
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+    let shared = RuntimeSharedServices::default();
+    let mut admission = Admission::default();
+
+    // No free space: the migration pauses, so the first check is not due.
+    test_free_space::set(dir.path(), 0);
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert!(app_storage.legacy_attachment_bytes().unwrap() > 0);
+    assert!(!admission.compaction_due.load(Ordering::Acquire));
+    assert!(!app_storage.database_space().unwrap().incremental);
+    assert!(
+        admission
+            .latches
+            .recheck_due
+            .is_some_and(|due| due > std::time::Instant::now()),
+        "the hourly recheck is not due on the next tick"
+    );
+
+    test_free_space::set(dir.path(), 1 << 40);
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert_eq!(app_storage.legacy_attachment_bytes().unwrap(), 0);
+    assert!(admission.latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(admission.compaction_attempted, "flagged and compacted");
+    assert!(app_storage.database_space().unwrap().incremental);
+    test_free_space::clear(dir.path());
+}
+
 /// Repeated rollbacks stop after the cap, so a failure that keeps happening
 /// cannot rebuild the in-memory copy on every tick.
 #[test]
