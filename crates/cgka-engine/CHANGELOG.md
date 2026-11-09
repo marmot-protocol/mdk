@@ -8,7 +8,7 @@
   SelfRemove, staging either again if it is refused or lost. The last active admin is refused with `AdminDepletion`,
   and a non-admin's call is a plain `Leave`. Plain `Leave` from an admin is still refused with `AdminCannotSelfRemove`.
   A call made while an earlier intent is queued is queued behind it, and the drain records the leave after that intent
-  is prepared. No wire or schema change.
+  is prepared, blocked if the account has become the last active admin meanwhile. No wire or schema change.
 
 - A blocked leave is visible and can be cancelled (mdk#3014). When the selected branch makes a leaving account the
   last active admin, the leave re-drive records `LeaveRequest::blocked = Some(LastActiveAdmin)` and clears it as soon

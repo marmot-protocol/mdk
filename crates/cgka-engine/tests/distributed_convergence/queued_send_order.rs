@@ -15,6 +15,7 @@
 //! after a queued message, and a message after a queued group change.
 
 use super::*;
+use cgka_traits::storage::{LeaveBlockReason, LeaveRequestStorage};
 
 /// Sends queued while carol's convergence is unsettled.
 const QUEUED: usize = 60;
@@ -611,6 +612,80 @@ async fn an_admins_leave_behind_a_queued_message_goes_out_after_it() {
             format!("-> {}", epoch + 1)
         ],
         "alice reads the message carol sent before stepping down"
+    );
+}
+
+/// An admin's leave queued while another admin remained is not refused when
+/// that admin steps down before the drain reaches it: the leave had started,
+/// so the drain records it and the re-drive blocks it as the last admin's,
+/// which its user can cancel. Asking again meanwhile returns the queued
+/// leave rather than refusing the last admin.
+#[tokio::test]
+async fn an_admins_queued_leave_is_blocked_once_its_account_is_the_last_admin() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let group_id = three_member_group(&mut alice, &mut carol, &mut bob).await;
+    queue_message(&mut carol, &group_id, "sent before leaving").await;
+    let step_down_and_leave = || SendIntent::StepDownAndLeave {
+        group_id: group_id.clone(),
+    };
+    let leave = carol.send(step_down_and_leave()).await.unwrap();
+    assert!(matches!(leave, SendResult::Queued { .. }), "{leave:?}");
+
+    // alice, the other admin, steps down before carol's drain runs.
+    let SendResult::LeaveRequested { .. } = alice.send(step_down_and_leave()).await.unwrap() else {
+        panic!("alice's leave is recorded");
+    };
+    alice.advance_convergence(&group_id).await.unwrap();
+    let mut staged = alice.drain_auto_publish();
+    assert_eq!(staged.len(), 1, "alice's step-down");
+    let step_down = staged.remove(0);
+    alice.confirm_published(step_down.pending).await.unwrap();
+    read(&mut carol, &group_id, &[route(step_down.msg, &group_id)]).await;
+    assert_eq!(carol.admin_pubkeys(&group_id).unwrap().len(), 1);
+    assert_eq!(
+        carol.send(step_down_and_leave()).await.unwrap(),
+        leave,
+        "asking again returns the queued leave"
+    );
+
+    carol.drain_events();
+    let drained = carol.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(
+            drained.as_slice(),
+            [
+                SendResult::ApplicationMessage { .. },
+                SendResult::LeaveRequested { .. }
+            ]
+        ),
+        "the message, then the recorded leave: {drained:?}"
+    );
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .iter()
+            .all(|record| !matches!(record.intent, SendIntent::StepDownAndLeave { .. })),
+        "the drain retires the leave it recorded"
+    );
+    carol.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage
+            .leave_request(&group_id)
+            .unwrap()
+            .and_then(|request| request.blocked),
+        Some(LeaveBlockReason::LastActiveAdmin)
+    );
+    assert!(carol.drain_auto_publish().is_empty(), "no step-down");
+    assert!(carol.drain_auto_proposals().is_empty(), "no SelfRemove");
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. })),
+        "the queued leave is not refused"
     );
 }
 

@@ -1118,7 +1118,10 @@ impl<S: StorageProvider> Engine<S> {
     /// is queued behind it instead, as a Leave is (mdk#2842). Recorded now,
     /// the request would hold the drain to the leave, and the removal would
     /// discard the earlier intent unsent. The drain records the request when
-    /// it reaches the queued leave.
+    /// it reaches the queued leave, even if the account has become the last
+    /// active admin since: that leave had started, so the re-drive blocks it
+    /// (`LeaveBlockReason::LastActiveAdmin`) rather than the drain refusing
+    /// it after the app already showed it.
     pub(crate) fn do_request_admin_leave(
         &mut self,
         group_id: &GroupId,
@@ -1128,13 +1131,27 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(group_id);
             return Ok(Some(SendResult::LeaveRequested { request }));
         }
+        // A leave already queued answers a repeated call, whatever the admin
+        // list now says.
+        if entry == AdminLeaveEntry::Send
+            && let Some(record) = self
+                .storage
+                .list_queued_outbound_intents(group_id)?
+                .into_iter()
+                .find(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }))
+        {
+            return Ok(Some(SendResult::Queued {
+                group_id: group_id.clone(),
+                intent_id: record.id,
+            }));
+        }
         let authority = self.capture_group_authority_facts(group_id)?;
         if !authority.is_admin {
             return Ok(None);
         }
-        // member-departure.md, "Behavior": the last active admin designates
-        // another admin before leaving.
-        if authority.admin_count < 2 {
+        // member-departure.md, "Behavior": the last active admin cannot start
+        // a leave; it designates another admin first.
+        if entry == AdminLeaveEntry::Send && authority.admin_count < 2 {
             return Err(EngineError::AdminDepletion {
                 group_id: group_id.clone(),
             });
@@ -1142,17 +1159,6 @@ impl<S: StorageProvider> Engine<S> {
         if entry == AdminLeaveEntry::Send
             && self.has_queued_intent_awaiting_preparation(group_id)?
         {
-            let queued = self
-                .storage
-                .list_queued_outbound_intents(group_id)?
-                .into_iter()
-                .find(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }));
-            if let Some(record) = queued {
-                return Ok(Some(SendResult::Queued {
-                    group_id: group_id.clone(),
-                    intent_id: record.id,
-                }));
-            }
             let queued = self.queue_outbound_intent(
                 group_id.clone(),
                 SendIntent::StepDownAndLeave {

@@ -338,15 +338,18 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   ends it through the terminal verdict, and a reorg or acknowledged disband failure must find its rotation still owed.
 - **An admin's Leave is recorded before anything is published (mdk#3014).** `SendIntent::StepDownAndLeave` from an
   active admin with another active admin writes the `LeaveRequest` (`last_proposed_epoch: None`), schedules the group
-  and returns `SendResult::LeaveRequested`, in any epoch state and with no staged Commit; the re-drive below stages
-  the step-down and then the SelfRemove. Never stage either inside the call: a step-down sent before the request is
-  durable is the torn two-send leave this replaces. The last active admin is refused with `AdminDepletion` and
-  nothing is written; a non-admin's call becomes `SendIntent::Leave`; a call on a group that already has a request
-  returns it. Plain `Leave` from an admin stays `AdminCannotSelfRemove`, so only callers that opt in get the step-down.
-  A call made while an intent queued earlier still awaits preparation queues behind it instead (mdk#2842), and the
-  drain records the request when it reaches that row and retires it: a request recorded first would hold the drain to
-  the leave, and the removal would discard the earlier intent unsent. Pinned by `invite_leave::admin_leave`,
-  `queued_send_order`, and marmot-app's `rival_branch_leave` and `linked_device_chats` admin leaves.
+  and returns `SendResult::LeaveRequested`, in any epoch state and with no staged Commit; the re-drive below stages the
+  step-down and then the SelfRemove. Never stage either inside the call: a step-down sent before the request is durable
+  is the torn two-send leave this replaces. The last active admin is refused with `AdminDepletion` and nothing is
+  written; a non-admin's call becomes `SendIntent::Leave`; a call on a group that already has a request returns it.
+  Plain `Leave` from an admin stays `AdminCannotSelfRemove`, so only callers that opt in get the step-down. A call made
+  while an intent queued earlier still awaits preparation queues behind it instead (mdk#2842), and the drain records the
+  request when it reaches that row and retires it: a request recorded first would hold the drain to the leave, and the
+  removal would discard the earlier intent unsent. The queued leave has started, so the drain records it even when the
+  account has become the last active admin, and the re-drive blocks it; never refuse it at drain, since the app has
+  already shown the leave. A repeated call returns the queued row before any admin check. Pinned by
+  `invite_leave::admin_leave`, `queued_send_order`, and marmot-app's `rival_branch_leave` and `linked_device_chats`
+  admin leaves.
 - **A leave request owns its admin step-down (mdk#3014).** While a durable `LeaveRequest` exists, `next_leave_step`
   decides the next step on a `Stable` epoch: an account the selected branch makes an admin again stages a step-down
   (`stage_leave_step_down`: the selected branch's admin list minus itself, never the lost Commit's bytes, and only

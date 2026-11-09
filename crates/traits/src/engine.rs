@@ -309,7 +309,9 @@ pub enum SendIntent {
     /// group that already has a leave request returns that request. An
     /// admin's call made while an intent queued earlier still waits is
     /// queued behind it ([`SendResult::Queued`]), and the drain records the
-    /// request when it reaches it.
+    /// request when it reaches it. That leave has started: if the account
+    /// has become the last active admin by then, it is recorded blocked
+    /// rather than refused.
     StepDownAndLeave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.
     ///
