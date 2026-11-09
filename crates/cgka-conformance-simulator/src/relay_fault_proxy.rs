@@ -724,7 +724,7 @@ async fn read_opening(stream: &mut TcpStream) -> Option<Opening> {
 
 /// Whether a request head asks for the relay's NIP-11 document: an HTTP
 /// request that is no WebSocket upgrade and accepts `application/nostr+json`.
-fn asks_for_information(head: &[u8]) -> bool {
+pub fn asks_for_information(head: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(head) else {
         return false;
     };

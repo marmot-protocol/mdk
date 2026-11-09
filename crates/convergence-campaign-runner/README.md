@@ -17,7 +17,9 @@ contract, backend boundary, and artifact posture are in
 - `cgka-distributed-campaign` — the campaign CLI (below).
 - `cgka-conformance-node` — participant process inside campaign containers.
 - `cgka-conformance-relay` — campaign-only relay plus loopback proxy. These use real sockets, so they live here rather
-  than in the deterministic simulator.
+  than in the deterministic simulator. The relay answers NIP-11 requests with the same production-shaped document
+  (NIP-77, `max_limit` 500) the in-process and process routes' relays serve, so app recovery sweeps see the same
+  relay limits on every route.
 
 ## Running a campaign
 
