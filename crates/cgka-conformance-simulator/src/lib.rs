@@ -163,6 +163,7 @@ pub use quiescence::{
 };
 pub use reference_subject::ReferenceModelSubject;
 pub use relay_control::harness_relay_builder;
+pub use relay_fault_proxy::{PRODUCTION_RELAY_INFORMATION, asks_for_information};
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,

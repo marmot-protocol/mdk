@@ -29,6 +29,8 @@ const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 /// realistic result set; a warn fires if it is ever hit.
 const PUBLIC_DIRECTORY_USERS_MAX: usize = 10_000;
 
+type SearchProfile = (PublicDirectoryProfileRecord, Option<u64>, u8);
+
 /// Message carried by every [`StorageError::Closed`] this module raises.
 const CLOSED_DETAIL: &str = "sqlite shared storage is closed";
 
@@ -198,6 +200,7 @@ impl SqliteSharedStorage {
         )
         .storage()?;
         migrations::run_all(&mut conn)?;
+        crate::base::text_search::register_search_functions(&conn).storage()?;
         Ok(Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
         })
@@ -317,27 +320,85 @@ impl SqliteSharedStorage {
         self.public_directory_users_capped(PUBLIC_DIRECTORY_USERS_MAX)
     }
 
-    /// Read only searchable public identity/profile fields, with the same
-    /// defensive identity cap as `public_directory_users`. No follow-edge join.
-    pub fn public_directory_profiles(&self) -> StorageResult<Vec<PublicDirectoryProfileRecord>> {
+    /// Read raw profiles, their timestamps, and ranks for a normalized query.
+    /// Empty IDs scan at most 10,000 matching identities in account-ID order.
+    /// Requested IDs include nonmatches so newer profiles suppress stale matches
+    /// in other caches. Follow edges and unrelated JSON are not read.
+    pub fn public_directory_profiles(
+        &self,
+        query: &str,
+        account_ids: &[String],
+    ) -> StorageResult<Vec<SearchProfile>> {
+        const PROJECTION: &str =
+            "SELECT account_id_hex, npub, profile_json,
+                    CASE WHEN profile_json IS NULL THEN NULL
+                         ELSE COALESCE(profile_json -> '$.created_at', '0')
+                    END,
+                    min(
+                        marmot_search_rank(json_extract(profile_json, '$.name'), ?1) * 6,
+                        marmot_search_rank(json_extract(profile_json, '$.nip05'), ?1) * 6 + 1,
+                        marmot_search_rank(json_extract(profile_json, '$.display_name'), ?1) * 6 + 2,
+                        marmot_search_rank(json_extract(profile_json, '$.about'), ?1) * 6 + 3,
+                        marmot_search_rank(npub, ?1) * 6 + 4,
+                        marmot_search_rank(account_id_hex, ?1) * 6 + 5
+                    ) AS search_rank
+             FROM directory_users";
         let conn = self.lock()?;
-        let mut statement = conn
-            .prepare_cached(
-                "SELECT account_id_hex, npub, profile_json FROM directory_users
-                 ORDER BY account_id_hex LIMIT ?1",
-            )
-            .storage()?;
-        statement
-            .query_map([PUBLIC_DIRECTORY_USERS_MAX as i64], |row| {
-                Ok(PublicDirectoryProfileRecord {
+        let read_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                PublicDirectoryProfileRecord {
                     account_id_hex: row.get(0)?,
                     npub: row.get(1)?,
                     profile_json: row.get(2)?,
-                })
-            })
-            .storage()?
-            .map(|row| row.storage())
-            .collect()
+                },
+                row.get::<_, Option<String>>(3)?
+                    .map(|value| {
+                        value.parse::<u64>().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                row.get(4)?,
+            ))
+        };
+        if account_ids.is_empty() {
+            let mut statement = conn
+                .prepare_cached(&format!(
+                    "{PROJECTION} WHERE search_rank < 18
+                     ORDER BY account_id_hex LIMIT {PUBLIC_DIRECTORY_USERS_MAX}"
+                ))
+                .storage()?;
+            return statement
+                .query_map([query], read_row)
+                .storage()?
+                .map(|row| row.storage())
+                .collect();
+        }
+        let mut profiles = Vec::new();
+        for ids in account_ids.chunks(crate::SQLITE_BIND_PARAMETER_CHUNK - 1) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn
+                .prepare_cached(&format!(
+                    "{PROJECTION} WHERE account_id_hex IN ({placeholders})"
+                ))
+                .storage()?;
+            let rows = statement
+                .query_map(
+                    params_from_iter(std::iter::once(query).chain(ids.iter().map(String::as_str))),
+                    read_row,
+                )
+                .storage()?;
+            for row in rows {
+                profiles.push(row.storage()?);
+            }
+        }
+        Ok(profiles)
     }
 
     /// Read only requested profiles, without follow, relay-list, or key-package rows.
@@ -859,12 +920,129 @@ mod tests {
             .execute_batch("DROP TABLE directory_user_follows")
             .unwrap();
         assert_eq!(
-            storage.public_directory_profiles().unwrap(),
-            vec![PublicDirectoryProfileRecord {
-                account_id_hex: record.account_id_hex,
-                npub: record.npub,
-                profile_json: record.profile_json,
-            }]
+            storage.public_directory_profiles("alice", &[]).unwrap(),
+            vec![(
+                PublicDirectoryProfileRecord {
+                    account_id_hex: record.account_id_hex,
+                    npub: record.npub,
+                    profile_json: record.profile_json,
+                },
+                Some(0),
+                0
+            )]
+        );
+    }
+
+    #[test]
+    fn public_directory_profile_search_ranks_fields_and_preserves_nonmatching_winners() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let mut record = PublicDirectoryUserRecord {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1unrelated".into(),
+            profile_json: None,
+            relay_lists_json: "{}".into(),
+            key_package_json: None,
+            event_id_hex: None,
+            event_kind: None,
+            event_created_at: None,
+            follows: Vec::new(),
+        };
+        for (field, rank) in [("name", 0), ("nip05", 1), ("display_name", 2), ("about", 3)] {
+            record.profile_json = Some(format!(r#"{{"{field}":"ÉCOLE %_","created_at":42}}"#));
+            storage.put_public_directory_user(&record).unwrap();
+            for (query, quality) in [("école %_", 0), ("école", 1), ("%_", 2)] {
+                let rows = storage.public_directory_profiles(query, &[]).unwrap();
+                assert_eq!(rows.len(), 1, "{field}: {query}");
+                assert_eq!(rows[0].1, Some(42));
+                assert_eq!(rows[0].2, quality * 6 + rank, "{field}: {query}");
+            }
+            assert!(
+                storage
+                    .public_directory_profiles("%x", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        record.profile_json = Some(r#"{"name":"ÉCOLE prefix","nip05":"école"}"#.into());
+        storage.put_public_directory_user(&record).unwrap();
+        let rows = storage.public_directory_profiles("école", &[]).unwrap();
+        assert_eq!((rows[0].1, rows[0].2), (Some(0), 1));
+        record.profile_json = None;
+        storage.put_public_directory_user(&record).unwrap();
+        let rows = storage
+            .public_directory_profiles("npub1unrelated", &[])
+            .unwrap();
+        assert_eq!((rows[0].1, rows[0].2), (None, 4));
+        let rows = storage
+            .public_directory_profiles(&record.account_id_hex, &[])
+            .unwrap();
+        assert_eq!((rows[0].1, rows[0].2), (None, 5));
+
+        record.profile_json = Some(r#"{"name":"new name","created_at":99}"#.into());
+        storage.put_public_directory_user(&record).unwrap();
+        assert!(
+            storage
+                .public_directory_profiles("école", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let mut ids = (0..crate::SQLITE_BIND_PARAMETER_CHUNK)
+            .map(|id| format!("{id:064x}"))
+            .collect::<Vec<_>>();
+        ids.push(record.account_id_hex.clone());
+        let rows = storage.public_directory_profiles("école", &ids).unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                PublicDirectoryProfileRecord {
+                    account_id_hex: record.account_id_hex,
+                    npub: record.npub,
+                    profile_json: record.profile_json,
+                },
+                Some(99),
+                18
+            )]
+        );
+    }
+
+    #[test]
+    fn public_directory_profile_search_filters_before_the_candidate_cap() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "WITH RECURSIVE ids(id) AS (
+                 VALUES(0) UNION ALL SELECT id + 1 FROM ids WHERE id < 10000
+             )
+             INSERT INTO directory_users (account_id_hex, npub, profile_json, relay_lists_json)
+             SELECT printf('%064x', id), 'npub1unrelated',
+                    CASE WHEN id = 10000 THEN '{\"about\":\"needle\"}' ELSE NULL END,
+                    '{}'
+             FROM ids;",
+            )
+            .unwrap();
+        let rows = storage.public_directory_profiles("needle", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.account_id_hex, format!("{:064x}", 10000));
+        assert_eq!((rows[0].1, rows[0].2), (Some(0), 3));
+        storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE directory_users SET profile_json = '{\"about\":\"needle\"}'",
+                [],
+            )
+            .unwrap();
+        let rows = storage.public_directory_profiles("needle", &[]).unwrap();
+        assert_eq!(rows.len(), PUBLIC_DIRECTORY_USERS_MAX);
+        assert_eq!(
+            rows.first().unwrap().0.account_id_hex,
+            format!("{:064x}", 0)
+        );
+        assert_eq!(
+            rows.last().unwrap().0.account_id_hex,
+            format!("{:064x}", 9999)
         );
     }
 

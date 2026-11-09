@@ -7,7 +7,7 @@
 
 use super::removal::{chat_with_both, pending_removals, published_count};
 use super::*;
-use crate::client::sign_out::SiblingSignOut;
+use crate::client::sign_out::{SiblingSignOut, SignOutAdminKeep, SignOutLeave};
 use crate::messages::AppMessageIntent;
 use crate::notifications::PushPlatform;
 use crate::tests::canonical_membership::deliver_events;
@@ -265,10 +265,10 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 /// removal reaches the laptop, which is not unlinked and is told nothing.
 /// Every publish of its account is held back but its sign-out's own steps:
 /// it can still delete its own slot, and sends nothing else. A chat message
-/// does not go out, no maintenance pass or push token retry runs, and the
-/// engine refuses to let an admin's device leave the chat its account
-/// administers, a refusal that comes without the push token removal a leave
-/// sends first. While the slot's deletion waits on its relay, a
+/// does not go out, no maintenance pass or push token retry runs, and it
+/// keeps its leaf in the chat its account is the last admin of, sending
+/// nothing there, not even the push token removal a leave sends first
+/// (mdk#2818). While the slot's deletion waits on its relay, a
 /// profile published beside it, in the same task or a spawned one, is still
 /// refused. When its sign-out ends without a wipe, the next pairing drive
 /// finds the stored removal and unlinks it.
@@ -333,11 +333,10 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
             .retry_pending_push_registration_shares_best_effort()
             .await
     );
-    let refused = laptop.leave_group_for_sign_out(&notes).await.unwrap_err();
-    assert!(matches!(
-        refused.as_engine_error(),
-        Some(cgka_traits::error::EngineError::AdminCannotSelfRemove { .. })
-    ));
+    assert_eq!(
+        laptop.leave_group_for_sign_out(&notes).await.unwrap(),
+        SignOutLeave::Kept(SignOutAdminKeep::LastAdmin)
+    );
     assert_eq!(published_count(&relay), published, "nothing goes out");
 
     let publish_profile = |app: MarmotApp| async move {
@@ -491,7 +490,8 @@ async fn sign_out_and_wipe_leaves_a_shared_chat_to_the_sibling() {
 /// The laptop's `leaving` commit cannot go out, so it is not confirmed in
 /// time: the laptop says its siblings could not be asked and leaves every
 /// chat itself, reporting the one its account administers as one it could
-/// not leave.
+/// not leave: the phone stays in it, and a step-down would take the
+/// phone's admin rights too (mdk#2818).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     let (mut devices, _group) = tagging_devices().await;
@@ -516,10 +516,13 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     // Its account administers the chat, so it cannot leave it itself: the
     // chat keeps its leaf and is reported to its user.
     assert_eq!(outcome.groups_left, 0);
-    let [failure] = outcome.group_leave_failures.as_slice() else {
-        panic!("one chat it could not leave: {outcome:?}");
-    };
-    assert_eq!(failure.group_id_hex, hex::encode(chat.as_slice()));
+    assert_eq!(
+        outcome.group_leave_failures,
+        [crate::GroupLeaveFailure {
+            group_id_hex: hex::encode(chat.as_slice()),
+            reason: "account is an admin and another of its devices stays in the chat".to_owned(),
+        }]
+    );
     assert!(outcome.local_cleanup.completed);
     runtime.shutdown().await;
 }
@@ -685,7 +688,8 @@ async fn shutting_down_ends_a_wipes_worker_retry_without_waiting_for_its_deadlin
 /// the laptop mid-wait: it is not unlinked but signs out on its own, does
 /// not try to leave the chat it is no longer in, and from then on sends
 /// only its SelfRemove from a chat bob administers and its slot's
-/// deletion.
+/// deletion. It takes no step-down in a chat its account and bob both
+/// administer, so it keeps its leaf there and reports why (mdk#2818).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let (mut devices, group) = linked_devices().await;
@@ -694,6 +698,11 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let with_bob = devices
         .laptop
         .create_group("existing chat", &[])
+        .await
+        .unwrap();
+    let co_admin = devices
+        .laptop
+        .create_group("co-admin chat", &[])
         .await
         .unwrap();
     let phone_slot = slot_of(&devices.phone);
@@ -736,6 +745,9 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     laptop.invite_members(&with_bob, &[&bob_id]).await.unwrap();
     laptop.promote_admin(&with_bob, &bob_id).await.unwrap();
     laptop.self_demote_admin(&with_bob).await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    laptop.invite_members(&co_admin, &[&bob_id]).await.unwrap();
+    laptop.promote_admin(&co_admin, &bob_id).await.unwrap();
     let laptop_key = laptop.runtime.own_signature_key();
     drop(laptop);
     let mut phone_cursor = published_count(&relay);
@@ -811,13 +823,16 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let outcome = wipe.await.unwrap();
     assert!(!outcome.siblings_not_reached);
     assert_eq!(outcome.groups_left_to_siblings, 0);
-    // It leaves bob's chat; the shared chat it is no longer in is neither
-    // left nor reported.
+    // It leaves bob's chat and keeps the one its account still
+    // administers; the shared chat it is no longer in is neither left nor
+    // reported.
     assert_eq!(outcome.groups_left, 1);
-    assert!(
-        outcome.group_leave_failures.is_empty(),
-        "{:?}",
-        outcome.group_leave_failures
+    assert_eq!(
+        outcome.group_leave_failures,
+        [crate::GroupLeaveFailure {
+            group_id_hex: hex::encode(co_admin.as_slice()),
+            reason: "account is an admin of the chat".to_owned(),
+        }]
     );
     assert_eq!(outcome.key_packages_deleted, 1);
     assert!(outcome.local_cleanup.completed);
@@ -827,7 +842,7 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
             .map(|event| event.kind)
             .collect::<Vec<_>>(),
         vec![445, 5],
-        "only its SelfRemove in bob's chat and its slot's deletion go out"
+        "only its SelfRemove in bob's chat and its slot's deletion go out, no step-down"
     );
     runtime.shutdown().await;
 }

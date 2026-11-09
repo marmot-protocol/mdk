@@ -7,6 +7,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- `marmot_sign_out_and_wipe` leaves a chat the account administers with another account, where none of its other devices
+  is in (mdk#2818): it steps the account down first and counts the chat in `groups_left` only once it sees its removal,
+  blocking up to about 30 seconds more for all such chats. A chat this device was already leaving waits the same way.
+  Otherwise `group_leave_failures` says why. No ABI change.
+
 - Add account relay liveness snapshots, single-relay reconnect, and a closeable
   subscription with blocking reads and callbacks. `MarmotRelayLivenessList` owns
   its records and strings; free it with `marmot_relay_liveness_list_free`.

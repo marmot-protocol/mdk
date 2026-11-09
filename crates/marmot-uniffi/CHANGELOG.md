@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `sign_out_and_wipe` leaves a chat the account administers with another account, where none of its other devices is in
+  (mdk#2818): it steps the account down first and counts the chat in `groups_left` only once it sees its removal,
+  waiting up to about 30 seconds more for all such chats. A chat this device was already leaving waits the same way.
+  Otherwise `group_leave_failures` says why. No API change.
+
 - Add `account_relay_liveness`, `subscribe_relay_liveness`, and `reconnect_relay` (mdk#329), with
   `RelayLivenessFfi`, stable `RelayStatusFfi`, and a closeable `RelayLivenessSubscription`.
   Rows include session-local attempt times and available connection-error categories. Additive; aggregate health

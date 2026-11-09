@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Signing out leaves a chat its account administers with another account (mdk#2818). Where none of the account's other
+  devices is in the chat, `sign_out_and_wipe` sends the engine's `StepDownAndLeave`, whether or not device groups are
+  on: the leave is recorded, then the engine steps the account down and leaves. One wait of about 30 seconds covers all
+  such chats, and each counts in `groups_left` only once this device sees the commit that removes it. Otherwise
+  `group_leave_failures` reports why: the step-down was not accepted in time, the removal was not seen in time, or the
+  account became the last admin. A blocked leave ends that chat's wait. A chat this device was already leaving gets
+  nothing new and joins the same wait. Such a chat reads as `Left` only once its removal is seen. A chat the account is
+  the last admin of, one another of its devices stays in, and every admin chat of a device removed during the sign-out
+  keep its leaf and are reported with that reason.
+
 - Add account-scoped relay liveness snapshots, event-driven subscriptions, and safety-checked per-relay reconnects
   (mdk#329). Unobserved configured relays remain `Unknown`; closed sessions retain available attempt/error details.
   Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
@@ -13,6 +23,10 @@
   again instead of leaving the account demoted with no leave. The Leave call now returns once the leave is recorded,
   or queued behind sends made before it, and before the step-down is published. Ordinary builds still refuse an admin's Leave or Decline until the host demotes
   the account.
+
+- Automatic rejoin announces committed recovery-status changes even when preparing a later group fails
+  (mdk#3219). Unreadable statuses also queue a host refresh. The preparation error is preserved, and retry
+  budgets are unchanged.
 
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
 

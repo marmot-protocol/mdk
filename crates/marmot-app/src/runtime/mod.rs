@@ -29,7 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
-use crate::client::sign_out::SiblingSignOut;
+use crate::client::sign_out::{SiblingSignOut, SignOutAdminLeave, SignOutLeave};
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
@@ -1088,7 +1088,10 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Active MLS groups whose local leave call succeeded, not confirmed removal.
+    /// Active MLS groups whose local leave call succeeded, not confirmed removal,
+    /// except a chat whose leave the sign-out waits for (an admin chat the
+    /// account steps down in, or one this device was already leaving), which
+    /// counts only once this device sees its removal (mdk#2818).
     /// A chat this device is no longer in, its copy removed or disbanded, is
     /// neither counted nor reported as a failure.
     pub groups_left: u32,
@@ -1225,6 +1228,15 @@ pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
         let category = match engine {
             cgka_traits::EngineError::Storage(_) => "local storage error",
             cgka_traits::EngineError::UnknownGroup(_) => "unknown local group",
+            // A leave refused because the admin list changed after stage 1
+            // read it (mdk#2818): the last admin cannot step down, and an
+            // account that became an admin cannot send a plain Leave.
+            cgka_traits::EngineError::AdminDepletion { .. } => {
+                crate::client::sign_out::SIGN_OUT_LAST_ADMIN
+            }
+            cgka_traits::EngineError::AdminCannotSelfRemove { .. } => {
+                crate::client::sign_out::SIGN_OUT_ADMIN
+            }
             _ => "session error",
         };
         return category.to_owned();
@@ -4856,6 +4868,14 @@ impl MarmotAppRuntime {
     ///    pending invite is a real committed membership this device must leave
     ///    (the decline path leaves such groups too). Group-enumeration failures
     ///    are surfaced as a recorded failure rather than silently dropped.
+    ///    In a chat its account administers with another account, where no
+    ///    other of its devices has a leaf, it sends `StepDownAndLeave`: the
+    ///    engine records the leave, steps the account down and then leaves.
+    ///    A chat this device is already leaving gets nothing new and joins
+    ///    them. One more wait of about 30 seconds covers all such chats, and
+    ///    each counts as left only once this device sees the commit that
+    ///    removes it (mdk#2818). It keeps its leaf, and reports why, in any
+    ///    other chat its account is an active admin of.
     /// 2. Best-effort deletion of this device's KeyPackage slot, always (no
     ///    toggle): one kind 5 naming only that slot, so the account's other
     ///    devices keep theirs.
@@ -4952,6 +4972,7 @@ impl MarmotAppRuntime {
                 }
             };
             let storage = self.accounts.app.account_storage(&account.label).ok();
+            let mut waiting = Vec::new();
             for group in groups {
                 let group_id_hex = group.group_id_hex.clone();
                 if left_to_siblings.contains(&group_id_hex) {
@@ -4977,18 +4998,31 @@ impl MarmotAppRuntime {
                 }) {
                     continue;
                 }
+                // In a chat its account is an active admin of, an admin's
+                // SelfRemove is refused: it steps down first where another
+                // account is an admin too, and keeps its leaf otherwise
+                // (mdk#2818).
                 match self
                     .accounts
                     .leave_group_for_sign_out(account_ref, &group_id)
                     .await
                 {
-                    Ok(_) => outcome.groups_left += 1,
+                    Ok(SignOutLeave::Left) => outcome.groups_left += 1,
+                    Ok(SignOutLeave::Recorded) => waiting.push((group_id, group_id_hex)),
+                    Ok(SignOutLeave::Kept(kept)) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: kept.reason().to_owned(),
+                        });
+                    }
                     Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
                         group_id_hex,
                         reason: wipe_failure_reason(&err),
                     }),
                 }
             }
+            self.finish_admin_sign_out_leaves(account_ref, waiting, &mut outcome)
+                .await;
 
             // Stage 2: delete this device's KeyPackage slot while its private
             // material still exists. A failure must not abort the wipe.
@@ -5020,6 +5054,98 @@ impl MarmotAppRuntime {
         }
 
         Ok(outcome)
+    }
+
+    /// Wait for the chats whose leave stage 1 recorded, or found already in
+    /// progress, to remove this device (mdk#2818). One deadline, the
+    /// sign-out's `leaving` wait, covers them all and is polled first, as in
+    /// signing out through siblings: the account worker keeps receiving and
+    /// draining between polls, so the engine stages each step-down and then
+    /// its SelfRemove from the leave request, and a member's commit of it
+    /// removes this device. A chat counts in `groups_left` only once a poll
+    /// reads that commit; any other is reported with where its leave stood
+    /// when last read. A runtime shutdown also ends the wait, at once: a chat
+    /// no poll read yet is reported as not accepted in time, whatever its
+    /// state, since the device wipes either way.
+    async fn finish_admin_sign_out_leaves(
+        &self,
+        account_ref: &str,
+        chats: Vec<(GroupId, String)>,
+        outcome: &mut WipeOutcome,
+    ) {
+        if chats.is_empty() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let mut pending = chats
+            .into_iter()
+            .map(|(group_id, group_id_hex)| {
+                (group_id, group_id_hex, SignOutAdminLeave::SteppingDown)
+            })
+            .collect::<Vec<_>>();
+        let mut settled = Vec::new();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {}
+            () = wait_for_runtime_shutdown(&mut stopping) => {}
+            () = self.poll_admin_sign_out_leaves(account_ref, &mut pending, &mut settled) => {}
+        }
+        for (_, group_id_hex, leave) in settled.into_iter().chain(pending) {
+            match leave.failure_reason() {
+                None => outcome.groups_left += 1,
+                Some(reason) => outcome.group_leave_failures.push(GroupLeaveFailure {
+                    group_id_hex,
+                    reason: reason.to_owned(),
+                }),
+            }
+        }
+    }
+
+    /// Poll each pending admin chat until all have settled, moving each
+    /// settled one to `settled`; the caller's deadline ends it otherwise. A
+    /// chat whose poll fails keeps its last answer and is polled again.
+    async fn poll_admin_sign_out_leaves(
+        &self,
+        account_ref: &str,
+        pending: &mut Vec<(GroupId, String, SignOutAdminLeave)>,
+        settled: &mut Vec<(GroupId, String, SignOutAdminLeave)>,
+    ) {
+        let mut logged = false;
+        loop {
+            let mut index = 0;
+            while index < pending.len() {
+                match self
+                    .accounts
+                    .sign_out_admin_leave(account_ref, &pending[index].0)
+                    .await
+                {
+                    Ok(leave) if leave.settled() => {
+                        let mut chat = pending.swap_remove(index);
+                        chat.2 = leave;
+                        settled.push(chat);
+                        continue;
+                    }
+                    Ok(leave) => pending[index].2 = leave,
+                    Err(err) => {
+                        if !logged {
+                            tracing::warn!(
+                                target: "marmot_app::runtime",
+                                method = "poll_admin_sign_out_leaves",
+                                error_kind = err.privacy_safe_kind(),
+                                "could not read an admin chat's sign-out leave; retrying"
+                            );
+                            logged = true;
+                        }
+                    }
+                }
+                index += 1;
+            }
+            if pending.is_empty() {
+                return;
+            }
+            sleep(SIGN_OUT_LEAVING_POLL).await;
+        }
     }
 
     /// Ask this device's siblings to take it out of the account's groups
