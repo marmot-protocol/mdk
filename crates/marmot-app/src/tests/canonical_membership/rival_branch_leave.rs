@@ -229,6 +229,8 @@ impl Fork {
 /// never held his step-down, wins. Before mdk#3226 he never left his branch.
 /// On the winning branch he is an admin again, so he steps down again and his
 /// leave completes (mdk#3014).
+/// A non-admin role alone also matches a losing or intermediate branch.
+/// Wait for the winning name before accepting the replacement step-down.
 async fn admin_leaves_across_a_lost_step_down(
     fork: &mut Fork,
     rival: Vec<NostrTransportEvent>,
@@ -238,11 +240,10 @@ async fn admin_leaves_across_a_lost_step_down(
     deliver_events(&mut fork.clients[0], &leave).await;
     deliver_events(&mut fork.clients[2], &leave).await;
     deliver_events(&mut fork.clients[2], &rival).await;
-    // bob adopts the winning branch, where he is an admin again, and steps
-    // down again in the same wake.
+    let winning_name = fork.name(0);
     for _ in 0..4 {
         fork.wake(1).await;
-        if !fork.admin(1, 1) {
+        if fork.name(1) == winning_name && !fork.admin(1, 1) {
             break;
         }
     }
