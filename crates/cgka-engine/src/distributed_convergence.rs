@@ -345,7 +345,7 @@ impl<S: StorageProvider> Engine<S> {
                     .saturating_sub(now.monotonic_ms)
             })),
             // RawTransport applications do not open a convergence pass. A
-            // failed post-confirmation replay still needs a scheduler edge,
+            // failed lifecycle replay still needs a scheduler edge,
             // after existing pass deadlines and pending-publication gates.
             _ if self.pending_confirmation_replays.contains(group_id)
                 && self
