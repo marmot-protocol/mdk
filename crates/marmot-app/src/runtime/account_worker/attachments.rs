@@ -308,8 +308,8 @@ fn spawn_upload_promotion(
 /// WAL truncate is retried hourly or after a deletion. The compaction check
 /// (not worthwhile, too large or too tight) runs on every batch while a
 /// migration is owed, otherwise hourly or after a deletion. The startup
-/// truncate runs on the first batch. A batch that pauses for free space, resumes, finishes,
-/// or drops a corrupt body wakes attachment observers.
+/// truncate runs on the first batch. A batch that pauses for free space,
+/// resumes, finishes, or drops a corrupt body wakes attachment observers.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
