@@ -4048,9 +4048,26 @@ async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
     })
     .await
     .expect("the first tick and avatar pass run");
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
+    // Two warm-up ticks, as in the idle test, so no pass left over from
+    // startup (a presentation pass sets the avatar pass due) runs later.
+    let tick = async || {
+        let ticks = count(RuntimeOp::WorkerMaintenance);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while count(RuntimeOp::WorkerMaintenance) == ticks {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a tick completes");
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+    };
+    tick().await;
+    tick().await;
     let passes = count(RuntimeOp::WorkerAvatarPass);
     assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 0);
 
@@ -4075,19 +4092,16 @@ async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
         "nothing woke it"
     );
 
-    let ticks = count(RuntimeOp::WorkerMaintenance);
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(15)).await;
-    tokio::time::resume();
+    tick().await;
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WorkerMaintenance) == ticks
+        while count(RuntimeOp::WatchdogMissedWakeAvatarPass) == 0
             || count(RuntimeOp::WorkerAvatarPass) == passes
         {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the tick's watchdog runs the pass");
+    .expect("the tick's watchdog counts the miss and runs the pass");
     assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 1);
     runtime.shutdown().await;
 }
