@@ -1771,6 +1771,7 @@ async fn run_app_runtime_account_worker(
             && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
         {
             turn.serve(&mut client).await;
+            publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
         }
         // Native and runner admission may have advanced frames. Publish their
         // committed effects before live input.
@@ -2637,6 +2638,7 @@ async fn run_app_runtime_account_worker(
             // loop's top serves one per pass while other work is ready.
             turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
                 turn.serve(&mut client).await;
+                publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
             }
             Ok(()) = recovery_catching_up.changed() => {
                 client.recovery_status_owed = true;
@@ -7916,6 +7918,22 @@ fn publish_client_pending_applied_summary(
     // here, and no account-level seam follows them until the next command.
     publish_device_group_changes(client, events, account_id_hex, account_label);
     publish_sign_in_changes(client, events, account_id_hex, account_label);
+}
+
+/// After a runner turn: a turn that settled a changed copy may have raised or
+/// cleared a rejoin notice the runner's survey does not show (mdk#2660 row
+/// 11), so it publishes account-level changes even when what is catching up
+/// stayed the same. A notice change announces `HistoryNoticesChanged` and
+/// `RecoveryStatusChanged`; an unchanged one announces nothing.
+fn publish_settled_recovery_copies(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if std::mem::take(&mut client.recovery_copy_settled) {
+        publish_account_level_changes(client, events, account_id_hex, account_label);
+    }
 }
 
 /// Announce account-level changes. A change in the parked recovery set

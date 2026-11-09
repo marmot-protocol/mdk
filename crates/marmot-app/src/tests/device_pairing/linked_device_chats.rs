@@ -438,8 +438,20 @@ async fn await_account_departure(
             deliver_new(bob, relay, &mut bob_cursor).await;
             bob.run_due_maintenance().await.unwrap();
             // Direct clients have no worker to advance scheduled convergence.
+            // The worker also wakes a group whose state still owes outbound
+            // work after a pass, such as a leave request's next step.
             for client in [&mut phone.client, &mut laptop.client, &mut *bob] {
-                for group in client.take_pending_convergence_groups() {
+                let mut groups = client.take_pending_convergence_groups();
+                if matches!(
+                    client.convergence_schedule_state(chat),
+                    Ok(crate::client::ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: None
+                    })
+                ) && !groups.contains(chat)
+                {
+                    groups.push(chat.clone());
+                }
+                for group in groups {
                     client
                         .advance_convergence_with_projection_progress_and_yield(
                             &group,
@@ -492,19 +504,54 @@ async fn user_account_leave_case(admin: bool) {
             .generation,
         admission.generation
     );
-    relay.block_next_publish();
-    let mut leaving = Box::pin(phone.client.leave_group(&chat));
-    tokio::select! {
-        result = &mut leaving => panic!("Leave must reach its real departure publication: {result:?}"),
-        _ = relay.wait_for_blocked_publish() => {}
-    }
-    let choice_before_publish = store
-        .app_storage()
-        .invitation_decision(&chat_hex, &admission.generation)
-        .unwrap()
-        .unwrap();
-    relay.release_publish();
-    leaving.await.unwrap();
+    let choice_before_publish = if admin {
+        // An admin's Leave records the leave and publishes nothing: the engine
+        // stages the step-down and then the SelfRemove from that request
+        // (mdk#3014), so no failure between them can strand the account
+        // demoted.
+        let group_messages = || {
+            relay
+                .published_events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == 445)
+                .count()
+        };
+        let before = group_messages();
+        phone.client.leave_group(&chat).await.unwrap();
+        assert_eq!(group_messages(), before, "nothing departs yet");
+        assert!(store.leave_request(&chat).unwrap().is_some());
+        assert!(
+            phone
+                .client
+                .runtime
+                .admin_pubkeys(&chat)
+                .unwrap()
+                .iter()
+                .any(|admin| admin.as_slice() == phone.client.runtime.self_id().as_slice())
+        );
+        store
+            .app_storage()
+            .invitation_decision(&chat_hex, &admission.generation)
+            .unwrap()
+            .unwrap()
+    } else {
+        relay.block_next_publish();
+        let mut leaving = Box::pin(phone.client.leave_group(&chat));
+        tokio::select! {
+            result = &mut leaving => panic!("Leave must reach its real departure publication: {result:?}"),
+            _ = relay.wait_for_blocked_publish() => {}
+        }
+        let choice = store
+            .app_storage()
+            .invitation_decision(&chat_hex, &admission.generation)
+            .unwrap()
+            .unwrap();
+        relay.release_publish();
+        leaving.await.unwrap();
+        choice
+    };
     assert!(
         choice_before_publish.declined,
         "UserLeave must durably record the current generation's decline before its first departure publication"
@@ -621,6 +668,19 @@ async fn one_undelivered_commit_ack_admits_an_admin_account_leave() {
             .declined
     );
     assert!(store.leave_request(&chat).unwrap().is_some());
+    // The engine stages the step-down from the leave request on the next
+    // drain, with no second acknowledgment.
+    for group in phone.client.take_pending_convergence_groups() {
+        phone
+            .client
+            .advance_convergence_with_projection_progress_and_yield(
+                &group,
+                None,
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+    }
     let own = phone.client.runtime.self_id();
     assert!(
         !phone

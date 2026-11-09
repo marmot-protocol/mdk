@@ -726,6 +726,9 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
+/// Each of a group's routes with the relays the recovery runner carries on it.
+pub(crate) type CarriedRoutes = Vec<(storage_sqlite::TransportReconciliationRoute, Vec<String>)>;
+
 pub struct AppClient {
     /// Runs once right after the next projection checkpoint's save, before
     /// anything else reads storage.
@@ -982,6 +985,18 @@ pub struct AppClient {
     /// The retention floor the recovery runner's debt turns last pruned the
     /// ledger to in this process, if any did.
     pub(crate) runner_pruned_floor: Option<u64>,
+    /// Each group's local copy (its install epoch) the recovery runner's debt
+    /// turns settled in this process, with the relays its routes carried then
+    /// (mdk#2660 row 11), so a turn reads the durable copy only for a group
+    /// whose copy or carried relays changed since. At most one entry per group
+    /// with a current route: each settle drops the rest, and forgetting a
+    /// group drops its entry. A missing entry costs one durable read.
+    pub(crate) settled_recovery_copies: std::collections::HashMap<Vec<u8>, (u64, CarriedRoutes)>,
+    /// A debt turn settled a changed copy, which raises or clears a rejoin
+    /// notice, since the account worker last published account-level
+    /// changes. The runner's survey may not change with it (a group already
+    /// catching up stays so), so the worker publishes after that turn.
+    pub(crate) recovery_copy_settled: bool,
     /// The clock (Unix seconds) the runner's next prune takes its retention
     /// floor from: its previous debt turn's, or before its first, the one the
     /// open seeded standing goals with. It moves only past a prune that
@@ -3506,6 +3521,7 @@ impl AppClient {
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
         self.accepted_push_announces.remove(group_id);
+        self.settled_recovery_copies.remove(group_id.as_slice());
         self.push_repairs.forget_group(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
@@ -3681,15 +3697,6 @@ impl AppClient {
             return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
         }
 
-        if initially_admin {
-            Box::pin(self.demote_admitted_account_for_leave(
-                group_id,
-                audit_context.clone(),
-                invitation,
-            ))
-            .await?;
-        }
-
         // Once the MLS leave commits we can no longer author an in-group token
         // removal. Drain that durable intent first; if the leave later fails,
         // queue the current registration update as compensation. A device
@@ -3709,25 +3716,31 @@ impl AppClient {
             {
                 return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
             }
-            if !initially_admin && self.leave_steps_admin_down(group_id, reason)? {
+            let became_admin = !initially_admin && self.leave_steps_admin_down(group_id, reason)?;
+            if became_admin {
                 self.ensure_group_change_admitted(group_id)?;
-                Box::pin(self.demote_admitted_account_for_leave(
-                    group_id,
-                    audit_context.clone(),
-                    invitation,
-                ))
-                .await?;
             }
-            // A pending admin update may put this intent in the ordinary
-            // durable queue. Only native preparation can create SelfRemove,
-            // after its selected admin policy permits it.
+            // An admin's Leave (D99) hands its step-down to the engine, which
+            // records the leave before publishing anything and then stages
+            // the step-down and the SelfRemove, so no failure between the two
+            // leaves the account demoted with no leave (mdk#3014). Otherwise a
+            // pending admin update may put this intent in the ordinary durable
+            // queue. Only native preparation can create SelfRemove, after its
+            // selected admin policy permits it.
+            let intent = if initially_admin || became_admin {
+                SendIntent::StepDownAndLeave {
+                    group_id: group_id.clone(),
+                }
+            } else {
+                SendIntent::Leave {
+                    group_id: group_id.clone(),
+                }
+            };
             let effects = sign_out_step
-                .run(self.runtime.send_with_audit_context(
-                    SendIntent::Leave {
-                        group_id: group_id.clone(),
-                    },
-                    audit_context.clone(),
-                ))
+                .run(
+                    self.runtime
+                        .send_with_audit_context(intent, audit_context.clone()),
+                )
                 .await?;
             self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
                 .await?;
@@ -4122,34 +4135,6 @@ impl AppClient {
             .await?;
         self.send_admin_policy_component(group_id, component, audit_context, wake_targets)
             .await
-    }
-
-    // Both callers have already admitted this account-policy change. The
-    // delivery acknowledgment is one-shot and must not be consumed again.
-    async fn demote_admitted_account_for_leave(
-        &mut self,
-        group_id: &GroupId,
-        audit_context: AuditEventContext,
-        invitation: Option<&storage_sqlite::InvitationDecision>,
-    ) -> Result<(), AppError> {
-        self.sync_runtime_groups_for_send("leave_admin_demotion")
-            .await?;
-        if let Some(invitation) = invitation
-            && !self.invitation_decline_is_current(invitation)?
-        {
-            return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
-        }
-        if !self.account_leave_needs_demotion(group_id)? {
-            return Ok(());
-        }
-        let own = self.runtime.self_id();
-        let mut admins = self.runtime.admin_pubkeys(group_id)?;
-        admins.retain(|admin| admin.as_slice() != own.as_slice());
-        let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
-        let target = hex::encode(own.as_slice());
-        self.send_admin_policy_component(group_id, component, audit_context, &[target])
-            .await?;
-        Ok(())
     }
 
     async fn send_admin_policy_component(

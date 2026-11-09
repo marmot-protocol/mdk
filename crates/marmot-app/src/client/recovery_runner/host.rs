@@ -189,6 +189,10 @@ impl RunnerHost for AccountRunnerHost {
                 if let Err(error) = client.settle_recovery_route_changes(&app, now) {
                     return Some(Err(error));
                 }
+                // After the goals, so a rejoin retires what they owe.
+                if let Err(error) = client.settle_recovery_rejoins(&app, now) {
+                    return Some(Err(error));
+                }
                 if let Err(error) = client.prune_runner_retention(&app, now) {
                     return Some(Err(error));
                 }

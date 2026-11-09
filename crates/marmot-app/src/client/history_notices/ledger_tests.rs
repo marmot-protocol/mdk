@@ -300,8 +300,12 @@ async fn a_remainder_is_a_notice_once_nothing_on_its_route_catches_up() {
     let dir = tempfile::tempdir().unwrap();
     let (mut client, app, group, route) = fixture(&dir).await;
     let now = crate::unix_now_seconds();
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), now - 2 * DAY)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&route),
+        now - 2 * DAY,
+        storage_sqlite::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     app.prune_recovery_coverage(now - DAY, &[(route.clone(), vec![RELAY.to_owned()])])
         .unwrap();
     assert_eq!(app.recovery_coverage_remainders().unwrap().len(), 1);
@@ -369,8 +373,12 @@ async fn a_suspended_groups_park_and_remainder_are_no_notices() {
     assert!(client.dismiss_history_notice(&parked[0].notice_id).unwrap());
 
     let now = crate::unix_now_seconds();
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), now - 2 * DAY)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&route),
+        now - 2 * DAY,
+        storage_sqlite::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     app.prune_recovery_coverage(now - DAY, &[(route.clone(), vec![RELAY.to_owned()])])
         .unwrap();
     catching_up(&client, &[]);
@@ -502,7 +510,11 @@ async fn a_hidden_park_moves_no_notice_revision_and_is_never_dismissed() {
     let storage = app.account_storage("alice").unwrap().app_storage();
     let now = crate::unix_now_seconds();
     storage
-        .widen_recovery_coverage_goals(std::slice::from_ref(&route), now - 2 * DAY)
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            now - 2 * DAY,
+            storage_sqlite::CopyFloorReason::Clamp,
+        )
         .unwrap();
     storage
         .prune_recovery_coverage(now - DAY, &[(route.clone(), vec![OPERATED.to_owned()])])

@@ -1481,7 +1481,9 @@ impl<S: StorageProvider> Engine<S> {
         let mut rows = Vec::new();
 
         let main = match result {
-            SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => None,
+            SendResult::NoChange { .. }
+            | SendResult::DisbandRequested { .. }
+            | SendResult::LeaveRequested { .. } => None,
             SendResult::ApplicationMessage { msg, .. } => {
                 Some((msg, MessageArtifactKind::ApplicationMessage))
             }
@@ -2802,6 +2804,29 @@ impl<S: StorageProvider> Engine<S> {
         request: &LeaveRequest,
     ) -> Result<(), StorageError> {
         self.storage.put_leave_request(request)?;
+        self.leave_requests
+            .insert(request.group_id.clone(), request.clone());
+        self.leaving_groups.insert(request.group_id.clone());
+        Ok(())
+    }
+
+    /// [`Self::put_leave_request_state`] for a request that replaces queued
+    /// intents: writing the request and deleting `replaced` are one storage
+    /// transaction, and memory follows only once it commits. A failure leaves
+    /// the queued intents and no request, so the next drain retries; neither
+    /// outlives the other (mdk#3014).
+    pub(crate) fn put_leave_request_state_replacing(
+        &mut self,
+        request: &LeaveRequest,
+        replaced: &[MessageId],
+    ) -> Result<(), StorageError> {
+        self.storage.with_transaction(|storage| {
+            storage.put_leave_request(request)?;
+            for id in replaced {
+                storage.delete_queued_outbound_intent(id)?;
+            }
+            Ok::<_, StorageError>(())
+        })?;
         self.leave_requests
             .insert(request.group_id.clone(), request.clone());
         self.leaving_groups.insert(request.group_id.clone());

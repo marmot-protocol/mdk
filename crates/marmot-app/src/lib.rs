@@ -2219,6 +2219,8 @@ impl MarmotApp {
             pending_runtime_group_subscription_refresh: false,
             runner_preparation_owed: false,
             runner_pruned_floor: None,
+            settled_recovery_copies: std::collections::HashMap::new(),
+            recovery_copy_settled: false,
             // Set with the open's goals, just below.
             runner_prune_clock: unix_now_seconds(),
             #[cfg(test)]

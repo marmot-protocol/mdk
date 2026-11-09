@@ -140,6 +140,7 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
         SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
         SendIntent::Leave { .. } => "leave",
+        SendIntent::StepDownAndLeave { .. } => "step_down_and_leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
@@ -170,6 +171,7 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::AddOwnAccountDevices { group_id, .. }
         | SendIntent::RemoveOwnAccountDevices { group_id, .. }
         | SendIntent::Leave { group_id }
+        | SendIntent::StepDownAndLeave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::ReplaceDeviceEntry { group_id, .. }
@@ -190,6 +192,7 @@ pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
     match result {
         SendResult::NoChange { .. } => "no_change",
         SendResult::DisbandRequested { .. } => "disband_requested",
+        SendResult::LeaveRequested { .. } => "leave_requested",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
@@ -545,7 +548,9 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
     }
     let mut messages = Vec::new();
     match result {
-        SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
+        SendResult::NoChange { .. }
+        | SendResult::DisbandRequested { .. }
+        | SendResult::LeaveRequested { .. } => {}
         SendResult::ApplicationMessage { msg, .. } => {
             messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
         }

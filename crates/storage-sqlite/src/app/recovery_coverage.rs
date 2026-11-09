@@ -17,13 +17,20 @@
 //! second again there. Live boundaries leave it out until retention pruning
 //! passes it.
 //!
+//! On a rejoined group's routes nothing below the new copy's floor is owed
+//! again except by loss, explicit repair or evidence (mdk#2660 row 11). Every
+//! goal or coverage write here names a [`CopyFloorReason`], and one clamp
+//! ([`copy_floor_tx`]) keeps it at or above the floor unless the reason is an
+//! exemption; evidence is the one-second un-cover alone ([`Reach::Evidence`]).
+//!
 //! The ledger is in shadow mode: the app owner fills it from facts it already
 //! has and compares it with the obligations, but nothing schedules, retries or
 //! fences on it yet. Route ids and relay URLs are account-private and must never
 //! be logged.
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::app::recovery_units::trim_spans_tx;
+use crate::app::recovery_copies::{CopyFloorReason, copy_floor_tx};
+use crate::app::recovery_units::{retire_opened_before_copy_tx, trim_spans_tx};
 use crate::base::codec::i64_to_u64;
 use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute};
@@ -320,42 +327,157 @@ fn record_range(
     Ok(())
 }
 
-pub(crate) fn widen_goal(
+/// How low one goal or coverage write may reach on its route.
+#[derive(Clone, Copy)]
+enum Reach {
+    /// No lower than its caller's reason allows ([`copy_floor_tx`]).
+    Reason(CopyFloorReason),
+    /// Evidence (mdk#2660 row 11): exactly one second, for an event this
+    /// device held or a relay showed it: a released receipt, or a staged row
+    /// given back, which is how the re-check's findings come back. It reaches
+    /// below a rejoined copy's floor on purpose, so a message from before the
+    /// rejoin that the re-check finds is still fetched. Only
+    /// [`uncover_second_tx`] uses it, and [`uncover_on_route_tx`] refuses it
+    /// for a range.
+    Evidence,
+}
+
+/// The lowest second a write from `since_seconds` reaches on `route`.
+fn reach_tx(
     conn: &Connection,
     route: &TransportReconciliationRoute,
     since_seconds: u64,
-) -> StorageResult<()> {
-    let (kind, id) = route.storage_key();
-    conn.execute_cached(
-        "INSERT INTO account_recovery_coverage_goals (route_kind, route_id, since_seconds)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT (route_kind, route_id)
-         DO UPDATE SET since_seconds = MIN(since_seconds, excluded.since_seconds)",
-        params![kind, id, integer(since_seconds)?],
-    )
-    .storage()?;
-    Ok(())
+    reach: Reach,
+) -> StorageResult<u64> {
+    Ok(match reach {
+        Reach::Reason(reason) => since_seconds.max(copy_floor_tx(conn, route, reason)?),
+        Reach::Evidence => since_seconds,
+    })
 }
 
-/// Loss widens the route's goal to its floor and reopens settled history down
-/// to it: deliveries from the floor up were lost, so the next prune parks
-/// what is still owed below the retention floor again.
-pub(crate) fn reopen_goal(
+/// Lower `route`'s goal to `since_seconds`; a lower goal stays. With
+/// `reopen_settled`, settled history down to it reopens too. Callers have
+/// applied their reach.
+fn goal_tx(
     conn: &Connection,
     route: &TransportReconciliationRoute,
-    floor_seconds: u64,
+    since_seconds: u64,
+    reopen_settled: bool,
 ) -> StorageResult<()> {
     let (kind, id) = route.storage_key();
-    conn.execute_cached(
+    let sql = if reopen_settled {
         "INSERT INTO account_recovery_coverage_goals (route_kind, route_id, since_seconds)
          VALUES (?1, ?2, ?3)
          ON CONFLICT (route_kind, route_id)
          DO UPDATE SET since_seconds = MIN(since_seconds, excluded.since_seconds),
-                       settled_below_seconds = MIN(settled_below_seconds, excluded.since_seconds)",
-        params![kind, id, integer(floor_seconds)?],
-    )
-    .storage()?;
+                       settled_below_seconds = MIN(settled_below_seconds, excluded.since_seconds)"
+    } else {
+        "INSERT INTO account_recovery_coverage_goals (route_kind, route_id, since_seconds)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (route_kind, route_id)
+         DO UPDATE SET since_seconds = MIN(since_seconds, excluded.since_seconds)"
+    };
+    conn.execute_cached(sql, params![kind, id, integer(since_seconds)?])
+        .storage()?;
     Ok(())
+}
+
+/// The route's goal widens to `since_seconds`, no lower than `reason` allows
+/// ([`copy_floor_tx`]). A goal only widens.
+pub(crate) fn widen_goal(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    since_seconds: u64,
+    reason: CopyFloorReason,
+) -> StorageResult<()> {
+    let since = reach_tx(conn, route, since_seconds, Reach::Reason(reason))?;
+    goal_tx(conn, route, since, false)
+}
+
+/// Loss widens the route's goal to its floor and reopens settled history down
+/// to it: deliveries from the floor up were lost, so the next prune parks
+/// what is still owed below the retention floor again. No lower than
+/// `reason` allows ([`copy_floor_tx`]).
+pub(crate) fn reopen_goal(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    floor_seconds: u64,
+    reason: CopyFloorReason,
+) -> StorageResult<()> {
+    let floor = reach_tx(conn, route, floor_seconds, Reach::Reason(reason))?;
+    goal_tx(conn, route, floor, true)
+}
+
+/// Un-cover `route` from `since_seconds` through `until_seconds` (to the top
+/// when `None`), no lower than `reach` allows: its coverage there goes, its
+/// goal widens to it (reopening settled history when `reopen_settled`), and
+/// the un-cover log records it, which reopens retired spans it overlaps
+/// ([`crate::app::recovery_units::probe_on_uncover_tx`]). Writes nothing when
+/// the reach leaves no range. Evidence is one second, never a range: when
+/// that second lies below a rejoined copy's floor and below the route's goal,
+/// the widening also opens the seconds between it and the lower of the two,
+/// which lay outside the goal and were never owed, so they retire as before
+/// the copy ([`retire_opened_before_copy_tx`]) and only the second is owed.
+#[allow(clippy::too_many_arguments)]
+fn uncover_on_route_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    since_seconds: u64,
+    until_seconds: Option<u64>,
+    reach: Reach,
+    reopen_settled: bool,
+    now_seconds: u64,
+) -> StorageResult<()> {
+    if matches!(reach, Reach::Evidence) && until_seconds != Some(since_seconds) {
+        return Err(invalid());
+    }
+    let since = reach_tx(conn, route, since_seconds, reach)?;
+    if until_seconds.is_some_and(|until| until < since) {
+        return Ok(());
+    }
+    let opened = match reach {
+        Reach::Evidence => evidence_opens_tx(conn, route, since)?,
+        Reach::Reason(_) => None,
+    };
+    remove_coverage_tx(conn, Some(route), since, until_seconds)?;
+    goal_tx(conn, route, since, reopen_settled)?;
+    log_uncover_tx(conn, Some(route), &[(since, until_seconds)], now_seconds)?;
+    match opened {
+        Some(gap) => retire_opened_before_copy_tx(conn, route, gap),
+        None => Ok(()),
+    }
+}
+
+/// The seconds an evidence un-cover of `second` opens below `route`'s
+/// rejoined copy's floor: those after it and below both the floor and the
+/// route's goal (the floor alone when it has none). `None` on a route no
+/// rejoin floors, or when the second is not below both.
+fn evidence_opens_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    second: u64,
+) -> StorageResult<Option<RecoveryCoverageRange>> {
+    let floor = copy_floor_tx(conn, route, CopyFloorReason::Clamp)?;
+    let (kind, id) = route.storage_key();
+    let goal = conn
+        .query_row_cached(
+            "SELECT since_seconds FROM account_recovery_coverage_goals
+             WHERE route_kind = ?1 AND route_id = ?2",
+            params![kind, id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .storage()?
+        .map(i64_to_u64)
+        .transpose()?;
+    let below = goal.map_or(floor, |goal| goal.min(floor));
+    Ok(match (second.checked_add(1), below.checked_sub(1)) {
+        (Some(since), Some(until)) if since <= until => Some(RecoveryCoverageRange {
+            since_seconds: since,
+            until_seconds: until,
+        }),
+        _ => None,
+    })
 }
 
 /// Remove `[since, until]` (`until` open to the top when `None`) from the
@@ -515,7 +637,8 @@ fn prune_uncover_log_tx(conn: &Connection, now_seconds: Option<u64>) -> StorageR
 }
 
 /// Account-wide loss from `floor_seconds` upward, inside the transaction that
-/// imports it: every route the ledger holds loses its coverage from the floor
+/// imports it. Loss is its reason ([`CopyFloorReason::Loss`]), so it reaches
+/// below a rejoined copy's floor: every route the ledger holds loses its coverage from the floor
 /// up, and its goal widens to the floor and reopens settled history down to
 /// it. Routes the ledger does not hold yet have no coverage to lose; the owner
 /// widens their goals afterwards. The log
@@ -563,20 +686,28 @@ pub(crate) fn settle_goals_tx(conn: &Connection, floor_seconds: u64) -> StorageR
     Ok(())
 }
 
-/// Loss on one route from `floor_seconds` upward, inside the transaction
-/// that imports it: the route loses its coverage from the floor up, its goal
-/// widens to the floor and reopens settled history down to it, and the log
-/// records it, so a fetch already running on that route keeps the debt. Other
-/// routes keep everything.
-pub(crate) fn uncover_route_loss_tx(
+/// One route owes from `floor_seconds` upward again (loss, post-join, an
+/// epoch-gap visit), inside the caller's transaction and no lower than
+/// `reason` allows ([`copy_floor_tx`]): the route loses its coverage from the
+/// floor up, its goal widens to the floor and reopens settled history down
+/// to it, and the log records it, so a fetch already running on that route
+/// keeps the debt. Other routes keep everything.
+pub(crate) fn uncover_route_tx(
     conn: &Connection,
     route: &TransportReconciliationRoute,
     floor_seconds: u64,
+    reason: CopyFloorReason,
     now_seconds: u64,
 ) -> StorageResult<()> {
-    remove_coverage_tx(conn, Some(route), floor_seconds, None)?;
-    reopen_goal(conn, route, floor_seconds)?;
-    log_uncover_tx(conn, Some(route), &[(floor_seconds, None)], now_seconds)
+    uncover_on_route_tx(
+        conn,
+        route,
+        floor_seconds,
+        None,
+        Reach::Reason(reason),
+        true,
+        now_seconds,
+    )
 }
 
 /// A released receipt lets its event be delivered and admitted again, so the
@@ -614,7 +745,9 @@ pub(crate) fn uncover_released_event_tx(conn: &Connection, event_id: &[u8]) -> S
 /// it. Below the retention window nothing is owed, so there the release
 /// changes nothing: its coverage stays until the prune drops it, so the prune
 /// parks no hole, and no goal widens and no parked or retired span reopens.
-/// Only loss parks debt from below the window.
+/// Only loss parks debt from below the window. The second is evidence
+/// ([`Reach::Evidence`]), so it is owed again below a rejoined copy's floor
+/// too.
 pub(crate) fn uncover_second_tx(
     conn: &Connection,
     route: &TransportReconciliationRoute,
@@ -624,7 +757,6 @@ pub(crate) fn uncover_second_tx(
     if second < now.saturating_sub(crate::TRANSPORT_RECONCILIATION_RETENTION_SECS) {
         return Ok(());
     }
-    remove_coverage_tx(conn, Some(route), second, Some(second))?;
     let (kind, id) = route.storage_key();
     conn.execute_cached(
         "INSERT OR IGNORE INTO account_recovery_coverage_released (route_kind, route_id, second)
@@ -632,8 +764,15 @@ pub(crate) fn uncover_second_tx(
         params![kind, id, integer(second)?],
     )
     .storage()?;
-    widen_goal(conn, route, second)?;
-    log_uncover_tx(conn, Some(route), &[(second, Some(second))], now)
+    uncover_on_route_tx(
+        conn,
+        route,
+        second,
+        Some(second),
+        Reach::Evidence,
+        false,
+        now,
+    )
 }
 
 /// [`SqliteAppStorage::record_recovery_coverage_since`] inside the caller's
@@ -827,12 +966,14 @@ impl SqliteAppStorage {
         Ok(Some(routes))
     }
 
-    /// The routes need everything from `since_seconds` up to now. A goal only
-    /// widens; an existing lower floor stays.
+    /// The routes need everything from `since_seconds` up to now, no lower
+    /// than `reason` allows: [`CopyFloorReason::Clamp`] stops at a rejoined
+    /// copy's floor. A goal only widens; an existing lower floor stays.
     pub fn widen_recovery_coverage_goals(
         &self,
         routes: &[TransportReconciliationRoute],
         since_seconds: u64,
+        reason: CopyFloorReason,
     ) -> StorageResult<()> {
         if routes.is_empty() {
             return Ok(());
@@ -840,19 +981,21 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for route in routes {
-                widen_goal(&conn, route, since_seconds)?;
+                widen_goal(&conn, route, since_seconds, reason)?;
             }
             Ok(())
         })
     }
 
-    /// A loss on `routes` from `floor_seconds` upward: their coverage at and
-    /// above the floor is dropped, and their goals widen to the floor. Other
+    /// `routes` owe from `floor_seconds` upward again, no lower than `reason`
+    /// allows ([`CopyFloorReason::Clamp`] stops at a rejoined copy's floor):
+    /// their coverage there is dropped, and their goals widen to it. Other
     /// routes keep everything.
     pub fn uncover_recovery_coverage(
         &self,
         routes: &[TransportReconciliationRoute],
         floor_seconds: u64,
+        reason: CopyFloorReason,
     ) -> StorageResult<()> {
         if routes.is_empty() {
             return Ok(());
@@ -861,7 +1004,7 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for route in routes {
-                uncover_route_loss_tx(&conn, route, floor_seconds, now)?;
+                uncover_route_tx(&conn, route, floor_seconds, reason, now)?;
             }
             Ok(())
         })
@@ -1276,10 +1419,18 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 100)
-            .unwrap();
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 500)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            100,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            500,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         assert_eq!(app.recovery_coverage_goal(&route).unwrap(), Some(100));
         record(
             &app,
@@ -1338,10 +1489,18 @@ mod tests {
                 );
             }
         }
-        app.widen_recovery_coverage_goals(&[lost.clone(), kept.clone()], 100)
-            .unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&lost), 500)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            &[lost.clone(), kept.clone()],
+            100,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(&lost),
+            500,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         for relay in [RELAY_A, RELAY_B] {
             assert_eq!(
                 ranges(&app, &lost, relay),
@@ -1359,15 +1518,23 @@ mod tests {
         );
         // A loss below every range drops all of the route's coverage and
         // widens its goal to the floor.
-        app.uncover_recovery_coverage(std::slice::from_ref(&lost), 50)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(&lost),
+            50,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         assert!(ranges(&app, &lost, RELAY_A).is_empty());
         assert_eq!(app.recovery_coverage_goal(&lost).unwrap(), Some(50));
         assert_eq!(app.recovery_coverage_goal(&kept).unwrap(), Some(100));
         // A loss on a route with no goal gives it one.
         let fresh = group(3);
-        app.uncover_recovery_coverage(std::slice::from_ref(&fresh), 700)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(&fresh),
+            700,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         assert_eq!(app.recovery_coverage_goal(&fresh).unwrap(), Some(700));
     }
 
@@ -1380,8 +1547,12 @@ mod tests {
         record(&app, &route, RELAY_A, 0, 99, proof, 1);
         record(&app, &route, RELAY_A, 150, 400, proof, 1);
         record(&app, &route, RELAY_A, 500, 600, proof, 1);
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 0)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            0,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         assert_eq!(app.prune_recovery_coverage(200, &[]).unwrap(), 1);
         assert_eq!(
             ranges(&app, &route, RELAY_A),
@@ -1407,8 +1578,12 @@ mod tests {
                 1,
             );
         }
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&inbox), 100)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&inbox),
+            100,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         app.record_account_recovery_loss_bounded(
             "alice",
             crate::RecoveryLossCause::Queue,
@@ -1671,8 +1846,12 @@ mod tests {
         let app = storage.app_storage();
         let route = group(1);
         let routes = [(route.clone(), vec![RELAY_A.to_owned()])];
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 100)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            100,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         prove(&app, &[&route], 1);
         app.prune_recovery_coverage(500, &routes).unwrap();
         assert!(app.recovery_coverage_remainders().unwrap().is_empty());
@@ -1873,16 +2052,16 @@ mod tests {
         let app = storage.app_storage();
         let (a, b, c) = (group(1), group(2), group(3));
         // Loss before the fetch started is not subtracted again.
-        app.uncover_recovery_coverage(std::slice::from_ref(&c), 200)
+        app.uncover_recovery_coverage(std::slice::from_ref(&c), 200, crate::CopyFloorReason::Loss)
             .unwrap();
         let mark = app.recovery_coverage_mark().unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&a), 600)
+        app.uncover_recovery_coverage(std::slice::from_ref(&a), 600, crate::CopyFloorReason::Loss)
             .unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&b), 300)
+        app.uncover_recovery_coverage(std::slice::from_ref(&b), 300, crate::CopyFloorReason::Loss)
             .unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&a), 800)
+        app.uncover_recovery_coverage(std::slice::from_ref(&a), 800, crate::CopyFloorReason::Loss)
             .unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&a), 450)
+        app.uncover_recovery_coverage(std::slice::from_ref(&a), 450, crate::CopyFloorReason::Loss)
             .unwrap();
         assert!(
             app.record_recovery_coverage_since(
@@ -1985,8 +2164,12 @@ mod tests {
                 1,
             );
         }
-        app.widen_recovery_coverage_goals(&[route.clone(), other.clone()], since)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            &[route.clone(), other.clone()],
+            since,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         let released = crate::TransportReconciliationItem {
             event_id: [9; 32],
             created_at: sent,
@@ -2060,8 +2243,12 @@ mod tests {
         let route = group(1);
         let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap();
         let floor = now - crate::TRANSPORT_RECONCILIATION_RETENTION_SECS;
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), floor + 1_000)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            floor + 1_000,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         for (second, goal) in [(floor - 1_000, floor + 1_000), (floor + 500, floor + 500)] {
             storage
                 .connection
@@ -2085,8 +2272,12 @@ mod tests {
         let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap();
         let floor = now - crate::TRANSPORT_RECONCILIATION_RETENTION_SECS;
         let routes = [(route.clone(), vec![RELAY_A.to_owned()])];
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), floor - 1_000)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            floor - 1_000,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         record(
             &app,
             &route,
@@ -2269,8 +2460,12 @@ mod tests {
             Some(vec![]),
             "a released second is no loss"
         );
-        app.uncover_recovery_coverage(std::slice::from_ref(&lost), 600)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(&lost),
+            600,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         assert_eq!(
             app.recovery_coverage_lost_since(start).unwrap(),
             Some(vec![lost.clone()])
@@ -2324,8 +2519,12 @@ mod tests {
         let app = storage.app_storage();
         let route = group(1);
         let stale = app.recovery_coverage_mark().unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&route), 600)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(&route),
+            600,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         let current = app.recovery_coverage_mark().unwrap();
         let later = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap()
             + UNCOVER_LOG_RETENTION_SECS
@@ -2358,12 +2557,13 @@ mod tests {
             .map(|byte| group(u8::try_from(byte % 251).unwrap()))
             .collect::<Vec<_>>();
         let mut chunks = routes.chunks(64);
-        app.uncover_recovery_coverage(chunks.next().unwrap(), 10)
+        app.uncover_recovery_coverage(chunks.next().unwrap(), 10, crate::CopyFloorReason::Loss)
             .unwrap();
         // A mark taken after the generation the bound will drop.
         let first = app.recovery_coverage_mark().unwrap();
         for chunk in chunks {
-            app.uncover_recovery_coverage(chunk, 10).unwrap();
+            app.uncover_recovery_coverage(chunk, 10, crate::CopyFloorReason::Loss)
+                .unwrap();
         }
         let rows: i64 = storage
             .lock()

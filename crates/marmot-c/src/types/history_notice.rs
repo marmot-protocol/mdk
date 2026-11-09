@@ -9,9 +9,9 @@ use crate::macros::{c_enum, c_mirror};
 
 c_enum! {
     /// Why recovery parked. Current epoch-gap exhaustion emits `EpochGap`;
-    /// coverage-ledger parks emit `UnprovenHistory`. Other labels preserve
-    /// compatibility; `KnownEvent` and `MaintenanceBoundary` remain reserved
-    /// for parking policy.
+    /// coverage-ledger parks emit `UnprovenHistory`; a rejoin emits
+    /// `BeforeRejoin`. Other labels preserve compatibility; `KnownEvent` and
+    /// `MaintenanceBoundary` remain reserved for parking policy.
     MarmotHistoryNoticeCause from HistoryNoticeCauseFfi {
         /// Deliveries were dropped from a full account queue, or spilled
         /// rows could not be admitted, and comparison could not recover them.
@@ -32,6 +32,14 @@ c_enum! {
         /// relays and stopped retrying them: a group's (`group_id_hex` names
         /// it) or the account inbox's.
         UnprovenHistory,
+        /// This device rejoined the group (`group_id_hex` names it): a
+        /// Welcome installed a new copy in place of its old one. That is an
+        /// automatic rejoin after the old copy could not be repaired, a
+        /// reentry after a trusted removal, or a fork discarded with the
+        /// user's consent, whose old copy may still have worked. Messages
+        /// from before the rejoin that it had not received are unavailable.
+        /// One notice per rejoin.
+        BeforeRejoin,
     }
 }
 

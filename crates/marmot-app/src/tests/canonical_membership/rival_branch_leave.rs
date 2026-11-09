@@ -22,11 +22,26 @@ struct Fork {
 
 impl Fork {
     async fn new() -> Self {
+        Self::with_device_groups(false).await
+    }
+
+    /// With device groups on, an admin's Leave steps its account down itself
+    /// (D99).
+    async fn with_device_groups(device_groups: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let accounts = LABELS.map(|label| home.create_account(label).unwrap());
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = app_at(&dir, relay.clone());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig::white_noise()
+                .with_dev_settlement_quiescence_ms(0)
+                .with_dev_scheduled_convergence_delay_ms(0)
+                .with_dev_device_groups(device_groups),
+        )
+        .with_test_relay_client(relay.clone());
+        assert_eq!(app.admin_leave_steps_down(), device_groups);
         for peer in &accounts {
             remember_test_member_inbox(&app, &peer.account_id_hex, "wss://relay.example");
         }
@@ -239,12 +254,27 @@ async fn admin_leaves_across_a_lost_step_down(
     deliver_events(&mut fork.clients[2], &leave).await;
     deliver_events(&mut fork.clients[2], &rival).await;
     // bob adopts the winning branch, where he is an admin again, and steps
-    // down again in the same wake.
-    for _ in 0..4 {
-        fork.wake(1).await;
-        if !fork.admin(1, 1) {
-            break;
+    // down again, possibly over several wakes: each wake stops at its time
+    // budget, so one may adopt nothing yet, or adopt without stepping down.
+    // He already reads as no admin on his own branch, so wait for both.
+    let caught_up = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            fork.wake(1).await;
+            if fork.name(1) == fork.name(0) && !fork.admin(1, 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
+    })
+    .await;
+    if caught_up.is_err() {
+        panic!(
+            "within 10 s bob did not reach the selected branch and step down: \
+             on {:?} (selected {:?}), admin {}",
+            fork.name(1),
+            fork.name(0),
+            fork.admin(1, 1)
+        );
     }
     assert!(
         !fork.admin(1, 1),
@@ -308,6 +338,33 @@ fn an_admin_whose_step_down_lost_to_a_branch_that_left_admins_alone_steps_down_a
         assert!(fork.leaving(1));
         assert_eq!(fork.epoch(1), source + 1);
         let leave = fork.published_since(start);
+        let rival = fork.longer_rival().await;
+        admin_leaves_across_a_lost_step_down(&mut fork, rival, leave).await;
+    });
+}
+
+/// #3014's second gap, with device groups on: bob's Leave records the leave
+/// before anything is published, and the engine stages his step-down from
+/// it. That step-down loses to alice's longer branch before his SelfRemove is
+/// sent. The leave is already durable, so he steps down again on the winning
+/// branch and leaves. Before, the app sent the step-down and the Leave as two
+/// sends, and a step-down lost in between left the Leave refused with nothing
+/// to retry it.
+#[test]
+fn an_admin_leave_whose_first_step_down_loses_steps_down_again_and_leaves() {
+    run_composed_app_runtime_test("rival-branch-admin-leave-first-step-down", || async {
+        let mut fork = Fork::with_device_groups(true).await;
+        let source = fork.epoch(1);
+        let start = fork.published();
+        fork.clients[1].leave_group(&fork.group).await.unwrap();
+        assert!(fork.leaving(1), "the leave is recorded");
+        assert_eq!(fork.published(), start, "before anything is published");
+        assert!(fork.admin(1, 1));
+        fork.wake(1).await;
+        assert!(!fork.admin(1, 1), "the engine stages the step-down");
+        assert_eq!(fork.epoch(1), source + 1);
+        let leave = fork.published_since(start);
+        assert_eq!(leave.len(), 1, "the step-down alone, no SelfRemove yet");
         let rival = fork.longer_rival().await;
         admin_leaves_across_a_lost_step_down(&mut fork, rival, leave).await;
     });

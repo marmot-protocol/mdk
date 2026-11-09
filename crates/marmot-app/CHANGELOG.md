@@ -7,7 +7,25 @@
   Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
   is unchanged. Malformed cached URLs are excluded without blocking receive startup or valid retries.
 
+- With experimental device groups on, an admin's User Leave or Decline no longer sends its own step-down before the
+  Leave (mdk#3014). It sends the engine's `StepDownAndLeave`, which records the leave first and then stages the
+  step-down and the SelfRemove, so a step-down that is refused, left unresolved or lost to another branch is staged
+  again instead of leaving the account demoted with no leave. The Leave call now returns once the leave is recorded,
+  or queued behind sends made before it, and before the step-down is published. Ordinary builds still refuse an admin's Leave or Decline until the host demotes
+  the account.
+
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
+
+- A rejoin settles the recovery ledger once (mdk#2660 row 11). When a replacement Welcome installs a new copy of a
+  group (its install epoch moved and its join epoch was reset), the recovery runner's next debt turn retires what the
+  group's routes owed or parked below the new copy's standing floor as before this copy, never as coverage, and the
+  group gets one `HistoryNoticeCause::BeforeRejoin` notice. A restart raises no second one; dismissing it retires
+  nothing further. Retired spans stay in the relay re-check, loss inside them reopens them and explicit repair
+  re-arms them. A relay first carried after the rejoin owes only from the floor too. Nothing else makes the rejoined
+  group owe below the floor again: goal widening, the post-join collection and every epoch-gap visit stop there,
+  and only loss, explicit repair, or a released or given-back event's own second reach below it. The Welcome time alone still retires nothing. A group's history proof (the device-group inactivity
+  clock's "caught up") no longer counts what a rejoin retired. **Breaking:** `HistoryNoticeCause` gains
+  `BeforeRejoin`; exhaustive matches need it. Rejoin notices are not written to the forensic audit.
 
 - A starting account worker is given up on after 45 s without startup progress, not after 45 s in total
   (mdk#3145). Entering a startup step, or each migration an open of the account's database applies, starts the 45 s

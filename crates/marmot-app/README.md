@@ -340,14 +340,13 @@ targets.
 **Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
 `AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
 leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With experimental device groups on (`MarmotApp::admin_leave_steps_down`),
-User Leave instead demotes this account itself when another active administrator account remains, then requests its
-own leaf's SelfRemove, and the last active administrator account is refused on all its devices before a choice or
-departure is published (mdk#3014 keeps that automatic step-down off elsewhere until a lost step-down can no longer
-leave a Leave stuck). Queued work is pending, not completed departure; native Leave owns its retry. Sign-out uses
+User Leave instead records the leave and lets the engine step this account down when another active administrator
+account remains, then request its own leaf's SelfRemove; the call returns before the step-down is published. The last
+active administrator account is refused on all its devices before a choice or departure is published (mdk#3014 keeps
+that automatic step-down off elsewhere). Queued work is pending, not completed departure; native Leave owns its retry. Sign-out uses
 leaf-only departure and never demotes the account or records a shared Decline. The coarse chat-list Leave action only
-opens this authoritative flow. A recorded Decline remains if a later eligibility check refuses departure. An admin
-demotion that committed is not undone when the following Leave fails; without a trusted device group there is no new
-shared departure obligation. Already admitted native work follows its ordinary retry rules.
+opens this authoritative flow. A recorded Decline remains if a later eligibility check refuses departure. Without a
+trusted device group there is no new shared departure obligation. Already admitted native work follows its ordinary retry rules.
 
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
@@ -819,6 +818,12 @@ the groups whose history is still being fetched, whether the inbox's is, and eve
 them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`; the recovery runner supplies the catching-up fields.
 Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger parks emit `HistoryNoticeCause::UnprovenHistory`
 without attributing the original reason history was owed. Other cause labels preserve compatibility.
+
+A rejoin emits one `HistoryNoticeCause::BeforeRejoin` per new copy of the group. A replacement Welcome (the copy's
+install epoch moved and its join epoch was reset) makes the recovery runner retire what the group's routes owed or
+parked below the new copy's standing floor, never as coverage. A restart raises no second notice, and dismissing it
+retires nothing further. Retired spans stay in the relay re-check; loss inside them reopens them and explicit repair
+re-arms them.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired

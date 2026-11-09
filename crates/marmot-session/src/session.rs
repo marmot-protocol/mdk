@@ -2111,7 +2111,9 @@ impl AccountDeviceSession {
         };
         for result in results {
             match result {
-                SendResult::NoChange { .. } | SendResult::DisbandRequested { .. } => {}
+                SendResult::NoChange { .. }
+                | SendResult::DisbandRequested { .. }
+                | SendResult::LeaveRequested { .. } => {}
                 SendResult::ApplicationMessage {
                     msg,
                     group_id,
@@ -2211,6 +2213,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
         SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
         SendIntent::Leave { .. } => "leave",
+        SendIntent::StepDownAndLeave { .. } => "step_down_and_leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
@@ -2231,6 +2234,7 @@ fn send_result_kind(result: &SendResult) -> &'static str {
     match result {
         SendResult::NoChange { .. } => "no_change",
         SendResult::DisbandRequested { .. } => "disband_requested",
+        SendResult::LeaveRequested { .. } => "leave_requested",
         SendResult::ApplicationMessage { .. } => "application_message",
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",

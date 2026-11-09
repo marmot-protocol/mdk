@@ -48,7 +48,11 @@ fn prove_history_from(
     for route in &routes {
         assert!(!route.required.is_empty());
         storage
-            .widen_recovery_coverage_goals(std::slice::from_ref(&route.route), goal_from)
+            .widen_recovery_coverage_goals(
+                std::slice::from_ref(&route.route),
+                goal_from,
+                storage_sqlite::CopyFloorReason::Clamp,
+            )
             .unwrap();
         for relay in route.required.iter().chain(&route.best_effort) {
             storage

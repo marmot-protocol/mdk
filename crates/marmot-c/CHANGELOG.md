@@ -25,6 +25,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Remove the unused direct `libc` dependency. C allocation and release paths
   continue to use Rust `CString` and `Box`.
 
+- `MarmotHistoryNoticeCause` appends `MARMOT_HISTORY_NOTICE_CAUSE_BEFORE_REJOIN` (mdk#2660 row 11): one notice per
+  rejoin, when a Welcome installed a new copy of a group in place of this device's old one (an automatic rejoin after
+  the old copy could not be repaired, a reentry after a trusted removal, or a consented fork discard). Rebuild against
+  the matching header and library.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `MarmotAppGroupRecord` and `MarmotChatListRow` append
   `leave_blocked`, `MarmotGroupManagementState` appends `leave_blocked` and `can_cancel_leave`, and
   `MarmotConversationCapabilities` appends `can_cancel_leave`. New `marmot_cancel_leave` cancels the leave on this
