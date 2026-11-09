@@ -58,8 +58,12 @@ fn owing(
     since: u64,
     covered: (u64, u64),
 ) {
-    app.widen_recovery_coverage_goals(std::slice::from_ref(route), since)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(route),
+        since,
+        crate::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     cover(app, route, RELAY, covered);
 }
 
@@ -529,11 +533,15 @@ fn new_loss_over_a_park_earns_one_probe() {
     let route = group(1);
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let park = break_unit(&app, &route, NOW).park.unwrap();
-    app.uncover_recovery_coverage(&[group(2)], NOW - 800)
+    app.uncover_recovery_coverage(&[group(2)], NOW - 800, crate::CopyFloorReason::Loss)
         .unwrap();
     assert!(!unit(&app, &route, RELAY).probe, "another route's loss");
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 700)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        NOW - 700,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     assert!(unit(&app, &route, RELAY).probe);
     assert_eq!(
         app.recovery_unit_debt(&route, RELAY, NOW).unwrap(),
@@ -556,8 +564,12 @@ fn new_loss_over_a_park_earns_one_probe() {
             retired: None
         }]
     );
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 600)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        NOW - 600,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     let cleared = settle(&app, &route, RELAY, RecoveryUnitOutcome::Advanced, NOW + 20);
     assert_eq!(cleared.state, RecoveryUnitState::Active);
     assert_eq!(cleared.park, None);
@@ -1002,8 +1014,12 @@ fn state_survives_a_reopen() {
         let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = storage.app_storage();
         // A remainder the prune parked, below every other route's goal.
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&overtaken), NOW - 3_000)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(&overtaken),
+            NOW - 3_000,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         app.prune_recovery_coverage(NOW - 2_000, &[(overtaken.clone(), vec![RELAY.to_owned()])])
             .unwrap();
         // A dismissed span and a route-gone span.
@@ -1238,8 +1254,12 @@ fn the_retention_prune_parks_overtaken_debt() {
     let app = storage.app_storage();
     let (owed, covered, left_out, bare) = (group(1), group(2), group(3), group(4));
     for route in [&owed, &covered, &left_out, &bare] {
-        app.widen_recovery_coverage_goals(std::slice::from_ref(route), NOW - 1_000)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(route),
+            NOW - 1_000,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
     }
     cover(&app, &owed, RELAY, (NOW - 1_000, NOW - 701));
     cover(&app, &owed, RELAY, (NOW - 600, NOW));
@@ -1269,8 +1289,12 @@ fn the_retention_prune_parks_overtaken_debt() {
     // Coverage the prune keeps parks nothing more; new loss above it does.
     app.prune_recovery_coverage(NOW - 400, &routes).unwrap();
     assert!(remainder(&app, &owed).unwrap() == first);
-    app.uncover_recovery_coverage(std::slice::from_ref(&owed), NOW - 450)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&owed),
+        NOW - 450,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     app.prune_recovery_coverage(NOW - 300, &routes).unwrap();
     let widened = remainder(&app, &owed).unwrap();
     assert_eq!(widened.range, range(NOW - 800, NOW - 301));
@@ -1287,10 +1311,18 @@ fn loss_below_the_window_parks_the_rest() {
     for route in [&known, &unknown] {
         owing(&app, route, NOW - 500, (NOW - 500, NOW));
     }
-    app.uncover_recovery_coverage(std::slice::from_ref(&known), NOW - 2_000)
-        .unwrap();
-    app.uncover_recovery_coverage(std::slice::from_ref(&unknown), 0)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&known),
+        NOW - 2_000,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&unknown),
+        0,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     let routes = [
         (known.clone(), vec![RELAY.to_owned()]),
         (unknown.clone(), vec![RELAY.to_owned()]),
@@ -1350,8 +1382,12 @@ fn dismissal_clears_the_remainder_under_the_routes_newest_park() {
     let app = storage.app_storage();
     let (alone, both) = (group(1), group(2));
     for route in [&alone, &both] {
-        app.widen_recovery_coverage_goals(std::slice::from_ref(route), NOW - 1_000)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            std::slice::from_ref(route),
+            NOW - 1_000,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
     }
     owing(&app, &both, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let park = break_unit(&app, &both, NOW).park.unwrap().revision;
@@ -1360,8 +1396,12 @@ fn dismissal_clears_the_remainder_under_the_routes_newest_park() {
         (both.clone(), vec![RELAY.to_owned()]),
     ];
     // `both` owes nothing below the floor until new loss lands there.
-    app.uncover_recovery_coverage(std::slice::from_ref(&both), NOW - 900)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&both),
+        NOW - 900,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     app.prune_recovery_coverage(NOW - 800, &routes).unwrap();
     let alone_revision = remainder(&app, &alone).unwrap().revision;
     let both_revision = remainder(&app, &both).unwrap().revision;
@@ -1402,8 +1442,12 @@ fn a_goal_widened_back_below_the_settled_floor_parks_nothing_twice() {
     let app = storage.app_storage();
     let (partial, covered) = (group(1), group(2));
     for route in [&partial, &covered] {
-        app.uncover_recovery_coverage(std::slice::from_ref(route), NOW - 1_000)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(route),
+            NOW - 1_000,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
     }
     cover(&app, &partial, RELAY, (NOW - 1_000, NOW - 801));
     cover(&app, &partial, RELAY, (NOW - 600, NOW));
@@ -1419,8 +1463,12 @@ fn a_goal_widened_back_below_the_settled_floor_parks_nothing_twice() {
 
     // The report restores the pending loss's goal before every prune.
     for floor in [NOW - 500, NOW - 400] {
-        app.widen_recovery_coverage_goals(&[partial.clone(), covered.clone()], NOW - 1_000)
-            .unwrap();
+        app.widen_recovery_coverage_goals(
+            &[partial.clone(), covered.clone()],
+            NOW - 1_000,
+            crate::CopyFloorReason::Clamp,
+        )
+        .unwrap();
         app.prune_recovery_coverage(floor, &routes).unwrap();
         assert!(remainder(&app, &partial).unwrap() == first);
         assert!(
@@ -1433,14 +1481,22 @@ fn a_goal_widened_back_below_the_settled_floor_parks_nothing_twice() {
         app.dismiss_recovery_route_park(&partial, first.revision)
             .unwrap()
     );
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&partial), NOW - 1_000)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&partial),
+        NOW - 1_000,
+        crate::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     app.prune_recovery_coverage(NOW - 400, &routes).unwrap();
     assert!(remainder(&app, &partial).is_none(), "a dismissal sticks");
 
     // New loss from below the settled floor parks again, under a new notice.
-    app.uncover_recovery_coverage(std::slice::from_ref(&partial), NOW - 900)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&partial),
+        NOW - 900,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     app.prune_recovery_coverage(NOW - 400, &routes).unwrap();
     let reopened = remainder(&app, &partial).unwrap();
     assert_eq!(reopened.range, range(NOW - 900, NOW - 401));
@@ -1454,12 +1510,20 @@ fn a_route_left_out_stays_settled_when_its_goal_widens_back() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
     let route = group(1);
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 1_000)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        NOW - 1_000,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     cover(&app, &route, RELAY, (NOW - 1_000, NOW));
     app.prune_recovery_coverage(NOW - 500, &[]).unwrap();
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 1_000)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&route),
+        NOW - 1_000,
+        crate::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     app.prune_recovery_coverage(NOW - 500, &[(route.clone(), vec![RELAY.to_owned()])])
         .unwrap();
     assert!(remainder(&app, &route).is_none());
@@ -1585,8 +1649,12 @@ fn new_loss_reopens_retired_spans_in_any_state() {
     );
     let revision = break_unit(&app, &broken, NOW + 20).park.unwrap().revision;
     for route in [&active, &broken, &retired] {
-        app.uncover_recovery_coverage(std::slice::from_ref(route), NOW - 300)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(route),
+            NOW - 300,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
     }
     let still_active = unit(&app, &active, RELAY);
     assert_eq!(still_active.state, RecoveryUnitState::Active);
@@ -1653,8 +1721,12 @@ fn a_failed_probe_re_parks_under_the_same_notice() {
         let route = group(byte);
         owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
         let park = break_unit(&app, &route, NOW).park.unwrap();
-        app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 100)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(&route),
+            NOW - 100,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         assert!(unit(&app, &route, RELAY).probe);
         let reparked = settle(&app, &route, RELAY, outcome, NOW + 10);
         assert!(!reparked.probe);
@@ -1679,8 +1751,12 @@ fn an_unanswered_probe_keeps_its_allowance() {
     let route = group(1);
     owing(&app, &route, NOW - 1_000, (NOW - 1_000, NOW - 501));
     let park = break_unit(&app, &route, NOW).park;
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 700)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        NOW - 700,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     let unreachable = settle(
         &app,
         &route,
@@ -1767,8 +1843,12 @@ fn nothing_owed_keeps_a_retired_unit_retired() {
         ),
         (0, 0)
     );
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 300)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        NOW - 300,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
     let reopened = unit(&app, &route, RELAY);
     assert!(matches!(reopened.state, RecoveryUnitState::Broken(_)) && reopened.probe);
     assert!(reopened.park.unwrap().revision > revision, "a new notice");
@@ -1794,8 +1874,12 @@ fn a_granted_probe_does_not_wait_out_an_old_backoff() {
         NOW + 30
     );
     for route in [&broken, &retired] {
-        app.uncover_recovery_coverage(std::slice::from_ref(route), NOW - 700)
-            .unwrap();
+        app.uncover_recovery_coverage(
+            std::slice::from_ref(route),
+            NOW - 700,
+            crate::CopyFloorReason::Loss,
+        )
+        .unwrap();
         let probing = unit(&app, route, RELAY);
         assert!(probing.probe);
         assert_eq!(probing.next_attempt_at_seconds, 0);
@@ -2004,8 +2088,12 @@ fn loss_reopens_nothing_a_gone_relay_retired() {
     break_unit(&app, &route, NOW);
     app.retire_gone_recovery_units(&route, None, NOW).unwrap();
 
-    app.uncover_recovery_coverage(std::slice::from_ref(&route), NOW - 800)
-        .unwrap();
+    app.uncover_recovery_coverage(
+        std::slice::from_ref(&route),
+        NOW - 800,
+        crate::CopyFloorReason::Loss,
+    )
+    .unwrap();
 
     let retired = unit(&app, &route, RELAY);
     assert_eq!(
@@ -2025,8 +2113,12 @@ fn an_ended_route_drops_its_remainder() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let app = storage.app_storage();
     let route = group(1);
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), NOW - 1_000)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&route),
+        NOW - 1_000,
+        crate::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     app.prune_recovery_coverage(NOW - 800, &[(route.clone(), vec![RELAY.to_owned()])])
         .unwrap();
     assert!(remainder(&app, &route).is_some());

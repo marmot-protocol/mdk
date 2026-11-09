@@ -191,6 +191,7 @@ impl SqliteAccountStorage {
                         )
                         .storage()?,
                     );
+                    delete_recovery_copy_tx(&tx, &group_id)?;
                 }
                 if let Some(at) = forgotten_at {
                     deleted += tx.execute_cached(
@@ -204,6 +205,7 @@ impl SqliteAccountStorage {
                         &tx,
                         &cgka_traits::GroupId::new(group_id.clone()),
                     )?;
+                    delete_recovery_copy_tx(&tx, &group_id)?;
                     for table in ["cgka_welcomes", "cgka_disband_tombstones"] {
                         tx.execute_cached(
                             &format!("DELETE FROM {table} WHERE group_id = ?1"),
@@ -360,5 +362,23 @@ fn retire_device_sync_preparations(
         params![u64_to_i64(at.0)?],
     )
     .storage()?;
+    Ok(())
+}
+
+/// The recovery ledger's copy of a group goes with the engine record it
+/// settled: a later join is a fresh copy, with no rejoin floor, settled relay
+/// or notice (mdk#2660 row 11).
+fn delete_recovery_copy_tx(tx: &rusqlite::Transaction<'_>, group_id: &[u8]) -> StorageResult<()> {
+    for table in [
+        "account_recovery_copies",
+        "account_recovery_copy_routes",
+        "account_recovery_copy_units",
+    ] {
+        tx.execute_cached(
+            &format!("DELETE FROM {table} WHERE group_id = ?1"),
+            params![group_id],
+        )
+        .storage()?;
+    }
     Ok(())
 }

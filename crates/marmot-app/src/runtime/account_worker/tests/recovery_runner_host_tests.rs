@@ -7,6 +7,8 @@
 
 use super::*;
 use crate::runtime::account_worker::recovery_credits::{MAX_CONCURRENT_JOBS, available_credits};
+use cgka_traits::EpochId;
+use cgka_traits::storage::GroupStorage;
 use nostr_relay_builder::prelude::{
     BoxedFuture, Filter as RelayFilter, PolicyResult, QueryPolicy, SingleLetterTag,
 };
@@ -137,6 +139,7 @@ impl RunnerWorker {
             .widen_recovery_coverage_goals(
                 std::slice::from_ref(&route),
                 crate::unix_now_seconds() - HOUR,
+                storage_sqlite::CopyFloorReason::Clamp,
             )
             .unwrap();
         let app = app.with_unvouched_relay_replies_for_test();
@@ -166,6 +169,7 @@ impl RunnerWorker {
             .uncover_recovery_coverage(
                 std::slice::from_ref(&self.route),
                 crate::unix_now_seconds() - 24 * HOUR,
+                storage_sqlite::CopyFloorReason::Loss,
             )
             .unwrap();
     }
@@ -577,6 +581,7 @@ async fn shutdown_and_close_stops_the_runner_mid_quantum() {
         .widen_recovery_coverage_goals(
             std::slice::from_ref(&worker.route),
             crate::unix_now_seconds() - 24 * HOUR,
+            storage_sqlite::CopyFloorReason::Clamp,
         )
         .unwrap();
     let pass = worker.pass().await;
@@ -655,6 +660,7 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
         .uncover_recovery_coverage(
             std::slice::from_ref(&worker.route),
             crate::unix_now_seconds() - 24 * HOUR,
+            storage_sqlite::CopyFloorReason::Loss,
         )
         .unwrap();
     let _pass = worker.pass().await;
@@ -890,4 +896,97 @@ async fn a_burst_of_quiet_joins_costs_recovery_linear_in_the_joins() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A rejoin of a copy that is not suspended and already catching up (a
+/// consented fork discard, a reentry) leaves the runner's survey unchanged:
+/// the group still owes its new copy's span, and with its relay cooling down
+/// no sweep follows. Its notice still reaches hosts (mdk#2660 row 11). The
+/// worker publishes after the debt turn that raised it; here the group's
+/// rebuilt live REQs announce it too, so this pins the contract, not that
+/// publication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejoin_the_survey_does_not_show_is_still_announced() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let started = crate::unix_now_seconds();
+    let worker = RunnerWorker::start(&url).await;
+    worker.served_after(started).await;
+    timeout(SETTLE, worker.pass().await).await.unwrap().unwrap();
+    let storage = worker.app.account_storage(&worker.label).unwrap();
+    let mut events = worker.runtime.subscribe();
+    let drain = |events: &mut broadcast::Receiver<MarmotAppEvent>| {
+        let (mut notices, mut status) = (false, false);
+        while let Ok(event) = events.try_recv() {
+            notices |= matches!(event, MarmotAppEvent::HistoryNoticesChanged { .. });
+            status |= matches!(event, MarmotAppEvent::RecoveryStatusChanged { .. });
+        }
+        (notices, status)
+    };
+
+    // The group's relay rate-limited it and cools down: a lost day keeps the
+    // group catching up, and nothing is swept.
+    storage
+        .app_storage()
+        .settle_recovery_unit(
+            &worker.route,
+            &transport_nostr::canonical_relay(&url),
+            storage_sqlite::RecoveryUnitOutcome::RateLimited,
+            &crate::client::recovery_runner::RecoveryRunnerPolicy::default().unit,
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+    worker.lose_a_day();
+    timeout(SETTLE, worker.pass().await).await.unwrap().unwrap();
+    timeout(SETTLE, async {
+        while !drain(&mut events).1 {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the group is catching up");
+
+    // A replacement Welcome installs a new copy two hours old. The next debt
+    // turn retires what lay before it; the new copy's span is still owed.
+    let mut copy = storage.get_group(&worker.group).unwrap();
+    copy.join_epoch = EpochId(0);
+    copy.local_copy_install_epoch = EpochId(copy.local_copy_install_epoch.0 + 1);
+    copy.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(
+        crate::unix_now_seconds() - 2 * HOUR,
+    ));
+    storage.put_group(&copy).unwrap();
+    timeout(SETTLE, worker.pass().await).await.unwrap().unwrap();
+    // Read before any command: every command's completion publishes too.
+    let (mut notices_changed, mut status_changed) = (false, false);
+    timeout(SETTLE, async {
+        while !(notices_changed && status_changed) {
+            let (notices, status) = drain(&mut events);
+            notices_changed |= notices;
+            status_changed |= status;
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the rejoin's notice is announced");
+
+    let status = worker
+        .runtime
+        .account_recovery_status(&worker.label)
+        .await
+        .unwrap();
+    let group_hex = worker.group_hex();
+    assert!(
+        status.catching_up_group_ids_hex.contains(&group_hex),
+        "the group still catches up its new copy's span"
+    );
+    let rejoins = status
+        .notices
+        .iter()
+        .filter(|notice| notice.group_id_hex.as_deref() == Some(group_hex.as_str()))
+        .map(|notice| notice.cause)
+        .collect::<Vec<_>>();
+    assert_eq!(rejoins, [crate::HistoryNoticeCause::BeforeRejoin]);
+    worker.runtime.shutdown_and_close().await.unwrap();
 }

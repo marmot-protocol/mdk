@@ -11,6 +11,17 @@
 
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
 
+- A rejoin settles the recovery ledger once (mdk#2660 row 11). When a replacement Welcome installs a new copy of a
+  group (its install epoch moved and its join epoch was reset), the recovery runner's next debt turn retires what the
+  group's routes owed or parked below the new copy's standing floor as before this copy, never as coverage, and the
+  group gets one `HistoryNoticeCause::BeforeRejoin` notice. A restart raises no second one; dismissing it retires
+  nothing further. Retired spans stay in the relay re-check, loss inside them reopens them and explicit repair
+  re-arms them. A relay first carried after the rejoin owes only from the floor too. Nothing else makes the rejoined
+  group owe below the floor again: goal widening, the post-join collection and every epoch-gap visit stop there,
+  and only loss, explicit repair, or a released or given-back event's own second reach below it. The Welcome time alone still retires nothing. A group's history proof (the device-group inactivity
+  clock's "caught up") no longer counts what a rejoin retired. **Breaking:** `HistoryNoticeCause` gains
+  `BeforeRejoin`; exhaustive matches need it. Rejoin notices are not written to the forensic audit.
+
 - A starting account worker is given up on after 45 s without startup progress, not after 45 s in total
   (mdk#3145). Entering a startup step, or each migration an open of the account's database applies, starts the 45 s
   again, whichever caller runs that open. A slow device whose first open migrates for longer than that, as a second

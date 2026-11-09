@@ -9,6 +9,12 @@
   Rust record literals must initialize the added fields or use `..Default::default()`; update Swift and Kotlin
   record construction for the expanded query. Regenerate bindings and ship them with the matching native library.
 
+- `HistoryNoticeCauseFfi` gains `BeforeRejoin` (mdk#2660 row 11): one notice per rejoin, when a Welcome installed a
+  new copy of a group in place of this device's old one (an automatic rejoin after the old copy could not be repaired,
+  a reentry after a trusted removal, or a consented fork discard). Messages from before the rejoin that it had not
+  received are unavailable. Dismissing it retires nothing further. Exhaustive switches need the case. Regenerate
+  bindings.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
   `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
   finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New

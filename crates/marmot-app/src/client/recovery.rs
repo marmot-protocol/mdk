@@ -117,7 +117,11 @@ impl AppClient {
             let _replay_flush = crate::replay_flush_writes::ReplayFlushWrite::enter();
             storage.with_transaction(|_| {
                 for (since, routes) in &goals {
-                    app.widen_recovery_coverage_goals(routes, *since)?;
+                    app.widen_recovery_coverage_goals(
+                        routes,
+                        *since,
+                        storage_sqlite::CopyFloorReason::Clamp,
+                    )?;
                 }
                 Ok::<_, StorageError>(())
             })?;

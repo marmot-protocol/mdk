@@ -29,8 +29,12 @@ fn epoch_gap_visits_survive_reopen_and_fence_stale_or_duplicate_work() {
     let route = TransportReconciliationRoute::Group([1; 32]);
     let other = TransportReconciliationRoute::Group([2; 32]);
     let relay = "wss://relay.example";
-    app.widen_recovery_coverage_goals(&[route.clone(), other.clone()], 100)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        &[route.clone(), other.clone()],
+        100,
+        crate::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     for r in [&route, &other] {
         app.record_recovery_coverage(
             &[RecoveryCoverageSlice {

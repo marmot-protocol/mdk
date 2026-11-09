@@ -12,8 +12,9 @@ use crate::AppError;
 /// Why recovery parked. Hosts choose wording from this; it carries no
 /// identities. Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger
 /// parks emit `UnprovenHistory` without attributing the original reason history
-/// was owed. Other labels preserve compatibility; `KnownEvent` and
-/// `MaintenanceBoundary` remain reserved for parking policy.
+/// was owed; a rejoin emits `BeforeRejoin`. Other labels preserve
+/// compatibility; `KnownEvent` and `MaintenanceBoundary` remain reserved for
+/// parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryNoticeCause {
@@ -39,6 +40,14 @@ pub enum HistoryNoticeCause {
     /// and stopped retrying them: a group's (`group_id_hex` names it) or the
     /// account inbox's. The runner does not know why the history was owed.
     UnprovenHistory,
+    /// The device rejoined the group (`group_id_hex` names it): a Welcome
+    /// installed a new copy in place of its old one. That is an automatic
+    /// rejoin after the old copy could not be repaired, a reentry after a
+    /// trusted removal, or a fork discarded with the user's consent, whose old
+    /// copy may still have worked. Messages from before the rejoin that this
+    /// device had not received are unavailable to it, and recovery stopped
+    /// fetching them. One notice per rejoin.
+    BeforeRejoin,
 }
 
 impl HistoryNoticeCause {
@@ -53,6 +62,7 @@ impl HistoryNoticeCause {
             Self::KnownEvent => "known_event",
             Self::MaintenanceBoundary => "maintenance_boundary",
             Self::UnprovenHistory => "unproven_history",
+            Self::BeforeRejoin => "before_rejoin",
         }
     }
 
@@ -123,6 +133,18 @@ pub(crate) fn ledger_route_tag(route: &TransportReconciliationRoute) -> [u8; 16]
             hash.update(nostr_group_id);
         }
     }
+    let mut tag = [0; 16];
+    tag.copy_from_slice(&hash.finalize()[..16]);
+    tag
+}
+
+/// What a rejoin notice's ids carry in place of an obligation id: a
+/// domain-separated hash of the group, so the id never names it. With the
+/// notice's revision it is the notice's ticket.
+pub(crate) fn rejoin_group_tag(group_id: &[u8]) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-app/history-notice/rejoin/v1");
+    hash.update(group_id);
     let mut tag = [0; 16];
     tag.copy_from_slice(&hash.finalize()[..16]);
     tag
@@ -212,6 +234,7 @@ mod tests {
             HistoryNoticeCause::UnprovenHistory.as_str(),
             "unproven_history"
         );
+        assert_eq!(HistoryNoticeCause::BeforeRejoin.as_str(), "before_rejoin");
     }
 
     #[test]
@@ -228,5 +251,10 @@ mod tests {
             ledger_route_tag(&TransportReconciliationRoute::Group([7; 32]))
         );
         assert_ne!(&group[..], &[7; 16][..], "the tag names its route");
+        let rejoin = rejoin_group_tag(&[7; 16]);
+        assert_eq!(rejoin, rejoin_group_tag(&[7; 16]));
+        assert_ne!(rejoin, rejoin_group_tag(&[8; 16]));
+        assert_ne!(&rejoin[..], &[7; 16][..], "the tag names its group");
+        assert_ne!(rejoin, group, "rejoin and ledger tags never collide");
     }
 }

@@ -253,6 +253,7 @@ async fn a_refused_inbox_is_never_a_covered_window() {
                 .map(|route| route.route.clone())
                 .collect::<Vec<_>>(),
             now - DAY,
+            storage_sqlite::CopyFloorReason::Clamp,
         )
         .unwrap();
     for candidate in &routes {
@@ -317,6 +318,7 @@ async fn an_unadmitted_staged_event_is_never_a_covered_window() {
                 .map(|route| route.route.clone())
                 .collect::<Vec<_>>(),
             now - DAY,
+            storage_sqlite::CopyFloorReason::Clamp,
         )
         .unwrap();
     for candidate in &routes {
@@ -479,7 +481,11 @@ async fn a_repair_behind_a_step_waiting_on_a_credit_meets_its_deadline() {
     let (_dir, _relay, mut client, storage, route) = client(&Sweeps::default()).await;
     cover_inbox(&client, &storage);
     storage
-        .widen_recovery_coverage_goals(std::slice::from_ref(&route), unix_now_seconds() - DAY)
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            unix_now_seconds() - DAY,
+            storage_sqlite::CopyFloorReason::Clamp,
+        )
         .unwrap();
     client.recovery_credits = private_recovery_credit_pool_for_test();
     let _held = hold_all_credits_for_test(&client.recovery_credits);
@@ -625,7 +631,11 @@ async fn a_worker_repair_re_arms_after_the_quantum_in_flight_settles() {
     let (_dir, _relay, mut client, storage, route) = client(&sweeps).await;
     cover_inbox(&client, &storage);
     storage
-        .widen_recovery_coverage_goals(std::slice::from_ref(&route), unix_now_seconds() - DAY)
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            unix_now_seconds() - DAY,
+            storage_sqlite::CopyFloorReason::Clamp,
+        )
         .unwrap();
     let relay = client
         .recovery_runner_routes()

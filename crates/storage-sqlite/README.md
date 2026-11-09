@@ -312,7 +312,7 @@ runner supplies validated facts and owns execution policy. Design:
   durable count records the relay plane's routes for its generation through `record_account_recovery_loss_routed`,
   merged as a marker write's are, and makes the generation account-wide when it passes none. `recovery_loss_reach`
   reads where one cause's unresolved loss may have lost events, by route.
-  `uncover_recovery_coverage` does the same for the given routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
+  `uncover_recovery_coverage` does the same for the given routes only, for the `CopyFloorReason` its caller names. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
   placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
   deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
   ends when retention pruning passes it. A release with no inventory row leaves
@@ -349,6 +349,38 @@ runner supplies validated facts and owns execution policy. Design:
   `staged_recovery_routes` and `recovery_unit_fences` tell the runner which groups to read, and
   `reclaim_staged_recovery_routes` gives back what a route it no longer lists staged. The recovery runner
   schedules on this state.
+- **Rejoins (`recovery_copies.rs`, migration 0153, mdk#2660 row 11).** `account_recovery_copies` keeps, per group,
+  the install epoch of the local copy the runner last settled, a rejoined copy's floor and the one notice a rejoin
+  raises; `account_recovery_copy_routes` records each of the group's routes that floor holds on, with relays or
+  without, and `account_recovery_copy_units` each relay of those routes that retired what lay below it. Forgetting a
+  group, or deleting a terminal one, drops all three with its engine record. The migration seeds
+  every existing group with the copy its engine record holds then (unknown only when the record does not decode), so
+  a rejoin from before it raises nothing and one applied after it, even before the runner's first turn, does. `settle_recovery_rejoin`
+  settles a copy the app calls a rejoin in one transaction: on each relay of each of the group's routes, what the unit
+  owes or parked below the new copy's floor becomes a `BeforeThisCopy` retired span (never coverage; earlier
+  retirements keep their reasons), its fences below the floor drop, and it restarts active with a fresh budget; each
+  route's remainder below the floor goes; the floor, the routes and those relays are recorded; and the notice is raised under a
+  new park revision. It returns false, changing nothing, for a copy already settled. `retire_before_recovery_copy`
+  records each carried route and does the same retirement, below the recorded floor, on each carried relay not yet
+  recorded (one that joined a route after the rejoin, or returned to one it had left before), once per relay, so loss
+  or repair that later reopens it stays reopened. `record_recovery_copy` settles any other copy and clears an earlier
+  rejoin's floor, routes, relays and notice; `dismiss_recovery_rejoin_notice` clears the notice at its revision and retires nothing more.
+  `recovery_copy_floor` reads the recorded floor. Every write that widens a goal or un-covers coverage names a
+  `CopyFloorReason`, and `Clamp` keeps it at or above the highest floor recorded for its route (`copy_floor_tx`: one
+  probe of `account_recovery_copy_routes_by_route` and a copy lookup in the same transaction; a route no rejoin
+  settled reads no row and is not clamped). So `widen_recovery_coverage_goals`, `uncover_recovery_coverage` and
+  `begin_recovery_epoch_gap_retry` stop at the floor, whoever begins the visit, and the retention prune parks nothing
+  below it, with relays or without (a route keeps one remainder, which would otherwise join a second owed below the
+  floor to debt above it). Only `Loss` (loss
+  import and the upgrade conversion) and `Repair` (explicit repair) reach below it, and so does one second the device
+  held: a released receipt, or a staged row given back, un-covers its own second, so the re-check fetches it again.
+  That second alone is owed: when it lies below the route's goal, the seconds its goal widening opens below the floor
+  lay outside the goal, owed nothing, and retire as `BeforeThisCopy` in the same transaction
+  (`retire_opened_before_copy_tx`).
+  `recovery_copy_debt` is a route's debt on one relay less what a rejoin retired there.
+  Retired spans stay in the re-check, loss inside them reopens them and explicit repair re-arms them; a relay that
+  leaves the route keeps every span retired below the floor, with its reason, through
+  `retire_gone_recovery_units`, so its return owes only from the floor.
 - **Upgrade conversion (`account_recovery/convert.rs`, migration 0136, mdk#2660 phase 4).**
   `convert_recovery_obligations` turns the old owner's queue-loss, notification-loss, explicit, incremental and
   native-replay obligations into ledger debt and runner retry state, once, before the runner first starts.

@@ -2,9 +2,10 @@
 //! user-authorized retirement. Retirement is recorded as its own outcome,
 //! never as coverage.
 //!
-//! Routes the coverage ledger parks raise notices too ([`LedgerNotice`]), and
-//! the account's recovery status reads what the recovery runner is catching up
-//! (mdk#2660 phase 4).
+//! Routes the coverage ledger parks raise notices too ([`LedgerNotice`]), as
+//! does each rejoin ([`RejoinNotice`], mdk#2660 row 11), and the account's
+//! recovery status reads what the recovery runner is catching up (mdk#2660
+//! phase 4).
 use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::GroupId;
@@ -12,7 +13,7 @@ use storage_sqlite::{RecoveryDemandTicket, SqliteAppStorage, TransportReconcilia
 
 use super::AppClient;
 use crate::history_notices::{
-    decode_notice_id, encode_notice_id, history_notice, ledger_route_tag,
+    decode_notice_id, encode_notice_id, history_notice, ledger_route_tag, rejoin_group_tag,
 };
 use crate::{AccountRecoveryStatus, AppError, HistoryNotice, HistoryNoticeCause};
 
@@ -41,13 +42,34 @@ impl LedgerNotice {
     }
 }
 
+/// One group's rejoin: one `BeforeRejoin` notice, whose ticket is the
+/// group's tag and the notice's revision. Dismissing it retires nothing
+/// further: the rejoin already retired what lay before the new copy. Not
+/// `Debug`: it carries its group.
+pub(crate) struct RejoinNotice {
+    group_id: Vec<u8>,
+    ticket: RecoveryDemandTicket,
+    noticed_at_seconds: u64,
+}
+
+impl RejoinNotice {
+    fn notice(&self) -> HistoryNotice {
+        HistoryNotice {
+            notice_id: encode_notice_id(self.ticket),
+            cause: HistoryNoticeCause::BeforeRejoin,
+            group_id_hex: Some(hex::encode(&self.group_id)),
+            parked_at_ms: Some(self.noticed_at_seconds.saturating_mul(1000)),
+        }
+    }
+}
+
 /// The parked set as last announced: each occurrence's obligation id and
 /// revision, with its group for group-scoped demand.
 pub(crate) type HistoryNoticeBaseline = Vec<([u8; 16], u64, Option<Vec<u8>>)>;
 
 impl AppClient {
     /// Every current occurrence: parked obligations oldest first, then the
-    /// ledger's parked routes oldest first.
+    /// ledger's parked routes oldest first, then rejoins oldest first.
     pub(crate) fn history_notices(&self) -> Result<Vec<HistoryNotice>, AppError> {
         let app = self.app.account_storage(&self.state.label)?.app_storage();
         let mut notices = app
@@ -57,7 +79,38 @@ impl AppClient {
             .map(history_notice)
             .collect::<Vec<_>>();
         notices.extend(self.ledger_notices(&app)?.iter().map(LedgerNotice::notice));
+        notices.extend(self.rejoin_notices(&app)?.iter().map(RejoinNotice::notice));
         Ok(notices)
+    }
+
+    /// Each rejoin's notice not yet dismissed, oldest first, for a group with
+    /// a current route that is not suspended and that the host may see.
+    pub(crate) fn rejoin_notices(
+        &self,
+        app: &SqliteAppStorage,
+    ) -> Result<Vec<RejoinNotice>, AppError> {
+        let groups = self
+            .recovery_runner_routes()
+            .into_iter()
+            .filter(|route| !route.suspended())
+            .filter_map(|route| route.group_id)
+            .collect::<BTreeSet<_>>();
+        Ok(app
+            .recovery_rejoin_notices()?
+            .into_iter()
+            .filter(|notice| {
+                groups.contains(&notice.group_id)
+                    && self.host_may_see_parked(Some(&notice.group_id))
+            })
+            .map(|notice| RejoinNotice {
+                ticket: RecoveryDemandTicket {
+                    id: rejoin_group_tag(&notice.group_id),
+                    revision: notice.revision,
+                },
+                group_id: notice.group_id,
+                noticed_at_seconds: notice.noticed_at_seconds,
+            })
+            .collect())
     }
 
     /// The routes the coverage ledger parks, one notice each, oldest first.
@@ -201,7 +254,7 @@ impl AppClient {
     }
 
     /// Notice ids of this group's own parked occurrences, oldest first, then
-    /// its routes' ledger notices.
+    /// its routes' ledger notices, then its rejoin's.
     pub(crate) fn group_history_notice_ids(
         &self,
         group_id: &GroupId,
@@ -216,6 +269,12 @@ impl AppClient {
             self.ledger_notices(&app)?
                 .into_iter()
                 .filter(|notice| notice.group_id.as_deref() == Some(group_id.as_slice()))
+                .map(|notice| encode_notice_id(notice.ticket)),
+        );
+        ids.extend(
+            self.rejoin_notices(&app)?
+                .into_iter()
+                .filter(|notice| notice.group_id == group_id.as_slice())
                 .map(|notice| encode_notice_id(notice.ticket)),
         );
         Ok(ids)
@@ -238,6 +297,13 @@ impl AppClient {
             .find(|parked| parked.ticket == ticket)
             .map(|parked| (parked.cause, parked.group_id))
         else {
+            if let Some(notice) = self
+                .rejoin_notices(&app)?
+                .into_iter()
+                .find(|notice| notice.ticket == ticket)
+            {
+                return self.dismiss_rejoin_notice(&app, &notice);
+            }
             return self.dismiss_ledger_notice(&app, ticket);
         };
         if !app.retire_parked_recovery_obligation(
@@ -324,6 +390,27 @@ impl AppClient {
         Ok(true)
     }
 
+    /// Dismiss a rejoin's notice. It retires nothing: the rejoin already
+    /// retired what lay before the new copy. Not audited: the forensic
+    /// recovery vocabulary has no rejoin cause. Returns false when the notice
+    /// went stale meanwhile.
+    fn dismiss_rejoin_notice(
+        &mut self,
+        app: &SqliteAppStorage,
+        notice: &RejoinNotice,
+    ) -> Result<bool, AppError> {
+        let dismissed =
+            app.dismiss_recovery_rejoin_notice(&notice.group_id, notice.ticket.revision)?;
+        tracing::info!(
+            target: "marmot_app::recovery",
+            method = "dismiss_history_notice",
+            cause = HistoryNoticeCause::BeforeRejoin.as_str(),
+            dismissed,
+            "dismissed a rejoin notice; nothing more retired",
+        );
+        Ok(dismissed)
+    }
+
     /// Re-read the parked set and return the groups whose own occurrences
     /// changed since the last call, or `None` when nothing changed. The first
     /// call only records the baseline. A failed read keeps the old baseline,
@@ -340,14 +427,15 @@ impl AppClient {
                 let app = storage.app_storage();
                 let parked = app.parked_recovery_obligations()?;
                 let ledger = self.ledger_notices(&app)?;
+                let rejoins = self.rejoin_notices(&app)?;
                 if !app.recovery_conversion_pending()?
                     && app.recovery_conversion_notices_changed()?
                 {
                     converted = Some(app);
                 }
-                Ok((parked, ledger))
+                Ok((parked, ledger, rejoins))
             }) {
-            Ok((parked, ledger)) => parked
+            Ok((parked, ledger, rejoins)) => parked
                 .into_iter()
                 .map(|parked| {
                     let cause = super::audit_recovery::obligation_cause(parked.cause);
@@ -361,6 +449,14 @@ impl AppClient {
                     causes.push((ticket.id, cause));
                     (ticket.id, ticket.revision, group)
                 })
+                // A rejoin has no forensic cause, so it shows unaudited.
+                .chain(rejoins.into_iter().map(|notice| {
+                    (
+                        notice.ticket.id,
+                        notice.ticket.revision,
+                        Some(notice.group_id),
+                    )
+                }))
                 .collect(),
             Err(_) => {
                 tracing::debug!(

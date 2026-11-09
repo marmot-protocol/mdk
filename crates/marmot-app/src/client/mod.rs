@@ -726,6 +726,9 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
+/// Each of a group's routes with the relays the recovery runner carries on it.
+pub(crate) type CarriedRoutes = Vec<(storage_sqlite::TransportReconciliationRoute, Vec<String>)>;
+
 pub struct AppClient {
     /// Runs once right after the next projection checkpoint's save, before
     /// anything else reads storage.
@@ -982,6 +985,18 @@ pub struct AppClient {
     /// The retention floor the recovery runner's debt turns last pruned the
     /// ledger to in this process, if any did.
     pub(crate) runner_pruned_floor: Option<u64>,
+    /// Each group's local copy (its install epoch) the recovery runner's debt
+    /// turns settled in this process, with the relays its routes carried then
+    /// (mdk#2660 row 11), so a turn reads the durable copy only for a group
+    /// whose copy or carried relays changed since. At most one entry per group
+    /// with a current route: each settle drops the rest, and forgetting a
+    /// group drops its entry. A missing entry costs one durable read.
+    pub(crate) settled_recovery_copies: std::collections::HashMap<Vec<u8>, (u64, CarriedRoutes)>,
+    /// A debt turn settled a changed copy, which raises or clears a rejoin
+    /// notice, since the account worker last published account-level
+    /// changes. The runner's survey may not change with it (a group already
+    /// catching up stays so), so the worker publishes after that turn.
+    pub(crate) recovery_copy_settled: bool,
     /// The clock (Unix seconds) the runner's next prune takes its retention
     /// floor from: its previous debt turn's, or before its first, the one the
     /// open seeded standing goals with. It moves only past a prune that
@@ -3506,6 +3521,7 @@ impl AppClient {
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
         self.accepted_push_announces.remove(group_id);
+        self.settled_recovery_copies.remove(group_id.as_slice());
         self.push_repairs.forget_group(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make

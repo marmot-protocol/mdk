@@ -6,7 +6,9 @@ use rusqlite::{OptionalExtension, params};
 
 use super::account_recovery::RecoveryDemandTicket;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute, i64_to_u64};
+use crate::{
+    CopyFloorReason, SqliteAppStorage, SqliteResultExt, TransportReconciliationRoute, i64_to_u64,
+};
 
 /// The current missing epoch's return-visit state. No identities for logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +67,9 @@ impl SqliteAppStorage {
     /// Begin one due visit and un-cover its retained goals atomically. A
     /// duplicate begin, stale ticket, parked demand or early retry does nothing.
     /// The owner supplies authoritative group routes and retention-bounded floors.
+    /// The un-cover is clamped ([`CopyFloorReason::Clamp`]): a rejoined group's
+    /// gap is in its new copy's epochs, so no visit reopens what lay before the
+    /// copy (mdk#2660 row 11).
     pub fn begin_recovery_epoch_gap_retry(
         &self,
         ticket: RecoveryDemandTicket,
@@ -126,7 +131,11 @@ impl SqliteAppStorage {
                 )
                 .storage()?;
             for (route, since) in floors {
-                self.uncover_recovery_coverage(std::slice::from_ref(route), *since)?;
+                self.uncover_recovery_coverage(
+                    std::slice::from_ref(route),
+                    *since,
+                    CopyFloorReason::Clamp,
+                )?;
             }
             Ok(true)
         })

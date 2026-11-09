@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-07
+updated: 2026-11-09
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -561,14 +561,64 @@ in `marmot-app` fills it from facts the owner already has:
 | A startup incremental history request | Every current route's goal widens to its standing floor: the retained window's floor, or for a group route whose copy has a Welcome time, that time less the 15-minute allowance when it is later |
 | An explicit history request | Every current route's goal widens to the retained window |
 | A pending epoch gap | The group's routes' goals widen to their standing floors |
-| Every settlement, and the recovery runner's first debt turn in a process and then each hour of floor movement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder. The runner prunes to the floor as of its previous debt turn, or of the open before its first (a turn whose prune failed does not count), so the seconds of a goal seeded since then at its own retention floor are swept, never parked before a debt turn could read them |
+| Every settlement, and the recovery runner's first debt turn in a process and then each hour of floor movement | Coverage and goals below the retained window are pruned. First, what any certifying relay of a current route still owes below the floor (not covered there and not retired; parked seconds count) joins that route's parked remainder, except anything below a rejoined copy's floor (see **Rejoins** below). The runner prunes to the floor as of its previous debt turn, or of the open before its first (a turn whose prune failed does not count), so the seconds of a goal seeded since then at its own retention floor are swept, never parked before a debt turn could read them |
 
 **Standing floors.** The Welcome time is a soft signal (`Group::local_copy_welcome_created_at`):
 an application message carries its sender's compose time, so one composed offline before the
 Welcome and sent after it is openable here yet older than the Welcome. The standing floor
-therefore only starts the goals that want history in general. It never retires, un-covers or
-drops debt: loss and released receipts keep their own floors, explicit repair wants the whole
-window, and goals only widen, so a later Welcome raises nothing.
+therefore only starts the goals that want history in general. On its own it never retires,
+un-covers or drops debt: loss and released receipts keep their own floors, explicit repair wants
+the whole window, and goals only widen, so a later Welcome raises nothing.
+
+**Rejoins** (Jeff, 2026-11-08; mdk#2660 row 11). The one exception is a replacement install: a
+Welcome that installs a new copy of a group over an old one, so the copy's install epoch moved
+and its join epoch was reset to zero. That covers the automatic rejoin of an Unrecoverable
+copy, a reentry after a trusted removal and a consented fork discard. The Welcome time still
+never decides anything by itself; it only bounds what the rejoin retires. At the recovery
+runner's next debt turn, on every relay of every route of the group, what the route owed or
+parked below the new copy's standing floor is retired as before this copy
+(`BeforeThisCopy`), never as coverage, and each unit starts over with a fresh budget, so what it
+parked above the floor is owed again. The route's parked remainder below the floor goes, and the
+group gets one notice, `BeforeRejoin`, that history from before the rejoin is unavailable.
+Dismissing it retires nothing further. Each copy settles once: storage records the copy's
+install epoch (migration 0153) in the same transaction, so a restart raises no second notice, a
+copy that replaced none settles silently and clears an earlier rejoin's notice, and a group
+that existed before the migration starts with the copy its record held then, so an older
+rejoin raises nothing and one applied after the upgrade, even before the runner's first turn,
+still counts. A suspended copy settles nothing until it is replaced or recovers. Goals keep their
+start; only what is owed rises.
+
+The soft Welcome time still applies to what is retired: a message composed before the rejoin
+and sent after it is openable by the new copy yet lies below its floor. Retired spans therefore
+stay in the six-hourly re-check on the relays that compare, loss inside one reopens it, and
+explicit repair re-arms all of them, so owed history below the floor is no weaker than covered
+history below it. They belong to the group's copy, not to a relay: storage records the rejoin's
+floor and each relay that retired below it, so a relay that leaves the route and returns keeps
+its retirement, and one first carried after the rejoin (added to a route, or returning to one it
+had left before the rejoin) retires below the recorded floor at the first debt turn that carries
+it. Either way it owes only from the floor, and each relay retires once, so loss or repair that
+later reopens its retirement is never undone. Nothing else makes the group's routes owe below
+the floor again, by construction: every ledger write that widens a route's goal or un-covers its
+coverage names its reason, and storage clamps it to the highest floor a rejoin recorded for that
+route in the same transaction, while a relay leaving keeps what was retired below the floor with
+its reason. Goal widening, the post-join collection and every epoch-gap visit, whether sync
+begins it on a new stall or the runner returns, therefore stop at the floor; the new copy's gap
+is in its own epochs. Only loss and explicit repair reach below it, and so does one second the
+device held: a released receipt, or a staged event given back because it no longer decodes or
+its route was reclaimed. That is how a re-check's finding, or a late message below the floor
+that was released, is fetched again, and that second alone is owed: when it lies below the
+route's goal too, the seconds the goal's widening opens below the floor were never owed, so they
+retire as before the copy. Storage records each route the rejoin settled, with relays or
+without, so a route no relay carries holds the floor too, and the retention prune parks nothing
+from before the copy on any rejoined route. A route keeps one parked remainder, so a second owed
+below the floor would otherwise join debt above it and park the retired history between, beside
+the rejoin's notice. The residual: such a second, or debt that loss reopened below the floor,
+that is still unfetched when retention passes it drops without a remainder notice. The runner
+sweeps it for the whole retention window, and the rejoin's notice already covers that history.
+Each clamped write reads the floor with one probe of an index on the
+recorded routes and one copy lookup; a route no rejoin settled reads no row.
+Forgetting the group drops its copy with the engine record. The remaining exposure is such a late message on a relay without NIP-77,
+which is found only on loss or repair.
 The hint is read from durable group metadata even on a deferred runtime open, before MLS
 hydration: an unavailable live accessor must not substitute the retention floor and
 permanently widen a recently joined copy's goal.
@@ -876,7 +926,11 @@ The runner's first look only records the generations, so a connection made befor
 nothing. A reconnect that a lag of the pool's notifications skipped still moves the
 generation, and a relay that leaves the pool leaves the feed. An Unrecoverable group's routes are suspended: their debt keeps accruing, but their
 units and re-checks are not scheduled, charged, broken or noticed, since a fetch would only
-fill the frozen copy's deferred input. For the same reason admission gives back what the group
+fill the frozen copy's deferred input. When a rejoin replaces the copy, the next debt turn
+settles it before reading debt, right after route changes: what was owed below the new copy's
+floor retires as before this copy and the group gets its one rejoin notice (section 7,
+**Rejoins**). The replacement's post-join collection un-covers the new copy's span, and the
+runner fetches it. For the same reason admission gives back what the group
 had staged, owed again, so it holds no staging bound, frontier or fence. A retained
 route owes nothing past its switch plus the clock-skew allowance: members that had not applied
 the switch by then still send there, and its live subscription carries that. A relay a route
@@ -922,7 +976,7 @@ re-check charges the account budget and the relay's streak like any quantum, nev
 own retry state. These values are decision A20.
 
 An unresolved durable epoch gap additionally authorizes bounded return visits to that group's retained goals,
-including on relays without NIP-77. This handles a commit published with an old timestamp after an earlier sweep.
+including on relays without NIP-77. A rejoined group's visits start no lower than its rejoin's floor. This handles a commit published with an old timestamp after an earlier sweep.
 The existing runner reopens those goals and resumes ordinary comparison or sweep quanta under the same credits,
 staging bounds and account budgets. A completed visit that leaves the epoch missing waits 30 seconds before the
 next, doubling the delay under the existing unit policy. A visit ends when each source has covered its range
@@ -1052,7 +1106,10 @@ route's also shows in that group's status. A park on a relay the route now carri
 effort, or no longer, raises none. What a notice shows, its revision (the newest park among
 them) and what dismissing it retires are one set, so such a park moves no revision and is never
 dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
-its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
+its route. A suspended (Unrecoverable) group's routes give no notice. A rejoin is one
+`BeforeRejoin` notice for its group, whose id is a hash of the group with the notice's
+revision, shown while the group has a current route that is not suspended. Rejoin notices are
+not written to the forensic audit, whose recovery vocabulary has no rejoin cause. Each survey
 publishes the required units still catching up; the account's recovery status reads that, and
 a change in it or in the notices is one `RecoveryStatusChanged`.
 
