@@ -80,7 +80,8 @@ session metadata; subscriptions, retained history connections, and active public
 After the relay plane's safety check, `reconnect_relay(endpoint)` restarts the existing relay object without
 changing its capabilities or owners. A configured endpoint absent from the pool gets a manual connection with
 `RelayCapabilities::NONE`: it inherits no REQs and does not enter the receive frontier. Subscription, history, or
-publication actors add their own capabilities and ownership when they use it. Reconnect returns the next observed
+publication actors add their own capabilities and ownership when they use it. Once only the manual owner remains,
+capabilities return to `NONE`, so the socket stays outside aggregate health. Reconnect returns the next observed
 attempt's current status, including `Connecting`, within five seconds. It does not claim subscription readiness or
 run a retry loop.
 

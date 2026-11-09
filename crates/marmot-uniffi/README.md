@@ -219,6 +219,7 @@ and aggregate snapshots; keep secrets out of diagnostics and host callback error
 `accountRelayLiveness(accountRef)` reads one row per configured relay, keyed by canonical URL.
 Root URLs omit the trailing slash; path trailing slashes retain their endpoint identity.
 The rows combine the account's cached NIP-65 read/write, inbox, default, and bootstrap lists.
+Malformed cached URLs are excluded, as in transport routing; they do not block receive startup or valid retries.
 `RelayStatusFfi` has `Unknown`, `Connecting`, `Connected`, and `Offline` variants for host localization.
 State comes from that account's pool, including receive/history and WRITE-only publication sockets, not another
 account or a separate directory pool. Configured URLs with no observed session are `Unknown`; closed sessions

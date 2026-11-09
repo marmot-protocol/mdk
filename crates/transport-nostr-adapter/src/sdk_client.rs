@@ -990,8 +990,8 @@ impl From<RelayStatus> for RelayLivenessStatus {
 pub struct RelayLiveness {
     pub url: String,
     pub status: RelayLivenessStatus,
-    /// Unix seconds of the latest transport connect attempt. Opaque clients use
-    /// the time a status notification reveals a new SDK attempt count.
+    /// Unix seconds of the latest transport connect attempt.
+    /// Unavailable for opaque clients supplied to `NostrSdkRelayClient::new`.
     pub last_attempt_unix: Option<u64>,
     /// The SDK error category from the latest failed transport connect.
     /// Unavailable for opaque clients supplied to `NostrSdkRelayClient::new`.
@@ -1955,9 +1955,11 @@ impl PublishRelayCache {
                 self.frontier.detach(endpoint);
                 return false;
             };
-            if state.manual_owned.contains(endpoint)
-                || state.acquisition_retained.contains(endpoint)
-            {
+            if state.manual_owned.contains(endpoint) {
+                relay.capabilities().remove(RelayCapabilities::WRITE);
+                return false;
+            }
+            if state.acquisition_retained.contains(endpoint) {
                 return false;
             }
             entry.discard
@@ -5317,6 +5319,7 @@ impl NostrSdkRelayClient {
         let added = self
             .client
             .add_relay(endpoint.clone())
+            .capabilities(RelayCapabilities::READ)
             .await
             // The sdk error Display can carry the relay URL; keep the error
             // operation-only so `TransportAdapterError` Display stays URL-free.
@@ -8860,17 +8863,21 @@ mod tests {
         );
         assert!(relay.capabilities().can_read());
         sdk.unsubscribe(subscription.clone()).await.unwrap();
-        assert_eq!(
-            sdk.relay_health().await.total_relays,
-            1,
-            "manual ownership survives final subscription release"
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+        assert_eq!(relay.capabilities().load(), RelayCapabilities::NONE);
+        assert!(relay.subscriptions().await.is_empty());
+        assert!(
+            sdk.client()
+                .relay(wire.endpoint.as_str())
+                .await
+                .unwrap()
+                .is_some()
         );
         assert!(sdk.relay_connections().borrow().is_empty());
-        assert!(!relay.capabilities().can_read());
         let before_retry = relay.stats().attempts();
         sdk.reconnect_relay(&wire.endpoint).await.unwrap();
         assert!(relay.stats().attempts() > before_retry);
-        assert!(!relay.capabilities().can_read());
+        assert_eq!(relay.capabilities().load(), RelayCapabilities::NONE);
         sdk.subscribe(subscription.clone()).await.unwrap();
         assert_eq!(
             wire.recv_kind("REQ").await[1],
@@ -8918,6 +8925,30 @@ mod tests {
             .unwrap();
         assert!(relay.capabilities().can_write());
         assert!(!relay.capabilities().can_read());
+        wire.send(serde_json::json!(["OK", event[1]["id"], true, ""]))
+            .await;
+        let outcome = publishing.await.unwrap();
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(relay.capabilities().load(), RelayCapabilities::NONE);
+        assert!(relay.subscriptions().await.is_empty());
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+        assert!(
+            sdk.client()
+                .relay(wire.endpoint.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let publish_client = sdk.clone();
+        let endpoint = wire.endpoint.clone();
+        let publishing = tokio::spawn(async move {
+            publish_client
+                .publish_event(&[endpoint], &signed_group_event_dto(), 1)
+                .await
+                .unwrap()
+        });
+        let event = wire.recv_kind("EVENT").await;
         sdk.sync_liveness_config(&[]).await.unwrap();
         assert_eq!(
             sdk.relay_health().await.total_relays,

@@ -582,7 +582,7 @@ async fn liveness_manual_lifetime() {
     lists.nip65.created_at = crate::unix_now_seconds();
     lists.nip65.relays = vec![receive_url.clone()];
     lists.inbox.created_at = lists.nip65.created_at;
-    lists.inbox.relays = vec![receive_url.clone()];
+    lists.inbox.relays = vec![receive_url.clone(), "relay.example.com".into()];
     lists.refresh();
     app.directory()
         .remember_directory_relay_lists(&account.account_id_hex, &lists)
@@ -610,6 +610,19 @@ async fn liveness_manual_lifetime() {
     })
     .await
     .expect("the managed account activates its receive socket");
+
+    runtime
+        .reconnect_relay(&account.label, &receive_url)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .account_relay_liveness(&account.label)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.url != "relay.example.com")
+    );
 
     // An existing pool socket outside the configured union is not a retry target.
     sdk.client().add_relay(&unconfigured_url).await.unwrap();

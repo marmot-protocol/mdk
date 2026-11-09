@@ -249,6 +249,7 @@ impl MarmotApp {
             .chain(lists.nip65.read_relays)
             .chain(lists.nip65.write_relays)
             .chain(lists.inbox.relays)
+            .filter(|url| nostr_sdk::prelude::RelayUrl::parse(url.trim()).is_ok())
             .map(|url| TransportEndpoint(transport_nostr::canonical_relay(&url)))
             .collect::<Vec<_>>();
         relays.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
