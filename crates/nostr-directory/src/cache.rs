@@ -8,6 +8,8 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -33,6 +35,12 @@ pub const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
 const CLOSED_DETAIL: &str = "directory cache is closed";
 // Stay below SQLite's historical 999-variable limit.
 const PROFILE_QUERY_BATCH_SIZE: usize = 900;
+
+type SearchProfile = (
+    storage_sqlite::PublicDirectoryProfileRecord,
+    Option<u64>,
+    u8,
+);
 
 #[cfg(test)]
 thread_local! {
@@ -81,6 +89,26 @@ impl DirectoryCache {
 
     fn from_connection(mut conn: Connection) -> Result<Self, DirectoryError> {
         migrations::run_all(&mut conn)?;
+        conn.create_scalar_function(
+            "marmot_search_rank",
+            2,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            |ctx| {
+                let (ValueRef::Text(haystack), ValueRef::Text(query)) =
+                    (ctx.get_raw(0), ctx.get_raw(1))
+                else {
+                    return Ok(3_u8);
+                };
+                let (Ok(haystack), Ok(query)) =
+                    (std::str::from_utf8(haystack), std::str::from_utf8(query))
+                else {
+                    return Ok(3_u8);
+                };
+                Ok(search_match_quality(haystack, query))
+            },
+        )?;
         let cache = Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
             #[cfg(any(test, feature = "test-support"))]
@@ -172,60 +200,120 @@ impl DirectoryCache {
     /// Public identity/profile fields only: no follow, key-package, or local-label reads.
     /// Profile-less promoted identities remain searchable by npub or pubkey.
     /// Search includes un-promoted profiles without making them sync candidates.
+    /// Empty IDs return up to 10,000 matching identities; requested IDs also return nonmatches.
+    /// Rank is quality * 6 + field (name, nip05, display_name, about, npub, pubkey);
+    /// exact, prefix, and contains qualities are 0, 1, and 2. Ranks >= 18 do not match.
+    /// The caller normalizes `query`; haystacks are Unicode-lowercased without trimming.
     pub(crate) fn public_search_records(
         &self,
         now: i64,
-    ) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
-        self.public_search_records_capped(now, super::cached_search::CACHED_SEARCH_MAX_RECORDS)
-    }
-
-    fn public_search_records_capped(
-        &self,
-        now: i64,
-        max: usize,
-    ) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
+        query: &str,
+        account_ids: &[String],
+    ) -> Result<Vec<SearchProfile>, DirectoryError> {
         let conn = self.lock()?;
-        let mut statement = conn.prepare(
-            "WITH candidates AS (
-                 SELECT account_id_hex, npub, profile_json, 0 AS tier FROM directory_users
-                 UNION ALL
-                 SELECT account_id_hex, npub, profile_json, 1 AS tier
-                 FROM directory_search_graph_users
-                 WHERE profile_json IS NOT NULL
-                   AND (metadata_expires_at IS NULL OR metadata_expires_at > ?1)
-             ), ranked AS (
-                 SELECT account_id_hex, npub, profile_json,
-                     ROW_NUMBER() OVER (
-                         PARTITION BY account_id_hex
-                         ORDER BY COALESCE(json_extract(profile_json, '$.created_at'), -1) DESC, tier
-                     ) AS choice
-                 FROM candidates
-             )
-             SELECT account_id_hex, npub, profile_json FROM ranked
-             WHERE choice = 1 ORDER BY account_id_hex LIMIT ?2",
-        )?;
-        let cap = i64::try_from(max).unwrap_or(i64::MAX);
-        let rows = statement.query_map([now, cap], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (account_id_hex, npub, profile_json) = row?;
-            Ok(UserDirectoryRecord {
-                account_id_hex,
-                npub,
-                profile: optional_value(profile_json)?,
-                local_account: None,
-                follows: Vec::new(),
-                follow_source_relays: Vec::new(),
-                relay_lists: AccountRelayListStatus::empty(),
-                key_package: None,
-            })
-        })
-        .collect()
+        let mut records = Vec::new();
+        let mut read_batch = |ids: &[String]| -> Result<(), DirectoryError> {
+            let id_filter = if ids.is_empty() {
+                String::new()
+            } else {
+                let placeholders = (3..ids.len() + 3)
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("AND account_id_hex IN ({placeholders})")
+            };
+            let scan_filter = if ids.is_empty() {
+                "WHERE search_rank < 18 ORDER BY account_id_hex LIMIT 10000"
+            } else {
+                "ORDER BY account_id_hex"
+            };
+            // Select the current winner before testing its text. A newer,
+            // nonmatching profile must suppress an older matching tier.
+            let mut statement = conn.prepare_cached(&format!(
+                "WITH candidates AS (
+                     SELECT account_id_hex, npub, profile_json
+                     FROM directory_users AS promoted
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM directory_search_graph_users AS graph
+                         WHERE graph.account_id_hex = promoted.account_id_hex
+                           AND graph.profile_json IS NOT NULL
+                           AND (graph.metadata_expires_at IS NULL OR graph.metadata_expires_at > ?1)
+                           AND COALESCE(json_extract(graph.profile_json, '$.created_at'), 0)
+                             > CASE WHEN promoted.profile_json IS NULL THEN -1
+                               ELSE COALESCE(json_extract(promoted.profile_json, '$.created_at'), 0) END
+                     ) {id_filter}
+                     UNION ALL
+                     SELECT account_id_hex, npub, profile_json
+                     FROM directory_search_graph_users AS graph
+                     WHERE profile_json IS NOT NULL
+                       AND (metadata_expires_at IS NULL OR metadata_expires_at > ?1)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM directory_users AS promoted
+                           WHERE promoted.account_id_hex = graph.account_id_hex
+                             AND CASE WHEN promoted.profile_json IS NULL THEN -1
+                                 ELSE COALESCE(json_extract(promoted.profile_json, '$.created_at'), 0) END
+                               >= COALESCE(json_extract(graph.profile_json, '$.created_at'), 0)
+                       ) {id_filter}
+                 ), ranked AS (
+                     SELECT account_id_hex, npub, profile_json,
+                         CASE WHEN profile_json IS NULL THEN NULL
+                             ELSE COALESCE(profile_json -> '$.created_at', '0') END AS created_at,
+                         min(
+                             marmot_search_rank(json_extract(profile_json, '$.name'), ?2) * 6,
+                             marmot_search_rank(json_extract(profile_json, '$.nip05'), ?2) * 6 + 1,
+                             marmot_search_rank(json_extract(profile_json, '$.display_name'), ?2) * 6 + 2,
+                             marmot_search_rank(json_extract(profile_json, '$.about'), ?2) * 6 + 3,
+                             marmot_search_rank(npub, ?2) * 6 + 4,
+                             marmot_search_rank(account_id_hex, ?2) * 6 + 5
+                         ) AS search_rank
+                     FROM candidates
+                 )
+                 SELECT account_id_hex, npub, profile_json, created_at, search_rank
+                 FROM ranked {scan_filter}"
+            ))?;
+            let parameters = [ValueRef::Integer(now), ValueRef::Text(query.as_bytes())];
+            let rows = statement.query_map(
+                params_from_iter(
+                    parameters
+                        .into_iter()
+                        .chain(ids.iter().map(|id| ValueRef::Text(id.as_bytes())))
+                        .map(rusqlite::types::ToSqlOutput::Borrowed),
+                ),
+                |row| {
+                    Ok((
+                        storage_sqlite::PublicDirectoryProfileRecord {
+                            account_id_hex: row.get(0)?,
+                            npub: row.get(1)?,
+                            profile_json: row.get(2)?,
+                        },
+                        row.get::<_, Option<String>>(3)?
+                            .map(|value| {
+                                value.parse::<u64>().map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        3,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })
+                            })
+                            .transpose()?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                records.push(row?);
+            }
+            Ok(())
+        };
+        if account_ids.is_empty() {
+            read_batch(account_ids)?;
+        } else {
+            for ids in account_ids.chunks(PROFILE_QUERY_BATCH_SIZE) {
+                read_batch(ids)?;
+            }
+        }
+        Ok(records)
     }
 
     /// Look an account up for search: the promoted directory tier first, then
@@ -742,6 +830,45 @@ impl DirectoryCache {
     }
 }
 
+fn search_match_quality(haystack: &str, query: &str) -> u8 {
+    if query.is_empty() {
+        return 3;
+    }
+    if haystack.is_ascii() {
+        if !query.is_ascii() {
+            return 3;
+        }
+        let haystack = haystack.as_bytes();
+        let query = query.as_bytes();
+        if haystack.eq_ignore_ascii_case(query) {
+            0
+        } else if haystack
+            .get(..query.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+        {
+            1
+        } else if haystack
+            .windows(query.len())
+            .any(|part| part.eq_ignore_ascii_case(query))
+        {
+            2
+        } else {
+            3
+        }
+    } else {
+        let haystack = haystack.to_lowercase();
+        if haystack == query {
+            0
+        } else if haystack.starts_with(query) {
+            1
+        } else if haystack.contains(query) {
+            2
+        } else {
+            3
+        }
+    }
+}
+
 fn record_directory_cache_open() {
     tracing::debug!(
         target: "nostr_directory::cache",
@@ -911,44 +1038,173 @@ mod tests {
     #[test]
     fn public_search_materialization_stops_at_its_cap() {
         let (_dir, cache) = test_cache();
-        for id in 1..=4 {
-            cache
-                .put(&directory_record(account_id(id), vec![]))
-                .unwrap();
-        }
-        // Mirrored rows consume one identity slot, not two.
-        let rows = cache.public_search_records_capped(i64::MAX, 3).unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].account_id_hex, account_id(1));
-        assert_eq!(rows[2].account_id_hex, account_id(3));
-        assert_eq!(
-            cache
-                .public_search_records_capped(i64::MAX, 4)
-                .unwrap()
-                .len(),
-            4
-        );
-
-        // The fresher search-tier profile wins without emitting a duplicate.
-        let mut newer = directory_record(account_id(1), vec![]).profile.unwrap();
-        newer.created_at += 1;
-        newer.name = Some("new name".into());
-        cache
-            .put_search_graph_record(
-                &DirectorySearchGraphRecord {
-                    account_id_hex: account_id(1),
-                    npub: "npub-new".into(),
-                    profile: Some(newer.clone()),
-                    follows: None,
-                    metadata_updated_at: Some(newer.created_at),
-                    metadata_expires_at: None,
-                },
-                0,
+        {
+            let conn = cache.lock().unwrap();
+            // Deliberately not deserializable as UserProfileMetadata: the raw
+            // projection must not decode even a matching profile.
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10002)
+                 INSERT INTO directory_users(account_id_hex,npub,profile_json,relay_lists_json,updated_at)
+                 SELECT printf('%064x',x),'npub',
+                     json_object('created_at',1,'name',CASE WHEN x=1 THEN 'other' ELSE 'alice' END,
+                                 'source_relays',42), '{}', 0 FROM n",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO directory_search_graph_users
+                     (account_id_hex,npub,profile_json,created_at,updated_at)
+                 SELECT account_id_hex,npub,profile_json,0,0 FROM directory_users",
+                [],
             )
             .unwrap();
-        let rows = cache.public_search_records_capped(0, 1).unwrap();
+        }
+        // Mirrored rows consume one identity slot, not two.
+        let rows = cache.public_search_records(i64::MAX, "alice", &[]).unwrap();
+        assert_eq!(rows.len(), 10000);
+        assert_eq!(rows[0].0.account_id_hex, format!("{:064x}", 2));
+        assert_eq!(rows[9999].0.account_id_hex, format!("{:064x}", 10001));
+        assert!(
+            rows.iter()
+                .all(|(_, timestamp, rank)| *timestamp == Some(1) && *rank == 0)
+        );
+
+        // Requested IDs bypass the candidate cap and matching predicate, and
+        // cross SQLite's historical variable bound without losing winners.
+        let ids = (1..=10002)
+            .map(|id| format!("{id:064x}"))
+            .collect::<Vec<_>>();
+        let rows = cache.public_search_records(0, "alice", &ids).unwrap();
+        assert_eq!(rows.len(), ids.len());
+        assert_eq!(rows[0].0.account_id_hex, ids[0]);
+        assert_eq!(rows[0].2, 18);
+        assert_eq!(rows.last().unwrap().0.account_id_hex, ids[10001]);
+    }
+
+    #[test]
+    fn public_search_uses_current_profile_across_tiers() {
+        let (_dir, cache) = test_cache();
+        let mut promoted = directory_record(account_id(1), vec![]);
+        cache.put(&promoted).unwrap();
+        let mut newer = promoted.profile.clone().unwrap();
+        newer.created_at += 1;
+        newer.name = Some("new name".into());
+        let mut graph = DirectorySearchGraphRecord {
+            account_id_hex: account_id(1),
+            npub: "npub-new".into(),
+            profile: Some(newer.clone()),
+            follows: None,
+            metadata_updated_at: Some(newer.created_at),
+            metadata_expires_at: Some(10),
+        };
+        cache.put_search_graph_record(&graph, 0).unwrap();
+        assert!(
+            cache
+                .public_search_records(0, "alice", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let ids = [account_id(1)];
+        let rows = cache.public_search_records(0, "alice", &ids).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].profile.as_ref(), Some(&newer));
+        assert_eq!(
+            rows[0].0.profile_json,
+            optional_json(&Some(newer.clone())).unwrap()
+        );
+        assert_eq!(rows[0].1, Some(newer.created_at));
+        assert_eq!(rows[0].2, 18);
+
+        // Expiry makes the promoted profile current again at the exact bound.
+        let rows = cache.public_search_records(10, "alice", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, 0);
+
+        // The promoted tier wins ties, and a newer nonmatch there likewise
+        // suppresses an older matching graph profile.
+        promoted.profile = Some(newer.clone());
+        cache.put(&promoted).unwrap();
+        let mut older = newer.clone();
+        older.name = Some("alice".into());
+        graph.profile = Some(older.clone());
+        graph.metadata_expires_at = None;
+        cache.put_search_graph_record(&graph, 0).unwrap();
+        assert!(
+            cache
+                .public_search_records(0, "alice", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cache.public_search_records(0, "new name", &[]).unwrap()[0]
+                .0
+                .npub,
+            promoted.npub
+        );
+        older.created_at -= 1;
+        graph.profile = Some(older);
+        cache.put_search_graph_record(&graph, 0).unwrap();
+        assert!(
+            cache
+                .public_search_records(0, "alice", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cache.public_search_records(0, "alice", &ids).unwrap()[0]
+                .0
+                .profile_json,
+            optional_json(&promoted.profile).unwrap()
+        );
+    }
+
+    #[test]
+    fn public_search_ranks_unicode_and_literal_fields_without_trimming() {
+        let (_dir, cache) = test_cache();
+        let mut promoted = directory_record(account_id(1), vec![]);
+        promoted.profile = None;
+        promoted.npub = "npub-IDENTITY".into();
+        cache.put(&promoted).unwrap();
+        let rows = cache
+            .public_search_records(0, "npub-identity", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].1, rows[0].2), (None, 4));
+        assert_eq!(
+            cache.public_search_records(0, &account_id(1), &[]).unwrap()[0].2,
+            5
+        );
+
+        for (field, value, query, expected) in [
+            ("name", "ÉCOLE", "école", Some(0)),
+            ("name", "\u{212a}elvin", "kelvin", Some(0)),
+            ("name", "İ", "i\u{307}", Some(0)),
+            ("name", "ÉCOLE du soir", "école", Some(6)),
+            ("name", "une ÉCOLE ici", "école", Some(12)),
+            ("name", " ÉCOLE ", "école", Some(12)),
+            ("name", "50%_done", "50%_", Some(6)),
+            ("name", "500xdone", "50%_", None),
+            ("nip05", "ÉCOLE", "école", Some(1)),
+            ("display_name", "ÉCOLE", "école", Some(2)),
+            ("about", "ÉCOLE", "école", Some(3)),
+        ] {
+            let json = serde_json::json!({field: value});
+            cache
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE directory_users SET profile_json = ?1",
+                    [json.to_string()],
+                )
+                .unwrap();
+            let rows = cache.public_search_records(0, query, &[]).unwrap();
+            assert_eq!(
+                rows.first().map(|row| row.2),
+                expected,
+                "{field}: {value:?}"
+            );
+            if let Some(row) = rows.first() {
+                assert_eq!(row.1, Some(0));
+            }
+        }
     }
 
     #[test]
