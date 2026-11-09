@@ -7,6 +7,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Remove the unused direct `libc` dependency. C allocation and release paths
+  continue to use Rust `CString` and `Box`.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `MarmotAppGroupRecord` and `MarmotChatListRow` append
   `leave_blocked`, `MarmotGroupManagementState` appends `leave_blocked` and `can_cancel_leave`, and
   `MarmotConversationCapabilities` appends `can_cancel_leave`. New `marmot_cancel_leave` cancels the leave on this
