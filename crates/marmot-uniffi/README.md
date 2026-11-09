@@ -1494,8 +1494,8 @@ It is false in ordinary opens without explicit experimental device-group intent.
 - `dismiss_compromise_warning(account_ref)` marks everything the warning gathers as seen, on this device only. It stays
   closed until a new rejection arrives, and a rejection that branch selection drops and brings back stays seen.
 - The app writes the wording, and never says the account's devices stopped them.
-- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
-  account's worker opens, so it may fire with no visible change.
+- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. With device groups on, it also fires once each
+  time the account's worker opens, so it may fire with no visible change.
 - The list is empty in ordinary opens without explicit experimental device-group intent.
 
 ## Linking a new device
@@ -1514,8 +1514,8 @@ returns a `DeviceLinkSnapshotFfi`, and every call requires the explicit experime
   Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added by <added_by_label>".
 - Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
 - `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
-  which carries no device, session or group identities. It also fires once each time the account's worker opens or
-  reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
+  which carries no device, session or group identities. With device groups on, it also fires once each time the
+  account's worker opens or reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
   rather than assuming an interrupted comparison undid an admitted move.
 
 ## Backup recovery and background conditions
