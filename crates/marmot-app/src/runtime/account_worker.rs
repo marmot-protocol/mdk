@@ -1098,6 +1098,25 @@ fn install_storage_telemetry(
             );
         })));
     }
+    // The engine has its own connection to the session database. Only its
+    // writer transactions are recorded, under their own operation, so the
+    // app database's timings keep their meaning (mdk#2923).
+    let telemetry = telemetry.clone();
+    client.engine_storage.set_timing_observer(Some(Arc::new(
+        move |operation, duration, success| {
+            if operation == storage_sqlite::SqliteTimingOperation::WriteBegin {
+                telemetry.record_runtime(
+                    RuntimeOp::StorageSessionWriteBegin,
+                    duration,
+                    if success {
+                        TelemetryOutcome::Success
+                    } else {
+                        TelemetryOutcome::Failure
+                    },
+                );
+            }
+        },
+    )));
 }
 
 pub(crate) fn spawn_app_runtime_account_worker(
@@ -1751,6 +1770,9 @@ async fn run_app_runtime_account_worker(
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut relay_config_work = RelayConfigWork::Ready;
+    let mut account_wakeups = app
+        .presentation_signals
+        .subscribe_account_work(&account_label);
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
@@ -2776,6 +2798,9 @@ async fn run_app_runtime_account_worker(
                 }
             }
             result = presentation_wakeups.changed() => {
+                if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
+            }
+            result = account_wakeups.changed() => {
                 if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
             }
             _ = tokio::task::yield_now(), if presentation_due => {

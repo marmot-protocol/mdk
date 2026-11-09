@@ -133,14 +133,24 @@ impl SqliteAppStorage {
     }
 
     /// Discard every handed-over KeyPackage that expired by `now`. Returns
-    /// how many went.
+    /// how many went. With none expired it only reads (mdk#2923).
     pub fn delete_expired_received_private_key_packages(&self, now: u64) -> StorageResult<usize> {
-        self.lock()?
-            .execute_cached(
-                "DELETE FROM private_key_packages_received WHERE not_after <= ?1",
+        let conn = self.lock()?;
+        let expired: bool = conn
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM private_key_packages_received WHERE not_after <= ?1)",
                 params![u64_to_i64(now)?],
+                |row| row.get(0),
             )
-            .storage()
+            .storage()?;
+        if !expired {
+            return Ok(0);
+        }
+        conn.execute_cached(
+            "DELETE FROM private_key_packages_received WHERE not_after <= ?1",
+            params![u64_to_i64(now)?],
+        )
+        .storage()
     }
 
     /// Discard everything `issuer_slot_hex` handed over, and this device's

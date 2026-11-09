@@ -76,6 +76,15 @@
   raises a notice. After the upgrade to the coverage ledger, nearly every chat showed "history may be incomplete" for
   this alone, and busy groups flashed the notice about once a second as live input moved their live edge.
 
+### Changed
+
+- Account-scoped work wakes only that account's worker (mdk#2923 step B). A chat-list, message, avatar or attachment
+  change for one account no longer runs every other account's presentation, avatar and attachment passes; shared
+  profile and directory changes and attachment controls still wake every account. The 15 s maintenance tick still
+  sets every pass due. The expired private KeyPackage discard reads first and opens no writer transaction when
+  nothing has expired, so an idle tick no longer writes the session database. New runtime operation
+  `storage_session_write_begin` counts writer transactions on the engine's session connection.
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

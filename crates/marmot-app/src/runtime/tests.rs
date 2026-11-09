@@ -3973,8 +3973,69 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.shutdown().await;
 }
 
+/// Another account's activity runs none of this account's passes; its own
+/// does (mdk#2923).
+#[tokio::test(flavor = "current_thread")]
+async fn another_accounts_wake_runs_no_pass_here() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let runtime = &runtime;
+    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
+    let settled = || {
+        count(RuntimeOp::WorkerMaintenance) > 0
+            && count(RuntimeOp::WorkerAttachmentPass) > 0
+            && count(RuntimeOp::WorkerPresentationPass) > 0
+            && [
+                RuntimeOp::WorkerAttachmentPass,
+                RuntimeOp::WorkerPresentationPass,
+                RuntimeOp::WorkerAvatarPass,
+            ]
+            .into_iter()
+            .all(|operation| startup_stage_snapshot(runtime, operation).in_flight == 0)
+    };
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while !settled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first tick's passes run");
+    // Let anything the startup passes left due run out.
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    let passes = || {
+        (
+            count(RuntimeOp::WorkerAttachmentPass),
+            count(RuntimeOp::WorkerPresentationPass),
+        )
+    };
+    let before = passes();
+
+    app.presentation_signals.wake_account("bob");
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(passes(), before, "bob's wake runs no pass for alice");
+
+    app.presentation_signals.wake_account("alice");
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while passes().0 == before.0 || passes().1 == before.1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alice's own wake runs her passes");
+    runtime.shutdown().await;
+}
+
 /// What idle ticks do once a worker's startup housekeeping has settled
-/// (mdk#2923 §4): no writer transaction, no blocking-pool housekeeping
+/// (mdk#2923 §4): no writer transaction on the app or session database, no blocking-pool housekeeping
 /// batch, media sweep or upload promotion, while every tick still runs its
 /// phases and sets its passes due. That includes an offline account's
 /// replay flush, which repeated its writes every tick until mdk#3238.
@@ -4046,7 +4107,7 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     .await
     .expect("the first maintenance tick completes");
     settle((1, 1)).await;
-    const COUNTED: [RuntimeOp; 7] = [
+    const COUNTED: [RuntimeOp; 8] = [
         RuntimeOp::WorkerMaintenance,
         RuntimeOp::StorageWriteBegin,
         RuntimeOp::WorkerMaintenanceHousekeepingBatch,
@@ -4054,6 +4115,7 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         RuntimeOp::WorkerUploadPromotion,
         RuntimeOp::WorkerAttachmentPass,
         RuntimeOp::WorkerPresentationPass,
+        RuntimeOp::StorageSessionWriteBegin,
     ];
     let snapshot = || COUNTED.map(count);
     // Settle one more tick, which may still finish startup work.
@@ -4069,6 +4131,11 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         delta(1),
         0,
         "an idle tick takes no app-storage writer transaction"
+    );
+    assert_eq!(
+        delta(7),
+        0,
+        "an idle tick takes no session-storage writer transaction"
     );
     assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
     assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");

@@ -3779,7 +3779,9 @@ impl AppClient {
         self.accepted_push_announces.remove(group_id);
         self.history_recovery.forget_settled_recovery_copy(group_id);
         self.push_repairs.forget_group(group_id);
-        self.app.presentation_signals.wake();
+        self.app
+            .presentation_signals
+            .wake_account(&self.state.label);
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
         if self.sync_runtime_groups().await.is_err() {

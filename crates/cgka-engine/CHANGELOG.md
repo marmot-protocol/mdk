@@ -10,6 +10,10 @@
   restore or release keeps that snapshot and quarantines the group for the session (`RewindRestoreFailed`), as a
   committing window's does, unless an enclosing committing window answers for it; that window keeps its own snapshot
   when it cannot release the nested one. SQLite is unchanged.
+### Changed
+
+- `Engine::discard_private_key_packages` reads first and opens no writer transaction when nothing matches, so an
+  idle maintenance pass no longer writes (mdk#2923).
 
 ## 0.16.0 - 2026-11-12
 

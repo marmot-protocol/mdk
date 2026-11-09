@@ -325,7 +325,7 @@ pub(crate) fn prepare_search_batch(
     let pending = app_storage.chat_list_pending_search_text(view, CHAT_PRESENTATION_BATCH_LIMIT)?;
     let prepared = prepare_window(&app_storage, &shared, local, &pending);
     if owed || !pending.is_empty() {
-        app.presentation_signals.wake();
+        app.presentation_signals.wake_account(label);
     }
     let after = app_storage.chat_presentation_version()?;
     if after != before {

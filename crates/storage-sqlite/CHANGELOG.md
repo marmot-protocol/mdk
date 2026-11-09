@@ -50,6 +50,10 @@
   affected it, rather than the first event in the batch. Every cause participates: conflicting or unmatched causes
   use the generic reprojection trigger, including simultaneous reaction and reply-preview changes (mdk#2843).
 
+### Changed
+
+- `delete_expired_received_private_key_packages` only reads when nothing has expired (mdk#2923).
+
 ## 0.16.0 - 2026-11-12
 
 ### Breaking changes

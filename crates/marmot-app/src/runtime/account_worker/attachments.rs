@@ -457,7 +457,7 @@ pub(super) fn spawn_legacy_migration(
         // (mdk#2314 step 9), so compaction can return their pages.
         if avatars_owed {
             if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
-                app.presentation_signals.wake();
+                app.presentation_signals.wake_account(&label);
                 let _ = app.presentation_signals.avatars.send(label.clone());
             }
             if matches!(app_storage.has_database_held_avatars(), Ok(false)) {

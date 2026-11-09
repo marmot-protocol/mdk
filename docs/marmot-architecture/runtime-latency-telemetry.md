@@ -96,6 +96,7 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `storage_connection_wait` | Shared account connection acquisition, including transaction-owner wait |
 | `storage_transaction` | Entire account transaction including ownership wait, begin, closure, commit/rollback; nested transactions also report |
 | `storage_write_begin` | SQLite `BEGIN IMMEDIATE`, including existing busy retries |
+| `storage_session_write_begin` | The same, on the engine's own connection to the session database. Only its writer begins are recorded; an idle maintenance tick should take none (mdk#2923) |
 | `catch_up_requested` | Explicit account-manager catch-up call |
 | `catch_up_after_mutation` | Command helper's post-mutation catch-up (does not cover every creation/invite background task) |
 | `catch_up_coalesced` | Zero-duration count of requests folded into an existing worker catch-up |
