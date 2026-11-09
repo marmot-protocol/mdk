@@ -13509,6 +13509,7 @@ async fn direct_retry_survives_restart() {
     .expect("post-canonical projection failure must retain the founding Welcome");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].group_id_hex, group_hex);
+    let mut repaired_events = runtime.subscribe();
     assert_eq!(
         runtime
             .start_direct_conversation(alice_id, bob_id)
@@ -13516,6 +13517,14 @@ async fn direct_retry_survives_restart() {
             .unwrap(),
         group_id
     );
+    wait_for_event(&mut repaired_events, |event| {
+        matches!(event, MarmotAppEvent::ProjectionUpdated(update)
+            if update.account_id_hex == *alice_id
+                && update.update.chat_list_trigger == marmot_app::ChatListUpdateTrigger::NewGroup
+                && update.update.chat_list_row.as_ref()
+                    .is_some_and(|row| row.group_id_hex == group_hex))
+    })
+    .await;
     assert_eq!(
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected.clone())

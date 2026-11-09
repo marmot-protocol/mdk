@@ -7,8 +7,10 @@
 - `MarmotAppRuntime::start_direct_conversation` serializes peer lookup and
   creation on the account worker (mdk#464). New direct conversations include
   both accounts as founding admins. Retries reuse canonical local state,
-  including after a lost response or projection failure. Generic creation
-  and existing conversations retain their current admin semantics.
+  including after a lost response or projection failure. Recovery restores
+  missing projections and announces the repaired row without reading
+  unrelated projected MLS groups. Generic creation and existing
+  conversations retain their current admin semantics.
 
 ## 0.15.0 - 2026-11-09
 

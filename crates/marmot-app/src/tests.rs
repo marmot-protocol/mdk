@@ -22435,6 +22435,48 @@ fn reconcile_repairs_stale_three_member_count_on_two_member_direct() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_miss_skips_unhydrated() {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let peer = home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let unrelated = {
+        let mut client = app.client("alice").await.unwrap();
+        client.create_group("unrelated", &[]).await.unwrap()
+    };
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut client = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .runtime
+            .group_record(&unrelated)
+            .unwrap_err()
+            .as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    assert!(
+        client
+            .reusable_direct_group(&peer.account_id_hex)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        client
+            .runtime
+            .group_record(&unrelated)
+            .unwrap_err()
+            .as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+}
+
 async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let dir = tempfile::tempdir().unwrap();

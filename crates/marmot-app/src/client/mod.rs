@@ -2014,15 +2014,52 @@ impl AppClient {
     pub(crate) fn reusable_direct_group(
         &mut self,
         peer_account_id_hex: &str,
-    ) -> Result<Option<GroupId>, AppError> {
+    ) -> Result<Option<CanonicalCreatedGroup>, AppError> {
         if let Some(group_id) = self.find_direct_group(peer_account_id_hex)? {
-            return Ok(Some(group_id));
+            return Ok(Some(CanonicalCreatedGroup {
+                group_id,
+                chat_list_row: None,
+            }));
         }
         // A canonical create can outlive its response and projection. Repair
-        // that tear before treating an index miss as permission to create.
-        self.reconcile_live_engine_groups()?;
+        // missing projections only; existing unrelated groups need no MLS reads.
+        let mut missing = self.runtime.live_group_ids()?;
+        {
+            let projected = self
+                .state
+                .groups
+                .iter()
+                .map(|group| group.group_id_hex.as_str())
+                .collect::<HashSet<_>>();
+            missing
+                .retain(|group_id| !projected.contains(hex::encode(group_id.as_slice()).as_str()));
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        for group_id in missing {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            if storage
+                .local_group_deletion_frontier(&group_id_hex)?
+                .is_some()
+            {
+                continue;
+            }
+            self.runtime.ensure_group_hydrated(&group_id)?;
+            if self.is_device_group(&group_id)? {
+                continue;
+            }
+            self.add_group(&group_id)?;
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.find_direct_group(peer_account_id_hex)
+        let Some(group_id) = self.find_direct_group(peer_account_id_hex)? else {
+            return Ok(None);
+        };
+        let chat_list_row = self
+            .app
+            .chat_list_row(&self.state.label, &hex::encode(group_id.as_slice()))?;
+        Ok(Some(CanonicalCreatedGroup {
+            group_id,
+            chat_list_row,
+        }))
     }
 
     fn find_direct_group(

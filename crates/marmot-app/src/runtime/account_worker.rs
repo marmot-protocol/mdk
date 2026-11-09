@@ -4877,19 +4877,36 @@ fn account_worker_command_future<'a>(
                     peer_account_id_hex,
                 } => {
                     match client.reusable_direct_group(&peer_account_id_hex) {
-                        Ok(Some(group_id)) => {
+                        Ok(Some(created)) => {
+                            if created.chat_list_row.is_some() {
+                                publish_created_group(
+                                    events,
+                                    account_id_hex,
+                                    account_label,
+                                    &created,
+                                );
+                            }
+                            publish_client_pending_projection_updates(
+                                client,
+                                events,
+                                account_id_hex,
+                                account_label,
+                            );
                             let _ = respond_diagnosed(
                                 shared,
                                 storage_permit.as_ref(),
                                 respond,
-                                Ok(CanonicalCreatedGroup {
-                                    group_id,
-                                    chat_list_row: None,
-                                }),
+                                Ok(created),
                             );
                             return true;
                         }
                         Err(error) => {
+                            publish_client_pending_projection_updates(
+                                client,
+                                events,
+                                account_id_hex,
+                                account_label,
+                            );
                             let _ = respond_diagnosed(
                                 shared,
                                 storage_permit.as_ref(),
@@ -4930,26 +4947,7 @@ fn account_worker_command_future<'a>(
             };
             let response_handoff_started_at = Instant::now();
             if let Ok(created_group) = &result {
-                publish_app_runtime_group_state_updated(
-                    events,
-                    account_id_hex,
-                    account_label,
-                    &created_group.group_id,
-                );
-                if let Some(chat_list_row) = &created_group.chat_list_row {
-                    let _ =
-                        events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
-                            account_id_hex: account_id_hex.to_owned(),
-                            account_label: account_label.to_owned(),
-                            update: AppProjectionUpdate {
-                                group_id_hex: chat_list_row.group_id_hex.clone(),
-                                timeline_messages: Vec::new(),
-                                timeline_changes: Vec::new(),
-                                chat_list_row: Some(chat_list_row.clone()),
-                                chat_list_trigger: ChatListUpdateTrigger::NewGroup,
-                            },
-                        }));
-                }
+                publish_created_group(events, account_id_hex, account_label, created_group);
             }
             let created = result.is_ok();
             let response_sent =
@@ -7864,6 +7862,33 @@ pub(super) fn publish_app_runtime_projection_update(
             update,
         }))
         .is_ok()
+}
+
+fn publish_created_group(
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    created: &CanonicalCreatedGroup,
+) {
+    publish_app_runtime_group_state_updated(
+        events,
+        account_id_hex,
+        account_label,
+        &created.group_id,
+    );
+    if let Some(row) = &created.chat_list_row {
+        let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            update: AppProjectionUpdate {
+                group_id_hex: row.group_id_hex.clone(),
+                timeline_messages: Vec::new(),
+                timeline_changes: Vec::new(),
+                chat_list_row: Some(row.clone()),
+                chat_list_trigger: ChatListUpdateTrigger::NewGroup,
+            },
+        }));
+    }
 }
 
 fn publish_client_pending_projection_updates(
