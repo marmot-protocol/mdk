@@ -217,6 +217,18 @@ async fn offline_fixture() -> (
     SqliteAccountStorage,
     crate::MediaAttachmentReference,
 ) {
+    offline_fixture_with(b"retained worker bytes").await
+}
+
+/// [`offline_fixture`] with a received attachment of `plaintext`.
+async fn offline_fixture_with(
+    plaintext: &[u8],
+) -> (
+    tempfile::TempDir,
+    AppClient,
+    SqliteAccountStorage,
+    crate::MediaAttachmentReference,
+) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -232,8 +244,7 @@ async fn offline_fixture() -> (
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let storage = app.account_storage("alice").unwrap();
-    let (mut reference, _) =
-        crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(plaintext);
     reference.locators = vec![crate::MediaLocator {
         kind: "blossom-v1".into(),
         value: format!("https://media.example/{}", reference.ciphertext_sha256),

@@ -359,7 +359,11 @@ pub(super) fn spawn_legacy_migration(
     if recheck {
         latches.recheck_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL);
     }
-    let check_compaction = recheck
+    // While a migration is owed, every batch checks: the batch that frees
+    // the pages also sees them, after its legacy and avatar steps. A
+    // deletion frees pages too. Neither happens on an idle tick, so this
+    // costs an idle account nothing.
+    let check_compaction = (recheck || deleted || legacy_owed || avatars_owed)
         && !admission.compaction_attempted
         && !HousekeepingLatches::done(&latches.compaction_settled);
     let legacy_done = latches.legacy_bodies_done.clone();
