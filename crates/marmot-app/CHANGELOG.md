@@ -9,6 +9,10 @@
   or queued behind sends made before it, and before the step-down is published. Ordinary builds still refuse an admin's Leave or Decline until the host demotes
   the account.
 
+- Automatic rejoin announces committed recovery-status changes even when preparing a later group fails
+  (mdk#3219). Unreadable statuses also queue a host refresh. The preparation error is preserved, and retry
+  budgets are unchanged.
+
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
 
 - A rejoin settles the recovery ledger once (mdk#2660 row 11). When a replacement Welcome installs a new copy of a
