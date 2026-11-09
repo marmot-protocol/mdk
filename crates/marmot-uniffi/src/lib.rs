@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use cgka_traits::TransportEndpoint;
 use marmot_app::{
-    MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination,
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineAttachmentType, TimelineMessageQuery,
+    TimelinePagination,
 };
 
 /// Shared metadata lookup bound for native adapters.
@@ -195,6 +196,29 @@ pub(crate) fn timeline_query_from_ffi(
             let value = value.trim().to_owned();
             (!value.is_empty()).then_some(value)
         }),
+        sender: query
+            .sender
+            .map(|sender| {
+                conversions::normalize_member_ref_ffi(&sender).map(|member| member.account_id_hex)
+            })
+            .transpose()?,
+        since: query.since,
+        until: query.until,
+        attachment_type: match query.attachment_type {
+            0 => TimelineAttachmentType::Any,
+            1 => TimelineAttachmentType::Image,
+            2 => TimelineAttachmentType::Video,
+            3 => TimelineAttachmentType::Audio,
+            4 => TimelineAttachmentType::File,
+            5 => TimelineAttachmentType::Attachment,
+            _ => {
+                return Err(MarmotKitError::Runtime {
+                    details: "timeline attachment_type must be in 0..=5".into(),
+                });
+            }
+        },
+        search_wall_clock: query.search_wall_clock,
+        cursor_group_id: optional_group_id_hex(query.cursor_group_id)?,
         pagination: TimelinePagination {
             before: query.before,
             before_message_id: optional_message_id_hex(query.before_message_id)?,
@@ -729,12 +753,25 @@ mod tests {
     fn timeline_query_preserves_search_cursor_direction_and_exclusive_before() {
         let empty = timeline_query_from_ffi(TimelineMessageQueryFfi::default()).unwrap();
         assert!(empty.group_id_hex.is_none() && empty.search.is_none());
+        assert!(empty.sender.is_none() && empty.since.is_none() && empty.until.is_none());
+        assert_eq!(empty.attachment_type, TimelineAttachmentType::Any);
+        assert!(!empty.search_wall_clock);
+        assert!(empty.cursor_group_id.is_none());
         assert!(empty.pagination.before.is_none() && empty.pagination.after.is_none());
         assert!(empty.pagination.limit.is_none());
         assert!(!empty.pagination.before_inclusive);
         let query = timeline_query_from_ffi(TimelineMessageQueryFfi {
             group_id_hex: Some(format!(" {} ", "AB".repeat(16))),
             search: Some("  needle  ".into()),
+            sender: Some(format!(
+                " {} ",
+                "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+            )),
+            since: Some(200),
+            until: Some(600),
+            attachment_type: 5,
+            search_wall_clock: true,
+            cursor_group_id: Some(" ABCD ".into()),
             before: Some(501),
             before_message_id: Some(format!(" {} ", "CD".repeat(32))),
             after: Some(201),
@@ -744,6 +781,14 @@ mod tests {
         .unwrap();
         assert_eq!(query.group_id_hex, Some("ab".repeat(16)));
         assert_eq!(query.search.as_deref(), Some("needle"));
+        assert_eq!(
+            query.sender.as_deref(),
+            Some("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+        );
+        assert_eq!((query.since, query.until), (Some(200), Some(600)));
+        assert_eq!(query.attachment_type, TimelineAttachmentType::Attachment);
+        assert!(query.search_wall_clock);
+        assert_eq!(query.cursor_group_id.as_deref(), Some("abcd"));
         assert_eq!(query.pagination.before, Some(501));
         assert_eq!(query.pagination.before_message_id, Some("cd".repeat(32)));
         assert_eq!(query.pagination.after, Some(201));
@@ -756,6 +801,45 @@ mod tests {
         })
         .unwrap();
         assert!(blank.search.is_none());
+    }
+
+    #[test]
+    fn timeline_query_validation() {
+        for (value, expected) in [
+            (0, TimelineAttachmentType::Any),
+            (1, TimelineAttachmentType::Image),
+            (2, TimelineAttachmentType::Video),
+            (3, TimelineAttachmentType::Audio),
+            (4, TimelineAttachmentType::File),
+            (5, TimelineAttachmentType::Attachment),
+        ] {
+            let query = timeline_query_from_ffi(TimelineMessageQueryFfi {
+                attachment_type: value,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(query.attachment_type, expected);
+        }
+        for attachment_type in [6, u32::MAX] {
+            assert!(matches!(timeline_query_from_ffi(TimelineMessageQueryFfi {
+                attachment_type,
+                ..Default::default()
+            }), Err(MarmotKitError::Runtime { details }) if details == "timeline attachment_type must be in 0..=5"));
+        }
+        assert!(matches!(
+            timeline_query_from_ffi(TimelineMessageQueryFfi {
+                sender: Some("not-a-public-key".into()),
+                ..Default::default()
+            }),
+            Err(MarmotKitError::InvalidIdentity { .. })
+        ));
+        assert!(matches!(
+            timeline_query_from_ffi(TimelineMessageQueryFfi {
+                cursor_group_id: Some("not-hex".into()),
+                ..Default::default()
+            }),
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
     }
 
     #[test]

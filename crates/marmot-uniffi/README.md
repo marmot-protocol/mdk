@@ -23,7 +23,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
-  [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
+  [advanced timeline search](#advanced-timeline-search), [live timeline updates](#live-timeline-updates),
+  [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
@@ -809,7 +810,9 @@ account-scoped cache, so a reopened chat renders prior previews in its first
 frame, offline included. Call `cachedPublicEventPreviews` (at most 16
 references, network-free) before layout, then `resolvePublicEventPreview` for
 each reference shown; it touches the network only for missing or stale rows.
-MDK fetches from safe relay hints and the configured directory relays, stores
+MDK fetches from safe relay hints and the configured directory relays; when
+they miss, it asks once more on the deployment's discovery indexers and the
+author's NIP-65 write relays (an `naddr` author or an `nevent` author hint). It stores
 only verified events that match the reference, keeps the newest `naddr`
 version, and turns an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
 event; shape its content for display on the host. Author names and avatars
@@ -846,6 +849,26 @@ for paging, sequence handling, cancellation, C ownership, and compatibility.
 `openConversationWindow` combines history, header/capabilities, visible identities,
 read state and revisioned draft descriptors. See the [native conversation contract](CONVERSATION-WINDOW.md)
 for opening, paging, cancellation, timeout, ownership and draft migration.
+
+## Advanced timeline search
+
+`timelineMessages(accountRef, query)` reads matching messages from local storage. `TimelineMessageQueryFfi`
+combines `search`, `sender`, `since`, `until`, and `attachmentType` with AND before applying `limit`.
+`search` is trimmed, lowercased by Unicode rules, and matched as a literal substring, not a wildcard expression.
+`sender` accepts the same public-key and member-reference forms as `normalizeMemberRef` and matches the canonical account key.
+`since` includes its `timelineAt` boundary, while `until` excludes its boundary. Both use Unix seconds.
+
+`attachmentType` is an integer: `0` Any (no attachment restriction), `1` Image, `2` Video,
+`3` Audio, `4` File, or `5` Attachment (any attachment type). Other values return `MarmotKitError::Runtime`.
+Omitted optional filters, `attachmentType = 0`, and `searchWallClock = false` preserve the unfiltered query defaults.
+
+Group queries use canonical conversation order unless `searchWallClock` is true. With that flag, searches use
+`(timelineAt, messageIdHex, groupIdHex)` order, including account-wide searches with no `groupIdHex`.
+Default account-wide queries keep their timestamp/message-id cursor semantics.
+To continue an account-wide search with `searchWallClock = true`, pass that row's `groupIdHex` as `cursorGroupId`
+alongside `before` and `beforeMessageId`, or `after` and `afterMessageId`. Group ids are non-empty opaque MLS
+bytes encoded as hex, not fixed-size transport routing ids. Keep filters and ordering unchanged between pages.
+`subscribeTimelineMessages` retains its group-and-limit interface; these filters apply to the one-shot query.
 
 ## Live timeline updates
 

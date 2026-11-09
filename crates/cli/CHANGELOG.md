@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Add sender, half-open date-range, and attachment MIME filters to `messages timeline search`.
+  Filters apply across retained local history before the page limit. Search uses wall-clock order even within
+  one group; before/after pagination includes a cursor group id for account-wide searches.
+
 - On macOS, report a daemon request by the daemon's answer even when the daemon closes the connection right after
   answering. `wn daemon stop` could report `daemon_unavailable` (`Socket is not connected (os error 57)`) for a stop
   the daemon had accepted, and other one-shot requests could report a lost answer or unknown command state (#2628).

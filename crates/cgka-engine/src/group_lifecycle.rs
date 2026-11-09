@@ -2287,7 +2287,16 @@ impl<S: StorageProvider> Engine<S> {
                 ),
             }
         }
-        self.replay_buffered_messages(&group_id).await?;
+        if let Err(error) = self.replay_buffered_messages(&group_id).await {
+            // The join is durable; replay owns its background retry.
+            tracing::warn!(
+                target: "cgka_engine::group_lifecycle",
+                method = "do_join_welcome",
+                error_code = "buffered_replay_failed",
+                transient = error.is_transient(),
+                "buffered inbound replay deferred after successful join"
+            );
+        }
         Ok(group_id)
     }
 

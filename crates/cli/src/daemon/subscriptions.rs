@@ -270,6 +270,7 @@ pub(crate) async fn handle_timeline_messages_subscription(
                     limit,
                     ..marmot_app::TimelinePagination::default()
                 },
+                ..Default::default()
             },
         )
         .await

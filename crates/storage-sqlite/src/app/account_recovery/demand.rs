@@ -80,6 +80,24 @@ impl SqliteAppStorage {
                 format!("maintenance:{}:{}:2", hex::encode(group), hex::encode(job))
             })
             .collect::<std::collections::HashSet<_>>();
+        // Every tick retains the same set: read first, and take a writer only
+        // when some prerequisite is no longer wanted (mdk#2923).
+        let stale = {
+            let conn = self.lock()?;
+            conn.prepare_cached(
+                "SELECT demand_key FROM account_recovery_obligations WHERE cause=2 AND predicate=2",
+            )
+            .storage()?
+            .query_map([], |row| row.get::<_, String>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?
+            .into_iter()
+            .any(|key| !keys.contains(&key))
+        };
+        if !stale {
+            return Ok(());
+        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let existing = conn.prepare_cached("SELECT demand_key FROM account_recovery_obligations WHERE cause=2 AND predicate=2")

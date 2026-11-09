@@ -324,7 +324,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
     /// Session-only retries for inbound replay that failed after durable
-    /// publish confirmation. The input rows remain durable; this marker
+    /// publish confirmation, rollback, or Welcome join. The input rows remain durable; this marker
     /// avoids scanning every group on ordinary convergence advancement.
     pub(crate) pending_confirmation_replays: HashSet<GroupId>,
 

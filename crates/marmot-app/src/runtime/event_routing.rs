@@ -76,12 +76,15 @@ pub(crate) fn projection_update_matches_query(
 }
 
 pub(crate) fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
-    // Projection application already derives canonical-vs-wall ordering from
-    // this field, so global windows can safely merge per-group deltas.
     query
         .search
         .as_ref()
         .is_none_or(|search| search.trim().is_empty())
+        && query.sender.is_none()
+        && query.since.is_none()
+        && query.until.is_none()
+        && query.attachment_type == crate::TimelineAttachmentType::Any
+        && !query.search_wall_clock
         && query.pagination.before.is_none()
         && query.pagination.before_message_id.is_none()
         && query.pagination.after.is_none()

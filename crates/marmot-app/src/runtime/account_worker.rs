@@ -1042,7 +1042,11 @@ fn install_storage_telemetry(
                     RuntimeOp::StorageConnectionWait
                 }
                 storage_sqlite::SqliteTimingOperation::Transaction => RuntimeOp::StorageTransaction,
-                storage_sqlite::SqliteTimingOperation::WriteBegin => RuntimeOp::StorageWriteBegin,
+                storage_sqlite::SqliteTimingOperation::WriteBegin => {
+                    #[cfg(test)]
+                    crate::replay_flush_writes::note_write_begin();
+                    RuntimeOp::StorageWriteBegin
+                }
             };
             telemetry.record_runtime(
                 operation,

@@ -1255,6 +1255,48 @@ fn empty_timeline_page() -> TimelinePage {
     }
 }
 
+#[test]
+fn timeline_delta_filters() {
+    use super::event_routing::timeline_query_can_apply_projection_delta;
+
+    assert!(timeline_query_can_apply_projection_delta(
+        &TimelineMessageQuery::default()
+    ));
+    assert!(timeline_query_can_apply_projection_delta(
+        &TimelineMessageQuery {
+            group_id_hex: Some("aa".into()),
+            ..Default::default()
+        }
+    ));
+    for filtered in [
+        TimelineMessageQuery {
+            sender: Some("sender".into()),
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            since: Some(0),
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            until: Some(50),
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            attachment_type: crate::TimelineAttachmentType::Attachment,
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            search_wall_clock: true,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            !timeline_query_can_apply_projection_delta(&filtered),
+            "{filtered:?}"
+        );
+    }
+}
+
 fn timeline_ids(page: &TimelinePage) -> Vec<String> {
     page.messages
         .iter()
@@ -1439,7 +1481,13 @@ fn merge_timeline_window_orders_epoch_boundaries_canonically() {
         has_more_after: false,
     };
 
-    merge_timeline_window_with_order(&mut window, incoming, TimelineWindowEdge::Newer, 300, true);
+    merge_timeline_window_with_order(
+        &mut window,
+        incoming,
+        TimelineWindowEdge::Newer,
+        300,
+        TimelineOrder::GroupCanonical,
+    );
 
     assert_eq!(
         timeline_ids(&window),
@@ -1452,7 +1500,13 @@ fn merge_timeline_window_newer_caps_by_dropping_oldest() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let newer = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
 
-    merge_timeline_window_with_order(&mut window, newer, TimelineWindowEdge::Newer, 3, true);
+    merge_timeline_window_with_order(
+        &mut window,
+        newer,
+        TimelineWindowEdge::Newer,
+        3,
+        TimelineOrder::GroupCanonical,
+    );
 
     assert_eq!(timeline_ids(&window), vec!["b", "c", "d"]);
     assert!(window.has_more_before);
@@ -1465,7 +1519,13 @@ fn merge_timeline_window_dedupes_overlap() {
     let mut window = timeline_test_page(&[("b", 20), ("c", 30)], true, false);
     let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);
 
-    merge_timeline_window_with_order(&mut window, older, TimelineWindowEdge::Older, 300, true);
+    merge_timeline_window_with_order(
+        &mut window,
+        older,
+        TimelineWindowEdge::Older,
+        300,
+        TimelineOrder::GroupCanonical,
+    );
 
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
 }
@@ -1485,7 +1545,7 @@ fn apply_projection_suppresses_new_head_message_when_detached() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let update = projection_for(vec![timeline_test_record("c", 30)]);
 
-    apply_projection_to_window(&mut window, &update, 300, true);
+    apply_projection_to_window(&mut window, &update, 300, TimelineOrder::GroupCanonical);
 
     // Detached window stays put; the new head message is dropped.
     assert_eq!(timeline_ids(&window), vec!["a", "b"]);
@@ -1499,7 +1559,7 @@ fn apply_projection_applies_in_window_edit_when_detached() {
     edited.plaintext = "edited".to_owned();
     let update = projection_for(vec![edited]);
 
-    apply_projection_to_window(&mut window, &update, 300, true);
+    apply_projection_to_window(&mut window, &update, 300, TimelineOrder::GroupCanonical);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b"]);
     assert_eq!(window.messages[1].plaintext, "edited");
@@ -1513,7 +1573,7 @@ fn apply_projection_suppresses_same_second_head_when_detached() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let update = projection_for(vec![timeline_test_record("c", 20)]);
 
-    apply_projection_to_window(&mut window, &update, 300, true);
+    apply_projection_to_window(&mut window, &update, 300, TimelineOrder::GroupCanonical);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b"]);
     assert!(window.has_more_after);
@@ -1526,7 +1586,7 @@ fn apply_projection_applies_same_second_in_range_message_when_detached() {
     let mut window = timeline_test_page(&[("a", 10), ("c", 20)], true, true);
     let update = projection_for(vec![timeline_test_record("b", 20)]);
 
-    apply_projection_to_window(&mut window, &update, 300, true);
+    apply_projection_to_window(&mut window, &update, 300, TimelineOrder::GroupCanonical);
 
     assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
 }
@@ -1538,7 +1598,7 @@ fn apply_projection_suppresses_new_message_when_detached_window_empty() {
     let mut window = timeline_test_page(&[], true, true);
     let update = projection_for(vec![timeline_test_record("a", 10)]);
 
-    apply_projection_to_window(&mut window, &update, 300, true);
+    apply_projection_to_window(&mut window, &update, 300, TimelineOrder::GroupCanonical);
 
     assert!(window.messages.is_empty());
     assert!(window.has_more_after);
@@ -1558,7 +1618,7 @@ fn apply_projection_removes_message() {
         chat_list_trigger: Default::default(),
     };
 
-    apply_projection_to_window(&mut window, &update, 300, true);
+    apply_projection_to_window(&mut window, &update, 300, TimelineOrder::GroupCanonical);
 
     assert_eq!(timeline_ids(&window), vec!["b"]);
 }
@@ -1568,7 +1628,7 @@ fn apply_projection_caps_anchored_window_by_dropping_oldest() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20), ("c", 30)], false, false);
     let update = projection_for(vec![timeline_test_record("d", 40)]);
 
-    apply_projection_to_window(&mut window, &update, 3, true);
+    apply_projection_to_window(&mut window, &update, 3, TimelineOrder::GroupCanonical);
 
     assert_eq!(timeline_ids(&window), vec!["b", "c", "d"]);
     assert!(window.has_more_before);
@@ -1587,9 +1647,43 @@ fn apply_projection_preserves_wall_clock_order_for_global_windows() {
         has_more_after: false,
     };
 
-    apply_projection_to_window(&mut window, &projection_for(Vec::new()), 300, false);
+    apply_projection_to_window(
+        &mut window,
+        &projection_for(Vec::new()),
+        300,
+        TimelineOrder::WallClock,
+    );
 
     assert_eq!(timeline_ids(&window), ["newer-epoch", "older-epoch"]);
+}
+
+#[test]
+fn timeline_legacy_group_ties() {
+    for (existing, incoming) in [("aa", "bb"), ("bb", "aa")] {
+        let mut loaded = timeline_test_record("shared", 20);
+        loaded.group_id_hex = existing.into();
+        let mut tied = loaded.clone();
+        tied.group_id_hex = incoming.into();
+        let mut window = TimelinePage {
+            messages: vec![loaded],
+            has_more_before: true,
+            has_more_after: true,
+        };
+        apply_projection_to_window(
+            &mut window,
+            &projection_for(vec![tied]),
+            3,
+            TimelineOrder::WallClock,
+        );
+        assert_eq!(
+            window
+                .messages
+                .iter()
+                .map(|row| row.group_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            [existing, incoming],
+        );
+    }
 }
 
 #[test]
@@ -1618,7 +1712,7 @@ fn apply_projection_scopes_global_window_changes_by_group() {
         chat_list_trigger: Default::default(),
     };
 
-    apply_projection_to_window(&mut window, &edit, 300, false);
+    apply_projection_to_window(&mut window, &edit, 300, TimelineOrder::WallClock);
 
     assert_eq!(window.messages.len(), 2);
     assert_eq!(
@@ -1651,7 +1745,7 @@ fn apply_projection_scopes_global_window_changes_by_group() {
         chat_list_trigger: Default::default(),
     };
 
-    apply_projection_to_window(&mut window, &remove, 300, false);
+    apply_projection_to_window(&mut window, &remove, 300, TimelineOrder::WallClock);
 
     assert_eq!(window.messages.len(), 1);
     assert_eq!(window.messages[0].group_id_hex, "group-b");
@@ -1685,6 +1779,175 @@ async fn paginate_backwards_extends_window_and_clears_more_before() {
         Some("c")
     );
     assert_eq!(queries[0].pagination.limit, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_tied_group_window() {
+    let mut group_a = timeline_test_record("shared", 20);
+    group_a.group_id_hex = "aa".into();
+    let mut group_b = group_a.clone();
+    group_b.group_id_hex = "bb".into();
+    let mut group_c = group_a.clone();
+    group_c.group_id_hex = "cc".into();
+    let store = ScriptedTimelineStore::new(vec![
+        TimelinePage {
+            messages: vec![group_a.clone()],
+            has_more_before: false,
+            has_more_after: true,
+        },
+        TimelinePage {
+            messages: vec![group_c.clone(), group_b.clone()],
+            has_more_before: true,
+            has_more_after: false,
+        },
+    ]);
+    let handle = timeline_window_handle(
+        &store,
+        TimelinePage {
+            messages: vec![group_b.clone()],
+            has_more_before: true,
+            has_more_after: true,
+        },
+        3,
+    );
+    handle.inner.lock().unwrap().base_query.search_wall_clock = true;
+    handle.paginate_backwards(1).await.unwrap();
+    let page = handle.paginate_forwards(1).await.unwrap();
+    assert_eq!(
+        page.messages
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["aa", "bb", "cc"]
+    );
+    let queries = store.recorded_queries();
+    assert_eq!(queries[0].cursor_group_id.as_deref(), Some("bb"));
+    assert_eq!(queries[1].cursor_group_id.as_deref(), Some("bb"));
+
+    let mut detached = timeline_test_page(&[], true, true);
+    detached.messages.push(group_b);
+    let mut window = timeline_window(&ScriptedTimelineStore::default(), detached, 3);
+    window.base_query.search_wall_clock = true;
+    let refresh = window.refresh_query();
+    assert_eq!(refresh.cursor_group_id.as_deref(), Some("bb"));
+    assert_eq!(
+        refresh.pagination.before_message_id.as_deref(),
+        Some("shared")
+    );
+    assert!(refresh.pagination.before_inclusive);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_search_window() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://test.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("search", &[]).await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let sender = "ee".repeat(32);
+    let event = |at: u64| storage_sqlite::StoredAppEvent {
+        group_id_hex: group_hex.clone(),
+        message_id_hex: format!("{at:064x}"),
+        source_message_id_hex: None,
+        source_epoch: Some(100 - at),
+        direction: "received".into(),
+        sender: sender.clone(),
+        plaintext: "needle".into(),
+        kind: 9,
+        tags: vec![vec!["imeta".into(), "m image/png".into()]],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    for at in [10, 20, 30, 40] {
+        storage.record_app_event(&event(at)).unwrap();
+    }
+    for mut excluded in [event(5), event(55), event(46), event(47), event(48)] {
+        match excluded.recorded_at {
+            46 => excluded.sender = "dd".repeat(32),
+            47 => excluded.tags.clear(),
+            48 => excluded.plaintext = "other".into(),
+            _ => {}
+        }
+        storage.record_app_event(&excluded).unwrap();
+    }
+    let runtime = app.runtime();
+    let mut subscription = runtime
+        .subscribe_timeline_messages(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                search: Some("needle".into()),
+                sender: Some(sender.clone()),
+                since: Some(10),
+                until: Some(50),
+                attachment_type: crate::TimelineAttachmentType::Attachment,
+                search_wall_clock: true,
+                cursor_group_id: Some(group_hex.clone()),
+                pagination: storage_sqlite::TimelinePagination {
+                    before: Some(40),
+                    before_message_id: Some(format!("{:064x}", 40)),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(subscription.take_snapshot().messages[0].timeline_at, 30);
+    let older = subscription.paginate_backwards(10).await.unwrap();
+    assert_eq!(
+        older
+            .messages
+            .iter()
+            .map(|row| row.timeline_at)
+            .collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
+    let newer = subscription.paginate_forwards(10).await.unwrap();
+    assert_eq!(
+        newer
+            .messages
+            .iter()
+            .map(|row| row.timeline_at)
+            .collect::<Vec<_>>(),
+        [10, 20, 30, 40]
+    );
+
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&event(45)).unwrap())
+        .unwrap();
+    runtime
+        .events
+        .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account.account_id_hex,
+            account_label: account.label,
+            update,
+        }))
+        .unwrap();
+    let update = timeout(Duration::from_secs(5), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let RuntimeTimelineMessageUpdate::Page { page } = update else {
+        panic!("filtered search must refresh rather than apply a projection delta");
+    };
+    assert_eq!(
+        page.messages
+            .iter()
+            .map(|row| row.timeline_at)
+            .collect::<Vec<_>>(),
+        [20, 30, 40, 45]
+    );
+    assert!(page.has_more_before);
+    assert!(!page.has_more_after);
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3192,6 +3455,118 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
         .await
         .unwrap_or_else(|_| panic!("{} completes", operation.as_str()));
     }
+    runtime.shutdown().await;
+}
+
+/// What idle ticks do once a worker's startup housekeeping has settled
+/// (mdk#2923 §4): no writer transaction, no blocking-pool housekeeping
+/// batch, media sweep or upload promotion, while every tick still runs its
+/// phases and sets its passes due. The recovery runner's replay-flush writes
+/// are excluded by source (`replay_flush_writes`) until mdk#3238 is fixed.
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let runtime = &runtime;
+    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
+    let passes = || {
+        (
+            count(RuntimeOp::WorkerAttachmentPass),
+            count(RuntimeOp::WorkerPresentationPass),
+        )
+    };
+    // Waits, without a fixed real-time window, until the passes the last
+    // tick set due have run (`target`) and no pass or blocking-pool
+    // housekeeping is still in flight. A timeout fails the test.
+    let settle = |target: (u64, u64)| async move {
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            loop {
+                let (attachment, presentation) = passes();
+                let in_flight = [
+                    RuntimeOp::WorkerAttachmentPass,
+                    RuntimeOp::WorkerPresentationPass,
+                    RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+                    RuntimeOp::WorkerMediaSweep,
+                    RuntimeOp::WorkerUploadPromotion,
+                ]
+                .into_iter()
+                .any(|operation| startup_stage_snapshot(runtime, operation).in_flight > 0);
+                if attachment >= target.0 && presentation >= target.1 && !in_flight {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the tick's passes and housekeeping finish");
+    };
+    let tick = async move || {
+        let ticks = count(RuntimeOp::WorkerMaintenance);
+        let (attachment, presentation) = passes();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while count(RuntimeOp::WorkerMaintenance) == ticks {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an idle tick completes");
+        settle((attachment + 1, presentation + 1)).await;
+    };
+    // The first tick fires on entry and starts the startup housekeeping:
+    // let it, its passes and the blocking work they spawn all finish.
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first maintenance tick completes");
+    settle((1, 1)).await;
+    const COUNTED: [RuntimeOp; 7] = [
+        RuntimeOp::WorkerMaintenance,
+        RuntimeOp::StorageWriteBegin,
+        RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+        RuntimeOp::WorkerMediaSweep,
+        RuntimeOp::WorkerUploadPromotion,
+        RuntimeOp::WorkerAttachmentPass,
+        RuntimeOp::WorkerPresentationPass,
+    ];
+    let snapshot = || COUNTED.map(count);
+    // Settle one more tick, which may still finish startup work.
+    tick().await;
+    let before = snapshot();
+    let flush_before = crate::replay_flush_writes::writes();
+    for _ in 0..3 {
+        tick().await;
+    }
+    let after = snapshot();
+    let delta = |index: usize| after[index] - before[index];
+    assert_eq!(delta(0), 3, "three idle ticks ran");
+    // Since #3104 an idle account with an inactive adapter repeats the
+    // runner's replay flush, and its writes, every tick. Those are excluded
+    // by source; every other writer still fails this. Remove this exclusion
+    // once mdk#3238 is fixed.
+    let flush_writes = crate::replay_flush_writes::writes() - flush_before;
+    assert_eq!(
+        delta(1) - flush_writes,
+        0,
+        "an idle tick takes no app-storage writer transaction outside the replay flush"
+    );
+    assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
+    assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");
+    assert_eq!(delta(4), 0, "no staged upload spawns no promotion");
+    // Each tick still sets its passes due (per-account wakes are step 2).
+    assert_eq!(delta(5), 3, "one attachment pass per tick");
+    assert_eq!(delta(6), 3, "one presentation pass per tick");
     runtime.shutdown().await;
 }
 

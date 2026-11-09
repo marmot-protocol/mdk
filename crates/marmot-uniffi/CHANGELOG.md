@@ -7,6 +7,13 @@
   Rows include session-local attempt times and available connection-error categories. Additive; aggregate health
   remains unchanged.
 
+- `TimelineMessageQueryFfi` adds `sender`, inclusive `since`, exclusive `until`, integer `attachment_type`
+  (`0` Any, `1` Image, `2` Video, `3` Audio, `4` File, `5` Attachment), `search_wall_clock`, and
+  `cursor_group_id`. Filters combine before the page limit; explicit wall-clock order supports deterministic
+  account-wide cursors with the anchor row's group id. Default queries keep canonical group ordering.
+  Rust record literals must initialize the added fields or use `..Default::default()`; update Swift and Kotlin
+  record construction for the expanded query. Regenerate bindings and ship them with the matching native library.
+
 - A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
   `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
   finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New

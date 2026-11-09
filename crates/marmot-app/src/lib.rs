@@ -97,6 +97,8 @@ mod directory_tests;
 mod drafts;
 mod emoji_sets;
 mod local_submissions;
+#[cfg(test)]
+mod replay_flush_writes;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod backup_archive;
 mod error;
@@ -359,10 +361,10 @@ pub use storage_sqlite::{
     BackupHistorySource, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow,
     DeletionSource, ExistingDirectConversation, HistoryImportProvenance, HistoryImportSource,
-    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
-    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
-    select_reusable_direct_conversation,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineAttachmentType, TimelineEditHistoryPage,
+    TimelineEditSummary, TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, TimelinePagination, TimelineReactionSummary, TimelineReplyPreview,
+    TimelineUserReaction, select_reusable_direct_conversation,
 };
 #[cfg(test)]
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
@@ -2224,6 +2226,7 @@ impl MarmotApp {
             checkpointed_transport_timestamp,
             saved_transport_timestamp: checkpointed_transport_timestamp,
             observed_commit_version: None,
+            content_report_backfill_done: None,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
             #[cfg(test)]

@@ -15,6 +15,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   this callback receives an explicit status to distinguish errors from close.
   Rebuild consumers against the matching generated header and library.
 
+- `MarmotTimelineMessageQuery` appends borrowed `sender` and `cursor_group_id` strings, `has_since`/`since`,
+  `has_until`/`until`, `uint32_t attachment_type`, and `uint8_t search_wall_clock`. The input struct grows;
+  consumers must recompile with the matching generated header and native library. Whole-struct `{0}`
+  initialization preserves defaults. Search filters combine before the limit, dates are inclusive/exclusive
+  respectively, and account-wide search cursors include the anchor row's group id. Attachment values outside
+  `0..=5` return `MARMOT_STATUS_INVALID_ARGUMENT`.
+
 - Remove the unused direct `libc` dependency. C allocation and release paths
   continue to use Rust `CString` and `Box`.
 

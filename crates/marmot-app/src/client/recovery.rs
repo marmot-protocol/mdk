@@ -111,12 +111,17 @@ impl AppClient {
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
         self.finish_runner_loss_import()?;
-        storage.with_transaction(|_| {
-            for (since, routes) in &goals {
-                app.widen_recovery_coverage_goals(routes, *since)?;
-            }
-            Ok::<_, StorageError>(())
-        })?;
+        {
+            // Replay-flush write, excluded from the idle-tick test (mdk#3238).
+            #[cfg(test)]
+            let _replay_flush = crate::replay_flush_writes::ReplayFlushWrite::enter();
+            storage.with_transaction(|_| {
+                for (since, routes) in &goals {
+                    app.widen_recovery_coverage_goals(routes, *since)?;
+                }
+                Ok::<_, StorageError>(())
+            })?;
+        }
         if changed_generation {
             self.wake_recovery_runner();
         }
@@ -203,6 +208,9 @@ impl AppClient {
     /// Imported ledger debt replaces the cursor's loss fence. This is a
     /// durable handoff, not proof of recovery and not a recovery-success metric.
     pub(crate) fn finish_runner_loss_import(&mut self) -> Result<bool, AppError> {
+        // Replay-flush write, excluded from the idle-tick test (mdk#3238).
+        #[cfg(test)]
+        let _replay_flush = crate::replay_flush_writes::ReplayFlushWrite::enter();
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
         let entries = app

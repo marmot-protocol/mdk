@@ -377,6 +377,16 @@ event journal.
 
 ## Conversations
 
+- **Timeline search.** `timeline_messages_with_query` and `subscribe_timeline_messages` accept `TimelineMessageQuery`.
+  The query combines literal Unicode-lowercased substring search, sender, inclusive `since`, exclusive `until`, and
+  `TimelineAttachmentType` filters before the page limit. Time bounds use `timeline_at`. Attachment types are `Any`
+  (the default), `Image`, `Video`, `Audio`, `File`, and `Attachment` (any attachment).
+  Group queries retain canonical chat order unless `search_wall_clock` is true. With that flag, searches order by
+  `(timeline_at, message_id_hex, group_id_hex)`; account-wide search cursors also require `cursor_group_id`.
+  Default account-wide queries and windows retain timestamp/message-id ordering and cursors.
+  Subscription windows retain filters and ordering through paging and live refreshes, use each
+  edge row's group for cursors, and preserve a scrolled-back window's inclusive upper bound. Filtered and explicit
+  wall-clock windows refresh from storage instead of applying unfiltered projection deltas.
 - **Drafts.** Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes,
   and revision-bound sends. Post-commit invalidations let conversation owners reload the selected composer; durable
   outbox acceptance clears only the submitted revision. See the

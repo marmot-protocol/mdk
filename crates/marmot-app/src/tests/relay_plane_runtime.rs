@@ -680,8 +680,8 @@ async fn liveness_socket_watch() {
         url: &str,
         status: crate::RelayLivenessStatus,
     ) -> crate::RelayLiveness {
+        let mut rows = subscription.snapshot.clone();
         timeout(Duration::from_secs(5), async {
-            let mut rows = subscription.snapshot.clone();
             loop {
                 if let Some(row) = rows
                     .iter()
@@ -697,11 +697,36 @@ async fn liveness_socket_watch() {
             }
         })
         .await
-        .expect("the runtime observes the socket's status")
+        .unwrap_or_else(|error| panic!("expected {status:?}, last snapshot {rows:?}: {error}"))
     }
 
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
+    // MockRelay's shutdown notification can miss a busy connection handler.
+    // Own the TCP streams so this test closes every socket deterministically.
+    let upstream = relay.url().await.to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let upstream = upstream
+            .strip_prefix("ws://")
+            .unwrap()
+            .trim_end_matches('/');
+        let mut sockets = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                accepted = listener.accept() => {
+                    let (mut incoming, _) = accepted.unwrap();
+                    let mut outgoing = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                    sockets.spawn(async move {
+                        tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await
+                    });
+                }
+            }
+        }
+        sockets.shutdown().await;
+    });
     let canonical = url.trim_end_matches('/').to_owned();
     let slash_url = format!("{canonical}/");
     let dir = tempfile::tempdir().unwrap();
@@ -791,7 +816,8 @@ async fn liveness_socket_watch() {
     assert!(reconnected.last_attempt_unix.is_some());
     assert_eq!(reconnected.last_error, None);
 
-    relay.shutdown();
+    stop.send(()).unwrap();
+    proxy.await.unwrap();
     let offline = wait_for_status(
         &subscription,
         &canonical,
@@ -800,6 +826,7 @@ async fn liveness_socket_watch() {
     .await;
     assert!(offline.last_attempt_unix.is_some());
     runtime.shutdown().await;
+    relay.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

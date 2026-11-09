@@ -174,8 +174,8 @@ pub(crate) use agent_stream_watch::{
 };
 #[cfg(test)]
 pub(crate) use subscriptions::{
-    TIMELINE_WINDOW_LIMIT, TimelineQueryFn, TimelineSubscriptionSignal, TimelineWindow,
-    TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
+    TIMELINE_WINDOW_LIMIT, TimelineOrder, TimelineQueryFn, TimelineSubscriptionSignal,
+    TimelineWindow, TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
     merge_timeline_window_with_order, messages_recovery_query, received_message_update_from_record,
     reconcile_chat_list_snapshot, recovery_row_is_pre_subscription, send_atomic_chat_list_snapshot,
     send_chat_list_remove_update,
@@ -5372,18 +5372,28 @@ impl MarmotAppRuntime {
     /// stale, then return its local state. An event-ID preview never refetches
     /// once every relay answered the fetch that cached it; otherwise, and for
     /// `naddr` previews, it refetches after 30 minutes. Repeat calls within
-    /// 30 seconds of a finished fetch return local state.
+    /// 30 seconds of a finished fetch return local state. A reference the
+    /// operational relays miss is looked up once more on the deployment's
+    /// discovery indexers and the author's NIP-65 write relays.
     pub async fn resolve_public_event_preview(
         &self,
         account_ref: &str,
         reference: &str,
     ) -> Result<crate::PublicEventPreviewRead, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        // The deployment's discovery indexers reach public notes the
+        // operational relays do not carry. They feed this lookup only, never
+        // the directory relays block-list, backup, sync and KeyPackage reads use.
+        let discovery_indexers = self.accounts.app.discovery_indexer_relays();
         Ok(self
             .accounts
             .app
             .directory()
-            .resolve_public_event_preview(&directory_account(&account), reference)
+            .resolve_public_event_preview(
+                &directory_account(&account),
+                reference,
+                &discovery_indexers,
+            )
             .await?)
     }
 
