@@ -3210,15 +3210,56 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         .expect("create alice");
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.accounts().reconcile().await.expect("alice starts");
-    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let runtime = &runtime;
+    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
+    let passes = || {
+        (
+            count(RuntimeOp::WorkerAttachmentPass),
+            count(RuntimeOp::WorkerPresentationPass),
+        )
+    };
+    // Waits, without a fixed real-time window, until the passes the last
+    // tick set due have run (`target`) and no pass or blocking-pool
+    // housekeeping is still in flight. A timeout fails the test.
+    let settle = |target: (u64, u64)| async move {
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            loop {
+                let (attachment, presentation) = passes();
+                let in_flight = [
+                    RuntimeOp::WorkerAttachmentPass,
+                    RuntimeOp::WorkerPresentationPass,
+                    RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+                    RuntimeOp::WorkerMediaSweep,
+                    RuntimeOp::WorkerUploadPromotion,
+                ]
+                .into_iter()
+                .any(|operation| startup_stage_snapshot(runtime, operation).in_flight > 0);
+                if attachment >= target.0 && presentation >= target.1 && !in_flight {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the tick's passes and housekeeping finish");
+    };
+    let tick = async move || {
+        let ticks = count(RuntimeOp::WorkerMaintenance);
+        let (attachment, presentation) = passes();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while count(RuntimeOp::WorkerMaintenance) == ticks {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an idle tick completes");
+        settle((attachment + 1, presentation + 1)).await;
+    };
     // The first tick fires on entry and starts the startup housekeeping:
     // let it, its passes and the blocking work they spawn all finish.
-    let settle = || async {
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
         while count(RuntimeOp::WorkerMaintenance) == 0 {
             tokio::task::yield_now().await;
@@ -3226,7 +3267,7 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     })
     .await
     .expect("the first maintenance tick completes");
-    settle().await;
+    settle((1, 1)).await;
     const COUNTED: [RuntimeOp; 7] = [
         RuntimeOp::WorkerMaintenance,
         RuntimeOp::StorageWriteBegin,
@@ -3238,25 +3279,11 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     ];
     let snapshot = || COUNTED.map(count);
     // Settle one more tick, which may still finish startup work.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(15)).await;
-    tokio::time::resume();
-    settle().await;
+    tick().await;
     let before = snapshot();
     let flush_before = crate::replay_flush_writes::writes();
     for _ in 0..3 {
-        let ticks = count(RuntimeOp::WorkerMaintenance);
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::time::resume();
-        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-            while count(RuntimeOp::WorkerMaintenance) == ticks {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("an idle tick completes");
-        settle().await;
+        tick().await;
     }
     let after = snapshot();
     let delta = |index: usize| after[index] - before[index];
