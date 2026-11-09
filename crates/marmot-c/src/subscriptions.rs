@@ -1474,12 +1474,12 @@ pub unsafe extern "C" fn marmot_relay_liveness_subscription_snapshot(
 /// # Safety
 /// Subscription must be a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_relay_liveness_subscription_close(
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_cancel(
     sub: *const MarmotRelayLivenessSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
         let sub = try_arg!(unsafe { sub_ref(sub) });
-        sub.inner.close();
+        sub.inner.cancel();
         MarmotStatus::Ok
     })
 }

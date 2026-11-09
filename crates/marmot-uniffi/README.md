@@ -226,7 +226,8 @@ or successful message delivery. A configured relay absent from this pool is `Unk
 and complete replacement lists from `next()`. Updates cover socket transitions, account-pool replacement,
 and cached relay-list changes without polling. Slow readers may skip intermediate states.
 Snapshot production runs on MDK's runtime; cancellation does not consume an update.
-`close()` wakes pending receives and stops this observer without disconnecting relays.
+`cancel()` wakes pending receives and stops this observer without disconnecting relays.
+Release the foreign object separately; Kotlin's generated `close()` destroys its handle.
 Runtime shutdown ends receives; read failures propagate through `MarmotKitError`.
 
 `lastAttemptUnix` is a session-local Unix-seconds timestamp, and `lastError` is an optional, bounded SDK

@@ -30,7 +30,7 @@ impl RelayLivenessSubscription {
         super::take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
-    /// Receive the latest complete snapshot, or None after close or runtime shutdown.
+    /// Receive the latest complete snapshot, or None after cancellation or runtime shutdown.
     #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<Vec<RelayLivenessFfi>>, MarmotKitError> {
         Ok(self
@@ -41,7 +41,7 @@ impl RelayLivenessSubscription {
     }
 
     /// End pending and future receives without changing the account's connections.
-    pub fn close(&self) {
+    pub fn cancel(&self) {
         self.inner.close();
     }
 }

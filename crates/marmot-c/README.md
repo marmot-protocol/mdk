@@ -53,7 +53,7 @@ coalesce. `snapshot` takes the initial snapshot once; later calls return an empt
 list. The relay callback additionally receives a `MarmotStatus`: OK accompanies a
 list, CLOSED accompanies terminal NULL, and a mapped error status accompanies
 terminal NULL on failure. Blocking `next` returns the same error status directly.
-`close` wakes pending reads without
+`cancel` wakes pending reads without
 freeing the handle; release it with `marmot_relay_liveness_subscription_free` before
 freeing its client. Callback cancellation and context lifetime follow the generic
 subscription rules below.

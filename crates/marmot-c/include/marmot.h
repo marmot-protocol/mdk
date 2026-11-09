@@ -14019,7 +14019,7 @@ MarmotStatus marmot_relay_liveness_subscription_snapshot(const struct MarmotRela
  * # Safety
  * Subscription must be a live handle.
  */
-MarmotStatus marmot_relay_liveness_subscription_close(const struct MarmotRelayLivenessSubscription *sub);
+MarmotStatus marmot_relay_liveness_subscription_cancel(const struct MarmotRelayLivenessSubscription *sub);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_block_list_snapshot_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).

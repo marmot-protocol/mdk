@@ -6997,10 +6997,10 @@ executing callback and does not guarantee a terminal callback. Keep `user_data` 
 
 [Header contract](include/marmot.h#L13990)
 
-### `marmot_relay_liveness_subscription_close`
+### `marmot_relay_liveness_subscription_cancel`
 
 ```c
-MarmotStatus marmot_relay_liveness_subscription_close(const struct MarmotRelayLivenessSubscription *sub);
+MarmotStatus marmot_relay_liveness_subscription_cancel(const struct MarmotRelayLivenessSubscription *sub);
 ```
 
 Close only this observer; pending and future reads return `MARMOT_STATUS_CLOSED`. The account's connections

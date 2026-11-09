@@ -5682,10 +5682,10 @@ polling and may coalesce intermediate states. Close the observer when leaving th
 
 [Source](src/commands/relay.rs#L74)
 
-### `RelayLivenessSubscription::close`
+### `RelayLivenessSubscription::cancel`
 
 ```rust
-pub fn close(&self)
+pub fn cancel(&self)
 ```
 
 Stop this observer and wake pending receives with `None`. Future receives also return `None`.
