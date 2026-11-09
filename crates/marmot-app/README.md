@@ -96,11 +96,14 @@ sample. These measurements do not include host rendering or every subsequent eng
   stay usable through account-scoped commands.
 - Signed-out, missing-signer, and onboarding-gated accounts remain ineligible even after a reset.
 
-**Relay settings.** `account_relay_liveness` reads configured relay URLs with the account's receive-pool status,
+**Relay settings.** `account_relay_liveness` reads configured relay URLs with the account's socket status,
 last attempt time, and available connection-error category. `subscribe_relay_liveness` supplies an initial snapshot
 and event-driven replacement lists; `RuntimeRelayLivenessSubscription::close` stops only the observer.
-`reconnect_relay` requires an active account pool, checks configured membership and dial safety, and returns the
-next observed attempt state within five seconds. These session-local rows do not establish message delivery.
+`reconnect_relay` requires a running managed account and checks configured membership and dial safety. Its worker
+serializes reconnect with configuration reconciliation; after dispatch, the dial wait is capped at five seconds.
+Existing roles and ownership remain unchanged. Managed workers
+retire newly dialed manual connections when their configured membership ends, independently of UI observers.
+These session-local rows do not establish message delivery.
 See the [binding contract](../marmot-uniffi/README.md#relay-liveness) for state and privacy semantics.
 
 **Shutdown.** Hosts whose process can be suspended must call `MarmotAppRuntime::shutdown_and_close`, which closes every

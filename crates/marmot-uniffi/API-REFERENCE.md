@@ -5653,8 +5653,9 @@ pub async fn account_relay_liveness( &self, account_ref: String, ) -> Result<Vec
 ```
 
 Read every configured relay's canonical URL and current account-pool state without dialing.
-Missing pool entries are `Unknown`. Attempt times and bounded connection-error categories are session-local and
-optional. See the [state and privacy contract](README.md#relay-liveness); aggregate `relay_health` is unchanged.
+Unobserved sessions are `Unknown`; closed configured sessions retain `Offline`. Optional attempt times and
+bounded connection-error categories are session-local. See the [state and privacy contract](README.md#relay-liveness);
+aggregate `relay_health` is unchanged.
 
 [Source](src/commands/relay.rs#L60)
 
@@ -5664,8 +5665,9 @@ optional. See the [state and privacy contract](README.md#relay-liveness); aggreg
 pub async fn reconnect_relay( &self, account_ref: String, url: String, ) -> Result<conversions::RelayLivenessFfi, MarmotKitError>
 ```
 
-Reconnect one configured relay in the account's active receive/history pool after the normal dial-safety check.
-Wait up to five seconds for the next observed attempt state, which may be `Connecting` rather than a successful
+Reconnect one configured relay through its running account worker after the normal dial-safety check, preserving existing
+socket roles and ownership. New manual connections follow configured membership, independently of UI observers.
+After dispatch, wait up to five seconds for the next observed attempt state, which may be `Connecting` rather than a successful
 connection. Use the liveness subscription for the eventual outcome; this does not establish message delivery.
 
 [Source](src/commands/relay.rs#L84)

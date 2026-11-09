@@ -2782,6 +2782,26 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub(super) async fn reconnect_relay(
+        &self,
+        account_ref: &str,
+        canonical_url: String,
+    ) -> Result<crate::RelayLiveness, AppError> {
+        let command = self
+            .existing_worker_commands(account_ref)
+            .await?
+            .ok_or(AppError::TransportClosed)?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ReconnectRelay {
+                canonical_url,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn periodic_maintenance_policy(
         &self,
         account_ref: &str,

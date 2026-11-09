@@ -6958,8 +6958,8 @@ release it with `marmot_relay_liveness_list_free`. Unknown entries and optional 
 MarmotStatus marmot_reconnect_relay(const struct MarmotClient *client, const char *account_ref, const char *url, struct MarmotRelayLiveness **out);
 ```
 
-Block for up to five seconds while a configured relay starts a new connection attempt in the account's active
-pool. Normal dial safety applies. The returned owned record may still report `Connecting`; free it with
+Dispatch through the running account worker; once handled, the dial wait is capped at five seconds.
+Normal dial safety applies. The returned owned record may still report `Connecting`; free it with
 `marmot_relay_liveness_free` and use the subscription for later outcomes. Inputs remain borrowed.
 
 [Header contract](include/marmot.h#L10069)

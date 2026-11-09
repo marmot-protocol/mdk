@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Add account-scoped relay liveness snapshots, event-driven subscriptions, and safety-checked per-relay reconnects
-  (mdk#329). Configured relays without a pool entry remain `Unknown`; aggregate health is unchanged.
+  (mdk#329). Unobserved configured relays remain `Unknown`; closed sessions retain available attempt/error details.
+  Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
+  is unchanged.
 
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
 

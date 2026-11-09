@@ -562,6 +562,118 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_manual_lifetime() {
+    let receive = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let manual = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let unconfigured = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let receive_url = receive.url().await.to_string();
+    let manual_url = manual.url().await.to_string();
+    let unconfigured_url = unconfigured.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        receive_url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![receive_url.clone()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec![receive_url.clone()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let mut changes = app.relay_plane.relay_liveness_changes().unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let sdk = timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if let Some(client) = app
+                .relay_plane
+                .account_history_relay_client(&account_id)
+                .await
+                && client.relay_liveness().await.iter().any(|row| {
+                    row.url.trim_end_matches('/') == receive_url.trim_end_matches('/')
+                        && row.status == crate::RelayLivenessStatus::Connected
+                })
+            {
+                break client;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the managed account activates its receive socket");
+
+    // An existing pool socket outside the configured union is not a retry target.
+    sdk.client().add_relay(&unconfigured_url).await.unwrap();
+    sdk.reconnect_relay(&TransportEndpoint(unconfigured_url.clone()))
+        .await
+        .unwrap();
+    let outside = sdk
+        .client()
+        .relay(&unconfigured_url)
+        .await
+        .unwrap()
+        .unwrap();
+    let attempts = outside.stats().attempts();
+    assert!(
+        runtime
+            .reconnect_relay(&account.label, &unconfigured_url)
+            .await
+            .is_err()
+    );
+    assert_eq!(outside.stats().attempts(), attempts);
+
+    lists.nip65.created_at += 1;
+    lists.nip65.write_relays = vec![manual_url.clone()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    runtime
+        .reconnect_relay(&account.label, &manual_url)
+        .await
+        .unwrap();
+    let socket = sdk.client().relay(&manual_url).await.unwrap().unwrap();
+    assert!(!socket.capabilities().can_read());
+    assert!(!socket.capabilities().can_write());
+
+    // No UI subscription or read drives cleanup after this configuration commit.
+    lists.nip65.created_at += 1;
+    lists.nip65.write_relays.clear();
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if sdk.client().relay(&manual_url).await.unwrap().is_none() {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the account worker releases a no-longer-configured manual socket");
+    assert!(sdk.relay_liveness().await.iter().any(|row| {
+        row.url.trim_end_matches('/') == receive_url.trim_end_matches('/')
+            && row.status == crate::RelayLivenessStatus::Connected
+    }));
+    runtime.shutdown().await;
+    receive.shutdown();
+    manual.shutdown();
+    unconfigured.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_socket_watch() {
     async fn wait_for_status(
         subscription: &crate::RuntimeRelayLivenessSubscription,
@@ -599,7 +711,7 @@ async fn liveness_socket_watch() {
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
         slash_url.clone(),
-        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
     let mut lists = crate::AccountRelayListStatus::empty();
     lists.nip65.created_at = crate::unix_now_seconds();
@@ -622,10 +734,7 @@ async fn liveness_socket_watch() {
         crate::RelayLivenessStatus::Unknown
     );
 
-    // Use the app's tracked production transport and its account receive pool,
-    // not the separate plane that MarmotApp::client would construct.
-    let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
-    client.prepare_transport().await.unwrap();
+    runtime.reconcile_accounts().await.unwrap();
     let connected = wait_for_status(
         &subscription,
         &canonical,
@@ -745,12 +854,6 @@ async fn relay_liveness_account_watch() {
             .unwrap()
             .is_empty()
     );
-    assert!(
-        matches!(runtime.reconnect_relay(&bob.label, "wss://relay.example").await,
-        Err(crate::AppError::Transport(TransportAdapterError::Subscription(detail)))
-            if detail == "relay is not configured for this account")
-    );
-
     // A cancelled receive must not consume the next configured-list replacement.
     {
         let receive = subscription.recv();
@@ -774,17 +877,6 @@ async fn relay_liveness_account_watch() {
     assert_eq!(
         rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>(),
         vec!["wss://replacement.example"]
-    );
-    lists.inbox.created_at += 1;
-    lists.inbox.relays = vec!["wss://127.0.0.1".into()];
-    lists.refresh();
-    app.directory()
-        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
-        .unwrap();
-    assert!(
-        matches!(runtime.reconnect_relay(&alice.label, "wss://127.0.0.1").await,
-        Err(crate::AppError::Transport(TransportAdapterError::Subscription(detail)))
-            if detail == "relay reconnect: relay endpoint host is not a public address")
     );
     runtime.shutdown().await;
     assert!(subscription.recv().await.unwrap().is_none());

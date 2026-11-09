@@ -1,7 +1,6 @@
 use super::{MarmotAppRuntime, wait_for_runtime_shutdown};
 use crate::{AppError, RelayLiveness, RelayLivenessStatus};
-use cgka_traits::{MemberId, TransportAdapterError, TransportEndpoint};
-use std::collections::BTreeMap;
+use cgka_traits::MemberId;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use transport_nostr::canonical_relay;
 
@@ -50,28 +49,18 @@ impl MarmotAppRuntime {
     ) -> Result<Vec<RelayLiveness>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
-        let lists = self
+        let mut rows = self
             .accounts
             .app
-            .account_relay_list_status(&account.label)?;
-        let mut rows = BTreeMap::new();
-        for url in lists
-            .default_relays
+            .relay_liveness_config(&account.label)?
             .into_iter()
-            .chain(lists.bootstrap_relays)
-            .chain(lists.nip65.relays)
-            .chain(lists.nip65.read_relays)
-            .chain(lists.nip65.write_relays)
-            .chain(lists.inbox.relays)
-        {
-            let url = canonical_relay(&url);
-            rows.entry(url.clone()).or_insert(RelayLiveness {
-                url,
+            .map(|endpoint| RelayLiveness {
+                url: endpoint.0,
                 status: RelayLivenessStatus::Unknown,
                 last_attempt_unix: None,
                 last_error: None,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
         let account_id = MemberId::new(
             hex::decode(&account.account_id_hex).map_err(|_| AppError::InvalidPublicKey)?,
         );
@@ -83,12 +72,12 @@ impl MarmotAppRuntime {
         {
             for mut row in client.relay_liveness().await {
                 row.url = canonical_relay(&row.url);
-                if let Some(current) = rows.get_mut(&row.url) {
-                    *current = row;
+                if let Ok(index) = rows.binary_search_by(|current| current.url.cmp(&row.url)) {
+                    rows[index] = row;
                 }
             }
         }
-        Ok(rows.into_values().collect())
+        Ok(rows)
     }
 
     /// Subscribe before reading, so a concurrent transport or list change is retained.
@@ -168,24 +157,9 @@ impl MarmotAppRuntime {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let canonical = canonical_relay(url);
-        if !self
-            .account_relay_liveness(account_ref)
-            .await?
-            .iter()
-            .any(|row| row.url == canonical)
-        {
-            return Err(TransportAdapterError::Subscription(
-                "relay is not configured for this account".into(),
-            )
-            .into());
-        }
-        let account_id = MemberId::new(
-            hex::decode(&account.account_id_hex).map_err(|_| AppError::InvalidPublicKey)?,
-        );
         let mut row = self
-            .shared
-            .relay_plane()
-            .reconnect_relay(&account_id, TransportEndpoint(url.to_owned()))
+            .accounts
+            .reconnect_relay(&account.label, canonical)
             .await?;
         row.url = canonical_relay(&row.url);
         Ok(row)

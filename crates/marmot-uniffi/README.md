@@ -219,8 +219,9 @@ and aggregate snapshots; keep secrets out of diagnostics and host callback error
 Root URLs omit the trailing slash; path trailing slashes retain their endpoint identity.
 The rows combine the account's cached NIP-65 read/write, inbox, default, and bootstrap lists.
 `RelayStatusFfi` has `Unknown`, `Connecting`, `Connected`, and `Offline` variants for host localization.
-State comes from that account's receive/history pool, not another account's sockets, transient publication pools,
-or successful message delivery. A configured relay absent from this pool is `Unknown`; reads never dial.
+State comes from that account's pool, including receive/history and WRITE-only publication sockets, not another
+account or a separate directory pool. Configured URLs with no observed session are `Unknown`; closed sessions
+retain `Offline` and available attempt/error details while configured. Reads never dial or add receive sources.
 
 `subscribeRelayLiveness(accountRef)` returns a `RelayLivenessSubscription` with a one-shot initial `snapshot()`
 and complete replacement lists from `next()`. Updates cover socket transitions, account-pool replacement,
@@ -232,12 +233,18 @@ Runtime shutdown ends receives; read failures propagate through `MarmotKitError`
 
 `lastAttemptUnix` is a session-local Unix-seconds timestamp, and `lastError` is an optional, bounded SDK
 connection-error category rather than raw transport text. A new attempt clears the previous error.
-Details unavailable from the SDK, including an externally cancelled dial, remain absent.
+Attempt times require the transport tap. Errors the SDK does not expose, including external cancellation,
+remain absent.
 The rows are private settings data: do not log them or send their URLs through diagnostics exports.
 
 `reconnectRelay(accountRef, url)` accepts only a relay configured for that account and applies the normal
-dial-safety policy. The account needs an active relay pool. It starts a connection attempt and waits up to
-five seconds for the next observed attempt state, which may still be `Connecting`; the watch reports the outcome.
+dial-safety policy. The account must be running. Its worker serializes reconnect with configuration reconciliation;
+after dispatch, the dial wait is capped at five seconds. The next observed attempt state may still be `Connecting`;
+the watch reports the outcome.
+Existing sockets keep their roles and owners. A missing socket gets manual ownership without inherited REQs or
+receive routing. Managed account workers release that ownership when the URL leaves the configured union,
+even without a liveness observer; other actors keep their subscription, history, and publication ownership.
+Removing a URL from only one list does not release it while another configured list still contains it.
 Neither `Connected` nor a successful reconnect return proves subscription readiness or message delivery.
 
 ### Markdown rendering

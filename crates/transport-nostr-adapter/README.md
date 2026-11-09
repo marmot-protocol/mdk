@@ -58,23 +58,31 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrRelayClient` is intentionally small so tests can use an in-memory client and production can use
 `NostrSdkRelayClient` behind the `sdk` feature.
 
-`NostrSdkRelayClient::relay_liveness()` reads the account-local physical READ pool without network I/O or monitor
-attachment. WRITE-only publication sockets appear in neither liveness snapshots nor the transport receive feed.
+`NostrSdkRelayClient::relay_liveness()` reads the account-local physical pool without network I/O or monitor
+attachment. READ, WRITE-only, and manually connected sockets all appear. Liveness observation neither adds a
+receive source nor retains a socket; WRITE-only sockets stay outside the transport receive feed.
 Its `RelayLiveness` rows expose `Unknown`, `Connecting`, `Connected`, or `Offline`, independently of message traffic.
-The caller adds configured endpoints absent from the pool as `Unknown`. Subscribe to `liveness_changes()` before
+The caller adds configured endpoints with no observed session as `Unknown`. Closed-session attempt and error
+metadata survives only for configured URLs. Subscribe to `liveness_changes()` before
 reading: its monotonic generation coalesces changes, rather than retaining every transition. A multi-account root's
 watch also wakes for child relay changes, account registration, and account removal.
 
 Clients built with `from_builder` record `last_attempt_unix` when the transport starts connecting and retain the
 SDK error category in `last_error` on connection failure. Raw error text is never retained. A new attempt clears the
 previous error. The SDK's outer connect timeout exposes no error to the transport hook. Opaque clients passed to
-`new` instead timestamp status notifications that reveal a new SDK attempt count and have no retained connection
-errors; attempts before monitor attachment have no timestamp. Relay URLs and errors are local presentation data,
-not logs or telemetry.
+`new` cannot measure exact attempt times or retain connection errors; those fields remain absent. Attempts before
+monitor attachment also have no timestamp. Relay URLs and errors are local presentation data, not logs or telemetry.
 
-After the relay plane's safety check, `reconnect_relay(endpoint)` restarts one existing relay or registers it in the
-account's retained READ pool. It returns the next observed attempt's current status, including `Connecting`, within
-five seconds. It does not claim a successful connection, replace an existing relay object, or run a retry loop.
+Keep configured membership current with `sync_liveness_config(endpoints)`, including when no UI observes liveness.
+This call dials nothing. Removing a configured endpoint releases only its manual connection ownership and closed
+session metadata; subscriptions, retained history connections, and active publication leases keep their ownership.
+
+After the relay plane's safety check, `reconnect_relay(endpoint)` restarts the existing relay object without
+changing its capabilities or owners. A configured endpoint absent from the pool gets a manual connection with
+`RelayCapabilities::NONE`: it inherits no REQs and does not enter the receive frontier. Subscription, history, or
+publication actors add their own capabilities and ownership when they use it. Reconnect returns the next observed
+attempt's current status, including `Connecting`, within five seconds. It does not claim subscription readiness or
+run a retry loop.
 
 Public DTO ingress verifies the event signature and id/content binding before delivery, including reconciliation
 and acquired replay pages. SDK notifications carry event ids authenticated by the pinned SDK. Its verification
