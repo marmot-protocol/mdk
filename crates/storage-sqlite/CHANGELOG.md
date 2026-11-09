@@ -52,6 +52,10 @@
 
 ### Changed
 
+- New reads for the account worker's pass deadlines (mdk#2923): `SqliteAppStorage::attachment_work_schedule`
+  (`AttachmentWorkSchedule`: the earliest timed candidate, acquisition or partial, whether polled work exists, and
+  whether an admission demand waits), `avatar_work_schedule` and `chat_presentation_work_pending`.
+
 - New `SqliteAccountStorage::post_join_work_owed`: whether any group has a post-join history fetch without a
   completion, or a post-join obligation in catch-up or its EOSE timeout, in one read (mdk#2923).
 

@@ -122,6 +122,9 @@ operations! {
     // pending, found by the maintenance tick's watchdog (mdk#2923 step B).
     WatchdogMissedWakeRecovery => "watchdog_missed_wake_recovery",
     WatchdogMissedWakePostJoin => "watchdog_missed_wake_post_join",
+    WatchdogMissedWakeAttachmentPass => "watchdog_missed_wake_attachment_pass",
+    WatchdogMissedWakeAvatarPass => "watchdog_missed_wake_avatar_pass",
+    WatchdogMissedWakePresentationPass => "watchdog_missed_wake_presentation_pass",
     WorkerPresentationPass => "worker_presentation_pass",
     WorkerAvatarPass => "worker_avatar_pass",
     WorkerAttachmentPass => "worker_attachment_pass",

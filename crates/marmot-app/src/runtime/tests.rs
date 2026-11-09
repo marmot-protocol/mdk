@@ -4032,11 +4032,77 @@ async fn another_accounts_wake_runs_no_pass_here() {
     runtime.shutdown().await;
 }
 
+/// Work created without a wake is a missed wake: the next tick's watchdog
+/// counts it and runs the pass, so it waits at most one tick (mdk#2923 step
+/// B). Here an avatar request goes straight to storage, which wakes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let runtime = &runtime;
+    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == 0 || count(RuntimeOp::WorkerAvatarPass) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first tick and avatar pass run");
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    let passes = count(RuntimeOp::WorkerAvatarPass);
+    assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 0);
+
+    app.account_storage("alice")
+        .expect("alice's storage")
+        .app_storage()
+        .request_avatar_acquisition(
+            "owner",
+            &crate::SelectedAvatar::RemoteImage {
+                url: "https://example.com/a.png".into(),
+                cache_key: "a".into(),
+            },
+            false,
+        )
+        .expect("request");
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        count(RuntimeOp::WorkerAvatarPass),
+        passes,
+        "nothing woke it"
+    );
+
+    let ticks = count(RuntimeOp::WorkerMaintenance);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == ticks
+            || count(RuntimeOp::WorkerAvatarPass) == passes
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the tick's watchdog runs the pass");
+    assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 1);
+    runtime.shutdown().await;
+}
+
 /// What idle ticks do once a worker's startup housekeeping has settled
 /// (mdk#2923 §4): no writer transaction on the app or session database, no blocking-pool housekeeping
-/// batch, media sweep or upload promotion, while every tick still runs its
-/// phases and sets its passes due. That includes an offline account's
-/// replay flush, which repeated its writes every tick until mdk#3238.
+/// batch, media sweep or upload promotion, and no attachment or
+/// presentation pass, while every tick still runs its phases. That includes
+/// an offline account's replay flush, which repeated its writes every tick
+/// until mdk#3238.
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
@@ -4093,7 +4159,9 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         })
         .await
         .expect("an idle tick completes");
-        settle((attachment + 1, presentation + 1)).await;
+        // Idle ticks set no pass due (mdk#2923 step B): wait only for
+        // whatever is in flight.
+        settle((attachment, presentation)).await;
     };
     // The first tick fires on entry and starts the startup housekeeping:
     // let it, its passes and the blocking work they spawn all finish.
@@ -4105,7 +4173,7 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     .await
     .expect("the first maintenance tick completes");
     settle((1, 1)).await;
-    const COUNTED: [RuntimeOp; 12] = [
+    const COUNTED: [RuntimeOp; 15] = [
         RuntimeOp::WorkerMaintenance,
         RuntimeOp::StorageWriteBegin,
         RuntimeOp::WorkerMaintenanceHousekeepingBatch,
@@ -4118,9 +4186,15 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         RuntimeOp::WatchdogMissedWakePostJoin,
         RuntimeOp::WorkerMaintenancePostJoin,
         RuntimeOp::WorkerMaintenanceRecovery,
+        RuntimeOp::WatchdogMissedWakeAttachmentPass,
+        RuntimeOp::WatchdogMissedWakeAvatarPass,
+        RuntimeOp::WatchdogMissedWakePresentationPass,
     ];
     let snapshot = || COUNTED.map(count);
-    // Settle one more tick, which may still finish startup work.
+    // Settle two more ticks, which may still finish startup work: a pass
+    // that ran while the ownership sweep was still in flight polls once
+    // more 15 s later.
+    tick().await;
     tick().await;
     let before = snapshot();
     for _ in 0..3 {
@@ -4145,15 +4219,21 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         (0, 0),
         "the watchdog found no missed wake"
     );
+    assert_eq!(
+        [12, 13, 14].map(delta),
+        [0, 0, 0],
+        "the watchdog found no missed pass"
+    );
     assert_eq!(delta(10), 0, "no post-join work, so post-join rests");
     // With no relays the replay generation never authorizes, so recovery
     // keeps its 15 s cadence; since mdk#3238 a repeat pass writes nothing.
     assert_eq!(delta(11), 3, "recovery still runs once per tick offline");
     assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");
     assert_eq!(delta(4), 0, "no staged upload spawns no promotion");
-    // Each tick still sets its passes due (per-account wakes are step 2).
-    assert_eq!(delta(5), 3, "one attachment pass per tick");
-    assert_eq!(delta(6), 3, "one presentation pass per tick");
+    // The passes run on their own wakes and deadlines, and an idle account
+    // has none due (mdk#2923 step B).
+    assert_eq!(delta(5), 0, "an idle tick runs no attachment pass");
+    assert_eq!(delta(6), 0, "an idle tick runs no presentation pass");
     runtime.shutdown().await;
 }
 

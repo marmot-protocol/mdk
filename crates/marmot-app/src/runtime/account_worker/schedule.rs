@@ -1,8 +1,9 @@
 //! The account worker's own deadlines (mdk#2923 step B). Recovery and
-//! post-join work run when an event wakes them or a deadline comes, not on
-//! every maintenance tick. While a job still has work after it ran, it
-//! re-arms at [`RETRY_WHILE_OWED`], the tick's old cadence, and with none it
-//! rests until a wake.
+//! post-join work, and the attachment, avatar and presentation passes, run
+//! when an event wakes them or a deadline comes, not on every maintenance
+//! tick. Recovery and post-join re-arm at [`RETRY_WHILE_OWED`], the tick's
+//! old cadence, while they still have work, and with none they rest until a
+//! wake. A pass arms the deadline its data gives (see [`Schedule::arm`]).
 //!
 //! The 15 s tick stays only as a watchdog until PR C removes it: a job that
 //! has work due with no wake pending and no deadline within 15 s is a missed
@@ -23,16 +24,35 @@ pub(super) enum Job {
     Recovery,
     /// Post-join history collection (`advance_post_join_maintenance_subscriptions`).
     PostJoin,
+    /// The attachment pass (`attachments::schedule`).
+    AttachmentPass,
+    /// The avatar pass (identity avatars and avatar acquisition).
+    AvatarPass,
+    /// The chat presentation pass.
+    PresentationPass,
 }
 
 impl Job {
-    pub(super) const ALL: [Self; 2] = [Self::Recovery, Self::PostJoin];
+    pub(super) const ALL: [Self; 5] = [
+        Self::Recovery,
+        Self::PostJoin,
+        Self::AttachmentPass,
+        Self::AvatarPass,
+        Self::PresentationPass,
+    ];
 
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Recovery => "recovery",
             Self::PostJoin => "post_join",
+            Self::AttachmentPass => "attachment_pass",
+            Self::AvatarPass => "avatar_pass",
+            Self::PresentationPass => "presentation_pass",
         }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -49,36 +69,27 @@ struct JobState {
 /// The deadlines and pending wakes of one account worker's jobs.
 #[derive(Debug)]
 pub(super) struct Schedule {
-    recovery: JobState,
-    post_join: JobState,
+    jobs: [JobState; Job::ALL.len()],
 }
 
 impl Schedule {
     /// A worker that just opened runs each job once: what an earlier process
     /// left owed is rebuilt from the data, then each job arms its own deadline.
     pub(super) fn opened() -> Self {
-        let woken = || JobState {
-            woken: true,
-            ..JobState::default()
-        };
         Self {
-            recovery: woken(),
-            post_join: woken(),
+            jobs: std::array::from_fn(|_| JobState {
+                woken: true,
+                ..JobState::default()
+            }),
         }
     }
 
     fn state(&mut self, job: Job) -> &mut JobState {
-        match job {
-            Job::Recovery => &mut self.recovery,
-            Job::PostJoin => &mut self.post_join,
-        }
+        &mut self.jobs[job.index()]
     }
 
     fn get(&self, job: Job) -> &JobState {
-        match job {
-            Job::Recovery => &self.recovery,
-            Job::PostJoin => &self.post_join,
-        }
+        &self.jobs[job.index()]
     }
 
     /// An event created work for `job`.
@@ -93,6 +104,15 @@ impl Schedule {
         let state = self.state(job);
         state.woken = false;
         state.deadline = still_owed.then(|| now + RETRY_WHILE_OWED);
+    }
+
+    /// `job` runs next at `at` on its own, or only on a wake when `None`. A
+    /// pass arms what its data gives after a run that left nothing to repeat
+    /// at once.
+    pub(super) fn arm(&mut self, job: Job, at: Option<Instant>) {
+        let state = self.state(job);
+        state.woken = false;
+        state.deadline = at;
     }
 
     /// When the worker next has a job to run: now for a woken one, else the
@@ -148,7 +168,10 @@ mod tests {
         let now = Instant::now();
         let mut schedule = Schedule::opened();
         assert_eq!(schedule.next_at(now), Some(now));
-        assert!(schedule.due(Job::Recovery, now) && schedule.due(Job::PostJoin, now));
+        assert!(Job::ALL.into_iter().all(|job| schedule.due(job, now)));
+        for pass in [Job::AttachmentPass, Job::AvatarPass, Job::PresentationPass] {
+            schedule.arm(pass, None);
+        }
 
         schedule.ran(Job::Recovery, true, now);
         schedule.ran(Job::PostJoin, false, now);

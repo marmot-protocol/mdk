@@ -751,6 +751,104 @@ fn retry_at(storage: &SqliteAppStorage, job: &AttachmentAcquisition, now: u64) -
     )
 }
 
+/// What the attachment pass next owes (mdk#2923 step B): the earliest timed
+/// row, whether some work has to be polled for, and whether event-created
+/// work waits now. A failed read counts as work to poll for.
+fn pass_work(client: &AppClient, admission: &Admission) -> PassWork {
+    use std::sync::atomic::Ordering;
+    let read = (|| {
+        let storage = client.app.account_storage(&client.state.label)?;
+        let app_storage = storage.app_storage();
+        let automatic = app_storage
+            .attachment_download_policy(&super::super::attachment_controls::default_policy(
+                &client.app.config,
+            ))?
+            .automatic;
+        let mut work = app_storage.attachment_work_schedule(automatic)?;
+        // The pass admits demands only for automatic, app-managed downloads;
+        // otherwise they wait for the host and are not owed here.
+        work.pending_now &= automatic
+            && client.app.config.attachment_acquisition_mode
+                != crate::AttachmentAcquisitionMode::HostManaged;
+        Ok::<_, AppError>(work)
+    })();
+    let Ok(work) = read else {
+        return PassWork {
+            now: scheduler_now(client),
+            next_at: None,
+            polling: true,
+            pending_now: false,
+            rescan_at: None,
+        };
+    };
+    let running = |task: &Option<tokio::task::JoinHandle<()>>| {
+        task.as_ref().is_some_and(|task| !task.is_finished())
+    };
+    let latches = &admission.latches;
+    // A media sweep batch wakes nothing when it ends, and a failed sweep
+    // batch owes a rescan the next pass schedules: poll for those. An upload
+    // promotion's completion wakes the worker itself (#3374).
+    let polling = work.polling
+        || running(&admission.media_sweep)
+        || latches.sweep_unfinished.load(Ordering::Acquire)
+        || (latches.sweep_rescan.load(Ordering::Acquire) && latches.sweep_rescan_due.is_none());
+    PassWork {
+        now: scheduler_now(client),
+        next_at: work.next_at,
+        polling,
+        pending_now: work.pending_now,
+        rescan_at: latches.sweep_rescan_due,
+    }
+}
+
+struct PassWork {
+    now: u64,
+    next_at: Option<u64>,
+    polling: bool,
+    pending_now: bool,
+    rescan_at: Option<std::time::Instant>,
+}
+
+/// When the attachment pass should next run on its own, after a run that
+/// left nothing to repeat at once. A timed row is due at its second; one
+/// already due that the pass could not take (no permit or slot free) waits
+/// for the completion that frees one, or 15 s; polled work also runs every
+/// 15 s, as the tick ran it; and the pass runs at least hourly, for what only
+/// it notices, such as another connection's commits for the media sweep.
+pub(super) fn next_pass_at(client: &AppClient, admission: &Admission) -> TokioInstant {
+    let work = pass_work(client, admission);
+    let now = TokioInstant::now();
+    let retry = now + super::schedule::RETRY_WHILE_OWED;
+    let timed = work.next_at.map(|at| {
+        if at <= work.now {
+            retry
+        } else {
+            now + Duration::from_secs(at - work.now)
+        }
+    });
+    [
+        timed,
+        work.polling.then_some(retry),
+        work.rescan_at.map(TokioInstant::from_std),
+        Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(retry)
+}
+
+/// The watchdog's read: whether the attachment pass has work due now.
+pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
+    let work = pass_work(client, admission);
+    work.pending_now
+        || work.polling
+        || work.next_at.is_some_and(|at| at <= work.now)
+        || work
+            .rescan_at
+            .is_some_and(|at| at <= std::time::Instant::now())
+}
+
 /// The scheduler's clock. Tests may pin it per account directory to cross
 /// readmission backoffs without sleeping; transfers, leases and publication
 /// keep wall time.

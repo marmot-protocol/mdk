@@ -2808,9 +2808,13 @@ async fn run_app_runtime_account_worker(
                 });
                 avatar_due |= identities.as_ref().is_ok_and(|more| *more)
                     || acquisition.as_ref().is_ok_and(|more| *more);
-                if identities.is_err() || acquisition.is_err() {
+                let failed = identities.is_err() || acquisition.is_err();
+                if failed {
                     tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
-                        "avatar maintenance failed; retrying on the next tick");
+                        "avatar maintenance failed; retrying in 15 s");
+                }
+                if !avatar_due {
+                    schedule.arm(schedule::Job::AvatarPass, avatar_pass_next_at(&client, failed));
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
@@ -2840,14 +2844,21 @@ async fn run_app_runtime_account_worker(
                 let step = shared.observer.performance().observe(RuntimeOp::WorkerPresentationPass);
                 let presentation = presentation_maintenance.run(&client, &account_id_hex);
                 step.finish_app(&presentation);
+                let failed = presentation.is_err();
                 presentation_due = match presentation {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
-                            "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
+                            "local chat presentation maintenance failed; retrying on the next wakeup or in 15 s");
                         false
                     }
                 };
+                if !presentation_due {
+                    schedule.arm(
+                        schedule::Job::PresentationPass,
+                        presentation_pass_next_at(&client, failed),
+                    );
+                }
             }
             more = attachment_admission.ready(), if attachment_admission.is_waiting() => {
                 attachment_due |= more;
@@ -2857,14 +2868,26 @@ async fn run_app_runtime_account_worker(
                 let step = shared.observer.performance().observe(RuntimeOp::WorkerAttachmentPass);
                 let attachment = attachments::schedule(&client, &shared, &media_http, &mut attachment_admission);
                 step.finish_app(&attachment);
+                let failed = attachment.is_err();
                 attachment_due = match attachment {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
-                            "attachment maintenance failed; retrying on next wakeup or tick");
+                            "attachment maintenance failed; retrying on next wakeup or in 15 s");
                         false
                     }
                 };
+                if !attachment_due {
+                    let next = attachments::next_pass_at(&client, &attachment_admission);
+                    schedule.arm(
+                        schedule::Job::AttachmentPass,
+                        Some(if failed {
+                            next.min(TokioInstant::now() + schedule::RETRY_WHILE_OWED)
+                        } else {
+                            next
+                        }),
+                    );
+                }
             }
             // Native input still being admitted takes its next turn as soon as
             // commands and live input have had theirs, instead of waiting for
@@ -2893,12 +2916,23 @@ async fn run_app_runtime_account_worker(
                     client.post_join_advanced = false;
                     schedule.ran(schedule::Job::PostJoin, owed, TokioInstant::now());
                 }
+                // A pass's deadline sets it due; the pass arms its next one
+                // when it runs.
+                for (job, due) in [
+                    (schedule::Job::AttachmentPass, &mut attachment_due),
+                    (schedule::Job::AvatarPass, &mut avatar_due),
+                    (schedule::Job::PresentationPass, &mut presentation_due),
+                ] {
+                    if schedule.due(job, now) {
+                        schedule.arm(job, None);
+                        *due = true;
+                    }
+                }
             }
             _ = maintenance_tick.tick() => {
+                // The passes run on their own wakes and deadlines; the
+                // watchdog below checks that none was missed.
                 local_submission_due = true;
-                attachment_due = true;
-                presentation_due = true;
-                avatar_due = true;
                 if relay_config_work == RelayConfigWork::RetryOnTick {
                     relay_config_work = RelayConfigWork::Ready;
                 }
@@ -3056,6 +3090,13 @@ async fn run_app_runtime_account_worker(
                     let owed = match job {
                         schedule::Job::Recovery => client.recovery_owed(),
                         schedule::Job::PostJoin => client.post_join_owed(),
+                        // A pass already set due is not missed.
+                        schedule::Job::AttachmentPass => !attachment_due
+                            && attachments::pass_owed_now(&client, &attachment_admission),
+                        schedule::Job::AvatarPass => !avatar_due && avatar_pass_owed_now(&client),
+                        schedule::Job::PresentationPass => {
+                            !presentation_due && presentation_pass_owed_now(&client)
+                        }
                     };
                     let Some(first) = schedule.missed(job, owed, TokioInstant::now()) else {
                         continue;
@@ -3064,6 +3105,13 @@ async fn run_app_runtime_account_worker(
                         match job {
                             schedule::Job::Recovery => RuntimeOp::WatchdogMissedWakeRecovery,
                             schedule::Job::PostJoin => RuntimeOp::WatchdogMissedWakePostJoin,
+                            schedule::Job::AttachmentPass => {
+                                RuntimeOp::WatchdogMissedWakeAttachmentPass
+                            }
+                            schedule::Job::AvatarPass => RuntimeOp::WatchdogMissedWakeAvatarPass,
+                            schedule::Job::PresentationPass => {
+                                RuntimeOp::WatchdogMissedWakePresentationPass
+                            }
                         },
                         Duration::ZERO,
                         TelemetryOutcome::Success,
@@ -3071,6 +3119,17 @@ async fn run_app_runtime_account_worker(
                     if first {
                         tracing::warn!(target: "marmot_app::runtime", method = "maintenance_watchdog",
                             job = job.as_str(), "scheduled job had work with no wake pending");
+                    }
+                    // A missed pass runs on the worker's next turn.
+                    let pass = match job {
+                        schedule::Job::AttachmentPass => Some(&mut attachment_due),
+                        schedule::Job::AvatarPass => Some(&mut avatar_due),
+                        schedule::Job::PresentationPass => Some(&mut presentation_due),
+                        schedule::Job::Recovery | schedule::Job::PostJoin => None,
+                    };
+                    if let Some(due) = pass {
+                        *due = true;
+                        continue;
                     }
                     let context = EpochBackfillReportContext {
                         events: &events,
@@ -3087,6 +3146,9 @@ async fn run_app_runtime_account_worker(
                             client.post_join_advanced = false;
                             owed
                         }
+                        schedule::Job::AttachmentPass
+                        | schedule::Job::AvatarPass
+                        | schedule::Job::PresentationPass => unreachable!("passes set due above"),
                     };
                     schedule.ran(job, owed, TokioInstant::now());
                 }
@@ -3192,6 +3254,60 @@ async fn run_scheduled_post_join(
         );
     }
     failed || client.post_join_owed()
+}
+
+/// When the avatar pass next runs on its own: at the earliest acquisition
+/// `due`, in 15 s for one already due that waits for a free slot, after a
+/// failure, or while the bootstrap still has rows; otherwise only on a wake
+/// (mdk#2923 step B).
+fn avatar_pass_next_at(client: &AppClient, failed: bool) -> Option<TokioInstant> {
+    let retry = TokioInstant::now() + schedule::RETRY_WHILE_OWED;
+    let Ok((due, bootstrap)) = client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+    else {
+        return Some(retry);
+    };
+    if failed || bootstrap {
+        return Some(retry);
+    }
+    let now = crate::unix_now_seconds();
+    due.map(|at| {
+        if at <= now {
+            retry
+        } else {
+            TokioInstant::now() + Duration::from_secs(at - now)
+        }
+    })
+}
+
+/// The watchdog's read: whether the avatar pass has work due now.
+fn avatar_pass_owed_now(client: &AppClient) -> bool {
+    client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+        .map_or(true, |(due, bootstrap)| {
+            bootstrap || due.is_some_and(|at| at <= crate::unix_now_seconds())
+        })
+}
+
+/// When the presentation pass next runs on its own. It has no timed work:
+/// only rows it could not apply yet, or a failure, retry every 15 s, as the
+/// tick retried them (mdk#2923 step B).
+fn presentation_pass_next_at(client: &AppClient, failed: bool) -> Option<TokioInstant> {
+    (failed || presentation_pass_owed_now(client))
+        .then(|| TokioInstant::now() + schedule::RETRY_WHILE_OWED)
+}
+
+/// The watchdog's read: whether the presentation pass has rows left.
+fn presentation_pass_owed_now(client: &AppClient) -> bool {
+    client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().chat_presentation_work_pending()?))
+        .unwrap_or(true)
 }
 
 /// Sleeps until the schedule's next job, or forever when every job rests.

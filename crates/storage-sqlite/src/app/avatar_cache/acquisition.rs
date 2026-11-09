@@ -1,6 +1,7 @@
 //! Durable, bounded acquisition intent. Network/source policy belongs to marmot-app.
 use super::*;
 use crate::SqliteAppStorage;
+use crate::base::connection::CachedSql;
 use crate::{ChatPresentationRead, ChatPresentationVersion, SelectedAvatar};
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -153,6 +154,22 @@ impl SqliteAppStorage {
                 .storage()?;
         }
         Ok(())
+    }
+
+    /// When the avatar pass next has work: the earliest `due` of an
+    /// acquisition (a request, a lease end, a retry or a refresh), and
+    /// whether the one-time bootstrap still has rows. Reads only (mdk#2923).
+    pub fn avatar_work_schedule(&self) -> StorageResult<(Option<u64>, bool)> {
+        let (due, bootstrap): (Option<i64>, bool) = self
+            .lock()?
+            .query_row_cached(
+                "SELECT (SELECT MIN(due) FROM avatar_acquisition WHERE due IS NOT NULL),
+                        EXISTS(SELECT 1 FROM avatar_acquisition_bootstrap)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .storage()?;
+        Ok((due.map(|due| u64::try_from(due).unwrap_or(0)), bootstrap))
     }
 
     /// One bounded upgrade pass. The durable bootstrap ledger is consumed once;
