@@ -201,8 +201,9 @@ nix --extra-experimental-features 'nix-command flakes' develop
 
 The FHS shell provides Clang, pkg-config, nextest, cargo-audit, cargo-llvm-cov,
 cbindgen, valgrind, Python with uv, Tamarin, Java for TLC and rustup.
-Rustup supplies Rust 1.97.1; install that toolchain through rustup if it is
-missing. Cargo output defaults to `target/nix`, separate from non-Nix builds.
+Rustup reads the toolchain and required components from
+[`rust-toolchain.toml`](rust-toolchain.toml). Cargo keeps its usual `target/`
+output directory so the TUI recipes find the binaries they build.
 The packages are pinned by [`flake.lock`](flake.lock); no global `nix-ld`
 configuration is required.
 
@@ -214,7 +215,9 @@ nix --extra-experimental-features 'nix-command flakes' run . -- rustc --version
 ```
 
 The relay recipes need a separate `docker compose` command, provided by rootless
-Podman with Docker compatibility.
+Podman with Docker compatibility. The FHS shell replaces the host's `/usr`, so
+clients installed in `/usr/bin` are unavailable inside it. Run relay recipes
+outside the shell on those hosts, or install the client through Nix on the host.
 
 </details>
 

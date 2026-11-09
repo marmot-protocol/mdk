@@ -48,8 +48,6 @@
             jre_headless
           ];
         profile = ''
-          export RUSTUP_TOOLCHAIN=1.97.1
-          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$PWD/target/nix}"
           export CC=${pkgs.clang}/bin/clang
           export CXX=${pkgs.clang}/bin/clang++
           export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
