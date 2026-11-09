@@ -1121,13 +1121,21 @@ impl<S: StorageProvider> Engine<S> {
     /// it reaches the queued leave, even if the account has become the last
     /// active admin since: that leave had started, so the re-drive blocks it
     /// (`LeaveBlockReason::LastActiveAdmin`) rather than the drain refusing
-    /// it after the app already showed it.
+    /// it after the app already showed it. The request replaces the queued
+    /// leave in one storage transaction: a queued leave left beside its
+    /// request would record the leave again after a Cancel cleared it.
     pub(crate) fn do_request_admin_leave(
         &mut self,
         group_id: &GroupId,
         entry: AdminLeaveEntry,
     ) -> Result<Option<SendResult>, EngineError> {
         if let Some(request) = self.load_leave_request_state(group_id)? {
+            // The request already holds the leave the drain reached.
+            if entry == AdminLeaveEntry::Prepare {
+                for id in self.queued_admin_leave_ids(group_id)? {
+                    self.storage.delete_queued_outbound_intent(&id)?;
+                }
+            }
             self.schedule_pending_convergence_group(group_id);
             return Ok(Some(SendResult::LeaveRequested { request }));
         }
@@ -1175,7 +1183,13 @@ impl<S: StorageProvider> Engine<S> {
             last_proposed_epoch: None,
             blocked: None,
         };
-        self.put_leave_request_state(&request)?;
+        match entry {
+            AdminLeaveEntry::Send => self.put_leave_request_state(&request)?,
+            AdminLeaveEntry::Prepare => {
+                let queued = self.queued_admin_leave_ids(group_id)?;
+                self.put_leave_request_state_replacing(&request, &queued)?;
+            }
+        }
         self.schedule_pending_convergence_group(group_id);
         tracing::info!(
             target: "cgka_engine::leave_request",
@@ -1183,6 +1197,18 @@ impl<S: StorageProvider> Engine<S> {
             "admin leave request recorded"
         );
         Ok(Some(SendResult::LeaveRequested { request }))
+    }
+
+    /// The group's queued admin leaves: at most one, since a repeated
+    /// `StepDownAndLeave` returns the queued row.
+    fn queued_admin_leave_ids(&self, group_id: &GroupId) -> Result<Vec<MessageId>, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .into_iter()
+            .filter(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }))
+            .map(|record| record.id)
+            .collect())
     }
 
     pub(crate) async fn prepare_self_remove_proposal(

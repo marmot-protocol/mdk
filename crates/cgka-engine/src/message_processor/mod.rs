@@ -1413,13 +1413,12 @@ impl<S: StorageProvider> Engine<S> {
                     self.queued_intent_by_pending
                         .insert(*pending, (record.group_id.clone(), record.id.clone()));
                 }
-                // The settled state already holds the change, or the durable
-                // leave request now holds an admin's leave, and with nothing
+                // The settled state already holds the change, and with nothing
                 // to publish no confirmation will retire the record. Kept, it
                 // would wait forever and hold every later send behind it. If
                 // the delete fails, the record stays for the next drain to
                 // retire: failing this one would drop what it has prepared.
-                SendResult::NoChange { .. } | SendResult::LeaveRequested { .. } => {
+                SendResult::NoChange { .. } => {
                     if self
                         .storage
                         .delete_queued_outbound_intent(&record.id)
@@ -1434,6 +1433,9 @@ impl<S: StorageProvider> Engine<S> {
                         self.schedule_pending_convergence_group(group_id);
                     }
                 }
+                // Recording an admin's leave request retired its queued row in
+                // the same transaction (`do_request_admin_leave`).
+                SendResult::LeaveRequested { .. } => {}
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
                 | SendResult::DisbandRequested { .. }

@@ -344,8 +344,11 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   written; a non-admin's call becomes `SendIntent::Leave`; a call on a group that already has a request returns it.
   Plain `Leave` from an admin stays `AdminCannotSelfRemove`, so only callers that opt in get the step-down. A call made
   while an intent queued earlier still awaits preparation queues behind it instead (mdk#2842), and the drain records the
-  request when it reaches that row and retires it: a request recorded first would hold the drain to the leave, and the
-  removal would discard the earlier intent unsent. The queued leave has started, so the drain records it even when the
+  request when it reaches that row, deleting the row in the same storage transaction
+  (`put_leave_request_state_replacing`): a request recorded first would hold the drain to the leave, and the
+  removal would discard the earlier intent unsent. Never write the two separately: a row left beside its request
+  records the leave again once a Cancel clears the request.
+  The queued leave has started, so the drain records it even when the
   account has become the last active admin, and the re-drive blocks it; never refuse it at drain, since the app has
   already shown the leave. A repeated call returns the queued row before any admin check. Pinned by
   `invite_leave::admin_leave`, `queued_send_order`, and marmot-app's `rival_branch_leave` and `linked_device_chats`
