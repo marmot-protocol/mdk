@@ -1873,7 +1873,7 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
-    /// Retry only raw input whose replay failed after durable confirmation.
+    /// Retry raw input whose replay failed after confirmation, rollback, or join.
     /// Background drain and inputs-only entry points share this before later work; the
     /// terminal/pending gates still own whether the retained input may run.
     async fn retry_pending_confirmation_replay(
@@ -4169,9 +4169,18 @@ impl<S: StorageProvider> Engine<S> {
             .or_default()
             .confirmation_replay_visited
             .clear();
-        self.replay_buffered_messages_with_execution(group_id, None)
+        let result = self
+            .replay_buffered_messages_with_execution(group_id, None)
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if result.is_err() {
+            // The lifecycle change has committed; retained input still needs a wake.
+            self.pending_confirmation_replays.insert(group_id.clone());
+            self.schedule_pending_convergence_group(group_id);
+        } else {
+            self.pending_confirmation_replays.remove(group_id);
+        }
+        result
     }
 
     /// Replay complete input operations within the caller's shared background allowance.

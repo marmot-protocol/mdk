@@ -199,6 +199,15 @@ impl From<TimelineReactionSummary> for TimelineReactionSummaryFfi {
 pub struct TimelineMessageQueryFfi {
     pub group_id_hex: Option<String>,
     pub search: Option<String>,
+    pub sender: Option<String>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+    /// 0 Any, 1 Image, 2 Video, 3 Audio, 4 File, 5 Attachment.
+    #[uniffi(default = 0)]
+    pub attachment_type: u32,
+    #[uniffi(default = false)]
+    pub search_wall_clock: bool,
+    pub cursor_group_id: Option<String>,
     pub before: Option<u64>,
     pub before_message_id: Option<String>,
     pub after: Option<u64>,

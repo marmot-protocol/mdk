@@ -44,15 +44,39 @@ pub struct MarmotTimelineMessageQuery {
     /// Page-size cap; set `has_limit`.
     pub has_limit: u8,
     pub limit: u32,
+    /// Sender public key or member reference. Nullable.
+    pub sender: *const c_char,
+    /// Inclusive lower timeline timestamp; set `has_since`.
+    pub has_since: u8,
+    pub since: u64,
+    /// Exclusive upper timeline timestamp; set `has_until`.
+    pub has_until: u8,
+    pub until: u64,
+    /// 0 Any, 1 Image, 2 Video, 3 Audio, 4 File, 5 Attachment.
+    pub attachment_type: u32,
+    /// Nonzero selects wall-clock ordering even within a group.
+    pub search_wall_clock: u8,
+    /// Opaque MLS group id in hex for a wall-clock cursor. Nullable.
+    pub cursor_group_id: *const c_char,
 }
 
 impl MarmotTimelineMessageQuery {
     /// # Safety
     /// Non-NULL strings must be valid NUL-terminated strings.
     pub(crate) unsafe fn to_ffi(&self) -> Result<TimelineMessageQueryFfi, MarmotStatus> {
+        if self.attachment_type > 5 {
+            crate::status::set_last_error("timeline attachment_type must be in 0..=5");
+            return Err(MarmotStatus::InvalidArgument);
+        }
         Ok(TimelineMessageQueryFfi {
             group_id_hex: unsafe { optional_str(self.group_id_hex) }?,
             search: unsafe { optional_str(self.search) }?,
+            sender: unsafe { optional_str(self.sender) }?,
+            since: c_bool(self.has_since).then_some(self.since),
+            until: c_bool(self.has_until).then_some(self.until),
+            attachment_type: self.attachment_type,
+            search_wall_clock: c_bool(self.search_wall_clock),
+            cursor_group_id: unsafe { optional_str(self.cursor_group_id) }?,
             before: c_bool(self.has_before).then_some(self.before),
             before_message_id: unsafe { optional_str(self.before_message_id) }?,
             after: c_bool(self.has_after).then_some(self.after),
@@ -461,6 +485,43 @@ c_mirror! {
 #[cfg(test)]
 mod edit_tests {
     use super::*;
+
+    #[test]
+    fn timeline_query_inputs() {
+        // Every field is an integer or a nullable borrowed pointer.
+        let mut query: MarmotTimelineMessageQuery = unsafe { std::mem::zeroed() };
+        let empty = unsafe { query.to_ffi() }.unwrap();
+        assert!(empty.group_id_hex.is_none() && empty.search.is_none());
+        assert!(empty.sender.is_none() && empty.since.is_none() && empty.until.is_none());
+        assert_eq!(empty.attachment_type, 0);
+        assert!(!empty.search_wall_clock);
+        assert!(empty.cursor_group_id.is_none());
+        assert!(empty.before.is_none() && empty.after.is_none() && empty.limit.is_none());
+
+        query.sender = c"sender".as_ptr();
+        query.has_since = 2;
+        query.since = 0;
+        query.has_until = 255;
+        query.until = 501;
+        query.attachment_type = 5;
+        query.search_wall_clock = 2;
+        query.cursor_group_id = c"abcd".as_ptr();
+        let filters = unsafe { query.to_ffi() }.unwrap();
+        assert_eq!(filters.sender.as_deref(), Some("sender"));
+        assert_eq!((filters.since, filters.until), (Some(0), Some(501)));
+        assert_eq!(filters.attachment_type, 5);
+        assert!(filters.search_wall_clock);
+        assert_eq!(filters.cursor_group_id.as_deref(), Some("abcd"));
+
+        for attachment_type in [6, u32::MAX] {
+            query.attachment_type = attachment_type;
+            assert!(matches!(
+                unsafe { query.to_ffi() },
+                Err(MarmotStatus::InvalidArgument)
+            ));
+        }
+    }
+
     /// The complete participant list owns and deep-frees every nested field, including empty lists.
     #[test]
     fn complete_reaction_list_deep_frees_all_participants() {

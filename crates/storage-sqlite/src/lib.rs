@@ -159,11 +159,11 @@ pub use app::timeline::{
     ConversationPresentationPage, ConversationWindowQuery, DeletionSource, HistoryExportEvent,
     HistoryExportRow, HistoryImportProvenance, HistoryImportSource, ImportedAppEvent,
     ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON, LatestHistoryImport, MAX_TIMELINE_LIMIT,
-    SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
-    TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    SecurePruneAppEventsResult, StoredAppEvent, TimelineAttachmentType, TimelineEditHistoryPage,
+    TimelineEditSummary, TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery,
+    TimelineMessageRecord, TimelineMessageTarget, TimelinePage, TimelinePagination,
+    TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
+    TimelineUpdateTrigger, TimelineUserReaction,
 };
 pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,

@@ -25,7 +25,7 @@ per feature.
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
-  [chat screens and avatars](#chat-screens-and-avatars),
+  [chat screens and avatars](#chat-screens-and-avatars), [advanced timeline search](#advanced-timeline-search),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
   [turning on account devices](#turning-on-account-devices),
   [undelivered Welcomes](#undelivered-welcomes),
@@ -440,6 +440,27 @@ avatar metadata pointer. Use `marmot_request_avatar_assets` for up to 16 visible
 opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 references / 16 MiB), and
 `marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
 `marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions.
+## Advanced timeline search
+
+`marmot_timeline_messages` takes a borrowed `MarmotTimelineMessageQuery`. See the
+[shared search contract](../marmot-uniffi/README.md#advanced-timeline-search) for filters, ordering, and cursors.
+Initialize the entire struct with `{0}` before setting fields. The search fields have these C types and defaults:
+
+| Field | C type | Unset or default |
+| --- | --- | --- |
+| `sender` | `const char *` | `NULL` |
+| `has_since`, `since` | `uint8_t`, `uint64_t` | `has_since = 0` |
+| `has_until`, `until` | `uint8_t`, `uint64_t` | `has_until = 0` |
+| `attachment_type` | `uint32_t` | `0` (Any) |
+| `search_wall_clock` | `uint8_t` | `0` (canonical group order) |
+| `cursor_group_id` | `const char *` | `NULL` |
+
+These fields are appended after `limit` in the input layout. `sender` and `cursor_group_id`
+strings are borrowed for the call, like the other query strings. Nonzero flags are true, including
+`has_since` and `has_until` when their corresponding timestamp is zero. Invalid `attachment_type` values
+outside `0..=5` return `MARMOT_STATUS_INVALID_ARGUMENT` before querying the runtime.
+Free the returned page with `marmot_timeline_page_free`; the library does not free query inputs.
+
 ## NIP-46 accounts
 
 Keep one `MarmotNip46Session` per remote-signer account. Local-key accounts use

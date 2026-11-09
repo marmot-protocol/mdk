@@ -182,11 +182,21 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
         has_more_after: false,
     };
     for update in &returned.projection_updates {
-        crate::runtime::apply_projection_to_window(&mut window, update, 100, true);
+        crate::runtime::apply_projection_to_window(
+            &mut window,
+            update,
+            100,
+            crate::runtime::TimelineOrder::GroupCanonical,
+        );
     }
     let buffered = client.take_pending_applied_sync_summary();
     for update in &buffered.projection_updates {
-        crate::runtime::apply_projection_to_window(&mut window, update, 100, true);
+        crate::runtime::apply_projection_to_window(
+            &mut window,
+            update,
+            100,
+            crate::runtime::TimelineOrder::GroupCanonical,
+        );
     }
     let stored = timeline(&app, &group);
     assert_eq!(stored.messages.len(), 1);

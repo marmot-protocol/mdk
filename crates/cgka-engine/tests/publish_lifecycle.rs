@@ -3457,6 +3457,182 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
 
 // ── Retained app messages across a temporary non-stable state ────────────────
 
+#[tokio::test]
+async fn rejoin_retries_failed_replay() {
+    use cgka_traits::engine::GroupEvent;
+    use cgka_traits::ingest::LocalIngestState;
+
+    enum Route {
+        Direct,
+        Inbox,
+        RetainedOffer,
+    }
+    for route in [Route::Direct, Route::Inbox, Route::RetainedOffer] {
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let fault = ConfirmationFault::default();
+        let mut alice = EngineBuilder::new(FaultStorage {
+            inner: storage.clone(),
+            message_rows: Arc::default(),
+            fault: ProcessedFault::default(),
+            lifecycle_fault: ProcessedFault::default(),
+            disband_request_fault: ProcessedFault::default(),
+            queued_intent_list_fault: ProcessedFault::default(),
+            confirmation_fault: fault.clone(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"rejoin-alice"))
+        .account_identity_proof_signer(proof_signer(b"rejoin-alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+        let mut bob = build(b"rejoin-bob");
+        let group_id = group_with_bob(&mut bob, &mut alice).await;
+        let SendResult::GroupEvolution {
+            mut msg, pending, ..
+        } = bob
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![alice.self_id()],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("removal stages a commit");
+        };
+        bob.confirm_published(pending).await.unwrap();
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+        let removal = msg;
+
+        let key_package = alice.fresh_key_package().await.unwrap();
+        let SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } = bob
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![key_package],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("reinvite stages a Welcome");
+        };
+        bob.confirm_published(pending).await.unwrap();
+        let welcome = welcomes.remove(0);
+        if matches!(route, Route::RetainedOffer) {
+            assert!(matches!(
+                alice.ingest(welcome.clone()).await.unwrap(),
+                IngestOutcome::LocalState {
+                    state: LocalIngestState::RejoinConfirmationRequired
+                }
+            ));
+        }
+        alice.ingest(removal).await.unwrap();
+        alice
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+        assert!(storage.get_group(&group_id).unwrap().removed);
+
+        let payload = app_payload_for(&bob, "retained until replacement replay heals");
+        let SendResult::ApplicationMessage { mut msg, .. } = bob
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: payload.clone(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("peer application message");
+        };
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+        alice.ingest(msg.clone()).await.unwrap();
+        let retained = storage.get_message(&msg.id).unwrap();
+        assert_eq!(retained.state, MessageState::Retryable);
+        alice.drain_events();
+
+        fault.replay.arm(2);
+        match route {
+            Route::Direct => assert_eq!(alice.join_welcome(welcome).await.unwrap(), group_id),
+            Route::Inbox => {
+                let welcome_id = welcome.id.clone();
+                assert!(matches!(
+                    alice.ingest(welcome).await.unwrap(),
+                    IngestOutcome::Processed
+                ));
+                assert_eq!(
+                    storage.get_message(&welcome_id).unwrap().state,
+                    MessageState::Processed
+                );
+            }
+            Route::RetainedOffer => {
+                assert!(alice.retry_rejoins_after_trusted_removal().await.unwrap())
+            }
+        }
+        assert!(!storage.get_group(&group_id).unwrap().removed);
+        assert_eq!(
+            alice.epoch(&group_id).unwrap(),
+            bob.epoch(&group_id).unwrap()
+        );
+        assert!(alice.drain_events().iter().any(|event| matches!(event,
+        GroupEvent::GroupJoined { group_id: joined, .. } if joined == &group_id)));
+        assert_eq!(storage.get_message(&msg.id).unwrap(), retained);
+        assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            Some(0)
+        );
+
+        let error = alice.advance_convergence(&group_id).await.unwrap_err();
+        assert!(
+            matches!(&error, EngineError::Storage(StorageError::Busy(reason))
+        if reason == "injected post-confirm replay read")
+        );
+        assert_eq!(storage.get_message(&msg.id).unwrap(), retained);
+        assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            Some(0)
+        );
+
+        alice.advance_convergence(&group_id).await.unwrap();
+        let received: Vec<_> = alice
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived {
+                    sender, payload, ..
+                } => Some((sender, payload)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received, vec![(bob.self_id(), payload)]);
+        assert_eq!(
+            storage.get_message(&msg.id).unwrap().state,
+            MessageState::Processed
+        );
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            None
+        );
+        alice.advance_convergence(&group_id).await.unwrap();
+        assert!(alice.drain_events().is_empty());
+    }
+}
+
 /// A chat payload the engine's app-payload validation accepts from `engine`.
 fn app_payload_for(engine: &impl CgkaEngine, body: &str) -> Vec<u8> {
     cgka_traits::app_event::MarmotAppEvent::new(

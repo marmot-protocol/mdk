@@ -408,6 +408,8 @@ wn --account <npub-or-hex> messages subscribe <group-hex> --limit 50
 wn --account <npub-or-hex> messages subscribe <group-hex> --kind 30100
 wn --account <npub-or-hex> messages timeline list <group-hex> --limit 20
 wn --account <npub-or-hex> messages timeline search <query> --group <group-hex> --limit 20
+wn --account <npub-or-hex> messages timeline search "" --sender <npub-or-hex> --since <unix-seconds> --until <unix-seconds> --attachment-type image
+wn --account <npub-or-hex> messages timeline search <query> --before <timeline-at> --before-message-id <message-id> --cursor-group-id <group-hex>
 wn --account <npub-or-hex> messages timeline subscribe <group-hex>
 ```
 
@@ -455,9 +457,20 @@ standalone rows with their own kind and tags and never fold onto a target messag
 a custom event arrives as type `message`; on the timeline feed its change trigger is `CustomEvent`.
 
 **Timeline.** `messages timeline list|search|subscribe` read the materialized timeline, which interleaves messages,
-media, and agent-stream anchors/finals in conversation order. Projected history is ordered by recorded message time
-first, then local receipt/insertion order, so synced stream anchors and finals stay in conversation order rather than
-relay catch-up order.
+media, and agent-stream anchors/finals. Group lists and subscriptions use canonical conversation order.
+
+**Timeline search.** `messages timeline search` searches retained local history, across the account unless a group
+is supplied. Text is a trimmed, case-insensitive literal substring; query operators and wildcards have no special
+meaning. An empty query (`""`) applies only the other filters. `--sender` accepts an exact npub or hex public key.
+`--since` is inclusive and `--until` is exclusive, both in Unix seconds on `timeline_at`. `--attachment-type` accepts
+`any` (no attachment restriction), `image`, `video`, `audio`, `file` (other or unknown MIME type), or `attachment`
+(any attachment). Filters combine before the page limit, which is capped at 200 rows.
+
+Search pages are oldest first in wall-clock order, including group-restricted searches. To fetch older results,
+pass the first row's `timeline_at` and `message_id` as `--before` and `--before-message-id`. To fetch newer results,
+use the last row with `--after` and `--after-message-id`. Account-wide paging also requires that row's `group_id`
+as `--cursor-group-id`, so identical message ids in different groups remain distinct. Keep the same filters between
+pages and use `has_more_before` and `has_more_after` from JSON output to find the remaining history.
 
 **Delivery.** A timeline row (`messages timeline list|search|subscribe`) carries `invalidation_status`, which names
 why the row was withdrawn or failed (`local_publish_failed`, `LosingBranch`, ...) and is `null` otherwise. A row is

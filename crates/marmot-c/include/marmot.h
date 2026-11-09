@@ -5187,6 +5187,32 @@ typedef struct MarmotTimelineMessageQuery {
    */
   uint8_t has_limit;
   uint32_t limit;
+  /**
+   * Sender public key or member reference. Nullable.
+   */
+  const char *sender;
+  /**
+   * Inclusive lower timeline timestamp; set `has_since`.
+   */
+  uint8_t has_since;
+  uint64_t since;
+  /**
+   * Exclusive upper timeline timestamp; set `has_until`.
+   */
+  uint8_t has_until;
+  uint64_t until;
+  /**
+   * 0 Any, 1 Image, 2 Video, 3 Audio, 4 File, 5 Attachment.
+   */
+  uint32_t attachment_type;
+  /**
+   * Nonzero selects wall-clock ordering even within a group.
+   */
+  uint8_t search_wall_clock;
+  /**
+   * Opaque MLS group id in hex for a wall-clock cursor. Nullable.
+   */
+  const char *cursor_group_id;
 } MarmotTimelineMessageQuery;
 
 /**

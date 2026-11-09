@@ -15,6 +15,10 @@
 
 ### Fixed
 
+- Retry a failed buffered-message replay after a committed replacement Welcome through the normal background drain
+  (mdk#3240). Messages retained while the copy was frozen no longer need redelivery or another publication to replay.
+  The committed join returns success even if that replay fails, so inbox and automatic-rejoin callers receive its effects.
+
 - A leaving account that the selected branch makes an admin again steps down again before its SelfRemove
   (mdk#3014). While a durable leave request exists and another active admin remains, the drain stages a step-down
   from the selected branch's admin list, so a promotion on the winning branch stands; the SelfRemove follows once that
