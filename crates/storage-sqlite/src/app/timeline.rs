@@ -3885,8 +3885,14 @@ fn timeline_query_sql(
             TimelineAttachmentType::Any | TimelineAttachmentType::Attachment => "",
         };
         clauses.push(format!(
-            "EXISTS (SELECT 1 FROM json_each(timeline.tags_json) AS attachment
-             WHERE json_extract(attachment.value, '$[0]') = 'imeta' {mime_predicate})"
+            "EXISTS (SELECT 1 FROM json_each(
+                 CASE WHEN json_valid(timeline.tags_json) THEN
+                     CASE WHEN json_type(timeline.tags_json) = 'array'
+                         THEN timeline.tags_json ELSE '[]' END
+                     ELSE '[]' END) AS attachment
+             WHERE CASE WHEN attachment.type = 'array' THEN
+                 json_extract(attachment.value, '$[0]') = 'imeta' {mime_predicate}
+                 ELSE 0 END)"
         ));
     }
     let account_search_order = query.search_wall_clock && query.group_id_hex.is_none();

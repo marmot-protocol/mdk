@@ -236,6 +236,7 @@ before the page limit. `TimelineAttachmentType` reads individual `imeta` tags, i
 column: image, video, and audio match case-insensitive MIME prefixes. File matches an attachment without any of
 those prefixes, including an unknown MIME type. A message with an image and a separate file matches both filters.
 Attachment matches any `imeta` tag; Any leaves attachments unfiltered.
+Malformed or non-array tag blobs and non-array tag entries do not match attachment filters.
 
 Group reads use canonical epoch order by default. `search_wall_clock = true` selects wall-clock order instead.
 Account-wide searches with that flag order by `(timeline_at, message_id_hex, group_id_hex)` and require

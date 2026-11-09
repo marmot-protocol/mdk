@@ -3073,6 +3073,47 @@ fn timeline_search_mime_tags() {
 }
 
 #[test]
+fn timeline_search_corrupt_tags() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let store = storage.app_storage();
+    let mut image = chat("image", "alice", 10, "attachment");
+    image.tags = vec![vec!["imeta".into(), "m image/png".into()]];
+    store.record_app_event(&image).unwrap();
+    for (id, tags) in [
+        ("invalid", "not json"),
+        ("scalar", r#""imeta""#),
+        ("object", r#"{"tags":[["imeta","m image/png"]]}"#),
+        ("elements", r#"["imeta",null,7,{}]"#),
+    ] {
+        store
+            .record_app_event(&chat(id, "alice", 10, "attachment"))
+            .unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE message_timeline SET tags_json = ?1 WHERE message_id_hex = ?2",
+                params![tags, id],
+            )
+            .unwrap();
+    }
+    for (attachment_type, expected) in [
+        (TimelineAttachmentType::Image, vec!["image"]),
+        (TimelineAttachmentType::File, vec![]),
+        (TimelineAttachmentType::Attachment, vec!["image"]),
+    ] {
+        let page = store
+            .message_timeline(TimelineMessageQuery {
+                attachment_type,
+                search_wall_clock: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(ids(&page), expected, "{attachment_type:?}");
+    }
+}
+
+#[test]
 fn sender_own_invalidated_message_stays_as_tombstone() {
     // Issue #111: a sender's own message invalidated by convergence (losing
     // branch) must not silently disappear; it stays with a status instead.
