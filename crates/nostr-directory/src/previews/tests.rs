@@ -563,3 +563,134 @@ fn shared_identity_corpus_matches_preview_baseline() {
         );
     }
 }
+
+/// One local account over a real encrypted cache, for tests that need a
+/// `Directory` but no relays.
+#[derive(Clone)]
+struct CacheResources {
+    account: DirectoryAccount,
+    cache: crate::DirectoryCache,
+    shared: storage_sqlite::SqliteSharedStorage,
+}
+
+impl DirectoryResources for CacheResources {
+    fn local_accounts(&self) -> Result<Vec<DirectoryAccount>, DirectoryError> {
+        Ok(vec![self.account.clone()])
+    }
+
+    fn account_id_for_label(&self, _: &str) -> Result<String, DirectoryError> {
+        Ok(self.account.account_id_hex.clone())
+    }
+
+    fn current_caches(&self) -> Result<Vec<crate::DirectoryCache>, DirectoryError> {
+        Ok(vec![self.cache.clone()])
+    }
+
+    fn cache_for_account(
+        &self,
+        _: &DirectoryAccount,
+    ) -> Result<crate::DirectoryCache, DirectoryError> {
+        Ok(self.cache.clone())
+    }
+
+    fn shared_storage(&self) -> Result<storage_sqlite::SqliteSharedStorage, DirectoryError> {
+        Ok(self.shared.clone())
+    }
+
+    fn directory_entry_changed(&self, _: &str) {}
+
+    fn account_key_package_published(&self, _: &str) {}
+}
+
+/// The cached relay-list read takes the cache's SQLite lock. While another
+/// operation holds that lock, the read must wait on a blocking thread, not
+/// park the runtime: on a single-threaded runtime, other tasks keep running
+/// until the lock is released, and the read then returns the cached relays.
+#[tokio::test(flavor = "current_thread")]
+async fn cached_author_relay_reads_do_not_park_the_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let key = storage_sqlite::SqlCipherKey::raw([0x31; 32]);
+    let cache = crate::DirectoryCache::open(temp.path().join("directory.sqlite3"), &key).unwrap();
+    let resources = CacheResources {
+        account: DirectoryAccount {
+            account_id_hex: Keys::generate().public_key().to_hex(),
+            label: "fixture".into(),
+            local_signing: true,
+            active_signing: true,
+        },
+        cache: cache.clone(),
+        shared: storage_sqlite::SqliteSharedStorage::in_memory().unwrap(),
+    };
+    let config = crate::DirectoryConfig {
+        directory_relays: vec![],
+        default_relays: vec![],
+        max_future_skew: Duration::from_secs(60),
+        open_ranking: None,
+        fallback_seeds: vec![],
+        http_builder: Ok,
+        test_clock: None,
+    };
+    let directory = Directory::new(
+        resources,
+        config,
+        transport_nostr::MarmotRelayPlane::full_history(),
+        crate::DirectoryState::default(),
+    );
+    let author = Keys::generate().public_key();
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = 1_000;
+    lists.nip65.relays = vec!["wss://write.example".into()];
+    lists.nip65.write_relays = lists.nip65.relays.clone();
+    lists.refresh();
+    directory
+        .remember_directory_relay_lists(&author.to_hex(), &lists)
+        .unwrap();
+
+    // Another operation holds the cache lock until told to release it, or
+    // for at most five seconds, so a regression fails instead of hanging.
+    let released = Arc::new(AtomicBool::new(false));
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let released = released.clone();
+        move || {
+            let guard = cache.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            released.store(true, Ordering::SeqCst);
+            drop(guard);
+        }
+    });
+    locked_rx.recv().unwrap();
+
+    let read = tokio::spawn({
+        let directory = directory.clone();
+        async move {
+            directory
+                .public_event_author_relays(Some(author), &[])
+                .await
+        }
+    });
+    // Spawned after the read, so on this one thread it runs only once the
+    // read has yielded.
+    let progressed = tokio::spawn({
+        let released = released.clone();
+        async move { !released.load(Ordering::SeqCst) }
+    });
+    assert!(
+        progressed.await.unwrap(),
+        "the runtime stalled until the cache lock was released"
+    );
+    release_tx.send(()).unwrap();
+    let (relays, complete) = read.await.unwrap();
+    holder.join().unwrap();
+    assert_eq!(
+        relays,
+        vec![TransportEndpoint("wss://write.example".to_owned())]
+    );
+    assert!(complete);
+}

@@ -944,8 +944,14 @@ impl<R: DirectoryResources> Directory<R> {
         let Some(author) = author else {
             return (Vec::new(), true);
         };
+        // The cache read opens account caches and takes their SQLite locks, so
+        // it runs on a blocking thread: lock contention must not park a Tokio
+        // worker. A failed read is treated as uncached.
+        let directory = self.clone();
         let author_hex = author.to_hex();
-        if let Ok(cached) = self.cached_relay_list_status(&author_hex)
+        let cached =
+            blocking_directory_task(move || directory.cached_relay_list_status(&author_hex)).await;
+        if let Ok(cached) = cached
             && cached.nip65.created_at > 0
         {
             return (
