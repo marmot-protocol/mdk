@@ -230,6 +230,21 @@ compatible with other backends.
 
 ## Conversation reads
 
+`message_timeline` combines `TimelineMessageQuery`'s literal, Unicode-lowercased substring search with an exact
+sender match, an inclusive `since` and exclusive `until` on `timeline_at`, and an attachment type. All filters apply
+before the page limit. `TimelineAttachmentType` reads individual `imeta` tags, independently of the decoded media
+column: image, video, and audio match case-insensitive MIME prefixes. File matches an attachment without any of
+those prefixes, including an unknown MIME type. A message with an image and a separate file matches both filters.
+Attachment matches any `imeta` tag; Any leaves attachments unfiltered.
+Malformed or non-array tag blobs and non-array tag entries do not match attachment filters.
+
+Group reads use canonical epoch order by default. `search_wall_clock = true` selects wall-clock order instead.
+Account-wide searches with that flag order by `(timeline_at, message_id_hex, group_id_hex)` and require
+`cursor_group_id` alongside a before or after cursor. The cursor compares the same complete tuple, with
+`before_inclusive` including the exact cursor row. Pages remain bounded by `MAX_TIMELINE_LIMIT`, including filtered
+searches over longer histories. The default timeline and retention wall-clock query keep their existing cursor
+semantics.
+
 `conversation_open` composes a bounded canonical timeline page with retained read state in one read-only snapshot,
 supporting first-unread/latest opening and scoped anchor recovery; dirty projections return `ReadStateNotReady` for the
 existing owner to refresh. `conversation_window` adds explicit context placement around a retained anchor (latest

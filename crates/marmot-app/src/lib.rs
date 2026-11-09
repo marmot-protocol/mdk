@@ -358,10 +358,10 @@ pub use storage_sqlite::{
     BackupHistorySource, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow,
     DeletionSource, ExistingDirectConversation, HistoryImportProvenance, HistoryImportSource,
-    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
-    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
-    select_reusable_direct_conversation,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineAttachmentType, TimelineEditHistoryPage,
+    TimelineEditSummary, TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, TimelinePagination, TimelineReactionSummary, TimelineReplyPreview,
+    TimelineUserReaction, select_reusable_direct_conversation,
 };
 #[cfg(test)]
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;

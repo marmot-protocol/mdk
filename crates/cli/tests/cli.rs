@@ -5331,6 +5331,82 @@ fn messages_plural_send_and_list_are_the_canonical_message_surface() {
     assert_message_plaintexts(&timeline_search, &["another searchable line"]);
     assert_no_message_plaintext(&timeline_search, "plural surface");
 
+    let hit = &timeline_search["messages"][0];
+    let at = hit["timeline_at"].as_u64().expect("timeline timestamp");
+    let since = at.to_string();
+    let until = (at + 1).to_string();
+    let filtered = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "search",
+            "searchable",
+            "--sender",
+            &alice,
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--attachment-type",
+            "any",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(filtered["messages"], timeline_search["messages"]);
+
+    let older = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "search",
+            "searchable",
+            "--before",
+            &since,
+            "--before-message-id",
+            hit["message_id"].as_str().expect("message id"),
+            "--cursor-group-id",
+            group_id,
+        ],
+    );
+    assert_eq!(older["messages"], serde_json::json!([]));
+
+    let wrong_sender = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "search",
+            "searchable",
+            "--sender",
+            &bob,
+        ],
+    );
+    assert_eq!(wrong_sender["messages"], serde_json::json!([]));
+
+    let attachments = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "search",
+            "searchable",
+            "--attachment-type",
+            "image",
+        ],
+    );
+    assert_eq!(attachments["messages"], serde_json::json!([]));
+
     let search_all = run_json(
         home.path(),
         &["--account", &bob, "messages", "search-all", "plural"],

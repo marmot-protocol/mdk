@@ -1153,6 +1153,16 @@ pub(crate) enum MessageCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+pub(crate) enum SearchAttachmentType {
+    Any,
+    Image,
+    Video,
+    Audio,
+    File,
+    Attachment,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum MessageTimelineCommand {
     #[command(about = "List materialized timeline messages")]
@@ -1180,6 +1190,24 @@ pub(crate) enum MessageTimelineCommand {
         group_id: Option<String>,
         #[arg(long, help = "Group id to search")]
         group: Option<String>,
+        #[arg(long, help = "Exact sender pubkey (npub or hex)")]
+        sender: Option<String>,
+        #[arg(long, help = "Inclusive timeline timestamp in Unix seconds")]
+        since: Option<u64>,
+        #[arg(long, help = "Exclusive timeline timestamp in Unix seconds")]
+        until: Option<u64>,
+        #[arg(long, value_enum, help = "Attachment MIME category")]
+        attachment_type: Option<SearchAttachmentType>,
+        #[arg(long, requires = "before_message_id", conflicts_with = "after")]
+        before: Option<u64>,
+        #[arg(long, requires = "before")]
+        before_message_id: Option<String>,
+        #[arg(long, requires = "after_message_id", conflicts_with = "before")]
+        after: Option<u64>,
+        #[arg(long, requires = "after")]
+        after_message_id: Option<String>,
+        #[arg(long, help = "Cursor row's group id; required for account-wide paging")]
+        cursor_group_id: Option<String>,
         #[arg(long, help = "Maximum number of results to return")]
         limit: Option<usize>,
     },

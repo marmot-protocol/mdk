@@ -100,11 +100,11 @@ impl Marmot {
     ) -> Result<Arc<TimelineMessagesSubscription>, MarmotKitError> {
         let query = TimelineMessageQuery {
             group_id_hex: optional_group_id_hex(group_id_hex)?,
-            search: None,
             pagination: TimelinePagination {
                 limit: limit.map(|value| value as usize),
                 ..TimelinePagination::default()
             },
+            ..TimelineMessageQuery::default()
         };
         let inner = self
             .runtime
