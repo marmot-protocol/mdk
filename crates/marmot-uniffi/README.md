@@ -105,6 +105,24 @@ screen API exists. The method reference marks explicit alternatives individually
 | KeyPackage settings | `localAccountKeyPackages`, then `refreshAccountKeyPackages` | `accountKeyPackages` for the existing network-oriented inventory; `accountKeyPackageRelayEvents` remains useful for observed publication history. |
 | Interactive imported-account onboarding | `beginOnboarding` / `beginExternalSignerOnboarding`, workflow snapshots and revision/epoch-aware approvals | `login` / `loginExternalSigner` remain compatible direct flows; they do not implement the interactive repair/notice UI for you. |
 | Group administration | Detailed mutation methods where available, plus `groupManagementState` | Shorter mutation methods remain supported; use detailed results when the UI needs operation outcomes. |
+| Start a direct chat | `startDirectConversation(accountRef, peerAccountId)` | `existingDirectConversation` is lookup-only. Generic `createGroup` remains supported and retains creator-only founding admins. |
+
+### Start a direct chat
+
+Use `startDirectConversation` with a hex or npub peer identity. MDK serializes lookup and creation on the account worker.
+It reuses the deterministic local direct-conversation selection, or creates an unnamed group with both accounts as admins
+in the founding state and Welcome. Reuse preserves existing roles and sends no admin-policy update.
+
+The returned hex MLS group id confirms canonical local state, not delivery of the Welcome. Observe pending Welcome
+deliveries separately. Cancelling the foreign call detaches the wait while admitted creation and retained delivery continue.
+Retry after cancellation, response loss, or delayed projection reuses the canonical group, including engine state not yet
+projected into the chat list. Concurrent starts for the same account return one local group. Simultaneous starts by different
+accounts can produce two groups, each with symmetric founding admins.
+
+MDK has no immutable cross-client DM provenance and does not automatically repair legacy or generic groups based on an
+unnamed two-member roster. Those groups retain their authoritative roles. Generic creator-only clients remain interoperable,
+but their new groups stay asymmetric until they adopt this operation. A non-admin recipient cannot self-promote.
+See the [exact Rust signature and contract](API-REFERENCE.md#marmotstart_direct_conversation).
 
 ### Feature map
 

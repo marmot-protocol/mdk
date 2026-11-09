@@ -322,6 +322,17 @@ pub(crate) struct AccountWorkerRuntime {
     pub(crate) unlinked: oneshot::Sender<()>,
 }
 
+pub(crate) enum GroupCreationRequest {
+    Group {
+        name: String,
+        members: Vec<String>,
+        prepared_image_upload_id: Option<String>,
+    },
+    Direct {
+        peer_account_id_hex: String,
+    },
+}
+
 pub(crate) enum AccountWorkerCommand {
     CatchUp {
         respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
@@ -343,10 +354,8 @@ pub(crate) enum AccountWorkerCommand {
     },
     CreateGroup {
         queued_at: Instant,
-        name: String,
-        members: Vec<String>,
+        request: GroupCreationRequest,
         options: AppCreateGroupOptions,
-        prepared_image_upload_id: Option<String>,
         respond: oneshot::Sender<Result<CanonicalCreatedGroup, AppError>>,
     },
     StagePreparedGroupImage {
@@ -4848,10 +4857,8 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::CreateGroup {
             queued_at,
-            name,
-            members,
-            options,
-            prepared_image_upload_id,
+            request,
+            mut options,
             respond,
         } => Box::pin(async move {
             let telemetry = shared.observer.performance().clone();
@@ -4860,6 +4867,43 @@ fn account_worker_command_future<'a>(
                 queued_at.elapsed(),
                 true,
             );
+            let (name, members, prepared_image_upload_id) = match request {
+                GroupCreationRequest::Group {
+                    name,
+                    members,
+                    prepared_image_upload_id,
+                } => (name, members, prepared_image_upload_id),
+                GroupCreationRequest::Direct {
+                    peer_account_id_hex,
+                } => {
+                    match client.reusable_direct_group(&peer_account_id_hex) {
+                        Ok(Some(group_id)) => {
+                            let _ = respond_diagnosed(
+                                shared,
+                                storage_permit.as_ref(),
+                                respond,
+                                Ok(CanonicalCreatedGroup {
+                                    group_id,
+                                    chat_list_row: None,
+                                }),
+                            );
+                            return true;
+                        }
+                        Err(error) => {
+                            let _ = respond_diagnosed(
+                                shared,
+                                storage_permit.as_ref(),
+                                respond,
+                                Err(error),
+                            );
+                            return true;
+                        }
+                        Ok(None) => {}
+                    }
+                    options.initial_admins = vec![peer_account_id_hex.clone()];
+                    (String::new(), vec![peer_account_id_hex], None)
+                }
+            };
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let result = match prepared_image_upload_id {
                 None => {

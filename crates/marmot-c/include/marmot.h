@@ -8505,6 +8505,23 @@ MarmotStatus marmot_export_encrypted_secret_key(const struct MarmotClient *clien
                                                 char **out);
 
 /**
+ * Reuse a local direct conversation with a hex or npub peer, or create
+ * an unnamed group with both accounts as founding admins. Blocks until
+ * canonical local state is available, not until Welcome delivery.
+ * Writes an owned hex MLS group id; free it with `marmot_string_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_start_direct_conversation(const struct MarmotClient *client,
+                                              const char *account_ref,
+                                              const char *peer_account_id,
+                                              char **out);
+
+/**
  * Create a new MLS group with `name` and the given members
  * (referenced by `npub` or hex account id). Writes the new group id
  * as a hex string; free it with `marmot_string_free`.

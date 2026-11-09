@@ -693,6 +693,12 @@ c_cmd! {
     /// `passphrase`. Free with `marmot_string_free`.
     sync fn marmot_export_encrypted_secret_key(account_ref: str, passphrase: str) -> string = export_encrypted_secret_key;
 
+    /// Reuse a local direct conversation with a hex or npub peer, or create
+    /// an unnamed group with both accounts as founding admins. Blocks until
+    /// canonical local state is available, not until Welcome delivery.
+    /// Writes an owned hex MLS group id; free it with `marmot_string_free`.
+    async fn marmot_start_direct_conversation(account_ref: str, peer_account_id: str) -> string = start_direct_conversation;
+
     /// Create a new MLS group with `name` and the given members
     /// (referenced by `npub` or hex account id). Writes the new group id
     /// as a hex string; free it with `marmot_string_free`.

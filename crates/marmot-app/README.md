@@ -268,6 +268,32 @@ membership, provider response, profile hydration, and network completion, withou
 
 ## Groups and invitations
 
+### Start a direct conversation
+
+```rust
+pub async fn start_direct_conversation(
+    &self,
+    account_ref: &str,
+    peer_account_id: &str,
+) -> Result<GroupId, AppError>
+```
+
+`MarmotAppRuntime::start_direct_conversation` accepts a hex or npub peer identity. The account worker serializes the
+existing deterministic direct-conversation lookup with creation. If no reusable conversation exists, it creates an unnamed
+group with the creator and peer as admins in the same founding state and Welcome. Reusing a group preserves its roles
+without an admin-policy update. Generic creation remains separate and does not infer direct-chat intent from a name or roster.
+
+The returned opaque MLS group id confirms canonical local state, not Welcome delivery. Retained Welcome delivery continues
+independently. Cancellation after command admission detaches the caller while the worker completes creation and retains
+delivery work. Retry after cancellation, response loss, or projection failure recovers and reuses the canonical engine group,
+even when the chat-list projection is missing. Concurrent starts on the same account return one local group. Simultaneous
+starts by different accounts can create two groups, each with both accounts as founding admins.
+
+There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
+Legacy and generic groups retain their authoritative roles, including unnamed two-member groups. Clients using generic
+creator-only creation remain interoperable: recipients accept the founding admin set through the Welcome, but cannot
+self-promote if they are not admins. Those clients must adopt the explicit start operation to create symmetric direct chats.
+
 **Experimental shared invitation decisions.** With device groups enabled, updated clients share Accept/Decline for
 one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch
 or admission fork can prompt again; older unidentified invites stay local-only. Higher version wins, with decline

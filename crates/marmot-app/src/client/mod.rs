@@ -2011,6 +2011,69 @@ impl AppClient {
         Ok(prepared_group_image_status(&record))
     }
 
+    pub(crate) fn reusable_direct_group(
+        &mut self,
+        peer_account_id_hex: &str,
+    ) -> Result<Option<GroupId>, AppError> {
+        if let Some(group_id) = self.find_direct_group(peer_account_id_hex)? {
+            return Ok(Some(group_id));
+        }
+        // A canonical create can outlive its response and projection. Repair
+        // that tear before treating an index miss as permission to create.
+        self.reconcile_live_engine_groups()?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.find_direct_group(peer_account_id_hex)
+    }
+
+    fn find_direct_group(
+        &mut self,
+        peer_account_id_hex: &str,
+    ) -> Result<Option<GroupId>, AppError> {
+        if !self.app.account_import_marker(
+            &self.state.label,
+            crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+        )? {
+            return Err(AppError::DirectConversationIndexNotReady);
+        }
+        let candidates = self
+            .app
+            .direct_conversation_candidates(&self.state.label, peer_account_id_hex)?;
+        let mut memberships = HashMap::with_capacity(candidates.len());
+        for row in &candidates {
+            if row.conversation_kind != crate::ChatConversationKind::Direct
+                || row.self_membership != crate::SelfMembership::Member
+                || row.lifecycle_state == cgka_traits::GroupLifecycleState::Disbanded
+                || row.disbanding
+                || row.leave_requested_at_ms.is_some()
+            {
+                continue;
+            }
+            let bytes = hex::decode(&row.group_id_hex)?;
+            if bytes.is_empty() {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation group id is empty".to_owned(),
+                ));
+            }
+            let group_id = GroupId::new(bytes);
+            self.runtime.ensure_group_hydrated(&group_id)?;
+            let members = crate::groups::member_accounts(&self.runtime.members(&group_id)?)
+                .into_iter()
+                .map(|(member_id, _)| hex::encode(member_id.as_slice()))
+                .collect();
+            memberships.insert(row.group_id_hex.clone(), members);
+        }
+        let account = self.app.account_home().account(&self.state.label)?;
+        storage_sqlite::select_reusable_direct_conversation(
+            &candidates,
+            &account.account_id_hex,
+            peer_account_id_hex,
+            &memberships,
+        )
+        .map(|conversation| hex::decode(conversation.group_id_hex).map(GroupId::new))
+        .transpose()
+        .map_err(AppError::from)
+    }
+
     /// Create a locally canonical group and attempt each founding Welcome.
     ///
     /// `Ok(group_id)` reports group creation, not blanket invitation success.

@@ -2048,6 +2048,32 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Start or reuse a direct conversation with one peer (hex or `npub`).
+    ///
+    /// Lookup and creation run together on the account worker. New unnamed
+    /// groups include both accounts as admins in the founding state and Welcome.
+    /// Reuse follows [`Self::existing_direct_conversation`], including archived
+    /// and pending-confirmation conversations, and never changes admin roles.
+    /// Legacy groups have no immutable direct-conversation provenance, so even
+    /// a creator-side reuse preserves their authoritative admin policy.
+    ///
+    /// Returns the locally canonical MLS group id, not a delivery acknowledgement.
+    /// Once admitted to the worker, cancellation detaches the caller without
+    /// cancelling creation or retained Welcome delivery. Retry re-reads canonical
+    /// state and repairs a missing projection before creating anything. Concurrent
+    /// starts on this account converge locally; simultaneous starts by different
+    /// accounts can create separate groups, each with both participants as admins.
+    /// See [`Self::pending_welcome_deliveries`] for delivery failures.
+    pub async fn start_direct_conversation(
+        &self,
+        account_ref: &str,
+        peer_account_id: &str,
+    ) -> Result<GroupId, AppError> {
+        self.accounts
+            .start_direct_conversation(account_ref, peer_account_id)
+            .await
+    }
+
     /// Create a locally canonical group. A successful return does not imply
     /// every invitation Welcome was delivered; subscribe for
     /// [`MarmotAppEvent::WelcomeDeliveryPending`] or query

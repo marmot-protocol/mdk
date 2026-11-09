@@ -12,6 +12,7 @@ use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::{mpsc, oneshot};
 
+use super::account_worker::GroupCreationRequest;
 use super::{
     AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
     local_account_worker_response, long_account_worker_catch_up_response,
@@ -261,6 +262,35 @@ impl AccountManager {
         .await
     }
 
+    pub(super) async fn start_direct_conversation(
+        &self,
+        account_ref: &str,
+        peer_account_id: &str,
+    ) -> Result<GroupId, AppError> {
+        let account = self.resolve(account_ref)?;
+        let peer_account_id_hex = crate::ids::account_id_hex_from_ref(peer_account_id)?;
+        if peer_account_id_hex == account.account_id_hex {
+            return Err(AppError::GroupCreateIncludesCreator);
+        }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CreateGroup {
+                queued_at: Instant::now(),
+                request: GroupCreationRequest::Direct {
+                    peer_account_id_hex,
+                },
+                options: AppCreateGroupOptions::default(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let created = long_account_worker_response(response).await?;
+        self.spawn_create_catch_up(command);
+        self.schedule_audit_log_tracker_update("start_direct_conversation");
+        Ok(created.group_id)
+    }
+
     pub async fn create_group_with_options(
         &self,
         account_ref: &str,
@@ -275,10 +305,12 @@ impl AccountManager {
             command
                 .send(AccountWorkerCommand::CreateGroup {
                     queued_at: Instant::now(),
-                    name: name.to_owned(),
-                    members: members.to_vec(),
+                    request: GroupCreationRequest::Group {
+                        name: name.to_owned(),
+                        members: members.to_vec(),
+                        prepared_image_upload_id: None,
+                    },
                     options,
-                    prepared_image_upload_id: None,
                     respond,
                 })
                 .await
@@ -398,13 +430,15 @@ impl AccountManager {
             command
                 .send(AccountWorkerCommand::CreateGroup {
                     queued_at: Instant::now(),
-                    name: name.to_owned(),
-                    members: members.to_vec(),
+                    request: GroupCreationRequest::Group {
+                        name: name.to_owned(),
+                        members: members.to_vec(),
+                        prepared_image_upload_id: Some(upload_id),
+                    },
                     options: AppCreateGroupOptions {
                         description: description.unwrap_or_default(),
                         ..Default::default()
                     },
-                    prepared_image_upload_id: Some(upload_id),
                     respond,
                 })
                 .await
@@ -474,10 +508,12 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::CreateGroup {
                 queued_at: Instant::now(),
-                name: name.to_owned(),
-                members: members.to_vec(),
+                request: GroupCreationRequest::Group {
+                    name: name.to_owned(),
+                    members: members.to_vec(),
+                    prepared_image_upload_id: None,
+                },
                 options,
-                prepared_image_upload_id: None,
                 respond,
             })
             .await
