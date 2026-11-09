@@ -208,6 +208,31 @@ fn write_singleton<T: serde::Serialize>(
     })
 }
 
+impl SqliteAccountStorage {
+    /// Whether any group owes post-join work: a post-join history fetch with
+    /// no completion, or a post-join obligation still in catch-up or its EOSE
+    /// timeout. One read over the stored records, so the account worker can
+    /// check it without reading each group (mdk#2923).
+    pub fn post_join_work_owed(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(
+                     SELECT 1 FROM cgka_group_maintenance
+                      WHERE json_type(CAST(record AS TEXT), '$.post_join_history') = 'object'
+                        AND coalesce(json_type(CAST(record AS TEXT),
+                                '$.post_join_history.completion'), 'null') = 'null')
+                 OR EXISTS(
+                     SELECT 1 FROM cgka_maintenance_obligations
+                      WHERE json_extract(CAST(record AS TEXT), '$.trigger') = 'post_join'
+                        AND json_extract(CAST(record AS TEXT), '$.phase')
+                            IN ('catch_up', 'eose_timeout'))",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+}
+
 fn read_group_record<T: serde::de::DeserializeOwned>(
     store: &SqliteAccountStorage,
     table: &str,
@@ -363,6 +388,62 @@ mod tests {
             semantic_rearm_count: 0,
             last_failure_code: None,
         }
+    }
+
+    /// Post-join work is owed while a group's post-join history fetch has no
+    /// completion, or its post-join obligation is in catch-up or its EOSE
+    /// timeout, and not otherwise (mdk#2923).
+    #[test]
+    fn post_join_work_is_owed_only_while_a_fetch_or_catch_up_is_open() {
+        use cgka_traits::maintenance::{
+            PostJoinHistoryFetch, PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome,
+        };
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        assert!(!store.post_join_work_owed().unwrap());
+
+        let mut state = GroupMaintenanceState {
+            group_id: gid(1),
+            enrolled_at: Some(Timestamp(10)),
+            periodic_enrolled: true,
+            last_own_leaf_rotation_at: None,
+            next_periodic_rotation_at: None,
+            leaf_refresh_due_at: None,
+            post_join_history: None,
+        };
+        store.put_group_maintenance(&state).unwrap();
+        assert!(!store.post_join_work_owed().unwrap(), "no fetch");
+        state.post_join_history = Some(PostJoinHistoryFetch::new(mid(9)));
+        store.put_group_maintenance(&state).unwrap();
+        assert!(store.post_join_work_owed().unwrap(), "an owed fetch");
+        state.post_join_history = Some(PostJoinHistoryFetch {
+            obligation_id: mid(9),
+            deadline_at: Some(Timestamp(14)),
+            completion: Some(PostJoinHistoryFetchCompletion {
+                outcome: PostJoinHistoryFetchOutcome::Fetched,
+                completed_at_ms: 15_000,
+            }),
+        });
+        store.put_group_maintenance(&state).unwrap();
+        assert!(!store.post_join_work_owed().unwrap(), "a completed fetch");
+
+        let mut job = MaintenanceObligation {
+            trigger: MaintenanceTrigger::PostJoin,
+            phase: MaintenancePhase::CatchUp,
+            ..obligation(mid(9))
+        };
+        store.put_maintenance_obligation(&job).unwrap();
+        assert!(store.post_join_work_owed().unwrap(), "catch-up");
+        job.phase = MaintenancePhase::EoseTimeout;
+        store.put_maintenance_obligation(&job).unwrap();
+        assert!(store.post_join_work_owed().unwrap(), "EOSE timeout");
+        job.phase = MaintenancePhase::Grace;
+        store.put_maintenance_obligation(&job).unwrap();
+        assert!(!store.post_join_work_owed().unwrap(), "grace");
+        job.trigger = MaintenanceTrigger::Periodic;
+        job.phase = MaintenancePhase::CatchUp;
+        store.put_maintenance_obligation(&job).unwrap();
+        assert!(!store.post_join_work_owed().unwrap(), "not post-join");
     }
 
     /// The KeyPackage lifecycle is one row that a write replaces; a record

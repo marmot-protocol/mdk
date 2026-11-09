@@ -96,8 +96,9 @@ async fn the_maintenance_tick_compacts_the_database_once() {
 }
 
 /// A compaction that rolls back (here: another connection holds the write
-/// lock) leaves the database as it was and is tried again on a later tick,
-/// where it completes. It does not use up the worker's one attempt.
+/// lock) leaves the database as it was and is not tried again on the next
+/// tick, only once its spacing has passed, where it completes. It does not
+/// use up the worker's one attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rolled_back_compaction_is_tried_again_later() {
     let (dir, client, storage, _reference) = offline_fixture().await;
@@ -125,6 +126,14 @@ async fn a_rolled_back_compaction_is_tried_again_later() {
     assert!(!storage.app_storage().database_space().unwrap().incremental);
 
     writer.execute_batch("COMMIT").unwrap();
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert!(
+        !storage.app_storage().database_space().unwrap().incremental,
+        "not before its spacing has passed"
+    );
+    let past = std::time::Instant::now() - Duration::from_secs(1);
+    admission.compaction_retry_at = Some(past);
+    admission.latches.recheck_due = Some(past);
     maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(storage.app_storage().database_space().unwrap().incremental);
@@ -184,6 +193,32 @@ async fn the_tick_that_finishes_the_migration_flags_the_compaction() {
     assert!(admission.compaction_attempted, "flagged and compacted");
     assert!(app_storage.database_space().unwrap().incremental);
     test_free_space::clear(dir.path());
+}
+
+/// A rolled-back compaction waits 1 minute before its next attempt, then 10
+/// minutes; the third rollback ends the attempts for this worker (mdk#2923).
+#[test]
+fn compaction_rollbacks_are_spaced_1_min_then_10_min() {
+    use crate::media::storage_compaction::CompactionAttempt;
+    let mut admission = Admission::default();
+    let waits = |admission: &Admission| {
+        admission
+            .compaction_retry_at
+            .unwrap()
+            .duration_since(std::time::Instant::now())
+    };
+    admission.record_compaction(CompactionAttempt::RolledBack);
+    assert!((Duration::from_secs(59)..=Duration::from_secs(60)).contains(&waits(&admission)));
+    assert_eq!(admission.latches.recheck_due, admission.compaction_retry_at);
+    admission.record_compaction(CompactionAttempt::RolledBack);
+    assert!((Duration::from_secs(599)..=Duration::from_secs(600)).contains(&waits(&admission)));
+    let last = admission.compaction_retry_at;
+    admission.record_compaction(CompactionAttempt::RolledBack);
+    assert!(
+        admission.compaction_attempted,
+        "the third ends the attempts"
+    );
+    assert_eq!(admission.compaction_retry_at, last);
 }
 
 /// Repeated rollbacks stop after the cap, so a failure that keeps happening
