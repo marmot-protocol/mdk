@@ -940,39 +940,44 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
-        self.leave_group_for_reason(account_ref, group_id, false)
-            .await
+        self.leave_group_command(account_ref, |respond| AccountWorkerCommand::LeaveGroup {
+            group_id: group_id.clone(),
+            respond,
+        })
+        .await
     }
 
+    /// Leave `group_id` for `sign_out_and_wipe`, or keep this device's leaf
+    /// where its account is an active admin (mdk#2818).
     pub(crate) async fn leave_group_for_sign_out(
         &self,
         account_ref: &str,
         group_id: &GroupId,
-    ) -> Result<SendSummary, AppError> {
-        self.leave_group_for_reason(account_ref, group_id, true)
-            .await
+    ) -> Result<crate::client::sign_out::SignOutLeave, AppError> {
+        self.leave_group_command(account_ref, |respond| {
+            AccountWorkerCommand::LeaveGroupForSignOut {
+                group_id: group_id.clone(),
+                respond,
+            }
+        })
+        .await
     }
 
-    async fn leave_group_for_reason(
+    async fn leave_group_command<T>(
         &self,
         account_ref: &str,
-        group_id: &GroupId,
-        for_sign_out: bool,
-    ) -> Result<SendSummary, AppError> {
+        command_for: impl FnOnce(oneshot::Sender<Result<T, AppError>>) -> AccountWorkerCommand,
+    ) -> Result<T, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::LeaveGroup {
-                group_id: group_id.clone(),
-                for_sign_out,
-                respond,
-            })
+            .send(command_for(respond))
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let outcome = account_worker_response(response).await?;
         self.catch_up_committed(command, "leave_group").await;
         self.schedule_audit_log_tracker_update("leave_group");
-        Ok(summary)
+        Ok(outcome)
     }
 
     pub async fn cancel_leave(
@@ -1299,6 +1304,24 @@ impl AccountManager {
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::SignOutThroughSiblingsStep { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    /// Where an admin's sign-out leave from `group_id` stands (mdk#2818).
+    pub(crate) async fn sign_out_admin_leave(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::client::sign_out::SignOutAdminLeave, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SignOutAdminLeave {
+                group_id: group_id.clone(),
+                respond,
+            })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await

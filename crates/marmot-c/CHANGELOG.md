@@ -7,6 +7,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- `marmot_sign_out_and_wipe` leaves a chat the account administers with another account, where none of its other devices
+  is in (mdk#2818): it steps the account down first and counts the chat in `groups_left` only once it sees its removal,
+  blocking up to about 30 seconds more for all such chats. A chat this device was already leaving waits the same way.
+  Otherwise `group_leave_failures` says why. No ABI change.
+
 - `MarmotTimelineMessageQuery` appends borrowed `sender` and `cursor_group_id` strings, `has_since`/`since`,
   `has_until`/`until`, `uint32_t attachment_type`, and `uint8_t search_wall_clock`. The input struct grows;
   consumers must recompile with the matching generated header and native library. Whole-struct `{0}`

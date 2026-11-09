@@ -329,14 +329,16 @@ targets.
 
 **Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
 `AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
-leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With experimental device groups on (`MarmotApp::admin_leave_steps_down`),
-User Leave instead records the leave and lets the engine step this account down when another active administrator
-account remains, then request its own leaf's SelfRemove; the call returns before the step-down is published. The last
-active administrator account is refused on all its devices before a choice or departure is published (mdk#3014 keeps
-that automatic step-down off elsewhere). Queued work is pending, not completed departure; native Leave owns its retry. Sign-out uses
-leaf-only departure and never demotes the account or records a shared Decline. The coarse chat-list Leave action only
-opens this authoritative flow. A recorded Decline remains if a later eligibility check refuses departure. Without a
-trusted device group there is no new shared departure obligation. Already admitted native work follows its ordinary retry rules.
+leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With
+experimental device groups on (`MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
+engine step this account down when another active administrator account remains, then request its own leaf's SelfRemove;
+the call returns before the step-down is published. The last active administrator account is refused on all its devices
+before a choice or departure is published (mdk#3014 keeps that automatic step-down off elsewhere). Queued work is
+pending, not completed departure; native Leave owns its retry. Sign-out never records a shared Decline; in a chat its
+account administers with another account it steps the account down and then leaves (mdk#2818, below). The coarse
+chat-list Leave action only opens this authoritative flow. A recorded Decline remains if a later eligibility check
+refuses departure. Without a trusted device group there is no new shared departure obligation. Already admitted native
+work follows its ordinary retry rules.
 
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
@@ -584,18 +586,24 @@ leaves only the chats no other device can take it out of, deletes its slot and w
 from the device group and from the rest. `WipeOutcome::groups_left_to_siblings` counts the chats it left to them. When
 it can't ask them in time, it tries to leave every chat itself, reporting any it can't in `group_leave_failures`, and
 sets `siblings_not_reached`: tell the user its other devices couldn't be asked, and that they may still list it until
-the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it.
-A device removed while it signs out finishes signing out and is not unlinked.
-Signing out targets this device only; it does not submit an account-wide Leave decision or automatically change the
-account's admin rights. An active-admin account cannot use SelfRemove, even when another admin exists, so an admin
-chat can retain this device's leaf. Changing that account's admin status separately affects all its devices. Before
-the account can leave the chat entirely, another account must be an active admin; an eligible sibling can still
-remove this device while the account remains an admin.
+the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it. A
+device removed while it signs out finishes signing out and is not unlinked. Signing out targets this device only; it
+does not submit an account-wide Leave decision. An active admin's SelfRemove is refused, so in a chat its account
+administers with another account, where none of the account's other devices has a leaf, it steps the account down first
+and then leaves, as an admin's Leave does (mdk#2818). One wait of about 30 seconds covers all such chats, and each
+counts in `groups_left` only once this device sees the commit that removes it. Otherwise `group_leave_failures` reports
+it: its step-down was not accepted in time, the account is off the admin list but the removal was not seen in time (it
+stays a member), or the account became the chat's last admin. A blocked leave ends that chat's wait; the sign-out does
+not wait for a branch change that could unblock it. A chat this device was already leaving gets nothing new and joins
+the same wait. This device keeps its leaf, and the sign-out reports the chat, where the account is the chat's last
+admin, where another of the account's devices stays in it (a step-down takes the admin rights from every device), and
+once its device group removed it during the sign-out. An eligible sibling can still remove this device while the account
+remains an admin.
 
 Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
 roster entry already carrying its tag signature key. It applies only to chats that support same-account device
 removal and have the required tagged leaves. `groups_left_to_siblings` records a handoff, not confirmation that removal
-completed. `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
+completed. Outside admin chats, `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
 local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
 `local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
 

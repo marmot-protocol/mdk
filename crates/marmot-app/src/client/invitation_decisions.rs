@@ -10,7 +10,11 @@ use storage_sqlite::InvitationDecision;
 #[derive(Clone, Copy)]
 pub(super) enum AccountLeaveReason<'a> {
     User,
+    /// Signing out of a chat its account is not an admin of.
     SignOut,
+    /// Signing out of a chat its account is an admin of and another
+    /// account is too: it steps down first (mdk#2818).
+    SignOutAsAdmin,
     ReceivedDecline(&'a InvitationDecision),
 }
 
@@ -80,17 +84,23 @@ impl AppClient {
     }
 
     /// Whether this Leave first takes its account off the admin list (D99),
-    /// through the engine's `StepDownAndLeave`. Sign-out never does. With
-    /// device groups off an admin's Leave is refused here, before any choice,
-    /// push token removal or departure, as before 0.15: the host demotes
-    /// first (mdk#3014 interim).
+    /// through the engine's `StepDownAndLeave`. With device groups off an
+    /// admin's Leave is refused here, before any choice, push token removal
+    /// or departure, as before 0.15: the host demotes first (mdk#3014
+    /// interim). Sign-out steps down only from a chat stage 1 chose to
+    /// (mdk#2818), whether or not device groups are on: the device wipes once
+    /// its sign-out ends, so no leave outlives it.
     pub(super) fn leave_steps_admin_down(
         &self,
         group_id: &GroupId,
         reason: AccountLeaveReason<'_>,
     ) -> Result<bool, AppError> {
-        if matches!(reason, AccountLeaveReason::SignOut) {
-            return Ok(false);
+        match reason {
+            AccountLeaveReason::SignOut => return Ok(false),
+            AccountLeaveReason::SignOutAsAdmin => {
+                return self.account_leave_needs_demotion(group_id);
+            }
+            AccountLeaveReason::User | AccountLeaveReason::ReceivedDecline(_) => {}
         }
         let needs_demotion = self.account_leave_needs_demotion(group_id);
         if self.app.admin_leave_steps_down() {

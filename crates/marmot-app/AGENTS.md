@@ -532,8 +532,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   down before its SelfRemove, only while `MarmotApp::admin_leave_steps_down` is true. Never send the step-down from the
   app ahead of a Leave: nothing durable holds the leave between the two. Otherwise every admin UserLeave, Decline included, is refused before any
   decision write, token removal or publish, and the host calls `self_demote_admin` first (mdk#3014 interim). Unknown
-  admission, no trusted device group and held MAX skip a new decision. Sign-out stays leaf-only; received Decline reuses owed work without
-  a new version. Preserve the existing pending-projection guard before any received application or saved-row adoption.
+  admission, no trusted device group and held MAX skip a new decision. Sign-out writes no decision; in a chat its account
+  administers with another account and no other of its devices is in, it steps down before its SelfRemove whether or
+  not `admin_leave_steps_down` is true (mdk#2818). Received Decline reuses owed work without a new version. Preserve the existing pending-projection guard before any received application or saved-row adoption.
   Native `InvitationAdmission` holds the original validated generation
   and local `via_welcome` association; compare that existing GroupJoined source before re-arming work, and never seed
   legacy copies from current state. A local decision/owed broadcast/necessary decline work is one durable row change

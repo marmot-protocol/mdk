@@ -74,7 +74,10 @@ impl Marmot {
     /// partial-failure sheet (mdk#478). In a device group, it first asks the
     /// account's other devices to take it out, which can take about 30
     /// seconds, and leaves them the chats they can take it out of
-    /// (mdk#2628). It keeps running when the call is cancelled. A sibling
+    /// (mdk#2628). In a chat its account administers with another account
+    /// and no other of its devices is in, it steps the account down first,
+    /// then waits up to about 30 seconds for its removal (mdk#2818). It
+    /// keeps running when the call is cancelled. A sibling
     /// that sees its `leaving` entry takes it out later, on its own time,
     /// whatever the host does.
     #[marmot_uniffi_macros::survives_cancellation]

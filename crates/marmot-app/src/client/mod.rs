@@ -3272,12 +3272,39 @@ impl AppClient {
             .await
     }
 
+    /// Leave `group_id` while signing out. Where its account is an active
+    /// admin and another account is too, it sends `StepDownAndLeave`: the
+    /// engine records the leave, then steps the account down and leaves.
+    /// Anywhere else its account is an active admin it keeps its leaf and
+    /// says why. A chat this device is already leaving gets nothing new: its
+    /// leave request carries the leave, and the sign-out waits for it as for
+    /// one it records (mdk#2818).
     pub(crate) async fn leave_group_for_sign_out(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<SendSummary, AppError> {
-        self.leave_group_for_reason(group_id, AccountLeaveReason::SignOut)
-            .await
+    ) -> Result<sign_out::SignOutLeave, AppError> {
+        self.ensure_group(group_id)?;
+        if self
+            .runtime
+            .leave_in_progress(group_id)
+            .map_err(marmot_session::SessionError::from)?
+        {
+            return Ok(sign_out::SignOutLeave::Recorded);
+        }
+        let reason = match self.sign_out_admin_keep(group_id)? {
+            None => AccountLeaveReason::SignOut,
+            // A device removed while it signs out sends only its SelfRemoves
+            // (D67), so it cannot step down.
+            Some(sign_out::SignOutAdminKeep::Admin) if !self.removed_while_signing_out()? => {
+                AccountLeaveReason::SignOutAsAdmin
+            }
+            Some(kept) => return Ok(sign_out::SignOutLeave::Kept(kept)),
+        };
+        self.leave_group_for_reason(group_id, reason).await?;
+        Ok(match reason {
+            AccountLeaveReason::SignOutAsAdmin => sign_out::SignOutLeave::Recorded,
+            _ => sign_out::SignOutLeave::Left,
+        })
     }
 
     /// Cancel a blocked leave on this device (mdk#3014, D116). The engine
@@ -3775,12 +3802,18 @@ impl AppClient {
         // for the account unread aggregate, so propagate its error (like the
         // nearby projection writes) rather than swallow it: a silently failed
         // update would leave `account_unread_total()` returning an inflated
-        // badge after a leave that otherwise reports success.
-        self.app.set_group_self_membership(
-            &self.state.label,
-            &hex::encode(group_id.as_slice()),
-            SelfMembership::Left,
-        )?;
+        // badge after a leave that otherwise reports success. A sign-out's
+        // leave from an admin chat waits instead for the member's commit that
+        // removes this device, which the inbound path records: it may never
+        // come before the wait ends, and the chat is then reported, not left
+        // (mdk#2818).
+        if !matches!(reason, AccountLeaveReason::SignOutAsAdmin) {
+            self.app.set_group_self_membership(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                SelfMembership::Left,
+            )?;
+        }
         Ok(send_summary_from_effects(&effects))
     }
 

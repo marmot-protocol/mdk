@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
+use cgka_traits::storage::LeaveRequestStorage;
 use cgka_traits::{EpochState, GroupId};
 use marmot_session::{DeviceRosterEdit, DeviceRosterEditBlocked};
 use rand::Rng;
@@ -65,6 +66,110 @@ pub(crate) enum SiblingSignOut {
     /// these chats (hex group ids); it leaves the others itself.
     Confirmed { left_to_siblings: Vec<String> },
 }
+
+/// What stage 1 of `sign_out_and_wipe` did with one chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SignOutLeave {
+    /// This device's leave went through the ordinary leave path.
+    Left,
+    /// Its leave is recorded and the engine carries it out: this sign-out
+    /// sent `StepDownAndLeave` to a chat its account administers with
+    /// another account, or the device was already leaving the chat. The chat
+    /// counts as left only once this device sees the commit that removes its
+    /// leaf (mdk#2818).
+    Recorded,
+    /// This device keeps its leaf: its account is an active admin there
+    /// and cannot step down from this device (mdk#2818).
+    Kept(SignOutAdminKeep),
+}
+
+/// Where an admin's sign-out leave from one chat stands, as
+/// `sign_out_and_wipe` polls it after stage 1 (mdk#2818).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignOutAdminLeave {
+    /// This device's leaf is gone.
+    Left,
+    /// Its account is still on the chat's admin list: the step-down is not
+    /// staged or has not merged yet, or a rival branch undid it and the
+    /// engine steps down again.
+    SteppingDown,
+    /// Its account is off the admin list and its SelfRemove waits to be
+    /// sent or committed.
+    AwaitingRemoval,
+    /// Branch selection left its account the chat's last admin, which
+    /// blocks the leave. A blocked leave ends this chat's wait: the sign-out
+    /// reports it and does not wait for a branch change that could unblock
+    /// it, so the device keeps its leaf there, as a last admin's does.
+    Blocked,
+}
+
+impl SignOutAdminLeave {
+    /// Whether nothing more happens to this chat before the wipe.
+    pub(crate) fn settled(self) -> bool {
+        matches!(self, Self::Left | Self::Blocked)
+    }
+
+    /// The privacy-safe `GroupLeaveFailure::reason` that reports a chat the
+    /// sign-out did not leave, or `None` once it did.
+    pub(crate) fn failure_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Left => None,
+            Self::SteppingDown => Some(SIGN_OUT_STEP_DOWN_NOT_ACCEPTED),
+            Self::AwaitingRemoval => Some(SIGN_OUT_REMOVAL_NOT_SEEN),
+            Self::Blocked => Some(SIGN_OUT_LAST_ADMIN),
+        }
+    }
+}
+
+/// Why signing out keeps this device's leaf in a chat its account is an
+/// active admin of. An admin's SelfRemove is refused, so leaving would
+/// first take the account off the chat's admin list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignOutAdminKeep {
+    /// No other account is an active admin of the chat.
+    LastAdmin,
+    /// Another of the account's devices has a leaf in the chat. Admin
+    /// rights belong to the account, so a step-down would take them from
+    /// that device too.
+    AnotherDeviceStays,
+    /// The account is an admin of the chat and another account is too.
+    /// Signing out steps down and leaves such a chat, unless the device was
+    /// removed while it signs out and so sends only its SelfRemoves.
+    Admin,
+}
+
+impl SignOutAdminKeep {
+    /// The privacy-safe `GroupLeaveFailure::reason` that reports the chat.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::LastAdmin => SIGN_OUT_LAST_ADMIN,
+            Self::AnotherDeviceStays => SIGN_OUT_ADMIN_ON_ANOTHER_DEVICE,
+            Self::Admin => SIGN_OUT_ADMIN,
+        }
+    }
+}
+
+/// `GroupLeaveFailure::reason` for a chat whose last active admin is this
+/// account.
+pub(crate) const SIGN_OUT_LAST_ADMIN: &str = "account is the chat's last admin";
+/// `GroupLeaveFailure::reason` for an admin chat another of the account's
+/// devices stays in.
+pub(crate) const SIGN_OUT_ADMIN_ON_ANOTHER_DEVICE: &str =
+    "account is an admin and another of its devices stays in the chat";
+/// `GroupLeaveFailure::reason` for any other chat the account is an admin
+/// of: a device removed while it signs out sends only its SelfRemoves, so
+/// it cannot step down.
+pub(crate) const SIGN_OUT_ADMIN: &str = "account is an admin of the chat";
+/// `GroupLeaveFailure::reason` for an admin chat whose step-down had not
+/// merged when the sign-out's wait ended.
+pub(crate) const SIGN_OUT_STEP_DOWN_NOT_ACCEPTED: &str =
+    "account's step-down as admin was not accepted in time";
+/// `GroupLeaveFailure::reason` for a chat whose leave the sign-out waited
+/// for, where the account is off the admin list but the removal of this
+/// device was not seen when the wait ended. The account stays in the chat
+/// as a member.
+pub(crate) const SIGN_OUT_REMOVAL_NOT_SEEN: &str =
+    "account is not an admin and its removal was not seen in time";
 
 /// Marks an account as signing out on this device until dropped, so a
 /// sign-out that fails or is cancelled leaves no mark behind. The account
@@ -205,6 +310,100 @@ impl AppClient {
         Ok(SignOutStepPermit(Some(self.app.account_publish_stop(
             &hex::encode(self.adapter.account_id().as_slice()),
         ))))
+    }
+
+    /// Why signing out keeps this device's leaf in `group_id`, read on the
+    /// selected state: `None` unless its account is an active admin there
+    /// and this device has an active leaf, in which case the engine would
+    /// refuse its SelfRemove (mdk#2818). The send checks again.
+    pub(crate) fn sign_out_admin_keep(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<SignOutAdminKeep>, AppError> {
+        // A group that fails to hydrate is quarantined; the leave decides.
+        if !self.runtime.ensure_group_hydrated(group_id)? {
+            return Ok(None);
+        }
+        let (membership, admins) = self
+            .runtime
+            .group_authority_view()
+            .with_group_authority_snapshot(group_id, |_, _| {
+                Ok::<_, AppError>((
+                    self.runtime.canonical_group_membership(group_id)?,
+                    self.runtime.admin_pubkeys(group_id)?,
+                ))
+            })?;
+        if !membership.local_leaf_active {
+            return Ok(None);
+        }
+        let own = self.runtime.self_id();
+        let has_leaf = |account: &[u8]| {
+            membership
+                .member_leaves
+                .iter()
+                .any(|leaf| leaf.member.as_slice() == account)
+        };
+        let active_admins = admins
+            .iter()
+            .filter(|admin| has_leaf(admin.as_slice()))
+            .collect::<HashSet<_>>();
+        if !active_admins
+            .iter()
+            .any(|admin| admin.as_slice() == own.as_slice())
+        {
+            return Ok(None);
+        }
+        let own_leaves = membership
+            .member_leaves
+            .iter()
+            .filter(|leaf| leaf.member == own)
+            .count();
+        Ok(Some(if own_leaves > 1 {
+            SignOutAdminKeep::AnotherDeviceStays
+        } else if active_admins.len() == 1 {
+            SignOutAdminKeep::LastAdmin
+        } else {
+            SignOutAdminKeep::Admin
+        }))
+    }
+
+    /// Where this device's leave from `group_id`, a chat whose leave the
+    /// sign-out waits for, stands (mdk#2818). The account worker keeps
+    /// receiving and draining between polls, so the engine stages the
+    /// step-down and then the SelfRemove from the leave request, and a
+    /// member's commit of it makes the copy here terminal.
+    pub(crate) fn sign_out_admin_leave(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SignOutAdminLeave, AppError> {
+        if self.runtime.group_record(group_id)?.is_terminal() {
+            return Ok(SignOutAdminLeave::Left);
+        }
+        let request = self
+            .app
+            .account_storage(&self.state.label)?
+            .leave_request(group_id)?;
+        if request
+            .as_ref()
+            .is_some_and(|request| request.blocked.is_some())
+        {
+            return Ok(SignOutAdminLeave::Blocked);
+        }
+        Ok(if self.account_is_admin(group_id)? {
+            SignOutAdminLeave::SteppingDown
+        } else {
+            SignOutAdminLeave::AwaitingRemoval
+        })
+    }
+
+    /// Whether this account is on `group_id`'s admin list.
+    pub(crate) fn account_is_admin(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        let own = self.runtime.self_id();
+        Ok(self
+            .runtime
+            .admin_pubkeys(group_id)?
+            .iter()
+            .any(|admin| admin.as_slice() == own.as_slice()))
     }
 
     /// Move signing out through siblings one step on: commit this device's
