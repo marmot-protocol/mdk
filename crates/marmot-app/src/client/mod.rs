@@ -2025,6 +2025,12 @@ impl AppClient {
         // only a missing direct with this peer. Hidden and unrelated groups
         // remain untouched, even when their projection cannot be repaired.
         let mut missing = self.runtime.live_group_ids()?;
+        missing.extend(
+            self.runtime
+                .quarantined_groups()
+                .into_iter()
+                .map(|(id, _)| id),
+        );
         {
             let projected = self
                 .state
@@ -2072,7 +2078,9 @@ impl AppClient {
             if !has_local || !has_peer || has_other {
                 continue;
             }
-            self.runtime.ensure_group_hydrated(&group_id)?;
+            if !self.runtime.ensure_group_hydrated(&group_id)? {
+                return Err(AppError::UnknownGroup(hex::encode(group_id.as_slice())));
+            }
             self.add_group(&group_id)?;
         }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;

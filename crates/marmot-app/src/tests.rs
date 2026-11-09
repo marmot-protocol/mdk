@@ -22513,6 +22513,92 @@ async fn direct_miss_skips_unhydrated() {
     assert_eq!(app.groups("alice").unwrap().len(), 1);
 }
 
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_retry_blocks_quarantine() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise().with_dev_fail_create_local_projection(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let group_id = {
+        let mut peer = app.client("bob").await.unwrap();
+        peer.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        alice
+            .create_group_with_options(
+                "",
+                &[&bob.account_id_hex],
+                AppCreateGroupOptions {
+                    initial_admins: vec![bob.account_id_hex.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+    };
+    assert!(app.groups("alice").unwrap().is_empty());
+    let group_hex = hex::encode(group_id.as_slice());
+    let storage = app.account_storage("alice").unwrap();
+    let mut damaged = storage.get_group(&group_id).unwrap();
+    assert_ne!(
+        damaged.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy
+    );
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&damaged).unwrap();
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let error = match alice.reusable_direct_group(&bob.account_id_hex) {
+            Err(error) => error,
+            Ok(_) => panic!("an unreadable canonical direct must not allow a new create"),
+        };
+        assert!(
+            matches!(&error, AppError::UnknownGroup(id) if id == &group_hex)
+                || matches!(error.as_engine_error(), Some(cgka_traits::error::EngineError::UnknownGroup(id)) if id == &group_id),
+            "{error:?}"
+        );
+        assert_eq!(alice.runtime.quarantined_groups().len(), 1);
+        assert_eq!(alice.runtime.quarantined_groups()[0].0, group_id);
+    }
+    drop(alice);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    for _ in 0..2 {
+        let error = runtime
+            .start_direct_conversation("alice", &bob.account_id_hex)
+            .await
+            .expect_err("an unreadable canonical direct must not allow a new create");
+        assert!(
+            matches!(&error, AppError::UnknownGroup(id) if id == &group_hex)
+                || matches!(error.as_engine_error(), Some(cgka_traits::error::EngineError::UnknownGroup(id)) if id == &group_id),
+            "{error:?}"
+        );
+    }
+    assert_eq!(
+        storage
+            .list_group_records()
+            .unwrap()
+            .iter()
+            .map(|group| &group.id)
+            .collect::<Vec<_>>(),
+        vec![&group_id]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let dir = tempfile::tempdir().unwrap();

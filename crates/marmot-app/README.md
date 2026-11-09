@@ -286,7 +286,8 @@ without an admin-policy update. Generic creation remains separate and does not i
 The returned opaque MLS group id confirms canonical local state, not Welcome delivery. Retained Welcome delivery continues
 independently. Cancellation after command admission detaches the caller while the worker completes creation and retains
 delivery work. Retry after cancellation, response loss, or projection failure recovers and reuses the canonical engine group,
-even when the chat-list projection is missing. Concurrent starts on the same account return one local group. Simultaneous
+even when the chat-list projection is missing. If a matching canonical group cannot hydrate, retry returns an error rather
+than creating another group. Concurrent starts on the same account return one local group. Simultaneous
 starts by different accounts can create two groups, each with both accounts as founding admins.
 
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.

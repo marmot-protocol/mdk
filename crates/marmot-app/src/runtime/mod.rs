@@ -2060,7 +2060,8 @@ impl MarmotAppRuntime {
     /// Returns the locally canonical MLS group id, not a delivery acknowledgement.
     /// Once admitted to the worker, cancellation detaches the caller without
     /// cancelling creation or retained Welcome delivery. Retry re-reads canonical
-    /// state and repairs a missing projection before creating anything. Concurrent
+    /// state and repairs a missing projection before creating anything. A matching
+    /// canonical group that cannot hydrate causes an error, not a new group. Concurrent
     /// starts on this account converge locally; simultaneous starts by different
     /// accounts can create separate groups, each with both participants as admins.
     /// See [`Self::pending_welcome_deliveries`] for delivery failures.
