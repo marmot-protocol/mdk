@@ -773,6 +773,11 @@ impl AppClient {
                 groups.entry(group_id).or_default().push(route);
             }
         }
+        // The cache only saves reads. A group with no current route (deleted,
+        // or no longer routed) drops its entry and rereads its durable copy if
+        // it comes back.
+        self.settled_recovery_copies
+            .retain(|group_id, _| groups.contains_key(group_id.as_slice()));
         for (group_id, routes) in groups {
             let carried = routes
                 .iter()

@@ -1532,8 +1532,9 @@ runner supplies those fields. Current epoch-gap exhaustion emits `EpochGap`; cov
 parks emit `HistoryNoticeCauseFfi::UnprovenHistory` without attributing the original reason
 history was owed. Other cause labels preserve compatibility; keep exhaustive switches.
 
-When this device rejoins a group with a new copy after its old one could not be repaired,
-the group gets one `HistoryNoticeCauseFfi::BeforeRejoin` notice: messages from before the
+When a Welcome installs a new copy of a group in place of this device's old one (an automatic
+rejoin after the old copy could not be repaired, a reentry after a trusted removal, or a fork
+discarded with the user's consent, whose old copy may still have worked), the group gets one `HistoryNoticeCauseFfi::BeforeRejoin` notice: messages from before the
 rejoin that the device had not received are unavailable, and recovery stopped fetching
 them. A restart raises no second one, dismissing it retires nothing further, and a later
 rejoin raises a new one.

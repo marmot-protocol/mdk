@@ -32,10 +32,13 @@ c_enum! {
         /// relays and stopped retrying them: a group's (`group_id_hex` names
         /// it) or the account inbox's.
         UnprovenHistory,
-        /// This device rejoined the group (`group_id_hex` names it) with a
-        /// new copy after its old one could not be repaired. Messages from
-        /// before the rejoin that it had not received are unavailable. One
-        /// notice per rejoin.
+        /// This device rejoined the group (`group_id_hex` names it): a
+        /// Welcome installed a new copy in place of its old one. That is an
+        /// automatic rejoin after the old copy could not be repaired, a
+        /// reentry after a trusted removal, or a fork discarded with the
+        /// user's consent, whose old copy may still have worked. Messages
+        /// from before the rejoin that it had not received are unavailable.
+        /// One notice per rejoin.
         BeforeRejoin,
     }
 }

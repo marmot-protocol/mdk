@@ -18,7 +18,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   continue to use Rust `CString` and `Box`.
 
 - `MarmotHistoryNoticeCause` appends `MARMOT_HISTORY_NOTICE_CAUSE_BEFORE_REJOIN` (mdk#2660 row 11): one notice per
-  rejoin, when this device rejoined a group with a new copy after its old one could not be repaired. Rebuild against
+  rejoin, when a Welcome installed a new copy of a group in place of this device's old one (an automatic rejoin after
+  the old copy could not be repaired, a reentry after a trusted removal, or a consented fork discard). Rebuild against
   the matching header and library.
 
 - A blocked leave is shown and can be cancelled (mdk#3014). `MarmotAppGroupRecord` and `MarmotChatListRow` append
