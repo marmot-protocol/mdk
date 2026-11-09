@@ -57,6 +57,8 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
   `conformance.rs` in the same commit, and every catalog (`storage-sqlite`, the in-memory one) must keep passing it.
 - One `MediaStore` (and its clones) per account: the in-flight set that protects live publishes from the sweep is
   per instance.
+- A best-effort unlink, wire truncate or abandon that fails sets the store's sweep-owed flag
+  (`take_sweep_owed`), so a runtime that sweeps only when something may have left work still finds it (mdk#2923).
 - Nothing runs after close, including abandon cleanup; the next process's sweep reclaims what is left. The runtime
   closes the store through `marmot-app`'s close registry, the same one every other closeable handle uses.
 - Inside a catalog transaction the only file I/O is the one `present` check (a single `stat`) for the ready twin.

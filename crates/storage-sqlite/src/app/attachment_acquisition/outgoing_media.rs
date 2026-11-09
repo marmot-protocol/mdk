@@ -106,6 +106,19 @@ impl SqliteAppStorage {
         Ok(file.flatten().and_then(|id| FileId::from_slice(&id)))
     }
 
+    /// Whether any file-backed upload is staged: only those promote, and a
+    /// consumed one is pruned, so with none the promotion pass has nothing to
+    /// page (mdk#2923). A read.
+    pub fn has_file_backed_uploads(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Up to `limit` (upload, message) pairs to promote: a file-backed,
     /// bound upload and a visible slot of a sent message in a confirmed group
     /// that carries its exact descriptor, in `(token, group, message)` order

@@ -848,6 +848,19 @@ impl SqliteAppStorage {
             .storage()
     }
 
+    /// How many `media_files` and `attachment_partial` rows this connection
+    /// has deleted since it opened: a delete can leave a file only the media
+    /// sweep removes. A read of a TEMP row, no transaction (mdk#2923).
+    pub fn media_cleanup_epoch(&self) -> StorageResult<i64> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT deleted FROM temp.media_cleanup_epoch WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// The persisted transport cursor alone, for a check that needs nothing
     /// else from the projection. One cached primary-key read in autocommit:
     /// it opens no transaction and takes no writer lock.
@@ -3186,14 +3199,27 @@ impl SqliteAppStorage {
     /// completed: time during which this device could fetch its groups'
     /// messages. Returns how many windows it counted toward.
     pub fn count_push_join_window_time(&self, counted_ms: i64) -> StorageResult<usize> {
-        self.lock()?
-            .execute_cached(
-                "UPDATE group_push_gossip_state
+        let conn = self.lock()?;
+        // Most ticks find no open window: skip the write statement then
+        // (mdk#2923).
+        let open: bool = conn
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM group_push_gossip_state
+                 WHERE joining_since_ms IS NOT NULL AND joined_at_ms IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !open {
+            return Ok(0);
+        }
+        conn.execute_cached(
+            "UPDATE group_push_gossip_state
                  SET join_window_counted_ms = join_window_counted_ms + ?1
                  WHERE joining_since_ms IS NOT NULL AND joined_at_ms IS NOT NULL",
-                params![counted_ms],
-            )
-            .storage()
+            params![counted_ms],
+        )
+        .storage()
     }
 
     /// Record that this device published, at `announced_at_ms`, an announce

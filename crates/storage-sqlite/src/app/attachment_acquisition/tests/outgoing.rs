@@ -1043,3 +1043,18 @@ fn outgoing_staging_blocks_all_network_routes_after_promotion_fault() {
     assert_eq!(app.recover_attachment_uploads(13, 64, 10000).unwrap(), 1);
     assert_eq!(read(&app, &asset), BODY);
 }
+
+/// A legacy upload, staged in the database, still owes the legacy body
+/// migration work: its promotion copies the body in as a legacy one, so the
+/// migration may not latch finished while one exists (mdk#2923 §4).
+#[test]
+fn a_legacy_upload_keeps_legacy_attachment_work_owed() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    sent(&store, "legacy-upload");
+    assert!(!app.has_legacy_attachment_work().unwrap());
+    app.stage_attachment_uploads(GROUP, 3, &[BODY], 11, 10000)
+        .unwrap();
+    assert!(app.has_legacy_attachment_work().unwrap());
+    assert!(!app.has_file_backed_uploads().unwrap());
+}
