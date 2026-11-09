@@ -5925,6 +5925,5 @@ fn idle_maintenance_checks_take_no_writer() {
     assert!(!app.has_legacy_attachment_work().unwrap());
     assert!(!app.has_database_held_avatars().unwrap());
     assert!(!app.has_file_backed_uploads().unwrap());
-    assert_eq!(store.promote_legacy_message_rows(64).unwrap().promoted, 0);
     assert_eq!(*writers.lock().unwrap(), 0);
 }

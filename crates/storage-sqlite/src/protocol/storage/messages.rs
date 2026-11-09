@@ -184,25 +184,6 @@ impl SqliteAccountStorage {
         }
         retry_on_busy(|| {
             let mut conn = self.lock()?;
-            // A promoted database has no pending row (new writes derive their
-            // content): answer from the partial index, without a writer
-            // (mdk#2923).
-            let pending: bool = conn
-                .query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM cgka_messages
-                         WHERE openmls_content = {OPENMLS_CONTENT_PENDING})"
-                    ),
-                    [],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            if !pending {
-                return Ok(MessageFormatPromotionProgress {
-                    promoted: 0,
-                    has_more: false,
-                });
-            }
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
