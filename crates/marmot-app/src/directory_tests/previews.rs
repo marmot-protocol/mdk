@@ -813,6 +813,81 @@ fn supplementary_relays_put_indexers_first_within_the_cap() {
     // Neutral deployments pass no indexers: only author relays remain.
     assert_eq!(plan(&[], &writes), canonical(&writes));
     assert!(plan(&[], &[]).is_empty());
+    // Relays are compared by identity, not spelling, before either cap: other
+    // spellings of indexers or queried relays never take an author slot, so
+    // the real write relay after them is still asked.
+    assert_eq!(
+        plan(
+            &[
+                "wss://index1.example",
+                "wss://index2.example",
+                "wss://index3.example",
+                "wss://index4.example",
+                "wss://index5.example",
+                "wss://INDEX1.example:443/",
+                "wss://relay.example/",
+            ],
+            &[
+                "wss://index1.example/",
+                "wss://Index2.Example",
+                "wss://index3.example:443",
+                "wss://hint.example/",
+                "wss://write1.example",
+            ],
+        ),
+        canonical(&[
+            "wss://index1.example",
+            "wss://index2.example",
+            "wss://index3.example",
+            "wss://index4.example",
+            "wss://index5.example",
+            "wss://write1.example",
+        ])
+    );
+}
+
+/// White Noise passes five indexers, which may each hold a different signed
+/// version of an author's relay list. Every reply fits the read, so the author
+/// route survives and the newest version picks the write relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_list_reads_hold_one_version_from_every_indexer() {
+    let operational = MockRelay::run().await.unwrap();
+    let author_relay = MockRelay::run().await.unwrap();
+    let mut indexers = Vec::new();
+    for _ in 0..5 {
+        indexers.push(MockRelay::run().await.unwrap());
+    }
+    let author = Keys::generate();
+    let base = Timestamp::now().as_secs() - 1_000;
+    let note = signed(&author, 1, base, "only on the write relay", Vec::new());
+    publish(&author_relay, &[&note]).await;
+    let newest = indexers.len() - 1;
+    for (version, indexer) in indexers.iter().enumerate() {
+        let write = if version == newest {
+            url(&author_relay).await
+        } else {
+            format!("wss://old{version}.example")
+        };
+        publish(
+            indexer,
+            &[&relay_list(&author, base + version as u64, &write)],
+        )
+        .await;
+    }
+
+    let dir = alice_home();
+    let mut indexer_urls = Vec::new();
+    for indexer in &indexers {
+        indexer_urls.push(url(indexer).await);
+    }
+    let app = app_with_indexers(dir.path(), vec![url(&operational).await], indexer_urls);
+    let runtime = app.runtime();
+    let resolved = runtime
+        .resolve_public_event_preview("alice", &nevent_by(note.id, &author))
+        .await
+        .unwrap();
+    assert_eq!(present_json(&resolved), note);
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 /// A neutral deployment configures no indexers, so a miss dials none: the

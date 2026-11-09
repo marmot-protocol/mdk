@@ -48,6 +48,7 @@ use nostr::nips::nip01::Coordinate;
 use nostr::nips::nip19::{FromBech32, Nip19};
 use nostr::prelude::{EventId, Filter, Kind, PublicKey, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use transport_nostr::canonical_relay;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use super::published_records::relay_list_state_from_event;
@@ -77,8 +78,9 @@ const MAX_QUERY_RELAYS: usize = 6;
 /// Endpoints in the supplementary query: every discovery indexer first, then
 /// author write relays in the room left.
 const MAX_SUPPLEMENTARY_RELAYS: usize = 8;
-/// Kind-10002 events read for one author's relay list.
-const MAX_AUTHOR_RELAY_LIST_EVENTS: usize = 4;
+/// Kind-10002 versions each indexer returns for one author's relay list: the
+/// newest. The read's shared buffer holds one per indexer it asks.
+const AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER: usize = 1;
 const MAX_FETCHED_EVENTS: usize = 64;
 /// Limit on the unattributed kind-5 query for an event ID. A full answer may
 /// hide the author's deletion behind other keys' requests.
@@ -345,6 +347,23 @@ fn follow_up_deletions(target: &Target, stored: Option<&Event>, fetched: &[Event
             vec![deletions(coordinate.public_key).events(versions).limit(8)]
         }
     }
+}
+
+/// The first spelling of each relay in `relays`, skipping relays in `exclude`.
+/// Relays compare by identity: `wss://relay.example/` and
+/// `wss://Relay.Example:443` name `wss://relay.example`.
+fn distinct_relays(
+    relays: Vec<TransportEndpoint>,
+    exclude: &[TransportEndpoint],
+) -> Vec<TransportEndpoint> {
+    let mut seen = exclude
+        .iter()
+        .map(|relay| canonical_relay(&relay.0))
+        .collect::<HashSet<_>>();
+    relays
+        .into_iter()
+        .filter(|relay| seen.insert(canonical_relay(&relay.0)))
+        .collect()
 }
 
 /// Verified events from one or more public-event reads, and whether every
@@ -959,19 +978,29 @@ impl<R: DirectoryResources> Directory<R> {
                 true,
             );
         }
-        let indexers = self
-            .relay_plane
-            .retain_safe_discovered_endpoints(discovery_indexers.to_vec(), "public event indexer");
+        let mut indexers = distinct_relays(
+            self.relay_plane.retain_safe_discovered_endpoints(
+                discovery_indexers.to_vec(),
+                "public event indexer",
+            ),
+            &[],
+        );
+        indexers.truncate(MAX_SUPPLEMENTARY_RELAYS);
         if indexers.is_empty() {
             return (Vec::new(), true);
         }
+        // `max_events` bounds the whole read, not each relay, and a read that
+        // fills it counts as truncated. Room for every indexer's reply keeps
+        // distinct current versions on different indexers from looking like a
+        // partial read; a relay that ignores the limit still does.
+        let max_events = indexers.len() * AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER;
         let filter = Filter::new()
             .kind(Kind::RelayList)
             .author(author)
-            .limit(MAX_AUTHOR_RELAY_LIST_EVENTS);
+            .limit(AUTHOR_RELAY_LIST_EVENTS_PER_INDEXER);
         let read = self
             .relay_plane
-            .fetch_public_events(indexers, vec![filter], MAX_AUTHOR_RELAY_LIST_EVENTS)
+            .fetch_public_events(indexers, vec![filter], max_events)
             .await;
         let read = match read {
             Ok(read) if read.complete => read,
@@ -1001,33 +1030,35 @@ impl<R: DirectoryResources> Directory<R> {
 
     /// The supplementary query's endpoints: every safe discovery indexer, then
     /// at most four author write relays in the room left, at most eight in
-    /// all. Endpoints the first query already asked are skipped, so an
-    /// author's relay that duplicates one does not use up a slot.
+    /// all. Relays are compared by identity, not spelling, before either cap:
+    /// a relay the first query already asked, or another spelling of one
+    /// already chosen, never takes a slot.
     pub(crate) fn public_event_supplementary_relays(
         &self,
         queried: &[TransportEndpoint],
         discovery_indexers: &[TransportEndpoint],
         author_relays: Vec<TransportEndpoint>,
     ) -> Vec<TransportEndpoint> {
-        let queried = self
-            .relay_plane
-            .retain_safe_discovered_endpoints(queried.to_vec(), "public event queried relay");
-        let fresh = |relays: Vec<TransportEndpoint>, context| {
-            self.relay_plane
-                .retain_safe_discovered_endpoints(relays, context)
-                .into_iter()
-                .filter(|relay| !queried.contains(relay))
-                .collect::<Vec<_>>()
-        };
-        let mut relays = fresh(discovery_indexers.to_vec(), "public event indexer");
+        let mut relays = distinct_relays(
+            self.relay_plane.retain_safe_discovered_endpoints(
+                discovery_indexers.to_vec(),
+                "public event indexer",
+            ),
+            queried,
+        );
         relays.truncate(MAX_SUPPLEMENTARY_RELAYS);
         let room = MAX_SUPPLEMENTARY_RELAYS - relays.len();
-        let author_relays = fresh(author_relays, "public event author write relay")
-            .into_iter()
-            .filter(|relay| !relays.contains(relay))
-            .take(SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR.min(room))
-            .collect::<Vec<_>>();
-        relays.extend(author_relays);
+        let asked = queried.iter().chain(&relays).cloned().collect::<Vec<_>>();
+        let author_relays = distinct_relays(
+            self.relay_plane
+                .retain_safe_discovered_endpoints(author_relays, "public event author write relay"),
+            &asked,
+        );
+        relays.extend(
+            author_relays
+                .into_iter()
+                .take(SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR.min(room)),
+        );
         relays
     }
 
