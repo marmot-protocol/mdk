@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `start_direct_conversation(account_ref, peer_account_id)` exposes shared
+  local reuse and creation with both participants as founding admins
+  (mdk#464). Cancellation detaches the wait; retry reuses canonical state.
+  Generic creation and legacy admin roles remain unchanged.
+
 ## 0.15.0 - 2026-11-09
 
 Regenerate Swift/Kotlin bindings with the matching native library. The main

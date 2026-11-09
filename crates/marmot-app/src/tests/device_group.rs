@@ -124,6 +124,59 @@ fn trust(app: &MarmotApp, group: &GroupId) -> Option<DeviceGroupTrust> {
         .map(|record| record.trust)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_miss_skips_device_group() {
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        mut phone,
+        laptop,
+        link,
+    } = phone_and_laptop().await;
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let peer = phone_app.account_home().create_account("bob").unwrap();
+    drop(phone);
+    drop(laptop);
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut client = phone_app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .runtime
+            .group_record(&group)
+            .unwrap_err()
+            .as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    assert!(
+        client
+            .reusable_direct_group(&peer.account_id_hex)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        client
+            .runtime
+            .group_record(&group)
+            .unwrap_err()
+            .as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    assert!(
+        phone_app
+            .chat_list_row("alice", &hex::encode(group.as_slice()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(client.state_group_record(&group).is_none());
+    drop(client);
+    drop(laptop_app);
+}
+
 fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
     let bytes = client
         .runtime
