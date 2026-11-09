@@ -33,6 +33,14 @@
   upload trims the file name; both versions canonicalize the media type)
   instead of comparing the strings literally (#3431).
 
+- The attachment, avatar and presentation passes no longer run on every maintenance tick (mdk#2923 step B). Each
+  runs when an event wakes it and at the deadline its data gives: the attachment pass at the earliest acquisition
+  `due` among its candidates (a request, a lease end, a retry, a deferral or a readmission backoff), an acquisition
+  or partial expiry, and at least hourly; the avatar pass at the earliest avatar acquisition `due`. Work no column
+  announces is still polled every 15 s while it exists: a staged upload, a row parked for free disk space, a running
+  media sweep batch, and presentation rows that cannot be applied yet. An idle account runs none of them. The
+  tick's watchdog also checks the passes (`watchdog_missed_wake_attachment_pass`, `_avatar_pass`,
+  `_presentation_pass`).
 - Recovery and post-join work run on the account worker's own schedule, not on every maintenance tick (mdk#2923
   step B). Each runs once when the worker opens, then when an event wakes it (a receive, a convergence pass, a new
   replay generation, a join, maintenance pausing or resuming) and again 15 s later while it still has work. An

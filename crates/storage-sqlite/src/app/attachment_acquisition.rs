@@ -1162,10 +1162,12 @@ pub enum RetainedAttachmentRead {
 mod tests;
 
 mod partial;
+mod work_schedule;
 pub use partial::{
     ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity,
     STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
 };
+pub use work_schedule::AttachmentWorkSchedule;
 
 mod checkpoint;
 pub use checkpoint::AttachmentCheckpoint;
