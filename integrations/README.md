@@ -111,7 +111,7 @@ install_verified() (
 ```
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.14.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.15.0"
 ```
 
 ### Hermes
@@ -209,17 +209,17 @@ installer installs and starts `wn-agent` alone, without a harness or plugin.
 existing key instead. The connector's identity must not also be signed in on
 another client. Continue with [Build your own client](custom-client.md).
 
-`install-wn-agent.sh` is published from the first WN Agent release after
-0.14.0. While `base_url` above is 0.14.0 or earlier, run the installer from a
-clone of this repository instead. It downloads and verifies that release's
-`wn-agent` bundle the same way:
+`install-wn-agent.sh` is published from WN Agent 0.15.0 onward. If you pin
+0.14.0 or earlier in `base_url`, run the installer from a clone of this
+repository instead. It downloads and verifies that release's `wn-agent` bundle
+the same way:
 
 ```sh
 bash scripts/install-wn-agent.sh --bootstrap
 ```
 
-With a release that publishes it, run this example in the same shell where
-`install_verified` above was defined.
+Otherwise, run this example in the same shell where `install_verified` above
+was defined.
 
 ```sh
 install_verified "$base_url/install-wn-agent.sh" \

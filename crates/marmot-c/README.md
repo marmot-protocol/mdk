@@ -20,14 +20,15 @@ per feature.
 - Feature notes: [runtime construction](#runtime-construction),
   [experimental device-group test builds](#experimental-device-group-test-builds), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
-  [custom reaction artwork](#custom-reaction-artwork),
+  [custom reaction artwork](#custom-reaction-artwork), [emoji set installs](#emoji-set-installs),
   [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
   [chat screens and avatars](#chat-screens-and-avatars), [advanced timeline search](#advanced-timeline-search),
-  [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
+  [history may be incomplete notices](#history-may-be-incomplete-notices), [blocked leaves](#blocked-leaves),
+  [group reporting](#group-reporting),
   [turning on account devices](#turning-on-account-devices),
   [undelivered Welcomes](#undelivered-welcomes),
   [backup recovery](#backup-recovery),
@@ -235,8 +236,8 @@ the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
 
 Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just before `out_client`: the
-deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client
-preference, moderation label namespace and keychain service. Create one with `marmot_deployment_white_noise` or
+deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, moderation label namespace
+and keychain service. Create one with `marmot_deployment_white_noise` or
 `marmot_deployment_neutral`, adjust it with the `marmot_deployment_set_*` functions, construct, then free it with
 `marmot_deployment_free`; the client keeps its own copy. For an available constructor, a NULL deployment returns `MARMOT_STATUS_NULL_POINTER`
 before anything opens. The unavailable experimental constructor checks its capability immediately after
@@ -301,6 +302,18 @@ the standalone result with `marmot_attachment_entry_free`; never use that free
 for an entry borrowed from a page. Use its original source target with ordinary
 attachment acquisition and local reads. See the
 [shared reaction contract](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork).
+
+## Emoji set installs
+
+`marmot_install_emoji_set` blocks for the whole install and borrows a host-owned `MarmotEmojiSetInstallControl`.
+Create it with `marmot_emoji_set_install_control_new`, pass it to one install, and free it with
+`marmot_emoji_set_install_control_free` only after the install has returned and every other call on the handle has
+finished. From another thread, `marmot_emoji_set_install_control_cancel` makes the install return
+`MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED` (too late once the final write has started),
+`marmot_emoji_set_install_control_is_cancelled` writes a `uint8_t`, and `marmot_emoji_set_install_control_progress`
+fills a caller-provided `MarmotEmojiSetInstallProgress` with plain values that need no free. A NULL control returns
+`MARMOT_STATUS_NULL_POINTER`. Pass the `expected_event_id_hex` the user was shown; a different stored version returns
+`MARMOT_STATUS_EMOJI_SET_CHANGED`.
 
 ## File-backed media upload
 
@@ -665,6 +678,14 @@ status is returned.
 Automatic Unrecoverable rejoin runs inside the account workers; C hosts keep their existing group-state
 subscriptions. See the [shared automatic rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy)
 for authorization, history retention and availability requirements.
+
+## Blocked leaves
+
+When `leave_blocked` is set on `MarmotAppGroupRecord`, `MarmotChatListRow` or `MarmotGroupManagementState`, the
+account is the chat's last active admin and the leave cannot finish. While `can_cancel_leave` is true, offer Cancel
+and call `marmot_cancel_leave`; it allocates nothing, applies to this device only, and returns
+`MARMOT_STATUS_LEAVE_NOT_BLOCKED` in any other state. See the
+[shared leave contract](../marmot-uniffi/README.md#linked-devices).
 
 ## Group reporting
 

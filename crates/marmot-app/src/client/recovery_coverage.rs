@@ -1074,14 +1074,7 @@ impl AppClient {
                 })
             })
             .collect::<Vec<_>>();
-        let recorded = {
-            // Replay-flush write (the flush and the runner turn's live tails),
-            // excluded from the idle-tick test (mdk#3238).
-            #[cfg(test)]
-            let _replay_flush = crate::replay_flush_writes::ReplayFlushWrite::enter();
-            app.record_recovery_coverage_since(&slices, now, mark)
-        };
-        match recorded {
+        match app.record_recovery_coverage_since(&slices, now, mark) {
             Ok(true) => {
                 for (fact, _, routes) in &durable {
                     live.settled

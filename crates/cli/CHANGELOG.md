@@ -9,74 +9,105 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
-- Add sender, half-open date-range, and attachment MIME filters to `messages timeline search`.
-  Filters apply across retained local history before the page limit. Search uses wall-clock order even within
-  one group; before/after pagination includes a cursor group id for account-wide searches.
+## [0.15.0] - 2026-11-09
 
-- On macOS, report a daemon request by the daemon's answer even when the daemon closes the connection right after
-  answering. `wn daemon stop` could report `daemon_unavailable` (`Socket is not connected (os error 57)`) for a stop
-  the daemon had accepted, and other one-shot requests could report a lost answer or unknown command state (#2628).
-
-- JSON errors gain the code `leave_not_blocked` for a Cancel of a leave that is not blocked (mdk#3014).
-- `wn groups management` JSON gains `leave_blocked`, true while this account's leave cannot finish because it is
-  the chat's last active admin (mdk#3014).
-
-- `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
-  with its device group and should be reset and linked again (experimental device-group builds).
-- `wn groups management` reports `requires_self_demote_before_leave` for an admin again, including an admin invitee,
-  and `wn groups leave` and `wn groups decline` refuse an admin until it self-demotes, as in 0.14 (mdk#3014). TUI `L`
-  shows an admin the 0.14 info card again instead of confirming. A `dev-device-groups` build keeps Leave's automatic
-  step-down.
-
-- Keep the newest overlapping TUI timeline refresh for the same chat, including page errors; stale
-  completions cannot consume the newer request or apply its subscriptions and followups.
-- Preserve TUI command acknowledgements, prompts and load errors using explicit feedback permissions. Older
-  command completions and background notices cannot overwrite newer feedback; ordinary successful loads
-  still permit live notices, and background refreshes continue updating the pane. Scrolling and cancelled
-  navigation preserve pending feedback; repeated searches admit only their newest request, and invite notices
-  wait until the status line is available. Returning from member search refreshes the roster without hiding an
-  add or follow result; ordinary view refresh failures remain visible. Startup failures wait for idle feedback,
-  and removing a chat cancels its pending page and settles its loading feedback (#3139, #3154).
-
-- Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
-  retained panes under a different account's list. Start the adopted account's live feed even when its page
-  fails; same-account navigation and feed reconnects preserve the feed and observed previews (#2441).
-
-- Recover TUI chat and notification feeds for the selected account when a background chat-list retry succeeds
-  after a failed account switch, while preserving the open conversation and matching live subscriptions (#2968).
-
-- Add dev-only `devices link reset --confirm`, forwarding the shared user-controlled local device-group reset. Ordinary chat data/credentials remain; fresh pairing may be refused by existing admission rules.
-
-- Report conclusive all-target size refusals as JSON `event_too_large` with coarse `artifact` and `size_class`;
-  a legacy Welcome's first observed attempt can also report this reason without proving no earlier delivery.
-  Ambiguous and mixed relay failures retain their existing generic error; pending Welcome retries are unchanged.
-
-- Keep `code=engine_error` for invalid device-roster marker edits while core reports its corrected caller-error
-  type and fixed diagnostic text. JSON fields and command behavior are unchanged.
-
-- Use core Leave capability hints in group-management output and allow TUI Leave confirmation for admins. Core
-  automatically demotes an eligible nonlast admin account and refuses the last active admin before departure effects;
-  manual self-demotion remains supported. `can_leave` is false for unaccepted invitations and unrecoverable groups.
-  Existing JSON fields and command spellings are unchanged.
-- Experimental `devices link start` can move an already linked device; status adds move progress and old-sibling hints,
-  and device status includes `moved`. Ordinary chat membership remains in place.
-
-- Add dev-only `devices list` and `devices link` start/status/confirm-match/approve/cancel commands over the persistent daemon, enabled by the separate default-off `dev-device-groups` Cargo feature. Production timing stays unchanged; ordinary releases keep it off.
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances from
+migration 116 through migration 201 on first open, and the directory cache stays at migration 2; back up before
+upgrade because downgrade is unsupported. Building `wn`, `wnd` or `wn-agent` from source now needs the Odin compiler
+(mdk#3214). Upgrade `wn-agent` and its Hermes, OpenClaw and terminal-harness plugins together. The control protocol
+stays `marmot.agent-control.v2` and only gains requests, but an older `wn-agent` closes the control socket without an
+error on any request it cannot parse, including `group_create_capabilities`. See the
+[release notes](../../docs/release/0.15.0.md) and the
+[client upgrade guide](../../docs/integration/0.15.0.md).
 
 ### Added
 
+- `messages timeline search` gains `--sender` (npub or hex), half-open `--since`/`--until` (Unix seconds) and
+  `--attachment-type any|image|video|audio|file|attachment` filters (mdk#3245). Filters apply across retained local
+  history before the page limit. Search uses wall-clock order even within one group and pages with
+  `--before`/`--before-message-id` or `--after`/`--after-message-id`; an account-wide search also passes the cursor
+  row's `--cursor-group-id`.
 - Timeline JSON rows (`messages timeline list`, `messages timeline search`, and daemon timeline snapshots and upserts)
   carry `recipient_confirmed` and `invalidation_status` (mdk#1291). `recipient_confirmed` is `true` for an own send
   that no relay accepted but another member reacted to; such a row has no `source_message_id` and reads as delivered.
   `invalidation_status` names why a row was withdrawn or failed, and a row with it set is not delivered even when it
   keeps its `source_message_id`.
-
-- Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
-  (mdk#2628 item 3.6b). Such an account stays signed out; wiping it skips leaving its chats and deleting its slot.
-
+- `wn groups management` JSON gains `leave_blocked`, true while this account's leave cannot finish because it is
+  the chat's last active admin (mdk#3014).
+- `leave_not_blocked` is the JSON error code for a Cancel of a leave that is not blocked. `wn` has no Cancel command;
+  hosts cancel through `cancel_leave` (mdk#3014).
 - `self_membership` in `groups show`, `chats list` and their feeds can read `device_removed` (mdk#2628 item 3.6b):
   this device's leaf was removed while the account stays in the group through another of its devices. It is not a
   removal of the account from the group.
+- `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It takes `--home`,
+  `--socket`, `--auth-token-file`, `--relay`, `--no-default-relays` and `--socket-dir-mode`. It prints one line per
+  check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
+  many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
+  the daemon answers, its protocol, accounts, this device's KeyPackage, relay health and catch-up from
+  `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids, public
+  keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show that
+  messages are delivered.
+- `wn-agent` adds `group_create_capabilities`, answered with `initial_admins`, and `group_create_with_admins`, which
+  takes `group_create`'s fields plus `admins`, invited members who receive admin rights in the founding state. An admin
+  who is not a member is refused with `invalid_group_create` before anything is created. `group_create` keeps its
+  creator-only admin policy. Rust `agent-control` matches must handle the new variants (#2587).
+- `wn-agent` adds `attachment_get`, `download_attachment` and `release_attachment` for the attachments of past inbound
+  messages (mdk#2168, #2614). Both reads reply `attachment` with the slot's authenticated identity, native transfer
+  `state`, and, once downloaded, a `handoff` lease to a private, byte-verified local copy; `null` means the slot is
+  unavailable. Release every lease; `attachment_release_failed` is retryable with the same lease. Other new codes are
+  `attachment_epoch_unavailable` and `attachment_rejected`. Timeline reads stay network-free.
+- `AgentControlMediaRef` gains optional `source_epoch_identity`, the local upload branch. Received references omit it;
+  Rust struct literals must set it (#2891).
+- `scripts/install-wn-agent.sh` installs and supervises `wn-agent` alone, for your own control-socket client, with home
+  `~/.marmot-agents/standalone` and service `wn-agent-standalone` / `org.marmot.wn-agent.standalone`. `--bootstrap`
+  creates or reuses an agent account; `--import-identity [--expected-identity npub…]` imports one. See
+  `integrations/custom-client.md` (mdk#2571, #2580).
+- A retained outbound Welcome now keeps the `KeyPackageRef` of the KeyPackage it answers, staged, owed and after
+  withdrawal (mdk#2628 item 3.3b). `Engine::sent_welcomes_for_key_package`, forwarded as the runtime's
+  `welcomes_for_key_package`, finds a group's Welcomes by it, so a device link that failed can withdraw its Welcome
+  even when a crash lost the Welcome's id. `StoredMessagePayload::OutboundWelcome` becomes a struct variant carrying
+  `key_package_ref`, as `StagedInviteWelcome` now also does; two new stored-payload variants hold it, a Welcome
+  stored without one keeps its original bytes, and legacy JSON rows still decode.
+- The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
+  IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
+  vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
+  state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
+  invite of a member without support, with each side winning once.
+- `SendIntent::EnableAccountDevices` turns on `marmot.group.account-devices.v1` (0x800d) in an existing group, in one
+  admin Commit that adds it to the required list and removes any GroupContext entry left under its id (mdk#2628). The
+  engine never sends it by itself. It is refused before anything is staged with
+  `EngineError::AccountDevicesActivationRefused` and an aggregate `AccountDevicesActivationRefusal` when the group
+  already requires the component, is on the legacy profile, has a leaf that does not advertise it or carries data
+  under its id, or has an account over the leaf limit; a non-admin gets `NotGroupAdmin`.
+  `Engine::account_devices_activation_refusal` gives the same answer to a host deciding whether to offer it. A send
+  that has to wait for convergence is checked before it is queued; if the settled state then refuses it, the drain
+  retires it instead of failing every later drain. The
+  conformance simulator's `require_account_devices` now sends this intent, so the activation vectors that expect a
+  refusal name `account_devices_activation_refused` instead of `other`.
+- The engine gains two send intents for a device's own account in a group that requires
+  `marmot.group.account-devices.v1` (0x800d) (mdk#2628). `SendIntent::AddOwnAccountDevices` adds devices of the
+  sender's account from KeyPackages the caller supplies and sends one Welcome rumor per KeyPackage, as an invite does.
+  `SendIntent::RemoveOwnAccountDevices` removes other devices of the account, named by leaf signature key. Each sends
+  a same-account Commit with nothing else in it and leaves pending proposals alone. Anything else is refused before
+  anything is published or changed, including every request in a group that does not require 0x800d. A queued one
+  gets the preparation attempt after a convergence pass that admin intents get; self-updates and Leave still don't.
+  marmot-app does not expose them, so hosts cannot send them yet. The simulator's `remove_own_account_devices` now
+  sends the Remove intent.
+
+Experimental device groups (`dev-device-groups` or policy-test builds only; ordinary builds keep all of this off and
+release readers can skip it):
+
+- Add dev-only `devices list` and `devices link` start/status/confirm-match/approve/cancel commands over the persistent
+  daemon, enabled by the separate default-off `dev-device-groups` Cargo feature. Production timing stays unchanged;
+  ordinary releases keep it off.
+- Add dev-only `devices link reset --confirm`, forwarding the shared user-controlled local device-group reset. Ordinary
+  chat data/credentials remain; fresh pairing may be refused by existing admission rules.
+- `devices link` JSON gains `device_group_stalled`, and plain output says when this device can no longer catch up
+  with its device group and should be reset and linked again (experimental device-group builds).
+- Experimental `devices link start` can move an already linked device; status adds move progress and old-sibling hints,
+  and device status includes `moved`. Ordinary chat membership remains in place.
+- Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
+  (mdk#2628 item 3.6b). Such an account stays signed out; wiping it skips leaving its chats and deleting its slot.
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
   verification in Marmot encodings, with seven emoji to compare, a commitment to the new device's key, and
   confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of
@@ -84,13 +115,6 @@ versioning through the workspace version in the root `Cargo.toml`.
   and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
   the `unreleased-device-pairing` feature. Explicit `dev-device-groups` builds enable that capability; ordinary
   builds keep it off.
-- `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
-  check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
-  many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
-  the daemon answers, its protocol, accounts, this device's KeyPackage, relay health and catch-up from
-  `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids,
-  public keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show
-  that messages are delivered.
 - The engine implements `marmot.account.device-roster.v1` (0x800e), the roster of an account's device group
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
   requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
@@ -114,7 +138,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   update; that Commit's own leaf already carries a tag. From then on every KeyPackage it builds carries a fresh tag, a
   KeyPackage whose tag doesn't read as its own is due for replacement, and every own Commit or self-update that replaces
   a leaf without such a tag adds one. A founder whose entry in a new device group's roster carries its key tags its
-  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. The App runtime requires explicit device-group capability and runtime intent; ordinary CLI builds tag nothing.
+  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. The App runtime requires explicit
+  device-group capability and runtime intent; ordinary CLI builds tag nothing.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
@@ -127,9 +152,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
   relay route stays live. The app path requires explicit device-group capability and
   `MarmotAppConfig::dev_device_groups` runtime intent; policy-test builds retain the hidden fixture hooks.
-- Hosts can list the account's own devices from its device group's roster (mdk#2628 item 3.1):
-  `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
-  re-read it, since the device group's own events never reach hosts. The list is empty without explicit device-group capability and runtime intent.
+- Hosts can list the account's own devices from its device group's roster (mdk#2628 item 3.1): `linked_devices` in
+  `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to re-read it, since the device
+  group's own events never reach hosts. The list is empty without explicit device-group capability and runtime intent.
 - Hosts can tell the user when the device group has held this device's KeyPackage refresh back for a week (mdk#2628
   item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
   event to re-read it. It is false without explicit device-group capability and runtime intent.
@@ -144,27 +169,29 @@ versioning through the workspace version in the root `Cargo.toml`.
   the roster holds the slot as a device, a link the user confirmed, and commits one again whenever the roster has no
   entry for the slot; it never replaces an entry. The runtime writes them (`AccountDeviceRuntime::reject_device_slots`)
   behind the gate its other roster updates wait behind. A rejection names the slot alone, never its KeyPackage, which
-  may be a copy of a real device's. A sign-in another
-  device answered keeps its prompt, saying so, until dismissed, and is listed again if the roster loses that answer; one
-  whose slot a complete check finds empty stays listed as no longer signed in. A publication that is only stale never
-  signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
-  with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
-  UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. The app path requires explicit device-group capability and runtime intent.
-- Hosts can warn the user that someone holding the account's signing key published where the account's devices did
-  not (mdk#2628 items 3.7a and 3.7b). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected
-  sign-in, from this device or its device group's roster, and each KeyPackage this device found in its own slot that it
-  did not make, that the user has not seen on this device, with a `CompromiseWarningChanged` event to re-read it. A
-  device made a KeyPackage when its LeafNode carries the device's signature key, so only a foreign key warns, and only
-  on the device that found it, before it replaces the publication. Existing development device groups must be
-  recreated: the roster dropped its rejected KeyPackages (mdk#2628 D74), which changed its encoding. `dismiss_compromise_warning` marks them seen on this device only;
-  a rejection branch selection drops and restores stays seen, and rejections already in a device's first roster count
-  as seen. `start_fresh` lets the user start a device without the devices its first check found, answering each Not
-  now without rejecting it, and `started_fresh` says whether it did. The app path requires explicit device-group capability and runtime intent.
+  may be a copy of a real device's. A sign-in another device answered keeps its prompt, saying so, until dismissed, and
+  is listed again if the roster loses that answer; one whose slot a complete check finds empty stays listed as no longer
+  signed in. A publication that is only stale never signs a slot out, and a check of fallback relays, when the account
+  lists none, is never complete. Hosts list sign-ins with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and
+  check now with `check_sign_ins`, in `marmot-app`, UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event.
+  The app path requires explicit device-group capability and runtime intent.
+- Hosts can warn the user that someone holding the account's signing key published where the account's devices did not
+  (mdk#2628 items 3.7a and 3.7b). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected sign-in, from
+  this device or its device group's roster, and each KeyPackage this device found in its own slot that it did not make,
+  that the user has not seen on this device, with a `CompromiseWarningChanged` event to re-read it. A device made a
+  KeyPackage when its LeafNode carries the device's signature key, so only a foreign key warns, and only on the device
+  that found it, before it replaces the publication. Existing development device groups must be recreated: the roster
+  dropped its rejected KeyPackages (mdk#2628 D74), which changed its encoding. `dismiss_compromise_warning` marks them
+  seen on this device only; a rejection branch selection drops and restores stays seen, and rejections already in a
+  device's first roster count as seen. `start_fresh` lets the user start a device without the devices its first check
+  found, answering each Not now without rejecting it, and `started_fresh` says whether it did. The app path requires
+  explicit device-group capability and runtime intent.
 - Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
-  device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
-  event to re-read it. A link shows as made only once the new device's first change in the device group arrives; one
-  with none within an hour is removed again. Every call is refused without the experimental device-group entry point and its build capability.
+  device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged` event
+  to re-read it. A link shows as made only once the new device's first change in the device group arrives; one with none
+  within an hour is removed again. Every call is refused without the experimental device-group entry point and its build
+  capability.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
@@ -196,26 +223,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   Welcome. It removes the leaf only if the group's tree still has it, and the roster entry either way. Like a link,
   it is never queued: while the device group is settling it is refused with `EngineError::LinkDeviceUnsettled`, and
   the caller retries. It requires explicit device-group build capability (`dev-device-groups` or policy tests).
-- A retained outbound Welcome now keeps the `KeyPackageRef` of the KeyPackage it answers, staged, owed and after
-  withdrawal (mdk#2628 item 3.3b). `Engine::sent_welcomes_for_key_package`, forwarded as the runtime's
-  `welcomes_for_key_package`, finds a group's Welcomes by it, so a device link that failed can withdraw its Welcome
-  even when a crash lost the Welcome's id. `StoredMessagePayload::OutboundWelcome` becomes a struct variant carrying
-  `key_package_ref`, as `StagedInviteWelcome` now also does; two new stored-payload variants hold it, a Welcome
-  stored without one keeps its original bytes, and legacy JSON rows still decode.
 - The engine can create a group under a group id the host chose before the group exists
   (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
   An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is
   written.
 - A device link's Welcome now carries a delivery deadline, the end of the new device's wait for it, and is never
   published from then on (mdk#2628 item 3.3b, D40). `SendIntent::LinkDevice` takes `deliver_until`, and
-  `create_group_with_chosen_id_and_audit_context` takes `welcome_deliver_until` for the founding Welcome, in the
-  engine, the session and the runtime (`prepare_create_group_with_chosen_id_and_audit_context`). The stored Welcome
-  keeps it through promotion, in two new stored-payload variants; every other Welcome keeps its bytes.
-  `Engine::sent_welcome_deliver_until` reads it, and `Engine::outbound_welcome_status` now takes the current time
-  and reports an expired Welcome as settled. The runtime's publish check refuses an expired Welcome on every path,
-  and a batch checks the deadline again before each relay attempt. With that, a failed link whose Welcome may still be
+  `create_group_with_chosen_id_and_audit_context` takes `welcome_deliver_until` for the founding Welcome, in the engine,
+  the session and the runtime (`prepare_create_group_with_chosen_id_and_audit_context`). The stored Welcome keeps it
+  through promotion, in two new stored-payload variants; every other Welcome keeps its bytes.
+  `Engine::sent_welcome_deliver_until` reads it, and `Engine::outbound_welcome_status` now takes the current time and
+  reports an expired Welcome as settled. The runtime's publish check refuses an expired Welcome on every path, and a
+  batch checks the deadline again before each relay attempt. With that, a failed link whose Welcome may still be
   deliverable is recorded only after its Welcome is withdrawn, and opening a client no longer withdraws link Welcomes
-  first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable with explicit device-group build capability (`dev-device-groups` or policy tests).
+  first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable with explicit
+  device-group build capability (`dev-device-groups` or policy tests).
 - A device group is now founded with only its creator in the roster, plus its sign-in rejections, and the founding
   Add sets the linked device's entry as every later link's Commit does (mdk#2628 item 3.3b, D41).
   `create_group_with_chosen_id_and_audit_context` takes that roster update, in the engine, the session and the runtime.
@@ -224,44 +246,44 @@ versioning through the workspace version in the root `Cargo.toml`.
   Any other device-group founding with a member, and a roster update on any other create, is refused and leaves no
   group state behind. Reachable with explicit device-group build capability (`dev-device-groups` or policy tests).
 - A new device now joins its device group only through a Welcome that adds it by the KeyPackage the link confirmed
-  (mdk#2628 item 3.3b, D41). `DeviceGroupWelcomeExpectation` gains `key_package_ref`, which `marmot-app` fills from
-  the confirmed link; an expectation stored without it matches no Welcome. While an expectation is unexpired, the
-  engine also refuses, with `EngineError::UnexpectedDeviceGroupWelcome`, a Welcome into any other group, a chat
-  included, that adds this device by that KeyPackage, so no other invite uses it up. Storage providers implement the
-  new `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable with explicit device-group build capability (`dev-device-groups` or policy tests).
-- The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
-  IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
-  vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
-  state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
-  invite of a member without support, with each side winning once.
-- `SendIntent::EnableAccountDevices` turns on `marmot.group.account-devices.v1` (0x800d) in an existing group, in one
-  admin Commit that adds it to the required list and removes any GroupContext entry left under its id (mdk#2628). The
-  engine never sends it by itself. It is refused before anything is staged with
-  `EngineError::AccountDevicesActivationRefused` and an aggregate `AccountDevicesActivationRefusal` when the group
-  already requires the component, is on the legacy profile, has a leaf that does not advertise it or carries data
-  under its id, or has an account over the leaf limit; a non-admin gets `NotGroupAdmin`.
-  `Engine::account_devices_activation_refusal` gives the same answer to a host deciding whether to offer it. A send
-  that has to wait for convergence is checked before it is queued; if the settled state then refuses it, the drain
-  retires it instead of failing every later drain. The
-  conformance simulator's `require_account_devices` now sends this intent, so the activation vectors that expect a
-  refusal name `account_devices_activation_refused` instead of `other`.
-- The engine gains two send intents for a device's own account in a group that requires
-  `marmot.group.account-devices.v1` (0x800d) (mdk#2628). `SendIntent::AddOwnAccountDevices` adds devices of the
-  sender's account from KeyPackages the caller supplies and sends one Welcome rumor per KeyPackage, as an invite does.
-  `SendIntent::RemoveOwnAccountDevices` removes other devices of the account, named by leaf signature key. Each sends
-  a same-account Commit with nothing else in it and leaves pending proposals alone. Anything else is refused before
-  anything is published or changed, including every request in a group that does not require 0x800d. A queued one
-  gets the preparation attempt after a convergence pass that admin intents get; self-updates and Leave still don't.
-  marmot-app does not expose them, so hosts cannot send them yet. The simulator's `remove_own_account_devices` now
-  sends the Remove intent.
+  (mdk#2628 item 3.3b, D41). `DeviceGroupWelcomeExpectation` gains `key_package_ref`, which `marmot-app` fills from the
+  confirmed link; an expectation stored without it matches no Welcome. While an expectation is unexpired, the engine
+  also refuses, with `EngineError::UnexpectedDeviceGroupWelcome`, a Welcome into any other group, a chat included, that
+  adds this device by that KeyPackage, so no other invite uses it up. Storage providers implement the new
+  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable with explicit device-group build capability
+  (`dev-device-groups` or policy tests).
 
 ### Changed
 
+- Building `wn`, `wnd` or `wn-agent` from source now needs the Odin compiler (`dev-2026-10`): `marmot-markdown` parses
+  message Markdown in Odin, and Rust keeps only the AST and the bridge (mdk#3214). `scripts/install-odin.sh` installs
+  the pinned version, or set `ODIN` to an installed compiler.
+- The OpenClaw plugin requires OpenClaw 2026.10.10 or newer (was 2026.7.1) and Node 24.22.1+ (24.x) or 26.12.1+ (was
+  22.19) (#2924). The installer checks Node even with `--no-configure-openclaw`. `--yes` runs `openclaw plugins install
+  --force --accept-capabilities` for the verified archive, and `--force` no longer retries without the flag. Its
+  vulnerable npm dependencies (`hono`, `@hono/node-server`, `undici`, `vite` and others) move to patched releases
+  (#2920).
 - Media send scripts must preserve the complete upload `media` JSON object, including local `source_epoch_identity`
-  (mdk#2840). A list or plaintext-hash lookup cannot reconstruct upload provenance, so those references must be uploaded
-  again before sending; downloads remain supported. Sends refuse missing provenance and changed upload branches, even
-  at the same epoch number, before publication.
-
+  (mdk#2840, #2891). A list or plaintext-hash lookup cannot reconstruct upload provenance, so those references must be
+  uploaded again before sending; downloads remain supported. Sends refuse missing provenance and changed upload
+  branches, even at the same epoch number, before publication.
+- Conclusive all-target size refusals report JSON `event_too_large` with coarse `artifact` and `size_class` (#2993,
+  #2999). A legacy Welcome's first observed attempt can also report this reason without proving no earlier delivery.
+  Ambiguous and mixed relay failures keep their existing generic error; pending Welcome retries are unchanged.
+- Group-management Leave hints come from the shared core capability selector. `can_leave` is false for unaccepted
+  invitations and unrecoverable groups. Existing JSON fields and command spellings are unchanged (#2964).
+- JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
+  A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
+  reported `command_failed`. An external-signer rejection now reports `command_failed`, with
+  the external-signer rejection message, on every path. Before, a rejection while signing an identity proof reported
+  `engine_error`.
+- `wn-agent` (serve) without `--relay` now reads `MARMOT_RELAYS` and then falls back to the White Noise relays, the
+  same order `wn-agent bootstrap` uses (mdk#2550). Before, it ran with no relays, so an account imported with
+  `import-identity` could not start. `--no-default-relays` keeps the old behavior for offline and test runs. A
+  relay that is not a `wss://` URL now stops startup with `code=invalid_relay_url` and a `reason=`.
+- `wn-agent bootstrap --relay` also accepts comma-separated URLs, as `serve` does (mdk#2550).
+- `agent-connector` library: `resolve_bootstrap_relays` is replaced by `resolve_relays(cli_relays, use_defaults)`, which
+  returns `ResolvedRelays { relays, source }` (mdk#2550).
 - `messages send-event` refuses the device-group kinds 457, 458, 459, 460, 461, 473, 475 and 476 with
   `reserved_app_event_kind`, and one received in a chat makes no timeline row or message (mdk#2628). They are read only
   in the account's device group.
@@ -313,38 +335,48 @@ versioning through the workspace version in the root `Cargo.toml`.
   publish stamp. Groups that don't require 0x800d behave exactly as before.
   Scenario IR v3 gains `remove_own_account_devices`, and a vector races two devices of one account: an admin's
   Remove of another member beats the other device's same-account Remove on every client.
-- JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
-  A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
-  reported `command_failed`. An external-signer rejection now reports `command_failed`, with
-  the external-signer rejection message, on every path. Before, a rejection while signing an identity proof reported
-  `engine_error`.
-- `wn-agent` (serve) without `--relay` now reads `MARMOT_RELAYS` and then falls back to the White Noise relays, the
-  same order `wn-agent bootstrap` uses (mdk#2550). Before, it ran with no relays, so an account imported with
-  `import-identity` could not start. `--no-default-relays` keeps the old behavior for offline and test runs. A
-  relay that is not a `wss://` URL now stops startup with `code=invalid_relay_url` and a `reason=`.
+
+Experimental device groups (`dev-device-groups` or policy-test builds only; ordinary builds keep all of this off and
+release readers can skip it):
+
+- Leave (`wn groups leave`, `wn groups decline`, TUI `L`) steps an admin that is not the chat's last active admin down
+  automatically before it leaves. Ordinary builds still refuse an admin's Leave or Decline until it self-demotes, as in
+  0.14 (mdk#3014).
 
 ### Fixed
 
+- `wnd` no longer grows by about 3 MB per request (`whoami`, `settings show`, `debug health`, ...) until the host kills
+  it (#3249). The relay plane each request builds now releases its transport, caches and relay connections when dropped.
+- `account.json` and `key-security.json` in an account home are now written owner-only, like its other files (mdk#2569,
+  #2575). Before, they were written at the process umask, typically 0644. Reading a record an earlier build left group-
+  or world-readable tightens it through one no-follow handle, and the read fails when that is not possible.
+- On macOS, report a daemon request by the daemon's answer even when the daemon closes the connection right after
+  answering. `wn daemon stop` could report `daemon_unavailable` (`Socket is not connected (os error 57)`) for a stop
+  the daemon had accepted, and other one-shot requests could report a lost answer or unknown command state (#3221).
+- Account startup now gives up after 45 seconds without progress instead of 45 seconds in total, so a slow first open
+  that is still applying migrations no longer fails `wn login` or daemon startup (#3224). `wn daemon start` still stops
+  a daemon that is not ready after 60 seconds; the migrations it applied are kept and the next start resumes them.
 - Daemon startup no longer waits forever when an existing local peer accepts a readiness probe but never completes
-  its reply. The existing 60-second startup budget bounds the probe; an unresponsive socket is preserved and no
-  competing daemon is started (mdk#2957).
-
-- The TUI keeps `/login` secret input hidden while a quoted argument is still being edited, including leading
-  whitespace inside quotes or an unfinished extra argument (mdk#2955). Submitting an unfinished quote still reports
-  a parse error. Whitespace-padded secrets use stdin for TUI login, and the CLI rejects them as identity arguments.
-- SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
-  creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
-  `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
-- Delayed TUI results and live chat projections stay with the account and chat that own the displayed data
-  (mdk#2956), including when accounts share a group or an account switch fails to refresh.
-- A device whose link failed can link again into the same device group (mdk#2628 item 3.3b). It forgets its removed
-  copy, and the engine refused the next link's Welcome into a forgotten group unless the existing device's clock dated
-  it after the forget. A Welcome a device link waits for is now held to that link alone: the existing device's leaf key
-  and the confirmed `KeyPackageRef`. A new device no longer starts a link by a KeyPackage it already joined by; it
-  waits for the replacement's publication. The app path requires explicit device-group capability and runtime intent.
-- `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
-  device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
-  the TUI could mark it "(you)" and refuse to leave as the group's only admin.
+  its reply. The existing 60-second startup budget bounds the probe, and the start then fails with
+  `daemon_unavailable`; an unresponsive socket is preserved and no competing daemon is started (mdk#2957).
+- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts (part of
+  mdk#2696). It used to bind its socket and accept nothing until then, so those commands connected and waited with no
+  reply. `wn daemon status` and the TUI status line now say `daemon starting` in that window, and `--json` carries a new
+  `starting` field. Other commands wait for the accounts as before. A stop during startup cancels the start and shuts
+  down what it had opened.
+- `wn daemon start` no longer reports a failed start while the daemon it launched keeps starting (mdk#2696). It gave
+  up after five seconds with `daemon_start_failed`, but the first launch of a newly built `wnd` on a loaded macOS
+  machine can wait longer than that before it runs, and the daemon then came up behind the error. The command now
+  watches the `wnd` it launched: it reports `daemon started` once that daemon reports its accounts open, fails at
+  once with `daemon_start_failed` and the log's last lines if it exits, and stops it and fails with
+  `daemon_start_timeout` if it is not ready after 60 seconds, which covers the runtime's own wait for accounts to
+  open. Ctrl-C stops it as well and fails with `daemon_start_interrupted`; the daemon runs in its own
+  process group, so it used to keep starting behind the interrupted command. When another start wins the socket, it
+  stops its own `wnd` and reports `daemon already running`.
+- `wn daemon stop` no longer reports `daemon stopped` while the daemon is still running (mdk#2696). It reported
+  success as soon as the daemon accepted the request, before the daemon shut down its runtime and exited, so a slow
+  or stuck shutdown left a daemon behind a successful stop. It now waits for the process to exit, and fails with
+  `daemon_stop_timeout` if it is still running after 30 seconds.
 - `wn-agent` no longer replaces an imported identity's published relay lists on its first start (mdk#2550). With no
   cached copy of the account's kind 10002 or 10050 list, it published a new list naming only its own relays. It now
   reads the published lists from its relays and adopts them. It publishes a list only when every relay answered and
@@ -354,24 +386,40 @@ versioning through the workspace version in the root `Cargo.toml`.
   message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
   place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
   paths, account ids or relay URLs.
-- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts, which the
-  runtime allows 45 seconds (part of mdk#2696). It used to bind its socket and accept nothing until then, so those
-  commands connected and waited with no reply. `wn daemon status` and the TUI status line now say `daemon starting`
-  in that window, and `--json` carries a new `starting` field. Other commands wait for the accounts as before. A stop during startup
-  cancels the start and shuts down what it had opened.
-- `wn daemon start` no longer reports a failed start while the daemon it launched keeps starting (mdk#2696). It gave
-  up after five seconds with `daemon_start_failed`, but the first launch of a newly built `wnd` on a loaded macOS
-  machine can wait longer than that before it runs, and the daemon then came up behind the error. The command now
-  watches the `wnd` it launched: it reports `daemon started` once that daemon reports its accounts open, fails at
-  once with `daemon_start_failed` and the log's last lines if it exits, and stops it and fails with
-  `daemon_start_timeout` if it is not ready after 60 seconds, which covers the runtime's own 45-second wait for
-  accounts to open. Ctrl-C stops it as well and fails with `daemon_start_interrupted`; the daemon runs in its own
-  process group, so it used to keep starting behind the interrupted command. When another start wins the socket, it
-  stops its own `wnd` and reports `daemon already running`.
-- `wn daemon stop` no longer reports `daemon stopped` while the daemon is still running (mdk#2696). It reported
-  success as soon as the daemon accepted the request, before the daemon shut down its runtime and exited, so a slow
-  or stuck shutdown left a daemon behind a successful stop. It now waits for the process to exit, and fails with
-  `daemon_stop_timeout` if it is still running after 30 seconds.
+- `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
+  device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
+  the TUI could mark it "(you)" and refuse to leave as the group's only admin.
+- SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
+  creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
+  `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
+- The TUI keeps `/login` secret input hidden while a quoted argument is still being edited, including leading
+  whitespace inside quotes or an unfinished extra argument (mdk#2955). Submitting an unfinished quote still reports
+  a parse error. Whitespace-padded secrets use stdin for TUI login, and the CLI rejects them as identity arguments.
+- Delayed TUI results and live chat projections stay with the account and chat that own the displayed data
+  (mdk#2956), including when accounts share a group or an account switch fails to refresh.
+- Keep the newest overlapping TUI timeline refresh for the same chat, including page errors; stale
+  completions cannot consume the newer request or apply its subscriptions and followups.
+- Preserve TUI command acknowledgements, prompts and load errors using explicit feedback permissions. Older
+  command completions and background notices cannot overwrite newer feedback; ordinary successful loads
+  still permit live notices, and background refreshes continue updating the pane. Scrolling and cancelled
+  navigation preserve pending feedback; repeated searches admit only their newest request, and invite notices
+  wait until the status line is available. Returning from member search refreshes the roster without hiding an
+  add or follow result; ordinary view refresh failures remain visible. Startup failures wait for idle feedback,
+  and removing a chat cancels its pending page and settles its loading feedback (#3139, #3154).
+- Keep TUI timeline loads and live stream previews bound to their account, including empty-list switches and
+  retained panes under a different account's list. Start the adopted account's live feed even when its page
+  fails; same-account navigation and feed reconnects preserve the feed and observed previews (#2441).
+- Recover TUI chat and notification feeds for the selected account when a background chat-list retry succeeds
+  after a failed account switch, while preserving the open conversation and matching live subscriptions (#2968).
+
+Experimental device groups (`dev-device-groups` or policy-test builds only; ordinary builds keep all of this off and
+release readers can skip it):
+
+- A device whose link failed can link again into the same device group (mdk#2628 item 3.3b). It forgets its removed
+  copy, and the engine refused the next link's Welcome into a forgotten group unless the existing device's clock dated
+  it after the forget. A Welcome a device link waits for is now held to that link alone: the existing device's leaf key
+  and the confirmed `KeyPackageRef`. A new device no longer starts a link by a KeyPackage it already joined by; it
+  waits for the replacement's publication. The app path requires explicit device-group capability and runtime intent.
 
 ## [0.14.0] - 2026-10-23
 

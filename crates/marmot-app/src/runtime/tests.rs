@@ -3501,8 +3501,8 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
 /// What idle ticks do once a worker's startup housekeeping has settled
 /// (mdk#2923 §4): no writer transaction, no blocking-pool housekeeping
 /// batch, media sweep or upload promotion, while every tick still runs its
-/// phases and sets its passes due. The recovery runner's replay-flush writes
-/// are excluded by source (`replay_flush_writes`) until mdk#3238 is fixed.
+/// phases and sets its passes due. That includes an offline account's
+/// replay flush, which repeated its writes every tick until mdk#3238.
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
@@ -3584,22 +3584,16 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     // Settle one more tick, which may still finish startup work.
     tick().await;
     let before = snapshot();
-    let flush_before = crate::replay_flush_writes::writes();
     for _ in 0..3 {
         tick().await;
     }
     let after = snapshot();
     let delta = |index: usize| after[index] - before[index];
     assert_eq!(delta(0), 3, "three idle ticks ran");
-    // Since #3104 an idle account with an inactive adapter repeats the
-    // runner's replay flush, and its writes, every tick. Those are excluded
-    // by source; every other writer still fails this. Remove this exclusion
-    // once mdk#3238 is fixed.
-    let flush_writes = crate::replay_flush_writes::writes() - flush_before;
     assert_eq!(
-        delta(1) - flush_writes,
+        delta(1),
         0,
-        "an idle tick takes no app-storage writer transaction outside the replay flush"
+        "an idle tick takes no app-storage writer transaction"
     );
     assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
     assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");

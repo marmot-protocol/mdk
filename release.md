@@ -543,7 +543,7 @@ not create or update a mutable latest alias. A verified install for the current 
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.14.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.15.0"
 
 install_verified() (
   set -eu
@@ -580,7 +580,7 @@ install_verified "$base_url/install-opencode-marmot.sh" "$base_url/install-openc
 install_verified "$base_url/install-pi-marmot.sh" "$base_url/install-pi-marmot.sh.sha256"
 # Goose terminal harness
 install_verified "$base_url/install-goose-marmot.sh" "$base_url/install-goose-marmot.sh.sha256"
-# wn-agent only, for your own agent-control client (published after 0.14.0)
+# wn-agent only, for your own agent-control client
 install_verified "$base_url/install-wn-agent.sh" "$base_url/install-wn-agent.sh.sha256"
 )
 ```

@@ -2,712 +2,527 @@
 
 ## Unreleased
 
-- Migration 0153 records the local copy of each group the recovery ledger last settled (mdk#2660 row 11):
-  `account_recovery_copies` holds its install epoch, a rejoined copy's floor and the one notice a rejoin raises,
-  `account_recovery_copy_routes` the group's routes that floor holds on (with relays or without), and
-  `account_recovery_copy_units` the relays that retired what lay below it. Existing groups start with
-  the copy their engine record holds at the upgrade (unknown only when the record does not decode), so a rejoin from
-  before the upgrade raises nothing and one applied after it, even before the runner's first turn, does. New `settle_recovery_rejoin` retires, in one
-  transaction, what each of a rejoined group's routes owed or parked below the new copy's floor as `BeforeThisCopy`
-  (never coverage), restarts those units with a fresh budget, drops the routes' remainders below the floor and raises
-  the notice; it settles each copy once. New `retire_before_recovery_copy` retires below the recorded floor on a relay
-  that joined one of the group's routes after the rejoin, or returned to it, once per relay. Forgetting a group, or
-  deleting a terminal one, drops its copy. Nothing but loss, explicit repair or one held event's second makes a
-  rejoined route owe below its floor again. **Breaking:** `widen_recovery_coverage_goals` and
-  `uncover_recovery_coverage` take a new `CopyFloorReason`. `Clamp` keeps the write at or above the highest floor a
-  rejoin recorded for the route, so goal widening, post-join un-covers and every `begin_recovery_epoch_gap_retry`
-  visit stop there; `Loss` and `Repair` reach below it. A released receipt or a staged row given back still un-covers
-  its own second below the floor, so the re-check fetches it again, and only that second: when it lies below the
-  route's goal, the seconds its goal widening opens below the floor retire as `BeforeThisCopy`.
-  `retire_gone_recovery_units` keeps what was retired below the floor with its reason, and the retention prune parks
-  nothing from below the floor, on a route relays carry or one none does: a route keeps one remainder, so a held
-  second below the floor would otherwise join debt above it and park the retired history between. Such a second (or
-  debt loss reopened below the floor) that is still unfetched when retention passes it drops without a remainder; the
-  runner sweeps it for the whole retention window and the rejoin's notice already covers that history. A route no rejoin settled is unchanged; the floor is read
-  through the `account_recovery_copy_routes` route index in the writing transaction. New `recovery_copy`, `recovery_copy_floor` (a rejoined copy's recorded
-  floor), `record_recovery_copy`, `recovery_rejoin_notices`, `dismiss_recovery_rejoin_notice`, and
-  `recovery_copy_debt`: a route's debt on one relay less what a rejoin retired there.
+## 0.15.0 - 2026-11-09
 
-- `ChatListRow` gains `leave_blocked`, read with `leave_requested_at_ms` from the engine's leave request (mdk#3014).
-  `SqliteAccountStorage::pending_leave_requests` now returns each group's whole `LeaveRequest`. No schema change.
-
-- Migration 0201 adds the inactivity clock for marking and removing inactive siblings (mdk#2628 item 3.6b-2):
-  `device_activity` gains `clock_from` and `marked_inactive`, and the new single-row `device_inactivity_clock` keeps
-  this device's last caught-up pass and last restart. `note_device_active` restarts a sibling's clock when it reads a
-  heartbeat that moves its activity later; new `note_device_marked_inactive`, `device_inactivity_clock`,
-  `put_device_inactivity_clock` and `epoch_gap_recovery_given_up`. The device-group reset wipe clears the clock.
-
-- Upgrade conversion reopens the epoch gaps the old owner certified (mdk#3059). It satisfied a gap once its relays
-  answered for the gap's window, never once the engine left the stalled epoch, and the runner reads only pending gaps,
-  so a group still stalled at a certified gap's epoch was never revisited and never showed a notice. The last step now
-  turns every satisfied epoch gap into pending, ready demand at its next revision, clearing its park and reason and
-  keeping its epoch, creation time and scopes, in the step's transaction. Migration 0152 adds
-  `account_recovery_conversion.epoch_gaps_reopened`, the count of them; a database that converted before it reopened
-  none. **Breaking:** `RecoveryConversionReport` adds `epoch_gaps_reopened`.
-
-- Migration 0180 preserves original removal validation separately from source authority, so damaged tags cannot turn
-  an invalid removal into a valid one (#3016). Validated removals retain their effect through pruning. Uncertain legacy
-  removals preserve only already-hidden targets and cannot hide new targets; verified repair remains tracked in #3017.
-
-- Add a `MessageText` chat-list filter leaf (mdk#2983): chats with a visible message whose text contains the query,
-  by the `Text` rule (trim, Unicode lowercase, literal substring). A visible message is a chat message or poll question
-  in `visible_message_timeline`, in its latest edit, not deleted, not invalidated (except an own send that reached
-  no one, which the row previews as failed), and not past its disappearing-message expiry at the read's `now_ms`. It scans each chat's history, so only `chat_list_ids` and
-  `revalidate_chat_list_ids` accept it: every window read refuses it with the new
-  `ChatListQueryError::MessageTextInWindow` before reading (`ChatListViewQuery::validate_for_window`). While the
-  content-report backfill is owed, a `MessageText` query returns `ProjectionNotReady`. Its text counts toward
-  `MAX_CHAT_LIST_FILTER_TEXT_BYTES`. No migration.
-- Timeline `search` now matches by the same rule: Unicode lowercasing instead of SQLite's ASCII-only `NOCASE`, so
-  `école` finds `ÉCOLE`. ASCII matches are unchanged. Account connections register a `marmot_search_contains` SQL
-  function for both. **Breaking:** `ChatListFilter`, `ChatListFilterNode` and `ChatListQueryError` gain variants.
-
-- Add a `Text` chat-list filter leaf (mdk#2983): a literal substring match, after trimming and Unicode lowercasing,
-  against the title, group name, description and a direct chat's peer profile names. Migration 0200 adds
-  `chat_list_rows.search_text`, written by `store_chat_presentation`; widens `chat_presentation_dependencies.roles`
-  with a search role so every eligible peer is a dependency; makes a group description change invalidate the row's
-  presentation; and invalidates every stored presentation once, so a text query is not ready until the account's
-  presentation worker has rewritten them. While any chat in the view has pending presentation, a `Text` query returns
-  `ProjectionNotReady` (selection) or the new `ChatListPageError::SearchTextNotReady` (window read); other queries are
-  unaffected. A presentation write that changes only the search text still advances the presentation revision. New:
-  `normalize_search_text` (shared with user directory search), `MAX_CHAT_LIST_FILTER_TEXT_BYTES` (1024, across all
-  leaves; `ChatListQueryError::TextTooLong`) and `chat_list_pending_search_text`. **Breaking:**
-  `ChatPresentationInput` adds `group_description` (captured) and `search_peer_names` (set by preparation), and
-  `ChatListFilter`, `ChatListFilterNode`, `ChatListQueryError` and `ChatListPageError` gain variants.
-
-- Idle maintenance reads answer without a writer transaction (mdk#2923 step 1): upload recovery and pruning,
-  recovery-job retention, the push join-window count, chat presentation inputs, and recovery conversion and loss
-  import each check read-only first. New reads: `content_reports_backfill_complete`,
-  `has_legacy_attachment_work`, `has_database_held_avatars`, `has_file_backed_uploads`, `media_cleanup_epoch` (a
-  per-connection count of deleted `media_files` and `attachment_partial` rows, kept in TEMP tables; no migration)
-  and `connection_serial`, unique to each opened handle.
-
-- Add `Direct`, `Group` and `Muted` chat-list filter conditions (mdk#2983). Migration 0179 adds
-  `chat_list_rows.list_kind`, kept equal to the classifier's conversation kind by triggers on the row's group name and
-  the account group's member count, and backfills existing rows; an Unknown kind matches neither leaf. `Muted` tests
-  mute settings against the read's time, so nothing is written when a mute expires. The migration also drops migration
-  0072's unread navigation-revision triggers; `chat_list_navigation_meta` stays for the pin-rewrite flag.
-  **Breaking:** `chat_list_ids` and `revalidate_chat_list_ids` take a trailing `now_ms`, and `ChatListWindowQuery`
-  adds `now_ms`; a window read's rows evaluate `muted` at that time too. `ChatListWindowRead` adds
-  `next_mute_expiry_ms`, the next mute expiry in the view for a query that tests `Muted`.
-
-- Migration 0178 adds NIP-51 emoji set tables: the discovered projection and installed snapshots holding each
-  emoji's bytes and SHA-256. New `SqliteAppStorage` emoji set methods; installs verify every digest and the set and
-  byte caps in one transaction. Older native builds supporting only schema 0177 must upgrade before reopening a
-  migrated account database.
-
-- Migration 0177 adds a nullable coarse size diagnosis to existing pending Welcome repair pointers. Old rows remain
-  Unknown; unknown future annotations preserve the pointer. Updating a failure diagnosis retains its existing identity
-  and oldest-first position and adds no retry owner. Rust record literals add `size_class: None` when unknown;
-  older native builds supporting only schema 0176 must upgrade before reopening a migrated account database.
-
-- Retire old device-sync preparations atomically only when explicitly forgetting an active trusted nonterminal device-group copy with no unfinished Move. Preserve ordinary chat data, admitted work, issued private keys and taken-reference tombstones; no migration.
+Account storage advances from migration 116 through 201 on first open (migrations 0117–0153, 0160–0180, 0200 and 0201;
+the numbers between are unused). Older binaries reject the upgraded database; downgrade is unsupported. The
+per-account directory cache (`app-cache.sqlite3`) stays at schema 2 and the shared database at schema 3. See the
+[release notes](../../docs/release/0.15.0.md) and the [0.14.0 → 0.15.0 upgrade
+guide](../../docs/integration/0.15.0.md).
 
 ### Breaking changes
 
-- Remove the old recovery owner's execution storage (mdk#2660 rows 9–10): the comparison slot API, retry
-  reservations and pacing, scope plans, checkpoints, streaks and the attempt-cap park, qualified stall samples, the
-  `SubscriptionReplay` APIs, loss acknowledgment (`acknowledge_recovery_loss*`, `restore_unacknowledged_recovery_loss`),
-  `recovery_loss_reach_after`, the account-wide loss revision and import stamps, `RecoveryRequest` and its waiters,
-  the legacy delivery-loss APIs (`record_account_delivery_loss*`, `mark_account_delivery_recovery*`, `clear_account_delivery_recovery`,
-  `account_delivery_recovery`, `synchronize_account_delivery_loss`), and the obligation status and transition reads.
-  The recovery runner called none of them. Discarding a spill row after its last retry records loss evidence only;
-  the caller imports it into the ledger. Conversion, the loss evidence writers, epoch-gap demand and parked notices
-  stay. No migration; no table is dropped.
-
-- Remove capacity-wait eligibility (mdk#2660 rows 9–10): `record_recovery_capacity_pressure`,
-  `release_due_recovery_capacity_probes` and `observe_recovery_route_snapshot`, the route-policy snapshot that was
-  all that released the wait. Epoch-gap visits (`begin_recovery_epoch_gap_retry`, `finish_recovery_epoch_gap_retry`)
-  now accept every pending gap that is not parked, so a gap the old owner left waiting for capacity or a capability
-  is served. `RecoveryEligibility` keeps its variants for stored rows. No migration; no table is dropped.
-
-- Remove cross-read chat-list paging (mdk#2983): `chat_list_page`, `chat_list_page_from_anchor`, `ChatListPageQuery`,
-  `ChatListCursor`, the `first`/`last` cursors on `ChatListPage`, and the `InvalidLimit`, `CursorMismatch`,
-  `StaleCursor` and `FilteredCursorUnsupported` errors. Nothing outside storage tests called them: the runtime window
-  composes its seeks inside one read snapshot and keeps its place by anchor chat ID. Block-list rebuilds no longer
-  bump the chat-list navigation revision, which nothing reads now; migration 0072's revision triggers stay until a
-  later migration drops them. No schema change.
-
-- Add `ChatListViewQuery` (a `ChatListView` plus an optional `ChatListFilter`) compiled to SQL on the view's page
-  index, with bound parameters, before keyset paging (mdk#2983). `ChatListWindowQuery` replaces its `view` field with
-  `query`; `chat_list_ids` and `revalidate_chat_list_ids` take `impl Into<ChatListViewQuery>`, so a `ChatListView`
-  still works. New typed `ChatListQueryError` (also as `ChatListPageError::InvalidQuery` and `ChatListSelectionError::InvalidQuery`) and
-  `ChatListFilter::from_nodes` for the bindings' flat node list. No schema change.
-
-- Replace the unused stateful chat-list selection snapshot with stateless `chat_list_ids(view)` and
-  `revalidate_chat_list_ids(view, ids)` (mdk#2983). Remove `ChatListSelectionSnapshot`,
+- Migrations 0117 through 0201 advance account storage from schema 116 to 201 on first open, each in its own
+  transaction, so an interrupted upgrade resumes where it stopped. Older binaries reject the upgraded database (schema
+  175 also gates stored-message variant 13, which they cannot decode); downgrade is unsupported. None of them copies
+  or rebuilds `app_events` or `message_timeline`, but a few read or index history-sized tables once:
+  - 0117–0119, 0122: push tokens. 0117 queues the current registration once for every joined group while native push
+    is on (mdk#2604); 0118, 0119 and 0122 add signed tombstones and `group_push_gossip_state` with its owed snapshot,
+    join window and owed announce (mdk#2611).
+  - 0120–0121: members. `account_groups.member_count` counts accounts, rewriting the rows whose engine record lists an
+    account more than once; the `cgka_member_capabilities` cache is dropped.
+  - 0123–0124, 0126–0128, 0130, 0132, 0134–0136, 0150–0153: the recovery ledger and runner (mdk#2660): coverage and
+    goals, the un-cover log, units, relays, budget and staging, loss routes, parked remainders, re-check revisions,
+    unit fences, the one-time conversion marker, epoch-gap retries, saturated seconds and per-group copies. 0153 reads
+    every group's engine record once to seed its copy. 0124's attempt counters belonged to the old recovery owner,
+    which is gone.
+  - 0141–0142: sticker packs, installs, outbox and exact-hash asset history (mdk#875). 0141 adds
+    `chat_list_rows.last_message_tags_json`, so the chat-list projection rebuilds once on open.
+  - 0147: the `device_removed` membership; recreates the chat-list navigation triggers that read membership.
+  - 0167: attachment sources for custom-emoji reactions (mdk#2151), backfilled once from every stored reaction.
+  - 0172: the authenticated group-rejoin journal.
+  - 0173: recipient-confirmed sends (mdk#1291). Rebuilds the chat-preview index over `message_timeline` and settles
+    failed sends from their stored reactions; the chat list rebuilds on open.
+  - 0175: the pending-reference watermark. It decodes every saved outbound fanout and group evolution; one undecodable
+    row aborts the migration, and the account does not open, rather than risk reusing a reference.
+  - 0177: a coarse size diagnosis on pending Welcome repair pointers.
+  - 0178: NIP-51 emoji sets.
+  - 0179, 0200: chat-list kind and search text (mdk#2983). 0179 backfills `list_kind` for every row and drops 0072's
+    navigation-revision triggers. 0200 rebuilds `chat_presentation_dependencies` and invalidates every stored chat
+    presentation once: rows keep rendering their last value, but a `Text` query is not ready until the account's
+    presentation worker has rewritten them.
+  - 0180: original removal validation (#3016). It reads every stored removal event once and blanks the bodies of
+    pruned removals whose decision could not be proved.
+  - 0125, 0129, 0131, 0133, 0137–0140, 0143–0146, 0148–0149, 0160–0166, 0168–0171, 0174, 0176, 0201: experimental
+    device groups, history transfer and backups (mdk#2628); most tables stay empty unless device groups are on. 0144
+    adds a table that 0165 drops again. 0169 adds twelve columns and eight indexes to `cgka_processed_transport_ids`,
+    one row per processed event; 0174 drops those indexes again, and the columns it no longer needs stay inert.
+- Remove the old recovery owner (mdk#2660 rows 9–10); the recovery runner called none of it. Gone: the comparison slot
+  API, retry reservations and pacing, scope plans, checkpoints, streaks and the attempt-cap park, qualified stall
+  samples, the `SubscriptionReplay` APIs, loss acknowledgment (`acknowledge_recovery_loss*`,
+  `restore_unacknowledged_recovery_loss`), the account-wide loss revision, `RecoveryRequest` and its waiters, the
+  legacy delivery-loss APIs (`record_account_delivery_loss*`, `mark_account_delivery_recovery*`,
+  `clear_account_delivery_recovery`, `account_delivery_recovery`, `synchronize_account_delivery_loss`,
+  `RecoveryLossImport`), the obligation status and transition reads, and capacity-wait eligibility
+  (`record_recovery_capacity_pressure`, `release_due_recovery_capacity_probes` and `observe_recovery_route_snapshot`,
+  the route-policy snapshot that was all that released the wait). Discarding a spill row after its last retry records
+  loss evidence only; the caller imports it into the ledger. Epoch-gap visits accept every pending gap that is not
+  parked, so a gap the old owner left waiting for capacity or a capability is served. Conversion, the loss evidence
+  writers, epoch-gap demand and parked notices stay, and `RecoveryEligibility` keeps its variants for stored rows. No
+  table is dropped.
+- Chat-list reads take a query (mdk#2983). `ChatListWindowQuery` replaces its `view` field with `query`
+  (`ChatListViewQuery`) and adds `now_ms`, at which a window read's rows evaluate `muted`; `ChatListWindowRead` adds
+  `next_mute_expiry_ms`. `ChatListPageError` gains `InvalidQuery` and `SearchTextNotReady` and
+  `ChatListSelectionError` gains `InvalidQuery`. `ChatPresentationInput` adds `group_description` (captured) and
+  `search_peer_names` (set by preparation). Cross-read paging is gone: `chat_list_page`, `chat_list_page_from_anchor`,
+  `ChatListPageQuery`, `ChatListCursor`, the `first`/`last` cursors on `ChatListPage`, and the `InvalidLimit`,
+  `CursorMismatch`, `StaleCursor` and `FilteredCursorUnsupported` errors; the runtime window composes its seeks inside
+  one read snapshot and keeps its place by anchor chat ID. The unused stateful selection snapshot gives way to
+  stateless `chat_list_ids` and `revalidate_chat_list_ids`: `ChatListSelectionSnapshot`,
   `chat_list_selection_snapshot`, `chat_list_selection_count`, `chat_list_selection_page`,
-  `revalidate_chat_list_selection` and the `InvalidPage`/`StaleSelection` error cases; no caller used them.
-  No schema, wire or host-binding format changes.
-
-- Remove the experimental `SqliteAppStorage::next_received_private_key_package` and
-  `take_received_private_key_package` conveniences. Rust source/nightly consumers should read
-  `received_private_key_packages_from`, validate their selected record, then call
-  `take_received_private_key_package_exact`; broad listing remains supported. No stable release contained these
-  methods, and no database, wire or host-binding format changes.
-  To retain the old preference, callers select usable stock first, then the longest-lived unexpired fallback;
-  the batch itself stays in expiry/ref order.
-
-- Experimental sibling-Welcome repair uses current-incarnation D35 heartbeats (D100). Remove
-  `SqliteAppStorage::due_sibling_welcome_resends`, `qualify_sibling_welcome_activity` and
-  `ignore_sibling_welcome_activity`; use `sibling_welcome_resend_is_due(welcome_id, linked_at)` for heartbeat
-  eligibility. `sibling_welcome_resend_batch` returns `(welcome_id, carrier)` pairs instead of Welcome ids.
-  Rust callers must update and rebuild. Migration 0174 retires D90/D91 observation indexes and local ordering
-  clock, preserving processed-wrapper dedup, known publication times and carrier high-water; unused nullable
-  legacy columns remain inert.
-
-- A peer's reaction settles a send whose publish was judged to have reached
-  no one (mdk#1291). `TimelineMessageRecord` adds `recipient_confirmed`:
-  true for a failed own row with no relay acceptance that another account
-  reacted to, which proves that peer received it. A pending send is not
-  settled. Such a row projects as delivered,
-  with no `invalidation_status` and, as before, no `source_message_id_hex`;
-  the chat list reports it `Delivered` and ranks it where it ranked as a
-  failed send, never as a pending one.
-  The stored `app_events` row keeps `local_publish_failed`, so a resend, the
-  terminal-group sweep and convergence withdrawals are unchanged. A peer
-  retracting its reaction returns the row to its failed state. When retention
-  prunes the confirming reaction while the send stays, the receipt is kept in
-  `kept_recipient_receipts` and goes with the send. Migration 0173 adds
-  `message_timeline.recipient_confirmed` and that table, rebuilds the
-  chat-list preview index and settles existing rows from their stored
-  reactions.
-
-- Migration 0175 adds a full-width pending-reference watermark outside group snapshots. Saved fanout/evolution
-  writes raise it atomically; deletion never lowers it. `StorageProvider` implementations must supply
-  `pending_ref_high_water` and preserve that bound. Undecodable pre-index artifacts abort migration rather than
-  guessing a safe handle; malformed artifacts after indexing remain isolated to their group.
-- Stored-message variant 13 retains a confirmed Welcome's origin Commit. Existing originless variants keep their
-  bytes and handling; older binaries refuse schema 175 on open.
-- Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
-
-- Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,
-  D81). Migration 0165 drops the unused `cgka_announced_key_packages` table
-  and its age index; migration 0144 stays unchanged. Device rosters and the
-  own-slot compromise warning are unaffected.
-
-- Methods with no caller outside their own tests are gone (mdk#2816):
-  `SqliteAppStorage::remove_group_push_token`,
-  `remove_group_push_tokens_for_member` (use
-  `remove_group_push_tokens_for_leaves` with the member as departed),
-  `clear_epoch_backfill_intents_for_groups`,
-  `clear_local_group_deletion_frontier_if_message_is_newer`,
-  `record_app_event_refreshing_moderation_grant` and its `_with_retention`
-  variant (nothing replaces a stored grant any more: re-recording keeps it,
-  and `record_app_event_with_source` decides it once from the source's
-  authority and never again), `avatar_acquisition_state`
-  (read `AvatarAssetPresentation::acquisition`) and `release_media_reference`
-  (removal releases a slot's reference); `AvatarFileImage::byte_len`,
-  `DatabaseAvatar::byte_len`, `SqliteSharedStorage::set_telemetry_install_id`
-  and `impl Default for SqlCipherHardening` (use
+  `revalidate_chat_list_selection` and the `InvalidPage`/`StaleSelection` errors are removed. Block-list rebuilds no
+  longer bump the chat-list navigation revision, which nothing reads; migration 0179 drops its triggers.
+- New fields on existing records; struct literals add them, or `..Default::default()` where the type has one.
+  `TimelineMessageRecord` adds `recipient_confirmed` (mdk#1291) and `imported_from` (mdk#2628 item 4.2d).
+  `TimelineMessageQuery` adds `sender`, `since`, `until`, `attachment_type`, `search_wall_clock` and `cursor_group_id`
+  (mdk#3245). `ChatListRow` adds `leave_blocked` (mdk#3014), `ChatListMessagePreview` and `TimelineReplyPreview` add
+  `tags` (mdk#875), `PendingWelcomeDeliveryRecord` adds `size_class` (`None` when unknown), and
+  `AttachmentAcquisitionSource` adds `message_id_hex`.
+- `SelfMembership` adds `DeviceRemoved`, stored as `device_removed` (migration 0147). Update exhaustive matches.
+- `SqliteAccountStorage::pending_leave_requests` returns each group's whole `LeaveRequest` instead of its request time
+  (mdk#3014).
+- `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone` instead of eight arguments, and stores
+  its optional removal proof.
+- `SqliteSharedStorage::public_directory_profiles` takes the normalized query and the account ids to resolve, and
+  returns each profile with its timestamp and match rank (mdk#1801).
+- Storage traits: `CapabilityStorage` loses `save_member_capabilities` and `member_capabilities` (migration 0121).
+  `StorageProvider` now also requires `AccountDeviceHistoryKeyStorage`, `DeviceGroupWelcomeStorage` and
+  `pending_ref_high_water`, which `SqliteAccountStorage` implements; an implementation must keep the pending-reference
+  bound across deletions (migration 0175).
+- Methods with no caller outside their own tests are gone (mdk#2816): `SqliteAppStorage::remove_group_push_token`,
+  `remove_group_push_tokens_for_member` (use `remove_group_push_tokens_for_leaves` with the member as departed),
+  `clear_epoch_backfill_intents_for_groups`, `clear_local_group_deletion_frontier_if_message_is_newer`,
+  `record_app_event_refreshing_moderation_grant` and its `_with_retention` variant (nothing replaces a stored grant
+  any more: re-recording keeps it, and `record_app_event_with_source` decides it once from the source's authority and
+  never again), `avatar_acquisition_state` (read `AvatarAssetPresentation::acquisition`) and `release_media_reference`
+  (removal releases a slot's reference); `AvatarFileImage::byte_len`, `DatabaseAvatar::byte_len`,
+  `SqliteSharedStorage::set_telemetry_install_id` and `impl Default for SqlCipherHardening` (use
   `SqlCipherHardening::cipher_only`).
-- Imported timeline rows name their source device (mdk#2628 item 4.2d).
-  `TimelineMessageRecord` adds `imported_from: Option<HistoryImportSource>`,
-  read from `app_event_imports`, with the device's name from
-  `set_device_labels`, which marmot-app gives from the roster. The names live
-  in a TEMP table each account connection creates at open, so nothing is
-  stored and every open starts with none; no migration. `latest_history_imports`
-  reads each chat's latest import (of two sources importing in the same
-  second, the greater slot) and `parked_history_chats` each chat parked
-  deliveries name, with whether a fetch failed. `watch_history_imports` starts
-  a per-connection TEMP count of every change those reads see, imports,
-  cascade deletes, parked deliveries and device names alike, and
-  `history_imports_generation` reads it; `set_device_labels` writes only when
-  the names differ.
-
-- Migration 0164 adds the backup ledger (mdk#2628 item 4.4b):
-  `backup_runs` and `backup_run_blobs` (each backup this device is writing
-  until a relay accepts its pointer, and its blobs, recorded before upload),
-  `backup_condemned_blobs` (blobs to delete while no pointer lists their
-  backup) and `backup_schedule` (the next pass, and the writer this device
-  last saw named for a key). Nothing secret is stored. `SqliteAppStorage`
-  gains `backup_schedule`, `schedule_backup_pass`, `note_backup_writer`,
-  `begin_backup_run`, `record_backup_run_blob`, `record_backup_run_head`,
-  `backup_runs`, `finish_backup_run`, `abandon_backup_run`,
-  `condemn_backup_blobs`, `due_condemned_backup_blobs`,
-  `next_condemned_backup_try`, `defer_condemned_backup_blob`,
-  `forget_condemned_backup_blob` and `forget_backups_except`, with the types
-  `BackupRun`, `BackupRunHead`, `BackupSchedule` and `CondemnedBackupBlob`.
-- Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
-  It adds `backup_recovery_key`, at most one row: the public half of the
-  recovery key that words confirmed while this device trusts no device group
-  derive. `trust_device_group` deletes it in the same transaction, since the
-  roster's account entry is then the account's. The words and the private
-  half are never stored. `SqliteAppStorage` gains `kept_recovery_key`,
-  `keep_recovery_key` and `forget_kept_recovery_key`.
-- `CompromiseWarningReason::RejectedKeyPackage` is now
-  `ForeignOwnSlotKeyPackage`, stored as `foreign_own_slot_key_package`
-  (mdk#2628 D74, 3.7b), and `record_foreign_own_slot_key_packages` records
-  the KeyPackages this device found in its own slot that it did not make. A
-  seen one goes 7,261,200 seconds after it was found, an unseen one stays
-  until dismissed or the 4,096-row cap drops it. No migration: the reason
-  is text, and no build wrote the old one.
-- Migration 0143 advances account storage to schema 143 (mdk#2628 item 3.6).
-  It adds `device_activity`, one row per sibling the trusted device group's
-  roster lists (that entry's `linked_at`, when this device first found it
-  there and the newest time one of its heartbeats counted for), and
-  `device_heartbeat_sent`, the
-  device group this device last sent its own heartbeat in and when.
-  `SqliteAppStorage` gains `device_activity`, `track_device_activity`,
-  `note_device_active`, `device_heartbeat_sent` and
-  `put_device_heartbeat_sent`, with `DeviceActivityRecord` and
-  `DeviceHeartbeatSent`.
-- Migration 0148 advances account storage to schema 148 (mdk#2628 item 3.7a).
-  It adds `account_compromise_warning_items`, one row per rejection the
-  account's compromise warning gathers, keyed by its reason and subject, with
-  when it was made, when this device first gathered it and when the user saw
-  it; a seen row stays, so a rejection that comes back does not warn again.
-  `account_compromise_warning_baseline` names the device group this device
-  first trusted, whose roster's rejections then count as seen, and
-  `account_sign_in_baseline.started_fresh_at` records that the user started
-  this device fresh. `SqliteAppStorage` gains `record_compromise_warning`,
-  `compromise_warning`, `dismiss_compromise_warning`, `start_fresh` and
-  `started_fresh`, and `trust_device_group`, which makes a device group
-  trusted and takes its roster as this device's first in one transaction.
-  `insert_device_group` and `set_device_group_trust` now refuse a trusted
-  state. The number below 148 that is not yet used (145) belongs to other
-  work, which lands later; the runner applies it in order.
-- Migration 0147 advances account storage to schema 147 (mdk#2628 item
-  3.6b). `SelfMembership` adds `DeviceRemoved`, stored as `device_removed`:
-  this device's leaf was removed from a chat the account stays in. The
-  migration recreates the chat-list triggers so such a chat lists with the
-  departed chats, and setting it suppresses the chat's unread like the other
-  departed states.
-
-- Migration 0161 advances account storage to schema 161 (mdk#2628 item 4.3).
-  It adds `small_state_items`, one row per chat and item (`read`, `pin`,
-  `mute`, `archive`) holding the value the account's devices agree on, what
-  this device last observed of it and whether its siblings are still owed it,
-  and `small_state_sync`, which records that this device started, when and at
-  which device-group tip it last broadcast every item, and whether it owes a
-  broadcast request or an answer to one. Only chats whose MLS group id is at
-  most 256 bytes hold items. It also adds `device_group_messages`: the kind of
-  each device-group message this device sent or read whose withdrawal a
-  feature acts on, by app event id and, once known, the message id the engine
-  names it by (an own send's transport id, a received message's content id),
-  kept a week and capped at 4,096 rows; a local forget of the group removes
-  them. `SqliteAppStorage` gains `record_device_group_message`,
-  `note_device_group_message_ids`, `device_group_message_kind`,
-  `start_small_state`, `small_state_started`, `small_state_schedule`,
-  `begin_small_state_broadcast`, `owe_small_state_broadcast_request`,
-  `small_state_broadcast_request_sent`, `owe_small_state_broadcast_answer`,
-  `sync_small_state`, `small_state_items`, `unsent_small_state_items`,
-  `mark_small_state_sent` and `owe_all_small_state_items`, with
-  `SmallStateItem`, `SmallStateRule`, `SmallStateSchedule`,
-  `SmallStateBroadcast` and their value types.
-- Migration 0160 advances account storage to schema 160 (mdk#2628 item 3.5b).
-  It adds `sibling_welcomes_received`, the sibling Welcomes this device
-  admitted from its device group and has not joined from yet, keyed by the
-  message that carried each, at most `MAX_STASHED_SIBLING_WELCOMES` at once.
-  A row the engine held, because this device still held an active copy of
-  its chat, keeps that chat's id, and a full stash drops its oldest held row
-  to keep a new one. `SqliteAppStorage` gains `stash_sibling_welcome`,
-  `stashed_sibling_welcomes`, `hold_stashed_sibling_welcome` and
-  `delete_stashed_sibling_welcome`, over `StashedSiblingWelcome`. Nothing
-  writes them unless device groups are on.
-- Migration 0137 advances account storage to schema 137 (mdk#2628 item 3.6).
-  It adds `device_renames`, one row per device this device renamed in its
-  device group's roster: the label its latest rename sets, the rename ids
-  that rename wrote, and the rename ids the device's entry held where this
-  device's renames of it were built. `SqliteAppStorage` gains
-  `device_renames`, `device_rename`, `put_device_rename` and
-  `drop_device_rename`, with `DeviceRenameRecord`.
-- Migration 0136 advances account storage to schema 136 (mdk#2660 phase 4).
-  It adds `account_recovery_conversion`, the marker of the one-time upgrade
-  conversion (its next step, whether the changed "history may be incomplete"
-  notices still need announcing, whether a report is pending, and the shadow
-  rows and units the conversion counted), `account_recovery_conversion_counts`
-  (converted obligations by cause and disposition) and
-  `account_recovery_conversion_loss` (the loss watermarks of each account and
-  cause whose live loss it un-covered). Every database starts with the
-  conversion pending.
-  `SqliteAppStorage` gains `convert_recovery_obligations`, which takes a
-  `RecoveryConversionInput` of `RecoveryConversionRoute`s,
-  `recovery_conversion_pending`, `recovery_conversion_report` (a
-  `RecoveryConversionReport` of `RecoveryConvertedObligations` by cause),
-  `acknowledge_recovery_conversion_report`, `converted_recovery_loss` (each
-  account and cause's converted `RecoveryConvertedLoss` watermarks, until
-  reclaimed), `reclaim_converted_recovery_loss` (deletes each converted
-  generation still at its converted count), `recovery_conversion_notices_changed`
-  and `acknowledge_recovery_conversion_notices`. Nothing calls the conversion
-  yet.
-- Migration 0135 advances account storage to schema 135 (mdk#2660 phase 4).
-  It replaces `account_recovery_units.fencing`, which nothing set, with
-  `account_recovery_unit_fences`: each capture range a unit fences, one row
-  each, never overlapping. `RecoveryUnit::fencing` goes, and
-  `set_recovery_unit_fencing` becomes `set_recovery_unit_fences`, which
-  replaces a unit's ranges. `recovery_unit_fences` lists every fenced range,
-  `staged_recovery_routes` the routes with staged events, and
-  `reclaim_staged_recovery_routes` drops the rows of routes the runner no
-  longer lists, owing their seconds again. The retention prune drops fenced
-  ranges below its floor.
-- Migration 0140 advances account storage to schema 140 (mdk#2628 item 3.4).
-  It adds private KeyPackages, single-use KeyPackages a device hands to one
-  sibling inside its device group: `cgka_private_key_packages` (one issuer
-  record per KeyPackage, its key in the OpenMLS bundle store),
-  `private_key_packages_received` (what siblings handed this device, by
-  issuer slot; one this device used keeps its ref until it expires, so it
-  is not kept again if handed over again) and `private_key_package_requests`
-  (what this device still wants from each issuer). `SqliteAccountStorage` implements the new
-  `PrivateKeyPackageStorage`; `SqliteAppStorage` gains the received-KeyPackage
-  and need reads and writes. Nothing writes them unless device groups are on.
-- Migration 0144 advances account storage to schema 144 (mdk#2628 item 3.2).
-  It adds `cgka_announced_key_packages`: one row per KeyPackage a
-  device-group roster this device applied announced for a slot, with when it
-  last applied one that did. `SqliteAccountStorage` implements the new
-  `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
-  with their group, and are pruned after 30 days or past 16 per slot. Nothing
-  writes them unless device groups are on.
-- Migration 0145 fills schema 145 (mdk#2761). It adds
-  `cgka_roster_tag_keys`: one row per tag signature key a device-group roster
-  this device applied listed for a slot, in a device entry or a `removed`
-  record, with when it last applied one that did, the order it applied them
-  in (`seen_seq`), and whether one listed it in a `removed` record
-  (`held_as_removed`). `SqliteAccountStorage` implements the new
-  `RosterTagKeyStorage`. Rows survive a branch-selection
-  rewind, go with their group, and are pruned after 30 days or past 4 per
-  slot; a slot's newest row held as removed is kept past the 4, so the slot
-  stays known to have held its `removed` record. Nothing writes them unless
-  device groups are on.
-- Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
-  It adds `device_removals`, one row per device this device's user removed
-  from the account's device group, written before anything is committed, with
-  when the user decided and when the removed device's slot deletion was
-  accepted. A row lasts as long as this device trusts the device group:
-  forgetting the group removes its rows, with its trust row, and nothing else
-  does. `SqliteAppStorage` gains `record_device_removal`, which keeps a
-  decision already recorded, `device_removals` and
-  `set_device_removal_slot_withdrawn`. No rows are seeded.
-- Migration 0139 (mdk#2628 item 4.2a) runs on every account database that
-  lacks it, including one already at schema 146. It adds `app_event_imports`,
-  which marks each app event imported from a sibling's history with the roster
-  slot of the device that sent it. `SqliteAppStorage::import_app_events`
-  records only events the account does not hold, as received rows with their
-  epoch and no transport id, and `app_event_import_source` reads the mark. An
-  imported review label or admin removal takes the sender's verdict
-  (`ImportedAppEvent::moderation_grant`) and has no authority without one.
-  Unread counts and the retention sweep's unread check skip imported rows, so
-  they never count as unread and expire on time; the read marker never moves
-  for them. `history_export_page` reads a chat's app events in chat order
-  (epoch, `created_at`, id) for a history bundle, with no event for each row
-  that must stay out.
-- Migration 0162 (mdk#2628 item 4.2a) adds `imported_media_file_keys`, which
-  holds the per-file attachment keys a sibling sent with imported history.
-  Each key is named by its media reference's `ciphertext_sha256`, is zeroed
-  before its app event is deleted, and goes with it.
-  `ImportedAppEvent::file_keys` carries the keys, and `import_app_events`
-  stores them only for rows it adds, refusing a second, different key for a
-  ciphertext the chat already holds one for. `imported_media_file_key` reads
-  an imported message's key for one media reference,
-  `imported_media_file_key_for_ciphertext` reads the chat's key for a
-  ciphertext when the caller cannot name the message, and
-  `imported_media_file_keys` reads a message's keys so they can be passed on.
-  `AttachmentAcquisitionSource` gains `message_id_hex`. Imported chat messages
-  now get attachment slots, which a timeline rebuild keeps.
-  `attachment_history_source` and its insert trigger take a row without a
-  transport id when `app_event_imports` marks it, and the attachment tables
-  use its app event id as its `source_message_id_hex`.
-- Migration 0166 (mdk#2628 item 4.2c, D77) sends a history too long for
-  inline deliveries through Blossom. `history_deliveries_owed` gains
-  `blossom_due_at` and `blossom_attempts` (`send_history_delivery_by_blossom`,
-  `due_blossom_history_deliveries`, `defer_blossom_history_delivery`; owing a
-  history afresh clears them), and `history_deliveries_parked` is rebuilt so a
-  delivery parks either its bundle or the Blossom servers that hold it, with
-  when to fetch it (`ParkedBundle`, `due_parked_history_fetches`,
-  `defer_parked_history_fetch`). `OwedHistoryDelivery` gains the two fields and
-  `ParkedHistoryDelivery::bundle` is a `ParkedBundle`.
-  `owe_history_delivery_again` returns the history it owes again
-  (`Option<OwedHistoryDelivery>`) instead of `bool`, so the caller can back off
-  one going through Blossom. Test support gains `execute_batch_for_test`.
-- Migration 0149 (mdk#2628 item 4.2b, D76) adds four tables for sealed
-  history deliveries. `cgka_sibling_adds` holds each sibling slot one of this
-  device's own confirmed Commits added to a group, written by the engine
-  through the new `SiblingAddStorage` (`record_sibling_adds`, which also drops
-  adds a week old, `sibling_adds`, `forget_sibling_add`); a rewind keeps its
-  rows and deleting the group drops them. `history_deliveries_owed` holds the
-  histories this device owes
-  its siblings (`owe_history_delivery`, `unsent_history_deliveries`,
-  `mark_history_delivery_sent`, `forget_history_delivery`);
-  `history_delivery_sends` names the chat and receiver of each delivery sent
-  (`record_history_delivery_send`), so `owe_history_delivery_again` owes the
-  history of a delivery withdrawn or failed for good again; and `history_deliveries_parked` keeps
-  deliveries read before this device holds their chat, at most 1,024
-  (`park_history_delivery`, `parked_history_delivery_chats`,
-  `parked_history_deliveries`, `drop_parked_history_delivery`).
-  `expire_history_deliveries` drops rows a week old, and a local forget of a
-  chat drops its rows. `device_group_message_event_id` reads the app event id
-  of a recorded device-group message.
-- `mark_account_delivery_recovery_observed` takes the routes the relay plane
-  holds for the generation it observes (mdk#2660 phase 4). An observation past
-  the durable count merges them as `record_account_recovery_loss_routed`
-  would, so the generation stays routed, and lowers the generation's floor to
-  the lowest bound they list; `None` makes it account-wide, as every such
-  observation did before.
-- Migration 0138 (mdk#2628 item 4.1) runs on every account database that
-  lacks it, including one already at schema 140. It adds
-  `cgka_account_device_history_keys`: this device's HPKE history key
-  pair, one per account-device identity, next to its MLS signer's binding.
-  `SqliteAccountStorage` implements the new
-  `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
-  `StorageProvider` now requires; `put_account_device_history_key_if_absent`
-  never replaces a stored key.
-- Migration 0172 advances account storage to schema 172 after migration 0171.
-  It adds the protocol-owned `cgka_group_rejoin` journal, with one recipient
-  job per group and bounded coordinator jobs. Capacity refusals preserve
-  existing work. A retained nonce cannot change its peer or recipient local
-  state token; refused writes leave the exact outbound artifact and retry
-  evidence intact. Same-job phase, retry and source refreshes remain writable.
-  Group deletion cascades to its recovery jobs. Older binaries reject the
-  upgraded database.
-  Runtime ownership retains exact publication artifacts and per-member Commit
-  cooldowns. Separate native and authenticated remote epoch baselines allow a
-  taller losing copy to rejoin. A durable one-shot remote rearm caps each
-  episode at 64 reservations between native/admin changes or explicit retry.
-  Nonce rotation clears remote-only height claims, not cost or the spent refill.
-- Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
-  It adds `recheck_revision` to `account_recovery_units`, which existing rows
-  start at 0. Every request that makes a re-check pass due bumps it
-  (`make_recovery_recheck_due`, `rearm_all_recovery_units`, and a cooldown
-  longer than `RecoveryUnitPolicy::recheck_after_cooldown_seconds` ending),
-  and `RecoveryRecheckPass::revision` reports it. `record_recovery_recheck`
-  takes the revision its quantum began on, records nothing once it moved, and
-  returns whether it recorded. Ending a long cooldown, by an answer or by
-  `record_recovery_relay_reconnected` (which now takes the policy and the
-  time), makes every re-check on the relay due in the same transaction.
-- Migration 0133 advances account storage to schema 133 (mdk#2628 item 3.3b).
-  It adds `device_links`, one row per device this device approved adding to
-  the account's device group, written before the approving commit, with the
-  added KeyPackage's `KeyPackageRef` (which also finds the link's Welcome) and
-  its leaf's signature key, its outcome (`pending`, `linked` or `failed`), and
-  whether a failed link's Welcome is withdrawn. It also adds
-  `device_group_joins`, the device groups this device joined through a link
-  whose first commit there has not landed yet. `SqliteAppStorage` gains
-  `record_device_link`, `mark_device_link_welcome_withdrawn`, `device_link`,
-  `device_links`, `decide_device_link`, `record_device_group_join`,
-  `device_group_joins` and `delete_device_group_join`. A local forget removes
-  the group's rows. No rows are seeded.
-- Migration 0132 advances account storage to schema 132 (mdk#2660 phase 4).
-  It adds `import_revision` to `account_delivery_loss_evidence`: the loss
-  revision the import that last charged a generation left. Existing imported
-  rows take the current loss revision; rows no import charged stay NULL. It
-  also adds `acknowledged_import_revision` to `account_recovery_state`: the
-  highest `import_revision` an acknowledgment deleted, starting at the current
-  loss revision. `recovery_loss_reach` and `recovery_loss_reach_after` return
-  a `RecoveryLossReach`: where unresolved loss of one cause, or loss imported
-  after a loss revision, may have lost events, by route.
-  `recovery_loss_reach_after` returns `None` below the acknowledged revision.
-- Migration 0131 advances account storage to schema 131 (mdk#2628 item 3.2).
-  It adds `account_sign_ins`, one row per KeyPackage slot of the account that
-  this device found and does not recognize: whether this device's first check
-  returned its slot, its client name, when it appeared and last published, its newest
-  KeyPackage, whether it is still signed in, and this device's answer, with
-  whether the device group's roster records a rejection yet.
-  `account_sign_in_baseline` holds when the first check ran, and
-  `account_sign_in_baseline_slots` every slot its read returned.
-  `SqliteAppStorage` gains `record_sign_in_check`, `sign_ins`, `sign_in`,
-  `answer_sign_in`, `settle_sign_in_rejection`,
-  `rearm_sign_in_rejections` and `sign_in_baseline`.
-- Migration 0130 advances account storage to schema 130 (mdk#2660 phase 4).
-  It adds `account_recovery_coverage_remainders`, each route's parked
-  remainder, and `settled_below_seconds` to
-  `account_recovery_coverage_goals` (an existing goal starts settled at its
-  own floor, where the earlier prune left it).
-  `prune_recovery_coverage` takes the current routes with their certifying
-  relays, parks what they still owe between each route's settled floor and
-  the retention floor, then settles every route at the retention floor; loss
-  lowers a route's settled floor to the loss floor.
-  `recovery_coverage_remainders` reads the remainders.
-  `dismiss_recovery_route_park` clears a route's remainder too, and accepts
-  the newest revision among its broken units and its remainder, which
-  `parked_recovery_routes` now reports. A released receipt (or a discarded
-  staged event) below the retention window no longer changes the ledger.
-- Migration 0129 advances account storage to schema 129 (mdk#2628 item 3.3b).
-  It adds `cgka_device_group_welcome_expectations`, one row per device group a
-  confirmed link waits to join: the sender leaf's signature key and the end of
-  the wait. `SqliteAccountStorage` implements the new
-  `DeviceGroupWelcomeStorage` trait over it. The engine consumes a row with
-  the join it admits, and the app deletes it when a link is withdrawn or its
-  wait ends. No rows are seeded.
-- Migration 0128 advances account storage to schema 128 (mdk#2660 phase 4).
-  It adds `route_state` to `account_delivery_loss_evidence`, which existing
-  rows leave 0, and `account_delivery_loss_evidence_routes`: the routes a loss
-  generation lost deliveries on, each with the earliest `created_at` lost
-  there. `record_account_recovery_loss_routed` records them; a generation with
-  every charge routed, and at most `MAX_LOSS_ROUTES` routes, un-covers only
-  those routes at import, and a legacy clear un-covers each generation it
-  restores the same way. A worker observation past the durable count makes its
-  generation account-wide. `RecoveryLossImport` gains `every_route`, and an
-  import that un-covered every route is reported even when its obligation did
-  not change.
-- Migration 0127 advances account storage to schema 127 (mdk#2660 phase 4).
-  It adds the recovery runner's retry state, which nothing in production
-  writes yet: `account_recovery_units` (per route and relay: active, broken
-  or retired, backoff, park and probe), `account_recovery_unit_spans` (parked
-  and retired spans, never coverage), `account_recovery_relays` (health and
-  NIP-11 caps), `account_recovery_budget` (a rolling-hour account budget),
-  `account_recovery_park_revision` and `account_recovery_staged` (a proven
-  slice's unseen events, written with its coverage). `SqliteAppStorage` gains
-  `begin_recovery_unit_attempt`, `settle_recovery_unit`, the re-arm,
-  dismissal, relay and re-check writers, `stage_recovery_slice` and the
-  matching reads; `RecoveryUnitPolicy` carries the caller's policy values.
-  The retention prune trims parked and retired spans at its floor.
-- Migration 0126 advances account storage to schema 126 (mdk#2660 phase 4).
-  It adds the coverage ledger's un-cover log
-  (`account_recovery_coverage_uncovers`,
-  `account_recovery_coverage_uncover_state`) and
-  `account_recovery_coverage_released`, the seconds released for replay that
-  live boundaries leave out. Loss imports and receipt releases append what
-  they un-cover; `recovery_coverage_mark` and `record_recovery_coverage_since`
-  let a fetch subtract everything un-covered since it started, and replace
-  `record_recovery_coverage_at_loss_revision`.
-- Migration 0125 advances account storage to schema 125 (mdk#2628 item 3.1).
-  It adds `device_groups`, one row per device group this device knows of, with
-  how it came to know it: `creating`, `created`, `awaiting_welcome`, `linked`
-  or `untrusted`. `SqliteAppStorage` gains `device_group`, `device_groups`,
-  `insert_device_group`, `set_device_group_trust` and `delete_device_group`.
-  At most one row claims the account's device group. A local forget removes
-  the group's row. No rows are seeded.
-- Migration 0121 advances account storage to schema 121 (mdk#2628). It drops
-  `cgka_member_capabilities`, the engine's per-account capability cache: with
-  several devices per account, one device's capabilities stood in for all of
-  them, so a capability could be offered as an upgrade while a device lacked
-  it. The engine now reads each current leaf's capabilities from the MLS tree,
-  and every member computes the same answer, a Welcome joiner included.
-  `CapabilityStorage` loses `save_member_capabilities` and
-  `member_capabilities`. Snapshots and checkpoints keep their v2 layout: the
-  retired list is written empty, and rows in older snapshots are skipped.
-- Migration 0120 advances account storage to schema 120 (mdk#2628).
-  `account_groups.member_count` now counts member accounts, so an account
-  with several devices in a group counts once and a chat between two
-  accounts is `Direct`. The migration rewrites rows whose engine record lists
-  an account more than once, with the peer index and presentation members
-  their accounts make; every other row already counted accounts.
-- Migration 0117 advances account storage to schema 117 on first open; older
-  binaries reject the upgraded database. It queues the current push
-  registration once for every joined group while native push is on, so
-  members who joined before this release receive this device's token
-  (mdk#2604).
-- Migration 0118 advances account storage to schema 118 (mdk#2611). It adds
-  `token_fingerprint` and `owner_sig` to push tombstones, which existing
-  tombstones leave NULL, and an empty `group_push_gossip_state` table.
-- Migration 0119 advances account storage to schema 119 (mdk#2611). It adds
-  `snapshot_owed_after_epoch` to `group_push_gossip_state`, which existing
-  rows leave NULL, and a partial index over the rows that owe one.
-  `AccountGroupPushGossipState` gains the matching field.
-- Migration 0122 advances account storage to schema 122 (mdk#2611). It adds
-  `joining_since_ms` to `group_push_gossip_state`, which existing rows leave
-  NULL, with a partial index over the rows that have it,
-  `join_window_counted_ms`, which they leave 0, and `announce_owed_at_ms`,
-  which they leave NULL, with a partial index over the rows that have it.
-  `AccountGroupPushGossipState` gains the matching fields.
-- Migration 0124 advances account storage to schema 124 (mdk#2660). It adds
-  `recovery_attempts` and `recovery_admitted_high` to
-  `account_recovery_obligations`, which existing rows leave 0, and a trigger
-  that clears both when an obligation leaves the pending state.
-  `count_recovery_attempt` and `park_capped_recovery_obligation` count and cap
-  reserved attempts per obligation; `RECOVERY_PARK_AFTER_ATTEMPTS` is the cap. Progress resets the count; for a native goal that means more of its
-  sources admitted at once than ever before (`recovery_admitted_high`). A
-  native goal's re-arm, retired native windows and route-policy changes keep a
-  goal the cap parked.
-- `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
-  instead of eight arguments, and stores its optional removal proof.
-- `SqliteAccountStorage` implements the new
-  `DeviceGroupWelcomeStorage::device_group_welcome_expectations`, which lists
-  every stored expectation, expired ones included (mdk#2628 item 3.3b, D41).
-  An expectation's record gains `key_package_ref`, the confirmed KeyPackage's
-  `KeyPackageRef`; a record stored before it reads with an empty ref. No
-  migration: the field lives in the stored record.
-- The test-only `test-migrated-template` feature and
-  `SqliteAccountStorage::in_memory_from_migrated_template` are gone.
-  `in_memory_for_test()` (`test-support`) now copies a migrated template that
-  a test binary's processes share, so each test no longer replays every
-  migration, and each copy draws its own store epoch. Before, a template lived
-  in one process, so nextest's process per test built it again for every test,
-  and every copy shared one store epoch and skipped incremental auto-vacuum.
+- The test-only `test-migrated-template` feature and `SqliteAccountStorage::in_memory_from_migrated_template` are
+  gone. `in_memory_for_test()` (`test-support`) now copies a migrated template that a test binary's processes share,
+  so each test no longer replays every migration, and each copy draws its own store epoch. Before, a template lived in
+  one process, so nextest's process per test built it again for every test, and every copy shared one store epoch and
+  skipped incremental auto-vacuum.
 
 ### Added
 
-- Migration 0150 adds `account_recovery_epoch_gap_retries`, the recovery runner's durable return-visit state for
-  unresolved epoch gaps (mdk#2660 phase 4). `SqliteAppStorage` gains `recovery_epoch_gap_retry`,
-  `begin_recovery_epoch_gap_retry` and `finish_recovery_epoch_gap_retry`, with `RecoveryEpochGapRetry`, and
-  `import_recovery_loss_to_ledger`, which turns loss recorded after the one-time conversion into ledger debt.
+- The recovery runner's durable state (mdk#2660), which now drives account history recovery:
+  - Migration 0123 adds the coverage ledger. `account_recovery_coverage` holds, per route and relay, the `created_at`
+    ranges (inclusive seconds) proved complete and how each was proved; ranges with the same route, relay and proof
+    never overlap, and a write merges them. `account_recovery_coverage_goals` holds each route's goal floor; debt is
+    the goal minus what is covered. No rows are seeded.
+  - Migration 0126 adds the un-cover log (`account_recovery_coverage_uncovers`,
+    `account_recovery_coverage_uncover_state`) and `account_recovery_coverage_released`, the seconds released for
+    replay that live boundaries leave out. Loss imports and receipt releases append what they un-cover;
+    `recovery_coverage_mark` and `record_recovery_coverage_since` let a fetch subtract everything un-covered since it
+    started.
+  - Migration 0127 adds the runner's retry state: `account_recovery_units` (per route and relay: active, broken or
+    retired, backoff, park and probe), `account_recovery_unit_spans` (parked and retired spans, never coverage),
+    `account_recovery_relays` (health and NIP-11 caps), `account_recovery_budget` (a rolling-hour account budget),
+    `account_recovery_park_revision` and `account_recovery_staged` (a proven slice's unseen events, written with its
+    coverage). `SqliteAppStorage` gains `begin_recovery_unit_attempt`, `settle_recovery_unit`, the re-arm, dismissal,
+    relay and re-check writers, `stage_recovery_slice` and the matching reads; `RecoveryUnitPolicy` carries the
+    caller's policy values. The retention prune trims parked and retired spans at its floor.
+  - Migration 0128 adds `route_state` to `account_delivery_loss_evidence` and `account_delivery_loss_evidence_routes`:
+    the routes a loss generation lost deliveries on, each with the earliest `created_at` lost there.
+    `record_account_recovery_loss_routed` records them; a generation with every charge routed, and at most
+    `MAX_LOSS_ROUTES` routes, un-covers only those routes at import.
+  - Migration 0130 adds `account_recovery_coverage_remainders`, each route's parked remainder, and
+    `settled_below_seconds` to `account_recovery_coverage_goals` (an existing goal starts settled at its own floor).
+    `prune_recovery_coverage` takes the current routes with their certifying relays, parks what they still owe between
+    each route's settled floor and the retention floor, then settles every route at the retention floor; loss lowers a
+    route's settled floor to the loss floor. `recovery_coverage_remainders` reads the remainders.
+    `dismiss_recovery_route_park` clears a route's remainder too, and accepts the newest revision among its broken
+    units and its remainder, which `parked_recovery_routes` reports. A released receipt (or a discarded staged event)
+    below the retention window does not change the ledger.
+  - Migration 0132 adds `import_revision` to `account_delivery_loss_evidence` (the loss revision the import that last
+    charged a generation left) and `acknowledged_import_revision` to `account_recovery_state`. `recovery_loss_reach`
+    returns a `RecoveryLossReach`: where unresolved loss of one cause may have lost events, by route.
+  - Migration 0134 adds `recheck_revision` to `account_recovery_units`. Every request that makes a re-check pass due
+    bumps it (`make_recovery_recheck_due`, `rearm_all_recovery_units`, and a cooldown longer than
+    `RecoveryUnitPolicy::recheck_after_cooldown_seconds` ending), and `RecoveryRecheckPass::revision` reports it.
+    `record_recovery_recheck` takes the revision its quantum began on, records nothing once it moved, and returns
+    whether it recorded. Ending a long cooldown, by an answer or by `record_recovery_relay_reconnected`, makes every
+    re-check on the relay due in the same transaction.
+  - Migration 0135 adds `account_recovery_unit_fences`: each capture range a unit fences, one row each, never
+    overlapping. `set_recovery_unit_fences` replaces a unit's ranges, `recovery_unit_fences` lists every fenced range,
+    `staged_recovery_routes` the routes with staged events, and `reclaim_staged_recovery_routes` drops the rows of
+    routes the runner no longer lists, owing their seconds again. The retention prune drops fenced ranges below its
+    floor.
+  - Migration 0136 adds the one-time upgrade conversion of the old owner's obligations into ledger debt:
+    `account_recovery_conversion` (its next step, whether the changed "history may be incomplete" notices still need
+    announcing, whether a report is pending, and the shadow rows and units it counted),
+    `account_recovery_conversion_counts` (converted obligations by cause and disposition) and
+    `account_recovery_conversion_loss` (the loss watermarks of each account and cause whose live loss it un-covered).
+    Every database starts with the conversion pending; the account worker runs it after open. `SqliteAppStorage` gains
+    `convert_recovery_obligations` (a `RecoveryConversionInput` of `RecoveryConversionRoute`s),
+    `recovery_conversion_pending`, `recovery_conversion_report` (a `RecoveryConversionReport` of
+    `RecoveryConvertedObligations` by cause), `acknowledge_recovery_conversion_report`, `converted_recovery_loss`,
+    `reclaim_converted_recovery_loss`, `recovery_conversion_notices_changed` and
+    `acknowledge_recovery_conversion_notices`. The last step reopens every epoch gap the old owner certified as
+    pending, ready demand (mdk#3059): the old owner satisfied a gap once its relays answered for its window, never
+    once the engine left the stalled epoch, so a group still stalled there was never revisited and showed no notice.
+    Migration 0152 counts them in `account_recovery_conversion.epoch_gaps_reopened`
+    (`RecoveryConversionReport::epoch_gaps_reopened`); a database that converted before it reopened none.
+  - Migration 0150 adds `account_recovery_epoch_gap_retries`, the durable return-visit state for unresolved epoch
+    gaps. `SqliteAppStorage` gains `recovery_epoch_gap_retry`, `begin_recovery_epoch_gap_retry` and
+    `finish_recovery_epoch_gap_retry`, with `RecoveryEpochGapRetry`, and `import_recovery_loss_to_ledger`, which turns
+    loss recorded after the conversion into ledger debt.
+  - Migration 0151 adds `account_recovery_units.saturated_second`: the second the unit's last answered quantum stopped
+    on because its relay cannot prove it. `RecoveryUnit` gains `saturated_second`, and
+    `settle_recovery_unit_saturated` settles an outcome while recording it; `settle_recovery_unit` records an
+    unsaturated answer. `record_recovery_relay_caps` clears it on a unit planned under other caps. Existing units
+    start unsaturated.
+  - Migration 0153 records the local copy of each group the ledger last settled (mdk#2660 row 11):
+    `account_recovery_copies` holds its install epoch, a rejoined copy's floor and the one notice a rejoin raises,
+    `account_recovery_copy_routes` the group's routes that floor holds on (with relays or without), and
+    `account_recovery_copy_units` the relays that retired what lay below it. Existing groups start with the copy their
+    engine record holds at the upgrade (unknown only when the record does not decode), so a rejoin from before the
+    upgrade raises nothing and one applied after it, even before the runner's first turn, does.
+    `settle_recovery_rejoin` retires, in one transaction, what each of a rejoined group's routes owed or parked below
+    the new copy's floor as `BeforeThisCopy` (never coverage), restarts those units with a fresh budget, drops the
+    routes' remainders below the floor and raises the notice; it settles each copy once. `retire_before_recovery_copy`
+    retires below the recorded floor on a relay that joined one of the group's routes after the rejoin, or returned to
+    it, once per relay. Forgetting a group, or deleting a terminal one, drops its copy.
+    `widen_recovery_coverage_goals` and `uncover_recovery_coverage` take a `CopyFloorReason`: `Clamp` keeps the write
+    at or above the highest floor a rejoin recorded for the route, so goal widening, post-join un-covers and every
+    `begin_recovery_epoch_gap_retry` visit stop there; `Loss` and `Repair` reach below it. A released receipt or a
+    staged row given back still un-covers its own second below the floor, so the re-check fetches it again, and only
+    that second: when it lies below the route's goal, the seconds its goal widening opens below the floor retire as
+    `BeforeThisCopy`. `retire_gone_recovery_units` keeps what was retired below the floor with its reason, and the
+    retention prune parks nothing from below the floor: a held second below it (or debt loss reopened below it) that
+    is still unfetched when retention passes it drops without a remainder; the runner sweeps it for the whole
+    retention window and the rejoin's notice already covers that history. Nothing but loss, explicit repair or one
+    held event's second makes a rejoined route owe below its floor again; a route no rejoin settled is unchanged. Also
+    new: `recovery_copy`, `recovery_copy_floor`, `record_recovery_copy`, `recovery_rejoin_notices`,
+    `dismiss_recovery_rejoin_notice` and `recovery_copy_debt` (a route's debt on one relay less what a rejoin retired
+    there).
+  - `dismiss_recovery_route_park_on` dismisses a route's broken units on the given relays and its remainder, checking
+    the revision against them only; a broken unit on any other relay stays as it is.
+  - `settle_recovery_recheck` applies one re-check quantum's outcome to its relay and the account's rolling-hour
+    budget, never to its unit's retry state. `staged_recovery_items` lists the ids and times a route has staged in a
+    range, from every relay. `make_recovery_recheck_due` keeps what a due or running pass would check below an epoch
+    gap's bound.
+- Push-token gossip (mdk#2604, mdk#2611):
+  - Migration 0117 queues the current push registration once for every joined group while native push is on, so
+    members who joined before this release receive this device's token.
+    `queue_current_push_registration_share_for_group` queues the stored registration for one joined group again,
+    including a revision whose share already completed; it does nothing while native push is off or without a
+    registration.
+  - Migration 0118 adds `token_fingerprint` and `owner_sig` to push tombstones, which existing tombstones leave NULL,
+    and `group_push_gossip_state`. `group_push_token_tombstones` lists a group's tombstones: one with an
+    `AccountPushTokenRemovalProof` can be relayed as the owner's signed removal; one without, written before migration
+    0118, stays local-only until the same removal is applied again with its proof. `group_push_gossip_state`,
+    `record_group_push_gossip_join` and `record_group_push_gossip_announce` keep when this device's join became final
+    and when it last announced, for its current membership. Writes need a joined group; the row goes when the device
+    leaves or is removed, and with the group.
+  - Migration 0119 adds `snapshot_owed_after_epoch`, with a partial index over the rows that owe one, and
+    `AccountGroupPushGossipState` the matching field. `record_group_push_snapshot_owed`, `owed_group_push_snapshots`
+    and `replace_group_push_snapshot_owed` keep the push snapshot this device owes a group after a Commit of its own
+    adds leaves: the latest source epoch wins, and replacing or settling it needs the epoch it still holds.
+  - Migration 0122 adds `joining_since_ms`, `join_window_counted_ms` and `announce_owed_at_ms`, with partial indexes
+    over the rows that have a window or owe an announce. Saving the projection opens this device's push join window in
+    a group when a Welcome installs or replaces its copy there; an earlier join time and its counted window time are
+    dropped, and a group this device created has no window. `joining_group_push_gossip_states` lists the open windows
+    and `count_push_join_window_time` adds time to every one whose join has completed.
+    `record_group_push_announce_owed` and `owed_group_push_announce_states` keep the other announces this device owes
+    a group: each new debt raises the stored value past the last, even if the clock went back, and returns it.
+    `record_group_push_gossip_announce` closes a window, and takes the owed value the published announce was built
+    under so that it settles the debt only while the debt still holds that value; a new Welcome drops it.
+- Typed chat-list queries (mdk#2983). `ChatListViewQuery` (a `ChatListView` plus an optional `ChatListFilter`)
+  compiles to SQL on the view's page index, with bound parameters, before keyset paging; `chat_list_ids(query,
+  now_ms)` and `revalidate_chat_list_ids(query, ids, now_ms)` take `impl Into<ChatListViewQuery>`, so a `ChatListView`
+  still works. `ChatListQueryError` is typed, and `ChatListFilter::from_nodes` builds a filter from the bindings' flat
+  node list.
+  - `Direct`, `Group` and `Muted` conditions. Migration 0179 adds `chat_list_rows.list_kind`, kept equal to the
+    classifier's conversation kind by triggers on the row's group name and the account group's member count; an
+    Unknown kind matches neither leaf. `Muted` tests mute settings against the read's time, so nothing is written when
+    a mute expires; `ChatListWindowRead::next_mute_expiry_ms` is the next mute expiry in the view for a query that
+    tests `Muted`. The migration drops 0072's unread navigation-revision triggers; `chat_list_navigation_meta` stays
+    for the pin-rewrite flag.
+  - A `Text` leaf: a literal substring match, after trimming and Unicode lowercasing, against the title, group name,
+    description and a direct chat's peer profile names. Migration 0200 adds `chat_list_rows.search_text`, written by
+    `store_chat_presentation`; widens `chat_presentation_dependencies.roles` with a search role so every eligible peer
+    is a dependency; and makes a group description change invalidate the row's presentation. While any chat in the
+    view has pending presentation, a `Text` query returns `ProjectionNotReady` (selection) or
+    `ChatListPageError::SearchTextNotReady` (window read); other queries are unaffected. A presentation write that
+    changes only the search text still advances the presentation revision. New: `normalize_search_text` (shared with
+    user directory search), `MAX_CHAT_LIST_FILTER_TEXT_BYTES` (1024, across all leaves;
+    `ChatListQueryError::TextTooLong`) and `chat_list_pending_search_text`.
+  - A `MessageText` leaf: chats with a visible message whose text contains the query, by the `Text` rule. A visible
+    message is a chat message or poll question in `visible_message_timeline`, in its latest edit, not deleted, not
+    invalidated (except an own send that reached no one, which the row previews as failed), and not past its
+    disappearing-message expiry at the read's `now_ms`. It scans each chat's history, so only `chat_list_ids` and
+    `revalidate_chat_list_ids` accept it: every window read refuses it with `ChatListQueryError::MessageTextInWindow`
+    before reading (`ChatListViewQuery::validate_for_window`). While the content-report backfill is owed, a
+    `MessageText` query returns `ProjectionNotReady`. No migration.
+- Advanced timeline search (mdk#3245). `TimelineMessageQuery` adds an exact `sender`, an inclusive `since` and
+  exclusive `until` on `timeline_at`, and an `attachment_type` (`TimelineAttachmentType`) read per `imeta` tag: image,
+  video and audio match case-insensitive MIME prefixes, file matches an attachment with none of them, and a message
+  with an image and a separate file matches both. Every filter applies before the page limit, and a damaged tag blob
+  matches no attachment instead of failing the search. An account-wide search can order by wall clock
+  (`search_wall_clock`), with `cursor_group_id` as its cursor's group component.
+- Sonar-compatible stickers (mdk#875). Migration 0141 adds the pack projection (`app_sticker_packs`, `app_stickers`),
+  the installed list with its pending install operations, and the sticker outbox; migration 0142 adds
+  `app_sticker_assets`, the exact-hash history that keeps a sticker a stored message names resolvable after its pack
+  changes. They are numbered after the private KeyPackage schema, so a database already at schema 140 still creates
+  them. `SqliteAppStorage` gains `replace_sticker_pack_if_newer`, `sticker_pack`, `sticker_packs`, `sticker_for_ref`,
+  `prune_uninstalled_sticker_discovery`, the installed-list and install-operation reads and writes, and the outbox,
+  with the `Stored*` sticker records. A pack changes only when the incoming event wins NIP-01 replacement; a winning
+  replacement refreshes asset URLs and metadata for an unchanged exact hash, and an older pack event cannot revert it.
+  Each pack keeps at most 400 historical assets; current-pack rows and assets a retained message references are never
+  dropped. Migration 0141 also adds `chat_list_rows.last_message_tags_json`, so chat-list and reply previews carry the
+  message's tags (`ChatListMessagePreview::tags`, `TimelineReplyPreview::tags`) and can resolve an exact sticker
+  reference.
+- Migration 0178 adds NIP-51 emoji set tables: the discovered projection and installed snapshots holding each emoji's
+  bytes and SHA-256. New `SqliteAppStorage` emoji set methods; installs verify every digest and the set and byte caps
+  in one transaction.
+- Migration 0167 indexes active kind-7 reaction attachments from retained app events without creating timeline rows
+  (mdk#2151), backfilling existing artwork and sharing normal acquisition, permission and retention behavior.
+  `reaction_attachment_candidates` provides bounded message-scoped source discovery. Incremental projection and
+  rebuilds preserve unchanged slots; authenticated reaction retractions and withdrawals revoke changed sources.
+- Migration 0172 adds the protocol-owned `cgka_group_rejoin` journal for automatic rejoin, with one recipient job per
+  group and bounded coordinator jobs. Capacity refusals preserve existing work. A retained nonce cannot change its
+  peer or recipient local state token; refused writes leave the exact outbound artifact and retry evidence intact.
+  Same-job phase, retry and source refreshes remain writable. Group deletion cascades to its jobs. Runtime ownership
+  retains exact publication artifacts and per-member Commit cooldowns. Separate native and authenticated remote epoch
+  baselines allow a taller losing copy to rejoin. A durable one-shot remote rearm caps each episode at 64 reservations
+  between native/admin changes or explicit retry. Nonce rotation clears remote-only height claims, not cost or the
+  spent refill.
+- Migration 0175 adds a full-width pending-reference watermark outside group snapshots. Saved fanout and evolution
+  writes raise it atomically; deletion never lowers it. Undecodable pre-index artifacts abort the migration rather
+  than guess a safe handle; malformed artifacts after indexing stay isolated to their group. Stored-message variant 13
+  keeps a confirmed Welcome's origin Commit; existing originless variants keep their bytes and handling.
+- Migration 0177 adds a nullable coarse size diagnosis (`PendingWelcomeDeliveryRecord::size_class`) to pending Welcome
+  repair pointers. Old rows read as unknown; unknown future annotations preserve the pointer. Updating a failure
+  diagnosis keeps its existing identity and oldest-first position and adds no retry owner.
+- `ChatListRow::leave_blocked`, read with `leave_requested_at_ms` from the engine's leave request (mdk#3014). No
+  schema change.
+- Migration 0147: `SelfMembership::DeviceRemoved` marks a chat this device's leaf was removed from while the account
+  stays in it. The migration recreates the chat-list triggers so such a chat lists with the departed chats, and it
+  suppresses the chat's unread like the other departed states.
+- `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and proposals whose MLS epoch falls in a
+  range, plus the rows SQLite cannot classify (mdk#2684). A failed convergence batch checks its horizon through it on
+  every load, reading neither the group's applications nor its older history.
+- Storage for experimental device groups, history transfer and backups (mdk#2628), which marmot-app enables only in
+  `dev-device-groups` builds:
+  - Migration 0125 adds `device_groups`, one row per device group this device knows of, with how it came to know it:
+    `creating`, `created`, `awaiting_welcome`, `linked` or `untrusted`. `SqliteAppStorage` gains `device_group`,
+    `device_groups`, `insert_device_group`, `set_device_group_trust` and `delete_device_group`. At most one row claims
+    the account's device group. A local forget removes the group's row.
+  - Migration 0129 adds `cgka_device_group_welcome_expectations`, one row per device group a confirmed link waits to
+    join: the sender leaf's signature key, the confirmed KeyPackage's `KeyPackageRef` (`key_package_ref`) and the end
+    of the wait. `SqliteAccountStorage` implements `DeviceGroupWelcomeStorage` over it;
+    `device_group_welcome_expectations` lists every stored expectation, expired ones included (D41). The engine
+    consumes a row with the join it admits, and the app deletes it when a link is withdrawn or its wait ends.
+  - Migration 0131 adds `account_sign_ins`, one row per KeyPackage slot of the account that this device found and does
+    not recognize: whether this device's first check returned its slot, its client name, when it appeared and last
+    published, its newest KeyPackage, whether it is still signed in, and this device's answer, with whether the device
+    group's roster records a rejection yet. `account_sign_in_baseline` holds when the first check ran, and
+    `account_sign_in_baseline_slots` every slot its read returned. `SqliteAppStorage` gains `record_sign_in_check`,
+    `sign_ins`, `sign_in`, `answer_sign_in`, `settle_sign_in_rejection`, `rearm_sign_in_rejections` and
+    `sign_in_baseline`.
+  - Migration 0133 adds `device_links`, one row per device this device approved adding to the account's device group,
+    written before the approving commit, with the added KeyPackage's `KeyPackageRef` (which also finds the link's
+    Welcome) and its leaf's signature key, its outcome (`pending`, `linked` or `failed`), and whether a failed link's
+    Welcome is withdrawn; and `device_group_joins`, the device groups this device joined through a link whose first
+    commit there has not landed yet. `SqliteAppStorage` gains `record_device_link`,
+    `mark_device_link_welcome_withdrawn`, `device_link`, `device_links`, `decide_device_link`,
+    `record_device_group_join`, `device_group_joins` and `delete_device_group_join`. A local forget removes the
+    group's rows.
+  - Migrations 0137 and 0171 add `device_renames`, one row per device this device renamed in its device group's
+    roster: the label and, for user edits made since 0171, the three settings flags its latest edit sets
+    (`DeviceRenameRecord::settings`; legacy NULL rows stay label-only), the rename ids that edit wrote, and the rename
+    ids the device's entry held where this device's edits of it were built (D37, D86). `SqliteAppStorage` gains
+    `device_renames`, `device_rename`, `put_device_rename` and `drop_device_rename`.
+  - Migration 0138 adds `cgka_account_device_history_keys`: this device's HPKE history key pair, one per
+    account-device identity, next to its MLS signer's binding. `SqliteAccountStorage` implements
+    `AccountDeviceHistoryKeyStorage`; `put_account_device_history_key_if_absent` never replaces a stored key.
+  - Migration 0139 adds `app_event_imports`, which marks each app event imported from a sibling's history (item 4.2a).
+    `SqliteAppStorage::import_app_events` records only events the account does not hold, as received rows with their
+    epoch and no transport id, and `app_event_import_source` reads the mark. An imported review label or admin removal
+    takes the sender's verdict (`ImportedAppEvent::moderation_grant`) and has no authority without one. Unread counts
+    and the retention sweep's unread check skip imported rows, so they never count as unread and expire on time; the
+    read marker never moves for them. `history_export_page` reads a chat's app events in chat order (epoch,
+    `created_at`, id) for a history bundle, with no event for each row that must stay out.
+  - Imported timeline rows name their source (item 4.2d): `TimelineMessageRecord::imported_from`
+    (`HistoryImportSource`), read from `app_event_imports`, with the device's name from `set_device_labels`, which
+    marmot-app gives from the roster. The names live in a TEMP table each account connection creates at open, so
+    nothing is stored. `latest_history_imports` reads each chat's latest import and `parked_history_chats` each chat
+    parked deliveries name, with whether a fetch failed. `watch_history_imports` starts a per-connection TEMP count of
+    every change those reads see, and `history_imports_generation` reads it; `set_device_labels` writes only when the
+    names differ.
+  - Migration 0140 adds private KeyPackages, single-use KeyPackages a device hands to one sibling inside its device
+    group (item 3.4): `cgka_private_key_packages` (one issuer record per KeyPackage, its key in the OpenMLS bundle
+    store), `private_key_packages_received` (what siblings handed this device, by issuer slot; one this device used
+    keeps its ref until it expires, so it is not kept again if handed over again) and `private_key_package_requests`
+    (what this device still wants from each issuer). `SqliteAccountStorage` implements `PrivateKeyPackageStorage`;
+    `SqliteAppStorage` gains the received-KeyPackage and need reads and writes. A caller reads
+    `received_private_key_packages_from`, validates the record it selects, then calls
+    `take_received_private_key_package_exact`.
+  - Migration 0143 adds `device_activity`, one row per sibling the trusted device group's roster lists (that entry's
+    `linked_at`, when this device first found it there and the newest time one of its heartbeats counted for), and
+    `device_heartbeat_sent`, the device group this device last sent its own heartbeat in and when. `SqliteAppStorage`
+    gains `device_activity`, `track_device_activity`, `note_device_active`, `device_heartbeat_sent` and
+    `put_device_heartbeat_sent`, with `DeviceActivityRecord` and `DeviceHeartbeatSent`.
+  - Migration 0201 adds the inactivity clock for marking and removing inactive siblings (item 3.6b-2):
+    `device_activity` gains `clock_from` and `marked_inactive`, and the single-row `device_inactivity_clock` keeps
+    this device's last caught-up pass and last restart. `note_device_active` restarts a sibling's clock when it reads
+    a heartbeat that moves its activity later; new `note_device_marked_inactive`, `device_inactivity_clock`,
+    `put_device_inactivity_clock` and `epoch_gap_recovery_given_up`. The device-group reset wipe clears the clock.
+  - Migration 0145 adds `cgka_roster_tag_keys` (mdk#2761): one row per tag signature key a device-group roster this
+    device applied listed for a slot, in a device entry or a `removed` record, with when it last applied one that did,
+    the order it applied them in (`seen_seq`), and whether one listed it in a `removed` record (`held_as_removed`).
+    `SqliteAccountStorage` implements `RosterTagKeyStorage`. Rows survive a branch-selection rewind, go with their
+    group, and are pruned after 30 days or past 4 per slot; a slot's newest row held as removed is kept past the 4.
+  - Migration 0146 adds `device_removals`, one row per device this device's user removed from the account's device
+    group, written before anything is committed, with when the user decided and when the removed device's slot
+    deletion was accepted. Only forgetting the group removes its rows. `SqliteAppStorage` gains
+    `record_device_removal`, which keeps a decision already recorded, `device_removals` and
+    `set_device_removal_slot_withdrawn`.
+  - Migration 0148 adds the compromise warning (items 3.7a and 3.7b): `account_compromise_warning_items`, one row per
+    rejection or foreign KeyPackage the warning gathers, keyed by its reason and subject, with when it was made, when
+    this device first gathered it and when the user saw it; a seen row stays, so a rejection that comes back does not
+    warn again. `account_compromise_warning_baseline` names the device group this device first trusted, whose roster's
+    rejections then count as seen, and `account_sign_in_baseline.started_fresh_at` records that the user started this
+    device fresh. `SqliteAppStorage` gains `record_compromise_warning`, `record_foreign_own_slot_key_packages`
+    (KeyPackages this device found in its own slot that it did not make, reason `ForeignOwnSlotKeyPackage`, D74),
+    `compromise_warning`, `dismiss_compromise_warning`, `start_fresh`, `started_fresh` and `trust_device_group`, which
+    makes a device group trusted and takes its roster as this device's first in one transaction; `insert_device_group`
+    and `set_device_group_trust` refuse a trusted state. A seen foreign KeyPackage goes 7,261,200 seconds after it was
+    found, an unseen one stays until dismissed or the 4,096-row cap drops it.
+  - Migrations 0149 and 0166 add sealed history deliveries (items 4.2b and 4.2c, D76, D77). `cgka_sibling_adds` holds
+    each sibling slot one of this device's own confirmed Commits added to a group, written by the engine through
+    `SiblingAddStorage` (`record_sibling_adds`, which also drops adds a week old, `sibling_adds`,
+    `forget_sibling_add`); a rewind keeps its rows and deleting the group drops them. `history_deliveries_owed` holds
+    the histories this device owes its siblings (`owe_history_delivery`, `unsent_history_deliveries`,
+    `mark_history_delivery_sent`, `forget_history_delivery`), and a history too long for inline deliveries goes
+    through Blossom (`blossom_due_at`, `blossom_attempts`; `send_history_delivery_by_blossom`,
+    `due_blossom_history_deliveries`, `defer_blossom_history_delivery`). `history_delivery_sends` names the chat and
+    receiver of each delivery sent, so `owe_history_delivery_again` owes the history of a delivery withdrawn or failed
+    for good again and returns it (`Option<OwedHistoryDelivery>`). `history_deliveries_parked` keeps at most 1,024
+    deliveries read before this device holds their chat, each with its bundle or the Blossom servers that hold it and
+    when to fetch it (`ParkedBundle`, `park_history_delivery`, `parked_history_delivery_chats`,
+    `parked_history_deliveries`, `drop_parked_history_delivery`, `due_parked_history_fetches`,
+    `defer_parked_history_fetch`). `expire_history_deliveries` drops rows a week old, and a local forget of a chat
+    drops its rows. `device_group_message_event_id` reads the app event id of a recorded device-group message. Test
+    support gains `execute_batch_for_test`.
+  - Migration 0160 adds `sibling_welcomes_received`, the sibling Welcomes this device admitted from its device group
+    and has not joined from yet, keyed by the message that carried each, at most `MAX_STASHED_SIBLING_WELCOMES` at
+    once. A row the engine held, because this device still held an active copy of its chat, keeps that chat's id, and
+    a full stash drops its oldest held row to keep a new one. `SqliteAppStorage` gains `stash_sibling_welcome`,
+    `stashed_sibling_welcomes`, `hold_stashed_sibling_welcome` and `delete_stashed_sibling_welcome`, over
+    `StashedSiblingWelcome`.
+  - Migration 0161 adds small state (item 4.3): `small_state_items`, one row per chat and item (`read`, `pin`, `mute`,
+    `archive`) holding the value the account's devices agree on, what this device last observed of it and whether its
+    siblings are still owed it, and `small_state_sync`, which records that this device started, when and at which
+    device-group tip it last broadcast every item, and whether it owes a broadcast request or an answer to one. Only
+    chats whose MLS group id is at most 256 bytes hold items. It also adds `device_group_messages`: the kind of each
+    device-group message this device sent or read whose withdrawal a feature acts on, by app event id and, once known,
+    the message id the engine names it by, kept a week and capped at 4,096 rows. `SqliteAppStorage` gains
+    `record_device_group_message`, `note_device_group_message_ids`, `device_group_message_kind`, `start_small_state`,
+    `small_state_started`, `small_state_schedule`, `begin_small_state_broadcast`, `owe_small_state_broadcast_request`,
+    `small_state_broadcast_request_sent`, `owe_small_state_broadcast_answer`, `sync_small_state`, `small_state_items`,
+    `unsent_small_state_items`, `mark_small_state_sent` and `owe_all_small_state_items`, with `SmallStateItem`,
+    `SmallStateRule`, `SmallStateSchedule`, `SmallStateBroadcast` and their value types.
+  - Migration 0162 adds `imported_media_file_keys`, the per-file attachment keys a sibling sent with imported history.
+    Each key is named by its media reference's `ciphertext_sha256`, is zeroed before its app event is deleted, and
+    goes with it. `ImportedAppEvent::file_keys` carries the keys, and `import_app_events` stores them only for rows it
+    adds, refusing a second, different key for a ciphertext the chat already holds one for. `imported_media_file_key`,
+    `imported_media_file_key_for_ciphertext` and `imported_media_file_keys` read them, and
+    `AttachmentAcquisitionSource::message_id_hex` names the message. Imported chat messages get attachment slots,
+    which a timeline rebuild keeps: `attachment_history_source` and its insert trigger take a row without a transport
+    id when `app_event_imports` marks it, using its app event id as its `source_message_id_hex`.
+  - Migration 0163 adds `backup_recovery_key`, at most one row: the public half of the recovery key that words
+    confirmed while this device trusts no device group derive (item 4.4a). `trust_device_group` deletes it in the same
+    transaction, since the roster's account entry is then the account's. The words and the private half are never
+    stored. `SqliteAppStorage` gains `kept_recovery_key`, `keep_recovery_key` and `forget_kept_recovery_key`.
+  - Migration 0164 adds the backup ledger (item 4.4b): `backup_runs` and `backup_run_blobs` (each backup this device
+    is writing until a relay accepts its pointer, and its blobs, recorded before upload), `backup_condemned_blobs`
+    (blobs to delete while no pointer lists their backup) and `backup_schedule` (the next pass, and the writer this
+    device last saw named for a key). Nothing secret is stored. `SqliteAppStorage` gains `backup_schedule`,
+    `schedule_backup_pass`, `note_backup_writer`, `begin_backup_run`, `record_backup_run_blob`,
+    `record_backup_run_head`, `backup_runs`, `finish_backup_run`, `abandon_backup_run`, `condemn_backup_blobs`,
+    `due_condemned_backup_blobs`, `next_condemned_backup_try`, `defer_condemned_backup_blob`,
+    `forget_condemned_backup_blob` and `forget_backups_except`, with `BackupRun`, `BackupRunHead`, `BackupSchedule`
+    and `CondemnedBackupBlob`.
+  - Migration 0168 adds the private backup-restore catalog (`backup_restore_catalog`, `backup_restore_catalog_chats`:
+    each recovery key's backups and the chats they hold; `put_backup_restore_archive`,
+    `retain_backup_restore_archives`, `backup_restore_archives_for_chat`) and lets an `app_event_imports` row name a
+    backup instead of a sibling slot as its source. Catalog metadata creates no group, route or membership, and each
+    key's complete pointer prunes only its own catalog.
+  - Migrations 0169 and 0174 add sibling-Welcome repair (D70, D89, D100): `sibling_welcome_resends` keeps one repair
+    generation per original Welcome, with its first accepted publication time and its carrier reservation and
+    high-water. A resend is due from current-incarnation D35 heartbeats (`sibling_welcome_resend_is_due(welcome_id,
+    linked_at)`), and `sibling_welcome_resend_batch` returns `(welcome_id, carrier)` pairs.
+  - Migration 0170 adds native admission metadata (`cgka_invitation_admissions`) and per-generation invitation
+    decisions synced between linked devices (`invitation_decisions`), with atomic owed publication, application and
+    Leave work (D96). No legacy group is seeded from its current epoch.
+  - Migration 0176 adds `device_group_moves`, which holds a move of this device to another device group, at most one
+    of them pending (D102).
+  - Explicitly forgetting an active trusted nonterminal device-group copy with no unfinished move retires old
+    device-sync preparations atomically. Ordinary chat data, admitted work, issued private keys and taken-reference
+    tombstones stay; no migration.
 
-- Migration 0151 adds `account_recovery_units.saturated_second`: the second the unit's last answered quantum stopped
-  on because its relay cannot prove it (mdk#2660 phase 4). `RecoveryUnit` gains `saturated_second`, and
-  `settle_recovery_unit_saturated` settles an outcome while recording it; `settle_recovery_unit` records an
-  unsaturated answer. `record_recovery_relay_caps` clears it on a unit planned under other caps. Existing units start
-  unsaturated.
+### Changed
 
-- Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
-  publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
-
-- Migration 0167 indexes active kind-7 reaction attachments from retained app
-  events without creating timeline rows (mdk#2151), backfilling existing
-  artwork and sharing normal acquisition, permission and retention behavior.
-  `reaction_attachment_candidates` provides bounded message-scoped source
-  discovery. Incremental projection and rebuilds preserve unchanged slots;
-  authenticated reaction retractions and withdrawals revoke changed sources.
-
-- `dismiss_recovery_route_park_on` dismisses a route's broken units on the
-  given relays and its remainder, checking the revision against them only;
-  a broken unit on any other relay stays as it is (mdk#2660 phase 4).
-- `settle_recovery_recheck` applies one re-check quantum's outcome to its
-  relay and the account's rolling-hour budget, never to its unit's retry
-  state (mdk#2660 phase 4). `staged_recovery_items` lists the ids and times a
-  route has staged in a range, from every relay. `make_recovery_recheck_due`
-  keeps what a due or running pass would check below an epoch gap's bound.
-- `OpenMlsContentFilter::CommitsAndProposalsBetween` lists only the commits and
-  proposals whose MLS epoch falls in a range, plus the rows SQLite cannot
-  classify (mdk#2684). A failed convergence batch checks its horizon through it
-  on every load, reading neither the group's applications nor its older
-  history.
-- `queue_current_push_registration_share_for_group` queues the stored
-  registration for one joined group again, including a revision whose share
-  already completed. It does nothing while native push is off or without a
-  registration.
-- `group_push_token_tombstones` lists a group's tombstones. One with an
-  `AccountPushTokenRemovalProof` can be relayed as the owner's signed removal;
-  one without, written before migration 0118, stays local-only until the same
-  removal is applied again with its proof.
-- `group_push_gossip_state`, `record_group_push_gossip_join` and
-  `record_group_push_gossip_announce` keep when this device's join became final
-  and when it last announced, for its current membership. Writes need a joined group; the row goes when the device leaves
-  or is removed, and with the group.
-- `record_group_push_snapshot_owed`, `owed_group_push_snapshots` and
-  `replace_group_push_snapshot_owed` keep the push snapshot this device owes a
-  group after a Commit of its own adds leaves: the latest source epoch wins,
-  and replacing or settling it needs the epoch it still holds.
-- Saving the projection opens this device's push join window in a group when a
-  Welcome installs or replaces its copy there: `joining_since_ms` records the
-  time, and an earlier join time and its counted window time are dropped. A
-  group this device created has no window. `joining_group_push_gossip_states`
-  lists the open windows, `count_push_join_window_time` adds time to every one
-  whose join has completed, and `record_group_push_gossip_announce` closes one.
-- `record_group_push_announce_owed` and `owed_group_push_announce_states` keep
-  the other announces this device owes a group. Each new debt raises the
-  stored value past the last, even if the clock went back, and returns it.
-  `record_group_push_gossip_announce` now also takes the owed value the
-  published announce was built under, and settles the debt only while it
-  still holds that value; a new Welcome drops it.
+- `account_groups.member_count` counts member accounts, so an account with several devices in a group counts once and
+  a chat between two accounts is `Direct` (mdk#2628). Migration 0120 rewrites rows whose engine record lists an
+  account more than once, with the peer index and presentation members their accounts make; every other row already
+  counted accounts.
+- The engine reads each current leaf's capabilities from the MLS tree instead of the per-account
+  `cgka_member_capabilities` cache, which migration 0121 drops: with several devices per account, one device's
+  capabilities stood in for all of them, so a capability could be offered as an upgrade while a device lacked it.
+  Snapshots and checkpoints keep their v2 layout: the retired list is written empty, and rows in older snapshots are
+  skipped.
+- A peer's reaction settles a send whose publish was judged to have reached no one (mdk#1291).
+  `TimelineMessageRecord::recipient_confirmed` is true for a failed own row with no relay acceptance that another
+  account reacted to, which proves that peer received it; a pending send is not settled. Such a row projects as
+  delivered, with no `invalidation_status` and, as before, no `source_message_id_hex`; the chat list reports it
+  `Delivered` and ranks it where it ranked as a failed send, never as a pending one. The stored `app_events` row keeps
+  `local_publish_failed`, so a resend, the terminal-group sweep and convergence withdrawals are unchanged. A peer
+  retracting its reaction returns the row to its failed state. When retention prunes the confirming reaction while the
+  send stays, the receipt is kept in `kept_recipient_receipts` and goes with the send. Migration 0173 adds
+  `message_timeline.recipient_confirmed` and that table, rebuilds the chat-preview index and settles existing rows
+  from their stored reactions.
+- Timeline `search` matches by the chat-list `Text` rule: Unicode lowercasing instead of SQLite's ASCII-only `NOCASE`,
+  so `école` finds `ÉCOLE`. ASCII matches are unchanged. Account connections register a `marmot_search_contains` SQL
+  function for both.
+- Cached user search filters and ranks in SQL (mdk#1801). Account and shared connections register `marmot_search_rank`
+  (exact, prefix, contains or no match, by the same Unicode rule), and `public_directory_profiles` applies its
+  10,000-identity cap after matching, so it finds identities past the 10,000th cached one.
+- Idle maintenance reads answer without a writer transaction (mdk#2923 step 1): upload recovery and pruning,
+  recovery-job retention, the push join-window count, chat presentation inputs, and recovery conversion and loss
+  import each check read-only first. New reads: `content_reports_backfill_complete`, `has_legacy_attachment_work`,
+  `has_database_held_avatars`, `has_file_backed_uploads`, `media_cleanup_epoch` (a per-connection count of deleted
+  `media_files` and `attachment_partial` rows, kept in TEMP tables; no migration) and `connection_serial`, unique to
+  each opened handle.
 
 ### Fixed
 
-- `prune_expired_attachment_acquisitions` and `prune_attachment_partials`
-  answer "nothing expired" from their expiry indexes and run their cached
-  `DELETE` only when a row has expired. Compiling that `DELETE` coded every
-  trigger and foreign-key action on the table on every call (mdk#2923).
-
-- `delete_group` joins a caller's `with_transaction` instead of beginning its
-  own, which failed inside one, so the engine's cleanup of a failed group
-  creation now removes the group's MLS state.
-- A queued proposal or proposal-queue ref list that fails to decode in the
-  MessagePack value encoding clears the group's proposal queue, as a
-  corrupt JSON row already did, instead of failing group load.
-- A transaction SQLite rolled back by itself (a full disk, an I/O error or
-  out of memory mid-statement, a trigger's `RAISE(ROLLBACK)`, a failed
-  `COMMIT`) no longer marks the account's connection unusable until the
-  account reopens. The caller gets the failure's own error, so a full disk
-  reaches it as `StorageError::Capacity`, and the rest of that transaction,
-  inside or after a savepoint, fails instead of committing write by write.
+- One `app_events.tags_json` value that does not decode is read as no tags by every reader, not only the group rebuild
+  (mdk#2845). Before, it blocked its commit's withdrawal, its group's terminal sweep, retention erasure, held-send
+  deadlines, deletes aimed at it, poll tallies, history export, report reads and raw message reads. Where the tags
+  were the only record of what a row changed, the readers that must act on it recover its targets and media from its
+  modifier edges and timeline row.
+- `adopt_block_list` takes the write lock up front in an IMMEDIATE transaction and retries the whole transaction on
+  `SQLITE_BUSY` (mdk#3046). A deferred read-then-write failed at once when the account engine's connection held the
+  write lock, so a `block_user` the relay had accepted reported `BlockPublicationUncertain`.
+- Migration 0180 preserves original removal validation separately from source authority, so damaged tags cannot turn
+  an invalid removal into a valid one (#3016). Validated removals retain their effect through pruning. Uncertain
+  legacy removals preserve only already-hidden targets and cannot hide new targets; verified repair remains tracked in
+  #3017.
+- `prune_expired_attachment_acquisitions` and `prune_attachment_partials` answer "nothing expired" from their expiry
+  indexes and run their cached `DELETE` only when a row has expired. Compiling that `DELETE` coded every trigger and
+  foreign-key action on the table on every call (mdk#2923).
+- `delete_group` joins a caller's `with_transaction` instead of beginning its own, which failed inside one, so the
+  engine's cleanup of a failed group creation now removes the group's MLS state.
+- A queued proposal or proposal-queue ref list that fails to decode in the MessagePack value encoding clears the
+  group's proposal queue, as a corrupt JSON row already did, instead of failing group load.
+- A transaction SQLite rolled back by itself (a full disk, an I/O error or out of memory mid-statement, a trigger's
+  `RAISE(ROLLBACK)`, a failed `COMMIT`) no longer marks the account's connection unusable until the account reopens.
+  The caller gets the failure's own error, so a full disk reaches it as `StorageError::Capacity`, and the rest of that
+  transaction, inside or after a savepoint, fails instead of committing write by write.
 
 ## 0.14.0 - 2026-10-23
 
@@ -985,10 +800,6 @@ is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
 
 ### Fixed
 
-- Sticker migrations run after the private KeyPackage schema, so upgrades
-  from schema `0140` create the pack and asset-history tables.
-- Winning sticker-pack replacements refresh asset URLs and metadata for an
-  unchanged exact hash. Older pack events cannot revert the replacement URL.
 - The timeline's modifier lookups (edits, reactions, deletions, reports), and
   the deleted-reaction and poll-vote queries, write their constant event kind
   into the SQL instead of binding it, so each kind keeps one cached statement.
