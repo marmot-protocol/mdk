@@ -68,8 +68,10 @@
   - One-time work stops once the opened database's data shows it finished: legacy attachment bodies (none left,
     and no legacy upload that could add one), database-held avatar images, the startup WAL truncate, the content
     report backfill, and the compaction check once the database is incremental. A deferred outcome never
-    latches: compaction not yet worthwhile, too large or too tight, keep-media `more` and an owed WAL truncate are
-    checked again hourly, or sooner after a deletion. The housekeeping batch spawns only while a part is owed.
+    latches. Keep-media `more` runs again on the next tick. An owed WAL truncate is retried hourly or after a
+    deletion. The compaction check (not yet worthwhile, too large or too tight) runs on every batch while a
+    migration is in progress, otherwise hourly or after a deletion. The housekeeping batch spawns only while a part
+    is owed.
   - The media sweep still runs to completion when a worker takes ownership, then only after a media or partial row
     was deleted on this connection, another connection committed, a best-effort unlink failed, or its last batch
     stopped short. A batch that fails owes a full rescan from the start on the next hourly recheck, which the current

@@ -617,8 +617,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Idle housekeeping (mdk#2923 §4, `runtime/account_worker/attachments.rs` `HousekeepingLatches`): the housekeeping
   batch spawns only while a part is owed, and finished one-time work latches from the opened database's data (no
   legacy bodies or legacy uploads, no database-held avatars, the startup truncate, an incremental database), keyed to
-  `connection_serial` so another opened database derives it again. Deferred outcomes never latch; they are rechecked
-  hourly or after a media-row deletion (`media_cleanup_epoch`). The media sweep runs to completion at ownership, then
+  `connection_serial` so another opened database derives it again. Deferred outcomes never latch: keep-media `more`
+  reruns the batch on the next tick, an owed WAL truncate is retried hourly or after a media-row deletion
+  (`media_cleanup_epoch`), and the compaction check runs on every batch while a migration is owed, otherwise hourly or
+  after a deletion. The startup truncate runs on the first batch. The media sweep runs to completion at ownership, then
   only after a deletion on this connection, another connection's commit (`foreign_commit_version`), a failed
   best-effort unlink (`MediaStore::take_sweep_owed`, which restarts the pass from the start, since its file may lie
   behind the cursor) or an unfinished batch. A failed batch owes a full rescan from

@@ -2171,7 +2171,9 @@ async fn housekeeping_latches_reset_for_another_opened_database() {
 /// otherwise (mdk#2923 §4). Finished one-time work (no legacy bodies or
 /// database-held avatars on a fresh account, an incremental database, the
 /// startup truncate) latches; a deferred outcome never does: keep-media
-/// `more`, the hourly recheck and a deletion each owe another batch.
+/// `more`, the hourly recheck and a deletion each owe another batch. An owed
+/// WAL truncate waits for the recheck, so a reader that keeps blocking it
+/// costs one batch per recheck, not one per tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
     use media_store::MediaCatalog;
@@ -2242,6 +2244,37 @@ async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
         4,
         "a deletion frees pages, so reclaim checks once"
     );
+
+    // A reader on another connection holds a snapshot of a non-empty WAL,
+    // so the truncate stays owed.
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: media_store::FileId([10; 16]),
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [4; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    let reader = retention_fault_connection(&client.app);
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    let app_storage = storage.app_storage();
+    assert!(!app_storage.truncate_wal().unwrap(), "the reader blocks it");
+    assert!(app_storage.wal_truncate_pending());
+    for _ in 0..3 {
+        run(&mut admission).await;
+    }
+    assert_eq!(batches(), 4, "an owed truncate alone owes no batch");
+
+    reader.execute_batch("COMMIT").unwrap();
+    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    run(&mut admission).await;
+    assert_eq!(batches(), 5, "the recheck retries it");
+    assert!(!app_storage.wal_truncate_pending(), "and it truncates");
     runtime.shutdown().await;
 }
 

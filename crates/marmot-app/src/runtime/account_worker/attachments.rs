@@ -27,8 +27,8 @@ const KEEP_MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// next tick.
 const KEEP_MEDIA_SWEEP_BUDGET: Duration = Duration::from_millis(250);
 /// How often deferred housekeeping is checked again once nothing else is
-/// owed: free-page reclaim and a compaction that was not yet worthwhile or
-/// did not fit (mdk#2923 §4). Deletions recheck sooner.
+/// owed: free-page reclaim, an owed WAL truncate, and a compaction that was
+/// not yet worthwhile or did not fit (mdk#2923 §4). Deletions recheck sooner.
 const HOUSEKEEPING_RECHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 type PermitWait = std::pin::Pin<
@@ -95,8 +95,9 @@ pub(super) struct HousekeepingLatches {
     /// The database is already incremental, so the one-time compaction can
     /// never be due on it.
     compaction_settled: Arc<std::sync::atomic::AtomicBool>,
-    /// When deferred housekeeping (reclaim, a compaction not yet worthwhile,
-    /// too large or too tight) is checked again. `None` means now.
+    /// When deferred housekeeping (reclaim, an owed WAL truncate, a
+    /// compaction not yet worthwhile, too large or too tight) is checked
+    /// again. `None` means now.
     recheck_due: Option<std::time::Instant>,
     /// The deletion count the last housekeeping batch saw: a deletion frees
     /// pages, so reclaim checks again.
@@ -305,9 +306,11 @@ fn spawn_upload_promotion(
 ///   incremental.
 ///
 /// Finished work latches for the life of the opened database; a deferred
-/// outcome (compaction not worthwhile, too large or too tight, keep-media
-/// more, an owed truncate) never does, and is checked again hourly, or sooner
-/// after a deletion. A batch that pauses for free space, resumes, finishes,
+/// outcome never does. Keep-media more runs again on the next tick. An owed
+/// WAL truncate is retried hourly or after a deletion. The compaction check
+/// (not worthwhile, too large or too tight) runs on every batch while a
+/// migration is owed, otherwise hourly or after a deletion. The startup
+/// truncate runs on the first batch. A batch that pauses for free space, resumes, finishes,
 /// or drops a corrupt body wakes attachment observers.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
@@ -340,15 +343,10 @@ pub(super) fn spawn_legacy_migration(
     // one, so the batch still runs.
     let cleanup = app_storage.media_cleanup_epoch().ok();
     let deleted = cleanup.is_none() || cleanup != latches.batch_cleanup_seen;
-    let truncate_owed = app_storage.wal_truncate_pending();
-    if !(sweep_keep_media
-        || legacy_owed
-        || avatars_owed
-        || startup
-        || recheck
-        || deleted
-        || truncate_owed)
-    {
+    // An owed WAL truncate is not a trigger of its own: every batch retries
+    // it, so it waits for the hourly recheck or a deletion. A reader that
+    // keeps blocking it then costs one batch per recheck, not one per tick.
+    if !(sweep_keep_media || legacy_owed || avatars_owed || startup || recheck || deleted) {
         return;
     }
     if sweep_keep_media {
