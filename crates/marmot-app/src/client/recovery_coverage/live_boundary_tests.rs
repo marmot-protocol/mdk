@@ -360,6 +360,7 @@ fn owe_retained_window(fixture: &Fixture) {
         .widen_recovery_coverage_goals(
             &routes(&fixture.client),
             retention_floor(unix_now_seconds()),
+            storage_sqlite::CopyFloorReason::Clamp,
         )
         .unwrap();
 }

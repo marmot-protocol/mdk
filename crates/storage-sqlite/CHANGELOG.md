@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Migration 0153 records the local copy of each group the recovery ledger last settled (mdk#2660 row 11):
+  `account_recovery_copies` holds its install epoch, a rejoined copy's floor and the one notice a rejoin raises,
+  `account_recovery_copy_routes` the group's routes that floor holds on (with relays or without), and
+  `account_recovery_copy_units` the relays that retired what lay below it. Existing groups start with
+  the copy their engine record holds at the upgrade (unknown only when the record does not decode), so a rejoin from
+  before the upgrade raises nothing and one applied after it, even before the runner's first turn, does. New `settle_recovery_rejoin` retires, in one
+  transaction, what each of a rejoined group's routes owed or parked below the new copy's floor as `BeforeThisCopy`
+  (never coverage), restarts those units with a fresh budget, drops the routes' remainders below the floor and raises
+  the notice; it settles each copy once. New `retire_before_recovery_copy` retires below the recorded floor on a relay
+  that joined one of the group's routes after the rejoin, or returned to it, once per relay. Forgetting a group, or
+  deleting a terminal one, drops its copy. Nothing but loss, explicit repair or one held event's second makes a
+  rejoined route owe below its floor again. **Breaking:** `widen_recovery_coverage_goals` and
+  `uncover_recovery_coverage` take a new `CopyFloorReason`. `Clamp` keeps the write at or above the highest floor a
+  rejoin recorded for the route, so goal widening, post-join un-covers and every `begin_recovery_epoch_gap_retry`
+  visit stop there; `Loss` and `Repair` reach below it. A released receipt or a staged row given back still un-covers
+  its own second below the floor, so the re-check fetches it again, and only that second: when it lies below the
+  route's goal, the seconds its goal widening opens below the floor retire as `BeforeThisCopy`.
+  `retire_gone_recovery_units` keeps what was retired below the floor with its reason, and the retention prune parks
+  nothing from below the floor, on a route relays carry or one none does: a route keeps one remainder, so a held
+  second below the floor would otherwise join debt above it and park the retired history between. Such a second (or
+  debt loss reopened below the floor) that is still unfetched when retention passes it drops without a remainder; the
+  runner sweeps it for the whole retention window and the rejoin's notice already covers that history. A route no rejoin settled is unchanged; the floor is read
+  through the `account_recovery_copy_routes` route index in the writing transaction. New `recovery_copy`, `recovery_copy_floor` (a rejoined copy's recorded
+  floor), `record_recovery_copy`, `recovery_rejoin_notices`, `dismiss_recovery_rejoin_notice`, and
+  `recovery_copy_debt`: a route's debt on one relay less what a rejoin retired there.
+
 - `ChatListRow` gains `leave_blocked`, read with `leave_requested_at_ms` from the engine's leave request (mdk#3014).
   `SqliteAccountStorage::pending_leave_requests` now returns each group's whole `LeaveRequest`. No schema change.
 
@@ -47,6 +73,13 @@
   leaves; `ChatListQueryError::TextTooLong`) and `chat_list_pending_search_text`. **Breaking:**
   `ChatPresentationInput` adds `group_description` (captured) and `search_peer_names` (set by preparation), and
   `ChatListFilter`, `ChatListFilterNode`, `ChatListQueryError` and `ChatListPageError` gain variants.
+
+- Idle maintenance reads answer without a writer transaction (mdk#2923 step 1): upload recovery and pruning,
+  recovery-job retention, the push join-window count, chat presentation inputs, and recovery conversion and loss
+  import each check read-only first. New reads: `content_reports_backfill_complete`,
+  `has_legacy_attachment_work`, `has_database_held_avatars`, `has_file_backed_uploads`, `media_cleanup_epoch` (a
+  per-connection count of deleted `media_files` and `attachment_partial` rows, kept in TEMP tables; no migration)
+  and `connection_serial`, unique to each opened handle.
 
 - Add `Direct`, `Group` and `Muted` chat-list filter conditions (mdk#2983). Migration 0179 adds
   `chat_list_rows.list_kind`, kept equal to the classifier's conversation kind by triggers on the row's group name and

@@ -381,7 +381,15 @@ impl SharedConnection {
     pub(crate) fn same_as(&self, other: &SharedConnection) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+
+    /// See [`SharedConnectionInner::serial`].
+    pub(crate) fn serial(&self) -> u64 {
+        self.inner.serial
+    }
 }
+
+/// The next [`SharedConnectionInner::serial`].
+static NEXT_CONNECTION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 struct SharedConnectionInner {
     timing: Mutex<Option<SqliteTimingObserver>>,
@@ -406,6 +414,9 @@ struct SharedConnectionInner {
     /// another connection and did not finish. Only changed with this
     /// connection locked, by the attempt it describes.
     wal_truncate_pending: AtomicBool,
+    /// Unique to this opened handle within the process, never reused: what
+    /// state derived from this database's data is keyed to (mdk#2923).
+    serial: u64,
 }
 
 impl fmt::Debug for SharedConnection {
@@ -430,6 +441,7 @@ impl SharedConnection {
                 post_commit: Mutex::new(Vec::new()),
                 openmls_writes: AtomicU64::new(0),
                 wal_truncate_pending: AtomicBool::new(false),
+                serial: NEXT_CONNECTION_SERIAL.fetch_add(1, Ordering::Relaxed),
             }),
         }
     }
@@ -1346,7 +1358,8 @@ pub(crate) fn finish_account_open(
 /// Tables that live only as long as the connection: TEMP, so nothing is
 /// stored and, with `temp_store = MEMORY`, nothing reaches a file.
 /// `device_labels` holds the device names imported chat history resolves its
-/// source against, by roster slot (mdk#2628 4.2d).
+/// source against, by roster slot (mdk#2628 4.2d). The media cleanup count
+/// lives in `cross` because it watches app tables.
 fn create_connection_tables(connection: &rusqlite::Connection) -> StorageResult<()> {
     connection
         .execute_batch(
@@ -1355,7 +1368,8 @@ fn create_connection_tables(connection: &rusqlite::Connection) -> StorageResult<
                  label TEXT NOT NULL
              ) WITHOUT ROWID;",
         )
-        .storage()
+        .storage()?;
+    crate::cross::media_cleanup::create_media_cleanup_epoch(connection)
 }
 
 impl SharedConnection {

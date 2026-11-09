@@ -224,6 +224,7 @@ fn rearm(turn: &DebtTurn<'_>) -> StorageResult<u64> {
         &routes,
         turn.now
             .saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS),
+        storage_sqlite::CopyFloorReason::Repair,
     )?;
     let rearmed = turn.app.rearm_all_recovery_units()?;
     tracing::debug!(

@@ -607,14 +607,27 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
   memory, and its final write-back cannot be interrupted, so the cap bounds how long a close can wait for it; an
   account over the cap with no legacy bodies left is logged once per process, as a power-of-two MiB bucket), at most once per worker ownership (a rolled-back one is retried, at most three times), never while a
-  migration batch runs. The maintenance task (never awaited) checks the gates every tick and only flags a due
-  compaction; the account worker awaits it from its maintenance tick only when flagged, so a tick with nothing due
+  migration batch runs. The maintenance task (never awaited) checks the gates and only flags a due compaction: on
+  the first batch of each opened database, then hourly, never again once the database is incremental (mdk#2923
+  §4); the account worker awaits it from its maintenance tick only when flagged, so a tick with nothing due
   costs the worker nothing and none of its synchronous storage calls park an async thread on the held connection, and
-  `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs after every
-  migration batch and bulk removal, settling any WAL truncate the storage records as owed; the first pass of each
+  `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs with every
+  housekeeping batch, settling any WAL truncate the storage records as owed; the first pass of each
   worker ownership truncates once on an incremental database, since a truncate owed when a process ended is recorded
   nowhere. `close_storage` calls `begin_close` on every database before closing media stores:
   a sweep blocked behind a compacting connection holds its store's sweep lock until the VACUUM, which polls the close latch, stops.
+- Idle housekeeping (mdk#2923 §4, `runtime/account_worker/attachments.rs` `HousekeepingLatches`): the housekeeping
+  batch spawns only while a part is owed, and finished one-time work latches from the opened database's data (no
+  legacy bodies or legacy uploads, no database-held avatars, the startup truncate, an incremental database), keyed to
+  `connection_serial` so another opened database derives it again. Deferred outcomes never latch: keep-media `more`
+  reruns the batch on the next tick, an owed WAL truncate is retried hourly or after a media-row deletion
+  (`media_cleanup_epoch`), and the compaction check runs on every batch while a migration is owed, otherwise hourly or
+  after a deletion. The startup truncate runs on the first batch. The media sweep runs to completion at ownership, then
+  only after a deletion on this connection, another connection's commit (`foreign_commit_version`), a failed
+  best-effort unlink (`MediaStore::take_sweep_owed`, which restarts the pass from the start, since its file may lie
+  behind the cursor) or an unfinished batch. A failed batch owes a full rescan from
+  the start (`MediaStore::restart_sweep`) on the next hourly recheck, never a retry every tick. Keep new idle paths
+  read-only until they find work.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
@@ -718,7 +731,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the window. Read that hint from durable group metadata, not the hydration-gated live accessor: runtime opens defer
   MLS hydration, and an overly early goal cannot narrow later. Propagate metadata read errors instead of treating
   them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
-  un-cover or drop debt. It logs aggregate counts only.
+  un-cover or drop debt by itself. The one exception is a rejoin (a replacement install, mdk#2660 row 11): it decides
+  the retirement, and the copy's standing floor only bounds it (`settle_recovery_rejoins`). It logs aggregate counts only.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
   fetch for every account; there is no other owner and no switch back. `prepare_runner_ownership` converts and

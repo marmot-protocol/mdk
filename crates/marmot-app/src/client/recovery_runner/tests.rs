@@ -159,7 +159,11 @@ impl Account {
 
     fn goal(&self, route: &Route, since: u64) {
         self.app
-            .widen_recovery_coverage_goals(std::slice::from_ref(route), since)
+            .widen_recovery_coverage_goals(
+                std::slice::from_ref(route),
+                since,
+                storage_sqlite::CopyFloorReason::Clamp,
+            )
             .unwrap();
     }
 
@@ -1447,8 +1451,12 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_real_ta
         .collect::<Vec<_>>();
     assert!(!groups.is_empty());
     let clock = Clock::new();
-    app.widen_recovery_coverage_goals(&groups, clock.now() - DAY)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        &groups,
+        clock.now() - DAY,
+        storage_sqlite::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     let model = ModelRelay::new(url, caps(500, true)).build();
     let host = TestHost::on_client(
         app.clone(),
@@ -1497,8 +1505,12 @@ async fn recovery_runner_explicit_repair_revisits_a_healthy_live_tail() {
     };
     let clock = Clock::new();
     let now = clock.now();
-    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), now - DAY)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(&route),
+        now - DAY,
+        storage_sqlite::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     let model = ModelRelay::new(url, caps(500, true))
         .with_events(vec![event(group_key, now)])
         .build();
@@ -1941,7 +1953,11 @@ async fn recovery_runner_retries_at_once_when_an_uncover_takes_back_its_proof() 
         wait_until("a held request", WAIT, || relay.gate.waiting() == 1).await;
         account
             .app
-            .uncover_recovery_coverage(std::slice::from_ref(&route), floor)
+            .uncover_recovery_coverage(
+                std::slice::from_ref(&route),
+                floor,
+                storage_sqlite::CopyFloorReason::Loss,
+            )
             .unwrap();
         relay.gate.open();
     });
@@ -2747,7 +2763,11 @@ async fn recovery_runner_counts_a_best_effort_attempt_only_when_it_reached_the_r
     let mark = account.app.recovery_coverage_mark().unwrap();
     account
         .app
-        .uncover_recovery_coverage(std::slice::from_ref(&unrelated), floor)
+        .uncover_recovery_coverage(
+            std::slice::from_ref(&unrelated),
+            floor,
+            storage_sqlite::CopyFloorReason::Loss,
+        )
         .unwrap();
     assert_ne!(account.app.recovery_coverage_mark().unwrap(), mark);
     assert_eq!(
@@ -4251,7 +4271,11 @@ async fn recovery_runner_stops_waiting_on_a_laggard_without_progress_refused_or_
             let reached = account.covered_through(&route, RELAY);
             account
                 .app
-                .uncover_recovery_coverage(std::slice::from_ref(&route), reached + 1)
+                .uncover_recovery_coverage(
+                    std::slice::from_ref(&route),
+                    reached + 1,
+                    storage_sqlite::CopyFloorReason::Loss,
+                )
                 .unwrap();
             assert!(account.unit(&route, OTHER_RELAY).probe);
             assert_eq!(

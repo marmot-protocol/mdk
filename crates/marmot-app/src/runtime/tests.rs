@@ -3498,6 +3498,118 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.shutdown().await;
 }
 
+/// What idle ticks do once a worker's startup housekeeping has settled
+/// (mdk#2923 §4): no writer transaction, no blocking-pool housekeeping
+/// batch, media sweep or upload promotion, while every tick still runs its
+/// phases and sets its passes due. The recovery runner's replay-flush writes
+/// are excluded by source (`replay_flush_writes`) until mdk#3238 is fixed.
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let runtime = &runtime;
+    let count = |operation| startup_stage_snapshot(runtime, operation).completed;
+    let passes = || {
+        (
+            count(RuntimeOp::WorkerAttachmentPass),
+            count(RuntimeOp::WorkerPresentationPass),
+        )
+    };
+    // Waits, without a fixed real-time window, until the passes the last
+    // tick set due have run (`target`) and no pass or blocking-pool
+    // housekeeping is still in flight. A timeout fails the test.
+    let settle = |target: (u64, u64)| async move {
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            loop {
+                let (attachment, presentation) = passes();
+                let in_flight = [
+                    RuntimeOp::WorkerAttachmentPass,
+                    RuntimeOp::WorkerPresentationPass,
+                    RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+                    RuntimeOp::WorkerMediaSweep,
+                    RuntimeOp::WorkerUploadPromotion,
+                ]
+                .into_iter()
+                .any(|operation| startup_stage_snapshot(runtime, operation).in_flight > 0);
+                if attachment >= target.0 && presentation >= target.1 && !in_flight {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the tick's passes and housekeeping finish");
+    };
+    let tick = async move || {
+        let ticks = count(RuntimeOp::WorkerMaintenance);
+        let (attachment, presentation) = passes();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while count(RuntimeOp::WorkerMaintenance) == ticks {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an idle tick completes");
+        settle((attachment + 1, presentation + 1)).await;
+    };
+    // The first tick fires on entry and starts the startup housekeeping:
+    // let it, its passes and the blocking work they spawn all finish.
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first maintenance tick completes");
+    settle((1, 1)).await;
+    const COUNTED: [RuntimeOp; 7] = [
+        RuntimeOp::WorkerMaintenance,
+        RuntimeOp::StorageWriteBegin,
+        RuntimeOp::WorkerMaintenanceHousekeepingBatch,
+        RuntimeOp::WorkerMediaSweep,
+        RuntimeOp::WorkerUploadPromotion,
+        RuntimeOp::WorkerAttachmentPass,
+        RuntimeOp::WorkerPresentationPass,
+    ];
+    let snapshot = || COUNTED.map(count);
+    // Settle one more tick, which may still finish startup work.
+    tick().await;
+    let before = snapshot();
+    let flush_before = crate::replay_flush_writes::writes();
+    for _ in 0..3 {
+        tick().await;
+    }
+    let after = snapshot();
+    let delta = |index: usize| after[index] - before[index];
+    assert_eq!(delta(0), 3, "three idle ticks ran");
+    // Since #3104 an idle account with an inactive adapter repeats the
+    // runner's replay flush, and its writes, every tick. Those are excluded
+    // by source; every other writer still fails this. Remove this exclusion
+    // once mdk#3238 is fixed.
+    let flush_writes = crate::replay_flush_writes::writes() - flush_before;
+    assert_eq!(
+        delta(1) - flush_writes,
+        0,
+        "an idle tick takes no app-storage writer transaction outside the replay flush"
+    );
+    assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
+    assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");
+    assert_eq!(delta(4), 0, "no staged upload spawns no promotion");
+    // Each tick still sets its passes due (per-account wakes are step 2).
+    assert_eq!(delta(5), 3, "one attachment pass per tick");
+    assert_eq!(delta(6), 3, "one presentation pass per tick");
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_worker_open_records_no_startup_stage_spans() {
     let dir = tempfile::tempdir().expect("tempdir");

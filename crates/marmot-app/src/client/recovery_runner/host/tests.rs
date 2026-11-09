@@ -263,7 +263,11 @@ async fn aged_capture() -> (
         until_seconds: now - 31 * DAY,
     };
     ledger
-        .widen_recovery_coverage_goals(std::slice::from_ref(&route), aged.since_seconds)
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            aged.since_seconds,
+            storage_sqlite::CopyFloorReason::Clamp,
+        )
         .unwrap();
     ledger
         .set_recovery_unit_fences(&route, &relay, &[aged])
@@ -537,7 +541,11 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     // A loss owes the last hour: the quiet groups' live REQs, which their
     // relay answered with nothing, already proved it.
     storage
-        .uncover_recovery_coverage(&groups, started - HOUR)
+        .uncover_recovery_coverage(
+            &groups,
+            started - HOUR,
+            storage_sqlite::CopyFloorReason::Loss,
+        )
         .unwrap();
     let before = storage.recovery_account_usage(started).unwrap().attempts;
     // Fresh service markers make this pass observable even when setup's
@@ -641,7 +649,11 @@ async fn a_crash_before_the_inventory_write_readmits_the_held_message() {
     app.account_storage("bob")
         .unwrap()
         .app_storage()
-        .uncover_recovery_coverage(std::slice::from_ref(&route), unix_now_seconds() - HOUR)
+        .uncover_recovery_coverage(
+            std::slice::from_ref(&route),
+            unix_now_seconds() - HOUR,
+            storage_sqlite::CopyFloorReason::Loss,
+        )
         .unwrap();
     let mut client = app.client("bob").await.unwrap();
     let candidate = client
@@ -1016,7 +1028,11 @@ async fn held_client(
     // A loss owes the last hour: the quiet group's live REQ, which its relay
     // answered with nothing, already proved it.
     storage
-        .uncover_recovery_coverage(&group_routes(&client), unix_now_seconds() - HOUR)
+        .uncover_recovery_coverage(
+            &group_routes(&client),
+            unix_now_seconds() - HOUR,
+            storage_sqlite::CopyFloorReason::Loss,
+        )
         .unwrap();
     cover_inbox(&client, &storage);
     (dir, relay, client, storage)
@@ -1110,8 +1126,12 @@ async fn new_epoch_gap_reopens_covered_history_once_and_atomically() {
         .unwrap();
     let now = unix_now_seconds();
     let since = now - 2 * HOUR;
-    app.widen_recovery_coverage_goals(std::slice::from_ref(group_route), since)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        std::slice::from_ref(group_route),
+        since,
+        storage_sqlite::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     let relay = relay();
     let cover = || {
         for route in &routes {
@@ -1446,8 +1466,12 @@ async fn a_direct_clients_pass_never_charges_an_idle_connected_account() {
     let app = storage.app_storage();
     let groups = group_routes(&client);
     assert!(!groups.is_empty());
-    app.widen_recovery_coverage_goals(&groups, unix_now_seconds() - DAY)
-        .unwrap();
+    app.widen_recovery_coverage_goals(
+        &groups,
+        unix_now_seconds() - DAY,
+        storage_sqlite::CopyFloorReason::Clamp,
+    )
+    .unwrap();
     client.seat_in_place().await;
     for _ in 0..2 {
         let report = client.run_recovery_runner_pass().await.unwrap();
@@ -1637,7 +1661,11 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
     let (route, relay) = (runner_route.route, runner_route.required[0].clone());
     let now = unix_now_seconds();
     storage
-        .widen_recovery_coverage_goals(std::slice::from_ref(&route), now - HOUR)
+        .widen_recovery_coverage_goals(
+            std::slice::from_ref(&route),
+            now - HOUR,
+            storage_sqlite::CopyFloorReason::Clamp,
+        )
         .unwrap();
     let policy = RecoveryRunnerPolicy::default().unit;
     for _ in 0..policy.break_after_no_progress {
@@ -2295,3 +2323,5 @@ async fn next_second() {
         .subsec_millis();
     tokio::time::sleep(Duration::from_millis(u64::from(1_050 - into_second))).await;
 }
+
+mod rejoin;

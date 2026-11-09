@@ -254,12 +254,27 @@ async fn admin_leaves_across_a_lost_step_down(
     deliver_events(&mut fork.clients[2], &leave).await;
     deliver_events(&mut fork.clients[2], &rival).await;
     // bob adopts the winning branch, where he is an admin again, and steps
-    // down again in the same wake.
-    for _ in 0..4 {
-        fork.wake(1).await;
-        if !fork.admin(1, 1) {
-            break;
+    // down again, possibly over several wakes: each wake stops at its time
+    // budget, so one may adopt nothing yet, or adopt without stepping down.
+    // He already reads as no admin on his own branch, so wait for both.
+    let caught_up = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            fork.wake(1).await;
+            if fork.name(1) == fork.name(0) && !fork.admin(1, 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
+    })
+    .await;
+    if caught_up.is_err() {
+        panic!(
+            "within 10 s bob did not reach the selected branch and step down: \
+             on {:?} (selected {:?}), admin {}",
+            fork.name(1),
+            fork.name(0),
+            fork.admin(1, 1)
+        );
     }
     assert!(
         !fork.admin(1, 1),

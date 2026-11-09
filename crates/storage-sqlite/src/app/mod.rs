@@ -29,6 +29,7 @@ pub(crate) mod media_catalog;
 pub(crate) mod message_drafts;
 pub(crate) mod pending_welcome_delivery;
 pub(crate) mod private_key_packages;
+pub(crate) mod recovery_copies;
 pub(crate) mod recovery_coverage;
 pub(crate) mod recovery_epoch_gap;
 pub(crate) mod recovery_health;

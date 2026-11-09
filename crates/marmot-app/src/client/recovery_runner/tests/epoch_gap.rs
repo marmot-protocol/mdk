@@ -597,3 +597,81 @@ async fn a_refused_epoch_gap_is_visited_on_the_runners_schedule_and_never_while_
         );
     }
 }
+
+/// A rejoined copy's epoch gap is in its own epochs (mdk#2660 row 11): its
+/// visit starts at the rejoin's floor, so what the rejoin retired before the
+/// copy stays retired and is never asked for, and the visit completes once
+/// the copy's own span is covered: the runner asks coverage from the floor,
+/// not from the older goal.
+#[tokio::test(start_paused = true)]
+async fn a_rejoined_copys_epoch_gap_visit_starts_at_its_floor() {
+    let account = account();
+    account
+        .fault_connection()
+        .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+        .unwrap();
+    let clock = Clock::new();
+    let now = clock.now();
+    let route = group(1);
+    account.goal(&route, now - 100);
+    let floor = now - 50;
+    assert!(
+        account
+            .app
+            .settle_recovery_rejoin(&storage_sqlite::RecoveryRejoin {
+                group_id: &[0x0a],
+                install_epoch: 1,
+                routes: &[(route.clone(), vec![RELAY.to_owned()])],
+                floor_seconds: floor,
+                now_seconds: now,
+            })
+            .unwrap()
+    );
+    let before = account.app.recovery_unit_spans(&route, RELAY).unwrap();
+    account
+        .app
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: "0a".into(),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+    let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
+    let mut owned = required(&route, &[RELAY]);
+    owned.group_id = Some(vec![0x0a]);
+    let relay = ModelRelay::new(RELAY, caps(500, false)).build();
+    let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
+    host.tails.stand(&route, RELAY, now);
+    let (mut owner, _) = runner(&host, test_policy());
+    for _ in 0..8 {
+        owner.step().await;
+        if account
+            .app
+            .recovery_epoch_gap_retry(ticket)
+            .unwrap()
+            .is_some_and(|state| !state.in_progress)
+        {
+            break;
+        }
+    }
+
+    let state = account
+        .app
+        .recovery_epoch_gap_retry(ticket)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.visits, 1);
+    assert!(
+        !state.in_progress,
+        "the copy's own span completes the visit"
+    );
+    assert!(
+        relay.queries().iter().all(|query| query.since >= floor),
+        "nothing before the copy is asked for"
+    );
+    assert_eq!(
+        account.app.recovery_unit_spans(&route, RELAY).unwrap(),
+        before,
+        "what the rejoin retired stays retired"
+    );
+    assert!(account.debt(&route, RELAY, now - 1).is_empty());
+}

@@ -5,7 +5,9 @@
 //! is covered or has failed off the admission frontier, at least one required
 //! source completed its sweep, and the group's releasable staging drained. Failure never certifies
 //! coverage; partial sweep progress cannot forgive the budget. Healthy periodic
-//! re-checks remain NIP-77-only.
+//! re-checks remain NIP-77-only. Storage begins a rejoined group's visit no
+//! lower than its rejoin's floor, so it never reopens what lay before the
+//! copy, and a visit completes from that floor.
 
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{RecoveryCause, RecoveryEligibility, TRANSPORT_RECONCILIATION_RETENTION_SECS};
@@ -79,13 +81,18 @@ pub(super) fn advance(
         }
 
         if let Some(state) = state.filter(|state| state.in_progress) {
+            // A rejoined copy's gap is in its own epochs: storage began the
+            // visit no lower than the rejoin's floor (mdk#2660 row 11), and
+            // what lay before the copy is retired, never covered, so the visit
+            // completes from the same floor.
+            let copy_floor = match &demand.group_id {
+                Some(group_id) => app.recovery_copy_floor(group_id)?.unwrap_or(0),
+                None => 0,
+            };
             let mut complete = true;
             let mut answered = false;
-            for route in &routes {
-                let since = app
-                    .recovery_coverage_goal(&route.route)?
-                    .unwrap_or(floor)
-                    .max(floor);
+            for (route, (_, since)) in routes.iter().zip(&floors) {
+                let since = (*since).max(copy_floor);
                 for relay in &route.required {
                     let covered = app.recovery_coverage_covers(
                         &route.route,

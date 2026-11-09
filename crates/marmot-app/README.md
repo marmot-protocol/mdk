@@ -814,6 +814,12 @@ them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`; the recovery runner
 Current epoch-gap exhaustion emits `EpochGap`; coverage-ledger parks emit `HistoryNoticeCause::UnprovenHistory`
 without attributing the original reason history was owed. Other cause labels preserve compatibility.
 
+A rejoin emits one `HistoryNoticeCause::BeforeRejoin` per new copy of the group. A replacement Welcome (the copy's
+install epoch moved and its join epoch was reset) makes the recovery runner retire what the group's routes owed or
+parked below the new copy's standing floor, never as coverage. A restart raises no second notice, and dismissing it
+retires nothing further. Retired spans stay in the relay re-check; loss inside them reopens them and explicit repair
+re-arms them.
+
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired
 loss keeps its evidence as a watermark, so a delayed duplicate cannot rearm it, and releases the transport-cursor fence
