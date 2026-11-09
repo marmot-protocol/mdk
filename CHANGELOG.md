@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.15.0 - 2026-11-09
+
 ### Added
 
 - Add host-driven automatic rejoin for eligible Unrecoverable group copies,

@@ -2,369 +2,88 @@
 
 ## Unreleased
 
-- `sign_out_and_wipe` leaves a chat the account administers with another account, where none of its other devices is in
-  (mdk#2818): it steps the account down first and counts the chat in `groups_left` only once it sees its removal,
-  waiting up to about 30 seconds more for all such chats. A chat this device was already leaving waits the same way.
-  Otherwise `group_leave_failures` says why. No API change.
+## 0.15.0 - 2026-11-09
 
-- `TimelineMessageQueryFfi` adds `sender`, inclusive `since`, exclusive `until`, integer `attachment_type`
-  (`0` Any, `1` Image, `2` Video, `3` Audio, `4` File, `5` Attachment), `search_wall_clock`, and
-  `cursor_group_id`. Filters combine before the page limit; explicit wall-clock order supports deterministic
-  account-wide cursors with the anchor row's group id. Default queries keep canonical group ordering.
-  Rust record literals must initialize the added fields or use `..Default::default()`; update Swift and Kotlin
-  record construction for the expanded query. Regenerate bindings and ship them with the matching native library.
-
-- `HistoryNoticeCauseFfi` gains `BeforeRejoin` (mdk#2660 row 11): one notice per rejoin, when a Welcome installed a
-  new copy of a group in place of this device's old one (an automatic rejoin after the old copy could not be repaired,
-  a reentry after a trusted removal, or a consented fork discard). Messages from before the rejoin that it had not
-  received are unavailable. Dismissing it retires nothing further. Exhaustive switches need the case. Regenerate
-  bindings.
-
-- A blocked leave is shown and can be cancelled (mdk#3014). `AppGroupRecordFfi`, `ChatListRowFfi` and
-  `GroupManagementStateFfi` gain `leave_blocked`: this account is the group's last active admin, so its leave cannot
-  finish. `GroupManagementStateFfi` and `ConversationCapabilitiesFfi` gain `can_cancel_leave`. New
-  `Marmot::cancel_leave(account_ref, group_id_hex)` cancels it on this device only; the chat reads as joined again.
-  Any other state returns the new `MarmotKitError::LeaveNotBlocked`; exhaustive error switches need it. Regenerate
-  bindings.
-
-- `DeviceLinkSnapshotFfi` gains `device_group_stalled` (default `false`): this device can no longer catch up with its
-  device group; offer `reset_device_group_for_repair`. Devices now mark and remove inactive siblings themselves
-  (mdk#2628 item 3.6b-2). Experimental device-group builds only. Regenerate bindings.
-- An admin's `leave_group`, and an admin invitee's `decline_group_invite`, return `AdminCannotSelfRemove` until
-  `self_demote_admin`, and management state reports `requires_self_demote_before_leave` for them, as in 0.14
-  (mdk#3014). Only the experimental device-groups constructor makes Leave demote a nonlast admin account itself. No
-  API change.
-
-- Emoji set changes (breaking; no host has shipped against the emoji set API).
-  `install_emoji_set(account_ref, coordinate, expected_event_id_hex, control)` binds the install to the version the
-  user was shown and takes a new `EmojiSetInstallControlFfi` (`cancel()`, `is_cancelled()`, `progress()` returning
-  `EmojiSetInstallProgressFfi`). `fetch_emoji_set_asset` gains `expected_event_id_hex` before `shortcode`. New
-  `fetch_emoji_set_cover` returns `EmojiSetCoverFfi`. New `MarmotKitError` cases `EmojiSetChanged {
-  current_event_id_hex }` and `EmojiSetInstallCancelled`; exhaustive error switches need them. `emoji_sets`,
-  `emoji_set`, `installed_custom_emoji` and `read_installed_custom_emoji` are now async. `MimeMismatch` now means a
-  non-image response type; any `image/*` type is accepted. Regenerate bindings.
-
-- Add `ChatListFilterNodeFfi::MessageText { text }` and `ChatListQueryErrorFfi::MessageTextInWindow` (mdk#2983):
-  chats with a visible message containing the text, trimmed and lowercased. `chat_list_query_ids` and
-  `revalidate_chat_list_query_ids` accept it; `open_chat_list_query_window` fails with `InvalidChatListQuery`
-  (`MessageTextInWindow`). While retained deletions and edits are still being backfilled it fails with
-  `ChatPresentationNotReady`; retry. Timeline `search` now lowercases non-ASCII text too. Regenerate bindings; an
-  exhaustive Swift/Kotlin `switch` over either enum needs the new case.
-
-- Add `ChatListFilterNodeFfi::Text { text }` and `ChatListQueryErrorFfi::TextTooLong` (mdk#2983): chats whose title,
-  group name, description or direct-chat peer profile name contains the text, trimmed and lowercased, at most 1024
-  bytes in all. While any chat in the view has pending presentation, a text query fails with
-  `ChatPresentationNotReady`; retry. Regenerate bindings; an exhaustive Swift/Kotlin `switch` over either enum needs
-  the new case.
-
-- Add `Direct`, `Group` and `Muted` to `ChatListConditionFfi` (mdk#2983). A chat whose conversation kind is still
-  `Unknown` matches neither kind; a window filtered on `Muted` updates when a mute expires. Regenerate bindings; an
-  exhaustive Swift/Kotlin `switch` over the enum needs the new cases.
-
-- An ordinary constructor no longer opens an account that holds or is joining a device group: it fails with `Runtime`
-  `experimental_device_groups_required` (mdk#3012). Open experimental device-group roots with
-  `newWithExperimentalDeviceGroups` in every opener, including notification service extensions.
-
-- Add NIP-51 emoji sets: `sync_emoji_sets`, `emoji_sets`, `emoji_set`, `fetch_emoji_set`, `user_emoji_list`,
-  `install_emoji_set`, `uninstall_emoji_set`, `fetch_emoji_set_asset`, `installed_custom_emoji` and
-  `read_installed_custom_emoji`, with their records and `EmojiSkipReasonFfi`. New `MarmotKitError` cases
-  `InvalidEmojiSet`, `EmojiSetNotFound`, `EmojiSetNetwork`, `EmojiImageTooLarge`, `EmojiImageUnsupported` and
-  `EmojiSetLimit`; exhaustive Swift/Kotlin error switches need the new cases. Regenerate bindings to use them.
-
-- Add filtered chat-list queries (mdk#2983): `open_chat_list_query_window`, `chat_list_query_ids` and
-  `revalidate_chat_list_query_ids` take a `ChatListViewQueryFfi` whose filter is a flat `ChatListFilterNodeFfi` list
-  (node 0 is the root; children are later indices). Invalid queries fail with the new
-  `MarmotKitError::InvalidChatListQuery { reason: ChatListQueryErrorFfi }`. Fixed-view methods are unchanged.
-  Additive; regenerate bindings to use them.
-
-- Add `chat_list_ids(account_ref, view)` and `revalidate_chat_list_ids(account_ref, view, group_ids)` for select all
-  over a whole chat-list view (mdk#2983). Hosts keep checkbox state, revalidate before a bulk action, then call the
-  existing per-chat commands. Additive; regenerate bindings to use them.
-
-- Expose qualified prior-linked-slot context and explicit local device-group reset for experimental clients. Regenerate matching Swift/Kotlin bindings; ordinary constructors stay disabled. No schema or wire migration.
-
-- Add typed `EventTooLarge` with coarse artifact and size-class enums. Regenerate Swift/Kotlin bindings with the
-  matching library; existing error cases and publication lifecycle remain unchanged. No database or wire migration.
-
-- Expose pending Welcome repair handles and optional coarse size diagnosis in the existing pending event.
-  Regenerate bindings with the matching library. Diagnostics are best effort, old/future unknown annotations remain
-  Unknown, and later coarse legacy retries may replace a specific cause; existing debt and retry behavior remain.
-  Legacy Welcome reasons, including `EventTooLarge`, explain the observed attempt, not earlier non-delivery or a
-  terminal outcome; a crash or expired bookkeeping can hide previous exposure.
-
-- Add a default-off `dev-device-groups` host capability and explicit experimental constructor. Ordinary constructors
-  remain disabled; opt-in native/generated build outputs are isolated. Existing options layouts remain unchanged.
-
-- Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
-  Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
-  setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.
+Regenerate Swift/Kotlin bindings with the matching native library. The main
+source breaks: `TimelineMessageQueryFfi` gains filter and cursor fields,
+`MarmotDeploymentFfi` loses its two KeyPackage-client fields, `MarmotKitError`,
+`MarmotEventFfi` and several other enums gain cases, and
+`MarmotEventFfi::WelcomeDeliveryPending` gains `size_class`. Account storage
+migrates on first open, and downgrade is unsupported. A new group whose
+founding devices all run 0.15 requires the account-devices component, so
+clients older than 0.15 cannot be invited into it. See the
+[release notes](../../docs/release/0.15.0.md) and the
+[client upgrade guide](../../docs/integration/0.15.0.md).
 
 ### Breaking changes
 
-- Device-link snapshots add owned move views and old-sibling recognition hints; linked-device status appends Moved.
-  `dismiss_device_group_move_sibling` dismisses one hint. Regenerate host bindings and rebuild consumers with the
-  matching native library/header: the snapshot layout changes. Moves remain behind the existing experimental gate.
-
-- Expose recovery-word setup/settings, manual backup restore begin/cancel/status/watch/current-chat hints, and
-  account-worker Wi-Fi/charging reports. Closing a restore observer does not cancel work. Timeline and conversation
-  rows add typed `history_import_provenance` for Device or Backup while preserving sibling-only `imported_from`.
-  Generated host strings remain caller-managed; do not persist or log recovery words.
-  Background writer work defaults closed on every new runtime; hosts must report both Wi-Fi and charging to admit
-  new passes. Already admitted passes settle after conditions change; manual restore remains independent.
-
-- `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).
-  Preserve it when saving an upload reference and sending it back, including
-  custom emoji reactions. Outbound sends refuse a missing identity or a changed
-  upload branch with `InvalidMediaReference`; re-upload retained bytes. The
-  field is local metadata, never written to `imeta`. Received and legacy
-  references remain downloadable. Regenerate bindings with the matching library.
-
-- `TimelineMessageRecordFfi` adds `recipient_confirmed: bool` (mdk#1291):
-  true when a peer reacted to an own send that failed with no relay
-  acceptance on record, which proves the peer received it. It stays true if
-  retention later prunes that reaction. Render the row as delivered:
-  its `invalidation_status` is null and its `source_message_id_hex` stays
-  null. The flip arrives with the `DeliveryOrSendStateChanged` trigger, and
-  `ChatListMessageDeliveryStateFfi` reports `Delivered`. A host that derives
-  "sending" from a null `source_message_id_hex` must also read
-  `recipient_confirmed`, or a settled send shows as sending instead of
-  failed. A row's change carries one trigger, so the reaction that settles
-  or unsettles a send arrives as `DeliveryOrSendStateChanged`: recompute
-  that row's reactions for this trigger too. Replies quoting the send arrive
-  as `ReplyPreviewChanged`. Regenerate bindings with the matching native
-  library.
-
-- `sign_out_and_wipe` signs out through the account's other devices
-  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
-  first records in the device group that it is leaving, which can take about
-  30 seconds, and leaves those devices the chats they can take it out of.
-  `WipeOutcomeFfi` adds `groups_left_to_siblings` and `siblings_not_reached`,
-  which says it could not ask them in time and tried to leave every chat
-  itself, reporting any it could not in `group_leave_failures`; tell the
-  user. The call now keeps running when the host cancels it, so a
-  sign-out that has asked its siblings always finishes. Regenerate bindings
-  with the matching native library.
-
-- `TimelineMessageRecordFfi` adds `imported_from: Option<HistoryImportSourceFfi>`,
-  the device an imported row came from, and `MarmotEventFfi` adds
-  `ChatHistoryImportsChanged { account_id_hex, account_label }` (mdk#2628
-  item 4.2d). New `chat_history_imports(account_ref)` lists each held chat's
-  history from another device as `ChatHistoryImportFfi`: `Receiving`, with
-  `retrying` once an attempt to get its bundle failed, or `Imported` with
-  its source and time. An
-  empty `device_label` means "another device". Only behind
-  `dev_device_groups`. Exhaustive matches add the new arm.
-
-- `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
-  `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
-  found in its own slot that it did not make, which only this device warns
-  of. Kind 462 is no longer reserved. The device roster changed its encoding,
-  so existing development device groups must be recreated.
-
-- A device that its device group removes after its link was made is
-  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
-  signed out. `MarmotEventFfi` adds `DeviceUnlinked { account_id_hex,
-  account_label }`, sent once; `AccountSummaryFfi` adds `unlinked`; and
-  `MarmotKitError` adds `AccountUnlinked { account_ref }`, which signing in,
-  logging in or importing the key of such an account returns. Show that this
-  device was unlinked and offer
-  `sign_out_and_wipe`, which skips leaving chats and deleting the slot;
-  signing in again is then a new link. Update exhaustive Swift/Kotlin
-  handling and regenerate bindings with the matching native library.
-
-- `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
-  (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
-  stays in through another of its devices. Show no "removed from group"
-  notice for it. Update exhaustive Swift/Kotlin handling and regenerate
-  bindings with the matching native library.
-
-- `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
-  reason }` (mdk#2694): a send that waited for the group to settle was dropped
-  because the settled state refused it; tell the user, who may try again.
-  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
-  matching native library.
-
-- `MarmotKitError` adds `GroupRecoveryUnsettled { group_id_hex }` and
-  `GroupRecoverySourceMismatch { group_id_hex }`. The former waits for the
-  source or local recovery state to settle. The latter requires checking local
-  eligibility and authenticated authority again, not blindly retrying the same
-  grant; a usable local copy must not recover. Update exhaustive host error handling.
-- `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
-  (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
-  with the matching native library.
-
-- `MarmotEventFfi` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
-  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
-  regenerate bindings with the matching native library.
-- `MarmotEventFfi` adds `DeviceLinkChanged { account_id_hex, account_label }`
-  (mdk#2628 item 3.3b). Update exhaustive Swift/Kotlin handling and regenerate
-  bindings with the matching native library.
-
-- `MarmotEventFfi` adds `UnrecognizedSignInsChanged { account_id_hex,
-  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
-  regenerate bindings with the matching native library.
-
-- `MarmotEventFfi` adds `CompromiseWarningChanged { account_id_hex,
-  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
-  regenerate bindings with the matching native library.
-- `HistoryNoticeCauseFfi` adds `UnprovenHistory`, and `MarmotEventFfi` adds
-  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660). Update
-  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
-  native library. Neither is produced until the recovery runner owns history.
-
-- `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
-  for an `enable_account_devices` call the group cannot take now (mdk#2628).
-  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
-  matching native library.
-
 - `MarmotDeploymentFfi` drops `key_package_preferred_clients` and
-  `key_package_last_clients` (mdk#2628): the KeyPackage `client` tag no longer
-  ranks invite candidates. Remove them from any record a host builds field by
-  field and regenerate bindings with the matching native library; hosts that
-  start from `marmot_deployment_white_noise()` or `marmot_deployment_neutral()`
-  only regenerate.
+  `key_package_last_clients` (mdk#2628, mdk#2649): the KeyPackage `client` tag
+  no longer ranks invite candidates. Remove them from any record a host builds
+  field by field; hosts that start from `marmot_deployment_white_noise()` or
+  `marmot_deployment_neutral()` only regenerate.
 
-- `MarmotKitError` adds `MediaReferenceStaleEpoch { source_epoch, current_epoch }`
-  and `MediaReferenceEpochUnsettled { source_epoch }`. They replace the
-  generic `InvalidMediaReference` for these two cases: the first means the
-  group left the epoch the attachment was encrypted under, so upload the file
-  again; the second means the epoch is settling, so sync and send again. Update
-  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
-  native library (#2158).
+- `TimelineMessageQueryFfi` adds `sender`, inclusive `since`, exclusive
+  `until`, integer `attachment_type` (`0` Any, `1` Image, `2` Video, `3`
+  Audio, `4` File, `5` Attachment; binding default `0`), `search_wall_clock`
+  (binding default `false`) and `cursor_group_id` (mdk#3245). The optional
+  fields have no binding default, and all of them come before `before`, so
+  every Swift initializer and positional Kotlin constructor call must change.
+  Filters combine before the page limit; explicit wall-clock order supports
+  deterministic account-wide cursors with the anchor row's group id. Default
+  queries keep canonical group ordering. See the README's "Advanced timeline
+  search".
 
-- Sonar-compatible stickers. `MarmotKitError` adds `InvalidSticker`, `StickerNotFound`,
-  `StickerNetwork`, `StickerImport` and `StickerImportUnsupported`; they previously had no
-  sticker path. `AppMessageRecordFfi`, `ReceivedMessageFfi`, `NotificationUpdateFfi`,
-  `ChatListMessagePreviewFfi`, `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` add
-  `sticker: Option<StickerRefFfi>`, the typed kind-9 sticker reference; it is `None` for a
-  deleted row. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when`
-  handling and code that constructs these records. New `Marmot` methods `sticker_packs`,
-  `sticker_pack`, `sync_sticker_packs`, `fetch_sticker_pack`, `install_sticker_pack`,
-  `uninstall_sticker_pack`, `fetch_sticker_asset`, `send_sticker` and
-  `import_signal_sticker_pack` (which validates the link and then refuses before any
-  network call) use the new `StickerRefFfi`, `StickerFfi`, `StickerPackFfi`,
-  `StickerAssetFfi`, `StickerSyncResultFfi` and `StickerImportResultFfi` records.
-  `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
+- `MarmotEventFfi::WelcomeDeliveryPending` adds `size_class:
+  Option<EventSizeClassFfi>` (mdk#2999), a best-effort coarse diagnosis of a
+  Welcome refused for size. Swift patterns and Kotlin destructuring that bind
+  every associated value need the new field.
 
-### Added
+- Records hosts may build for previews, mocks or tests gain fields without a
+  binding default: `AccountSummaryFfi.unlinked`; `leave_blocked` on
+  `AppGroupRecordFfi`, `ChatListRowFfi` and `GroupManagementStateFfi`;
+  `can_cancel_leave` on `GroupManagementStateFfi` and
+  `ConversationCapabilitiesFfi`; `sticker: Option<StickerRefFfi>` on
+  `AppMessageRecordFfi`, `ReceivedMessageFfi`, `NotificationUpdateFfi`,
+  `ChatListMessagePreviewFfi`, `TimelineMessageRecordFfi` and
+  `TimelineReplyPreviewFfi`; `recipient_confirmed`, `imported_from` and
+  `history_import_provenance` on `TimelineMessageRecordFfi`; and
+  `groups_left_to_siblings` and `siblings_not_reached` on `WipeOutcomeFfi`.
+  Each is described below.
 
-- `AppPerformanceSnapshotFfi.runtime_operations` reports per-phase
-  maintenance-tick operations (`worker_maintenance_*`, the presentation, avatar
-  and attachment passes and blocking batches a tick sets off) and full native
-  replay synchronizations by trigger (`replay_sync_*`) (mdk#2923).
+- `MarmotKitError` adds 22 cases; exhaustive Swift `switch` / Kotlin `when`
+  handling needs them: `EventTooLarge`, `MediaReferenceStaleEpoch`,
+  `MediaReferenceEpochUnsettled`, `GroupRecoveryUnsettled`,
+  `GroupRecoverySourceMismatch`, `LeaveNotBlocked`,
+  `AccountDevicesActivationRefused`, `InvalidChatListQuery`, `AccountUnlinked`,
+  the sticker cases (`InvalidSticker`, `StickerNotFound`, `StickerNetwork`,
+  `StickerImport`, `StickerImportUnsupported`) and the emoji-set cases
+  (`InvalidEmojiSet`, `EmojiSetNotFound`, `EmojiSetNetwork`,
+  `EmojiImageTooLarge`, `EmojiImageUnsupported`, `EmojiSetLimit`,
+  `EmojiSetChanged { current_event_id_hex }`, `EmojiSetInstallCancelled`).
+  The new APIs that return them are under Added.
 
-- Add `update_linked_device_settings` with three optional booleans. Omitted values stay current; refresh on `LinkedDevicesChanged`. Earlier lost user edits recover before the command proceeds (mdk#2628 D86).
-  This development transition requires custom post-link settings writers to rotate the user-edit marker;
-  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+- `MarmotKitError::EventTooLarge { artifact: OversizedArtifactFfi, size_class:
+  EventSizeClassFfi }` replaces `Publish` or `Runtime` when every current
+  target refused an event for size on the observed attempt (mdk#2993). It is
+  not proof of non-delivery or a terminal outcome; native retries and
+  confirmed state are kept, and no relay limit is inferred.
 
-- `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
-  resolves one active custom-emoji reaction's matching encrypted image to its
-  original attachment source slot (mdk#2151). Use ordinary host-managed
-  acquisition and opaque local reads; no group-wide `list_media` scan or
-  `download_media` fallback is required. The additive source migration backfills
-  retained eligible reactions. See `ATTACHMENT-HISTORY.md` for adoption and
-  reaction replacement/removal behavior.
+- `MarmotKitError` adds `MediaReferenceStaleEpoch { source_epoch,
+  current_epoch }` and `MediaReferenceEpochUnsettled { source_epoch }`
+  (mdk#2158). They replace the generic `InvalidMediaReference` for these two
+  cases: the first means the group left the epoch the attachment was
+  encrypted under, so upload the file again; the second means the epoch is
+  settling, so sync and send again.
 
-- `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
-  the groups whose history is still being fetched (`catching_up_group_ids_hex`),
-  whether the inbox's is (`inbox_catching_up`), and every notice as
-  `history_notices` lists them (mdk#2660). Re-read it on
-  `RecoveryStatusChanged`. Until the recovery runner owns history nothing is
-  ever catching up.
+- `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity`
+  (mdk#2840; binding default none). Preserve it when saving an upload
+  reference and sending it back, including custom emoji reactions. Outbound
+  sends refuse a missing identity or a changed upload branch with
+  `MediaReferenceStaleEpoch`, so an upload reference saved under 0.14 must be
+  uploaded again from its retained bytes. The field is local metadata, never
+  written to `imeta`. Received and legacy references remain downloadable.
 
-- `MarmotOptions.devicePlatform` names the platform this device runs on, such
-  as `iOS`. With `clientName`, each device writes it into its own roster
-  entry, so `linked_devices` shows every device's client and platform
-  (mdk#2628 item 3.6). Defaults to none; written only where device groups are.
-
-- `rename_linked_device(account_ref, slot_id_hex, label)` renames one of this
-  account's devices, this one included, with one roster commit in the device
-  group (mdk#2628 item 3.6). It is refused with nothing sent while the device
-  group has an earlier change in flight (`device_group_busy`; retry later),
-  and without explicit device-group capability and runtime intent. A rename whose commit
-  loses a fork is made again later, unless another rename of that device
-  won.
-
-- `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
-  whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
-  syncing; `retry_group_convergence` grants one more attempt. Regenerate
-  bindings with the matching native library.
-- Device linking (mdk#2628 item 3.3b): `start_device_link`,
-  `confirm_device_link_match` and `cancel_device_link` on the new device,
-  `link_device` and `decline_device_link` on a device already signed in, and
-  `device_link_snapshot`, each returning a `DeviceLinkSnapshotFfi`. Re-read it
-  on `DeviceLinkChanged`. Every call is refused without the experimental device-group entry point and its build capability.
-
-- `linked_devices(account_ref)` returns this account's own devices as
-  `LinkedDeviceFfi` records, from the roster of the device group this device
-  trusts, this device first (mdk#2628 item 3.1). Re-read it on
-  `LinkedDevicesChanged`. It is empty without explicit device-group capability and runtime intent.
-- `LinkedDeviceFfi` adds `last_active_at`, when a heartbeat last showed a
-  sibling running, and `inactive`, this device's own judgement 30 days after
-  the later of that and when it first found the sibling in the roster
-  (mdk#2628 item 3.6). Each device sends a heartbeat in the device group at
-  most once an hour while it runs. Neither is shown without explicit device-group capability and runtime intent.
-
-- `key_package_refresh_overdue(account_ref)` says when this device's device
-  group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
-  so the app can tell the user before inviters stop treating the device as
-  fresh at 30 days. Re-read it on `KeyPackageRefreshOverdueChanged`. It is
-  false without explicit device-group capability and runtime intent.
-
-- `unrecognized_sign_ins(account_ref)` returns sign-ins of this account that
-  this device does not recognize as `UnrecognizedSignInFfi` records (mdk#2628
-  item 3.2). `answer_sign_in(account_ref, slot_id_hex, response)` answers one
-  with a `SignInResponseFfi`, and `check_sign_ins(account_ref)` checks now.
-  Re-read the list on `UnrecognizedSignInsChanged`. It is empty without explicit device-group capability and runtime intent.
-
-- `compromise_warning(account_ref)` returns the account's open compromise
-  warning on this device as `CompromiseWarningItemFfi` records (mdk#2628 item
-  3.7a), and `dismiss_compromise_warning(account_ref)` closes it on this
-  device. Re-read it on `CompromiseWarningChanged`. `start_fresh(account_ref)`
-  answers every sign-in from before this device Not now without rejecting
-  any, and `started_fresh(account_ref)` says whether the device did so and
-  still has no device group. All are empty or false without explicit device-group capability and runtime intent.
-
-- An admin can turn on account-devices in an existing group (mdk#2628):
-  `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
-  only when the user asks, and the group can never turn it off.
-  `account_devices_activation(account_ref, group_id_hex)` answers whether the
-  group is eligible with an `AccountDevicesActivationFfi` (`Eligible`,
-  `NotAdmin`, `AlreadyEnabled`, `LegacyGroup`, `MembersNeedUpdate`,
-  `DevicesNeedReplacement`, `DeviceLimitExceeded`) that never names which members or devices hold it
-  back. See the README's "Turning on account devices".
-
-### Changed
-
-- Every text send queued while offline publishes as soon as the host reports
-  restored connectivity, not only the first (mdk#2762). Later sends no longer
-  wait out a retry clock of up to an hour behind it, also after a cold start
-  that is already online or a transport reopen, which get no connectivity
-  report from the host.
-- `removed_device_leftover_chats` also counts chats that keep the leaf of a
-  device the account's device group stopped listing without a removal, such
-  as after a failed link (mdk#2761). Release builds hold no device group, so
-  it stays zero there.
-- `send_custom_event` refuses the device-group kinds 457, 458, 459, 460, 461, 473,
-  475 and 476 as reserved, and one received in a chat makes no timeline row,
-  message or notification (mdk#2628). They are read only in the account's
-  device group.
-- Creating a group or inviting adds every device of each recipient account
-  (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
-  last 30 days, at most 20, or the single best one when none is that recent.
-  See the README's KeyPackage selection section.
-- Group member rows are accounts, not devices (mdk#2628). `group_members`,
-  `group_details`, `group_roster`, `group_member_ids_page` and
-  `group_conversation_snapshot` list an account with several devices in the
-  group once, and `AppGroupMemberRecordFfi` and `GroupMemberDetailsFfi` gain
-  `device_count` (binding default 1). `member_count`, admin counts and
-  `is_last_admin` count accounts, and a chat between two accounts stays direct
-  whatever devices either person uses.
-- `AttachmentTransferSubscription.next()` returns a replacement that changes a
-  row's transfer state as soon as the engine reports it; progress-only
-  replacements still arrive at most four per second. A host that polled
-  `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
-  that poll (#2157).
 - `MarmotKitError` now depends on what an error is, not on which MDK layers
   wrapped it (mdk#2602). Three answers change:
   - A busy, closed or full store that the account session reported itself now
@@ -378,9 +97,345 @@
     failure reads `local storage error`, an unknown engine group `unknown
     local group`, and any other engine failure `session error`. Account
     failures outside the engine still read `account error`.
+
+- A blocked leave is shown and can be cancelled (mdk#3014). `leave_blocked`
+  on `AppGroupRecordFfi`, `ChatListRowFfi` and `GroupManagementStateFfi`
+  means this account is the group's last active admin, so its leave cannot
+  finish; `can_cancel_leave` on `GroupManagementStateFfi` and
+  `ConversationCapabilitiesFfi` says the user can cancel it. New
+  `cancel_leave(account_ref, group_id_hex)` cancels it on this device only;
+  the chat reads as joined again. Any other state returns the new
+  `LeaveNotBlocked`.
+
+- `TimelineMessageRecordFfi` adds `recipient_confirmed: bool` (mdk#1291):
+  true when a peer reacted to an own send that failed with no relay
+  acceptance on record, which proves the peer received it. It stays true if
+  retention later prunes that reaction. Render the row as delivered:
+  its `invalidation_status` is null and its `source_message_id_hex` stays
+  null. The flip arrives with the `DeliveryOrSendStateChanged` trigger, and
+  `ChatListMessageDeliveryStateFfi` reports `Delivered`. A host that derives
+  "sending" from a null `source_message_id_hex` must also read
+  `recipient_confirmed`, or a settled send shows as sending instead of
+  failed. A row's change carries one trigger, so the reaction that settles
+  or unsettles a send arrives as `DeliveryOrSendStateChanged`: recompute
+  that row's reactions for this trigger too. Replies quoting the send arrive
+  as `ReplyPreviewChanged`.
+
+- `HistoryNoticeCauseFfi` adds `UnprovenHistory`, and `MarmotEventFfi` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660). Both
+  are produced now that the recovery runner owns account history (see
+  Changed). `HistoryNoticeCauseFfi` also adds `BeforeRejoin` (mdk#2660 row
+  11): one notice per rejoin, when a Welcome installed a new copy of a group in
+  place of this device's old one (an automatic rejoin after the old copy could
+  not be repaired, a reentry after a trusted removal, or a consented fork
+  discard). Messages from before the rejoin that it had not received are
+  unavailable. Dismissing it retires nothing further.
+
+- `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
+  reason }` (mdk#2694): a send that waited for the group to settle was
+  dropped because the settled state refused it; tell the user, who may try
+  again. Such refused intents are retired instead of staying queued.
+
+- `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
+  (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
+  stays in through another of its devices. Show no "removed from group"
+  notice for it.
+
+- `MarmotEventFfi` adds `LinkedDevicesChanged`, `KeyPackageRefreshOverdueChanged`,
+  `UnrecognizedSignInsChanged`, `CompromiseWarningChanged`,
+  `DeviceLinkChanged`, `ChatHistoryImportsChanged` and `DeviceUnlinked`, each
+  `{ account_id_hex, account_label }` (mdk#2628). Exhaustive handling needs
+  the arms in every build; MDK sends them only with experimental device
+  groups (see below), so ordinary hosts can ignore them.
+
+### Added
+
+- `pending_welcome_deliveries(account_ref)` lists, oldest first, the group
+  creates and confirmed Adds whose Welcome is still owed, as
+  `PendingWelcomeDeliveryFfi` records with repair handles and the same
+  best-effort `size_class` (mdk#2999). The `WelcomeDeliveryPending` notice
+  fires once per process and Welcome; re-read this query for later causes. A
+  coarse legacy retry may replace a specific cause with none while the same
+  repair handle and debt remain. A Welcome's `EventTooLarge` explains the
+  observed attempt, not earlier non-delivery or a terminal outcome.
+
+- `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
+  the groups whose history is still being fetched (`catching_up_group_ids_hex`),
+  whether the inbox's is (`inbox_catching_up`), and every notice as
+  `history_notices` lists them (mdk#2660). Re-read it on
+  `RecoveryStatusChanged`.
+
+- Select all over a whole chat-list view (mdk#2983):
+  `chat_list_ids(account_ref, view)` returns every chat ID in display order,
+  beyond the open window, and `revalidate_chat_list_ids(account_ref, view,
+  group_ids)` returns the subset of a host selection still in the view. Hosts
+  keep checkbox state, revalidate before a bulk action, then call the
+  existing per-chat commands.
+
+- Filtered chat-list queries (mdk#2983): `open_chat_list_query_window`,
+  `chat_list_query_ids` and `revalidate_chat_list_query_ids` take a
+  `ChatListViewQueryFfi` whose filter is a flat `ChatListFilterNodeFfi` list
+  (node 0 is the root; children are later indices). `All`, `Any` and `Not`
+  combine `Condition` leaves (`ChatListConditionFfi`, including `Direct`,
+  `Group` and `Muted`), `GroupIds`, `Text` and `MessageText`. `Text` matches
+  a chat's title, group name, description or direct-chat peer profile name;
+  `MessageText` matches chats with a visible message containing the text,
+  and only the ID queries accept it (a window fails with
+  `InvalidChatListQuery` `MessageTextInWindow`). Both are trimmed and
+  lowercased, at most 1024 bytes. A chat whose kind is still `Unknown`
+  matches neither kind; a window filtered on `Muted` updates when a mute
+  expires. Invalid queries fail with `InvalidChatListQuery { reason:
+  ChatListQueryErrorFfi }`; while presentation or retained edits are still
+  being prepared, text queries fail with `ChatPresentationNotReady`, so
+  retry. Fixed-view methods are unchanged. See the README's "Chat-list select
+  all and filtered queries".
+
+- NIP-51 emoji sets (mdk#3022, mdk#3043): `sync_emoji_sets`, `emoji_sets`,
+  `emoji_set`, `fetch_emoji_set`, `user_emoji_list`, `install_emoji_set`,
+  `uninstall_emoji_set`, `fetch_emoji_set_asset`, `fetch_emoji_set_cover`,
+  `installed_custom_emoji` and `read_installed_custom_emoji`, with their
+  records and `EmojiSkipReasonFfi`. `install_emoji_set(account_ref,
+  coordinate, expected_event_id_hex, control)` binds the install to the
+  version the user was shown and takes an `EmojiSetInstallControlFfi`
+  (`cancel()`, `is_cancelled()`, `progress()` returning
+  `EmojiSetInstallProgressFfi`); the asset and cover fetches take the same
+  `expected_event_id_hex`. Image fetches reveal the user's IP address to the
+  set author's image host, so call them only after the user opens or installs
+  a set. Any `image/*` response type is accepted. See the README's "Emoji
+  sets".
+
+- Sonar-compatible stickers (mdk#875): `sticker_packs`, `sticker_pack`,
+  `sync_sticker_packs`, `fetch_sticker_pack`, `install_sticker_pack`,
+  `uninstall_sticker_pack`, `fetch_sticker_asset`, `send_sticker` and
+  `import_signal_sticker_pack` (which validates the link and then refuses
+  before any network call), with `StickerRefFfi`, `StickerFfi`,
+  `StickerPackFfi`, `StickerAssetFfi`, `StickerSyncResultFfi` and
+  `StickerImportResultFfi`. Message, preview and timeline records carry the
+  typed kind-9 reference in `sticker`; it is `None` for a deleted row.
+  `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
+  See the README's "Stickers".
+
+- `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
+  resolves one active custom-emoji reaction's matching encrypted image to its
+  original attachment source slot (mdk#2151). Use ordinary host-managed
+  acquisition and opaque local reads; no group-wide `list_media` scan or
+  `download_media` fallback is required. The additive source migration backfills
+  retained eligible reactions. See `ATTACHMENT-HISTORY.md` for adoption and
+  reaction replacement/removal behavior.
+
+- An admin can turn on account-devices in an existing group (mdk#2628):
+  `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
+  only when the user asks, and the group can never turn it off.
+  `account_devices_activation(account_ref, group_id_hex)` answers whether the
+  group is eligible with an `AccountDevicesActivationFfi` (`Eligible`,
+  `NotAdmin`, `AlreadyEnabled`, `LegacyGroup`, `MembersNeedUpdate`,
+  `DevicesNeedReplacement`, `DeviceLimitExceeded`) that never names which
+  members or devices hold it back. A call the group cannot take now returns
+  `AccountDevicesActivationRefused { group_id_hex, reason }`. See the README's
+  "Turning on account devices".
+
+- `AppGroupMlsStateFfi.convergence_parked` (binding default `false`) reports a
+  group whose convergence pass spent its failure budget (mdk#2684). Show it as
+  stuck syncing; `retry_group_convergence` grants one more attempt.
+
+- `MarmotKitError` adds `GroupRecoveryUnsettled { group_id_hex }` and
+  `GroupRecoverySourceMismatch { group_id_hex }` (mdk#2683). The former waits
+  for the source or local recovery state to settle. The latter requires
+  checking local eligibility and authenticated authority again, not blindly
+  retrying the same grant; a usable local copy must not recover.
+
+- `AppPerformanceSnapshotFfi.runtime_operations` reports per-phase
+  maintenance-tick operations (`worker_maintenance_*`, the presentation, avatar
+  and attachment passes and blocking batches a tick sets off) and full native
+  replay synchronizations by trigger (`replay_sync_*`) (mdk#2923).
+
+- Experimental device groups (only with `new_with_experimental_device_groups`
+  in a `dev-device-groups` build). These APIs exist in every build; without
+  that constructor and build they return empty, false or zero, or refuse.
+  Refusals arrive as `MarmotKitError::Runtime` with details `device group
+  refused: <reason>` (for example `roster_unsupported`). Ordinary hosts can
+  skip this list.
+  - The `dev-device-groups` cargo feature and
+    `new_with_experimental_device_groups` constructor are default-off. The
+    packaging scripts take a leading `--dev-device-groups` flag and write to
+    `output-dev-device-groups/`. Ordinary constructors stay disabled and no
+    longer open an account that holds or is joining a device group: it fails
+    with `Runtime` `experimental_device_groups_required` (mdk#3012). Use the
+    experimental constructor in every opener of such a root, notification
+    service extensions included.
+  - `MarmotOptions.device_platform` (binding default none, after
+    `client_name`) names the platform this device runs on, such as `iOS`; with
+    `client_name`, each device writes it into its own roster entry (mdk#2628
+    item 3.6). Positional Kotlin construction shifts.
+  - Linked devices: `linked_devices(account_ref)` returns `LinkedDeviceFfi`
+    records, this device first, including `last_active_at` and `inactive`
+    (mdk#2628 items 3.1, 3.6); `rename_linked_device`,
+    `update_linked_device_settings` (three optional booleans; omitted values
+    stay current), `remove_linked_device(account_ref, slot_id_hex)`,
+    `removed_device_leftover_chats` and `chats_closed_to_linked_devices`
+    (mdk#2759, mdk#2761, mdk#2856). Re-read on `LinkedDevicesChanged`. Devices
+    mark and remove inactive siblings themselves.
+  - Device linking (mdk#2628 item 3.3b): `start_device_link`,
+    `confirm_device_link_match` and `cancel_device_link` on the new device,
+    `link_device` and `decline_device_link` on a device already signed in, and
+    `device_link_snapshot`, each returning a `DeviceLinkSnapshotFfi` with
+    `moves` (old-sibling recognition hints; `dismiss_device_group_move_sibling`
+    dismisses one) and `device_group_stalled`. When stalled, offer
+    `reset_device_group_for_repair`, a local reset before fresh code pairing.
+    Linked-device status includes `Moved`. Re-read on `DeviceLinkChanged`.
+  - `key_package_refresh_overdue(account_ref)` says when the device group has
+    held this device's KeyPackage refresh back for a week (mdk#2628 item 3.4).
+    Re-read it on `KeyPackageRefreshOverdueChanged`.
+  - `unrecognized_sign_ins`, `answer_sign_in` with a `SignInResponseFfi`, and
+    `check_sign_ins` (mdk#2628 item 3.2). Re-read on
+    `UnrecognizedSignInsChanged`.
+  - `compromise_warning`, `dismiss_compromise_warning`, `start_fresh` and
+    `started_fresh` (mdk#2628 item 3.7a). `CompromiseWarningReasonFfi`
+    includes `ForeignOwnSlotKeyPackage`: a KeyPackage in this device's own
+    slot that it did not make (3.7b). Re-read on `CompromiseWarningChanged`.
+    The device roster encoding changed during this cycle, so development
+    device groups created earlier must be recreated.
+  - `chat_history_imports(account_ref)` lists each held chat's history from
+    another device as `ChatHistoryImportFfi` (`Receiving`, with `retrying`, or
+    `Imported` with its source and time); `TimelineMessageRecordFfi` and
+    conversation rows carry `imported_from` and typed
+    `history_import_provenance` (Device or Backup) (mdk#2628 item 4.2d).
+    Re-read on `ChatHistoryImportsChanged`.
+  - Backups: `begin_recovery_words`, `confirm_recovery_words`,
+    `cancel_recovery_words`, `turn_off_backups`, `backup_settings`,
+    `set_runtime_backup_background_conditions`,
+    `set_backup_background_conditions`, `run_due_backup_pass`,
+    `begin_backup_restore`, `cancel_backup_restore`, `backup_restore_status`,
+    `watch_backup_restore` (`BackupRestoreSubscription`) and
+    `backup_history_availability`, with `RecoveryWordsFfi`,
+    `BackupSettingsFfi`, `BackgroundBackupOutcomeFfi`,
+    `BackupRestoreStatusFfi`, `BackupRestorePhaseFfi`,
+    `BackupHistoryAvailabilityFfi`, `BackupHistorySourceFfi` and
+    `HistoryImportProvenanceFfi`. Outside experimental device groups every
+    call is refused with `roster_unsupported`, so ordinary hosts have nothing
+    to do. Inside them, background passes need both Wi-Fi and charging
+    reported, and closing a restore observer does not cancel work. Do not
+    persist or log recovery words.
+  - Signing out with linked devices (mdk#2628 item 3.6b): `sign_out_and_wipe`
+    first records in the device group that it is leaving (about 30 seconds)
+    and leaves the siblings the chats they can take it out of.
+    `WipeOutcomeFfi.groups_left_to_siblings` counts those, and
+    `siblings_not_reached` says it could not ask them in time and tried to
+    leave every chat itself.
+  - A device its device group removes after its link was made is unlinked
+    (mdk#2628 item 3.6b): the account stops on that device and stays signed
+    out. `DeviceUnlinked` is sent once, `AccountSummaryFfi.unlinked` is true,
+    and signing in, logging in or importing the key returns `AccountUnlinked {
+    account_ref }`. Offer `sign_out_and_wipe`; signing in again is a new link.
+  - With the experimental constructor, Leave demotes a non-last admin account
+    itself instead of requiring `self_demote_admin` first.
+
+### Changed
+
+- MDK advertises `marmot.group.account-devices.v1` (`0x800d`) in every build
+  (mdk#2659). A new group whose founding devices all advertise it requires it,
+  so clients older than 0.15 cannot be invited into it (mdk#2656). No API
+  change.
+
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696, mdk#2649): every valid, compatible KeyPackage
+  published in the last 30 days, at most 20, or the single best one when none
+  is that recent. See the README's KeyPackage selection section.
+
+- Group member rows are accounts, not devices (mdk#2634). `group_members`,
+  `group_details`, `group_roster`, `group_member_ids_page` and
+  `group_conversation_snapshot` list an account with several devices in the
+  group once, and `AppGroupMemberRecordFfi` and `GroupMemberDetailsFfi` gain
+  `device_count` (binding default 1). `member_count`, admin counts and
+  `is_last_admin` count accounts, and a chat between two accounts stays direct
+  whatever devices either person uses.
+
+- New KeyPackages are valid for 30 days instead of 84, and each device
+  replaces its own every 6 to 7 days while it runs and after a Welcome uses it
+  (mdk#2643), so devices publish to relays more often. Sign-out and wipe delete
+  only this device's KeyPackage slot, with one kind 5 deletion, instead of
+  every KeyPackage the account published (mdk#2654); `key_packages_deleted` on
+  `SignOutOutcomeFfi` and `WipeOutcomeFfi` is now 1 or 0. No API change.
+
+- The recovery runner owns account history by default (mdk#2950). Newer live
+  messages in a group wait until its fetched backlog is admitted, and
+  notification wakes fetch only the history their messages wait on.
+  `account_recovery_status` reports catching-up groups, and `UnprovenHistory`
+  notices are produced. No API change.
+
+- Account workers rejoin `Unrecoverable` group copies automatically through
+  an authenticated handshake with an admin device (mdk#2700). Repair rearms a
+  parked attempt; usable forks still need consent. No API change.
+
+- `sign_out_and_wipe` leaves a chat the account administers with another
+  account, where none of its other devices is in (mdk#2818): it steps the
+  account down first and counts the chat in `groups_left` only once it sees
+  its removal, waiting up to about 30 seconds more for all such chats. A chat
+  this device was already leaving waits the same way. Otherwise
+  `group_leave_failures` says why. The call keeps running when the host
+  cancels it.
+
+- `requires_self_demote_before_leave` is now also true for an admin invitee
+  with a pending invitation (it was false in 0.14), whose
+  `decline_group_invite` returns `AdminCannotSelfRemove` until
+  `self_demote_admin` (mdk#3014). An admin's `leave_group` still returns
+  `AdminCannotSelfRemove` until `self_demote_admin`, as in 0.14.
+
+- Onboarding no longer reports `OnboardingIssueFfi::MultiDeviceUnsupported`,
+  and the `SingleDevice` step explains what signing in alone restores
+  (mdk#2894). Update the notice copy as the README's "Single-device notice"
+  shows; the case remains for compatibility.
+
+- Devices exchange push-token records inside each group (kinds 447, 448 and
+  449) so members learn the tokens of members who were offline: tokens are
+  re-shared when a merged Commit adds a member, and gaps an announce reveals
+  are repaired (mdk#2611). No API change.
+
+- `resolve_public_event_preview` also asks the deployment's discovery
+  indexers and the author's NIP-65 write relays when relay hints and
+  directory relays miss (mdk#3060). No API change.
+
+- Timeline `search` lowercases non-ASCII text too, using the same rule as
+  chat-list `MessageText` (mdk#2983).
+
+- `send_custom_event` refuses the device-group kinds 457, 458, 459, 460, 461,
+  473, 475 and 476 as reserved, and one received in a chat makes no timeline
+  row, message or notification (mdk#2628). They are read only in the
+  account's device group.
+
 - `new_with_client_name` and `MarmotOptions.client_name` leave out a name
   longer than 64 bytes once trimmed instead of publishing it; the KeyPackage
-  still publishes, untagged (mdk#2628).
+  still publishes, untagged (mdk#2631).
+
+- `AttachmentTransferSubscription.next()` returns a replacement that changes a
+  row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A host that polled
+  `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
+  that poll (mdk#2157).
+
+### Fixed
+
+- Every text send queued while offline publishes as soon as the host reports
+  restored connectivity, not only the first (mdk#2762). Later sends no longer
+  wait out a retry clock of up to an hour behind it, also after a cold start
+  that is already online or a transport reopen, which get no connectivity
+  report from the host.
+
+- Account startup is abandoned only after 45 seconds without progress, not
+  after 45 seconds in total, so a second device's login on a slow device no
+  longer fails while its database migrates (#3224).
+
+- A device joins only through the Welcome rumor that names a KeyPackage it
+  published; another device's Welcome for the same account is ignored instead
+  of failing a join (#2633).
+
+- Reopening an account reuses its stored, validated identity proof, so an
+  external signer is asked for one only when no usable proof is stored, not on
+  every open (#2703).
+
+- Idle maintenance ticks do less repeated work (#2952, #3035), and a
+  convergence pass that keeps failing after its decision is retried a bounded
+  number of times (mdk#2684).
 
 ## 0.14.0 - 2026-10-23
 

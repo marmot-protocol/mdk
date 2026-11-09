@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.15.0 - 2026-11-09
+
 - An admin's Leave records the leave before anything is published (mdk#3014). New `SendIntent::StepDownAndLeave`:
   from an admin with another active admin it writes the durable `LeaveRequest` and returns the new
   `SendResult::LeaveRequested` without staging anything, and the leave re-drive stages the step-down and then the
