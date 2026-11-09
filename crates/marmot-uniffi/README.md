@@ -775,7 +775,9 @@ account-scoped cache, so a reopened chat renders prior previews in its first
 frame, offline included. Call `cachedPublicEventPreviews` (at most 16
 references, network-free) before layout, then `resolvePublicEventPreview` for
 each reference shown; it touches the network only for missing or stale rows.
-MDK fetches from safe relay hints and the configured directory relays, stores
+MDK fetches from safe relay hints and the configured directory relays; when
+they miss, it asks once more on the deployment's discovery indexers and the
+author's NIP-65 write relays (an `naddr` author or an `nevent` author hint). It stores
 only verified events that match the reference, keeps the newest `naddr`
 version, and turns an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
 event; shape its content for display on the host. Author names and avatars

@@ -108,6 +108,77 @@ fn references_parse_to_canonical_targets() {
 }
 
 #[test]
+fn authors_route_queries_but_never_change_identity() {
+    let keys = Keys::generate();
+    let claimed = Keys::generate().public_key();
+    let note = signed(&keys, 1, 10, "hi", Vec::new());
+
+    // Bare IDs and `note1` carry no author.
+    for raw in [note.id.to_hex(), note.id.to_bech32().unwrap()] {
+        let parsed = parse_reference(&raw).unwrap();
+        assert!(parsed.relay_hints.is_empty());
+        assert_eq!(parsed.routing_author(), None, "{raw}");
+    }
+    // An `nevent` author is kept as a routing hint only: the target and cache
+    // key are the same as for the bare ID, whoever it names.
+    let nevent = Nip19Event::new(note.id)
+        .author(claimed)
+        .to_bech32()
+        .unwrap();
+    let parsed = parse_reference(&nevent).unwrap();
+    assert_eq!(parsed.routing_author(), Some(claimed));
+    assert_eq!(parsed.target, Target::EventId(note.id));
+    assert_eq!(
+        parsed.target.cache_key(),
+        format!("event:{}", note.id.to_hex())
+    );
+    // The author hint never admits the claimed author's own events.
+    let claimed_event = signed(&Keys::generate(), 1, 10, "hi", Vec::new());
+    assert!(!parsed.target.matches(&claimed_event));
+    assert!(parsed.target.matches(&note));
+    // An `naddr` routes by its coordinate author.
+    let parsed = parse_reference(&naddr(&coordinate(&keys, 30023, "entry"))).unwrap();
+    assert_eq!(parsed.routing_author(), Some(keys.public_key()));
+}
+
+#[test]
+fn read_buffers_hold_every_relay_answering_every_filter() {
+    let relays = |count: usize| {
+        (0..count)
+            .map(|index| TransportEndpoint(format!("wss://relay{index}.example")))
+            .collect::<Vec<_>>()
+    };
+    let id = Keys::generate();
+    let note = signed(&id, 1, 10, "hi", Vec::new());
+    let filters = Target::EventId(note.id).filters(None);
+    let per_relay = 1 + EVENT_DELETION_QUERY_LIMIT;
+    // The supplementary query's largest fan-out: eight relays.
+    assert_eq!(read_capacity(&relays(8), &filters), 8 * per_relay);
+    assert_eq!(read_capacity(&relays(1), &filters), per_relay);
+    assert_eq!(read_capacity(&[], &filters), per_relay);
+    let unlimited = [Filter::new().kind(Kind::TextNote)];
+    assert_eq!(
+        read_capacity(&relays(2), &unlimited),
+        2 * MAX_FETCHED_EVENTS
+    );
+}
+
+#[test]
+fn merged_reads_keep_each_event_once_and_completeness_of_all() {
+    let keys = Keys::generate();
+    let a = signed(&keys, 1, 10, "a", Vec::new());
+    let b = signed(&keys, 1, 11, "b", Vec::new());
+    let mut merged = Fetched::new(vec![a.clone()], true);
+    merged.merge(Fetched::new(vec![a.clone(), b.clone()], true));
+    assert_eq!(merged.events, vec![a.clone(), b.clone()]);
+    assert!(merged.complete);
+    merged.merge(Fetched::new(Vec::new(), false));
+    assert!(!merged.complete);
+    merged.merge(Fetched::new(Vec::new(), true));
+    assert!(!merged.complete, "one partial read keeps the merge partial");
+}
+
+#[test]
 fn event_id_admission_requires_exact_match_and_author_deletion() {
     let keys = Keys::generate();
     let note = signed(&keys, 1, 10, "note", Vec::new());
@@ -513,4 +584,135 @@ fn shared_identity_corpus_matches_preview_baseline() {
             case.name
         );
     }
+}
+
+/// One local account over a real encrypted cache, for tests that need a
+/// `Directory` but no relays.
+#[derive(Clone)]
+struct CacheResources {
+    account: DirectoryAccount,
+    cache: crate::DirectoryCache,
+    shared: storage_sqlite::SqliteSharedStorage,
+}
+
+impl DirectoryResources for CacheResources {
+    fn local_accounts(&self) -> Result<Vec<DirectoryAccount>, DirectoryError> {
+        Ok(vec![self.account.clone()])
+    }
+
+    fn account_id_for_label(&self, _: &str) -> Result<String, DirectoryError> {
+        Ok(self.account.account_id_hex.clone())
+    }
+
+    fn current_caches(&self) -> Result<Vec<crate::DirectoryCache>, DirectoryError> {
+        Ok(vec![self.cache.clone()])
+    }
+
+    fn cache_for_account(
+        &self,
+        _: &DirectoryAccount,
+    ) -> Result<crate::DirectoryCache, DirectoryError> {
+        Ok(self.cache.clone())
+    }
+
+    fn shared_storage(&self) -> Result<storage_sqlite::SqliteSharedStorage, DirectoryError> {
+        Ok(self.shared.clone())
+    }
+
+    fn directory_entry_changed(&self, _: &str) {}
+
+    fn account_key_package_published(&self, _: &str) {}
+}
+
+/// The cached relay-list read takes the cache's SQLite lock. While another
+/// operation holds that lock, the read must wait on a blocking thread, not
+/// park the runtime: on a single-threaded runtime, other tasks keep running
+/// until the lock is released, and the read then returns the cached relays.
+#[tokio::test(flavor = "current_thread")]
+async fn cached_author_relay_reads_do_not_park_the_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let key = storage_sqlite::SqlCipherKey::raw([0x31; 32]);
+    let cache = crate::DirectoryCache::open(temp.path().join("directory.sqlite3"), &key).unwrap();
+    let resources = CacheResources {
+        account: DirectoryAccount {
+            account_id_hex: Keys::generate().public_key().to_hex(),
+            label: "fixture".into(),
+            local_signing: true,
+            active_signing: true,
+        },
+        cache: cache.clone(),
+        shared: storage_sqlite::SqliteSharedStorage::in_memory().unwrap(),
+    };
+    let config = crate::DirectoryConfig {
+        directory_relays: vec![],
+        default_relays: vec![],
+        max_future_skew: Duration::from_secs(60),
+        open_ranking: None,
+        fallback_seeds: vec![],
+        http_builder: Ok,
+        test_clock: None,
+    };
+    let directory = Directory::new(
+        resources,
+        config,
+        transport_nostr::MarmotRelayPlane::full_history(),
+        crate::DirectoryState::default(),
+    );
+    let author = Keys::generate().public_key();
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = 1_000;
+    lists.nip65.relays = vec!["wss://write.example".into()];
+    lists.nip65.write_relays = lists.nip65.relays.clone();
+    lists.refresh();
+    directory
+        .remember_directory_relay_lists(&author.to_hex(), &lists)
+        .unwrap();
+
+    // Another operation holds the cache lock until told to release it, or
+    // for at most five seconds, so a regression fails instead of hanging.
+    let released = Arc::new(AtomicBool::new(false));
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let released = released.clone();
+        move || {
+            let guard = cache.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            released.store(true, Ordering::SeqCst);
+            drop(guard);
+        }
+    });
+    locked_rx.recv().unwrap();
+
+    let read = tokio::spawn({
+        let directory = directory.clone();
+        async move {
+            directory
+                .public_event_author_relays(Some(author), &[])
+                .await
+        }
+    });
+    // Spawned after the read, so on this one thread it runs only once the
+    // read has yielded.
+    let progressed = tokio::spawn({
+        let released = released.clone();
+        async move { !released.load(Ordering::SeqCst) }
+    });
+    assert!(
+        progressed.await.unwrap(),
+        "the runtime stalled until the cache lock was released"
+    );
+    release_tx.send(()).unwrap();
+    let (relays, complete) = read.await.unwrap();
+    holder.join().unwrap();
+    assert_eq!(
+        relays,
+        vec![TransportEndpoint("wss://write.example".to_owned())]
+    );
+    assert!(complete);
 }

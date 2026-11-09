@@ -5370,18 +5370,28 @@ impl MarmotAppRuntime {
     /// stale, then return its local state. An event-ID preview never refetches
     /// once every relay answered the fetch that cached it; otherwise, and for
     /// `naddr` previews, it refetches after 30 minutes. Repeat calls within
-    /// 30 seconds of a finished fetch return local state.
+    /// 30 seconds of a finished fetch return local state. A reference the
+    /// operational relays miss is looked up once more on the deployment's
+    /// discovery indexers and the author's NIP-65 write relays.
     pub async fn resolve_public_event_preview(
         &self,
         account_ref: &str,
         reference: &str,
     ) -> Result<crate::PublicEventPreviewRead, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        // The deployment's discovery indexers reach public notes the
+        // operational relays do not carry. They feed this lookup only, never
+        // the directory relays block-list, backup, sync and KeyPackage reads use.
+        let discovery_indexers = self.accounts.app.discovery_indexer_relays();
         Ok(self
             .accounts
             .app
             .directory()
-            .resolve_public_event_preview(&directory_account(&account), reference)
+            .resolve_public_event_preview(
+                &directory_account(&account),
+                reference,
+                &discovery_indexers,
+            )
             .await?)
     }
 

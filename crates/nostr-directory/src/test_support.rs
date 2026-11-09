@@ -115,6 +115,15 @@ impl<R: DirectoryResources> Directory<R> {
         self.public_event_query_relays(hints)
     }
 
+    pub fn public_event_supplementary_relays_for_test(
+        &self,
+        queried: &[TransportEndpoint],
+        discovery_indexers: &[TransportEndpoint],
+        author_relays: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        self.public_event_supplementary_relays(queried, discovery_indexers, author_relays)
+    }
+
     pub fn public_event_refresh_cooling_down_for_test(&self, key: &str) -> bool {
         self.public_event_refresh_cooling_down(key)
     }

@@ -108,7 +108,7 @@ struct LayerDepth {
 ///
 /// A relay list is attacker-controlled, so an account advertising hundreds of
 /// relays must not turn one profile lookup into hundreds of connections.
-const SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR: usize = 4;
+pub(crate) const SEARCH_MAX_WRITE_RELAYS_PER_AUTHOR: usize = 4;
 
 /// Distinct write relays queried while resolving one batch.
 ///
