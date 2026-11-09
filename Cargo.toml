@@ -51,12 +51,11 @@ jsonschema = { version = "0.56.0", default-features = false }
 # KeyPackage fix and the RustCrypto 0.14 / HPKE 0.8 provider backport (upstream
 # openmls#2249 and #2261; fixes RUSTSEC-2026-0387 and RUSTSEC-2026-0330/0331).
 # Keep every companion crate on the same repository commit to prevent source skew.
-# Migration: once an upstream OpenMLS release contains both, replace all five
+# Migration: once an upstream OpenMLS release contains both, replace all four
 # git entries together with one matching upstream release series and remove the fork pin.
 openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
 openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba" }
-openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
-openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba" }
+openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
 openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
 tls_codec = "~0.5"
 
@@ -148,7 +147,6 @@ uuid = { version = "1", features = ["v4"] }
 proptest = "1"
 insta = { version = "1", features = ["json"] }
 stateright = "0.31.0"
-test-log = { version = "0.2", features = ["trace"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 # workspace-internal

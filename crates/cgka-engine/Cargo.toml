@@ -25,7 +25,6 @@ test-conformance-snapshot = []
 cgka-traits.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
-openmls_memory_storage.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec = { workspace = true, features = ["derive", "std"] }
@@ -59,8 +58,6 @@ openmls = { workspace = true, features = ["js"] }
 storage-sqlite = { workspace = true, features = ["storage-format-benchmarks", "test-support"] }
 rusqlite.workspace = true
 tokio = { workspace = true, features = ["macros"] }
-test-log.workspace = true
-insta.workspace = true
 tempfile.workspace = true
 # Integration tests derive deterministic, spec-valid x-only secp256k1 identities
 # from ergonomic seed labels (see the `pad32` helper in tests/).

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
+
 - A starting account worker is given up on after 45 s without startup progress, not after 45 s in total
   (mdk#3145). Entering a startup step, or each migration an open of the account's database applies, starts the 45 s
   again, whichever caller runs that open. A slow device whose first open migrates for longer than that, as a second
