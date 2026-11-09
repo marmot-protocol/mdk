@@ -459,9 +459,6 @@ impl<S: StorageProvider> Engine<S> {
         if let Err(error) = self.replay_buffered_messages(&replay_group_id).await {
             // The pending slot is consumed and confirmation is durable. A
             // failed replay remains retained work, not a failed publication.
-            self.pending_confirmation_replays
-                .insert(replay_group_id.clone());
-            self.schedule_pending_convergence_group(&replay_group_id);
             tracing::warn!(
                 target: "cgka_engine::publish",
                 method = "do_confirm_published_with_fanout",
@@ -469,8 +466,6 @@ impl<S: StorageProvider> Engine<S> {
                 transient = error.is_transient(),
                 "buffered inbound replay deferred after successful confirmation"
             );
-        } else {
-            self.pending_confirmation_replays.remove(&replay_group_id);
         }
         Ok(event)
     }
