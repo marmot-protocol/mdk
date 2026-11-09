@@ -96,6 +96,7 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::AppMessage { .. }
             | SendIntent::RecoverMembers { .. }
             | SendIntent::Leave { .. }
+            | SendIntent::StepDownAndLeave { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::AddOwnAccountDevices { .. }
             | SendIntent::RemoveOwnAccountDevices { .. }

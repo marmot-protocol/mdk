@@ -4,7 +4,7 @@
 //! convergence inputs before any OpenMLS mutation.
 
 use super::route_wrapped_group_message;
-use super::{LeaveRedrive, LeaveStep, PendingProposals};
+use super::{AdminLeaveEntry, LeaveRedrive, LeaveStep, OutboundQueueReason, PendingProposals};
 use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -158,6 +158,15 @@ impl<S: StorageProvider> Engine<S> {
                     .await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
+            // The drain reaching an admin's leave that `do_send` queued behind
+            // earlier intents. Kept whole so no path can send it as a plain
+            // Leave from an admin.
+            SendIntent::StepDownAndLeave { group_id } => {
+                match self.do_request_admin_leave(&group_id, AdminLeaveEntry::Prepare)? {
+                    Some(requested) => Ok(requested),
+                    None => self.do_send_leave(group_id).await,
+                }
+            }
             SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
             SendIntent::UpdateAppComponents { group_id, updates } => match pending_proposals {
                 PendingProposals::Consume => {
@@ -1096,6 +1105,110 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         Ok(SendResult::Proposal { msg })
+    }
+
+    /// Record an admin's leave before anything is published (mdk#3014). The
+    /// leave re-drive then stages the step-down and, once that state is
+    /// canonical, the SelfRemove (`next_leave_step`), so a step-down that is
+    /// refused, possibly exposed or superseded is staged again rather than
+    /// leaving the account demoted with no leave. `None` when this account
+    /// is not an active admin: the caller sends an ordinary Leave.
+    ///
+    /// A send made while an intent queued earlier still waits for the drain
+    /// is queued behind it instead, as a Leave is (mdk#2842). Recorded now,
+    /// the request would hold the drain to the leave, and the removal would
+    /// discard the earlier intent unsent. The drain records the request when
+    /// it reaches the queued leave, even if the account has become the last
+    /// active admin since: that leave had started, so the re-drive blocks it
+    /// (`LeaveBlockReason::LastActiveAdmin`) rather than the drain refusing
+    /// it after the app already showed it. The request replaces the queued
+    /// leave in one storage transaction: a queued leave left beside its
+    /// request would record the leave again after a Cancel cleared it.
+    pub(crate) fn do_request_admin_leave(
+        &mut self,
+        group_id: &GroupId,
+        entry: AdminLeaveEntry,
+    ) -> Result<Option<SendResult>, EngineError> {
+        if let Some(request) = self.load_leave_request_state(group_id)? {
+            // The request already holds the leave the drain reached.
+            if entry == AdminLeaveEntry::Prepare {
+                for id in self.queued_admin_leave_ids(group_id)? {
+                    self.storage.delete_queued_outbound_intent(&id)?;
+                }
+            }
+            self.schedule_pending_convergence_group(group_id);
+            return Ok(Some(SendResult::LeaveRequested { request }));
+        }
+        // A leave already queued answers a repeated call, whatever the admin
+        // list now says.
+        if entry == AdminLeaveEntry::Send
+            && let Some(record) = self
+                .storage
+                .list_queued_outbound_intents(group_id)?
+                .into_iter()
+                .find(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }))
+        {
+            return Ok(Some(SendResult::Queued {
+                group_id: group_id.clone(),
+                intent_id: record.id,
+            }));
+        }
+        let authority = self.capture_group_authority_facts(group_id)?;
+        if !authority.is_admin {
+            return Ok(None);
+        }
+        // member-departure.md, "Behavior": the last active admin cannot start
+        // a leave; it designates another admin first.
+        if entry == AdminLeaveEntry::Send && authority.admin_count < 2 {
+            return Err(EngineError::AdminDepletion {
+                group_id: group_id.clone(),
+            });
+        }
+        if entry == AdminLeaveEntry::Send
+            && self.has_queued_intent_awaiting_preparation(group_id)?
+        {
+            let queued = self.queue_outbound_intent(
+                group_id.clone(),
+                SendIntent::StepDownAndLeave {
+                    group_id: group_id.clone(),
+                },
+                0,
+            )?;
+            OutboundQueueReason::EarlierIntentQueued.trace();
+            return Ok(Some(queued));
+        }
+        let request = LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: self.convergence_now_ms(),
+            last_proposed_epoch: None,
+            blocked: None,
+        };
+        match entry {
+            AdminLeaveEntry::Send => self.put_leave_request_state(&request)?,
+            AdminLeaveEntry::Prepare => {
+                let queued = self.queued_admin_leave_ids(group_id)?;
+                self.put_leave_request_state_replacing(&request, &queued)?;
+            }
+        }
+        self.schedule_pending_convergence_group(group_id);
+        tracing::info!(
+            target: "cgka_engine::leave_request",
+            method = "do_request_admin_leave",
+            "admin leave request recorded"
+        );
+        Ok(Some(SendResult::LeaveRequested { request }))
+    }
+
+    /// The group's queued admin leaves: at most one, since a repeated
+    /// `StepDownAndLeave` returns the queued row.
+    fn queued_admin_leave_ids(&self, group_id: &GroupId) -> Result<Vec<MessageId>, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .into_iter()
+            .filter(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }))
+            .map(|record| record.id)
+            .collect())
     }
 
     pub(crate) async fn prepare_self_remove_proposal(

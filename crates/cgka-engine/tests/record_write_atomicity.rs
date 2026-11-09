@@ -5971,3 +5971,118 @@ async fn a_blocked_leave_retries_its_marker_and_cancel_after_storage_faults() {
     assert_eq!(storage.leave_request(&group_id).unwrap(), None);
     assert!(!engine.leave_in_progress(&group_id).unwrap());
 }
+
+/// An admin's queued leave (mdk#3014) becomes its leave request and leaves
+/// the queue in one storage transaction. When the queued row's delete fails,
+/// the request is not recorded either, and the next drain records it. Once
+/// that leave is blocked and cancelled, no queued row is left behind to
+/// record it again.
+#[tokio::test]
+async fn a_queued_admin_leave_hands_off_to_its_request_in_one_transaction() {
+    use cgka_traits::group::ProtocolProfile;
+    use cgka_traits::storage::LeaveBlockReason;
+
+    let queue_delete_fault = LeaveWriteFault::default();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
+        termination_fault: queue_delete_fault.clone(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
+    })
+    .identity(pad32(b"queued-admin-leave"))
+    .account_identity_proof_signer(proof_signer(b"queued-admin-leave"))
+    .protocol_profile(ProtocolProfile::Current)
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, _) = engine
+        .create_group(CreateGroupRequest {
+            name: "last admin".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    // The leave was queued while another admin remained, and the account is
+    // the last admin by the time the drain reaches it.
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"queued-admin-leave".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::StepDownAndLeave {
+                group_id: group_id.clone(),
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    let queued_leaves = || {
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .into_iter()
+            .filter(|record| matches!(record.intent, SendIntent::StepDownAndLeave { .. }))
+            .count()
+    };
+
+    queue_delete_fault.arm_on_write(1);
+    assert!(matches!(
+        engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+            .await,
+        Err(EngineError::Storage(_))
+    ));
+    assert_eq!(queue_delete_fault.remaining(), 0, "the row's delete failed");
+    assert_eq!(
+        storage.leave_request(&group_id).unwrap(),
+        None,
+        "no request beside the row"
+    );
+    assert!(!engine.leave_in_progress(&group_id).unwrap());
+    assert_eq!(
+        queued_leaves(),
+        1,
+        "the leave stays queued for the next drain"
+    );
+
+    for now_ms in [1_000_001, 1_000_002] {
+        engine
+            .converge_and_drain_queued_outbound_intents(&group_id, now_ms)
+            .await
+            .unwrap();
+    }
+    assert_eq!(queued_leaves(), 0, "the request replaced the queued leave");
+    assert_eq!(
+        storage
+            .leave_request(&group_id)
+            .unwrap()
+            .and_then(|request| request.blocked),
+        Some(LeaveBlockReason::LastActiveAdmin)
+    );
+
+    engine.cancel_leave(&group_id).unwrap();
+    engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_003)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.leave_request(&group_id).unwrap(),
+        None,
+        "the Cancel holds"
+    );
+    assert!(!engine.leave_in_progress(&group_id).unwrap());
+}

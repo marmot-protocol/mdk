@@ -1763,6 +1763,7 @@ fn send_result_kind(res: &SendResult) -> &'static str {
     match res {
         SendResult::NoChange { .. } => "NoChange",
         SendResult::DisbandRequested { .. } => "DisbandRequested",
+        SendResult::LeaveRequested { .. } => "LeaveRequested",
         SendResult::ApplicationMessage { .. } => "ApplicationMessage",
         SendResult::Queued { .. } => "Queued",
         SendResult::Proposal { .. } => "Proposal",
@@ -3361,6 +3362,7 @@ impl HarnessClient {
             }
             SendResult::NoChange { .. }
             | SendResult::DisbandRequested { .. }
+            | SendResult::LeaveRequested { .. }
             | SendResult::Queued { .. } => {}
         }
         Ok(())

@@ -722,6 +722,15 @@ pub(crate) enum LeaveRedrive {
     SteppedDown,
 }
 
+/// Where an admin's leave reaches `do_request_admin_leave`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdminLeaveEntry {
+    /// A send, which queues behind an intent queued earlier.
+    Send,
+    /// The drain preparing that queued leave.
+    Prepare,
+}
+
 /// What an `UpdateAppComponents` Commit does with proposals pending in the
 /// OpenMLS proposal store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -963,6 +972,21 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(&intent, SendIntent::Disband { .. }) {
             return self.do_request_disband(group_id);
         }
+        // So is an admin's leave: the request is recorded before anything is
+        // published, in any epoch state, and the leave re-drive stages its
+        // step-down and SelfRemove. Behind an intent queued earlier it queues
+        // instead. Anyone else sends an ordinary Leave.
+        let intent = match intent {
+            SendIntent::StepDownAndLeave { group_id } => {
+                if let Some(requested) =
+                    self.do_request_admin_leave(&group_id, AdminLeaveEntry::Send)?
+                {
+                    return Ok(requested);
+                }
+                SendIntent::Leave { group_id }
+            }
+            intent => intent,
+        };
         if let Some(reason) = self.outbound_queue_reason(&group_id, &intent).await? {
             if matches!(&intent, SendIntent::RecoverMembers { .. }) {
                 return Err(EngineError::GroupRecoveryUnsettled { group_id });
@@ -1179,7 +1203,11 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        if !matches!(intent, SendIntent::Leave { .. }) && self.leave_in_progress(&group_id)? {
+        if !matches!(
+            intent,
+            SendIntent::Leave { .. } | SendIntent::StepDownAndLeave { .. }
+        ) && self.leave_in_progress(&group_id)?
+        {
             if matches!(intent, SendIntent::RecoverMembers { .. }) {
                 return Err(EngineError::GroupRecoveryUnsettled { group_id });
             }
@@ -1405,6 +1433,9 @@ impl<S: StorageProvider> Engine<S> {
                         self.schedule_pending_convergence_group(group_id);
                     }
                 }
+                // Recording an admin's leave request retired its queued row in
+                // the same transaction (`do_request_admin_leave`).
+                SendResult::LeaveRequested { .. } => {}
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
                 | SendResult::DisbandRequested { .. }
@@ -4449,6 +4480,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::AddOwnAccountDevices { group_id, .. }
         | SendIntent::RemoveOwnAccountDevices { group_id, .. }
         | SendIntent::Leave { group_id }
+        | SendIntent::StepDownAndLeave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::ReplaceDeviceEntry { group_id, .. }
@@ -4497,6 +4529,7 @@ pub(crate) fn is_fair_scheduled_intent(
         }
         SendIntent::AppMessage { .. }
         | SendIntent::Leave { .. }
+        | SendIntent::StepDownAndLeave { .. }
         | SendIntent::SelfUpdate { .. } => false,
     }
 }

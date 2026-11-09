@@ -64,6 +64,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   `observed_selfremove_proposal_delays_commit_then_retains_outbound_app_messages` owns due automatic maintenance
   before a public send prepares its wire, plus pre-due sendability and ordered retained sends after confirmation.
 
+- **File:** `invite_leave/admin_leave.rs`
+  - **Owns:** `StepDownAndLeave`: an admin's leave request is durable before anything is published and the re-drive
+    stages its step-down, then its SelfRemove; a refused step-down is staged again; the last active admin is refused
+    with nothing recorded; a member's call is a plain Leave. The re-drive across branches stays in `invite_leave.rs`
+    and marmot-app's `rival_branch_leave`.
+
 - **File:** `invite_leave/recovery_batch.rs`
   - **Owns:** Atomic native recovery for two and 32 distinct recipients, exact artifacts and pending references
     through encrypted reopen, ACK-gated Welcome release, recipient authenticators, and malformed recovery-artifact
@@ -127,12 +133,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
     is queued behind them, so the sender's generations follow its send order and a member reading the history in
     `created_at` order decrypts every message (mdk#2842). Each other intent kind keeps that order behind a queued
-    row: a member's leave goes out after its queued message, an invite or a removal is committed after the
-    committer's queued message (the invitee never reads it, the removed member does), and a message made behind a
-    queued group change is encrypted after it. Also an epoch-pinned send behind a queued one is refused, not queued;
-    a drained intent awaiting its outcome holds no later send; and a queued change the settled state already holds is
-    retired at drain, so it holds no later send. The device-group refusals behind a queued row are in
-    `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
+    row: a member's leave goes out after its queued message, and so does an admin's `StepDownAndLeave`, whose leave
+    request the drain records only on reaching it, blocked if the account has become the last active admin meanwhile; an
+    invite or a removal is committed after the committer's queued message (the invitee never reads it, the removed
+    member does), and a message made behind a queued group change is encrypted after it. Also an epoch-pinned send
+    behind a queued one is refused, not queued; a drained intent awaiting its outcome holds no later send; and a queued
+    change the settled state already holds is retired at drain, so it holds no later send. The device-group refusals
+    behind a queued row are in `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
 
   `queued_send_order::a_leave_behind_a_queued_message_goes_out_after_it` also owns the Leaving gate that closes
   within one drain: the prepared App/Leave prefix returns while a later accepted app stays queued.
@@ -186,7 +193,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
     (mdk#2694), and a queued `NoChange` whose retirement fails waits for the next drain while the pass keeps what it
     prepared (mdk#2842). A blocked leave's failed marker write stays owed and a Cancel whose read fails keeps the
-    request for a retry (mdk#3014). `a_failed_retryable_transition_keeps_the_row_and_its_account_capacity` owns a rejected
+    request for a retry (mdk#3014). An admin's queued `StepDownAndLeave` becomes its leave request and leaves the queue
+    in one transaction, so a failed delete leaves neither behind and a later Cancel holds (mdk#3014).
+    `a_failed_retryable_transition_keeps_the_row_and_its_account_capacity` owns a rejected
     `Retryable` write after a peeler fault retaining the row and its charged account capacity;
     `deferred_release_keeps_refusal_when_group_lookup_is_unavailable` owns an unavailable group lookup preserving
     the release refusal while freeing the row (mdk#3176, mdk#3179). Normal old-copy release stays in
