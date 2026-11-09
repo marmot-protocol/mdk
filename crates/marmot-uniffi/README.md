@@ -22,7 +22,9 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
-  [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
+  [bounded chat screens](#bounded-chat-screens),
+  [chat-list select all and filtered queries](#chat-list-select-all-and-filtered-queries),
+  [prepared conversation windows](#prepared-conversation-windows),
   [advanced timeline search](#advanced-timeline-search), [live timeline updates](#live-timeline-updates),
   [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
@@ -33,6 +35,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [backup recovery and background conditions](#backup-recovery-and-background-conditions),
   [group reporting](#group-reporting),
   [moderation reports to the operator](#moderation-reports-to-the-operator),
+  [stickers](#stickers), [emoji sets](#emoji-sets),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
@@ -116,6 +119,8 @@ All methods, including less common management/diagnostic operations, are listed 
 | Messages, edits, reactions and polls | Send/reply/edit/custom events, reaction changes, encrypted NIP-88 polls, deletion and edit history. Render effective prepared content and viewer reaction/poll state; use raw history only when the feature needs it. Every client must render and answer polls, because peers can send them. |
 | Moderation and blocking | Typed reports, individual dismissals, deletion-masked report targets and live block lists. Reports are not deletion evidence; the host designs moderation queue UI from the provided records. |
 | Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
+| Chat-list selection and filters | Select-all ID lists over a whole view and typed filter queries for windows and ID lists. The host keeps checkbox state and revalidates a selection before a bulk action; see [chat-list select all and filtered queries](#chat-list-select-all-and-filtered-queries). |
+| Stickers and emoji sets | Sonar-compatible sticker packs and NIP-51 emoji sets: discovery, install, validated asset reads and sticker sends. MDK fetches and validates images; the host renders pickers and asks before any fetch that reveals the user's IP address. See [stickers](#stickers) and [emoji sets](#emoji-sets). |
 | Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
 | Notifications and push | Notification preferences, native registration, bounded wake/catch-up and notification subscriptions. The host owns OS tokens, permission prompts, background budgets and notification presentation. |
 | Relays and maintenance | Relay safety/classification, account/user relay lists, health, connectivity restoration, KeyPackage rotation and periodic group updates. Loopback development policy is explicit; connectivity recovery is not permission to reset user settings. |
@@ -810,6 +815,37 @@ Existing chat-list APIs remain available.
 independent account attention. See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
 for paging, sequence handling, cancellation, C ownership, and compatibility.
 
+## Chat-list select all and filtered queries
+
+`chatListIds(accountRef, view)` returns every chat ID in a view, in display order, including chats beyond the open
+window; use its length for select-all and bulk-action counts. Keep the result as host checkbox state and call
+`revalidateChatListIds(accountRef, view, groupIds)` right before a bulk action: it returns the subset still in the
+view, in the caller's order, and never adds chats. Then run the existing per-chat commands (archive, local delete,
+leave), which check their own preconditions. While base rows are still being prepared, `chatListIds` fails with
+`ChatPresentationNotReady` instead of returning a partial list; keep the action disabled and retry.
+
+`openChatListQueryWindow(accountRef, query, initialRows)` is `openChatListWindow` narrowed by a `ChatListViewQueryFfi`:
+a base `view` plus `filter`, a flat `ChatListFilterNodeFfi` list in which node 0 is the root and every other node is
+the child of exactly one node listed before it (an empty list means no filter). `All`, `Any` and `Not` combine
+`Condition` leaves (`ChatListConditionFfi`: scope, unread, mention, pinned, draft, send state, `Direct` / `Group`
+kind, `Muted` and more), `GroupIds`, `Text` and `MessageText`. Folder include/exclude lists are ordinary nodes, for
+example `All[Not(GroupIds(excluded)), Any[GroupIds(included), rule]]`. `chatListQueryIds` and
+`revalidateChatListQueryIds` are the select-all pair for the same query; pass the same query value to all three so
+list, count and selection agree.
+
+- `Text` matches a chat's title, group name, description or a direct chat's peer profile name; `MessageText` matches
+  chats with a visible message containing the text, by the same rule as timeline `search`. Both trim and lowercase the
+  text and match a literal substring. Localized fallback titles are not searchable.
+- `MessageText` scans message history, so only the ID queries accept it; a window fails with `InvalidChatListQuery`
+  (`MessageTextInWindow`).
+- A query with text fails with `ChatPresentationNotReady` while presentation, or for `MessageText` retained edits and
+  deletions, are still being prepared; retry.
+- A malformed node list or a query over 8 levels, 64 nodes, 500 group IDs or 1024 bytes of text fails with
+  `InvalidChatListQuery { reason: ChatListQueryErrorFfi }` before any read; a malformed group ID fails with
+  `InvalidHex`.
+
+See [`API-REFERENCE.md`](API-REFERENCE.md#marmotopen_chat_list_query_window) for the full matching rules.
+
 ## Prepared conversation windows
 
 `openConversationWindow` combines history, header/capabilities, visible identities,
@@ -1067,6 +1103,39 @@ minutes returns the same `report_id`. Each account may send 20 reports per hour
 reports. The C ABI mirrors these calls. See the
 [wire format](../../docs/marmot-architecture/moderation-reports.md).
 
+## Stickers
+
+Stickers follow Sonar's pack format. `syncStickerPacks` refreshes recent public packs and the account's installed
+packs; `stickerPacks` and `stickerPack` read the local projection without network I/O. `fetchStickerPack` fetches one
+pack by coordinate or Sonar link when the user opens a shared pack. `installStickerPack` and `uninstallStickerPack`
+change the account's published installed list after a complete read of it; without one, the change stays pending for
+a later sync.
+
+A sticker message is kind 9 and carries one exact `(coordinate, shortcode, plaintext hash)` reference, exposed as
+`sticker: StickerRefFfi?` on message, preview and timeline records (`nil` for a deleted row). Hosts pass that typed
+reference to `fetchStickerAsset` to get validated bytes and never parse tags or fetch a sticker URL themselves; a
+reference the account has no mapping for fails with `StickerNotFound`. `sendSticker` sends only a reference the
+account already holds. `importSignalStickerPack` validates a Signal pack link and then refuses before any network call.
+
+## Emoji sets
+
+Emoji sets are NIP-51 kind-30030 sets. `syncEmojiSets` and `fetchEmojiSet` fetch set text only, never images;
+`emojiSets`, `emojiSet` and `userEmojiList` read without fetching images. Any call that downloads images reveals the
+user's IP address to the image hosts the set's author chose, so call it only after the user acts:
+
+- `fetchEmojiSetAsset` and `fetchEmojiSetCover` download and validate one image for a preview after the user opens a
+  set. Nothing is stored.
+- `installEmojiSet(accountRef, coordinate, expectedEventIdHex, control)` downloads, validates and stores every emoji
+  of the version the user was shown after the user taps Install. Another stored version fails with `EmojiSetChanged`
+  before any download. `EmojiSetInstallControlFfi` reports progress and cancels; a cancelled install fails with
+  `EmojiSetInstallCancelled` and stores nothing. Skipped entries are reported, not fatal. Caps: 50 installed sets,
+  500 emoji and 32 MiB per set, 128 MiB in all (`EmojiSetLimit`).
+
+`installedCustomEmoji` lists installed emoji for a picker and flags shortcode collisions without resolving them;
+`readInstalledCustomEmoji` returns stored bytes checked against the hash recorded at install. To use one in a chat,
+upload those bytes as an encrypted attachment; never put the set's image URL in a message. `uninstallEmojiSet` removes
+the stored snapshot.
+
 ## Experimental device-group test builds
 
 Ordinary constructors keep device groups disabled, including when the native library has the capability compiled in.
@@ -1180,7 +1249,7 @@ the device group this device trusts, for a Devices screen:
 - The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
   without explicit experimental device-group intent.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
-  device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
+  device or group identities. With device groups on, it also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
 Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
@@ -1194,8 +1263,8 @@ changes, a source device's rename or removal included; re-read rows on `LinkedDe
 one roster commit in the device group:
 
 - Only the label changes. It is at most 64 bytes of UTF-8; an empty label clears it.
-- It is refused with nothing sent (`DeviceGroupRefused`) in ordinary opens, for a label that is too long, without a
-  device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
+- It is refused with nothing sent (`MarmotKitError.Runtime` with details `device group refused: <reason>`) in ordinary
+  opens, for a label that is too long, without a device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
   in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
   change.
 - A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename or settings edit of that device
@@ -1369,7 +1438,7 @@ a device group that can't take that Commit holds the refresh back. `key_package_
 once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old.
 Inviters stop treating the device as fresh at 30 days, so tell the user. A routine refresh never shows, and neither
 does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
-which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
+which carries no device or group identities and, with device groups on, also fires once each time the account's worker opens or reconnects.
 It is false in ordinary opens without explicit experimental device-group intent.
 
 ## Unrecognized sign-ins
@@ -1398,7 +1467,7 @@ It is false in ordinary opens without explicit experimental device-group intent.
   prompt another device answered. Linking one is device pairing's.
 - The account checks at open, every six hours, and soon after one of its KeyPackages arrives live.
   `check_sign_ins(account_ref)` checks now and returns the list after the check.
-- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
+- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. With device groups on, it also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
 - The list is empty in ordinary opens without explicit experimental device-group intent.
 - `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
@@ -1425,8 +1494,8 @@ It is false in ordinary opens without explicit experimental device-group intent.
 - `dismiss_compromise_warning(account_ref)` marks everything the warning gathers as seen, on this device only. It stays
   closed until a new rejection arrives, and a rejection that branch selection drops and brings back stays seen.
 - The app writes the wording, and never says the account's devices stopped them.
-- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
-  account's worker opens, so it may fire with no visible change.
+- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. With device groups on, it also fires once each
+  time the account's worker opens, so it may fire with no visible change.
 - The list is empty in ordinary opens without explicit experimental device-group intent.
 
 ## Linking a new device
@@ -1445,14 +1514,15 @@ returns a `DeviceLinkSnapshotFfi`, and every call requires the explicit experime
   Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added by <added_by_label>".
 - Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
 - `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
-  which carries no device, session or group identities. It also fires once each time the account's worker opens or
-  reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
+  which carries no device, session or group identities. With device groups on, it also fires once each time the
+  account's worker opens or reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
   rather than assuming an interrupted comparison undid an admitted move.
 
 ## Backup recovery and background conditions
 
-Backup setup and manual restore require `devDeviceGroups`, which is off by default, and a build with experimental
-device-group support. MDK owns backup selection, due work, download limits, import validation and membership checks;
+Backup setup and manual restore require a `dev-device-groups` build opened with `newWithExperimentalDeviceGroups`
+(see [experimental device-group test builds](#experimental-device-group-test-builds)); both are off by default.
+Otherwise every backup call is refused with `roster_unsupported`, and ordinary hosts have nothing to do. MDK owns backup selection, due work, download limits, import validation and membership checks;
 the host supplies platform facts, renders status and obtains recovery words from the user.
 
 Use `beginRecoveryWords(accountRef)` to generate 12 new words for backup setup. Display them once, then ask for the
@@ -1708,6 +1778,10 @@ package that shared surface:
   cannot clobber either artifact.
 - `./crates/marmot-uniffi/kotlin-bindings.sh` builds `output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt` plus
   Android `jniLibs` shared libraries.
+
+Building from source also requires Odin `dev-2026-10` at the pinned revision, because Markdown parsing is compiled from
+Odin. Install it with `bash scripts/install-odin.sh <dir>` and set `ODIN` to the compiler, as the
+[workspace README](../../README.md#development) shows. Published artifacts already contain the compiled parser.
 
 The generated Swift file is platform-independent: `output/MarmotKit.swift` and `output/macos/MarmotKit.swift` are the
 same UniFFI surface, and releases publish it once. The Kotlin binding is generated from the same host library metadata,
