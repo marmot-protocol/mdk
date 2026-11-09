@@ -20,6 +20,11 @@ pub(crate) struct AccountRecoveryOwner {
     /// change; native progress re-sends the same one (mdk#2923 telemetry).
     replay_observed_generation: Option<u64>,
     replay_complete: bool,
+    /// The generation the last full synchronization finished while the
+    /// adapter was inactive (offline, or no relays). It never authorizes, but
+    /// a repeat pass on it, still inactive, has nothing new to record
+    /// (mdk#3238).
+    replay_inactive_generation: Option<u64>,
 }
 
 /// Wall-clock milliseconds, the precision recovery timestamps are stored at.
@@ -42,6 +47,14 @@ impl AccountRecoveryOwner {
         self.replay_generation == Some(generation) && self.replay_complete
     }
 
+    /// Whether a full synchronization of `generation` would repeat the last
+    /// one: it is authorized, or it was synchronized inactive and the adapter
+    /// is still inactive. Activation re-runs it even without a new generation.
+    fn native_replay_synchronized(&self, generation: u64, active: bool) -> bool {
+        self.native_replay_authorizes(generation)
+            || (!active && self.replay_inactive_generation == Some(generation))
+    }
+
     pub(crate) fn open() -> Self {
         Self {
             native_batch: None,
@@ -52,6 +65,7 @@ impl AccountRecoveryOwner {
             replay_generation: None,
             replay_observed_generation: None,
             replay_complete: false,
+            replay_inactive_generation: None,
         }
     }
 
@@ -74,6 +88,7 @@ impl AppClient {
         let changed_generation = self.recovery_owner.replay_generation != Some(generation);
         self.recovery_owner.replay_generation = None;
         self.recovery_owner.replay_complete = false;
+        self.recovery_owner.replay_inactive_generation = None;
         let active = observation.active();
         let floor = unix_now_seconds()
             .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
@@ -111,21 +126,16 @@ impl AppClient {
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
         self.finish_runner_loss_import()?;
-        {
-            // Replay-flush write, excluded from the idle-tick test (mdk#3238).
-            #[cfg(test)]
-            let _replay_flush = crate::replay_flush_writes::ReplayFlushWrite::enter();
-            storage.with_transaction(|_| {
-                for (since, routes) in &goals {
-                    app.widen_recovery_coverage_goals(
-                        routes,
-                        *since,
-                        storage_sqlite::CopyFloorReason::Clamp,
-                    )?;
-                }
-                Ok::<_, StorageError>(())
-            })?;
-        }
+        storage.with_transaction(|_| {
+            for (since, routes) in &goals {
+                app.widen_recovery_coverage_goals(
+                    routes,
+                    *since,
+                    storage_sqlite::CopyFloorReason::Clamp,
+                )?;
+            }
+            Ok::<_, StorageError>(())
+        })?;
         if changed_generation {
             self.wake_recovery_runner();
         }
@@ -134,6 +144,7 @@ impl AppClient {
         // full live EOSE proved complete history. A stale generation cannot seal.
         self.recovery_owner.replay_generation = active.then_some(generation);
         self.recovery_owner.replay_complete = active;
+        self.recovery_owner.replay_inactive_generation = (!active).then_some(generation);
         Ok(())
     }
 
@@ -151,7 +162,9 @@ impl AppClient {
             .recovery_owner
             .replay_observed_generation
             .replace(generation);
-        if self.recovery_owner.native_replay_authorizes(generation)
+        if self
+            .recovery_owner
+            .native_replay_synchronized(generation, observation.active())
             && !self.delivery_loss_blocks_cursor()
         {
             return Ok(());
@@ -212,9 +225,6 @@ impl AppClient {
     /// Imported ledger debt replaces the cursor's loss fence. This is a
     /// durable handoff, not proof of recovery and not a recovery-success metric.
     pub(crate) fn finish_runner_loss_import(&mut self) -> Result<bool, AppError> {
-        // Replay-flush write, excluded from the idle-tick test (mdk#3238).
-        #[cfg(test)]
-        let _replay_flush = crate::replay_flush_writes::ReplayFlushWrite::enter();
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
         let entries = app
@@ -514,6 +524,64 @@ mod tests {
             (retries + 1, retry_successes + 1),
             "an authorized generation records nothing"
         );
+    }
+
+    /// An inactive adapter's generation never authorizes, but a repeat pass
+    /// on it while still inactive has nothing new to record and is skipped,
+    /// so an offline account's idle ticks take no writer (mdk#3238).
+    /// Activation re-runs the pass even on the same generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inactive_generation_is_synchronized_once_until_activation() {
+        use crate::RuntimePerformanceOperation as Op;
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        let passes = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .filter(|snapshot| {
+                    matches!(
+                        snapshot.operation,
+                        Op::ReplaySyncSourcesChanged
+                            | Op::ReplaySyncSourcesChangedPending
+                            | Op::ReplaySyncRetry
+                            | Op::ReplaySyncRetryPending
+                    )
+                })
+                .map(|snapshot| snapshot.completed)
+                .sum::<u64>()
+        };
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.runtime_telemetry = Some(telemetry.clone());
+        client.prepare_transport().await.unwrap();
+        relay.answer_held_replies().await;
+        client.synchronize_native_replay().await.unwrap();
+        // Offline: the account's route set is gone from the adapter.
+        app.relay_plane
+            .deactivate_account_context(client.adapter.account_id())
+            .await
+            .unwrap();
+        let inactive = client.adapter.replay_admission().await;
+        assert!(!inactive.active());
+        let generation = inactive.generation();
+        drop(inactive);
+        let before = passes();
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(passes(), before + 1, "the first inactive pass runs in full");
+        assert!(!client.recovery_owner.native_replay_authorizes(generation));
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(
+            passes(),
+            before + 1,
+            "a repeat on the same inactive generation is skipped"
+        );
+
+        // Reconnecting synchronizes the account again until it authorizes.
+        client.prepare_transport().await.unwrap();
+        relay.answer_held_replies().await;
+        client.synchronize_native_replay().await.unwrap();
+        let generation = client.adapter.replay_admission().await.generation();
+        assert!(client.recovery_owner.native_replay_authorizes(generation));
     }
 
     /// A pass records the generation it synchronized, not one the adapter
