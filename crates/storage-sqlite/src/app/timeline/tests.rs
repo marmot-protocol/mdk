@@ -1702,6 +1702,7 @@ fn before_inclusive_cursor_keeps_window_rows_over_newer_same_second_rows() {
             limit: Some(2),
             ..TimelinePagination::default()
         },
+        ..TimelineMessageQuery::default()
     };
 
     // Inclusive: the tight descending LIMIT must NOT be spent on c/d; the
@@ -2061,6 +2062,47 @@ fn wall_clock_timeline_query_orders_by_sender_time() {
         .unwrap();
 
     assert_eq!(ids(&page), ["message-8", "message-7"]);
+
+    assert_eq!(
+        list(&store)
+            .iter()
+            .map(|row| row.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["system-7", "message-7", "system-8", "message-8"]
+    );
+    for (pagination, expected) in [
+        (
+            TimelinePagination::default(),
+            vec!["system-7", "message-8", "message-7", "system-8"],
+        ),
+        (
+            TimelinePagination {
+                after: Some(150),
+                after_message_id: Some("message-8".into()),
+                ..Default::default()
+            },
+            vec!["message-7", "system-8"],
+        ),
+        (
+            TimelinePagination {
+                before: Some(150),
+                before_message_id: Some("message-8".into()),
+                before_inclusive: true,
+                ..Default::default()
+            },
+            vec!["system-7", "message-8"],
+        ),
+    ] {
+        let search_page = store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some("11".repeat(32)),
+                search_wall_clock: true,
+                pagination,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(ids(&search_page), expected);
+    }
 }
 
 #[test]
@@ -2772,6 +2814,261 @@ fn timeline_search_matches_literal_text_after_unicode_lowercasing() {
                 .collect::<Vec<_>>(),
             vec![expected_id]
         );
+    }
+}
+
+#[test]
+fn timeline_search_cross_groups() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let store = storage.app_storage();
+    let groups = ["11".repeat(32), "22".repeat(32)];
+    let count = MAX_TIMELINE_LIMIT / 2 + 3;
+    cgka_traits::StorageProvider::with_transaction(&storage, |_| {
+        for index in 0..count {
+            for group in &groups {
+                let mut event = chat(&format!("message-{index:04}"), "alice", 10, "needle");
+                event.group_id_hex = group.clone();
+                event.source_message_id_hex = Some(format!("source-{group}-{index:04}"));
+                store.record_app_event(&event)?;
+            }
+        }
+        Ok::<_, StorageError>(())
+    })
+    .unwrap();
+    let expected = (0..count)
+        .flat_map(|index| {
+            groups
+                .iter()
+                .map(move |group| (format!("message-{index:04}"), group.clone()))
+        })
+        .collect::<Vec<_>>();
+    let keys = |page: &TimelinePage| {
+        page.messages
+            .iter()
+            .map(|row| (row.message_id_hex.clone(), row.group_id_hex.clone()))
+            .collect::<Vec<_>>()
+    };
+    let query = |pagination, cursor_group_id| TimelineMessageQuery {
+        search: Some("needle".to_owned()),
+        search_wall_clock: true,
+        cursor_group_id,
+        pagination,
+        ..Default::default()
+    };
+    let head = store
+        .message_timeline(query(
+            TimelinePagination {
+                limit: Some(MAX_TIMELINE_LIMIT + 100),
+                ..Default::default()
+            },
+            None,
+        ))
+        .unwrap();
+    assert_eq!(head.messages.len(), MAX_TIMELINE_LIMIT);
+    assert!(head.has_more_before);
+    assert_eq!(keys(&head), expected[6..]);
+    let cursor = &head.messages[0];
+    for cursor_index in [0, 1] {
+        let cursor = &head.messages[cursor_index];
+        for inclusive in [false, true] {
+            let before = store
+                .message_timeline(query(
+                    TimelinePagination {
+                        before: Some(cursor.timeline_at),
+                        before_message_id: Some(cursor.message_id_hex.clone()),
+                        before_inclusive: inclusive,
+                        limit: Some(MAX_TIMELINE_LIMIT),
+                        ..Default::default()
+                    },
+                    Some(cursor.group_id_hex.clone()),
+                ))
+                .unwrap();
+            assert_eq!(
+                keys(&before),
+                expected[..6 + cursor_index + usize::from(inclusive)]
+            );
+            assert!(!before.has_more_before);
+            assert!(before.has_more_after);
+        }
+    }
+    let mut after_keys = Vec::new();
+    let mut pagination = TimelinePagination {
+        after: Some(0),
+        after_message_id: Some(String::new()),
+        limit: Some(MAX_TIMELINE_LIMIT - 1),
+        ..Default::default()
+    };
+    let mut cursor_group = String::new();
+    loop {
+        let page = store
+            .message_timeline(query(pagination.clone(), Some(cursor_group.clone())))
+            .unwrap();
+        after_keys.extend(keys(&page));
+        if !page.has_more_after {
+            break;
+        }
+        let last = page.messages.last().unwrap();
+        pagination.after = Some(last.timeline_at);
+        pagination.after_message_id = Some(last.message_id_hex.clone());
+        cursor_group = last.group_id_hex.clone();
+    }
+    assert_eq!(after_keys, expected);
+    for pagination in [
+        pagination,
+        TimelinePagination {
+            before: Some(10),
+            before_message_id: Some(cursor.message_id_hex.clone()),
+            ..Default::default()
+        },
+    ] {
+        let missing_group = store.message_timeline(query(pagination, None));
+        assert!(matches!(missing_group, Err(StorageError::Backend(message))
+            if message == "timeline account-wide search cursor requires cursor_group_id"));
+    }
+}
+
+#[test]
+fn timeline_search_filter_bounds() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let store = storage.app_storage();
+    let mut matching = chat("match", "alice", 10, "Une ÉCOLE 50% a_b");
+    matching.tags = vec![vec!["imeta".into(), "m Image/PNG".into()]];
+    store.record_app_event(&matching).unwrap();
+    cgka_traits::StorageProvider::with_transaction(&storage, |_| {
+        for index in 0..=MAX_TIMELINE_LIMIT {
+            let mut newer = matching.clone();
+            newer.message_id_hex = format!("newer-{index:04}");
+            newer.source_message_id_hex = Some(format!("source-newer-{index:04}"));
+            newer.recorded_at = 11;
+            newer.received_at = 11;
+            store.record_app_event(&newer)?;
+        }
+        for (id, sender, at, text, mime) in [
+            (
+                "before-since",
+                "alice",
+                9,
+                "Une ÉCOLE 50% a_b",
+                "m image/png",
+            ),
+            ("sender", "Alice", 10, "Une ÉCOLE 50% a_b", "m image/png"),
+            ("text", "alice", 10, "Une ÉCOLE 500 axb", "m image/png"),
+            (
+                "attachment",
+                "alice",
+                10,
+                "Une ÉCOLE 50% a_b",
+                "m application/pdf",
+            ),
+        ] {
+            let mut event = chat(id, sender, at, text);
+            event.tags = vec![vec!["imeta".into(), mime.into()]];
+            store.record_app_event(&event)?;
+        }
+        Ok::<_, StorageError>(())
+    })
+    .unwrap();
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            search: Some(" école 50% a_b ".into()),
+            sender: Some("alice".into()),
+            since: Some(10),
+            until: Some(11),
+            attachment_type: TimelineAttachmentType::Image,
+            search_wall_clock: true,
+            pagination: TimelinePagination {
+                limit: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&page), ["match"]);
+    assert!(!page.has_more_before);
+}
+
+#[test]
+fn timeline_search_mime_tags() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let store = storage.app_storage();
+    for (id, attachments) in [
+        ("audio", vec![vec!["m AuDiO/ogg"]]),
+        ("file", vec![vec!["m application/pdf"]]),
+        ("image", vec![vec!["m IMAGE/png"]]),
+        (
+            "mixed",
+            vec![vec!["m image/png"], vec!["m application/pdf"]],
+        ),
+        ("multi-mime", vec![vec!["m application/pdf", "m image/png"]]),
+        ("none", vec![]),
+        ("unknown", vec![vec!["filename mystery"]]),
+        ("video", vec![vec!["m ViDeO/mp4"]]),
+    ] {
+        let mut event = chat(id, "alice", 10, "attachment");
+        event.tags = attachments
+            .into_iter()
+            .map(|fields| {
+                std::iter::once("imeta")
+                    .chain(fields)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect();
+        store.record_app_event(&event).unwrap();
+    }
+    storage
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE message_timeline SET media_json = '{not-json' WHERE message_id_hex = 'image'",
+            [],
+        )
+        .unwrap();
+    for (attachment_type, expected) in [
+        (
+            TimelineAttachmentType::Any,
+            vec![
+                "audio",
+                "file",
+                "image",
+                "mixed",
+                "multi-mime",
+                "none",
+                "unknown",
+                "video",
+            ],
+        ),
+        (
+            TimelineAttachmentType::Image,
+            vec!["image", "mixed", "multi-mime"],
+        ),
+        (TimelineAttachmentType::Video, vec!["video"]),
+        (TimelineAttachmentType::Audio, vec!["audio"]),
+        (
+            TimelineAttachmentType::File,
+            vec!["file", "mixed", "unknown"],
+        ),
+        (
+            TimelineAttachmentType::Attachment,
+            vec![
+                "audio",
+                "file",
+                "image",
+                "mixed",
+                "multi-mime",
+                "unknown",
+                "video",
+            ],
+        ),
+    ] {
+        let page = store
+            .message_timeline(TimelineMessageQuery {
+                attachment_type,
+                search_wall_clock: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(ids(&page), expected, "{attachment_type:?}");
     }
 }
 

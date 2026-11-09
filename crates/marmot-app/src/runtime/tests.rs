@@ -1255,6 +1255,48 @@ fn empty_timeline_page() -> TimelinePage {
     }
 }
 
+#[test]
+fn timeline_delta_filters() {
+    use super::event_routing::timeline_query_can_apply_projection_delta;
+
+    assert!(timeline_query_can_apply_projection_delta(
+        &TimelineMessageQuery::default()
+    ));
+    assert!(timeline_query_can_apply_projection_delta(
+        &TimelineMessageQuery {
+            group_id_hex: Some("aa".into()),
+            ..Default::default()
+        }
+    ));
+    for filtered in [
+        TimelineMessageQuery {
+            sender: Some("sender".into()),
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            since: Some(0),
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            until: Some(50),
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            attachment_type: crate::TimelineAttachmentType::Attachment,
+            ..Default::default()
+        },
+        TimelineMessageQuery {
+            search_wall_clock: true,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            !timeline_query_can_apply_projection_delta(&filtered),
+            "{filtered:?}"
+        );
+    }
+}
+
 fn timeline_ids(page: &TimelinePage) -> Vec<String> {
     page.messages
         .iter()
@@ -1685,6 +1727,188 @@ async fn paginate_backwards_extends_window_and_clears_more_before() {
         Some("c")
     );
     assert_eq!(queries[0].pagination.limit, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_tied_group_window() {
+    let mut group_a = timeline_test_record("shared", 20);
+    group_a.group_id_hex = "aa".into();
+    let mut group_b = group_a.clone();
+    group_b.group_id_hex = "bb".into();
+    let mut group_c = group_a.clone();
+    group_c.group_id_hex = "cc".into();
+    let store = ScriptedTimelineStore::new(vec![
+        TimelinePage {
+            messages: vec![group_a.clone()],
+            has_more_before: false,
+            has_more_after: true,
+        },
+        TimelinePage {
+            messages: vec![group_c.clone(), group_b.clone()],
+            has_more_before: true,
+            has_more_after: false,
+        },
+    ]);
+    let handle = timeline_window_handle(
+        &store,
+        TimelinePage {
+            messages: vec![group_b.clone()],
+            has_more_before: true,
+            has_more_after: true,
+        },
+        3,
+    );
+    handle.paginate_backwards(1).await.unwrap();
+    let page = handle.paginate_forwards(1).await.unwrap();
+    assert_eq!(
+        page.messages
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["aa", "bb", "cc"]
+    );
+    let queries = store.recorded_queries();
+    assert_eq!(queries[0].cursor_group_id.as_deref(), Some("bb"));
+    assert_eq!(queries[1].cursor_group_id.as_deref(), Some("bb"));
+
+    let mut detached = timeline_test_page(&[], true, true);
+    detached.messages.push(group_b);
+    let mut group_d = group_a.clone();
+    group_d.group_id_hex = "dd".into();
+    apply_projection_to_window(
+        &mut detached,
+        &projection_for(vec![group_d, group_a]),
+        3,
+        false,
+    );
+    assert_eq!(
+        detached
+            .messages
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        ["aa", "bb"]
+    );
+    let refresh = timeline_window(&ScriptedTimelineStore::default(), detached, 3).refresh_query();
+    assert_eq!(refresh.cursor_group_id.as_deref(), Some("bb"));
+    assert_eq!(
+        refresh.pagination.before_message_id.as_deref(),
+        Some("shared")
+    );
+    assert!(refresh.pagination.before_inclusive);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_search_window() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://test.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("search", &[]).await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let sender = "ee".repeat(32);
+    let event = |at: u64| storage_sqlite::StoredAppEvent {
+        group_id_hex: group_hex.clone(),
+        message_id_hex: format!("{at:064x}"),
+        source_message_id_hex: None,
+        source_epoch: Some(100 - at),
+        direction: "received".into(),
+        sender: sender.clone(),
+        plaintext: "needle".into(),
+        kind: 9,
+        tags: vec![vec!["imeta".into(), "m image/png".into()]],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    for at in [10, 20, 30, 40] {
+        storage.record_app_event(&event(at)).unwrap();
+    }
+    for mut excluded in [event(5), event(55), event(46), event(47), event(48)] {
+        match excluded.recorded_at {
+            46 => excluded.sender = "dd".repeat(32),
+            47 => excluded.tags.clear(),
+            48 => excluded.plaintext = "other".into(),
+            _ => {}
+        }
+        storage.record_app_event(&excluded).unwrap();
+    }
+    let runtime = app.runtime();
+    let mut subscription = runtime
+        .subscribe_timeline_messages(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                search: Some("needle".into()),
+                sender: Some(sender.clone()),
+                since: Some(10),
+                until: Some(50),
+                attachment_type: crate::TimelineAttachmentType::Attachment,
+                search_wall_clock: true,
+                cursor_group_id: Some(group_hex.clone()),
+                pagination: storage_sqlite::TimelinePagination {
+                    before: Some(40),
+                    before_message_id: Some(format!("{:064x}", 40)),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(subscription.take_snapshot().messages[0].timeline_at, 30);
+    let older = subscription.paginate_backwards(10).await.unwrap();
+    assert_eq!(
+        older
+            .messages
+            .iter()
+            .map(|row| row.timeline_at)
+            .collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
+    let newer = subscription.paginate_forwards(10).await.unwrap();
+    assert_eq!(
+        newer
+            .messages
+            .iter()
+            .map(|row| row.timeline_at)
+            .collect::<Vec<_>>(),
+        [10, 20, 30, 40]
+    );
+
+    let update = app
+        .app_projection_update("alice", storage.record_app_event(&event(45)).unwrap())
+        .unwrap();
+    runtime
+        .events
+        .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+            account_id_hex: account.account_id_hex,
+            account_label: account.label,
+            update,
+        }))
+        .unwrap();
+    let update = timeout(Duration::from_secs(5), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let RuntimeTimelineMessageUpdate::Page { page } = update else {
+        panic!("filtered search must refresh rather than apply a projection delta");
+    };
+    assert_eq!(
+        page.messages
+            .iter()
+            .map(|row| row.timeline_at)
+            .collect::<Vec<_>>(),
+        [20, 30, 40, 45]
+    );
+    assert!(page.has_more_before);
+    assert!(!page.has_more_after);
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

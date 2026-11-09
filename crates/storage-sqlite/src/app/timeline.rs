@@ -198,7 +198,29 @@ pub struct TimelinePagination {
 pub struct TimelineMessageQuery {
     pub group_id_hex: Option<String>,
     pub search: Option<String>,
+    pub sender: Option<String>,
+    /// Inclusive lower bound on `timeline_at`.
+    pub since: Option<u64>,
+    /// Exclusive upper bound on `timeline_at`.
+    pub until: Option<u64>,
+    pub attachment_type: TimelineAttachmentType,
+    /// Use wall-clock order instead of the group's canonical epoch order.
+    pub search_wall_clock: bool,
+    /// Group component of an account-wide wall-clock search cursor.
+    pub cursor_group_id: Option<String>,
     pub pagination: TimelinePagination,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TimelineAttachmentType {
+    #[default]
+    Any = 0,
+    Image = 1,
+    Video = 2,
+    Audio = 3,
+    File = 4,
+    Attachment = 5,
 }
 
 /// Origin of the accepted deletion selected by MDK. Meaningful only when `deleted`.
@@ -1583,7 +1605,8 @@ impl SqliteAppStorage {
         canonical_group_order: bool,
         hide_blocked: bool,
     ) -> StorageResult<TimelinePage> {
-        let canonical_group_order = canonical_group_order && query.group_id_hex.is_some();
+        let canonical_group_order =
+            canonical_group_order && query.group_id_hex.is_some() && !query.search_wall_clock;
         let mut pagination = validate_pagination(&query.pagination)?;
         let conn = self.lock()?;
         if canonical_group_order
@@ -3833,59 +3856,117 @@ fn timeline_query_sql(
         ));
         params.push(rusqlite::types::Value::Text(search));
     }
-    match (pagination.direction, pagination.cursor_order.as_ref()) {
-        (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
-            let comparison = if pagination.inclusive { "<=" } else { "<" };
-            clauses.push(format!(
-                "(timeline.timeline_order_class,
+    if let Some(sender) = &query.sender {
+        clauses.push("timeline.sender = ?".to_owned());
+        params.push(rusqlite::types::Value::Text(sender.clone()));
+    }
+    if let Some(since) = query.since {
+        clauses.push("timeline.timeline_at >= ?".to_owned());
+        params.push(rusqlite::types::Value::Integer(u64_to_i64(since)?));
+    }
+    if let Some(until) = query.until {
+        clauses.push("timeline.timeline_at < ?".to_owned());
+        params.push(rusqlite::types::Value::Integer(u64_to_i64(until)?));
+    }
+    if query.attachment_type != TimelineAttachmentType::Any {
+        let mime_predicate = match query.attachment_type {
+            TimelineAttachmentType::Image => {
+                "AND EXISTS (SELECT 1 FROM json_each(attachment.value) AS field WHERE lower(field.value) LIKE 'm image/%')"
+            }
+            TimelineAttachmentType::Video => {
+                "AND EXISTS (SELECT 1 FROM json_each(attachment.value) AS field WHERE lower(field.value) LIKE 'm video/%')"
+            }
+            TimelineAttachmentType::Audio => {
+                "AND EXISTS (SELECT 1 FROM json_each(attachment.value) AS field WHERE lower(field.value) LIKE 'm audio/%')"
+            }
+            TimelineAttachmentType::File => {
+                "AND NOT EXISTS (SELECT 1 FROM json_each(attachment.value) AS field WHERE lower(field.value) LIKE 'm image/%' OR lower(field.value) LIKE 'm video/%' OR lower(field.value) LIKE 'm audio/%')"
+            }
+            TimelineAttachmentType::Any | TimelineAttachmentType::Attachment => "",
+        };
+        clauses.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(timeline.tags_json) AS attachment
+             WHERE json_extract(attachment.value, '$[0]') = 'imeta' {mime_predicate})"
+        ));
+    }
+    let account_search_order = query.search_wall_clock && query.group_id_hex.is_none();
+    if account_search_order && !matches!(pagination.direction, CursorDirection::None) {
+        let cursor_group_id = query.cursor_group_id.as_ref().ok_or_else(|| {
+            StorageError::Backend(
+                "timeline account-wide search cursor requires cursor_group_id".to_owned(),
+            )
+        })?;
+        let comparison = match pagination.direction {
+            CursorDirection::Before if pagination.inclusive => "<=",
+            CursorDirection::Before => "<",
+            CursorDirection::After => ">",
+            CursorDirection::None => unreachable!(),
+        };
+        clauses.push(format!(
+            "(timeline.timeline_at, timeline.message_id_hex, timeline.group_id_hex) {comparison} (?, ?, ?)"
+        ));
+        params.push(rusqlite::types::Value::Integer(u64_to_i64(
+            pagination.cursor_at.unwrap_or_default(),
+        )?));
+        params.push(rusqlite::types::Value::Text(
+            pagination.cursor_message_id_hex.clone().unwrap_or_default(),
+        ));
+        params.push(rusqlite::types::Value::Text(cursor_group_id.clone()));
+    } else {
+        match (pagination.direction, pagination.cursor_order.as_ref()) {
+            (CursorDirection::Before, Some((class, primary, phase, at, id))) => {
+                let comparison = if pagination.inclusive { "<=" } else { "<" };
+                clauses.push(format!(
+                    "(timeline.timeline_order_class,
                   timeline.timeline_order_primary,
                   timeline.timeline_order_phase,
                   timeline.timeline_order_at,
                   timeline.message_id_hex) {comparison} (?, ?, ?, ?, ?)"
-            ));
-            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
-        }
-        (CursorDirection::After, Some((class, primary, phase, at, id))) => {
-            clauses.push(
-                "(timeline.timeline_order_class,
+                ));
+                params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+            }
+            (CursorDirection::After, Some((class, primary, phase, at, id))) => {
+                clauses.push(
+                    "(timeline.timeline_order_class,
                   timeline.timeline_order_primary,
                   timeline.timeline_order_phase,
                   timeline.timeline_order_at,
                   timeline.message_id_hex) > (?, ?, ?, ?, ?)"
-                    .to_owned(),
-            );
-            params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
-        }
-        (CursorDirection::Before, None) if !canonical_group_order => {
-            // Wall-clock-only queries retain the timestamp cursor semantics.
-            // Canonical group queries resolve a retained row above instead.
-            let id_comparison = if pagination.inclusive { "<=" } else { "<" };
-            clauses.push(format!(
+                        .to_owned(),
+                );
+                params.extend(canonical_cursor_params(*class, *primary, *phase, *at, id)?);
+            }
+            (CursorDirection::Before, None) if !canonical_group_order => {
+                // Wall-clock-only queries retain the timestamp cursor semantics.
+                // Canonical group queries resolve a retained row above instead.
+                let id_comparison = if pagination.inclusive { "<=" } else { "<" };
+                clauses.push(format!(
                 "(timeline.timeline_at < ? OR (timeline.timeline_at = ? AND timeline.message_id_hex {id_comparison} ?))"
             ));
-            let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
-            params.push(rusqlite::types::Value::Integer(cursor_at));
-            params.push(rusqlite::types::Value::Integer(cursor_at));
-            params.push(rusqlite::types::Value::Text(
-                pagination.cursor_message_id_hex.clone().unwrap_or_default(),
-            ));
-        }
-        (CursorDirection::After, None) if !canonical_group_order => {
-            clauses.push(
+                let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
+                params.push(rusqlite::types::Value::Integer(cursor_at));
+                params.push(rusqlite::types::Value::Integer(cursor_at));
+                params.push(rusqlite::types::Value::Text(
+                    pagination.cursor_message_id_hex.clone().unwrap_or_default(),
+                ));
+            }
+            (CursorDirection::After, None) if !canonical_group_order => {
+                clauses.push(
                 "(timeline.timeline_at > ? OR (timeline.timeline_at = ? AND timeline.message_id_hex > ?))"
                     .to_owned(),
             );
-            let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
-            params.push(rusqlite::types::Value::Integer(cursor_at));
-            params.push(rusqlite::types::Value::Integer(cursor_at));
-            params.push(rusqlite::types::Value::Text(
-                pagination.cursor_message_id_hex.clone().unwrap_or_default(),
-            ));
+                let cursor_at = u64_to_i64(pagination.cursor_at.unwrap_or_default())?;
+                params.push(rusqlite::types::Value::Integer(cursor_at));
+                params.push(rusqlite::types::Value::Integer(cursor_at));
+                params.push(rusqlite::types::Value::Text(
+                    pagination.cursor_message_id_hex.clone().unwrap_or_default(),
+                ));
+            }
+            (CursorDirection::Before | CursorDirection::After, None) => {
+                return Err(StorageError::TimelineCursorExpired);
+            }
+            (CursorDirection::None, _) => {}
         }
-        (CursorDirection::Before | CursorDirection::After, None) => {
-            return Err(StorageError::TimelineCursorExpired);
-        }
-        (CursorDirection::None, _) => {}
     }
     params.push(rusqlite::types::Value::Integer(
         i64::try_from(pagination.limit + 1).unwrap_or(i64::MAX),
@@ -3896,6 +3977,12 @@ fn timeline_query_sql(
         format!("WHERE {}", clauses.join(" AND "))
     };
     let order_sql = match (canonical_group_order, pagination.direction) {
+        (false, CursorDirection::After) if account_search_order => {
+            "ORDER BY timeline.timeline_at ASC, timeline.message_id_hex ASC, timeline.group_id_hex ASC"
+        }
+        (false, CursorDirection::None | CursorDirection::Before) if account_search_order => {
+            "ORDER BY timeline.timeline_at DESC, timeline.message_id_hex DESC, timeline.group_id_hex DESC"
+        }
         (true, CursorDirection::After) => TIMELINE_GROUP_ORDER_BY_ASC,
         (true, CursorDirection::None | CursorDirection::Before) => TIMELINE_GROUP_ORDER_BY_DESC,
         (false, CursorDirection::After) => TIMELINE_WALL_ORDER_BY_ASC,

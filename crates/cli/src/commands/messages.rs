@@ -16,15 +16,17 @@ use cgka_traits::{
 use marmot_account::AccountHome;
 use marmot_app::{
     AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppRuntime, RetentionSweepReport,
-    RetentionSweepStatus, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
-    TimelinePagination, group_system_event_from_message,
+    RetentionSweepStatus, TimelineAttachmentType, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, TimelinePagination, group_system_event_from_message,
 };
 use serde_json::{Value, json};
 
+use crate::args::SearchAttachmentType;
 use crate::{
     CommandOutput, MessageCommand, MessageTimelineCommand, WnError,
     agent_text_stream_payload_value, display_name_for_sender, ensure_local_signing,
-    normalize_group_id_hex, npub_for_account_id, resolve_account, terminal_safe_text,
+    normalize_group_id_hex, npub_for_account_id, parse_public_key, resolve_account,
+    terminal_safe_text,
 };
 
 fn message_target_and_text(
@@ -559,6 +561,7 @@ fn handle_message_timeline_command(
                         after_message_id,
                         limit,
                     },
+                    ..Default::default()
                 },
             )?;
             timeline_page_output(app, &account.account_id_hex, page, None)
@@ -567,6 +570,15 @@ fn handle_message_timeline_command(
             query,
             group_id,
             group,
+            sender,
+            since,
+            until,
+            attachment_type,
+            before,
+            before_message_id,
+            after,
+            after_message_id,
+            cursor_group_id,
             limit,
         } => {
             let account = resolve_account(account_home, account_flag)?;
@@ -580,7 +592,26 @@ fn handle_message_timeline_command(
                         .map(|group| normalize_group_id_hex(&group))
                         .transpose()?,
                     search: Some(query.clone()),
+                    sender: sender.map(|value| parse_public_key(&value)).transpose()?,
+                    since,
+                    until,
+                    attachment_type: match attachment_type.unwrap_or(SearchAttachmentType::Any) {
+                        SearchAttachmentType::Any => TimelineAttachmentType::Any,
+                        SearchAttachmentType::Image => TimelineAttachmentType::Image,
+                        SearchAttachmentType::Video => TimelineAttachmentType::Video,
+                        SearchAttachmentType::Audio => TimelineAttachmentType::Audio,
+                        SearchAttachmentType::File => TimelineAttachmentType::File,
+                        SearchAttachmentType::Attachment => TimelineAttachmentType::Attachment,
+                    },
+                    search_wall_clock: true,
+                    cursor_group_id: cursor_group_id
+                        .map(|group| normalize_group_id_hex(&group))
+                        .transpose()?,
                     pagination: TimelinePagination {
+                        before,
+                        before_message_id,
+                        after,
+                        after_message_id,
                         limit,
                         ..TimelinePagination::default()
                     },

@@ -70,6 +70,7 @@ impl AgentConnector {
                     after_message_id: after.as_ref().map(|cursor| cursor.message_id_hex.clone()),
                     limit: Some(limit as usize),
                 },
+                ..Default::default()
             },
         )?;
         bounded_timeline_page_response(

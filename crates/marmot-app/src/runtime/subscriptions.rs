@@ -232,7 +232,7 @@ impl TimelineWindow {
             // Detached: re-fetch the loaded range ending exactly at the newest
             // message using an *inclusive* upper-bound cursor. Group queries
             // apply the descending `LIMIT` against the row-resolved canonical
-            // key; global queries use the wall-clock timestamp/message-id key.
+            // key; wall-clock queries use timestamp, message id, and group id.
             // Either order excludes newer rows in SQL so they cannot starve the
             // window — no post-fetch trimming required.
             Some(newest) if !self.anchored_to_head() => TimelinePagination {
@@ -245,6 +245,13 @@ impl TimelineWindow {
             // Anchored or empty: refresh the head.
             _ => query.pagination,
         };
+        if !self.anchored_to_head() {
+            query.cursor_group_id = self
+                .page
+                .messages
+                .last()
+                .map(|row| row.group_id_hex.clone());
+        }
         query
     }
 }
@@ -312,6 +319,7 @@ impl TimelineWindowHandle {
                 limit: Some(count),
                 ..TimelinePagination::default()
             };
+            query.cursor_group_id = Some(oldest.group_id_hex.clone());
             (
                 window.query.clone(),
                 query,
@@ -326,7 +334,8 @@ impl TimelineWindowHandle {
         }
         let mut window = self.lock();
         let limit = window.window_limit;
-        let canonical_group_order = window.base_query.group_id_hex.is_some();
+        let canonical_group_order =
+            window.base_query.group_id_hex.is_some() && !window.base_query.search_wall_clock;
         merge_timeline_window_with_order(
             &mut window.page,
             older,
@@ -358,6 +367,7 @@ impl TimelineWindowHandle {
                 limit: Some(count),
                 ..TimelinePagination::default()
             };
+            query.cursor_group_id = Some(newest.group_id_hex.clone());
             (
                 window.query.clone(),
                 query,
@@ -372,7 +382,8 @@ impl TimelineWindowHandle {
         }
         let mut window = self.lock();
         let limit = window.window_limit;
-        let canonical_group_order = window.base_query.group_id_hex.is_some();
+        let canonical_group_order =
+            window.base_query.group_id_hex.is_some() && !window.base_query.search_wall_clock;
         merge_timeline_window_with_order(
             &mut window.page,
             newer,
@@ -389,7 +400,8 @@ impl TimelineWindowHandle {
     fn apply_projection(&self, update: &AppProjectionUpdate) {
         let mut window = self.lock();
         let limit = window.window_limit;
-        let canonical_group_order = window.base_query.group_id_hex.is_some();
+        let canonical_group_order =
+            window.base_query.group_id_hex.is_some() && !window.base_query.search_wall_clock;
         apply_projection_to_window(&mut window.page, update, limit, canonical_group_order);
         window.bump_generation();
     }
@@ -531,11 +543,19 @@ impl RuntimeTimelineMessagesSubscription {
 fn timeline_record_order_key(
     message: &TimelineMessageRecord,
     canonical_group_order: bool,
-) -> (u8, u64, u8, u64, &str) {
+) -> (u8, u64, u8, u64, &str, &str) {
     if canonical_group_order {
-        message.canonical_order_key()
+        let (class, primary, phase, at, id) = message.canonical_order_key();
+        (class, primary, phase, at, id, &message.group_id_hex)
     } else {
-        (0, message.timeline_at, 0, 0, &message.message_id_hex)
+        (
+            0,
+            message.timeline_at,
+            0,
+            0,
+            &message.message_id_hex,
+            &message.group_id_hex,
+        )
     }
 }
 
@@ -600,12 +620,12 @@ pub(crate) fn apply_projection_to_window(
 ) {
     let anchored = !window.has_more_after;
     // A detached window must suppress anything sorting strictly after its
-    // query-order upper bound. Own only the message id so delta application can
+    // query-order upper bound. Own only the ids so delta application can
     // mutate the window without cloning the newest record's payload.
-    let newest_order = window.messages.last().map(|newest| {
-        let (class, primary, phase, at, id) =
+    let newest_order = window.messages.last().filter(|_| !anchored).map(|newest| {
+        let (class, primary, phase, at, id, group) =
             timeline_record_order_key(newest, canonical_group_order);
-        (class, primary, phase, at, id.to_owned())
+        (class, primary, phase, at, id.to_owned(), group.to_owned())
     });
     if update.timeline_changes.is_empty() {
         for message in &update.timeline_messages {
@@ -659,7 +679,7 @@ fn insert_live_message(
     messages: &mut Vec<TimelineMessageRecord>,
     message: TimelineMessageRecord,
     anchored: bool,
-    newest_order: Option<&(u8, u64, u8, u64, String)>,
+    newest_order: Option<&(u8, u64, u8, u64, String, String)>,
     canonical_group_order: bool,
 ) {
     if let Some(existing) = messages.iter_mut().find(|existing| {
@@ -671,7 +691,14 @@ fn insert_live_message(
     }
     let within_window = newest_order.is_some_and(|newest| {
         timeline_record_order_key(&message, canonical_group_order)
-            <= (newest.0, newest.1, newest.2, newest.3, newest.4.as_str())
+            <= (
+                newest.0,
+                newest.1,
+                newest.2,
+                newest.3,
+                newest.4.as_str(),
+                newest.5.as_str(),
+            )
     });
     if anchored || within_window {
         messages.push(message);
@@ -1184,13 +1211,10 @@ impl MarmotAppRuntime {
                 .timeline_messages_with_query(&account_label_for_snapshot, snapshot_query)
         })
         .await?;
-        // The subscription owns the window, so the re-query base carries only the
-        // durable filter (group + search); pagination is supplied per call.
-        let base_query = TimelineMessageQuery {
-            group_id_hex: query.group_id_hex.clone(),
-            search: query.search.clone(),
-            pagination: TimelinePagination::default(),
-        };
+        // Preserve durable filters and ordering; each window read sets its own cursor.
+        let mut base_query = query.clone();
+        base_query.pagination = TimelinePagination::default();
+        base_query.cursor_group_id = None;
         // Deltas are applicable iff the base query is an unfiltered, unpaginated
         // tail. Search-scoped windows cannot be reconstructed from a projection
         // delta, so they trigger a window refresh instead.
