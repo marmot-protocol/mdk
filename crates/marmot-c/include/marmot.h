@@ -8516,10 +8516,10 @@ MarmotStatus marmot_export_encrypted_secret_key(const struct MarmotClient *clien
  * arguments must hold their stated length (or be NULL with
  * length 0); out-pointers must be valid.
  */
-MarmotStatus marmot_start_direct_conversation(const struct MarmotClient *client,
-                                              const char *account_ref,
-                                              const char *peer_account_id,
-                                              char **out);
+MarmotStatus marmot_start_direct_chat(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *peer_account_id,
+                                      char **out);
 
 /**
  * Create a new MLS group with `name` and the given members

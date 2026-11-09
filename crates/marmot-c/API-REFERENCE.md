@@ -1221,10 +1221,10 @@ Create a brand-new Nostr identity, store its secret in the account secret store,
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotcreate_identity) · [Header contract](include/marmot.h#L8224)
 
-### `marmot_start_direct_conversation`
+### `marmot_start_direct_chat`
 
 ```c
-MarmotStatus marmot_start_direct_conversation(const struct MarmotClient *client, const char *account_ref, const char *peer_account_id, char **out);
+MarmotStatus marmot_start_direct_chat(const struct MarmotClient *client, const char *account_ref, const char *peer_account_id, char **out);
 ```
 
 Blocks on the shared explicit direct-conversation start operation. `account_ref` and the hex or npub `peer_account_id` are borrowed NUL-terminated UTF-8 strings. `out` is required and receives an owned hex MLS group id on success; free it with `marmot_string_free`. Success confirms canonical local state, not Welcome delivery. Local reuse, retry recovery, founding admins, concurrent starts, and legacy role limits follow the shared contract.

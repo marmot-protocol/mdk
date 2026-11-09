@@ -697,7 +697,7 @@ c_cmd! {
     /// an unnamed group with both accounts as founding admins. Blocks until
     /// canonical local state is available, not until Welcome delivery.
     /// Writes an owned hex MLS group id; free it with `marmot_string_free`.
-    async fn marmot_start_direct_conversation(account_ref: str, peer_account_id: str) -> string = start_direct_conversation;
+    async fn marmot_start_direct_chat(account_ref: str, peer_account_id: str) -> string = start_direct_conversation;
 
     /// Create a new MLS group with `name` and the given members
     /// (referenced by `npub` or hex account id). Writes the new group id
