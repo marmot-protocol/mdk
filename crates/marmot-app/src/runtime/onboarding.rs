@@ -3108,8 +3108,9 @@ fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFind
 }
 const PROFILE_URL_FIELDS: [&str; 3] = ["picture", "banner", "website"];
 /// An absolute http(s) profile link with a host and no credentials. Clients
-/// commonly publish a bare host such as `www.example.com`; that reads as
-/// https rather than as a malformed profile. Valid values come back unchanged.
+/// commonly publish a bare domain such as `www.example.com/page`; only that
+/// shape reads as https, so no other scheme or authority can hide behind the
+/// prefix. Valid values come back unchanged.
 fn normalized_profile_url(value: &str) -> Option<String> {
     let usable = |url: &url::Url| {
         matches!(url.scheme(), "https" | "http")
@@ -3117,17 +3118,30 @@ fn normalized_profile_url(value: &str) -> Option<String> {
             && url.username().is_empty()
             && url.password().is_none()
     };
-    match url::Url::parse(value) {
-        Ok(url) if usable(&url) => return Some(value.to_owned()),
-        // A bare `host:port` parses with the host as its scheme. Any other
-        // scheme, such as `file:` or `javascript:`, is not a web link.
-        Ok(url) if !url.scheme().contains('.') => return None,
-        _ => {}
+    if url::Url::parse(value).is_ok_and(|url| usable(&url)) {
+        return Some(value.to_owned());
     }
-    let value = value.trim();
-    let candidate = format!("https://{}", value.strip_prefix("//").unwrap_or(value));
+    let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    let authority = &value[..value.find(['/', '?', '#']).unwrap_or(value.len())];
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let domain = host.contains('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if !domain
+        || port.is_some_and(|port| port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let candidate = format!("https://{value}");
     url::Url::parse(&candidate)
-        .is_ok_and(|url| usable(&url))
+        .is_ok_and(|url| usable(&url) && url.host_str() == Some(&host.to_ascii_lowercase()))
         .then_some(candidate)
 }
 fn relay_repair_event(

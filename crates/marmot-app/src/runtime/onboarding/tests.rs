@@ -4039,6 +4039,12 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
         "javascript:/alert(1)",
         "file:/etc/passwd",
         "localhost:3000",
+        "https://example.com:bad",
+        "//file:/etc/passwd",
+        "//javascript:1",
+        "\\\\javascript:1",
+        "\u{00a0}javascript:1",
+        "example.com:/x",
         "https://user:secret@example.com",
     ] {
         let content = serde_json::json!({ "website": unsafe_link }).to_string();
