@@ -3081,18 +3081,11 @@ fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFind
                 .any(|key| {
                     map.get(*key)
                         .is_some_and(|v| !v.is_string() && !v.is_null())
-                }) || ["picture", "banner", "website"].iter().any(|key| {
+                }) || PROFILE_URL_FIELDS.iter().any(|key| {
                     map.get(*key)
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
-                        .is_some_and(|value| {
-                            url::Url::parse(value).map_or(true, |url| {
-                                !matches!(url.scheme(), "https" | "http")
-                                    || url.host_str().is_none()
-                                    || !url.username().is_empty()
-                                    || url.password().is_some()
-                            })
-                        })
+                        .is_some_and(|value| normalized_profile_url(value).is_none())
                 })
             }
             _ => true,
@@ -3112,6 +3105,44 @@ fn validate_onboarding_record(event: &NostrTransportEvent) -> Vec<OnboardingFind
     } else {
         Vec::new()
     }
+}
+const PROFILE_URL_FIELDS: [&str; 3] = ["picture", "banner", "website"];
+/// An absolute http(s) profile link with a host and no credentials. Clients
+/// commonly publish a bare domain such as `www.example.com/page`; only that
+/// shape reads as https, so no other scheme or authority can hide behind the
+/// prefix. Valid values come back unchanged.
+fn normalized_profile_url(value: &str) -> Option<String> {
+    let usable = |url: &url::Url| {
+        matches!(url.scheme(), "https" | "http")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    };
+    if url::Url::parse(value).is_ok_and(|url| usable(&url)) {
+        return Some(value.to_owned());
+    }
+    let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    let authority = &value[..value.find(['/', '?', '#']).unwrap_or(value.len())];
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let domain = host.contains('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if !domain
+        || port.is_some_and(|port| port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let candidate = format!("https://{value}");
+    url::Url::parse(&candidate)
+        .is_ok_and(|url| usable(&url) && url.host_str() == Some(&host.to_ascii_lowercase()))
+        .then_some(candidate)
 }
 fn relay_repair_event(
     c: &OnboardingCheckpoint,
@@ -3150,6 +3181,15 @@ fn relay_repair_event(
         ] {
             if value.as_ref().is_some_and(String::is_empty) {
                 content.remove(name);
+            }
+        }
+        // Publish the https form the validator accepted, so the repaired
+        // record no longer depends on that leniency.
+        for name in PROFILE_URL_FIELDS {
+            if let Some(serde_json::Value::String(value)) = content.get_mut(name)
+                && let Some(normalized) = normalized_profile_url(value)
+            {
+                *value = normalized;
             }
         }
         return (

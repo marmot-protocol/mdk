@@ -4032,7 +4032,47 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
         validate_onboarding_record(&record),
         vec![finding(OnboardingIssue::Malformed)]
     );
-    c.records[0] = Some(record);
+    for unsafe_link in [
+        "mailto:me@example.com",
+        "javascript:alert(1)",
+        "javascript:1",
+        "javascript:/alert(1)",
+        "file:/etc/passwd",
+        "localhost:3000",
+        "https://example.com:bad",
+        "//file:/etc/passwd",
+        "//javascript:1",
+        "\\\\javascript:1",
+        "\u{00a0}javascript:1",
+        "example.com:/x",
+        "https://user:secret@example.com",
+    ] {
+        let content = serde_json::json!({ "website": unsafe_link }).to_string();
+        assert_eq!(
+            validate_onboarding_record(&signed(&keys, 0, vec![], &content, unix_now_seconds())),
+            vec![finding(OnboardingIssue::Malformed)],
+            "{unsafe_link}"
+        );
+    }
+    // A bare host, as other clients publish it, reads as https.
+    let schemeless = signed(
+        &keys,
+        0,
+        vec![],
+        "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com:8443/b.png\",\"picture\":\"file:///private/avatar\",\"custom\":true}",
+        unix_now_seconds(),
+    );
+    assert_eq!(
+        validate_onboarding_record(&signed(
+            &keys,
+            0,
+            vec![],
+            "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com:8443/b.png\"}",
+            unix_now_seconds(),
+        )),
+        Vec::new()
+    );
+    c.records[0] = Some(schemeless);
     let proposal = OnboardingRepairProposal {
         step: OnboardingStep::Profile,
         revision: 1,
@@ -4050,6 +4090,8 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert!(json.get("picture").is_none());
     assert_eq!(json["custom"], true);
+    assert_eq!(json["website"], "https://www.example.com");
+    assert_eq!(json["banner"], "https://cdn.example.com:8443/b.png");
     runtime.shutdown_and_close().await.unwrap();
 }
 
