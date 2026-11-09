@@ -129,7 +129,7 @@ key package kind.
 
 ## Privacy-safe diagnostics
 
-Adapter diagnostics are aggregate-only: counts, status buckets, method names, and success/failure totals. They never
+Tracing and metrics are aggregate-only: counts, status buckets, method names, and success/failure totals. They never
 include relay URLs, account ids, group ids, message ids, subscription ids, pubkeys, plaintext, ciphertext, or
 payload-derived values. Tracing uses explicit `target` and `method` fields such as
 `transport_nostr_adapter::adapter` / `publish`.
