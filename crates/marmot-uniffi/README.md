@@ -1249,7 +1249,7 @@ the device group this device trusts, for a Devices screen:
 - The list is empty until this device trusts a device group (a single-device account has none), and in ordinary opens
   without explicit experimental device-group intent.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
-  device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
+  device or group identities. With device groups on, it also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
 Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
@@ -1438,7 +1438,7 @@ a device group that can't take that Commit holds the refresh back. `key_package_
 once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old.
 Inviters stop treating the device as fresh at 30 days, so tell the user. A routine refresh never shows, and neither
 does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
-which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
+which carries no device or group identities and, with device groups on, also fires once each time the account's worker opens or reconnects.
 It is false in ordinary opens without explicit experimental device-group intent.
 
 ## Unrecognized sign-ins
@@ -1467,7 +1467,7 @@ It is false in ordinary opens without explicit experimental device-group intent.
   prompt another device answered. Linking one is device pairing's.
 - The account checks at open, every six hours, and soon after one of its KeyPackages arrives live.
   `check_sign_ins(account_ref)` checks now and returns the list after the check.
-- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
+- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. With device groups on, it also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
 - The list is empty in ordinary opens without explicit experimental device-group intent.
 - `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
