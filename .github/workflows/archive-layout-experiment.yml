@@ -32,6 +32,8 @@ jobs:
         env:
           MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: python3 scripts/ci_runner.py prepare
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
