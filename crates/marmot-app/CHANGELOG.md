@@ -10,7 +10,8 @@
   the account.
 
 - Automatic rejoin announces committed recovery-status changes even when preparing a later group fails
-  (mdk#3219). The preparation error is preserved, and retry budgets are unchanged.
+  (mdk#3219). Unreadable statuses also queue a host refresh. The preparation error is preserved, and retry
+  budgets are unchanged.
 
 - Move `fs4` to dev-dependencies; production free-space checks use `media-store`.
 

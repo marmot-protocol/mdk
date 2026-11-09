@@ -239,19 +239,24 @@ impl AppClient {
         }
         let peers = self.runtime.prepare_group_recovery();
         // Preparation can commit earlier groups before a later group fails.
-        let status_changes = (|| {
-            for (group_id, parked) in before {
-                if parked
-                    != matches!(
-                        self.runtime.group_rejoin_status(&group_id)?,
-                        marmot_session::GroupRejoinStatus::Parked { .. }
-                    )
-                {
-                    self.mark_recovery_status_changed(&group_id);
+        let mut status_changes = Ok(());
+        for (group_id, parked) in before {
+            let changed = match self.runtime.group_rejoin_status(&group_id) {
+                Ok(status) => {
+                    parked != matches!(status, marmot_session::GroupRejoinStatus::Parked { .. })
                 }
+                Err(error) => {
+                    // A later snapshot cannot recover a missed refresh cue.
+                    if status_changes.is_ok() {
+                        status_changes = Err(error);
+                    }
+                    true
+                }
+            };
+            if changed {
+                self.mark_recovery_status_changed(&group_id);
             }
-            Ok::<_, AppError>(())
-        })();
+        }
         let peers = peers?;
         status_changes?;
         let directory = self.app.directory();
@@ -513,91 +518,120 @@ mod tests {
         use std::sync::Arc;
         use storage_sqlite::{GroupRecoveryPhase, GroupRecoveryRole};
 
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = app.client("alice").await.unwrap();
-        let mut groups = [
-            client.create_group("first", &[]).await.unwrap(),
-            client.create_group("second", &[]).await.unwrap(),
-        ];
-        groups.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
-        drop(client);
+        const SPENT_ATTEMPTS: u32 = 32;
 
-        let storage = app.account_storage("alice").unwrap();
-        for group in &groups {
-            let mut halted = storage.get_group(group).unwrap();
-            halted.unrecoverable = true;
-            storage.put_group(&halted).unwrap();
-        }
-        let mut client = app.client("alice").await.unwrap();
-        for group in &groups {
-            client.runtime.retry_group_rejoin(group).unwrap();
-        }
-        let mut records = storage.list_group_recoveries().unwrap();
-        for record in &mut records {
-            assert_eq!(record.role, GroupRecoveryRole::Recipient);
-            record.total_attempts = 32;
-            record.expires_at = 0;
-            record.message.expires_at = 0;
-            storage.put_group_recovery(record).unwrap();
-        }
-        client.pending_recovery_status_updates.clear();
+        for fail_status_read in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let mut client = app.client("alice").await.unwrap();
+            let mut groups = [
+                client.create_group("first", &[]).await.unwrap(),
+                client.create_group("second", &[]).await.unwrap(),
+            ];
+            groups.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
+            drop(client);
 
-        let path = app.account_storage_path("alice");
-        let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let key = app
-            .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+            let storage = app.account_storage("alice").unwrap();
+            for group in &groups {
+                let mut halted = storage.get_group(group).unwrap();
+                halted.unrecoverable = true;
+                storage.put_group(&halted).unwrap();
+            }
+            let mut client = app.client("alice").await.unwrap();
+            for group in &groups {
+                client.runtime.retry_group_rejoin(group).unwrap();
+            }
+            let mut records = storage.list_group_recoveries().unwrap();
+            for record in &mut records {
+                assert_eq!(record.role, GroupRecoveryRole::Recipient);
+                record.total_attempts = SPENT_ATTEMPTS;
+                record.expires_at = 0;
+                record.message.expires_at = 0;
+                storage.put_group_recovery(record).unwrap();
+            }
+            client.pending_recovery_status_updates.clear();
+
+            let path = app.account_storage_path("alice");
+            let keys = app.account_home().load_signing_keys("alice").unwrap();
+            let key = app
+                .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+                .unwrap();
+            let connection = rusqlite::Connection::open(path).unwrap();
+            storage_sqlite::open_hardened_sqlcipher(
+                &connection,
+                &key,
+                storage_sqlite::SqlCipherHardening::cipher_only(),
+            )
             .unwrap();
-        let connection = rusqlite::Connection::open(path).unwrap();
-        storage_sqlite::open_hardened_sqlcipher(
-            &connection,
-            &key,
-            storage_sqlite::SqlCipherHardening::cipher_only(),
-        )
-        .unwrap();
-        connection
-            .execute_batch(&format!(
-                "CREATE TRIGGER fail_second_prepare BEFORE INSERT ON cgka_group_rejoin
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_second_prepare BEFORE INSERT ON cgka_group_rejoin
              WHEN NEW.group_id = x'{}'
              BEGIN SELECT RAISE(FAIL, 'injected second preparation failure'); END;",
-                hex::encode(groups[1].as_slice()),
-            ))
-            .unwrap();
+                    hex::encode(groups[1].as_slice()),
+                ))
+                .unwrap();
+            if fail_status_read {
+                connection
+                    .execute_batch(&format!(
+                        "CREATE TRIGGER fail_status_read AFTER UPDATE ON cgka_group_rejoin
+                 WHEN NEW.group_id = x'{}' AND NEW.role = 0
+                 BEGIN INSERT INTO cgka_group_rejoin (group_id, role, request_id, record)
+                 VALUES (NEW.group_id, 1, zeroblob(32), x'00'); END;",
+                        hex::encode(groups[0].as_slice()),
+                    ))
+                    .unwrap();
+            }
 
-        let error = client.advance_auto_recovery().await.unwrap_err();
-        assert!(
-            matches!(
-                error.as_engine_error(),
-                Some(cgka_traits::EngineError::Storage(cgka_traits::storage::StorageError::Backend(message)))
-                    if message.contains("injected second preparation failure")
-            ),
-            "preparation failure remains authoritative: {error:?}"
-        );
-        let after = storage.list_group_recoveries().unwrap();
-        assert_eq!(after[0].phase, GroupRecoveryPhase::Parked);
-        assert_eq!(after[1].phase, records[1].phase);
-        assert_eq!(after[0].total_attempts, 32);
-        assert_eq!(after[1].total_attempts, 32);
-        assert!(
-            client
-                .group_recovery_status(&groups[0])
-                .unwrap()
-                .automatic_recovery_failed
-        );
-        assert!(
-            !client
-                .group_recovery_status(&groups[1])
-                .unwrap()
-                .automatic_recovery_failed
-        );
-        assert_eq!(
-            client.pending_recovery_status_updates,
-            [groups[0].clone()].into()
-        );
+            let error = client.advance_auto_recovery().await.unwrap_err();
+            assert!(
+                matches!(
+                    error.as_engine_error(),
+                    Some(cgka_traits::EngineError::Storage(cgka_traits::storage::StorageError::Backend(message)))
+                        if message.contains("injected second preparation failure")
+                ),
+                "preparation failure remains authoritative: {error:?}"
+            );
+            if fail_status_read {
+                assert!(matches!(
+                    storage.list_group_recoveries(),
+                    Err(cgka_traits::storage::StorageError::Serialization(_))
+                ));
+                connection
+                    .execute("DELETE FROM cgka_group_rejoin WHERE role = 1", [])
+                    .unwrap();
+            }
+            let after = storage.list_group_recoveries().unwrap();
+            assert_eq!(after[0].phase, GroupRecoveryPhase::Parked);
+            assert_eq!(after[1].phase, records[1].phase);
+            assert_eq!(after[0].total_attempts, SPENT_ATTEMPTS);
+            assert_eq!(after[1].total_attempts, SPENT_ATTEMPTS);
+            assert!(
+                client
+                    .group_recovery_status(&groups[0])
+                    .unwrap()
+                    .automatic_recovery_failed
+            );
+            assert!(
+                !client
+                    .group_recovery_status(&groups[1])
+                    .unwrap()
+                    .automatic_recovery_failed
+            );
+            let notified = if fail_status_read {
+                &groups[..]
+            } else {
+                &groups[..1]
+            };
+            assert_eq!(
+                client.pending_recovery_status_updates,
+                notified.iter().cloned().collect()
+            );
+        }
     }
 
     #[test]
