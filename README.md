@@ -190,16 +190,42 @@ export ODIN="$HOME/.local/share/mdk-odin/odin"
 See the [Markdown crate](crates/marmot-markdown/README.md#build-requirements) for the compiler pin and native ownership
 boundary. CI and the campaign/integration container builds install this toolchain automatically.
 
+<details>
+<summary>Nix / NixOS (x86_64 Linux)</summary>
+
+From this checkout, enter the environment in [`flake.nix`](flake.nix):
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' develop
+```
+
+The FHS shell provides Clang, pkg-config, nextest, cargo-audit, cargo-llvm-cov,
+cbindgen, valgrind, Python with uv, Tamarin, Java for TLC and rustup.
+Rustup reads the toolchain and required components from
+[`rust-toolchain.toml`](rust-toolchain.toml). Cargo keeps its usual `target/`
+output directory so the TUI recipes find the binaries they build.
+The packages are pinned by [`flake.lock`](flake.lock); no global `nix-ld`
+configuration is required.
+
+For a single command, use the app entrypoint rather than `nix develop -c`,
+whose arguments the FHS shell hook does not forward:
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' run . -- rustc --version
+```
+
+The relay recipes need a separate `docker compose` command, provided by rootless
+Podman with Docker compatibility. The FHS shell replaces the host's `/usr`, so
+clients installed in `/usr/bin` are unavailable inside it. Run relay recipes
+outside the shell on those hosts, or install the client through Nix on the host.
+
+</details>
+
 ```sh
 just fast-ci                 # formatting, static gates, CI's two clippy passes; skips the `just test` matrix
 cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
-
-On x86-64 Linux with Nix, [`flake.nix`](flake.nix) provides rustup, `just`, nextest, cargo-audit, cargo-llvm-cov,
-cbindgen, valgrind, Python with uv, Tamarin and Java for TLC. Enter it with
-`nix --extra-experimental-features 'nix-command flakes' develop`. The relay recipes need a separate `docker compose`
-(Docker or rootless Podman with Docker compatibility).
 
 Pull requests run a pre-check of a few minutes: formatting, the static and
 contract gates (the tracing audit among them), dependency audit, workspace
