@@ -4035,6 +4035,10 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     for unsafe_link in [
         "mailto:me@example.com",
         "javascript:alert(1)",
+        "javascript:1",
+        "javascript:/alert(1)",
+        "file:/etc/passwd",
+        "localhost:3000",
         "https://user:secret@example.com",
     ] {
         let content = serde_json::json!({ "website": unsafe_link }).to_string();
@@ -4049,7 +4053,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
         &keys,
         0,
         vec![],
-        "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com/b.png\",\"picture\":\"file:///private/avatar\",\"custom\":true}",
+        "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com:8443/b.png\",\"picture\":\"file:///private/avatar\",\"custom\":true}",
         unix_now_seconds(),
     );
     assert_eq!(
@@ -4057,7 +4061,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
             &keys,
             0,
             vec![],
-            "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com/b.png\"}",
+            "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com:8443/b.png\"}",
             unix_now_seconds(),
         )),
         Vec::new()
@@ -4081,7 +4085,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     assert!(json.get("picture").is_none());
     assert_eq!(json["custom"], true);
     assert_eq!(json["website"], "https://www.example.com");
-    assert_eq!(json["banner"], "https://cdn.example.com/b.png");
+    assert_eq!(json["banner"], "https://cdn.example.com:8443/b.png");
     runtime.shutdown_and_close().await.unwrap();
 }
 

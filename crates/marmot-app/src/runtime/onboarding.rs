@@ -3117,15 +3117,14 @@ fn normalized_profile_url(value: &str) -> Option<String> {
             && url.username().is_empty()
             && url.password().is_none()
     };
-    if url::Url::parse(value).is_ok_and(|url| usable(&url)) {
-        return Some(value.to_owned());
+    match url::Url::parse(value) {
+        Ok(url) if usable(&url) => return Some(value.to_owned()),
+        // A bare `host:port` parses with the host as its scheme. Any other
+        // scheme, such as `file:` or `javascript:`, is not a web link.
+        Ok(url) if !url.scheme().contains('.') => return None,
+        _ => {}
     }
     let value = value.trim();
-    if value.contains("://") {
-        return None;
-    }
-    // `mailto:` and `javascript:` values have no `://`; behind the prefix they
-    // parse as userinfo or an invalid port, so they stay rejected.
     let candidate = format!("https://{}", value.strip_prefix("//").unwrap_or(value));
     url::Url::parse(&candidate)
         .is_ok_and(|url| usable(&url))
