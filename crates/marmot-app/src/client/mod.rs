@@ -2022,7 +2022,8 @@ impl AppClient {
             }));
         }
         // A canonical create can outlive its response and projection. Repair
-        // missing projections only; existing unrelated groups need no MLS reads.
+        // only a missing direct with this peer. Hidden and unrelated groups
+        // remain untouched, even when their projection cannot be repaired.
         let mut missing = self.runtime.live_group_ids()?;
         {
             let projected = self
@@ -2035,18 +2036,43 @@ impl AppClient {
                 .retain(|group_id| !projected.contains(hex::encode(group_id.as_slice()).as_str()));
         }
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let local = self.app.member_id(&self.state.label)?;
+        let peer = self.app.member_id(peer_account_id_hex)?;
         for group_id in missing {
             let group_id_hex = hex::encode(group_id.as_slice());
             if storage
                 .local_group_deletion_frontier(&group_id_hex)?
                 .is_some()
+                || storage.device_group(&group_id_hex)?.is_some()
             {
                 continue;
             }
-            self.runtime.ensure_group_hydrated(&group_id)?;
-            if self.is_device_group(&group_id)? {
+            let group = self
+                .stored_group(&group_id)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+            if group
+                .required_capabilities
+                .app_components
+                .contains(cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID)
+                || !group.name.trim().is_empty()
+            {
                 continue;
             }
+            let (mut has_local, mut has_peer, mut has_other) = (false, false, false);
+            for member in &group.members {
+                if member.id == local {
+                    has_local = true;
+                } else if member.id == peer {
+                    has_peer = true;
+                } else {
+                    has_other = true;
+                    break;
+                }
+            }
+            if !has_local || !has_peer || has_other {
+                continue;
+            }
+            self.runtime.ensure_group_hydrated(&group_id)?;
             self.add_group(&group_id)?;
         }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;

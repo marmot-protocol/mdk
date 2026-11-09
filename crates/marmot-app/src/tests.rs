@@ -22435,6 +22435,7 @@ fn reconcile_repairs_stale_three_member_count_on_two_member_direct() {
     );
 }
 
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_miss_skips_unhydrated() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -22448,6 +22449,20 @@ async fn direct_miss_skips_unhydrated() {
         let mut client = app.client("alice").await.unwrap();
         client.create_group("unrelated", &[]).await.unwrap()
     };
+    let missing = {
+        let failing = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig::white_noise().with_dev_fail_create_local_projection(true),
+        )
+        .with_test_relay_client(relay.clone());
+        let mut client = failing.client("alice").await.unwrap();
+        [
+            client.create_group("unprojected", &[]).await.unwrap(),
+            client.create_group("", &[]).await.unwrap(),
+        ]
+    };
+    assert_eq!(app.groups("alice").unwrap().len(), 1);
     let plane = MarmotRelayPlane::new(None, relay);
     let mut client = app
         .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
@@ -22461,6 +22476,16 @@ async fn direct_miss_skips_unhydrated() {
             .as_engine_error(),
         Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
     ));
+    for group_id in &missing {
+        assert!(matches!(
+            client
+                .runtime
+                .group_record(group_id)
+                .unwrap_err()
+                .as_engine_error(),
+            Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+        ));
+    }
     assert!(
         client
             .reusable_direct_group(&peer.account_id_hex)
@@ -22475,6 +22500,17 @@ async fn direct_miss_skips_unhydrated() {
             .as_engine_error(),
         Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
     ));
+    for group_id in &missing {
+        assert!(matches!(
+            client
+                .runtime
+                .group_record(group_id)
+                .unwrap_err()
+                .as_engine_error(),
+            Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+        ));
+    }
+    assert_eq!(app.groups("alice").unwrap().len(), 1);
 }
 
 async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {

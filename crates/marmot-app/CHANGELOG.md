@@ -8,8 +8,9 @@
   creation on the account worker (mdk#464). New direct conversations include
   both accounts as founding admins. Retries reuse canonical local state,
   including after a lost response or projection failure. Recovery restores
-  missing projections and announces the repaired row without reading
-  unrelated projected MLS groups. Generic creation and existing
+  only missing direct projections for the requested peer and announces the
+  repaired row. Device groups and unrelated groups remain untouched.
+  Generic creation and existing
   conversations retain their current admin semantics.
 
 ## 0.15.0 - 2026-11-09
