@@ -32,6 +32,11 @@ on:
       - scripts/install-odin.sh
   merge_group:
   workflow_dispatch:
+    inputs:
+      archive_layout_experiment:
+        description: Compare full and binary-local test archives
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -54,6 +59,11 @@ env:
   WORKSPACE_FILTER: not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))
 
 jobs:
+  archive-layout-experiment:
+    if: github.event_name == 'workflow_dispatch' && inputs.archive_layout_experiment
+    needs: signatures
+    uses: ./.github/workflows/archive-layout-experiment.yml
+
   signatures:
     name: PR signatures
     permissions:
