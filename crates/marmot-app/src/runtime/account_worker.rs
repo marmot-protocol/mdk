@@ -1817,18 +1817,36 @@ async fn run_app_runtime_account_worker(
             break 'worker;
         }
         // Re-arm the schedule from whichever path ran the recovery seam or
-        // the post-join advance since the last turn, and wake post-join
-        // when maintenance pauses or resumes.
+        // the post-join advance since the last turn. Pausing or resuming
+        // maintenance wakes post-join and history dispatch: neither has a
+        // deadline while paused, so a resume must re-read both.
         let now = TokioInstant::now();
         if client.runtime.maintenance_is_paused() != maintenance_paused {
             maintenance_paused = !maintenance_paused;
             schedule.wake(schedule::Job::PostJoin);
+            schedule.wake(schedule::Job::HistoryDispatch);
         }
         if let Some(owed) = client.recovery_seam_owed.take() {
             schedule.ran(schedule::Job::Recovery, owed, now);
         }
         if std::mem::take(&mut client.post_join_advanced) {
             schedule.ran(schedule::Job::PostJoin, client.post_join_owed(), now);
+        }
+        // Wake the jobs whose work arrives without time passing.
+        if std::mem::take(&mut client.key_package_lifecycle_changed) {
+            schedule.wake(schedule::Job::KeyPackageCatchUp);
+        }
+        if client
+            .history_dispatch_changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            schedule.wake(schedule::Job::HistoryDispatch);
+        }
+        if !schedule.pending(schedule::Job::Push) && client.push_timing_owed() {
+            schedule.wake(schedule::Job::Push);
+        }
+        if !schedule.pending(schedule::Job::DevicePairing) && client.device_pairing_owed() {
+            schedule.wake(schedule::Job::DevicePairing);
         }
         if recovery_runner.is_none() && client.recovery_runner_due() {
             // A successful paced preparation retry starts the runner here,
@@ -2066,6 +2084,9 @@ async fn run_app_runtime_account_worker(
                         );
                         avatar_due = true;
                         attachment_due = true;
+                        // A slot freed, and a history transfer may have
+                        // finished or backed off.
+                        schedule.wake(schedule::Job::HistoryDispatch);
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2877,6 +2898,8 @@ async fn run_app_runtime_account_worker(
                         false
                     }
                 };
+                // A pass may have deleted media rows, which frees pages.
+                schedule.wake(schedule::Job::Housekeeping);
                 if !attachment_due {
                     let next = attachments::next_pass_at(&client, &attachment_admission);
                     schedule.arm(
@@ -2922,197 +2945,177 @@ async fn run_app_runtime_account_worker(
                     (schedule::Job::AttachmentPass, &mut attachment_due),
                     (schedule::Job::AvatarPass, &mut avatar_due),
                     (schedule::Job::PresentationPass, &mut presentation_due),
+                    (schedule::Job::LocalSubmission, &mut local_submission_due),
                 ] {
                     if schedule.due(job, now) {
                         schedule.arm(job, None);
                         *due = true;
                     }
                 }
+                // The jobs the maintenance tick used to run, in its order.
+                let telemetry = shared.observer.performance().clone();
+                let retry = || Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED);
+                if schedule.due(schedule::Job::ContentBackfill, now) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
+                    let backfill = client.backfill_content_reports();
+                    step.finish_app(&backfill);
+                    let next = if backfill.is_err() {
+                        tracing::warn!(target: "marmot_app::account_worker",
+                            method = "report_backfill", "report backfill deferred");
+                        retry()
+                    } else {
+                        // The next batch on a later turn, until done. A
+                        // deadline at now waits for a timer turn, so every
+                        // ready arm above this one, and the tick, go first.
+                        client.content_report_backfill_owed().then(TokioInstant::now)
+                    };
+                    schedule.arm(schedule::Job::ContentBackfill, next);
+                }
+                if schedule.due(schedule::Job::LegacyPromotion, now) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
+                    let outcome =
+                        run_legacy_message_promotion_batch(&client, &mut legacy_message_promotion);
+                    step.finish(outcome);
+                    let next = match legacy_message_promotion.status {
+                        LegacyMessagePromotionStatus::Pending
+                            if outcome == TelemetryOutcome::Failure => retry(),
+                        // The next batch on a later turn, behind every ready
+                        // arm above this one and the tick: a deadline at now
+                        // still waits for a timer turn.
+                        LegacyMessagePromotionStatus::Pending => Some(TokioInstant::now()),
+                        LegacyMessagePromotionStatus::Complete
+                        | LegacyMessagePromotionStatus::Halted => None,
+                    };
+                    schedule.arm(schedule::Job::LegacyPromotion, next);
+                }
+                if schedule.due(schedule::Job::DevicePairing, now) {
+                    // Pairing timers, KeyPackage retries and link settlement.
+                    client.drive_device_pairing().await;
+                    if client.device_unlinked() {
+                        // Nothing more goes out; the next turn stops the worker.
+                        continue 'worker;
+                    }
+                    schedule.arm(
+                        schedule::Job::DevicePairing,
+                        if client.device_pairing_owed() { retry() } else { None },
+                    );
+                }
+                if schedule.due(schedule::Job::Housekeeping, now) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
+                    attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
+                    step.finish(TelemetryOutcome::Success);
+                    attachments::spawn_legacy_migration(&client, &shared, &mut attachment_admission);
+                    schedule.arm(
+                        schedule::Job::Housekeeping,
+                        attachments::next_housekeeping_at(&client, &attachment_admission),
+                    );
+                }
+                if schedule.due(schedule::Job::KeyPackageCatchUp, now) {
+                    if client.key_package_maintenance_requires_catch_up() {
+                        run_key_package_catch_up(
+                            &mut client,
+                            &shared,
+                            &mut scheduled_convergence,
+                            context,
+                        )
+                        .await;
+                        if client.device_unlinked() {
+                            // The catch-up applied this device's removal:
+                            // nothing more goes out (D67).
+                            continue 'worker;
+                        }
+                    }
+                    let next = if client.key_package_maintenance_requires_catch_up() {
+                        retry()
+                    } else {
+                        let now = crate::unix_now_seconds();
+                        client
+                            .key_package_catch_up_next_at()
+                            .filter(|at| *at > now)
+                            .map(scheduled_instant)
+                    };
+                    schedule.arm(schedule::Job::KeyPackageCatchUp, next);
+                }
+                if schedule.due(schedule::Job::Push, now) {
+                    // A join window ends once T has been counted since its
+                    // join completed, which only sampling fetch time shows.
+                    // Repair asks wait for the same clock, and replies for
+                    // their rank's slots.
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
+                    client.advance_push_join_windows().await;
+                    if client.has_due_push_announce() || client.has_due_push_repair() {
+                        scheduled_push_retry.observe_pending(true, &command_tx);
+                    }
+                    step.finish(TelemetryOutcome::Success);
+                    schedule.arm(
+                        schedule::Job::Push,
+                        if client.push_timing_owed() { retry() } else { None },
+                    );
+                }
+                if schedule.due(schedule::Job::HistoryDispatch, now) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
+                    dispatch_history_blobs(&mut client, &media_http);
+                    step.finish(TelemetryOutcome::Success);
+                    schedule.arm(
+                        schedule::Job::HistoryDispatch,
+                        client.history_dispatch_next_at().map(scheduled_instant),
+                    );
+                }
             }
             _ = maintenance_tick.tick() => {
-                // The passes run on their own wakes and deadlines; the
-                // watchdog below checks that none was missed.
-                local_submission_due = true;
+                // Every scheduled job runs on its own wakes and deadlines; the
+                // tick runs session maintenance (until it gets its own
+                // deadlines), the relay-config retry and the watchdog below,
+                // which checks that no job missed a wake.
                 if relay_config_work == RelayConfigWork::RetryOnTick {
                     relay_config_work = RelayConfigWork::Ready;
                 }
-                // Periodic maintenance is never urgent, and its longest leg
-                // runs past the whole shutdown budget: the key-package
-                // catch-up below is capped at 15s. Skip the tick outright once
-                // shutdown is requested rather than starting work the drain
-                // would then have to wait out.
+                // Periodic maintenance is never urgent: skip the tick
+                // outright once shutdown is requested rather than starting
+                // work the drain would then have to wait out.
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
                 let _unit = unit.enter(WorkerUnit::Maintenance);
-                // Each phase below is also timed on its own, so a profile can
-                // name the one an idle tick spends its time in (mdk#2923).
                 let telemetry = shared.observer.performance().clone();
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
-                let backfill = client.backfill_content_reports();
-                step.finish_app(&backfill);
-                if backfill.is_err() {
-                    tracing::warn!(
-                        target: "marmot_app::account_worker",
-                        method = "maintenance_tick",
-                        "report backfill deferred"
-                    );
-                }
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
-                step.finish(run_legacy_message_promotion_batch(
-                    &client,
-                    &mut legacy_message_promotion,
-                ));
-                // Pairing timers, KeyPackage retries and link settlement.
-                client.drive_device_pairing().await;
-                if client.device_unlinked() {
-                    // Nothing more goes out; the next turn stops the worker.
-                    phase.finish(TelemetryOutcome::Success);
-                    continue 'worker;
-                }
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
-                attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
-                step.finish(TelemetryOutcome::Success);
-                attachments::spawn_legacy_migration(
-                    &client,
-                    &shared,
-                    &mut attachment_admission,
-                );
-                if client.key_package_maintenance_requires_catch_up() {
-                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
-                    let observation = shared.observer.product().begin(
-                        crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
-                    );
-                    let catch_up = timeout(
-                        Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
-                    ).await;
-                    let outcome = match &catch_up {
-                        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
-                        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
-                        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
-                    };
-                    step.finish(match outcome {
-                        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
-                        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
-                        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
-                    });
-                    if let Some(observation) = observation {
-                        observation.finish(outcome.as_str());
-                    }
-                    if client.device_unlinked() {
-                        // The catch-up applied this device's removal:
-                        // nothing more goes out (D67).
-                        phase.finish(TelemetryOutcome::Success);
-                        continue 'worker;
-                    }
-                    match catch_up {
-                        Ok(Ok(summary)) => {
-                            publish_app_runtime_summary_with_v5(&client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &summary,
-                            );
-                            start_post_join_history_after_visibility(
-                                &mut client,
-                                &summary,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            )
-                            .await;
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            schedule_pending_convergence_groups(
-                                &mut scheduled_convergence,
-                                &mut client,
-                            );
-                        }
-                        Ok(Err(failure)) => {
-                            publish_sync_summary_with_audit(&client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &failure.partial_summary,
-                                &shared,
-                                "key_package_maintenance_catch_up",
-                            );
-                            start_post_join_history_after_visibility(
-                                &mut client,
-                                &failure.partial_summary,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            )
-                            .await;
-                            publish_app_runtime_account_error(
-                                Emit::Quiescent(&client),
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message(
-                                    "key package maintenance catch-up failed",
-                                    &failure.source,
-                                ),
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "marmot_app::runtime",
-                                method = "key_package_maintenance_catch_up",
-                                "key package maintenance catch-up reached its time cap"
-                            );
-                        }
-                    }
-                }
-                // A join window ends once T has been counted since its join
-                // completed, which only time passing shows; the tick counts
-                // it and notices joins that completed. Repair asks wait for
-                // the same clock, and replies for their rank's slots.
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
-                client.advance_push_join_windows().await;
-                if client.has_due_push_announce() || client.has_due_push_repair() {
-                    scheduled_push_retry.observe_pending(true, &command_tx);
-                }
-                step.finish(TelemetryOutcome::Success);
-                scheduled_runtime_group_subscription_refresh.observe_pending(
-                    client.has_pending_runtime_group_subscription_refresh(),
-                    &command_tx,
-                );
-                // The watchdog: a scheduled job with work but no wake or
-                // deadline pending was missed. Count it and run it now.
+                // The watchdog: a job with work but no wake or deadline
+                // pending was missed. Count it; it runs on the next turn.
                 for job in schedule::Job::ALL {
                     let owed = match job {
                         schedule::Job::Recovery => client.recovery_owed(),
                         schedule::Job::PostJoin => client.post_join_owed(),
-                        // A pass already set due is not missed.
+                        // A pass or submission already set due is not missed.
                         schedule::Job::AttachmentPass => !attachment_due
                             && attachments::pass_owed_now(&client, &attachment_admission),
                         schedule::Job::AvatarPass => !avatar_due && avatar_pass_owed_now(&client),
                         schedule::Job::PresentationPass => {
                             !presentation_due && presentation_pass_owed_now(&client)
                         }
+                        schedule::Job::LocalSubmission => {
+                            !local_submission_due && client.local_submission_pending()
+                        }
+                        schedule::Job::ContentBackfill => client.content_report_backfill_owed(),
+                        schedule::Job::LegacyPromotion => {
+                            legacy_message_promotion.status == LegacyMessagePromotionStatus::Pending
+                        }
+                        schedule::Job::DevicePairing => client.device_pairing_owed(),
+                        schedule::Job::Housekeeping => {
+                            attachments::housekeeping_owed_now(&client, &attachment_admission)
+                        }
+                        schedule::Job::KeyPackageCatchUp => {
+                            client.key_package_maintenance_requires_catch_up()
+                        }
+                        schedule::Job::Push => client.push_timing_owed(),
+                        schedule::Job::HistoryDispatch => client
+                            .history_dispatch_next_at()
+                            .is_some_and(|at| at <= crate::unix_now_seconds()),
                     };
                     let Some(first) = schedule.missed(job, owed, TokioInstant::now()) else {
                         continue;
                     };
                     telemetry.record_runtime(
-                        match job {
-                            schedule::Job::Recovery => RuntimeOp::WatchdogMissedWakeRecovery,
-                            schedule::Job::PostJoin => RuntimeOp::WatchdogMissedWakePostJoin,
-                            schedule::Job::AttachmentPass => {
-                                RuntimeOp::WatchdogMissedWakeAttachmentPass
-                            }
-                            schedule::Job::AvatarPass => RuntimeOp::WatchdogMissedWakeAvatarPass,
-                            schedule::Job::PresentationPass => {
-                                RuntimeOp::WatchdogMissedWakePresentationPass
-                            }
-                        },
+                        watchdog_missed_wake_op(job),
                         Duration::ZERO,
                         TelemetryOutcome::Success,
                     );
@@ -3120,37 +3123,13 @@ async fn run_app_runtime_account_worker(
                         tracing::warn!(target: "marmot_app::runtime", method = "maintenance_watchdog",
                             job = job.as_str(), "scheduled job had work with no wake pending");
                     }
-                    // A missed pass runs on the worker's next turn.
-                    let pass = match job {
-                        schedule::Job::AttachmentPass => Some(&mut attachment_due),
-                        schedule::Job::AvatarPass => Some(&mut avatar_due),
-                        schedule::Job::PresentationPass => Some(&mut presentation_due),
-                        schedule::Job::Recovery | schedule::Job::PostJoin => None,
-                    };
-                    if let Some(due) = pass {
-                        *due = true;
-                        continue;
+                    match job {
+                        schedule::Job::AttachmentPass => attachment_due = true,
+                        schedule::Job::AvatarPass => avatar_due = true,
+                        schedule::Job::PresentationPass => presentation_due = true,
+                        schedule::Job::LocalSubmission => local_submission_due = true,
+                        _ => schedule.wake(job),
                     }
-                    let context = EpochBackfillReportContext {
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                    };
-                    let owed = match job {
-                        schedule::Job::Recovery => {
-                            run_scheduled_recovery(&mut client, context).await
-                        }
-                        schedule::Job::PostJoin => {
-                            let owed = run_scheduled_post_join(&mut client, context).await;
-                            client.post_join_advanced = false;
-                            owed
-                        }
-                        schedule::Job::AttachmentPass
-                        | schedule::Job::AvatarPass
-                        | schedule::Job::PresentationPass => unreachable!("passes set due above"),
-                    };
-                    schedule.ran(job, owed, TokioInstant::now());
                 }
                 finish_periodic_maintenance(
                     &mut client,
@@ -3162,10 +3141,6 @@ async fn run_app_runtime_account_worker(
                     &mut scheduled_convergence,
                 )
                 .await;
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
-                dispatch_history_blobs(&mut client, &media_http);
-                step.finish(TelemetryOutcome::Success);
-
                 phase.finish(TelemetryOutcome::Success);
             }
         }
@@ -3308,6 +3283,144 @@ fn presentation_pass_owed_now(client: &AppClient) -> bool {
         .account_storage(&client.state.label)
         .and_then(|storage| Ok(storage.app_storage().chat_presentation_work_pending()?))
         .unwrap_or(true)
+}
+
+/// The KeyPackage maintenance catch-up, capped at 15 s, and what it found.
+/// Moved off the maintenance tick unchanged; the worker's schedule runs it
+/// when it is due (mdk#2923 step B).
+async fn run_key_package_catch_up(
+    client: &mut AppClient,
+    shared: &RuntimeSharedServices,
+    scheduled_convergence: &mut ScheduledConvergence,
+    context: EpochBackfillReportContext<'_>,
+) {
+    let EpochBackfillReportContext {
+        events,
+        account_id_hex,
+        account_label,
+        ..
+    } = context;
+    let step = shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
+    let observation = shared.observer.product().begin(
+        crate::ProductFamily::Maintenance,
+        "catch_up",
+        crate::ProductUnit::Attempt,
+    );
+    let catch_up = timeout(
+        Duration::from_secs(15),
+        client.sync_automatically_with_partial_progress(),
+    )
+    .await;
+    let outcome = match &catch_up {
+        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
+        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
+        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+    };
+    step.finish(match outcome {
+        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
+        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
+        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
+    });
+    if let Some(observation) = observation {
+        observation.finish(outcome.as_str());
+    }
+    if client.device_unlinked() {
+        return;
+    }
+    match catch_up {
+        Ok(Ok(summary)) => {
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
+            start_post_join_history_after_visibility(
+                client,
+                &summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            schedule_pending_convergence_groups(scheduled_convergence, client);
+        }
+        Ok(Err(failure)) => {
+            publish_sync_summary_with_audit(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &failure.partial_summary,
+                shared,
+                "key_package_maintenance_catch_up",
+            );
+            start_post_join_history_after_visibility(
+                client,
+                &failure.partial_summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
+            publish_app_runtime_account_error(
+                Emit::Quiescent(client),
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message("key package maintenance catch-up failed", &failure.source),
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "key_package_maintenance_catch_up",
+                "key package maintenance catch-up reached its time cap"
+            );
+        }
+    }
+}
+
+/// The schedule's instant for unix second `at`: then, or in 15 s for a time
+/// already past, so work due but not taken waits for its retry, not a busy
+/// loop.
+fn scheduled_instant(at: u64) -> TokioInstant {
+    let now = crate::unix_now_seconds();
+    if at <= now {
+        TokioInstant::now() + schedule::RETRY_WHILE_OWED
+    } else {
+        TokioInstant::now() + Duration::from_secs(at - now)
+    }
+}
+
+/// The runtime operation that counts `job`'s missed wakes.
+fn watchdog_missed_wake_op(job: schedule::Job) -> RuntimeOp {
+    use schedule::Job;
+    match job {
+        Job::Recovery => RuntimeOp::WatchdogMissedWakeRecovery,
+        Job::PostJoin => RuntimeOp::WatchdogMissedWakePostJoin,
+        Job::AttachmentPass => RuntimeOp::WatchdogMissedWakeAttachmentPass,
+        Job::AvatarPass => RuntimeOp::WatchdogMissedWakeAvatarPass,
+        Job::PresentationPass => RuntimeOp::WatchdogMissedWakePresentationPass,
+        Job::LocalSubmission => RuntimeOp::WatchdogMissedWakeLocalSubmission,
+        Job::ContentBackfill => RuntimeOp::WatchdogMissedWakeContentBackfill,
+        Job::LegacyPromotion => RuntimeOp::WatchdogMissedWakeLegacyPromotion,
+        Job::DevicePairing => RuntimeOp::WatchdogMissedWakeDevicePairing,
+        Job::Housekeeping => RuntimeOp::WatchdogMissedWakeHousekeeping,
+        Job::KeyPackageCatchUp => RuntimeOp::WatchdogMissedWakeKeyPackageCatchUp,
+        Job::Push => RuntimeOp::WatchdogMissedWakePush,
+        Job::HistoryDispatch => RuntimeOp::WatchdogMissedWakeHistoryDispatch,
+    }
 }
 
 /// Sleeps until the schedule's next job, or forever when every job rests.
@@ -7362,8 +7475,17 @@ async fn publish_next_local_submission(
         let Ok(_admission) = gate.try_lock() else {
             return Some(Duration::from_millis(100));
         };
-        let storage = app.account_storage(account_label).ok()?;
-        let submission = storage.app_storage().next_local_submission().ok()??;
+        // A failed read retries in 15 s, as the maintenance tick retried it,
+        // rather than leaving the queue to the next wake (mdk#2923).
+        let read_failed = Some(schedule::RETRY_WHILE_OWED);
+        let Ok(storage) = app.account_storage(account_label) else {
+            return read_failed;
+        };
+        let submission = match storage.app_storage().next_local_submission() {
+            Ok(Some(submission)) => submission,
+            Ok(None) => return None,
+            Err(_) => return read_failed,
+        };
         let queued = shared
             .local_submission_queue
             .lock()

@@ -1288,9 +1288,12 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     let forged_at = published_at(&phone) + 2;
     publish_into_slot(&account, &slot, "not a key package", forged_at);
 
+    phone.key_package_lifecycle_changed = false;
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&slot], SlotOutcome::OwnSlotForeign);
     assert!(report.foreign.replacing);
+    // The supersession wakes the worker's KeyPackage catch-up (mdk#2923).
+    assert!(phone.key_package_lifecycle_changed);
     assert!(report.own_slot_complete);
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
     // It holds no KeyPackage, so it warns of nothing.
@@ -1301,9 +1304,11 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     // Its own publication, now the slot's newest, is never mistaken for a
     // foreign one.
     let before = account.relay.published_events.lock().unwrap().len();
+    phone.key_package_lifecycle_changed = false;
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&slot], SlotOutcome::OwnSlot);
     assert!(!report.foreign.replacing);
+    assert!(!phone.key_package_lifecycle_changed, "nothing to replace");
     phone.run_due_maintenance().await.unwrap();
     assert_eq!(account.relay.published_events.lock().unwrap().len(), before);
 }

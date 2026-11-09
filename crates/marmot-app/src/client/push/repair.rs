@@ -44,6 +44,13 @@ pub(crate) struct PushRepairs {
     replied_at_ms: HashMap<PushRepairPeer, i64>,
 }
 
+impl PushRepairs {
+    /// Whether an ask is held, to decide or reply to (mdk#2923).
+    pub(crate) fn holds_asks(&self) -> bool {
+        !self.asks.is_empty()
+    }
+}
+
 /// The latest announce or request one leaf sent in a group, for which this
 /// device's leaf ranks in the top three, from receipt until this device
 /// replies to it or finds it owes none.

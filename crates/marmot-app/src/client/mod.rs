@@ -113,6 +113,7 @@ mod small_state;
 mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
+mod worker_due;
 
 pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
@@ -1026,6 +1027,10 @@ pub struct AppClient {
     /// EOSE. `None` reads the relays.
     #[cfg(test)]
     pub(crate) test_push_device_can_fetch: Option<bool>,
+    /// The time the push fetch clock reads, for tests that step it instead
+    /// of waiting real time. `None` reads the wall clock.
+    #[cfg(test)]
+    pub(crate) test_push_now_ms: Option<i64>,
     /// Tests fail every write of an owed push announce.
     #[cfg(test)]
     pub(crate) test_fail_push_announce_owed_write: bool,
@@ -1068,6 +1073,14 @@ pub struct AppClient {
     /// Post-join collection advanced, from any path, since the account
     /// worker last looked (mdk#2923).
     pub(crate) post_join_advanced: bool,
+    /// Something that can make the KeyPackage catch-up due without time
+    /// passing changed since the worker last looked: a maintenance pass (a
+    /// capability or device-tag change), a sign-in check that found the
+    /// slot superseded or emptied, or the slot's withdrawal (mdk#2923).
+    pub(crate) key_package_lifecycle_changed: bool,
+    /// A history delivery was owed or parked since the worker last looked
+    /// (mdk#2923).
+    pub(crate) history_dispatch_changed: std::sync::atomic::AtomicBool,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1724,6 +1737,9 @@ impl AppClient {
                 },
             );
         }
+        // Maintenance may change what the KeyPackage catch-up owes: a device
+        // tag or capability change, or a sign-in check (mdk#2923).
+        self.key_package_lifecycle_changed = true;
         let effects = effects?;
         boxed(|| self.finish_maintenance_effects(&effects)).await
     }
@@ -1828,9 +1844,12 @@ impl AppClient {
         // The slot's deletion is a step of a sign-out, which may go out
         // after a removal held the rest back (mdk#2628 D67).
         let sign_out_step = self.sign_out_step_permit()?;
-        Ok(sign_out_step
+        let withdrawn = sign_out_step
             .run(self.runtime.withdraw_key_package_slot())
-            .await?)
+            .await?;
+        // A withdrawn slot makes the KeyPackage catch-up due (mdk#2923).
+        self.key_package_lifecycle_changed = true;
+        Ok(withdrawn)
     }
 
     /// Validate and encrypt a founding image, then durably stage its exact

@@ -384,6 +384,11 @@ impl AppClient {
             }
         }
         report.refilling = self.refill_own_slot(&own, read.own_slot.as_ref(), roster.as_ref())?;
+        // A superseded or emptied slot makes the KeyPackage catch-up due
+        // without time passing (mdk#2923).
+        if report.foreign.replacing || report.refilling {
+            self.key_package_lifecycle_changed = true;
+        }
         Ok(report)
     }
 

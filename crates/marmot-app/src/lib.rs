@@ -2379,6 +2379,8 @@ impl MarmotApp {
             #[cfg(test)]
             test_push_device_can_fetch: None,
             #[cfg(test)]
+            test_push_now_ms: None,
+            #[cfg(test)]
             test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
             announced_welcome_failures: HashSet::new(),
@@ -2395,6 +2397,8 @@ impl MarmotApp {
             fail_next_convergence_retry_advance: false,
             recovery_seam_owed: None,
             post_join_advanced: false,
+            key_package_lifecycle_changed: false,
+            history_dispatch_changed: Default::default(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]

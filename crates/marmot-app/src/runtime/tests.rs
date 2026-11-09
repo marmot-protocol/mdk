@@ -3909,16 +3909,11 @@ async fn a_ready_worker_completes_one_span_per_startup_stage() {
 
 /// The maintenance phases every completed tick passes through, in tick order
 /// (mdk#2923). The key-package catch-up runs only when one is due.
-const MAINTENANCE_TICK_PHASES: [RuntimeOp; 9] = [
-    RuntimeOp::WorkerMaintenanceContentBackfill,
-    RuntimeOp::WorkerMaintenanceLegacyPromotion,
-    RuntimeOp::WorkerMaintenanceCompaction,
-    RuntimeOp::WorkerMaintenancePush,
+const MAINTENANCE_TICK_PHASES: [RuntimeOp; 4] = [
     RuntimeOp::WorkerMaintenanceDue,
     RuntimeOp::WorkerMaintenanceAppPasses,
     RuntimeOp::WorkerMaintenanceSession,
     RuntimeOp::WorkerMaintenanceEffects,
-    RuntimeOp::WorkerMaintenanceHistoryDispatch,
 ];
 
 /// A worker's first maintenance tick, which fires on entry, records one span
@@ -4197,11 +4192,40 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     tick().await;
     tick().await;
     let before = snapshot();
+    // Every job the tick used to run, and every watchdog counter.
+    let moved: Vec<RuntimeOp> = [
+        RuntimeOp::WorkerMaintenanceContentBackfill,
+        RuntimeOp::WorkerMaintenanceLegacyPromotion,
+        RuntimeOp::WorkerMaintenanceCompaction,
+        RuntimeOp::WorkerMaintenanceKeyPackageCatchUp,
+        RuntimeOp::WorkerMaintenancePush,
+        RuntimeOp::WorkerMaintenanceHistoryDispatch,
+    ]
+    .into_iter()
+    .chain(
+        RuntimeOp::ALL
+            .iter()
+            .copied()
+            .filter(|operation| operation.as_str().starts_with("watchdog_missed_wake_")),
+    )
+    .collect();
+    let moved_before: Vec<u64> = moved.iter().map(|operation| count(*operation)).collect();
     for _ in 0..3 {
         tick().await;
     }
     let after = snapshot();
     let delta = |index: usize| after[index] - before[index];
+    let moved_ran: Vec<(&str, u64)> = moved
+        .iter()
+        .zip(&moved_before)
+        .map(|(operation, before)| (operation.as_str(), count(*operation) - before))
+        .filter(|(_, ran)| *ran > 0)
+        .collect();
+    assert_eq!(
+        moved_ran,
+        Vec::<(&str, u64)>::new(),
+        "an idle tick runs none of the jobs it used to, and misses no wake"
+    );
     assert_eq!(delta(0), 3, "three idle ticks ran");
     assert_eq!(
         delta(1),

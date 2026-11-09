@@ -281,9 +281,7 @@ impl AppClient {
     /// T counts from then.
     pub(crate) async fn advance_push_join_windows(&mut self) {
         let can_fetch = self.push_device_can_fetch().await;
-        let counted_ms = self
-            .push_fetch_clock
-            .advance(can_fetch, notifications::unix_now_ms());
+        let counted_ms = self.push_fetch_clock.advance(can_fetch, self.push_now_ms());
         if counted_ms > 0
             && let Err(error) = self
                 .app
@@ -339,6 +337,15 @@ impl AppClient {
     /// catch-up timeout has passed since the client opened, any subscription
     /// served by one: a subscription whose relays never answer cannot hold
     /// back every announce in the account.
+    /// The time the push fetch clock reads: the wall clock, or a test's.
+    fn push_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now_ms) = self.test_push_now_ms {
+            return now_ms;
+        }
+        notifications::unix_now_ms()
+    }
+
     async fn push_device_can_fetch(&self) -> bool {
         #[cfg(test)]
         if let Some(can_fetch) = self.test_push_device_can_fetch {

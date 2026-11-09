@@ -163,6 +163,16 @@ impl DevicePairing {
         }
     }
 
+    /// Whether linking holds anything in memory that its timers still run:
+    /// a link this device is making, a prompt, an outbound message, or a
+    /// settlement window (mdk#2923).
+    pub(crate) fn has_state(&self) -> bool {
+        self.new_device.is_some()
+            || !self.prompts.is_empty()
+            || !self.outbox.is_empty()
+            || !self.quiet_since.is_empty()
+    }
+
     fn send(&mut self, message: PairingMessage, now: u64) {
         self.outbox.push_back((message, now));
     }

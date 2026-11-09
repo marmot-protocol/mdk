@@ -849,6 +849,79 @@ pub(super) fn pass_owed_now(client: &AppClient, admission: &Admission) -> bool {
             .is_some_and(|at| at <= std::time::Instant::now())
 }
 
+/// What the housekeeping job (the compaction and the housekeeping batch)
+/// owes (mdk#2923 step B): `poll` while a migration, the startup truncate,
+/// keep-media `more`, a flagged compaction or a running batch needs the next
+/// look in 15 s, as the tick gave it; `at` for the earliest in-memory
+/// deadline (the keep-media sweep, the hourly recheck, a compaction retry).
+/// Deadlines not yet set (a fresh worker) are due now.
+fn housekeeping_work(
+    client: &AppClient,
+    admission: &Admission,
+) -> (bool, Option<std::time::Instant>) {
+    use std::sync::atomic::Ordering;
+    if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen {
+        return (false, None);
+    }
+    let now = std::time::Instant::now();
+    let latches = &admission.latches;
+    let compaction_flagged =
+        !admission.compaction_attempted && admission.compaction_due.load(Ordering::Acquire);
+    let poll = admission
+        .legacy_migration
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+        || admission.keep_media_more.load(Ordering::Acquire)
+        || !HousekeepingLatches::done(&latches.legacy_bodies_done)
+        || !HousekeepingLatches::done(&latches.database_avatars_done)
+        || !admission.startup_wal_settled.load(Ordering::Acquire)
+        || (compaction_flagged && admission.compaction_retry_at.is_none());
+    let at = [
+        Some(admission.keep_media_due.unwrap_or(now)),
+        Some(latches.recheck_due.unwrap_or(now)),
+        admission.compaction_retry_at.filter(|_| compaction_flagged),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    (poll, at)
+}
+
+/// When the housekeeping job should next run on its own.
+pub(super) fn next_housekeeping_at(
+    client: &AppClient,
+    admission: &Admission,
+) -> Option<TokioInstant> {
+    let (poll, at) = housekeeping_work(client, admission);
+    let now = TokioInstant::now();
+    let retry = now + super::schedule::RETRY_WHILE_OWED;
+    [
+        poll.then_some(retry),
+        at.map(|at| {
+            let at = TokioInstant::from_std(at);
+            if at <= now { retry } else { at }
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// The watchdog's read: whether the housekeeping job has work due now,
+/// including a media-row deletion on this connection since the last batch
+/// (one read of a TEMP counter).
+pub(super) fn housekeeping_owed_now(client: &AppClient, admission: &Admission) -> bool {
+    let (poll, at) = housekeeping_work(client, admission);
+    poll || at.is_some_and(|at| at <= std::time::Instant::now())
+        || client
+            .app
+            .account_storage(&client.state.label)
+            .map_or(true, |storage| {
+                storage.app_storage().media_cleanup_epoch().ok()
+                    != admission.latches.batch_cleanup_seen
+            })
+}
+
 /// The scheduler's clock. Tests may pin it per account directory to cross
 /// readmission backoffs without sleeping; transfers, leases and publication
 /// keep wall time.

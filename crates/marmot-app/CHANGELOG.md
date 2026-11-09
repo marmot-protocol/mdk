@@ -78,6 +78,16 @@
 
 ### Changed
 
+- Every job the 15 s maintenance tick ran, other than session maintenance (`run_due_maintenance`), now runs on the
+  account worker's own schedule (mdk#2923 step B): local-submission retries, the content-report backfill, legacy
+  message promotion, device pairing timers, the compaction and housekeeping batch, the KeyPackage catch-up, push join
+  windows and announce/repair retries, and history dispatch. Each runs when an event wakes it and at the deadline
+  its data gives; the sweeps that finish (backfill, promotion) run batch after batch until done; pairing runs every
+  15 s only while pairing state exists, and push only while a join window is open, an announce is owed or a repair
+  ask is held. A slot withdrawal, a sign-in check that finds the slot superseded or emptied, and every maintenance
+  pass wake the KeyPackage catch-up. The tick runs session maintenance and the watchdog, which counts a missed wake
+  for each job (`watchdog_missed_wake_*`).
+
 - The attachment, avatar and presentation passes no longer run on every maintenance tick (mdk#2923 step B). Each
   runs when an event wakes it and at the deadline its data gives: the attachment pass at the earliest acquisition
   `due` among its candidates (a request, a lease end, a retry, a deferral or a readmission backoff), an acquisition
