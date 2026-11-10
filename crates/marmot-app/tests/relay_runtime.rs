@@ -15757,7 +15757,7 @@ async fn onboarding_fixture() -> (
     let keys = Keys::generate();
     let id = keys.public_key().to_hex();
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -15816,8 +15816,8 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
             .unwrap()
             .is_none()
     );
-    let mut subscription = runtime.accounts().subscribe_onboarding(&id).unwrap();
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let mut subscription = runtime.account_setup().subscribe_onboarding(&id).unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         snapshot.steps[0].status,
         marmot_app::OnboardingStatus::NeedsInput
@@ -15841,7 +15841,7 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
     runtime.shutdown_and_close().await.unwrap();
     let reopened = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url));
     assert_eq!(
-        reopened.accounts().onboarding_snapshot(&id).unwrap(),
+        reopened.account_setup().onboarding_snapshot(&id).unwrap(),
         Some(snapshot)
     );
     reopened.reconcile_accounts().await.unwrap();
@@ -15852,7 +15852,7 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
 async fn onboarding_valid_account_completes_all_checks_and_publishes_key_package() {
     let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
     seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
     assert!(snapshot.ready, "{snapshot:?}");
     assert!(
@@ -15900,26 +15900,26 @@ async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags(
         NostrTimestamp::now().as_secs() - 5,
     )
     .await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         snapshot.steps[2].status,
         marmot_app::OnboardingStatus::NeedsInput
     );
     assert!(!snapshot.ready);
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     assert!(matches!(
         runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, proposal.revision - 1)
             .await,
         Err(AppError::OnboardingActionUnavailable)
     ));
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -15972,9 +15972,9 @@ async fn onboarding_stale_repair_detects_a_new_remote_record() {
         NostrTimestamp::now().as_secs() - 5,
     )
     .await;
-    runtime.accounts().run_onboarding(&id).await.unwrap();
+    runtime.account_setup().run_onboarding(&id).await.unwrap();
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
@@ -15987,7 +15987,7 @@ async fn onboarding_stale_repair_detects_a_new_remote_record() {
     )
     .await;
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -15998,7 +15998,7 @@ async fn onboarding_stale_repair_detects_a_new_remote_record() {
         marmot_app::OnboardingIssue::RecordChanged
     );
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -16020,7 +16020,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
         url.clone(),
     ));
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             TestExternalAccountSigner { keys: keys.clone() },
@@ -16034,7 +16034,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
         .unwrap();
     assert!(!snapshot.ready);
     assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
     assert!(snapshot.ready, "{snapshot:?}");
     runtime
@@ -16047,7 +16047,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
         .await
         .unwrap();
     let reentered = runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             TestExternalAccountSigner { keys },
@@ -16077,7 +16077,7 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
         url.clone(),
     ));
     runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             TestExternalAccountSigner { keys },
@@ -16089,17 +16089,21 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
         )
         .await
         .unwrap();
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert!(!snapshot.ready);
     assert_eq!(
         snapshot.steps[4].status,
         marmot_app::OnboardingStatus::NeedsInput
     );
 
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&id)
             .unwrap()
             .is_none()
@@ -16134,7 +16138,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), url.clone()));
     let keys = Keys::generate();
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -16146,7 +16150,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
         .await
         .unwrap();
     let result = runtime
-        .accounts()
+        .account_setup()
         .run_onboarding(&snapshot.account_id_hex)
         .await
         .unwrap();
@@ -16176,7 +16180,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
     let keys = Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -16188,7 +16192,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
         .await
         .unwrap();
     seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
     assert!(!snapshot.ready);
     assert_eq!(
@@ -16208,7 +16212,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
     let acknowledged_notice = snapshot.single_device_notice.clone();
     runtime.shutdown_and_close().await.unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url.clone()));
-    let resumed = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let resumed = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(resumed.single_device_notice, acknowledged_notice);
     assert_eq!(
         resumed.steps[4].status,
@@ -16216,7 +16220,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
     );
     rejecting.store(false, Ordering::SeqCst);
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, marmot_app::OnboardingStep::KeyPackage)
         .await
         .unwrap();
@@ -16252,7 +16256,7 @@ async fn acknowledge_single_device_notice(
         Err(AppError::OnboardingRequired)
     ));
     runtime
-        .accounts()
+        .account_setup()
         .acknowledge_onboarding_single_device(&snapshot.account_id_hex, snapshot.revision)
         .await
         .unwrap()
@@ -16264,7 +16268,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     use nostr::prelude::ToBech32;
     let (first_directory, _relay, first_app, first, keys, id, url) = onboarding_fixture().await;
     seed_onboarding_records(&AccountHome::open(first_directory.path()), &id, &url).await;
-    let notice = first.accounts().run_onboarding(&id).await.unwrap();
+    let notice = first.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         notice.single_device_notice.as_ref().unwrap().discovery,
         OnboardingDeviceDiscovery::NoneFound
@@ -16278,7 +16282,11 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     checkpoint["snapshot"]["steps"][4]["checked_at"] = serde_json::json!(discovered_at);
     home.set_account_onboarding(&id, &serde_json::to_vec(&checkpoint).unwrap())
         .unwrap();
-    let retained = first.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    let retained = first
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(retained.revision, notice.revision);
     assert_eq!(retained.recovery_epoch, notice.recovery_epoch);
     assert_eq!(retained.steps[4].checked_at, Some(discovered_at));
@@ -16338,7 +16346,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
 
     // The same private package advertised under a different slot is still ours.
     let own_notice = first
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::SingleDevice)
         .await
         .unwrap();
@@ -16353,7 +16361,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     );
     first.publish_new_key_package(&id).await.unwrap();
     let rotated_notice = first
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::SingleDevice)
         .await
         .unwrap();
@@ -16376,7 +16384,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         || MarmotAppRuntime::new(MarmotApp::with_relay(second_directory.path(), url.clone()));
     let second = make_second();
     second
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
@@ -16387,7 +16395,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         )
         .await
         .unwrap();
-    let snapshot = second.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = second.account_setup().run_onboarding(&id).await.unwrap();
     let notice = snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(
         notice.discovery,
@@ -16413,19 +16421,23 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         2
     );
     // Cancel means the host leaves this pause; simply resuming cannot publish.
-    let resumed = second.accounts().run_onboarding(&id).await.unwrap();
+    let resumed = second.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(resumed.single_device_notice, snapshot.single_device_notice);
     assert_eq!(resumed.steps, snapshot.steps);
     let snapshot = resumed;
     second.shutdown_and_close().await.unwrap();
     let second = make_second();
     assert_eq!(
-        second.accounts().onboarding_snapshot(&id).unwrap().unwrap(),
+        second
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap(),
         snapshot
     );
     assert!(matches!(
         second
-            .accounts()
+            .account_setup()
             .acknowledge_onboarding_single_device(&id, snapshot.revision - 1)
             .await,
         Err(AppError::OnboardingActionUnavailable)
@@ -16443,7 +16455,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     second.shutdown_and_close().await.unwrap();
     let second = make_second();
     assert_eq!(
-        second.accounts().run_onboarding(&id).await.unwrap(),
+        second.account_setup().run_onboarding(&id).await.unwrap(),
         completed
     );
     // Continue never deletes the other installation's slots.
@@ -16474,7 +16486,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         .await
         .unwrap();
     let next_sign_in = second
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
@@ -16487,7 +16499,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         .unwrap();
     assert!(!next_sign_in.ready);
     assert!(next_sign_in.single_device_notice.is_none());
-    let next_notice = second.accounts().run_onboarding(&id).await.unwrap();
+    let next_notice = second.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         next_notice.steps[4].status,
         marmot_app::OnboardingStatus::NeedsInput
@@ -16538,7 +16550,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
     let keys = Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -16550,7 +16562,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
         .await
         .unwrap();
     seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let notice = snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(
         notice.discovery,
@@ -16599,14 +16611,14 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
     };
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
             .await
             .is_err()
     );
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&old.label)
             .unwrap()
             .is_none()
@@ -16620,7 +16632,7 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
             .any(|a| a.account_id_hex == old.account_id_hex && a.running)
     );
     let bad = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(Keys::generate().secret_key().to_bech32().unwrap()),
             options(),
@@ -16653,18 +16665,18 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .cancel_onboarding(&old.label)
         .await
         .unwrap();
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&old.label)
             .unwrap()
             .is_none()
@@ -16694,7 +16706,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
     let runtime = MarmotAppRuntime::new(app);
     let secret = Keys::generate().secret_key().to_bech32().unwrap();
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(secret.clone()),
             marmot_app::OnboardingOptions {
@@ -16706,7 +16718,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .cancel_onboarding(&snapshot.account_id_hex)
         .await
         .unwrap();

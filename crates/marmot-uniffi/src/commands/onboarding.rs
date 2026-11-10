@@ -34,7 +34,7 @@ impl Marmot {
     ) -> Result<bool, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .onboarding_recovery_required(&account_ref)?)
     }
 
@@ -48,7 +48,7 @@ impl Marmot {
     ) -> Result<String, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .recover_onboarding(&account_ref, acknowledge_latest_only_evidence)
             .await?)
     }
@@ -62,7 +62,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair_in_epoch(&account_ref, revision, &recovery_epoch)
             .await?
             .into())
@@ -77,7 +77,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .acknowledge_onboarding_single_device_in_epoch(&account_ref, revision, &recovery_epoch)
             .await?
             .into())
@@ -92,7 +92,7 @@ impl Marmot {
     pub async fn cancel_onboarding(&self, account_ref: String) -> Result<(), MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .cancel_onboarding(&account_ref)
             .await?)
     }
@@ -105,7 +105,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .acknowledge_onboarding_single_device(&account_ref, revision)
             .await?
             .into())
@@ -118,7 +118,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .begin_onboarding(Zeroizing::new(nsec), options.into())
             .await?
             .into())
@@ -131,7 +131,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .begin_external_signer_onboarding(
                 public_key,
                 ExternalAccountSignerAdapter::new(signer),
@@ -146,7 +146,7 @@ impl Marmot {
     ) -> Result<Option<OnboardingSnapshotFfi>, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&account_ref)?
             .map(Into::into))
     }
@@ -154,7 +154,10 @@ impl Marmot {
         &self,
         account_ref: String,
     ) -> Result<Arc<OnboardingSubscription>, MarmotKitError> {
-        let subscription = self.runtime.accounts().subscribe_onboarding(&account_ref)?;
+        let subscription = self
+            .runtime
+            .account_setup()
+            .subscribe_onboarding(&account_ref)?;
         Ok(Arc::new(OnboardingSubscription {
             snapshot: subscription.snapshot.clone().into(),
             inner: Mutex::new(subscription),
@@ -167,7 +170,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .set_onboarding_discovery_relays(&account_ref, discovery_relays)
             .await?
             .into())
@@ -178,7 +181,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .run_onboarding(&account_ref)
             .await?
             .into())
@@ -190,7 +193,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .retry_onboarding_step(&account_ref, step.into())
             .await?
             .into())
@@ -202,7 +205,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .continue_onboarding_without(&account_ref, step.into())
             .await?
             .into())
@@ -214,7 +217,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .propose_onboarding_relays(&account_ref, step.into(), None)
             .await?
             .into())
@@ -228,7 +231,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .propose_onboarding_relays(&account_ref, step.into(), Some((read_relays, write_relays)))
             .await?
             .into())
@@ -240,7 +243,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .propose_onboarding_profile(&account_ref, profile.into())
             .await?
             .into())
@@ -252,7 +255,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .propose_onboarding_follows(&account_ref, follows)
             .await?
             .into())
@@ -264,7 +267,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&account_ref, revision)
             .await?
             .into())
@@ -278,7 +281,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .propose_onboarding_relay_repair(&account_ref, step.into())
             .await?
             .into())
@@ -289,7 +292,7 @@ impl Marmot {
     ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
         Ok(self
             .runtime
-            .accounts()
+            .account_setup()
             .cancel_onboarding_repair(&account_ref)
             .await?
             .into())

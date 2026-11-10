@@ -11,6 +11,17 @@
   it. It returns `Err(AppError)` when the open fails and `Ok(Err(SyncFailure))`,
   with the durably applied prefix, when the pass fails.
 
+- Rust hosts reach onboarding through `MarmotAppRuntime::account_setup()`, which returns the new `AccountSetup`
+  (mdk#2782). `AccountManager`'s twenty onboarding methods moved there with unchanged signatures:
+  `onboarding_snapshot`, `subscribe_onboarding`, `begin_onboarding`, `begin_external_signer_onboarding`,
+  `run_onboarding`, `retry_onboarding_step`, `set_onboarding_discovery_relays`, `continue_onboarding_without`,
+  `propose_onboarding_relays`, `propose_onboarding_profile`, `propose_onboarding_follows`,
+  `cancel_onboarding_repair`, `approve_onboarding_repair`, `approve_onboarding_repair_in_epoch`,
+  `cancel_onboarding`, `onboarding_recovery_required`, `recover_onboarding`, `propose_onboarding_relay_repair`,
+  `acknowledge_onboarding_single_device` and `acknowledge_onboarding_single_device_in_epoch`. Replace
+  `runtime.accounts().begin_onboarding(..)` with `runtime.account_setup().begin_onboarding(..)`. The UniFFI and C
+  bindings do not change.
+
 ### Added
 
 - `MarmotAppRuntime::start_direct_conversation` serializes peer lookup and

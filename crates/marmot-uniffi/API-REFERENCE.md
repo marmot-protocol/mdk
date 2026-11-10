@@ -3234,7 +3234,7 @@ pub async fn propose_onboarding_relay_repair( &self, account_ref: String, step: 
 
 Preview an exact, minimal general or inbox relay-list repair. The returned `proposal.relay_repair` carries the source event ID, ordered before/after tags, unchanged content, typed occurrence diff, and repair mode. This method only persists a revision-bound proposal; it never signs or publishes. Show the diff and use `approve_onboarding_repair` (or its epoch-aware variant) only when `ApproveRepair` is offered. `ManualReview` deliberately has no approval action; prefill an editor from `before_tags` or offer a separately labeled full reset. Preserve the account, attempt, recovery epoch, source event, and snapshot revision until approval.
 
-[Source](src/commands/onboarding.rs#L274)
+[Source](src/commands/onboarding.rs#L277)
 
 ### `Marmot::approve_onboarding_repair_in_epoch`
 
@@ -3342,7 +3342,7 @@ pub async fn set_onboarding_discovery_relays( &self, account_ref: String, discov
 
 Change discovery sources for the workflow without publishing them as account relay lists.
 
-[Source](src/commands/onboarding.rs#L163)
+[Source](src/commands/onboarding.rs#L166)
 
 ### `Marmot::run_onboarding`
 
@@ -3354,7 +3354,7 @@ pub async fn run_onboarding( &self, account_ref: String, ) -> Result<OnboardingS
 
 Run/resume the durable onboarding workflow until ready or user input is required.
 
-[Source](src/commands/onboarding.rs#L175)
+[Source](src/commands/onboarding.rs#L178)
 
 ### `Marmot::retry_onboarding_step`
 
@@ -3366,7 +3366,7 @@ pub async fn retry_onboarding_step( &self, account_ref: String, step: Onboarding
 
 Retry a step whose current snapshot offers Retry.
 
-[Source](src/commands/onboarding.rs#L186)
+[Source](src/commands/onboarding.rs#L189)
 
 ### `Marmot::continue_onboarding_without`
 
@@ -3378,7 +3378,7 @@ pub async fn continue_onboarding_without( &self, account_ref: String, step: Onbo
 
 Explicitly skip an optional step where the current snapshot permits it.
 
-[Source](src/commands/onboarding.rs#L198)
+[Source](src/commands/onboarding.rs#L201)
 
 ### `Marmot::propose_onboarding_recommended_relays`
 
@@ -3393,7 +3393,7 @@ NIP-65 roles, including declarations this runtime cannot use. Dial policy filter
 connection attempts without deleting published entries. A policy-allowed outbox
 or inbox route is required; proposal alone is not publication.
 
-[Source](src/commands/onboarding.rs#L210)
+[Source](src/commands/onboarding.rs#L213)
 
 ### `Marmot::propose_onboarding_relays`
 
@@ -3405,7 +3405,7 @@ pub async fn propose_onboarding_relays( &self, account_ref: String, step: Onboar
 
 Prepare explicit relay changes for approval.
 
-[Source](src/commands/onboarding.rs#L222)
+[Source](src/commands/onboarding.rs#L225)
 
 ### `Marmot::propose_onboarding_profile`
 
@@ -3417,7 +3417,7 @@ pub async fn propose_onboarding_profile( &self, account_ref: String, profile: Us
 
 Prepare profile changes for approval.
 
-[Source](src/commands/onboarding.rs#L236)
+[Source](src/commands/onboarding.rs#L239)
 
 ### `Marmot::propose_onboarding_follows`
 
@@ -3429,7 +3429,7 @@ pub async fn propose_onboarding_follows( &self, account_ref: String, follows: Ve
 
 Prepare follow-list changes for approval.
 
-[Source](src/commands/onboarding.rs#L248)
+[Source](src/commands/onboarding.rs#L251)
 
 ### `Marmot::approve_onboarding_repair`
 
@@ -3441,7 +3441,7 @@ pub async fn approve_onboarding_repair( &self, account_ref: String, revision: u6
 
 Approve the displayed revision for a non-recovered attempt; recovered attempts require the epoch-aware method.
 
-[Source](src/commands/onboarding.rs#L260)
+[Source](src/commands/onboarding.rs#L263)
 
 ### `Marmot::cancel_onboarding_repair`
 
@@ -3453,7 +3453,7 @@ pub async fn cancel_onboarding_repair( &self, account_ref: String, ) -> Result<O
 
 Dismiss an unapproved repair proposal; this cannot undo already-approved publication intent.
 
-[Source](src/commands/onboarding.rs#L286)
+[Source](src/commands/onboarding.rs#L289)
 
 </details>
 
