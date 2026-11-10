@@ -196,6 +196,7 @@ pub struct MarmotAppRuntime {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     accounts: AccountManager,
+    setup: onboarding::SetupState,
     follow_list_updates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(test)]
@@ -259,19 +260,12 @@ pub struct AccountManager {
     tearing_down: Arc<StdMutex<HashSet<String>>>,
     worker_transactions: Arc<Mutex<()>>,
     startup_retries: Arc<StdMutex<worker_startup::WorkerStartupRetries>>,
-    generated_setup_local_transaction: Arc<Mutex<()>>,
-    onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
-    onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
-    onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
-    onboarding_cancellations: Arc<StdMutex<OnboardingCancellationTasks>>,
-    onboarding_retirements:
-        Arc<StdMutex<HashMap<String, watch::Sender<Option<onboarding::OnboardingAttempt>>>>>,
-    #[cfg(test)]
-    onboarding_test_holds: Arc<OnboardingTestHolds>,
+    /// Account setup's state, held for its three hooks only: reconcile,
+    /// removal and the two shutdown phases.
+    setup: onboarding::SetupState,
     #[cfg(test)]
     reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
-    generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
 }
 
 #[derive(Default)]
@@ -324,17 +318,9 @@ struct InviteCatchUpTasks {
     handles: Vec<JoinHandle<()>>,
 }
 
-struct GeneratedSetupTasks {
-    accepting: bool,
-    active_accounts: HashSet<String>,
-    handles: Vec<JoinHandle<()>>,
-}
-
-const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
 // Existing-account discovery includes two relay-list hops and an advisory
 // profile read, each bounded by connection and fetch budgets (5s + 3s).
 const ACCOUNT_DIRECTORY_PREFLIGHT_WAIT: Duration = Duration::from_secs(26);
-const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
@@ -1682,11 +1668,13 @@ impl MarmotAppRuntime {
     pub fn new(app: MarmotApp) -> Self {
         let (events, _) = broadcast::channel(1024);
         let shared = RuntimeSharedServices::for_app(&app);
-        let accounts = AccountManager::new(app, events.clone(), shared.clone());
+        let setup = onboarding::SetupState::new();
+        let accounts = AccountManager::new(app, events.clone(), shared.clone(), setup.clone());
         Self {
             events,
             shared,
             accounts,
+            setup,
             follow_list_updates: Arc::new(Mutex::new(HashMap::new())),
             initial_directory_sync: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -6392,375 +6380,6 @@ impl MarmotAppRuntime {
         })
     }
 
-    async fn resume_generated_account_setup(&self) -> Result<(), AppError> {
-        let Some(account) = self
-            .accounts
-            .app
-            .account_home()
-            .resumable_generated_account_setup()?
-        else {
-            return Ok(());
-        };
-        let Some(bytes) = self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&account.label)?
-        else {
-            self.report_generated_setup_resume_deferred(&account, "setup_context_missing");
-            return Ok(());
-        };
-        let context = match serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
-            Ok(context) => context,
-            Err(_) => {
-                self.report_generated_setup_resume_deferred(&account, "setup_context_unreadable");
-                return Ok(());
-            }
-        };
-        if let Err(error) = self
-            .create_generated_account_local_ready(context.request(), true, None)
-            .await
-        {
-            self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
-        }
-        Ok(())
-    }
-
-    fn report_generated_setup_resume_deferred(
-        &self,
-        account: &AccountSummary,
-        error_kind: &'static str,
-    ) {
-        tracing::warn!(
-            target: "marmot_app::runtime",
-            method = "resume_generated_account_setup",
-            error_kind,
-            "generated account setup resume deferred"
-        );
-        let _ = self
-            .events
-            .send(MarmotAppEvent::AccountError(RuntimeAccountError {
-                account_id_hex: account.account_id_hex.clone(),
-                account_label: account.label.clone(),
-                message: format!("generated account setup resume deferred: {error_kind}"),
-            }));
-    }
-
-    async fn create_generated_account_local_ready(
-        &self,
-        request: AccountSetupRequest,
-        schedule_background: bool,
-        initial_profile: Option<UserProfileMetadata>,
-    ) -> Result<AccountSetupResult, AppError> {
-        let observed = self.shared.observer.product().observed(
-            crate::ProductFamily::Account,
-            "local_ready",
-            crate::ProductUnit::Attempt,
-        );
-        let work = async move {
-            self.shared.lifecycle().ensure_running()?;
-            let _generated_setup_transaction =
-                self.accounts.generated_setup_local_transaction.lock().await;
-            validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
-
-            let resumable = self
-                .accounts
-                .app
-                .account_home()
-                .resumable_generated_account_setup()?;
-            // Persisted relays win on resume so every retry retains the exact
-            // locally prepared initial KeyPackage and its publication targets.
-            let context = match resumable.as_ref() {
-                Some(account) => match self
-                    .accounts
-                    .app
-                    .account_home()
-                    .account_setup_context(&account.label)?
-                {
-                    Some(bytes) => serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)?,
-                    None => GeneratedAccountSetupContext::from_request(&request),
-                },
-                None => GeneratedAccountSetupContext::from_request(&request),
-            };
-            let effective_request = context.request();
-            let bootstrap = AccountRelayListBootstrap::new(
-                effective_request.default_relays.clone(),
-                effective_request.bootstrap_relays.clone(),
-            )
-            .with_inbox_relays(effective_request.inbox_relays.clone());
-            if bootstrap.default_relays.is_empty() {
-                return Err(AppError::MissingDefaultRelays);
-            }
-            self.accounts
-                .app
-                .validate_account_relay_list_declarations(&bootstrap, None)?;
-
-            let identity_started = Instant::now();
-            let identity_result = self
-                .accounts
-                .create_nostr_account_from_setup(&effective_request);
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupIdentityLocal,
-                identity_started.elapsed(),
-                identity_result.is_ok(),
-            );
-            let (account, _) = identity_result?;
-            if self
-                .accounts
-                .app
-                .account_home()
-                .account_setup_context(&account.label)?
-                .is_none()
-            {
-                self.accounts
-                    .app
-                    .account_home()
-                    .set_account_setup_context(&account.label, &serde_json::to_vec(&context)?)?;
-            }
-            let storage_started = Instant::now();
-            let storage_result = self.accounts.app.account_storage(&account.label);
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupStorageLocal,
-                storage_started.elapsed(),
-                storage_result.is_ok(),
-            );
-            storage_result?;
-            let phase = self
-                .accounts
-                .app
-                .account_home()
-                .account_setup_state(&account.label)?
-                .map(|state| state.phase)
-                .ok_or(AppError::AccountSetupRetryRequired)?;
-
-            let profile_started = Instant::now();
-            let profile_result = (|| {
-                let cached = self
-                    .accounts
-                    .app
-                    .directory()
-                    .directory_entry_for_account_id(&account.account_id_hex)?
-                    .and_then(|entry| entry.profile);
-                let (profile, store) = generated_setup_profile(
-                    &account.account_id_hex,
-                    phase,
-                    cached,
-                    initial_profile,
-                    unix_now_seconds(),
-                );
-                if store {
-                    self.accounts
-                        .app
-                        .directory()
-                        .remember_directory_profile(&account.account_id_hex, &profile)?;
-                }
-                Ok::<_, AppError>(profile)
-            })();
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupProfileLocal,
-                profile_started.elapsed(),
-                profile_result.is_ok(),
-            );
-            let profile = profile_result?;
-
-            let key_package_started = Instant::now();
-            let key_package_result = async {
-                if phase == AccountSetupPhase::LocalStateCreated {
-                    let mut client = self
-                        .accounts
-                        .app
-                        .local_client_with_relay_plane(
-                            &account.label,
-                            self.shared.relay_plane(),
-                            Some(self.shared.lifecycle()),
-                        )
-                        .await?;
-                    let key_package = client
-                        .prepare_initial_key_package(effective_request.default_relays.to_vec())
-                        .await?;
-                    let bytes = key_package.bytes().len();
-                    drop(client);
-                    self.accounts
-                        .app
-                        .account_home()
-                        .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
-                    self.accounts.app.presentation_signals.catalog_changed();
-                    Ok(bytes)
-                } else {
-                    let lifecycle = self
-                        .accounts
-                        .app
-                        .account_storage(&account.label)?
-                        .key_package_lifecycle()?
-                        .ok_or(AppError::AccountSetupRetryRequired)?;
-                    lifecycle
-                        .pending_replacement
-                        .as_ref()
-                        .map(|pending| pending.key_package.bytes().len())
-                        .or_else(|| {
-                            lifecycle
-                                .current_key_package
-                                .as_ref()
-                                .map(|key_package| key_package.bytes().len())
-                        })
-                        .ok_or(AppError::AccountSetupRetryRequired)
-                }
-            }
-            .await;
-            self.shared.observer.performance().record(
-                AppPerformanceOperation::AccountSetupKeyPackageLocal,
-                key_package_started.elapsed(),
-                key_package_result.is_ok(),
-            );
-            let key_package_bytes = key_package_result?;
-            if phase == AccountSetupPhase::LocalStateCreated && !schedule_background {
-                self.accounts
-                    .reset_startup_retry(&account.account_id_hex)
-                    .await;
-            }
-
-            let relay_lists = self
-                .accounts
-                .app
-                .account_relay_list_status(&account.label)?;
-            let readiness = self.account_setup_readiness(&account.label)?;
-            if schedule_background {
-                let handoff_started_at = Instant::now();
-                let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
-                    self.accounts
-                        .retry_and_reconcile_for_account(&account.account_id_hex)
-                        .await
-                } else {
-                    self.accounts
-                        .reconcile_for_account(&account.account_id_hex)
-                        .await
-                };
-                self.shared.observer.performance().record(
-                    AppPerformanceOperation::AccountSetupLocalReadyHandoff,
-                    handoff_started_at.elapsed(),
-                    handoff_result.is_ok(),
-                );
-                handoff_result?;
-                self.schedule_generated_account_setup(account.clone(), context);
-            }
-            Ok(AccountSetupResult {
-                account,
-                relay_lists,
-                key_package_bytes: effective_request
-                    .publish_initial_key_package
-                    .then_some(key_package_bytes),
-                profile: Some(profile),
-                readiness,
-            })
-        };
-        observed
-            .run_async(work, marmot_observability::success_or_failure)
-            .await
-    }
-
-    async fn create_generated_account_network_ready(
-        &self,
-        request: AccountSetupRequest,
-    ) -> Result<AccountSetupResult, AppError> {
-        let local = self
-            .create_generated_account_local_ready(request, false, None)
-            .await?;
-        let context = self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&local.account.label)?
-            .ok_or(AppError::AccountSetupRetryRequired)
-            .and_then(|bytes| {
-                serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)
-                    .map_err(AppError::from)
-            })?;
-        let started_at = Instant::now();
-        let result = self
-            .create_or_import_account_network_ready(context.request())
-            .await;
-        self.shared.observer.performance().record(
-            AppPerformanceOperation::AccountSetupNetworkReady,
-            started_at.elapsed(),
-            result.is_ok(),
-        );
-        let mut result = result?;
-        if result.profile.is_none() {
-            result.profile = local.profile;
-        }
-        Ok(result)
-    }
-
-    fn schedule_generated_account_setup(
-        &self,
-        account: AccountSummary,
-        context: GeneratedAccountSetupContext,
-    ) {
-        let mut tasks = self
-            .accounts
-            .generated_setup_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tasks.handles.retain(|handle| !handle.is_finished());
-        if !tasks.accepting || !tasks.active_accounts.insert(account.account_id_hex.clone()) {
-            return;
-        }
-        let manager = self.clone();
-        let active = self.accounts.generated_setup_tasks.clone();
-        let account_id_hex = account.account_id_hex.clone();
-        let account_label = account.label.clone();
-        let handle = tokio::spawn(async move {
-            for attempt in 0..GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS {
-                let started_at = Instant::now();
-                let result = manager
-                    .create_or_import_account_network_ready(context.request())
-                    .await;
-                manager.shared.observer.performance().record(
-                    AppPerformanceOperation::AccountSetupNetworkReady,
-                    started_at.elapsed(),
-                    result.is_ok(),
-                );
-                match result {
-                    Ok(_) => break,
-                    Err(error) => {
-                        let final_attempt = attempt + 1 == GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS;
-                        let status = if final_attempt {
-                            "deferred"
-                        } else {
-                            "retry scheduled"
-                        };
-                        let _ = manager.events.send(MarmotAppEvent::AccountError(
-                            RuntimeAccountError {
-                                account_id_hex: account_id_hex.clone(),
-                                account_label: account_label.clone(),
-                                message: format!(
-                                    "generated account publication {status}: {}",
-                                    error.privacy_safe_kind()
-                                ),
-                            },
-                        ));
-                        if final_attempt {
-                            break;
-                        }
-                        let multiplier = 1_u32
-                            .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
-                            .unwrap_or(u32::MAX);
-                        tokio::time::sleep(
-                            GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY.saturating_mul(multiplier),
-                        )
-                        .await;
-                    }
-                }
-            }
-            active
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .active_accounts
-                .remove(&account_id_hex);
-        });
-        tasks.handles.push(handle);
-    }
-
     async fn create_or_import_account_network_ready(
         &self,
         request: AccountSetupRequest,
@@ -7145,11 +6764,272 @@ async fn catch_up_account_commands_with_retry(
     }
 }
 
+// Account setup reaches the workers only through this surface. The worker
+// transaction is a tokio `Mutex` and not reentrant, so every call keeps the lock
+// state it had when onboarding lived on this type, and each says which it is:
+// - takes the worker transaction: `lock_worker_transaction`,
+//   `reconcile_for_account`, `retry_and_reconcile_for_account`,
+//   `reset_startup_retry`;
+// - assumes its caller holds it: `clear_startup_retry`,
+//   `reconcile_locked_report_for`, `set_account_tearing_down`,
+//   `take_worker_locked`.
+// A worker setup takes out of the map is reaped through setup's own cancellation
+// registry, which shutdown's second phase joins, never through `worker_reapers`.
+impl AccountManager {
+    /// Takes the worker transaction and hands back its guard.
+    async fn lock_worker_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.worker_transactions.lock().await
+    }
+
+    /// Assumes the worker transaction is held. Takes the account's worker out
+    /// of the map and hands it back; the caller registers its reap before any
+    /// await.
+    async fn take_worker_locked(&self, account_id: &str) -> Option<ManagedAccountWorker> {
+        self.workers.lock().await.remove(account_id)
+    }
+
+    /// Setup's durable records, which hold the worker gate. Reading them never
+    /// touches setup's in-memory state.
+    fn setup_records(&self) -> onboarding::SetupRecords<'_> {
+        onboarding::SetupRecords::new(&self.app)
+    }
+
+    /// Account setup paired with this manager, for the host methods below.
+    fn account_setup(&self) -> onboarding::AccountSetup<'_> {
+        onboarding::AccountSetup::new(&self.setup, self)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn onboarding_worker_tracked(&self, account_id: &str) -> bool {
+        self.workers.lock().await.contains_key(account_id)
+    }
+}
+
+// Account setup's host methods, forwarded to setup.
+impl AccountManager {
+    pub fn onboarding_snapshot(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<OnboardingSnapshot>, AppError> {
+        self.account_setup().onboarding_snapshot(account_ref)
+    }
+
+    pub fn subscribe_onboarding(
+        &self,
+        account_ref: &str,
+    ) -> Result<OnboardingSubscription, AppError> {
+        self.account_setup().subscribe_onboarding(account_ref)
+    }
+
+    /// Import only the identity. No relay records or KeyPackages are published.
+    /// A retained account/checkpoint is returned even if later checks fail.
+    pub async fn begin_onboarding(
+        &self,
+        nsec: Zeroizing<String>,
+        options: OnboardingOptions,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup().begin_onboarding(nsec, options).await
+    }
+
+    pub async fn begin_external_signer_onboarding<S: crate::ExternalAccountSigner + 'static>(
+        &self,
+        public_key: String,
+        signer: S,
+        options: OnboardingOptions,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .begin_external_signer_onboarding(public_key, signer, options)
+            .await
+    }
+
+    /// Run pending checks until a decision or retry is needed. Cancelling this
+    /// future is safe: the next call retries its last checkpointed operation.
+    pub async fn run_onboarding(&self, account_ref: &str) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup().run_onboarding(account_ref).await
+    }
+
+    pub async fn retry_onboarding_step(
+        &self,
+        account_ref: &str,
+        step: OnboardingStep,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .retry_onboarding_step(account_ref, step)
+            .await
+    }
+
+    /// Retry discovery through an explicitly selected source set. This never
+    /// changes published relay declarations or publishes defaults.
+    pub async fn set_onboarding_discovery_relays(
+        &self,
+        account_ref: &str,
+        discovery_relays: Vec<String>,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .set_onboarding_discovery_relays(account_ref, discovery_relays)
+            .await
+    }
+
+    pub async fn continue_onboarding_without(
+        &self,
+        account_ref: &str,
+        step: OnboardingStep,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .continue_onboarding_without(account_ref, step)
+            .await
+    }
+
+    /// Prepare a relay replacement without signing or publishing it. Passing
+    /// None appends the recommended defaults to the observed list, preserving
+    /// existing tags and read/write roles, independently of local dial policy.
+    /// An explicit selection edits known endpoint roles while preserving retained
+    /// tags verbatim (including duplicates, order and extension fields), unrelated
+    /// tags and event content. The typed preview is inert until approved; an
+    /// unchanged selection produces a manual-review preview without approval.
+    /// For inbox lists use read_relays; write_relays must be empty.
+    pub async fn propose_onboarding_relays(
+        &self,
+        account_ref: &str,
+        step: OnboardingStep,
+        selection: Option<(Vec<String>, Vec<String>)>,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .propose_onboarding_relays(account_ref, step, selection)
+            .await
+    }
+
+    pub async fn propose_onboarding_profile(
+        &self,
+        account_ref: &str,
+        profile: UserProfileMetadata,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .propose_onboarding_profile(account_ref, profile)
+            .await
+    }
+
+    pub async fn propose_onboarding_follows(
+        &self,
+        account_ref: &str,
+        follows: Vec<String>,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .propose_onboarding_follows(account_ref, follows)
+            .await
+    }
+
+    pub async fn cancel_onboarding_repair(
+        &self,
+        account_ref: &str,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .cancel_onboarding_repair(account_ref)
+            .await
+    }
+
+    pub async fn approve_onboarding_repair(
+        &self,
+        account_ref: &str,
+        revision: u64,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .approve_onboarding_repair(account_ref, revision)
+            .await
+    }
+
+    /// Approve a displayed repair in a recovered attempt. Stale epochs fail
+    /// even when their numeric revision happens to match the fresh proposal.
+    pub async fn approve_onboarding_repair_in_epoch(
+        &self,
+        account_ref: &str,
+        revision: u64,
+        recovery_epoch: &str,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .approve_onboarding_repair_in_epoch(account_ref, revision, recovery_epoch)
+            .await
+    }
+
+    /// Cancel an interactive onboarding attempt at any step, including approved
+    /// or ready checkpoints. The identity stays signed out. Already-sent events
+    /// are not rolled back; the local journal and signed bytes are retained.
+    pub async fn cancel_onboarding(&self, account_ref: &str) -> Result<(), AppError> {
+        self.account_setup().cancel_onboarding(account_ref).await
+    }
+
+    /// Hosts can offer explicit recovery when begin/cancel returns
+    /// OnboardingActionUnavailable and this query returns true. Recovery is not
+    /// automatic and never interprets unknown bytes as approval or retry intent.
+    pub fn onboarding_recovery_required(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.account_setup()
+            .onboarding_recovery_required(account_ref)
+    }
+
+    /// Retire unreadable/unsupported or exhausted onboarding state explicitly.
+    /// Retains exact opaque bytes in the latest private recovery journal, keeps
+    /// identity/setup data, signs out and reaps the worker. The returned epoch
+    /// must accompany future approval/device-acknowledgment calls. A separate
+    /// begin is required; recovery never inherits a proposal or sends a repair.
+    ///
+    /// A true acknowledgment accepts latest-only evidence retention. Older
+    /// recovery evidence may be replaced by a later explicit recovery. Dropping
+    /// this caller does not stop owned cleanup; retry or reconcile completes it.
+    pub async fn recover_onboarding(
+        &self,
+        account_ref: &str,
+        acknowledge_latest_only_evidence: bool,
+    ) -> Result<String, AppError> {
+        self.account_setup()
+            .recover_onboarding(account_ref, acknowledge_latest_only_evidence)
+            .await
+    }
+
+    /// Prepare an exact, minimal relay repair without signing or publishing.
+    /// When no lossless candidate exists, return a typed manual-review preview
+    /// with no approval action; callers may open a prefilled manual editor.
+    pub async fn propose_onboarding_relay_repair(
+        &self,
+        account_ref: &str,
+        step: OnboardingStep,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .propose_onboarding_relay_repair(account_ref, step)
+            .await
+    }
+
+    /// Acknowledge the sign-in chat/history notice for this onboarding attempt. This
+    /// authorizes normal setup publication, never deletion of another slot.
+    /// Persist before resuming so cancellation/restart cannot lose the choice.
+    pub async fn acknowledge_onboarding_single_device(
+        &self,
+        account_ref: &str,
+        revision: u64,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .acknowledge_onboarding_single_device(account_ref, revision)
+            .await
+    }
+
+    /// Acknowledge the displayed device notice after explicit recovery.
+    pub async fn acknowledge_onboarding_single_device_in_epoch(
+        &self,
+        account_ref: &str,
+        revision: u64,
+        recovery_epoch: &str,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.account_setup()
+            .acknowledge_onboarding_single_device_in_epoch(account_ref, revision, recovery_epoch)
+            .await
+    }
+}
+
 impl AccountManager {
     fn new(
         app: MarmotApp,
         events: broadcast::Sender<MarmotAppEvent>,
         shared: RuntimeSharedServices,
+        setup: onboarding::SetupState,
     ) -> Self {
         Self {
             app,
@@ -7162,28 +7042,11 @@ impl AccountManager {
             startup_retries: Arc::new(StdMutex::new(
                 worker_startup::WorkerStartupRetries::default(),
             )),
-            generated_setup_local_transaction: Arc::new(Mutex::new(())),
-            onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
-            onboarding_state: Arc::new(StdMutex::new(HashMap::new())),
-            onboarding_updates: Arc::new(StdMutex::new(HashMap::new())),
-            onboarding_cancellations: Arc::new(StdMutex::new(OnboardingCancellationTasks {
-                accepting: true,
-                inflight: HashMap::new(),
-                handles: Vec::new(),
-                reaping: HashMap::new(),
-            })),
-            onboarding_retirements: Arc::new(StdMutex::new(HashMap::new())),
-            #[cfg(test)]
-            onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
+            setup,
             #[cfg(test)]
             reconcile_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
                 accepting: true,
-                handles: Vec::new(),
-            })),
-            generated_setup_tasks: Arc::new(StdMutex::new(GeneratedSetupTasks {
-                accepting: true,
-                active_accounts: HashSet::new(),
                 handles: Vec::new(),
             })),
         }
@@ -7202,6 +7065,8 @@ impl AccountManager {
         &self.app
     }
 
+    /// Called with the worker transaction held, which reconcile reads the marks
+    /// under.
     fn set_account_tearing_down(&self, account_id_hex: &str, tearing_down: bool) {
         let mut accounts = self
             .tearing_down
@@ -7475,10 +7340,7 @@ impl AccountManager {
             // account live, and a live external-signer account still needs its
             // signer to reconcile.
             self.app.forget_external_signer(&account.account_id_hex);
-            self.onboarding_updates
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&account.account_id_hex);
+            self.setup.account_removed(&account.account_id_hex);
             Ok(())
         }
         .await
@@ -7772,10 +7634,13 @@ impl AccountManager {
         self.reconcile_locked().await
     }
 
+    /// Takes the worker transaction and reconciles one account.
     async fn reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
         self.reconcile_for_account_inner(account_id, false).await
     }
 
+    /// Takes the worker transaction, resets the account's startup retry and
+    /// reconciles it.
     async fn retry_and_reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
         self.reconcile_for_account_inner(account_id, true).await
     }
@@ -7800,11 +7665,13 @@ impl AccountManager {
             .for_account(account_id)
     }
 
+    /// Takes the worker transaction and resets the account's startup retry.
     async fn reset_startup_retry(&self, account_id: &str) {
         let _worker_transaction = self.worker_transactions.lock().await;
         self.clear_startup_retry(account_id);
     }
 
+    /// Assumes the worker transaction is held.
     fn clear_startup_retry(&self, account_id: &str) {
         self.startup_retries
             .lock()
@@ -7832,9 +7699,11 @@ impl AccountManager {
         {
             return Ok(false);
         }
-        self.onboarding_worker_allowed(&account.label)
+        self.setup_records()
+            .onboarding_worker_allowed(&account.label)
     }
 
+    /// Assumes the worker transaction is held.
     async fn reconcile_locked_report_for(
         &self,
         target_account_id: Option<&str>,
@@ -7843,7 +7712,7 @@ impl AccountManager {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
-            self.finish_pending_onboarding_cancellations().await;
+            self.setup.reconcile_locked(self).await;
             let accounts = self
                 .app
                 .account_home()
@@ -8409,7 +8278,8 @@ impl AccountManager {
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        self.require_onboarding_complete_for(&account)?;
+        self.setup_records()
+            .require_onboarding_complete_for(&account)?;
         self.worker_commands_for_account(account)
             .await
             .map(|(commands, _)| commands)
@@ -8451,7 +8321,8 @@ impl AccountManager {
     ) -> Result<(mpsc::Sender<AccountWorkerCommand>, OwnedSemaphorePermit), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        self.require_onboarding_complete_for(&account)?;
+        self.setup_records()
+            .require_onboarding_complete_for(&account)?;
         let (commands, admission) = self.worker_commands_for_account(account).await?;
         // Wait outside the shared command lane, without holding the worker map lock.
         let permit = tokio::select! {
@@ -8489,7 +8360,9 @@ impl AccountManager {
                         && !self.account_is_tearing_down(&account.account_id_hex)
                         && (!account.external_signing
                             || self.app.has_external_signer(&account.account_id_hex))
-                        && self.onboarding_worker_allowed(&account.label)?
+                        && self
+                            .setup_records()
+                            .onboarding_worker_allowed(&account.label)?
                     {
                         return Ok((worker.commands.clone(), worker.media_admission.clone()));
                     }
@@ -8560,7 +8433,8 @@ impl AccountManager {
                     match self.app.account_home().account(&account_id) {
                         Ok(account) => {
                             refuse_unlinked(&account)?;
-                            self.require_onboarding_complete(&account.label)?;
+                            self.setup_records()
+                                .require_onboarding_complete(&account.label)?;
                         }
                         Err(AccountHomeError::UnknownAccount(_)) => {}
                         Err(error) => return Err(error.into()),
@@ -8809,7 +8683,8 @@ impl AccountManager {
                 let existing_account = self.app.account_home().account(&account_id_hex).ok();
                 if let Some(account) = existing_account.as_ref() {
                     refuse_unlinked(account)?;
-                    self.require_onboarding_complete(&account.label)?;
+                    self.setup_records()
+                        .require_onboarding_complete(&account.label)?;
                 }
                 let created_account = existing_account.is_none();
                 // add_external_signer_account below promotes a pre-existing tracked
@@ -9630,34 +9505,7 @@ impl AccountManager {
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
-        self.onboarding_updates
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        let onboarding_cancellation_tasks = {
-            let mut tasks = self
-                .onboarding_cancellations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tasks.accepting = false;
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in onboarding_cancellation_tasks {
-            let _ = task.await;
-        }
-        let generated_setup_tasks = {
-            let mut tasks = self
-                .generated_setup_tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tasks.accepting = false;
-            tasks.active_accounts.clear();
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in generated_setup_tasks {
-            task.abort();
-            let _ = task.await;
-        }
+        self.setup.shutdown_first_phase().await;
         let invite_catch_up_tasks = {
             let mut tasks = self
                 .invite_catch_up_tasks
@@ -9688,16 +9536,7 @@ impl AccountManager {
         // after the first handle snapshot. Cancellation tasks have now joined,
         // and this lock excludes every remaining reaper producer. Reapers do
         // not acquire worker_transactions, so they can safely be joined here.
-        let onboarding_reapers = {
-            let mut tasks = self
-                .onboarding_cancellations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in onboarding_reapers {
-            let _ = task.await;
-        }
+        self.setup.shutdown_second_phase().await;
         let workers = {
             let mut workers = self.workers.lock().await;
             workers.drain().collect::<Vec<_>>()

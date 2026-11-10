@@ -16,7 +16,7 @@ pub(super) struct OnboardingRecovery {
     previous_recovery: Option<Vec<u8>>,
 }
 
-impl AccountManager {
+impl SetupRecords<'_> {
     pub(super) fn read_onboarding_recovery(
         &self,
         account_ref: &str,
@@ -46,23 +46,28 @@ impl AccountManager {
             .read_onboarding_recovery(account_ref)?
             .is_some_and(|r| !r.completed))
     }
+}
 
+impl AccountSetup<'_> {
     /// Hosts can offer explicit recovery when begin/cancel returns
     /// OnboardingActionUnavailable and this query returns true. Recovery is not
     /// automatic and never interprets unknown bytes as approval or retry intent.
     pub fn onboarding_recovery_required(&self, account_ref: &str) -> Result<bool, AppError> {
-        let account = self.resolve(account_ref)?;
-        match self.read_onboarding_recovery(&account.label) {
+        let account = self.records().resolve(account_ref)?;
+        match self.records().read_onboarding_recovery(&account.label) {
             Ok(Some(r)) if !r.completed => return Ok(true),
             Err(_) => return Ok(true),
             _ => {}
         }
-        let home = self.app.account_home();
+        let home = self.app().account_home();
         let active = home.account_onboarding(&account.label)?;
         let cancelled = home.cancelled_account_onboarding(&account.label)?;
         if active.is_none()
             && cancelled.is_none()
-            && self.read_onboarding_recovery(&account.label)?.is_some()
+            && self
+                .records()
+                .read_onboarding_recovery(&account.label)?
+                .is_some()
         {
             return Ok(true);
         }
@@ -89,13 +94,14 @@ impl AccountManager {
         account_ref: &str,
         acknowledge_latest_only_evidence: bool,
     ) -> Result<String, AppError> {
-        self.shared.lifecycle().ensure_running()?;
+        self.shared().lifecycle().ensure_running()?;
         if !acknowledge_latest_only_evidence {
             return Err(onboarding_error());
         }
-        let account = self.resolve(account_ref)?;
+        let account = self.records().resolve(account_ref)?;
         let (receive, epoch) = {
             let mut tasks = self
+                .state
                 .onboarding_cancellations
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
@@ -104,11 +110,11 @@ impl AccountManager {
             }
             let state = self.onboarding_state_lock(&account.account_id_hex);
             let _state = state.lock().unwrap_or_else(|p| p.into_inner());
-            self.shared.lifecycle().ensure_running()?;
-            let home = self.app.account_home();
+            self.shared().lifecycle().ensure_running()?;
+            let home = self.app().account_home();
             // An unreadable recovery journal is evidence too. Explicit recovery
             // may replace it only after retaining its exact opaque bytes.
-            let previous = self.read_onboarding_recovery(&account.label);
+            let previous = self.records().read_onboarding_recovery(&account.label);
             let previous_recovery = if previous.is_err() {
                 home.account_onboarding_recovery(&account.label)?
             } else {
@@ -122,9 +128,11 @@ impl AccountManager {
                     // Retrying a completed recovery before an explicit begin is
                     // harmless. Never retire a healthy new attempt on retry.
                     if home.account_onboarding(&account.label)?.is_none()
-                        && let Some(previous) = self.read_onboarding_recovery(&account.label)?
-                        && let Some(cancelled) =
-                            self.read_cancelled_onboarding_checkpoint_for(&account)?
+                        && let Some(previous) =
+                            self.records().read_onboarding_recovery(&account.label)?
+                        && let Some(cancelled) = self
+                            .records()
+                            .read_cancelled_onboarding_checkpoint_for(&account)?
                         && cancelled.high_water() == 0
                         && cancelled.snapshot.recovery_epoch.as_deref()
                             == Some(previous.epoch.as_str())
@@ -160,24 +168,26 @@ impl AccountManager {
                     epoch: Some(Sha256::digest(recovery.epoch.as_bytes()).into()),
                 },
             );
-            self.onboarding_updates
+            self.state
+                .onboarding_updates
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&account.account_id_hex);
             let epoch = recovery.epoch;
             let (send, receive) = tokio::sync::oneshot::channel();
-            let manager = self.clone();
+            let (state, manager) = (self.state.clone(), self.manager.clone());
             let account = account.clone();
             retain_unfinished_onboarding_handles(&mut tasks);
             tasks.handles.push(tokio::spawn(async move {
+                let setup = AccountSetup::new(&state, &manager);
                 let result = async {
                     let _workers = timeout(
                         ONBOARDING_CANCELLATION_WAIT,
-                        manager.worker_transactions.lock(),
+                        setup.manager.lock_worker_transaction(),
                     )
                     .await
                     .map_err(|_| AppError::AccountWorkerResponseTimedOut)?;
-                    manager.finish_onboarding_recovery_locked(&account).await
+                    setup.finish_onboarding_recovery_locked(&account).await
                 }
                 .await;
                 let _ = send.send(result);
@@ -197,19 +207,24 @@ impl AccountManager {
         &self,
         account: &AccountSummary,
     ) -> Result<(), AppError> {
-        self.shared.lifecycle().ensure_running()?;
+        self.shared().lifecycle().ensure_running()?;
         let Some(mut recovery) = self
+            .records()
             .read_onboarding_recovery(&account.label)?
             .filter(|r| !r.completed)
         else {
             return Ok(());
         };
-        self.app
+        self.app()
             .account_home()
             .set_account_signed_out(&account.label, true)?;
         // Reaping may wait or fail before cache-drop emits its reset signal.
-        self.app.presentation_signals.catalog_changed();
-        if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
+        self.app().presentation_signals.catalog_changed();
+        if let Some(worker) = self
+            .manager
+            .take_worker_locked(&account.account_id_hex)
+            .await
+        {
             self.start_tracked_worker_reap(
                 &account.account_id_hex,
                 worker,
@@ -218,25 +233,25 @@ impl AccountManager {
         }
         self.await_tracked_worker_reap(&account.account_id_hex, ONBOARDING_CANCELLATION_WAIT)
             .await?;
-        self.app.drop_account_caches(&account.label);
+        self.app().drop_account_caches(&account.label);
         let state = self.onboarding_state_lock(&account.account_id_hex);
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
         // Terminal close can release the root lease while a reaper is pending.
         // Leave intent for the next runtime instead of writing a late tombstone
         // over state that a newly opened runtime may already have recovered.
-        self.shared.lifecycle().ensure_running()?;
+        self.shared().lifecycle().ensure_running()?;
         let mut tombstone = OnboardingCheckpoint::new(account, OnboardingOptions::default());
         tombstone.version = RECOVERED_ONBOARDING_VERSION;
         tombstone.snapshot.recovery_epoch = Some(recovery.epoch.clone());
         tombstone.snapshot.cancellation_pending = true;
-        self.app
+        self.app()
             .account_home()
             .finish_recovered_account_onboarding(
                 &account.label,
                 &serde_json::to_vec(&tombstone)?,
             )?;
         recovery.completed = true;
-        self.app
+        self.app()
             .account_home()
             .set_account_onboarding_recovery(&account.label, &serde_json::to_vec(&recovery)?)?;
         Ok(())

@@ -3,12 +3,12 @@ use super::*;
 use crate::APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT;
 use crate::runtime::ManagedAccountWorker;
 
-impl AccountManager {
+impl AccountSetup<'_> {
     /// Cancel an interactive onboarding attempt at any step, including approved
     /// or ready checkpoints. The identity stays signed out. Already-sent events
     /// are not rolled back; the local journal and signed bytes are retained.
     pub async fn cancel_onboarding(&self, account_ref: &str) -> Result<(), AppError> {
-        self.shared.lifecycle().ensure_running()?;
+        self.shared().lifecycle().ensure_running()?;
         let Some((account, attempt)) = self.persist_onboarding_cancellation_intent(account_ref)?
         else {
             return Ok(());
@@ -17,11 +17,11 @@ impl AccountManager {
             .await
     }
 
-    pub(crate) async fn finish_pending_onboarding_cancellations(&self) {
+    pub(super) async fn finish_pending_onboarding_cancellations(self) {
         #[cfg(test)]
-        self.await_onboarding_test_hold(&self.onboarding_test_holds.cancellation_recovery)
+        self.await_onboarding_test_hold(&self.state.onboarding_test_holds.cancellation_recovery)
             .await;
-        let accounts = match self.app.account_home().accounts() {
+        let accounts = match self.app().account_home().accounts() {
             Ok(accounts) => accounts,
             Err(error) => {
                 tracing::warn!(
@@ -35,6 +35,7 @@ impl AccountManager {
         };
         for account in accounts {
             if self
+                .records()
                 .onboarding_recovery_pending(&account.label)
                 .unwrap_or(true)
             {
@@ -47,7 +48,7 @@ impl AccountManager {
                 }
                 continue;
             }
-            let pending = match self.read_onboarding_checkpoint_for(&account) {
+            let pending = match self.records().read_onboarding_checkpoint_for(&account) {
                 Ok(Some(checkpoint)) if checkpoint.snapshot.cancellation_pending => {
                     Some(checkpoint.attempt())
                 }
@@ -81,14 +82,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Option<(AccountSummary, OnboardingAttempt)>, AppError> {
-        let account = self.resolve(account_ref)?;
+        let account = self.records().resolve(account_ref)?;
         let state = self.onboarding_state_lock(&account.account_id_hex);
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(mut checkpoint) = self.read_onboarding_checkpoint_for(&account)? else {
+        let Some(mut checkpoint) = self.records().read_onboarding_checkpoint_for(&account)? else {
             return Ok(None);
         };
         let setup = self
-            .app
+            .app()
             .account_home()
             .account_setup_state(&account.label)?;
         if setup
@@ -132,6 +133,7 @@ impl AccountManager {
         attempt: OnboardingAttempt,
     ) -> watch::Receiver<Option<OnboardingCancelOutcome>> {
         let mut tasks = self
+            .state
             .onboarding_cancellations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -152,11 +154,12 @@ impl AccountManager {
                 outcome: sender.clone(),
             },
         );
-        let manager = self.clone();
+        let (state, manager) = (self.state.clone(), self.manager.clone());
         let account = account.clone();
         retain_unfinished_onboarding_handles(&mut tasks);
         tasks.handles.push(tokio::spawn(async move {
-            let outcome = match manager
+            let setup = AccountSetup::new(&state, &manager);
+            let outcome = match setup
                 .complete_onboarding_cancellation(&account, attempt, false)
                 .await
             {
@@ -165,7 +168,8 @@ impl AccountManager {
                 Err(_) => OnboardingCancelOutcome::Failed,
             };
             let _ = sender.send(Some(outcome));
-            let mut tasks = manager
+            let mut tasks = setup
+                .state
                 .onboarding_cancellations
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
@@ -193,7 +197,7 @@ impl AccountManager {
             None
         } else {
             Some(
-                timeout(remaining(), self.worker_transactions.lock())
+                timeout(remaining(), self.manager.lock_worker_transaction())
                     .await
                     .map_err(|_| AppError::AccountWorkerResponseTimedOut)?,
             )
@@ -208,18 +212,22 @@ impl AccountManager {
         attempt: OnboardingAttempt,
         budget: Duration,
     ) -> Result<(), AppError> {
-        let Some(checkpoint) = self.read_onboarding_checkpoint_for(account)? else {
+        let Some(checkpoint) = self.records().read_onboarding_checkpoint_for(account)? else {
             return Ok(());
         };
         if checkpoint.attempt() != attempt || !checkpoint.snapshot.cancellation_pending {
             return Ok(());
         }
-        self.app
+        self.app()
             .account_home()
             .set_account_signed_out(&account.label, true)?;
-        self.set_account_tearing_down(&account.account_id_hex, true);
+        self.manager
+            .set_account_tearing_down(&account.account_id_hex, true);
         let result = async {
-            let worker = self.workers.lock().await.remove(&account.account_id_hex);
+            let worker = self
+                .manager
+                .take_worker_locked(&account.account_id_hex)
+                .await;
             if let Some(worker) = worker {
                 self.start_tracked_worker_reap(
                     &account.account_id_hex,
@@ -232,13 +240,13 @@ impl AccountManager {
                 budget.min(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT),
             )
             .await?;
-            self.app.drop_account_caches(&account.label);
+            self.app().drop_account_caches(&account.label);
             let setup = self
-                .app
+                .app()
                 .account_home()
                 .account_setup_state(&account.label)?;
             if let Some(setup) = setup.filter(|s| s.kind == AccountSetupKind::InteractiveIdentity) {
-                self.app.account_home().begin_account_setup_with(
+                self.app().account_home().begin_account_setup_with(
                     account,
                     setup.reused_account_id_credential,
                     if account.local_signing {
@@ -249,7 +257,7 @@ impl AccountManager {
                     setup.phase,
                 )?;
             }
-            self.app
+            self.app()
                 .account_home()
                 .archive_account_onboarding(&account.label)?;
             self.close_onboarding_subscription(&account.account_id_hex, &checkpoint.snapshot);
@@ -261,7 +269,8 @@ impl AccountManager {
             Ok(())
         }
         .await;
-        self.set_account_tearing_down(&account.account_id_hex, false);
+        self.manager
+            .set_account_tearing_down(&account.account_id_hex, false);
         result
     }
 
@@ -272,6 +281,7 @@ impl AccountManager {
         budget: Duration,
     ) {
         let mut tasks = self
+            .state
             .onboarding_cancellations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -282,6 +292,7 @@ impl AccountManager {
         tasks.reaping.insert(account_id.to_owned(), sender.clone());
         #[cfg(test)]
         let hold = self
+            .state
             .onboarding_test_holds
             .worker_reap
             .lock()
@@ -313,6 +324,7 @@ impl AccountManager {
             loop {
                 let mut receiver = {
                     let tasks = self
+                        .state
                         .onboarding_cancellations
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
@@ -326,6 +338,7 @@ impl AccountManager {
                     .await
                     .map_err(|_| onboarding_error())?;
                 let mut tasks = self
+                    .state
                     .onboarding_cancellations
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
@@ -346,6 +359,7 @@ impl AccountManager {
 
     fn close_onboarding_subscription(&self, account_id: &str, snapshot: &OnboardingSnapshot) {
         let mut updates = self
+            .state
             .onboarding_updates
             .lock()
             .unwrap_or_else(|p| p.into_inner());
