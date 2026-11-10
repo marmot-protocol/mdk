@@ -7,6 +7,9 @@
 - `TransportEndpointFailure::over_known_limit` is an adapter's refusal to send an event over an endpoint's known limit
   (mdk#2334): `NotExposed` with the `TooLarge` category and the event's size class. `TooLarge` now also covers this
   refusal, and `EventSizeClass::from_rejected_targets` counts it, alone or mixed with endpoints' own size refusals.
+- `TransportAdapter::size_class_over_known_limits` returns a message's size class when `publish` would refuse it,
+  unsent, on every endpoint it would send to, because it is over each one's known limit; it sends nothing (mdk#2334).
+  It defaults to `None`, so existing adapters build unchanged.
 
 ## 0.15.0 - 2026-11-09
 

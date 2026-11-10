@@ -396,6 +396,11 @@ pub struct PreparedSessionCommit {
 pub enum PreparedSessionSend {
     Commit(PreparedSessionCommit),
     Queued(SessionEffects),
+    /// The invite's commit fit none of its group relays' known size limits, or
+    /// one of its Welcomes fit none of its invitee's inbox relays' (mdk#2334).
+    /// It was rolled back with nothing sent; the effects carry its rollback and
+    /// one [`PublishFailure`] naming the oversized artifact.
+    Refused(Box<AccountDeviceEffects>),
 }
 
 impl PreparedSessionCommit {
@@ -3615,7 +3620,11 @@ where
     /// unsettled convergence returns the durable queued effects instead. For a
     /// staged commit, the caller must record exact Welcome delivery obligations
     /// before [`Self::publish_prepared_session_effects_with_audit_context`]
-    /// exposes the commit on the wire.
+    /// exposes the commit on the wire. An invite whose commit or Welcome fits
+    /// none of its relays' known limits is rolled back here instead, unsent,
+    /// as [`PreparedSessionSend::Refused`]. A queued invite is not checked:
+    /// when it drains, its commit is sent and the adapter refuses such a
+    /// Welcome, which stays owed with its size class.
     pub async fn confirm_commit_without_publish_with_audit_context(
         &mut self,
         intent: SendIntent,
@@ -3628,15 +3637,74 @@ where
             )
             .into());
         }
+        // Only an invite: other commits that carry Welcomes (recovery, own
+        // devices) keep their own handling of a Welcome that cannot be sent.
+        let invite = matches!(intent, SendIntent::Invite { .. });
         let session_effects = self
             .session
             .send_with_audit_context(intent, context)
             .await?;
         let prepared = classify_prepared_session_send(session_effects)?;
-        if let PreparedSessionSend::Commit(commit) = &prepared {
-            self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
+        let PreparedSessionSend::Commit(commit) = prepared else {
+            return Ok(prepared);
+        };
+        if invite && let Some((message_id, oversized)) = self.oversized_invite(&commit).await {
+            let mut output = self.rollback_prepared_session_commit(commit).await?;
+            output
+                .failures
+                .insert(0, refused_before_publishing(message_id, oversized));
+            return Ok(PreparedSessionSend::Refused(Box::new(output)));
         }
-        Ok(prepared)
+        self.watch_welcomes(commit.welcomes().iter().map(|welcome| welcome.id.clone()));
+        Ok(PreparedSessionSend::Commit(commit))
+    }
+
+    /// The commit's id and the oversized artifact when an invite must be
+    /// refused before its commit is published (mdk#2334): the commit fits
+    /// none of its group relays' known limits, or a Welcome fits none of its
+    /// invitee's inbox relays'. A relay with no known limit fits; one the
+    /// adapter would never send to does not count.
+    async fn oversized_invite(
+        &self,
+        prepared: &PreparedSessionCommit,
+    ) -> Option<(cgka_traits::MessageId, OversizedEvent)> {
+        let commit = prepared
+            .effects
+            .publish
+            .iter()
+            .find_map(|work| match work {
+                PublishWork::GroupEvolution { msg, pending, .. }
+                    if *pending == prepared.pending =>
+                {
+                    Some(msg)
+                }
+                _ => None,
+            })?;
+        let refused = |artifact, size_class| {
+            Some((
+                commit.id.clone(),
+                OversizedEvent {
+                    artifact,
+                    size_class,
+                },
+            ))
+        };
+        // A commit or Welcome without a route fails when it is published.
+        let target = self.routing.publish_target(commit).ok()?;
+        let adapter = &self.adapter;
+        if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
+            return refused(OversizedArtifact::Commit, size_class);
+        }
+        let welcomes = prepared.welcomes.iter().filter_map(|welcome| {
+            let target = self.routing.publish_target(welcome).ok()?;
+            Some(async move { adapter.size_class_over_known_limits(welcome, &target).await })
+        });
+        let size_class = futures::future::join_all(welcomes)
+            .await
+            .into_iter()
+            .flatten()
+            .next()?;
+        refused(OversizedArtifact::Welcome, size_class)
     }
 
     /// Roll back a prepared commit before that commit has any transport side
@@ -3691,6 +3759,7 @@ where
                 (effects, welcomes)
             }
             PreparedSessionSend::Queued(effects) => (effects, Vec::new()),
+            PreparedSessionSend::Refused(output) => return Ok((*output, Vec::new())),
         };
         let mut output = self
             .publish_session_effects_with_audit_context(session_effects, Some(context))
@@ -6967,6 +7036,26 @@ fn transport_retry_delay_ms(target: &TransportFanoutTarget, now_ms: u64) -> Opti
     }))
 }
 
+/// The failure of an invite refused before its commit was published because
+/// an artifact of it fits none of its relays' known limits (mdk#2334).
+fn refused_before_publishing(
+    message_id: cgka_traits::MessageId,
+    oversized: OversizedEvent,
+) -> PublishFailure {
+    tracing::debug!(
+        target: TRACE_TARGET,
+        method = "refused_before_publishing",
+        artifact = oversized.artifact.as_str(),
+        size_class = oversized.size_class.as_str(),
+        "invite fits none of its relays' known limits; rolled back unsent"
+    );
+    PublishFailure {
+        message_id,
+        reason: TransportEndpointFailure::OVER_KNOWN_LIMIT_REASON.to_owned(),
+        oversized: Some(oversized),
+    }
+}
+
 /// Pull caller-owned Welcome payloads off publish work so the commit/create can confirm
 /// without waiting for recipient delivery. Empty Welcome vectors remain on the
 /// original work items so later publish still confirms the commit. Automatic
@@ -7829,7 +7918,9 @@ mod tests {
                 assert_eq!(effects.queued, vec![queued]);
                 assert_eq!(effects.pending_convergence.len(), 1);
             }
-            PreparedSessionSend::Commit(_) => panic!("queued invite must not pretend to be staged"),
+            PreparedSessionSend::Commit(_) | PreparedSessionSend::Refused(_) => {
+                panic!("queued invite must not pretend to be staged")
+            }
         }
     }
 

@@ -4560,6 +4560,26 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             None => Ok(None),
         }
     }
+
+    async fn size_class_over_known_limits(
+        &self,
+        message: &cgka_traits::TransportMessage,
+        target: &cgka_traits::TransportPublishTarget,
+    ) -> Option<cgka_traits::EventSizeClass> {
+        // An unreadable payload is refused by `publish` itself.
+        let event = NostrTransportEvent::from_transport_message(message).ok()?;
+        // Judge the endpoints `publish` can reach, by the rule it applies to
+        // each request, and refuse them by the limits it applies.
+        let endpoints = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .reachable_publish_endpoints(target);
+        let (_, refused) = self
+            .refuse_over_known_limits(&endpoints, event_json_bytes(&event))
+            .await;
+        cgka_traits::EventSizeClass::from_rejected_targets(&endpoints, &refused)
+    }
 }
 
 /// Hand one delivery to its account without awaiting the account queue: a

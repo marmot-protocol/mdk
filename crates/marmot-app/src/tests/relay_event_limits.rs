@@ -119,3 +119,55 @@ async fn a_welcome_over_the_inbox_limit_stays_owed_with_its_size() {
         "no Welcome reached a relay"
     );
 }
+
+/// An invite whose Welcome fits none of the invitee's inbox relays is refused
+/// before its commit is sent: the commit rolls back, no Welcome stays owed,
+/// and nothing reaches a relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_with_event_limits(&dir, relay.clone(), &[("wss://inbox.example", 200)]);
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://inbox.example");
+    app.client("bob")
+        .await
+        .unwrap()
+        .publish_key_package()
+        .await
+        .unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice.create_group("invite", &[]).await.unwrap();
+    let epoch = alice.runtime.epoch_state(&group).unwrap().epoch();
+    let attempted = relay.attempted_events().len();
+
+    let error = alice
+        .invite_members(&group, &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            AppError::EventTooLarge {
+                artifact: OversizedArtifact::Welcome,
+                size_class: EventSizeClass::Under64Kib,
+            }
+        ),
+        "{error:?}"
+    );
+    let state = alice.runtime.epoch_state(&group).unwrap();
+    assert!(
+        matches!(state, cgka_traits::engine_state::EpochState::Stable { .. }),
+        "the refused invite rolled back: {state:?}"
+    );
+    assert_eq!(state.epoch(), epoch);
+    assert!(alice.pending_welcome_deliveries().unwrap().is_empty());
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "neither the commit nor the Welcome reached a relay"
+    );
+}
