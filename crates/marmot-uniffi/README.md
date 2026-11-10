@@ -395,7 +395,7 @@ WebSocket message limit a relay's NIP-11 document advertises, and uses the small
 event, Welcome or account-signed event to a relay over that relay's limit. A send that fits none of its relays reaches
 none, and a call that returns relay errors then fails with `EventTooLarge`
 (see [errors](#runtime-lifecycle-threads-and-errors)); a relay with no known limit gets every event, and
-its own size refusal arrives as the same error.
+its own size refusal reaches such a call as the same error.
 
 ```swift
 let options = MarmotOptions(clientName: "whitenoise", deployment: marmotDeploymentWhiteNoise())
