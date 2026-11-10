@@ -60,6 +60,27 @@ operations! {
     IngestEngine => "ingest_engine",
     IngestEffectPublish => "ingest_effect_publish",
     WorkerAcquire => "worker_acquire",
+    // One per read class of the read-path plan (mdk#3273): how long a host
+    // read waits on its account worker before the worker takes it up.
+    ReadQueueR1 => "read_queue_r1",
+    ReadQueueR2 => "read_queue_r2",
+    ReadQueueR3 => "read_queue_r3",
+    ReadQueueR4 => "read_queue_r4",
+    ReadQueueR5 => "read_queue_r5",
+    ReadQueueR6 => "read_queue_r6",
+    ReadQueueR7 => "read_queue_r7",
+    ReadQueueR8 => "read_queue_r8",
+    ReadQueueR9 => "read_queue_r9",
+    // The same wait again, for a read that arrived while the worker was
+    // inside one of the long units the plan names.
+    ReadQueueBehindStartupSync => "read_queue_behind_startup_sync",
+    ReadQueueBehindCatchUp => "read_queue_behind_catch_up",
+    ReadQueueBehindConvergence => "read_queue_behind_convergence",
+    ReadQueueBehindWelcomeFanout => "read_queue_behind_welcome_fanout",
+    ReadQueueBehindRepair => "read_queue_behind_repair",
+    ReadQueueBehindSend => "read_queue_behind_send",
+    ReadQueueBehindInviteOrCreate => "read_queue_behind_invite_or_create",
+    ReadQueueBehindMaintenance => "read_queue_behind_maintenance",
     LifecycleLockWait => "lifecycle_lock_wait",
     AccountStartup => "account_startup",
     AccountStartupRetrySuppressed => "account_startup_retry_suppressed",

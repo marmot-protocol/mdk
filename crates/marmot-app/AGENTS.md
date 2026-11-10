@@ -1147,7 +1147,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
-  `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `conversation_window.rs`, `chat_list_window.rs`,
+  `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `account_worker/read_queue.rs` (host-read
+  queue-wait telemetry: `ReadReply`, the read classes and the worker-unit gauge, mdk#3273; observes only, never
+  reorders), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,
