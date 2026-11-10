@@ -3600,6 +3600,7 @@ dependencies = [
  "jsonschema",
  "keyring-core",
  "marmot-account",
+ "marmot-app",
  "marmot-forensics",
  "marmot-markdown",
  "marmot-observability",

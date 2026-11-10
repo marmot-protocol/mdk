@@ -24,9 +24,10 @@ unreleased-device-pairing = [
 otlp-export = ["marmot-observability/otlp-export"]
 # Internal-only surface used by the repeatable media transport benchmark.
 media-benchmarks = []
-# The lower-stack error table that host crates check their classifiers
-# against, and the diagnostics test fixtures and hooks. Enable only as a
-# dev-dependency.
+# `AppClient` and `MarmotApp::client`, for tests that drive a directly owned
+# client; the lower-stack error table that host crates check their
+# classifiers against; and the diagnostics test fixtures and hooks. Hosts
+# reach accounts through `MarmotAppRuntime`. Enable only as a dev-dependency.
 test-support = ["marmot-observability/test-support"]
 
 [dependencies]
@@ -79,6 +80,9 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# This crate's own tests drive a directly owned `AppClient`, so a
+# `-p marmot-app` run builds them too.
+marmot-app = { workspace = true, features = ["test-support"] }
 # Production code names no engine item; tests reach into the engine directly.
 cgka-engine.workspace = true
 transport-nostr = { workspace = true, features = ["test-support"] }

@@ -11,7 +11,8 @@ use std::time::Duration;
 use cgka_traits::GroupId;
 use marmot_account::AccountHome;
 use marmot_app::{
-    AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
+    AppClient, AppError, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent,
+    MarmotAppRuntime,
 };
 use nostr_relay_builder::MockRelay;
 #[path = "support/limited_relay.rs"]
@@ -319,8 +320,18 @@ async fn native_prefix_reports_once() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
+/// Bob, invited by alice, with the Welcome still on the relay: bob's next sync
+/// is the cold pass that joins the group.
+struct PendingWelcome {
+    _relay: MockRelay,
+    relay_url: String,
+    bob_dir: tempfile::TempDir,
+    _alice_dir: tempfile::TempDir,
+    _alice: AppClient,
+    group_id: GroupId,
+}
+
+async fn pending_welcome(group_name: &str) -> PendingWelcome {
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
 
@@ -341,11 +352,24 @@ async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
     let app_alice = open_store(&alice_dir, &relay_url, None);
     let mut alice = app_alice.client("alice").await.unwrap();
     let group_id = alice
-        .create_group("join boundary recovery", &[bob_id.as_str()])
+        .create_group(group_name, &[bob_id.as_str()])
         .await
         .unwrap();
+    PendingWelcome {
+        _relay: relay,
+        relay_url,
+        bob_dir,
+        _alice_dir: alice_dir,
+        _alice: alice,
+        group_id,
+    }
+}
 
-    let app_bob_failing = open_store_with_boundary_failure(&bob_dir, &relay_url, 0);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
+    let welcome = pending_welcome("join boundary recovery").await;
+
+    let app_bob_failing = open_store_with_boundary_failure(&welcome.bob_dir, &welcome.relay_url, 0);
     let mut bob_failing = app_bob_failing.client("bob").await.unwrap();
     let failure = bob_failing
         .sync_with_partial_progress()
@@ -361,23 +385,56 @@ async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
     drop(bob_failing);
     drop(app_bob_failing);
 
-    let app_bob_recovered = open_store(&bob_dir, &relay_url, None);
+    let app_bob_recovered = open_store(&welcome.bob_dir, &welcome.relay_url, None);
     let mut bob_recovered = app_bob_recovered.client("bob").await.unwrap();
     let recovered = bob_recovered.sync().await.unwrap();
     assert_eq!(
         recovered.joined_groups,
-        vec![group_id.clone()],
+        vec![welcome.group_id.clone()],
         "the durable engine-to-app outbox must replay the joined group"
     );
     drop(bob_recovered);
     drop(app_bob_recovered);
 
-    let app_bob_acknowledged = open_store(&bob_dir, &relay_url, None);
+    let app_bob_acknowledged = open_store(&welcome.bob_dir, &welcome.relay_url, None);
     let mut bob_acknowledged = app_bob_acknowledged.client("bob").await.unwrap();
     let after_ack = bob_acknowledged.sync().await.unwrap();
     assert!(
         after_ack.joined_groups.is_empty(),
         "the projection save must acknowledge the replay exactly once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_account_keeps_open_failure_apart_from_pass_failure() {
+    let welcome = pending_welcome("sync account failures").await;
+    let app_bob = open_store_with_boundary_failure(&welcome.bob_dir, &welcome.relay_url, 0);
+
+    // Another open holds bob's engine session, so `sync_account` fails to
+    // open before anything syncs: the open's own error, not an empty partial
+    // sync.
+    let held = app_bob.client("bob").await.unwrap();
+    let busy = app_bob.sync_account("bob").await;
+    assert!(
+        matches!(busy, Err(AppError::AccountSessionBusy)),
+        "a failed open must surface as its AppError: {busy:?}",
+    );
+    drop(held);
+
+    // The cold pass `wn sync` runs fails projecting the Welcome: a pass
+    // failure, returned inside the open that succeeded.
+    let failure = app_bob
+        .sync_account("bob")
+        .await
+        .expect("the client opens once the other open is dropped")
+        .expect_err("the Welcome projection boundary must fail");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected catch-up boundary save failure"),
+        "the fault must come from the pass: {}",
+        failure.source
     );
 }
 

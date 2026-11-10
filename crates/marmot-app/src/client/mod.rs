@@ -1868,6 +1868,7 @@ impl AppClient {
     /// Fetch current relay KeyPackages for the composition roster without
     /// reserving or consuming them. Group creation fetches again before the
     /// MLS mutation; cached packages only inform discovery.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn prewarm_group_member_key_packages(
         &self,
         member_refs: &[&str],
@@ -2153,6 +2154,7 @@ impl AppClient {
     /// Any Welcome that misses its acknowledgement policy is reported through
     /// `WelcomeDeliveryPending` and remains listed by
     /// [`Self::pending_welcome_deliveries`] for explicit re-delivery.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn create_group(
         &mut self,
         name: &str,
@@ -2162,6 +2164,7 @@ impl AppClient {
             .await
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn create_group_with_initial_image(
         &mut self,
         name: &str,
@@ -2179,6 +2182,7 @@ impl AppClient {
         .await
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn create_group_with_options(
         &mut self,
         name: &str,
@@ -3017,6 +3021,7 @@ impl AppClient {
         Ok(self.runtime.safe_export_secret(group_id, component_id)?)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn agent_text_stream_exporter_secret(
         &self,
         group_id: &GroupId,
@@ -3034,6 +3039,7 @@ impl AppClient {
         Ok(self.runtime.exporter_secret(group_id, label, length)?)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn invite_members(
         &mut self,
         group_id: &GroupId,
@@ -4570,6 +4576,7 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send(
         &mut self,
         group_id: &GroupId,
@@ -5307,6 +5314,7 @@ impl AppClient {
         }
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn react_to_message(
         &mut self,
         group_id: &GroupId,
@@ -5394,6 +5402,7 @@ impl AppClient {
         Ok(summary)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn unreact_from_message(
         &mut self,
         group_id: &GroupId,
@@ -5403,6 +5412,7 @@ impl AppClient {
             .await
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn unreact_from_message_matching(
         &mut self,
         group_id: &GroupId,
@@ -5424,6 +5434,7 @@ impl AppClient {
         Ok(summary)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn report_message(
         &mut self,
         group_id: &GroupId,
@@ -5444,6 +5455,7 @@ impl AppClient {
             .await?;
         Ok(summary)
     }
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn dismiss_reports(
         &mut self,
         group_id: &GroupId,
@@ -5466,6 +5478,7 @@ impl AppClient {
     /// own chat. Otherwise delete one's own target with kind 5. A non-admin
     /// targeting another account's known message receives an error before send.
     /// Older clients may retain content removed by kind 4891.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn delete_message(
         &mut self,
         group_id: &GroupId,
@@ -5482,6 +5495,7 @@ impl AppClient {
         Ok(summary)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn reply_to_message(
         &mut self,
         group_id: &GroupId,
@@ -5503,6 +5517,7 @@ impl AppClient {
     /// Submit exactly the selected composer revision. Media references must be
     /// prepared in selected attachment order. Durable outbox acceptance clears
     /// only that revision; a later delivery error does not restore the composer.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send_message_draft(
         &mut self,
         group: &GroupId,
@@ -5653,6 +5668,7 @@ impl AppClient {
         Ok(pin)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send_media_attachments(
         &mut self,
         group_id: &GroupId,
@@ -5712,6 +5728,7 @@ impl AppClient {
 
     /// Stage every body in the media store, upload, then send. A body the
     /// disk cannot hold fails with the storage-full error before any upload.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
@@ -5734,6 +5751,7 @@ impl AppClient {
     /// Cheap exclusive-client setup for an encrypted-media upload. The returned
     /// HTTP job must run without holding `&mut AppClient` so the account worker
     /// can keep polling inbound delivery.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub(crate) async fn prepare_encrypted_media_upload(
         &mut self,
         group_id: &GroupId,
@@ -5918,6 +5936,7 @@ impl AppClient {
         Ok((result, None))
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn download_media(
         &mut self,
         group_id: &GroupId,
@@ -6164,6 +6183,7 @@ impl AppClient {
     }
 
     /// Fetch + decrypt the group's avatar. Errors when the group has no image set.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn download_group_blossom_image(
         &mut self,
         group_id: &GroupId,
@@ -6197,6 +6217,7 @@ impl AppClient {
         })
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn start_agent_text_stream(
         &mut self,
         group_id: &GroupId,
@@ -6207,6 +6228,7 @@ impl AppClient {
             .await
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn start_agent_text_stream_with_parent(
         &mut self,
         group_id: &GroupId,
@@ -6247,6 +6269,7 @@ impl AppClient {
         .await
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn finish_agent_text_stream(
         &mut self,
         group_id: &GroupId,
@@ -6273,6 +6296,7 @@ impl AppClient {
         .await
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send_agent_activity(
         &mut self,
         group_id: &GroupId,
@@ -6295,6 +6319,7 @@ impl AppClient {
         Ok(summary)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send_agent_operation_event(
         &mut self,
         group_id: &GroupId,
@@ -6338,6 +6363,7 @@ impl AppClient {
         Ok(summary)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send_group_system_event(
         &mut self,
         group_id: &GroupId,
@@ -6362,6 +6388,7 @@ impl AppClient {
     /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
     /// edit, delete, agent, group system, push token, device group) are
     /// rejected so an app cannot forge protocol events.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn send_custom_event(
         &mut self,
         group_id: &GroupId,

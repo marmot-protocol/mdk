@@ -1306,6 +1306,7 @@ impl AppClient {
     /// This compatibility entry point preserves the original [`AppError`]
     /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
     /// report the durably applied prefix of a failed catch-up pass.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
         match self.sync_inner(None, SyncMode::Explicit).await {
             Ok(summary) => Ok(summary),
@@ -2393,6 +2394,7 @@ impl AppClient {
         self.event_group_projection(group_id, group_metadata).ok()
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
             let mut native_changes = self.adapter.replay_changes().await;
