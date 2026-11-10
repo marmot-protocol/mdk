@@ -1428,6 +1428,17 @@ pub trait TransportAdapter: Send + Sync {
     }
 }
 
+/// Judges a founding create's Welcomes before the engine writes anything
+/// (mdk#2334). The engine refuses the create with
+/// [`crate::EngineError::WelcomeTooLarge`] when this names a size class.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait WelcomeSizeCheck: Send + Sync {
+    /// The size class of the first of `welcomes` that fits none of the
+    /// endpoints its publish would reach, or `None` when each fits one.
+    async fn oversized_welcome(&self, welcomes: &[TransportMessage]) -> Option<EventSizeClass>;
+}
+
 fn envelope_label(envelope: &TransportEnvelope) -> &'static str {
     match envelope {
         TransportEnvelope::GroupMessage { .. } => "group",

@@ -294,6 +294,12 @@ pub enum EngineError {
     #[error(transparent)]
     Peeler(#[from] PeelerError),
 
+    /// A founder's Welcome fits none of the endpoints its publish would
+    /// reach, so the create was refused before anything was written
+    /// (mdk#2334). See [`crate::WelcomeSizeCheck`].
+    #[error("a founding Welcome fits none of its relays' known size limits")]
+    WelcomeTooLarge { size_class: crate::EventSizeClass },
+
     #[error("serialization failure: {0}")]
     Serialize(String),
 
@@ -404,6 +410,7 @@ impl EngineError {
             EngineError::GroupRecoverySourceMismatch { .. } => "group_recovery_source_mismatch",
             EngineError::Storage(_) => "storage",
             EngineError::Peeler(_) => "peeler",
+            EngineError::WelcomeTooLarge { .. } => "event_too_large",
             EngineError::Serialize(_) => "serialize",
             EngineError::InvalidWelcome => "invalid_welcome",
             EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",

@@ -35,11 +35,13 @@
   do not advertise their event limit (mdk#2334). MDK sends no group event, Welcome or account-signed event over a
   relay's known limit, which for events over 64 KiB also counts the WebSocket message size a relay's NIP-11 document
   advertises. A send that fits none of its relays fails as `AppError::EventTooLarge`, rolled back with nothing sent:
-  a commit, and an invite staged at once whose Welcome fits none of the invitee's inbox relays. An invite queued behind an unsettled group, and a founding
-  create, keep such a Welcome owed with its size class. Every other event an account publishes (profile, follow and
-  relay lists, KeyPackages, the block list, stickers, the backup pointer) goes only to the relays it fits, and nowhere
-  when it fits none; the profile, follow-list and relay-list publishes then fail as
-  `EventTooLarge { artifact: Other }`. A relay with no known limit is sent to as before.
+  a commit, and an invite staged at once whose Welcome fits none of the invitee's inbox relays. A group create whose
+  founding Welcome fits none of an invitee's inbox relays fails as `EventTooLarge { artifact: Welcome }` before
+  anything is created or sent. An invite queued behind an unsettled group keeps such a Welcome owed with its size
+  class. Every other event an account publishes (profile, follow and relay lists, KeyPackages, the block list,
+  stickers, the backup pointer) goes only to the relays it fits, and nowhere when it fits none; the profile,
+  follow-list and relay-list publishes then fail as `EventTooLarge { artifact: Other }`. A relay with no known limit
+  is sent to as before.
   `MarmotDeployment::white_noise()` sets 2 MiB on White Noise's two relays; `neutral()` sets none. Struct literals add
   the field.
 

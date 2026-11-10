@@ -4,6 +4,11 @@
 
 ### Changed
 
+- `Engine::create_group_with_optional_app_components_and_audit_context` and
+  `Engine::create_group_with_siblings_and_audit_context` take `welcome_check: Option<&dyn WelcomeSizeCheck>`
+  (mdk#2334). After wrapping the founders' Welcomes, and before the creation's canonical write, a Welcome the check
+  finds too large refuses the create with `EngineError::WelcomeTooLarge`; the new group's OpenMLS state is removed.
+  Sibling Welcomes and chosen-id creates are not checked. Pass `None` to keep the old behaviour.
 - Engine paths read a group's stored record only through accessors that refuse a quarantined group, and the crate's
   `clippy.toml` bans the raw reads (mdk#3272). For any quarantined group, the settle API and `cancel_leave` return
   `UnknownGroup`, `has_pending_convergence_inputs` answers `false` unless a pass or replay is outstanding,

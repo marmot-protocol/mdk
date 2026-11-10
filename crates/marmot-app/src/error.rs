@@ -558,6 +558,18 @@ impl From<AuditUploadError> for AppError {
     }
 }
 
+fn welcome_too_large(error: &cgka_traits::error::EngineError) -> Option<crate::OversizedEvent> {
+    match error {
+        cgka_traits::error::EngineError::WelcomeTooLarge { size_class } => {
+            Some(crate::OversizedEvent {
+                artifact: crate::OversizedArtifact::Welcome,
+                size_class: *size_class,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// An external signer reports a rejection as text, which every layer passes
 /// through unchanged. So each lower-stack conversion recognises it by that
 /// text, wherever the rejection happened and however it was wrapped.
@@ -656,6 +668,11 @@ impl AppError {
                     artifact: crate::OversizedArtifact::Other,
                     size_class,
                 }),
+            // A founding create refused before it wrote anything (mdk#2334).
+            Self::Session(error) | Self::Account(AccountError::Session(error)) => {
+                welcome_too_large(error.as_engine_error())
+            }
+            Self::Account(AccountError::Engine(error)) => welcome_too_large(error),
             _ => None,
         }
     }

@@ -2575,6 +2575,8 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::NoDataAppComponent { .. }
         | EngineError::UnsupportedCiphersuite { .. }
         | EngineError::InvalidAppMessagePayload(_)
+        // A founding Welcome over its relays' known limits (mdk#2334).
+        | EngineError::WelcomeTooLarge { .. }
         // A halted group refusing new work is deliberate, not a protocol
         // violation: the state is durable and names its own repair path.
         | EngineError::GroupUnrecoverableRepairRequired { .. }
@@ -2670,6 +2672,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
         EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
+        EngineError::WelcomeTooLarge { .. } => "event_too_large",
     }
     .into()
 }
