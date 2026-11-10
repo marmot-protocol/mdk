@@ -507,7 +507,7 @@ async fn a_repair_queued_during_startup_goes_through_the_runner() {
         .await
         .unwrap();
     // A snapshot reply proves the repair entered startup replay before it.
-    let (respond, snapshot) = oneshot::channel();
+    let (respond, snapshot) = ReadReply::unobserved();
     commands
         .send(AccountWorkerCommand::QuarantinedGroups { respond })
         .await

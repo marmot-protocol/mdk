@@ -153,7 +153,8 @@ pub use subscriptions::{
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
     AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
-    publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
+    ReadClass, ReadReply, WorkerLane, WorkerUnitGauge, publish_app_runtime_group_state_updated,
+    spawn_app_runtime_account_worker,
 };
 pub(crate) use audit_tracker::{
     AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
@@ -7634,6 +7635,7 @@ impl AccountManager {
                     );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
+                    let unit = Arc::new(WorkerUnitGauge::default());
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
                     self.deactivate_when_unlinked(
                         account.account_id_hex.clone(),
@@ -7650,6 +7652,7 @@ impl AccountManager {
                             lifecycle: self.shared.lifecycle(),
                             shared: self.shared.clone(),
                             unlinked: unlinked_tx,
+                            unit: unit.clone(),
                         },
                         command_tx.clone(),
                         command_rx,
@@ -7665,6 +7668,7 @@ impl AccountManager {
                             commands: command_tx,
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
+                            unit,
                         },
                     );
                     ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));
@@ -8066,20 +8070,47 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+        self.worker_lane(account_ref)
+            .await
+            .map(|lane| lane.commands)
+    }
+
+    /// The account's worker lane: its commands, with the gauge host reads
+    /// sample when they are enqueued (mdk#3273 PR 0).
+    pub(super) async fn worker_lane(&self, account_ref: &str) -> Result<WorkerLane, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.setup_records()
             .require_onboarding_complete_for(&account)?;
         self.worker_commands_for_account(account)
             .await
-            .map(|(commands, _)| commands)
+            .map(|(lane, _)| lane)
+    }
+
+    /// The worker lane for one host read of `class`, and that read's reply,
+    /// whose wait on the worker starts now.
+    pub(super) async fn read_command<T>(
+        &self,
+        account_ref: &str,
+        class: ReadClass,
+    ) -> Result<
+        (
+            mpsc::Sender<AccountWorkerCommand>,
+            ReadReply<T>,
+            oneshot::Receiver<T>,
+        ),
+        AppError,
+    > {
+        let lane = self.worker_lane(account_ref).await?;
+        let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
+        Ok((lane.commands, respond, response))
     }
 
     /// Look up an already-running worker without starting or reconciling one.
     async fn existing_worker_commands(
         &self,
         account_ref: &str,
-    ) -> Result<Option<mpsc::Sender<AccountWorkerCommand>>, AppError> {
+    ) -> Result<Option<WorkerLane>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         if !account.can_sign() {
@@ -8091,7 +8122,7 @@ impl AccountManager {
         let workers = self.workers.lock().await;
         Ok(workers
             .get(&account.account_id_hex)
-            .map(|worker| worker.commands.clone()))
+            .map(ManagedAccountWorker::lane))
     }
 
     async fn worker_commands_for_setup(
@@ -8102,7 +8133,7 @@ impl AccountManager {
         let account = self.resolve(account_ref)?;
         self.worker_commands_for_account(account)
             .await
-            .map(|(commands, _)| commands)
+            .map(|(lane, _)| lane.commands)
     }
 
     async fn media_worker_commands(
@@ -8113,7 +8144,8 @@ impl AccountManager {
         let account = self.resolve(account_ref)?;
         self.setup_records()
             .require_onboarding_complete_for(&account)?;
-        let (commands, admission) = self.worker_commands_for_account(account).await?;
+        let (lane, admission) = self.worker_commands_for_account(account).await?;
+        let commands = lane.commands;
         // Wait outside the shared command lane, without holding the worker map lock.
         let permit = tokio::select! {
             _ = commands.closed() => return Err(AppError::TransportClosed),
@@ -8129,7 +8161,7 @@ impl AccountManager {
     async fn worker_commands_for_account(
         &self,
         account: AccountSummary,
-    ) -> Result<(mpsc::Sender<AccountWorkerCommand>, Arc<Semaphore>), AppError> {
+    ) -> Result<(WorkerLane, Arc<Semaphore>), AppError> {
         self.shared
             .observer
             .performance()
@@ -8154,7 +8186,7 @@ impl AccountManager {
                             .setup_records()
                             .onboarding_worker_allowed(&account.label)?
                     {
-                        return Ok((worker.commands.clone(), worker.media_admission.clone()));
+                        return Ok((worker.lane(), worker.media_admission.clone()));
                     }
                 }
                 self.reconcile_for_account(&account.account_id_hex).await?;
@@ -8170,7 +8202,7 @@ impl AccountManager {
                             && (!account.external_signing
                                 || self.app.has_external_signer(&account.account_id_hex))
                     })
-                    .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
+                    .map(|worker| (worker.lane(), worker.media_admission.clone()))
                     .ok_or_else(|| {
                         AppError::RelayDirectory(
                             "managed account worker is not running for local signing account"

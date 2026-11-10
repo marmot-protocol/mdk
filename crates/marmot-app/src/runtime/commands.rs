@@ -14,9 +14,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
-    local_account_worker_response, long_account_worker_catch_up_response,
-    long_account_worker_response, publish_app_runtime_group_state_updated,
+    AccountManager, AccountWorkerCommand, ReadClass, account_worker_response,
+    group_contributes_co_members, local_account_worker_response,
+    long_account_worker_catch_up_response, long_account_worker_response,
+    publish_app_runtime_group_state_updated,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -393,8 +394,7 @@ impl AccountManager {
         account_ref: &str,
         upload_id: String,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R1).await?;
         command
             .send(AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond })
             .await
@@ -406,8 +406,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppPreparedGroupImageUpload>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R1).await?;
         command
             .send(AccountWorkerCommand::PreparedGroupImages { respond })
             .await
@@ -553,8 +552,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::Members {
                 group_id: group_id.clone(),
@@ -581,8 +579,7 @@ impl AccountManager {
                 crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE
             )));
         }
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::MemberIdsPage {
                 group_ids: group_ids.to_vec(),
@@ -600,8 +597,8 @@ impl AccountManager {
     ) -> Result<AppGroupMlsState, AppError> {
         let started_at = Instant::now();
         let result = async {
-            let command = self.worker_commands(account_ref).await?;
-            let (respond, response) = oneshot::channel();
+            let (command, respond, response) =
+                self.read_command(account_ref, ReadClass::R4).await?;
             command
                 .send(AccountWorkerCommand::GroupMlsState {
                     group_id: group_id.clone(),
@@ -648,8 +645,7 @@ impl AccountManager {
         group_id: &GroupId,
     ) -> Result<AppGroupConversationSnapshot, AppError> {
         let account = self.resolve(account_ref)?;
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::GroupRoster {
                 group_id: group_id.clone(),
@@ -706,8 +702,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<crate::AppAccountDevicesActivation, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R4).await?;
         command
             .send(AccountWorkerCommand::AccountDevicesActivation {
                 group_id: group_id.clone(),
@@ -783,8 +778,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppQuarantinedGroup>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::QuarantinedGroups { respond })
             .await
@@ -845,8 +839,7 @@ impl AccountManager {
         group_id: &GroupId,
         component_id: cgka_traits::AppComponentId,
     ) -> Result<SecretBytes, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R5).await?;
         command
             .send(AccountWorkerCommand::SafeExportSecret {
                 group_id: group_id.clone(),
@@ -890,8 +883,7 @@ impl AccountManager {
         label: &str,
         length: usize,
     ) -> Result<SecretBytes, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R5).await?;
         command
             .send(AccountWorkerCommand::ExporterSecret {
                 group_id: group_id.clone(),
@@ -1109,8 +1101,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
         command
             .send(AccountWorkerCommand::GroupRecoveryStatus {
                 group_id: group_id.clone(),
@@ -1125,8 +1116,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::HistoryNotice>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
         command
             .send(AccountWorkerCommand::HistoryNotices { respond })
             .await
@@ -1138,8 +1128,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<crate::AccountRecoveryStatus, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
         command
             .send(AccountWorkerCommand::AccountRecoveryStatus { respond })
             .await
@@ -1151,8 +1140,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::LinkedDevice>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::LinkedDevices { respond })
             .await
@@ -1164,8 +1152,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
         command
             .send(AccountWorkerCommand::ChatHistoryImports { respond })
             .await
@@ -1174,8 +1161,7 @@ impl AccountManager {
     }
 
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::KeyPackageRefreshOverdue { respond })
             .await
@@ -1187,8 +1173,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::UnrecognizedSignIns { respond })
             .await
@@ -1239,8 +1224,7 @@ impl AccountManager {
     }
 
     pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
         command
             .send(AccountWorkerCommand::StartedFresh { respond })
             .await
@@ -1252,8 +1236,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::CompromiseWarningItem>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::CompromiseWarning { respond })
             .await
@@ -1364,8 +1347,7 @@ impl AccountManager {
     }
 
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::RemovedDeviceLeftoverChats { respond })
             .await
@@ -1374,8 +1356,7 @@ impl AccountManager {
     }
 
     pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::ChatsClosedToLinkedDevices { respond })
             .await
@@ -1517,8 +1498,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<crate::BackupRestoreStatus, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R7).await?;
         command
             .send(AccountWorkerCommand::BackupRestoreStatus { respond })
             .await
@@ -1530,8 +1510,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<crate::BackupRestoreWatch, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R7).await?;
         command
             .send(AccountWorkerCommand::WatchBackupRestore { respond })
             .await
@@ -1545,8 +1524,7 @@ impl AccountManager {
         group_id: &GroupId,
         event_id: &str,
     ) -> Result<Option<crate::HistoryImportProvenance>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
         command
             .send(AccountWorkerCommand::HistoryImportProvenance {
                 group_id: group_id.clone(),
@@ -1563,8 +1541,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Vec<crate::BackupHistoryAvailability>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::BackupHistoryAvailability {
                 group_id: group_id.clone(),
@@ -1579,8 +1556,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<crate::BackupSettings, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R6).await?;
         command
             .send(AccountWorkerCommand::BackupSettings { respond })
             .await
@@ -1627,8 +1603,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::GroupCommitDelivery {
                 group_id: group_id.clone(),
@@ -1834,8 +1809,7 @@ impl AccountManager {
         group_id: &GroupId,
         component_id: u16,
     ) -> Result<Option<Vec<u8>>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R4).await?;
         command
             .send(AccountWorkerCommand::GroupAppComponent {
                 group_id: group_id.clone(),
@@ -2233,8 +2207,9 @@ impl AccountManager {
     ) -> Result<GroupPushDebugInfo, AppError> {
         let account = self.resolve(account_ref)?;
         self.reconcile().await?;
-        let command = self.worker_commands(&account.account_id_hex).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self
+            .read_command(&account.account_id_hex, ReadClass::R4)
+            .await?;
         command
             .send(AccountWorkerCommand::GroupPushDebugInfo {
                 group_id: group_id.clone(),
@@ -2501,8 +2476,7 @@ impl AccountManager {
         group_id: &GroupId,
         reference: MediaAttachmentReference,
     ) -> Result<Vec<String>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R8).await?;
         command
             .send(AccountWorkerCommand::BuildMediaImetaTag {
                 group_id: group_id.clone(),
@@ -2638,8 +2612,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::PendingWelcomeDeliveries { respond })
             .await
@@ -2744,8 +2717,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
             .await
@@ -2757,11 +2729,12 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Option<Option<cgka_traits::KeyPackageLifecycleState>>, AppError> {
-        let Some(command) = self.existing_worker_commands(account_ref).await? else {
+        let Some(lane) = self.existing_worker_commands(account_ref).await? else {
             return Ok(None);
         };
-        let (respond, response) = oneshot::channel();
-        command
+        let (respond, response) =
+            lane.read_reply(self.shared.observer.performance(), ReadClass::R3);
+        lane.commands
             .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
             .map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
@@ -2777,11 +2750,12 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Option<AppGroupMlsState>, AppError> {
-        let Some(command) = self.existing_worker_commands(account_ref).await? else {
+        let Some(lane) = self.existing_worker_commands(account_ref).await? else {
             return Ok(None);
         };
-        let (respond, response) = oneshot::channel();
-        command
+        let (respond, response) =
+            lane.read_reply(self.shared.observer.performance(), ReadClass::R4);
+        lane.commands
             .try_send(AccountWorkerCommand::GroupMlsState {
                 group_id: group_id.clone(),
                 respond,
@@ -2799,8 +2773,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<cgka_traits::engine::KeyPackage>, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::DurablyOwnedKeyPackages { respond })
             .await
@@ -2813,8 +2786,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::MaintenanceStatus {
                 group_id: group_id.clone(),
@@ -2850,7 +2822,8 @@ impl AccountManager {
         let command = self
             .existing_worker_commands(account_ref)
             .await?
-            .ok_or(AppError::TransportClosed)?;
+            .ok_or(AppError::TransportClosed)?
+            .commands;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::ReconnectRelay {
@@ -2866,8 +2839,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
         command
             .send(AccountWorkerCommand::PeriodicMaintenancePolicy { respond })
             .await
@@ -2930,6 +2902,7 @@ impl AccountManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::ReadReply;
 
     #[tokio::test(start_paused = true)]
     async fn accept_waits_past_local_limit() {
@@ -2969,6 +2942,7 @@ mod tests {
                 handle,
                 commands,
                 shutdown,
+                unit: Default::default(),
             },
         );
         let error = manager
@@ -3031,7 +3005,7 @@ mod tests {
             "wss://relay.example",
         ));
         let (commands, mut received) = mpsc::channel(1);
-        let (respond, _response) = oneshot::channel();
+        let (respond, _response) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
             .unwrap();
@@ -3049,6 +3023,7 @@ mod tests {
                 handle,
                 commands,
                 shutdown,
+                unit: Default::default(),
             },
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -3131,6 +3106,7 @@ mod tests {
                 handle,
                 commands,
                 shutdown,
+                unit: Default::default(),
             },
         );
         assert!(

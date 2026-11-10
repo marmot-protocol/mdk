@@ -190,7 +190,7 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
         .lock()
         .unwrap()
         .remove(&account.account_id_hex);
-    let (respond, _response) = oneshot::channel();
+    let (respond, _response) = ReadReply::unobserved();
     commands
         .try_send(AccountWorkerCommand::GroupRecoveryStatus {
             group_id: groups[0].clone(),
@@ -213,7 +213,7 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
         predecessors.push(response);
     }
     // This snapshot read fences the two mutation commands into the deferred FIFO.
-    let (respond, response) = oneshot::channel();
+    let (respond, response) = ReadReply::unobserved();
     commands
         .try_send(AccountWorkerCommand::Members {
             group_id: groups[0].clone(),
