@@ -463,6 +463,9 @@ fn safe_failure_category(input: &str) -> String {
         "relay rejected event (unsupported)" => "relay_rejected_unsupported".to_owned(),
         "relay rejected event (auth-required)" => "relay_rejected_auth_required".to_owned(),
         "relay rejected event (restricted)" => "relay_rejected_restricted".to_owned(),
+        // A size refusal is an `invalid:` answer on the wire and is recorded
+        // as one until the vocabulary gains a size value (mdk#2779).
+        "relay rejected event (too-large)" => "relay_rejected_invalid".to_owned(),
         _ => "unclassified".to_owned(),
     }
 }

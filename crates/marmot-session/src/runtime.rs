@@ -7601,6 +7601,72 @@ mod tests {
         assert_eq!(OversizedEvent::of_fanout(&fanout), None);
     }
 
+    /// A publish outcome records each failed relay's adapter reason, and audit
+    /// v5 keeps only reasons it knows. Every rejection category must reach v5
+    /// as its category, not `unclassified` as `too-large` did (mdk#2334).
+    #[test]
+    fn every_relay_rejection_keeps_its_category_in_audit_v5() {
+        use TransportEndpointRejectionCategory as Category;
+
+        // One list feeds both an exhaustive match and the cases, so a new
+        // category fails to build until it is checked here.
+        macro_rules! cases {
+            ($($category:ident => $expected:literal),+ $(,)?) => {{
+                let _exhaustive = |category: Category| match category {
+                    $(Category::$category => ()),+
+                };
+                [$((Category::$category, $expected)),+]
+            }};
+        }
+        // The adapter's reason for each category (`sdk_client.rs`
+        // `relay_rejection_endpoint_failure`): an `error:` answer may have
+        // reached the relay, so it is reported as an unknown acknowledgement.
+        let cases = cases! {
+            Duplicate => "relay_rejected_duplicate",
+            Pow => "relay_rejected_pow",
+            Blocked => "relay_rejected_blocked",
+            RateLimited => "relay_rejected_rate_limited",
+            Invalid => "relay_rejected_invalid",
+            Error => "publish_acknowledgement_unknown",
+            Unsupported => "relay_rejected_unsupported",
+            AuthRequired => "relay_rejected_auth_required",
+            Restricted => "relay_rejected_restricted",
+            TooLarge => "relay_rejected_invalid",
+        };
+        for (category, expected) in cases {
+            let reason = match category {
+                Category::Error => "publish acknowledgement unknown (error)".to_owned(),
+                category => format!("relay rejected event ({})", category.as_str()),
+            };
+            let record = AuditRecord::new(
+                None,
+                AuditEventKind::PublishOutcome {
+                    msg_id: "00".repeat(32),
+                    artifact_kind: None,
+                    target_kind: "group".into(),
+                    relay_url: None,
+                    accepted_relay_urls: Vec::new(),
+                    failed_relays: vec![PublishRelayFailure {
+                        relay_url: "wss://relay.example".into(),
+                        reason,
+                    }],
+                    required_acks: 1,
+                    met_required_acks: false,
+                    transport: None,
+                    event_age_secs: None,
+                },
+            );
+            let event = serde_json::to_value(audit_v5::Event::Operational(Box::new(
+                audit_v5::OperationalEvent::from_audit(record),
+            )))
+            .unwrap();
+            assert_eq!(
+                event["failed_relays"][0]["reason"], expected,
+                "{category:?}"
+            );
+        }
+    }
+
     #[test]
     fn legacy_welcome_diagnosis_requires_an_untouched_complete_snapshot() {
         let mut request = failed_frozen_fanout(TransportEndpointFailureKind::TerminalRejected)
