@@ -1158,16 +1158,25 @@ impl<S: StorageProvider> Engine<S> {
     /// prepared. Its Welcomes are checked before the commit is published, as
     /// a direct invite's are (mdk#2334).
     pub fn pending_is_queued_invite(&self, pending: PendingStateRef) -> Result<bool, EngineError> {
+        Ok(self
+            .queued_intent_for_pending(pending)?
+            .is_some_and(|record| matches!(record.intent, SendIntent::Invite { .. })))
+    }
+
+    /// The queued intent the drain prepared `pending` from, while it is
+    /// still queued.
+    fn queued_intent_for_pending(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<Option<cgka_traits::storage::QueuedOutboundIntent>, EngineError> {
         let Some((group_id, intent_id)) = self.queued_intent_by_pending.get(&pending) else {
-            return Ok(false);
+            return Ok(None);
         };
         Ok(self
             .storage
             .list_queued_outbound_intents(group_id)?
-            .iter()
-            .any(|record| {
-                record.id == *intent_id && matches!(record.intent, SendIntent::Invite { .. })
-            }))
+            .into_iter()
+            .find(|record| record.id == *intent_id))
     }
 
     /// Roll back a commit that none of its relays will take, and retire the
@@ -1190,8 +1199,19 @@ impl<S: StorageProvider> Engine<S> {
             self.ensure_group_live(group_id)?;
         }
         self.pending_group_id(pending)?;
-        self.do_publish_failed_with_fanout(pending, fanout, Some((artifact, size_class)))
-            .await
+        // Read before the rollback's transaction, so a failed read writes
+        // nothing.
+        let retired = self.queued_intent_for_pending(pending)?;
+        let refusal = EngineError::EventTooLarge {
+            artifact,
+            size_class,
+        };
+        self.do_publish_failed_with_fanout(
+            pending,
+            fanout,
+            retired.as_ref().map(|record| (record, &refusal)),
+        )
+        .await
     }
 
     pub fn drain_valid_proposal_groups(&mut self) -> Vec<GroupId> {
