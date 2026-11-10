@@ -258,7 +258,7 @@ impl<S: StorageProvider> Engine<S> {
                 // failure here rather than swallowing it: a transient backend
                 // error must roll back the whole transaction and stay retryable,
                 // never commit the merge + `Processed` write with a stale record.
-                let mut g = storage.get_group(&group_id)?;
+                let mut g = self.live_group_record_in(storage, &group_id)?;
                 g.self_removed_sibling_slots
                     .extend(self_removed_slots.iter().copied());
                 if !g.self_removed_sibling_slots.is_empty()
@@ -570,7 +570,7 @@ impl<S: StorageProvider> Engine<S> {
 
                 // Re-derive the Marmot projection in the same durable unit as the
                 // MLS clear and fanout terminal state.
-                let mut g = storage.get_group(&group_id)?;
+                let mut g = self.live_group_record_in(storage, &group_id)?;
                 g.epoch = EpochId(mls_group.epoch().as_u64());
                 g.members = crate::group_lifecycle::marmot_members(&mls_group);
                 g.required_capabilities = required_capabilities_from_group(&mls_group);

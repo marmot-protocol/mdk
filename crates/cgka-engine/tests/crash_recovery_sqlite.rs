@@ -7,6 +7,9 @@
 //! tests stop it at fixed debug-only crash points, then reopen and hydrate the
 //! database without running child destructors.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};

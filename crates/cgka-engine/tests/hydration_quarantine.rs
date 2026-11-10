@@ -1,3 +1,6 @@
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
@@ -34,6 +37,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "hydration_quarantine/rewind_restore_fault.rs"]
+mod rewind_restore_fault;
 mod support;
 use support::proof_signer;
 
@@ -1369,9 +1374,11 @@ async fn assert_reader_recovers_after_refusal(operation: SnapshotOperation) {
         storage.list_group_snapshots(&group_id).unwrap(),
         snapshots_before
     );
+    // Open-time recovery failed, so the group is refused as when a restore
+    // fails in session, until the next open (mdk#3272).
     assert!(matches!(
         reopened.quarantined_groups().as_slice(),
-        [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
+        [(id, GroupHydrationQuarantineReason::RewindRestoreFailed)] if id == &group_id
     ));
     assert!(
         matches!(reopened.epoch(&group_id), Err(EngineError::UnknownGroup(id)) if id == group_id)
@@ -1381,15 +1388,28 @@ async fn assert_reader_recovers_after_refusal(operation: SnapshotOperation) {
     );
 
     flaky.clear_snapshot_refusal();
-    assert!(reopened.retry_hydrate_quarantined_group(&group_id).unwrap());
-    assert!(reopened.quarantined_groups().is_empty());
+    assert!(!reopened.retry_hydrate_quarantined_group(&group_id).unwrap());
+    assert!(
+        recovery_observation(&storage, &group_id) == stranded,
+        "a refused retry must leave the stranded state and its images alone"
+    );
     assert_eq!(
-        reopened.epoch(&group_id).unwrap(),
+        storage.list_group_snapshots(&group_id).unwrap(),
+        snapshots_before
+    );
+
+    // This is a same-storage engine rebuild, not an encrypted-file reopen.
+    drop(reopened);
+    let mut rebuilt = build_engine(storage.clone());
+    rebuilt.hydrate_all_stored_groups().unwrap();
+    assert!(rebuilt.quarantined_groups().is_empty());
+    assert_eq!(
+        rebuilt.epoch(&group_id).unwrap(),
         EpochId(live.native_epoch)
     );
     assert!(
         recovery_observation(&storage, &group_id) == live,
-        "the public retry must recover the captured live native state and complete work"
+        "the next open must recover the captured live native state and complete work"
     );
     assert_probe_work_rows(&storage, &message, &queued);
     assert!(names.iter().all(|name| {
@@ -1399,16 +1419,6 @@ async fn assert_reader_recovers_after_refusal(operation: SnapshotOperation) {
             .iter()
             .any(|stored| stored == name)
     }));
-
-    // This is a same-storage engine rebuild, not an encrypted-file reopen.
-    drop(reopened);
-    let mut rebuilt = build_engine(storage.clone());
-    rebuilt.hydrate_all_stored_groups().unwrap();
-    assert_eq!(
-        rebuilt.epoch(&group_id).unwrap(),
-        EpochId(live.native_epoch)
-    );
-    assert!(recovery_observation(&storage, &group_id) == live);
 }
 
 fn build_current_flaky_engine(
@@ -2866,7 +2876,7 @@ async fn hydration_recovers_interrupted_past_peel_rewind() {
 }
 
 // Two interrupted rewind probes mean two candidate live states and no way to
-// tell which is newer, so hydration must refuse the group rather than guess.
+// tell which is newer, so the open must refuse the group rather than guess.
 // The two rewinds must therefore be distinguishable on disk: were they to share
 // a snapshot name, `create_group_snapshot`'s INSERT OR REPLACE would collapse
 // them into one row and silently disarm this check.
@@ -2894,10 +2904,11 @@ async fn hydration_fails_closed_on_two_interrupted_rewind_probes_of_different_ki
     assert!(
         matches!(
             reopened.quarantined_groups().as_slice(),
-            [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
+            [(id, GroupHydrationQuarantineReason::RewindRestoreFailed)] if id == &group_id
         ),
         "an ambiguous pair of interrupted probes must quarantine the group"
     );
+    assert!(!reopened.retry_hydrate_quarantined_group(&group_id).unwrap());
 }
 
 // A replay guard's window lives entirely inside the sweep guard's, so the pair

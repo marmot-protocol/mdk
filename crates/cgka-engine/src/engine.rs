@@ -194,6 +194,7 @@ fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'
         GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
             "pending_commit_recovery_failed"
         }
+        GroupHydrationQuarantineReason::RewindRestoreFailed => "rewind_restore_failed",
     }
 }
 
@@ -389,6 +390,13 @@ pub struct Engine<S: StorageProvider> {
     /// added by [`Self::quarantine_stored_group_on_hydrate`] and removed by a
     /// successful [`Self::retry_hydrate_quarantined_group`].
     pub(crate) quarantined_groups: HashMap<GroupId, GroupHydrationQuarantineReason>,
+
+    /// Groups whose committing rewind window failed to restore live state
+    /// this session and that [`Self::quarantine_failed_rewinds`] has not yet
+    /// quarantined (mdk#3272). A guard cannot reach the engine, so it records
+    /// the failure here; [`Self::quarantined_reason`] reads it as a
+    /// `RewindRestoreFailed` quarantine until the move.
+    pub(crate) rewinds: crate::snapshot_guard::Rewinds,
 
     /// Groups seeded by the session-open cheap pass whose full per-group
     /// hydration (MLS load, validation, pending-commit recovery) has not run
@@ -674,6 +682,16 @@ impl<S: StorageProvider> EngineBuilder<S> {
         let proof_signer = self.account_identity_proof_signer.ok_or_else(|| {
             EngineError::Other("account identity proof signer is required".into())
         })?;
+        // Before anything reads a group's stored state: a group whose rewind
+        // was interrupted holds a retained anchor's state until its guard
+        // snapshot is restored (mdk#3272). Restoring here, where every engine
+        // is made, means no entry point and no open order can read the
+        // anchor. A group whose restore fails is refused from the start, as
+        // when a restore fails in session.
+        let rewinds = crate::snapshot_guard::Rewinds::failed_at_open(
+            crate::openmls_projection::recover_interrupted_rewind_guards_at_open(&self.storage)?,
+        );
+
         let crypto = RustCrypto::default();
         let identity = Identity::load_or_generate(
             self.ciphersuite,
@@ -785,6 +803,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
+            rewinds,
             unhydrated_groups: HashSet::new(),
             route_backfill_pending: HashSet::new(),
             transport_group_id_index: HashMap::new(),
@@ -1014,7 +1033,7 @@ impl<S: StorageProvider> Engine<S> {
                     // Unhydrated groups' fanouts stay frozen until full
                     // hydration restores their pending lifecycle (mdk#1161);
                     // quarantined groups' fanouts are hidden as before.
-                    !self.quarantined_groups.contains_key(group_id)
+                    self.quarantined_reason(group_id).is_none()
                         && !self.unhydrated_groups.contains(group_id)
                 })
             })
@@ -1029,7 +1048,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut group_ids: Vec<GroupId> = Vec::new();
         for fanout in self.storage.list_outbound_fanouts()? {
             if let Some(group_id) = fanout.group_id()
-                && !self.quarantined_groups.contains_key(group_id)
+                && self.quarantined_reason(group_id).is_none()
                 && !group_ids.contains(group_id)
             {
                 group_ids.push(group_id.clone());
@@ -1642,11 +1661,18 @@ impl<S: StorageProvider> Engine<S> {
     /// every-open `GroupUnrecoverable` re-emit. Idempotent: groups that
     /// already hold an epoch entry or a quarantine entry are left untouched,
     /// so a second call never demotes a live group.
+    ///
+    /// Every record this reads is live state: engine construction already
+    /// restored each interrupted rewind, and a group it could not restore is
+    /// quarantined here before the records are read (mdk#3272).
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
+        self.quarantine_failed_rewinds();
         // One unreadable record must quarantine that one group, never abort
         // the whole account open (mdk#151 / #417). The bulk read is the fast
         // path; if it fails, re-read per group and carry each failure as the
         // group id it belongs to.
+        // Hydration reads every stored record, including those it quarantines (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
         let records: Vec<Result<Group, GroupId>> = match self.storage.list_group_records() {
             Ok(records) => records.into_iter().map(Ok).collect(),
             Err(_) => self
@@ -1734,11 +1760,10 @@ impl<S: StorageProvider> Engine<S> {
             // Provisional seed: the durable record's epoch mirror keeps
             // `live_group_ids` (a removed copy excepted) and the app
             // projection listing this group while full hydration is
-            // outstanding. A crash mid-probe may have left the record rewound;
-            // the interrupted-probe rollback runs inside `ensure_hydrated`
-            // before any gated read, and the only pre-rollback reads are these
-            // display-provisional record fields, which full hydration
-            // re-derives.
+            // outstanding. The record is not a rewound anchor: engine
+            // construction restored every interrupted rewind before any
+            // record read, and a group it could not restore was quarantined
+            // above (mdk#3272).
             //
             // A removed copy seeds exactly like a live one and differs only in
             // the audit reason; see AGENTS.md, "A removed copy is seeded,
@@ -1844,17 +1869,19 @@ impl<S: StorageProvider> Engine<S> {
     /// re-add replay), read the durable records; a departed copy surfaces to
     /// the app again only on re-add.
     ///
-    /// Stored records quarantined during open are also omitted: they use the
-    /// separate recovery surface and must not be projected as healthy.
+    /// Quarantined groups are also omitted: they use the separate recovery
+    /// surface and must not be projected as healthy.
     pub fn live_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
         // One listing, not `list_groups` plus a per-group record read: the
-        // backend answers id order and terminal marker in a single query.
-        Ok(self
-            .storage
-            .list_group_records()?
+        // backend answers id order and terminal marker in a single query. Raw,
+        // because the filter below drops quarantined groups itself.
+        #[allow(clippy::disallowed_methods)]
+        let records = self.storage.list_group_records()?;
+        Ok(records
             .into_iter()
             .filter(|group| {
                 !group.removed
+                    && self.quarantined_reason(&group.id).is_none()
                     && self.epoch_manager.state(&group.id).is_some_and(|state| {
                         !matches!(state, cgka_traits::engine_state::EpochState::Disbanded(_))
                     })
@@ -2010,9 +2037,10 @@ impl<S: StorageProvider> Engine<S> {
         // deferred-peel sweep, past-epoch peel and retention lookups, the
         // hydrate self-remove probe, candidate replay — durably mutates the
         // live group behind a rollback guard. Process termination cannot run
-        // that guard, so restore whichever window `RewindSite` classifies as
-        // interrupted before loading any MLS or Marmot state — including the
-        // group record read below, whose epoch seeds the epoch manager.
+        // that guard. Engine construction restored every such window before
+        // any read (mdk#3272), so this finds none in a group the open
+        // seeded; it stays as the check full hydration has always made
+        // before loading any MLS or Marmot state.
         crate::openmls_projection::recover_interrupted_rewind_guard(&self.storage, group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
@@ -2021,6 +2049,8 @@ impl<S: StorageProvider> Engine<S> {
         // The one group-record read for this hydration (mdk#1161): every later
         // consumer (tombstone check, profile mirror check, pending-commit
         // recovery, epoch seeding) shares this post-recovery record.
+        // Hydration reads the record it validates (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
         let mut group = self
             .storage
             .get_group(group_id)
@@ -2198,10 +2228,13 @@ impl<S: StorageProvider> Engine<S> {
                 mls_group = openmls::group::MlsGroup::load(self.storage.mls_storage(), &mls_gid)
                     .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
                     .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-                group = self
+                // Hydration reads the record it validates (see clippy.toml).
+                #[allow(clippy::disallowed_methods)]
+                let reloaded = self
                     .storage
                     .get_group(group_id)
                     .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+                group = reloaded;
             } else if mls_group.pending_commit().is_none()
                 && evolutions.iter().any(|evolution| {
                     matches!(
@@ -2930,14 +2963,17 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update(group_id.as_slice());
             hasher.update(record.id.as_slice());
             let digest = hasher.finalize();
-            let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+            let processed = crate::snapshot_guard::SnapshotRollbackGuard::contained(
                 &self.storage,
-                group_id.clone(),
+                group_id,
                 crate::snapshot_guard::RewindSite::HydrateSelfRemove,
                 &hex::encode(&digest[..8]),
+                |_| {
+                    Ok::<_, cgka_traits::storage::StorageError>(
+                        mls_group.process_message(provider, protocol),
+                    )
+                },
             )?;
-            let processed = mls_group.process_message(provider, protocol);
-            guard.commit()?;
             let Ok(processed) = processed else {
                 continue;
             };
@@ -2983,7 +3019,11 @@ impl<S: StorageProvider> Engine<S> {
     /// group was quarantined. `forget_group_local` deliberately does not use
     /// this — it drops the group's rows outright and resets the whole total.
     pub(crate) fn leave_hydration_quarantine(&mut self, group_id: &GroupId) -> bool {
-        if self.quarantined_groups.remove(group_id).is_none() {
+        // Only the next open clears a failed rewind restore (mdk#3272).
+        if self.quarantined_reason(group_id)
+            == Some(GroupHydrationQuarantineReason::RewindRestoreFailed)
+            || self.quarantined_groups.remove(group_id).is_none()
+        {
             return false;
         }
         self.recharge_deferred_peel_account_for_group(group_id);
@@ -3107,24 +3147,102 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Order is unspecified. The returned reason is a copy; the engine retains
     /// its own entry until a retry succeeds.
+    ///
+    /// `RewindRestoreFailed` is the exception (mdk#3272): neither a retry nor
+    /// a re-join clears it, and the next open restores the group's live state.
+    /// It lists its group from the moment the guard records the failure, as
+    /// the gates refuse it (see [`Self::quarantined_reason`]).
     pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
         self.quarantined_groups
             .iter()
             .map(|(group_id, reason)| (group_id.clone(), *reason))
+            .chain(self.pending_failed_rewinds().map(|group_id| {
+                (
+                    group_id,
+                    GroupHydrationQuarantineReason::RewindRestoreFailed,
+                )
+            }))
             .collect()
     }
 
     /// Number of currently quarantined groups without cloning their identities.
     pub fn quarantined_group_count(&self) -> usize {
-        self.quarantined_groups.len()
+        self.quarantined_groups.len() + self.pending_failed_rewinds().count()
+    }
+
+    /// Failed rewind restores not yet moved into [`Self::quarantined_groups`].
+    fn pending_failed_rewinds(&self) -> impl Iterator<Item = GroupId> + '_ {
+        self.rewinds
+            .pending()
+            .into_iter()
+            .filter(|group_id| !self.quarantined_groups.contains_key(group_id))
     }
 
     /// Quarantine lookup for the live data-path gates.
+    ///
+    /// A group whose committing rewind window failed to restore its live state
+    /// reads as quarantined for `RewindRestoreFailed` from the moment the guard
+    /// records the failure, before [`Self::quarantine_failed_rewinds`] moves it
+    /// into [`Self::quarantined_groups`] (mdk#3272). A panic can unwind past
+    /// the call that would move it, and every gate must refuse it all the same.
     pub(crate) fn quarantined_reason(
         &self,
         group_id: &GroupId,
     ) -> Option<GroupHydrationQuarantineReason> {
-        self.quarantined_groups.get(group_id).copied()
+        self.quarantined_groups.get(group_id).copied().or_else(|| {
+            self.rewinds
+                .failed(group_id)
+                .then_some(GroupHydrationQuarantineReason::RewindRestoreFailed)
+        })
+    }
+
+    /// Quarantine every group whose committing rewind window failed to restore
+    /// its live state since the last call (mdk#3272).
+    ///
+    /// Such a group's stored state is a retained anchor's, and the guard kept
+    /// the snapshot that holds its live state. The quarantine is the hydration
+    /// one, with the side effects that brings: no epoch entry, no pending
+    /// publish lifecycle, deferred-peel bytes out of the account total, and a
+    /// `GroupHydrationQuarantined` event. `RewindRestoreFailed` is sticky:
+    /// neither a hydration retry nor a re-join clears it, since both would
+    /// build on anchor state that the next open replaces with the kept
+    /// snapshot. Called right after every committing window and at the entry
+    /// of each path that can run one.
+    pub(crate) fn quarantine_failed_rewinds(&mut self) {
+        for group_id in self.rewinds.take_failed() {
+            self.quarantine_stored_group_on_hydrate(
+                &group_id,
+                GroupHydrationQuarantineReason::RewindRestoreFailed,
+            );
+        }
+    }
+
+    /// The stored record of `group_id` for an engine path that acts on it.
+    ///
+    /// Refused with `UnknownGroup` for a quarantined group, whose stored
+    /// record is not live state: after a failed rewind restore it is a
+    /// retained anchor's (mdk#3272). Engine paths read group records only
+    /// through this and [`Self::stored_group_record`]; `clippy.toml` bans
+    /// `GroupStorage::get_group` in this crate, and each remaining raw read
+    /// allows it with the reason it needs a quarantined group's record.
+    pub(crate) fn live_group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
+        self.live_group_record_in(&self.storage, group_id)
+    }
+
+    /// [`Self::live_group_record`] read through `storage`, the handle a
+    /// transaction or read snapshot hands its closure.
+    pub(crate) fn live_group_record_in(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+    ) -> Result<Group, EngineError> {
+        if self.quarantined_reason(group_id).is_some() {
+            return Err(EngineError::UnknownGroup(group_id.clone()));
+        }
+        // The gated read itself (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let group = storage.get_group(group_id)?;
+        Ok(group)
     }
 
     /// Enforce the documented quarantine contract on a live surface: a
@@ -3134,7 +3252,7 @@ impl<S: StorageProvider> Engine<S> {
     /// band (mdk#364 / #365). Ingest has its own gate that additionally
     /// retains the input for post-repair replay.
     pub(crate) fn ensure_group_live(&self, group_id: &GroupId) -> Result<(), EngineError> {
-        if self.quarantined_groups.contains_key(group_id) {
+        if self.quarantined_reason(group_id).is_some() {
             return Err(EngineError::UnknownGroup(group_id.clone()));
         }
         // Seeded-but-unhydrated groups fail closed with the retryable variant
@@ -3168,6 +3286,10 @@ impl<S: StorageProvider> Engine<S> {
     /// caller observes `UnknownGroup` — the same view a quarantined group
     /// has always presented.
     pub fn ensure_hydrated(&mut self, group_id: &GroupId) -> Result<(), EngineError> {
+        // Settle any failed rewind restore first, so a path that starts here
+        // sees the group quarantined with the side effects that brings, even
+        // after a panic unwound past the call that would have (mdk#3272).
+        self.quarantine_failed_rewinds();
         if !self.unhydrated_groups.contains(group_id) {
             return Ok(());
         }
@@ -3242,8 +3364,22 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, EngineError> {
-        if !self.quarantined_groups.contains_key(group_id) {
-            return Err(EngineError::UnknownGroup(group_id.clone()));
+        self.quarantine_failed_rewinds();
+        match self.quarantined_groups.get(group_id) {
+            None => return Err(EngineError::UnknownGroup(group_id.clone())),
+            // Hydration would read the anchor state the failed restore left
+            // behind and could pass; only the next open, which restores the
+            // kept snapshot first, clears this reason (mdk#3272).
+            Some(GroupHydrationQuarantineReason::RewindRestoreFailed) => {
+                tracing::warn!(
+                    target: "cgka_engine::hydrate",
+                    method = "retry_hydrate_quarantined_group",
+                    reason = "rewind_restore_failed",
+                    "retry refused until the next open restores the live state"
+                );
+                return Ok(false);
+            }
+            Some(_) => {}
         }
         match self.hydrate_one_stored_group(group_id) {
             Ok(recovered_epoch) => {
@@ -3420,7 +3556,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Option<AuditGroupContext> {
-        let group = self.storage.get_group(group_id).ok()?;
+        let group = self.live_group_record(group_id).ok()?;
         Some(AuditGroupContext {
             epoch: Some(group.epoch.0),
             member_count: Some(group.members.len() as u64),
@@ -3501,6 +3637,7 @@ impl<S: StorageProvider> Engine<S> {
         self.pending_confirmation_replays.remove(group_id);
         self.unhydrated_groups.remove(group_id);
         self.quarantined_groups.remove(group_id);
+        self.rewinds.forget(group_id);
         self.leaving_groups.remove(group_id);
         self.leave_requests.remove(group_id);
         self.valid_proposal_groups.remove(group_id);
@@ -3582,7 +3719,7 @@ impl<S: StorageProvider> Engine<S> {
     /// without reaching into OpenMLS internals.
     pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
         self.ensure_group_live(group_id)?;
-        Ok(self.storage.get_group(group_id)?)
+        self.live_group_record(group_id)
     }
 
     /// The undecryptable transport objects this device retained for a group
@@ -3603,7 +3740,7 @@ impl<S: StorageProvider> Engine<S> {
         limit: usize,
     ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
         self.ensure_group_live(group_id)?;
-        let group = self.storage.get_group(group_id)?;
+        let group = self.live_group_record(group_id)?;
         let epoch = group.epoch;
         let mut rows = Vec::new();
         if limit > 0 {
@@ -4170,40 +4307,17 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(group_id.as_slice());
         hasher.update(epoch.0.to_be_bytes());
         let suffix = hex::encode(&hasher.finalize()[..8]);
-        let site = crate::snapshot_guard::RewindSite::DeviceTagSource;
-        // The read leaves through the savepoint's error path, so every write
-        // the rewind made, its guard included, is rolled back.
-        enum Undone {
-            Read(Result<Option<DeviceTagClaim>, EngineError>),
-            Storage(StorageError),
-        }
-        impl From<StorageError> for Undone {
-            fn from(error: StorageError) -> Self {
-                Self::Storage(error)
-            }
-        }
-        let undone = self.storage.with_group_savepoint(
+        // A contained window: its own savepoint undoes the rewind, the guard
+        // included, if the restore fails.
+        crate::openmls_projection::with_retained_anchor_group(
+            &self.storage,
+            &self.crypto,
             group_id,
-            &site.snapshot_name(&format!("{suffix}-undo")),
-            |storage| {
-                Err::<std::convert::Infallible, _>(Undone::Read(
-                    crate::openmls_projection::with_retained_anchor_group(
-                        storage,
-                        &self.crypto,
-                        group_id,
-                        epoch,
-                        site,
-                        &suffix,
-                        |historical_group, _| Ok(claim(historical_group)),
-                    ),
-                ))
-            },
-        );
-        match undone {
-            Ok(never) => match never {},
-            Err(Undone::Read(read)) => read,
-            Err(Undone::Storage(error)) => Err(error.into()),
-        }
+            epoch,
+            crate::snapshot_guard::RewindSite::DeviceTagSource,
+            &suffix,
+            |historical_group, _| Ok(claim(historical_group)),
+        )
     }
 
     /// The slot the leaf at `leaf_index` of `mls_group` reads as, or `None`
@@ -4527,10 +4641,18 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {
+        // A failed rewind restore that no later step has quarantined yet (a
+        // past-epoch peel window fails its ingest call) does so here, so the
+        // host reads its event with the operation that caused it (mdk#3272).
+        self.quarantine_failed_rewinds();
         self.events_buf.drain(..).collect()
     }
 
     fn drain_auto_publish(&mut self) -> Vec<AutoPublish> {
+        // Quarantining a group whose rewind restore failed drops its staged
+        // publish work, which the next open restores from durable state
+        // (mdk#3272).
+        self.quarantine_failed_rewinds();
         self.auto_publish_buf.drain(..).collect()
     }
 
@@ -4883,3 +5005,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.do_delete_key_package(key_package)
     }
 }
+
+#[cfg(test)]
+#[path = "engine/rewind_gate_tests.rs"]
+mod rewind_gate_tests;

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Changed
+
+- Engine paths read a group's stored record only through accessors that refuse a quarantined group, and the crate's
+  `clippy.toml` bans the raw reads (mdk#3272). For any quarantined group, the settle API and `cancel_leave` return
+  `UnknownGroup`, `has_pending_convergence_inputs` answers `false` unless a pass or replay is outstanding,
+  `buffer_openmls_convergence_message` refuses it, `reissue_superseded_own_commits_from_state` and authority recovery
+  skip it, and a removed copy's input is retained as quarantined rather than in the removed ring.
+
+### Fixed
+
+- A convergence pass, deferred-peel sweep or past-epoch peel whose restore fails after it rewound a group onto a
+  retained anchor no longer leaves the group live on anchor state (mdk#3272). The group is quarantined as
+  `RewindRestoreFailed` with a `GroupHydrationQuarantined` event, and its input is retained. Neither
+  `retry_hydrate_quarantined_group`, which answers `false`, nor a re-join Welcome clears it; the next open restores
+  the kept live state and replays the input. Meanwhile `pending_group_rejoins_for` omits the group's stored rejoin
+  offers and `confirm_group_rejoin` returns `UnknownGroup` for them, since their consent token would be the anchor's.
+- `EngineBuilder::build` restores every group's interrupted rewind before anything reads group state (mdk#3272). With
+  deferred hydration, ingest and a Welcome join could read a seeded group's record before its hydration restored a
+  rewind interrupted by a crash or a failed restore. A message could then be kept in a removed copy's ring, or a
+  re-join committed on the anchor and the live state lost. A group whose restore fails at open is quarantined as
+  `RewindRestoreFailed`, as is an ambiguous pair of interrupted rewinds, which used to be `GroupRecordLoadFailed`;
+  a retry no longer clears either, and the next open tries again.
+
 ## 0.15.0 - 2026-11-09
 
 - An admin's Leave records the leave before anything is published (mdk#3014). New `SendIntent::StepDownAndLeave`:

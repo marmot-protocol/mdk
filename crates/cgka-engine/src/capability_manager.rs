@@ -77,6 +77,8 @@ pub(crate) fn check_own_leaf_of_group(mls_group: &MlsGroup) -> Result<(), Engine
 /// Check that every validated invitee KeyPackage carries a proof of the
 /// persisted group's profile. Called from create_group / invite paths after
 /// the capability check passes.
+// Reads only the protocol profile, fixed at create or join, for callers that already hold the group (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn check_key_package_profiles<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -107,6 +109,8 @@ pub(crate) fn check_key_packages_carry_profile(
 
 /// Check that every leaf a staged commit adds carries a proof of the
 /// persisted group's profile, before `merge_staged_commit` consumes it.
+// Reads only the protocol profile, fixed at create or join, for callers that already hold the group (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn check_added_leaf_profiles<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,

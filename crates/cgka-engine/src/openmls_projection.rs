@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::provider::EngineOpenMlsProvider;
-use crate::snapshot_guard::RewindSite;
+use crate::snapshot_guard::{RewindSite, Rewinds};
 use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
@@ -40,6 +40,8 @@ use crate::canonicalization::{
 use crate::convergence::BranchCandidate;
 
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 #[path = "openmls_projection/tests.rs"]
 mod graph_tests;
 
@@ -990,37 +992,46 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
-    // A probe restores its starting state before this transaction commits.
-    // Joining all temporary OpenMLS writes avoids a durable commit per value;
-    // the guard still restores state for nested/nontransactional backends.
-    storage.with_transaction(|storage| {
-        replay_openmls_messages_probe(storage, group_id, messages, own_commits, profile_policy)
-    })
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+    // A probe restores its starting state before its savepoint commits, which
+    // also joins all temporary OpenMLS writes into one durable commit.
+    // Pre-validated own-commit rollforwards inside the replay land within the
+    // window, so they are unwound with everything else.
+    let output = SnapshotRollbackGuard::contained(
+        storage,
+        group_id,
+        RewindSite::Replay,
+        &replay_snapshot_suffix(group_id, messages),
+        |storage| {
+            replay_openmls_messages_window(storage, group_id, messages, own_commits, profile_policy)
+                .map_err(ReplayWindowError)
+        },
+    )
+    .map_err(|ReplayWindowError(error)| error)?;
+    crate::test_crash_hooks::pause_if_requested("candidate-replay-after-restoration");
+    Ok(output)
 }
 
-// Keep the restoration body separate so tests can compare identical replay work
-// with and without the transaction. Production callers enter through the wrapper.
-fn replay_openmls_messages_probe<S: StorageProvider>(
+/// A contained replay window's error. The guard's own storage failures read as
+/// snapshot failures, as they always have.
+struct ReplayWindowError(OpenMlsProjectionError);
+
+impl From<StorageError> for ReplayWindowError {
+    fn from(error: StorageError) -> Self {
+        Self(OpenMlsProjectionError::Snapshot(format!("{error:?}")))
+    }
+}
+
+// The window body of a replay probe: replay `messages` onto the current state.
+// Kept separate so tests can compare identical replay work with and without
+// the savepoint. Production callers enter through the contained wrapper.
+fn replay_openmls_messages_window<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
-    use crate::snapshot_guard::SnapshotRollbackGuard;
-    // RAII: on any unwind path (panic during replay, early error)
-    // Drop rolls back + releases. On the happy path we explicitly
-    // commit at the end. Pre-validated own-commit rollforwards inside the
-    // replay land within this guard, so they are unwound with everything
-    // else.
-    let guard = SnapshotRollbackGuard::create_group_state(
-        storage,
-        group_id.clone(),
-        RewindSite::Replay,
-        &replay_snapshot_suffix(group_id, messages),
-    )
-    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-
     let result = process_openmls_messages_inner(
         storage,
         group_id,
@@ -1036,12 +1047,31 @@ fn replay_openmls_messages_probe<S: StorageProvider>(
     if result.is_ok() {
         crate::test_crash_hooks::pause_if_requested("candidate-replay-after-processing");
     }
+    result
+}
+
+/// The same probe behind a guard but no savepoint, for tests that compare the
+/// two.
+#[cfg(test)]
+fn replay_openmls_messages_probe<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
+    let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_for_test(
+        storage,
+        group_id.clone(),
+        RewindSite::Replay,
+        &replay_snapshot_suffix(group_id, messages),
+    )
+    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let result =
+        replay_openmls_messages_window(storage, group_id, messages, own_commits, profile_policy);
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-    if result.is_ok() {
-        crate::test_crash_hooks::pause_if_requested("candidate-replay-after-restoration");
-    }
     result
 }
 
@@ -1260,6 +1290,8 @@ fn canonicalize_openmls_batch_with_materialized(
     ))
 }
 
+/// Standalone callers hold no engine session: a pass whose restore fails keeps
+/// its snapshot for the next open, and nothing refuses the group meanwhile.
 pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1270,6 +1302,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     canonicalize_stored_openmls_messages_with_profile_policy(
         storage,
+        &Rewinds::default(),
         group_id,
         state,
         outbound_intents,
@@ -1279,8 +1312,10 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     state: CanonicalizationState,
     outbound_intents: Vec<OutboundIntent>,
@@ -1307,6 +1342,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
     if replay_start_epoch < current_epoch {
         let mut result = canonicalize_stored_openmls_messages_from_retained_anchor(
             storage,
+            rewinds,
             group_id,
             StoredOpenMlsCanonicalizationWork {
                 state,
@@ -1406,6 +1442,8 @@ struct StoredOpenMlsGraphInputs {
     replay_start_epoch: u64,
 }
 
+// Seeds the pass, which runs only behind its quarantine gate (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1617,34 +1655,36 @@ fn append_missing_parent_deferred_commits(
 
 fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
 
-    let guard = SnapshotRollbackGuard::create_group_state(
+    let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
+    let rewound = SnapshotRollbackGuard::rewind(
         storage,
+        rewinds,
         group_id.clone(),
         RewindSite::RetainedAnchorPass,
         &rewind_probe_snapshot_suffix(group_id, work.replay_start_epoch),
+        &anchor_snapshot,
     )
     .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-
-    let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
-    let rewound = storage.rollback_group_state_keeping_live_records(group_id, &anchor_snapshot);
-    let result = match rewound {
-        Ok(()) => {
-            crate::test_crash_hooks::pause_if_requested("retained-anchor-after-rewind");
-            canonicalize_stored_openmls_messages_from_current(storage, group_id, work)
+    let guard = match rewound {
+        Ok(guard) => guard,
+        Err(StorageError::SnapshotMissing(_)) => {
+            return Ok(missing_retained_anchor_result(
+                work.state,
+                work.outbound_intents,
+                work.policy,
+                work.now_ms,
+            ));
         }
-        Err(StorageError::SnapshotMissing(_)) => Ok(missing_retained_anchor_result(
-            work.state,
-            work.outbound_intents,
-            work.policy,
-            work.now_ms,
-        )),
-        Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+        Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
     };
+    crate::test_crash_hooks::pause_if_requested("retained-anchor-after-rewind");
+    let result = canonicalize_stored_openmls_messages_from_current(storage, group_id, work);
 
     guard
         .commit()
@@ -1749,6 +1789,41 @@ pub(crate) fn recover_interrupted_rewind_guard<S: StorageProvider>(
         "restored the live state captured before an interrupted rewind"
     );
     Ok(())
+}
+
+/// Restore every group's interrupted rewind before the engine reads any group
+/// state (mdk#3272), and return the groups whose restore failed.
+///
+/// An interrupted window leaves the group's stored state on a retained anchor
+/// until its guard snapshot is restored: a crash inside a window that commits
+/// as it goes, or such a window whose restore or release failed. Engine
+/// construction runs this, so every reader of a stored record, before or
+/// after the open-time seed pass and whether or not the group has been
+/// hydrated, sees live state. One listing finds the windows in all groups;
+/// only a group that has one pays for more.
+pub(crate) fn recover_interrupted_rewind_guards_at_open<S: StorageProvider>(
+    storage: &S,
+) -> Result<Vec<GroupId>, StorageError> {
+    let groups: std::collections::BTreeSet<Vec<u8>> = storage
+        .list_snapshots_with_prefixes(&RewindSite::prefixes())?
+        .into_iter()
+        .map(|(group_id, _)| group_id.as_slice().to_vec())
+        .collect();
+    let mut failed = Vec::new();
+    for group_id in groups.into_iter().map(GroupId::new) {
+        if recover_interrupted_rewind_guard(storage, &group_id).is_err() {
+            failed.push(group_id);
+        }
+    }
+    if !failed.is_empty() {
+        tracing::warn!(
+            target: "cgka_engine::openmls_projection",
+            method = "recover_interrupted_rewind_guards_at_open",
+            failed = failed.len() as u64,
+            "could not restore the live state of an interrupted rewind at open"
+        );
+    }
+    Ok(failed)
 }
 
 /// Whether the pass may reuse the candidates the BFS already materialized instead
@@ -2026,6 +2101,7 @@ impl CandidateBranchPeelFailure {
 /// check below, ahead of every path that can lose contexts.
 pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
     max_rewind_commits: u64,
@@ -2060,38 +2136,40 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     // path, and an interrupted rewind is recovered by
     // `recover_interrupted_rewind_guard` exactly as the pass's is — under this
     // sweep's own site, so two interrupted rewinds stay distinguishable.
-    let guard = SnapshotRollbackGuard::create_group_state(
+    let snapshot_failure = |error| {
+        CandidateBranchPeelFailure::new(OpenMlsProjectionError::Snapshot(format!("{error:?}")), 0)
+    };
+    let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
+    let rewound = SnapshotRollbackGuard::rewind(
         storage,
+        rewinds,
         group_id.clone(),
         RewindSite::CandidateBranchSweep,
         &rewind_probe_snapshot_suffix(group_id, inputs.replay_start_epoch),
+        &anchor_snapshot,
     )
-    .map_err(|error| {
-        CandidateBranchPeelFailure::new(OpenMlsProjectionError::Snapshot(format!("{error:?}")), 0)
-    })?;
-    let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
-    let rewound = storage.rollback_group_state_keeping_live_records(group_id, &anchor_snapshot);
-    let contexts = match rewound {
-        Ok(()) => {
-            crate::test_crash_hooks::pause_if_requested("candidate-branch-after-rewind");
-            candidate_branch_peel_contexts_from_current(
-                storage,
-                group_id,
-                inputs,
-                max_rewind_commits,
-                profile_policy,
-                max_contexts,
-            )
+    .map_err(snapshot_failure)?;
+    let guard = match rewound {
+        Ok(guard) => guard,
+        Err(StorageError::SnapshotMissing(_)) => {
+            return Ok(CandidateBranchPeel::contested_over(
+                CandidateBranchPeelEnumeration {
+                    contexts: Vec::new(),
+                    replay_probe_count: 0,
+                },
+            ));
         }
-        Err(StorageError::SnapshotMissing(_)) => Ok(CandidateBranchPeelEnumeration {
-            contexts: Vec::new(),
-            replay_probe_count: 0,
-        }),
-        Err(error) => Err(CandidateBranchPeelFailure::new(
-            OpenMlsProjectionError::Snapshot(format!("{error:?}")),
-            0,
-        )),
+        Err(error) => return Err(snapshot_failure(error)),
     };
+    crate::test_crash_hooks::pause_if_requested("candidate-branch-after-rewind");
+    let contexts = candidate_branch_peel_contexts_from_current(
+        storage,
+        group_id,
+        inputs,
+        max_rewind_commits,
+        profile_policy,
+        max_contexts,
+    );
     let replay_probe_count = contexts.as_ref().map_or_else(
         |failure| failure.replay_probe_count,
         |enumeration| enumeration.replay_probe_count,
@@ -2311,25 +2389,28 @@ fn candidate_path_peel_context<S: StorageProvider>(
     };
     budget.consume()?;
 
-    let guard = SnapshotRollbackGuard::create_group_state(
-        storage,
-        group_id.clone(),
-        RewindSite::Replay,
-        &replay_snapshot_suffix(group_id, &replay_path.messages),
-    )
-    .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-    let captured = capture_candidate_tip_context(
+    // Contained even when no pass or sweep window encloses it: a candidate
+    // path can start at the live epoch, and its replay then runs on live
+    // state with no outer guard.
+    let captured = SnapshotRollbackGuard::contained(
         storage,
         group_id,
-        &replay_path.messages,
-        own_commits,
-        profile_policy,
-    );
-    guard
-        .commit()
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+        RewindSite::Replay,
+        &replay_snapshot_suffix(group_id, &replay_path.messages),
+        |storage| {
+            capture_candidate_tip_context(
+                storage,
+                group_id,
+                &replay_path.messages,
+                own_commits,
+                profile_policy,
+            )
+            .map_err(ReplayWindowError)
+        },
+    )
+    .map_err(|ReplayWindowError(error)| error)?;
 
-    Ok(captured?.map(|tip| CandidateBranchPeelContext {
+    Ok(captured.map(|tip| CandidateBranchPeelContext {
         branch_id: path.branch_id.clone(),
         tip_epoch: tip.epoch,
         depth: path.messages.len().try_into().unwrap_or(u64::MAX),
@@ -2698,6 +2779,8 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
 
 /// Apply with the caller's profile-admission policy, preserving each new commit's activity.
 /// Already-applied prefixes and checkpoint-restored own commits do not regenerate activity.
+// The pass's apply, behind its quarantine gate; a window that failed to restore fails the pass before this (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3091,6 +3174,8 @@ pub(crate) fn recover_interrupted_apply_snapshot<S: StorageProvider>(
     rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
+// Runs on a canonical advance inside a pass or confirm, both behind their gates, or inside a rewind window on its rewound state (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3292,6 +3377,8 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         .collect())
 }
 
+// Replay inside the pass or a rewind window writes the state it replayed (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 fn update_group_record_from_replay<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3763,6 +3850,8 @@ fn project_pending_canonicalization_messages(
 /// Authenticate messages against successive source trees for probe or canonical apply.
 /// `retain_replayed_anchors` enables durable apply and per-commit presentation deltas;
 /// probes omit both while still validating the complete candidate branch.
+// Replays inside a rewind window, where the rewound record is the state being replayed (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 fn process_openmls_messages_inner<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -4604,9 +4693,9 @@ pub(crate) fn retained_anchor_epoch_from_snapshot_name(name: &str) -> Option<u64
     name.strip_prefix("openmls-retained-anchor-")?.parse().ok()
 }
 
-/// Run `read` on the MLS group restored from `epoch`'s retained anchor under
-/// a rollback guard, then restore live state. `Ok(None)` when no anchor is
-/// retained for `epoch`, it vanished before the rewind, or it restores a
+/// Run `read` on the MLS group restored from `epoch`'s retained anchor in a
+/// contained rewind window, then restore live state. `Ok(None)` when no anchor
+/// is retained for `epoch`, it vanished before the rewind, or it restores a
 /// different epoch.
 pub(crate) fn with_retained_anchor_group<S: StorageProvider, T>(
     storage: &S,
@@ -4624,15 +4713,15 @@ pub(crate) fn with_retained_anchor_group<S: StorageProvider, T>(
     let Some(snapshot_name) = snapshot_name else {
         return Ok(None);
     };
-    let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+    crate::snapshot_guard::SnapshotRollbackGuard::contained(
         storage,
-        group_id.clone(),
+        group_id,
         site,
         guard_suffix,
-    )?;
-    let result = read_retained_anchor_group(storage, crypto, group_id, &snapshot_name, epoch, read);
-    guard.commit()?;
-    result
+        |storage| {
+            read_retained_anchor_group(storage, crypto, group_id, &snapshot_name, epoch, read)
+        },
+    )
 }
 
 fn read_retained_anchor_group<S: StorageProvider, T>(
@@ -4896,5 +4985,7 @@ mod unresolved_commit_state_tests {
 /// apart is pinned separately, over constructed values, in
 /// `message_processor::ingest`.
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 #[path = "openmls_projection/tests/candidate_replay.rs"]
 mod candidate_branch_peel_halt_tests;

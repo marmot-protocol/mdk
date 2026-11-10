@@ -6,6 +6,9 @@
 //! routing working for seeded groups, with a one-shot backfill for records
 //! predating the route table.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};

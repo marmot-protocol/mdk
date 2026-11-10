@@ -414,7 +414,10 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<SupersededIntentReport>, EngineError> {
         let mut reports = Vec::new();
         for record in self.storage.list_own_commit_intents(None)? {
-            if record.reinvite.is_some() {
+            // A quarantined group's record is refused (mdk#364, mdk#3272), so
+            // its intents wait for the group to return rather than fail the
+            // whole sweep.
+            if record.reinvite.is_some() || self.quarantined_reason(&record.group_id).is_some() {
                 continue;
             }
             let state = match self.storage.get_message(&record.commit_id) {

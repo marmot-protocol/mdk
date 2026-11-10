@@ -275,6 +275,8 @@ impl PartialEq for ReplaySource {
 }
 
 impl ReplaySource {
+    // Loads a pass's or sweep's replay state; both run only behind their quarantine gates (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     fn load<S: StorageProvider>(
         storage: &S,
         group: &GroupId,
@@ -306,6 +308,7 @@ impl ReplaySource {
 /// any Pending result escapes; the inner probe may only have restored an anchor.
 fn with_anchor<S: StorageProvider, T>(
     storage: &S,
+    rewinds: &Rewinds,
     group: &GroupId,
     source: &ReplaySource,
     peel: bool,
@@ -320,26 +323,24 @@ fn with_anchor<S: StorageProvider, T>(
     } else {
         RewindSite::RetainedAnchorPass
     };
-    let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+    let guard = match crate::snapshot_guard::SnapshotRollbackGuard::rewind(
         storage,
+        rewinds,
         group.clone(),
         site,
         &rewind_probe_snapshot_suffix(group, epoch),
-    )?;
-    let result = match storage
-        .rollback_group_state_keeping_live_records(group, &retained_anchor_snapshot_name(epoch))
-    {
-        Ok(()) => {
-            crate::test_crash_hooks::pause_if_requested(if peel {
-                "candidate-peel-slice-rewound"
-            } else {
-                "canonical-replay-slice-rewound"
-            });
-            f().map(Some)
-        }
-        Err(StorageError::SnapshotMissing(_)) => Ok(None),
-        Err(error) => Err(error.into()),
+        &retained_anchor_snapshot_name(epoch),
+    )? {
+        Ok(guard) => guard,
+        Err(StorageError::SnapshotMissing(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
+    crate::test_crash_hooks::pause_if_requested(if peel {
+        "candidate-peel-slice-rewound"
+    } else {
+        "canonical-replay-slice-rewound"
+    });
+    let result = f().map(Some);
     guard.commit()?;
     result
 }
@@ -369,6 +370,7 @@ impl CanonicalReplay {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group: &GroupId,
     state: CanonicalizationState,
     outbound_intents: Vec<OutboundIntent>,
@@ -383,6 +385,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
         *slot = None;
         return canonicalize_stored_openmls_messages_with_profile_policy(
             storage,
+            rewinds,
             group,
             state,
             outbound_intents,
@@ -451,7 +454,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
             next_path: 0,
         },
     };
-    let result = with_anchor(storage, group, &work.source, false, || {
+    let result = with_anchor(storage, rewinds, group, &work.source, false, || {
         if let Some(search) = &mut work.search {
             if !search.advance(
                 storage,
@@ -586,6 +589,7 @@ pub(crate) struct PeelReplay {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn candidate_peel_slice<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group: &GroupId,
     anchor: u64,
     max_rewind: u64,
@@ -599,6 +603,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
         *slot = None;
         return candidate_branch_peel(
             storage,
+            rewinds,
             group,
             anchor,
             max_rewind,
@@ -655,7 +660,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
             next_path: 0,
         },
     };
-    let result = with_anchor(storage, group, &work.source, true, || {
+    let result = with_anchor(storage, rewinds, group, &work.source, true, || {
         if let Some(search) = &mut work.search {
             if !search.advance(
                 storage,

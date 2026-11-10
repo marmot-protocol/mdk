@@ -754,6 +754,8 @@ impl<S: StorageProvider> Engine<S> {
         )
     }
 
+    // Retention keeps input for a quarantined group too (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     fn should_persist_transport_message_for_existing_group(
         &self,
         msg: &TransportMessage,
@@ -1121,6 +1123,8 @@ impl<S: StorageProvider> Engine<S> {
     /// to the storage write it accompanies it is free. Best-effort in both
     /// directions: an unreadable record or payload, or a copy that knows no
     /// Welcome time, answers `false` and keeps today's announcement.
+    // Reads only the copy's Welcome time, which no rewind changes, to choose an announcement (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     fn released_row_predates_local_copy(&self, record: &MessageRecord) -> bool {
         let Ok(group) = self.storage.get_group(&record.group_id) else {
             return false;
@@ -1268,6 +1272,8 @@ impl<S: StorageProvider> Engine<S> {
 }
 
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::RowEpochs;
     use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};

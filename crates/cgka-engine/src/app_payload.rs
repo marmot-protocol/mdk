@@ -156,61 +156,66 @@ pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
     use cgka_traits::storage::StorageError;
     use openmls::prelude::{MlsGroup, ProcessedMessageContent};
     use openmls_traits::OpenMlsProvider;
-    let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+    crate::snapshot_guard::SnapshotRollbackGuard::contained(
         storage,
-        request.group_id.clone(),
+        &request.group_id,
         crate::snapshot_guard::RewindSite::ModerationSource,
         &format!("{:032x}", rand::random::<u128>()),
-    )?;
-    match storage.rollback_group_state_keeping_live_records(&request.group_id, snapshot) {
-        Ok(()) => {}
-        Err(StorageError::SnapshotMissing(_)) => {
-            guard.commit()?;
-            return Ok(None);
-        }
-        Err(error) => return Err(error.into()),
-    }
-    let provider = crate::provider::EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
-    let group = MlsGroup::load(
-        provider.storage(),
-        &openmls::group::GroupId::from_slice(request.group_id.as_slice()),
-    )
-    .map_err(|_| EngineError::Backend("load moderation source state".into()))?;
-    let result = if let Some(mut group) = group.filter(|g| g.epoch().as_u64() == request.epoch.0) {
-        let (_, protocol) = crate::openmls_projection::project_protocol_message(wire)
-            .map_err(|_| EngineError::Backend("decode moderation source message".into()))?;
-        match protocol.and_then(|protocol| group.process_message(&provider, protocol).ok()) {
-            Some(processed)
-                if crate::identity::member_id_of_processed_message(&processed, &group).as_ref()
-                    == Some(&request.sender) =>
+        |storage| {
+            match storage.rollback_group_state_keeping_live_records(&request.group_id, snapshot) {
+                Ok(()) => {}
+                Err(StorageError::SnapshotMissing(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            let provider =
+                crate::provider::EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
+            let group = MlsGroup::load(
+                provider.storage(),
+                &openmls::group::GroupId::from_slice(request.group_id.as_slice()),
+            )
+            .map_err(|_| EngineError::Backend("load moderation source state".into()))?;
+            let result = if let Some(mut group) =
+                group.filter(|g| g.epoch().as_u64() == request.epoch.0)
             {
-                match processed.into_content() {
-                    ProcessedMessageContent::ApplicationMessage(bytes) => {
-                        let payload = bytes.into_bytes();
-                        if <[u8; 32]>::from(Sha256::digest(&payload)) == request.payload_digest {
-                            Some(HistoricalSource {
-                                authority: source_authority(&group, &request.sender)?,
-                                retention_seconds:
-                                    crate::app_components::message_retention_seconds_of_group(
-                                        &group,
-                                    )?
-                                    .unwrap_or(0),
-                                payload,
-                            })
-                        } else {
-                            None
+                let (_, protocol) = crate::openmls_projection::project_protocol_message(wire)
+                    .map_err(|_| EngineError::Backend("decode moderation source message".into()))?;
+                match protocol.and_then(|protocol| group.process_message(&provider, protocol).ok())
+                {
+                    Some(processed)
+                        if crate::identity::member_id_of_processed_message(&processed, &group)
+                            .as_ref()
+                            == Some(&request.sender) =>
+                    {
+                        match processed.into_content() {
+                            ProcessedMessageContent::ApplicationMessage(bytes) => {
+                                let payload = bytes.into_bytes();
+                                if <[u8; 32]>::from(Sha256::digest(&payload))
+                                    == request.payload_digest
+                                {
+                                    Some(HistoricalSource {
+                                        authority: source_authority(&group, &request.sender)?,
+                                        retention_seconds:
+                                            crate::app_components::message_retention_seconds_of_group(
+                                                &group,
+                                            )?
+                                            .unwrap_or(0),
+                                        payload,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
                         }
                     }
                     _ => None,
                 }
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    guard.commit()?;
-    Ok(result)
+            } else {
+                None
+            };
+            Ok(result)
+        },
+    )
 }
 
 impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
@@ -233,6 +238,11 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
             self.authority_recovery_cursor = Some(request.message_id.clone());
             self.authority_recovery_seen
                 .insert(request.message_id.clone());
+            // A quarantined group's state is not read (mdk#364, mdk#3272);
+            // the request waits for a round after the group returns.
+            if self.quarantined_reason(&request.group_id).is_some() {
+                continue;
+            }
             let record = match self.storage.get_message(&request.message_id) {
                 Ok(record) => record,
                 Err(cgka_traits::storage::StorageError::NotFound) => continue,
@@ -303,6 +313,8 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
 }
 
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{decrypted_payload_ref, validate_app_payload_for_sender};
     use cgka_traits::{EngineError, MarmotAppEvent, MemberId};

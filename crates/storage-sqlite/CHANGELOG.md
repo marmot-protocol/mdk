@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- `SqliteAccountStorage` answers `StorageProvider::list_snapshots_with_prefixes` with one scan of the snapshot keys,
+  which the primary-key index covers, so it reads no snapshot body (mdk#3272).
+
 ## 0.15.0 - 2026-11-09
 
 Account storage advances from migration 116 through 201 on first open (migrations 0117–0153, 0160–0180, 0200 and 0201;

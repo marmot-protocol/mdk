@@ -10,6 +10,9 @@
 //! failures at the relevant write seam and assert that nothing is torn, retries
 //! remain possible, and the group stays usable.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;

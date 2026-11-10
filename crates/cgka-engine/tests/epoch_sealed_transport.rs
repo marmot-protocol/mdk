@@ -11,6 +11,9 @@
 //! same-epoch fork, where post-fork traffic on a branch a device has not
 //! adopted is unreadable until the convergence pass materializes that branch.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
