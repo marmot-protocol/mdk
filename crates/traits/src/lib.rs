@@ -125,12 +125,12 @@ pub use transport::{
 };
 pub use transport_adapter::{
     EventSizeClass, FanoutMlsState, FanoutPendingKind, FanoutTargetStatus,
-    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, PublicationObservation,
-    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointAckKind,
-    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
-    TransportEndpointRejectionCategory, TransportGroupSubscription, TransportGroupSync,
-    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, OversizedArtifact,
+    PublicationObservation, TransportAccountActivation, TransportAdapter, TransportAdapterError,
+    TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
+    TransportEndpointAckKind, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportGroupSubscription,
+    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
     TransportPublishTarget, TransportWireMetadata, WelcomeSizeCheck,
     collapse_publish_failure_summaries,
 };

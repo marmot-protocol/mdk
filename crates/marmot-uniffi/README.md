@@ -1034,9 +1034,12 @@ recover a local copy that has applied its own removal.
 A send made while the group settles reports `AcceptedPending`, and MDK sends it
 once the group settles. If the settled group refuses it (the user stopped being
 an admin meanwhile, or the change no longer applies), MDK drops it and emits
-`GroupEventKindFfi::QueuedIntentRefused { intent_id_hex, intent_kind, reason }`
-for that group. Nothing retries it: tell the user, who may try again. `reason`
-is a stable tag such as `not_group_admin`.
+`GroupEventKindFfi::QueuedIntentRefused { intent_id_hex, intent_kind, reason,
+artifact, size_class }` for that group. Nothing retries it: tell the user, who
+may try again. `reason` is a stable tag such as `not_group_admin`. With
+`event_too_large`, the send's commit or an invitee's Welcome fits none of its
+relays' known size limits, or every relay refused it for size: `artifact` names
+that event and `size_class` its coarse size. Both are `nil` for other reasons.
 
 ## Undelivered Welcomes
 

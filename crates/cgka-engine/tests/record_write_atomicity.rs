@@ -3682,6 +3682,165 @@ async fn a_queued_intent_held_by_a_storage_failure_stays_queued() {
     assert_eq!(engine.group_record(&group_id).unwrap().name, "held edit");
 }
 
+/// A queued intent whose drained commit fits none of its relays is retired in
+/// the rollback's own transaction (mdk#2334). A failed delete undoes the
+/// rollback too: the commit stays pending, the intent queued and nothing is
+/// announced, so the refusal can run again. It never leaves a rolled-back
+/// commit whose intent the next drain prepares again.
+#[tokio::test]
+async fn a_too_large_queued_intent_is_retired_with_its_rollback() {
+    use cgka_traits::{EpochState, EventSizeClass, OversizedArtifact};
+
+    let termination_fault = LeaveWriteFault::default();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        deferred_usage_read_fault: DeferredUsageReadFault::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
+        termination_fault: termination_fault.clone(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+        deferred_release_read_fault: DeferredReleaseReadFault::default(),
+        message_list_fault: LeaveWriteFault::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"too-large-retirement"))
+    .account_identity_proof_signer(proof_signer(b"too-large-retirement"))
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = engine
+        .create_group(CreateGroupRequest {
+            name: "too large".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("create")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    let intent_id = MessageId::new(b"queued-too-large-edit".to_vec());
+    storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: intent_id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("too large edit".into()),
+                description: None,
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    let drained = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+        panic!("the queued edit stages: {drained:?}")
+    };
+    let pending = *pending;
+    engine.drain_events();
+
+    termination_fault.arm_on_write(1);
+    assert!(matches!(
+        engine
+            .publish_refused_as_too_large(
+                pending,
+                None,
+                OversizedArtifact::Commit,
+                EventSizeClass::Under64Kib,
+            )
+            .await,
+        Err(EngineError::Storage(StorageError::Busy(_)))
+    ));
+    assert_eq!(termination_fault.remaining(), 0);
+    assert!(
+        matches!(
+            engine.epoch_state(&group_id),
+            Some(EpochState::PendingPublish { .. })
+        ),
+        "a failed retirement leaves the commit pending: {:?}",
+        engine.epoch_state(&group_id)
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "a failed retirement leaves the intent queued"
+    );
+    assert!(
+        !engine
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+    );
+
+    engine
+        .publish_refused_as_too_large(
+            pending,
+            None,
+            OversizedArtifact::Commit,
+            EventSizeClass::Under64Kib,
+        )
+        .await
+        .expect("the refusal runs again once storage recovers");
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    let refusals: Vec<_> = engine
+        .drain_events()
+        .into_iter()
+        .filter(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+        .collect();
+    assert!(
+        matches!(
+            refusals.as_slice(),
+            [GroupEvent::QueuedIntentRefused {
+                intent_id: refused,
+                reason,
+                artifact: Some(OversizedArtifact::Commit),
+                size_class: Some(EventSizeClass::Under64Kib),
+                ..
+            }] if *refused == intent_id && reason == "event_too_large"
+        ),
+        "{refusals:?}"
+    );
+    assert!(matches!(
+        engine.epoch_state(&group_id),
+        Some(EpochState::Stable { .. })
+    ));
+    assert!(
+        engine
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the next drain prepares nothing"
+    );
+    assert_ne!(
+        engine.group_record(&group_id).unwrap().name,
+        "too large edit"
+    );
+}
+
 /// A queued change the settled state already holds drains to `NoChange` and
 /// is retired then (mdk#2842). A failed retirement leaves it for the next
 /// drain, and the pass still returns the message it prepared before it: had

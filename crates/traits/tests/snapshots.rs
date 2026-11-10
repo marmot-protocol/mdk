@@ -781,6 +781,19 @@ fn snapshot_group_events() {
             intent_id: mid(),
             intent_kind: "update_group_data".into(),
             reason: "not_group_admin".into(),
+            artifact: None,
+            size_class: None,
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_queued_intent_refused_too_large",
+        GroupEvent::QueuedIntentRefused {
+            group_id: gid(),
+            intent_id: mid(),
+            intent_kind: "invite".into(),
+            reason: "event_too_large".into(),
+            artifact: Some(cgka_traits::OversizedArtifact::Welcome),
+            size_class: Some(cgka_traits::EventSizeClass::From64To128Kib),
         }
     );
     insta::assert_json_snapshot!(

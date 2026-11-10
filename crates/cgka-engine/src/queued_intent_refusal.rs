@@ -112,7 +112,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::SiblingWelcomeHeld { .. }
         | EngineError::SiblingWelcomePredatesForget
         | EngineError::UnexpectedDeviceGroupWelcome
-        | EngineError::WelcomeTooLarge { .. }
+        | EngineError::EventTooLarge { .. }
         | EngineError::Other(_) => false,
     }
 }
@@ -175,6 +175,16 @@ impl<S: StorageProvider> Engine<S> {
         error: &EngineError,
     ) -> Result<(), EngineError> {
         self.storage.delete_queued_outbound_intent(&record.id)?;
+        self.announce_refused_queued_intent(record, error);
+        Ok(())
+    }
+
+    /// Tell the host a queued intent was refused, once its record is gone.
+    pub(crate) fn announce_refused_queued_intent(
+        &mut self,
+        record: &QueuedOutboundIntent,
+        error: &EngineError,
+    ) {
         let intent_kind = crate::audit_helpers::send_intent_kind_str(&record.intent);
         let reason = error.privacy_safe_kind();
         self.audit_group(
@@ -192,12 +202,20 @@ impl<S: StorageProvider> Engine<S> {
             error_kind = reason,
             "queued intent refused on the settled state; retired"
         );
+        let (artifact, size_class) = match error {
+            EngineError::EventTooLarge {
+                artifact,
+                size_class,
+            } => (Some(*artifact), Some(*size_class)),
+            _ => (None, None),
+        };
         self.events_buf.push_back(GroupEvent::QueuedIntentRefused {
             group_id: record.group_id.clone(),
             intent_id: record.id.clone(),
             intent_kind: intent_kind.to_string(),
             reason: reason.to_string(),
+            artifact,
+            size_class,
         });
-        Ok(())
     }
 }

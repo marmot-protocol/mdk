@@ -5310,8 +5310,9 @@ async fn create_whose_welcome_fails_the_size_check_writes_no_group() {
     assert!(
         matches!(
             refused,
-            Err(EngineError::WelcomeTooLarge {
-                size_class: EventSizeClass::From64To128Kib
+            Err(EngineError::EventTooLarge {
+                artifact: cgka_traits::OversizedArtifact::Welcome,
+                size_class: EventSizeClass::From64To128Kib,
             })
         ),
         "{refused:?}"

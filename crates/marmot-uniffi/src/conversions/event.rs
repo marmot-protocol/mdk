@@ -284,10 +284,16 @@ pub enum GroupEventKindFfi {
     /// (`update_group_data`, `invite`, ...), `reason` is a stable
     /// low-cardinality tag (`not_group_admin`, ...) and `intent_id_hex`
     /// identifies the dropped send, so a repeated delivery can be ignored.
+    /// With `reason` `event_too_large`, one of the send's events fits none of
+    /// its relays' known size limits: `artifact` names it (the change itself,
+    /// or the Welcome an invitee's inbox relays all refuse) and `size_class`
+    /// gives its size. Both are absent for every other reason.
     QueuedIntentRefused {
         intent_id_hex: String,
         intent_kind: String,
         reason: String,
+        artifact: Option<crate::OversizedArtifactFfi>,
+        size_class: Option<crate::EventSizeClassFfi>,
     },
 }
 
@@ -352,11 +358,15 @@ impl From<GroupEvent> for GroupEventKindFfi {
                 intent_id,
                 intent_kind,
                 reason,
+                artifact,
+                size_class,
                 ..
             } => Self::QueuedIntentRefused {
                 intent_id_hex: hex::encode(intent_id.as_slice()),
                 intent_kind,
                 reason,
+                artifact: artifact.map(Into::into),
+                size_class: size_class.map(Into::into),
             },
             GroupEvent::GroupMemberLeavesRemoved { epoch, .. } => {
                 Self::GroupMemberLeavesRemoved { epoch: epoch.0 }
@@ -1038,6 +1048,8 @@ mod tests {
                     intent_id: cgka_traits::MessageId::new(vec![0x42; 32]),
                     intent_kind: "update_group_data".into(),
                     reason: "not_group_admin".into(),
+                    artifact: None,
+                    size_class: None,
                 },
             }));
         let MarmotEventFfi::GroupEvent {
@@ -1047,6 +1059,8 @@ mod tests {
                     intent_id_hex,
                     intent_kind,
                     reason,
+                    artifact: None,
+                    size_class: None,
                 },
             ..
         } = converted
@@ -1057,6 +1071,39 @@ mod tests {
         assert_eq!(intent_id_hex, "42".repeat(32));
         assert_eq!(intent_kind, "update_group_data");
         assert_eq!(reason, "not_group_admin");
+    }
+
+    #[test]
+    fn a_queued_intent_refused_as_too_large_names_its_event_and_size() {
+        use crate::{EventSizeClassFfi, OversizedArtifactFfi};
+
+        let converted =
+            MarmotEventFfi::from(MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+                account_id_hex: "account".into(),
+                account_label: "alice".into(),
+                event: GroupEvent::QueuedIntentRefused {
+                    group_id: cgka_traits::GroupId::new(vec![0x31; 16]),
+                    intent_id: cgka_traits::MessageId::new(vec![0x42; 32]),
+                    intent_kind: "invite".into(),
+                    reason: "event_too_large".into(),
+                    artifact: Some(marmot_app::OversizedArtifact::Welcome),
+                    size_class: Some(marmot_app::EventSizeClass::From64To128Kib),
+                },
+            }));
+        assert!(
+            matches!(
+                converted,
+                MarmotEventFfi::GroupEvent {
+                    event: GroupEventKindFfi::QueuedIntentRefused {
+                        artifact: Some(OversizedArtifactFfi::Welcome),
+                        size_class: Some(EventSizeClassFfi::From64To128Kib),
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{converted:?}"
+        );
     }
 
     // Valid, distinct x-only public keys for the observing account and sender.

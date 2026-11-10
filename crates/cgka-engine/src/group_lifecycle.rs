@@ -863,7 +863,10 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(check) = welcome_check
             && let Some(size_class) = check.oversized_welcome(&welcomes).await
         {
-            return Err(EngineError::WelcomeTooLarge { size_class });
+            return Err(EngineError::EventTooLarge {
+                artifact: cgka_traits::OversizedArtifact::Welcome,
+                size_class,
+            });
         }
 
         // Capture the authenticated founding result, not a later epoch. A

@@ -3494,7 +3494,7 @@ where
 
     /// A founder's Welcome that fits none of the relays its publish would
     /// reach refuses the create before anything is written, with
-    /// `EngineError::WelcomeTooLarge` (mdk#2334).
+    /// `EngineError::EventTooLarge` (mdk#2334).
     pub async fn prepare_create_group_with_optional_app_components_and_audit_context(
         &mut self,
         request: CreateGroupRequest,
@@ -3676,10 +3676,8 @@ where
     }
 
     /// The commit's id and the oversized artifact when an invite must be
-    /// refused before its commit is published (mdk#2334): the commit fits
-    /// none of its group relays' known limits, or a Welcome fits none of its
-    /// invitee's inbox relays'. A relay with no known limit fits; one the
-    /// adapter would never send to does not count.
+    /// refused before its commit is published (mdk#2334); see
+    /// [`Self::oversized_invite_events`].
     async fn oversized_invite(
         &self,
         prepared: &PreparedSessionCommit,
@@ -3696,28 +3694,41 @@ where
                 }
                 _ => None,
             })?;
-        let refused = |artifact, size_class| {
-            Some((
-                commit.id.clone(),
-                OversizedEvent {
-                    artifact,
-                    size_class,
-                },
-            ))
-        };
+        let oversized = self
+            .oversized_invite_events(commit, &prepared.welcomes)
+            .await?;
+        Some((commit.id.clone(), oversized))
+    }
+
+    /// The oversized artifact when an invite's commit fits none of its group
+    /// relays' known limits, or a Welcome fits none of its invitee's inbox
+    /// relays'. A relay with no known limit fits; one the adapter would never
+    /// send to does not count. A direct invite and a queued one the drain
+    /// prepared are both judged here, before the commit is published.
+    async fn oversized_invite_events(
+        &self,
+        commit: &TransportMessage,
+        welcomes: &[TransportMessage],
+    ) -> Option<OversizedEvent> {
         // A commit or Welcome without a route fails when it is published.
         let target = self.routing.publish_target(commit).ok()?;
         let adapter = &self.adapter;
         if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
-            return refused(OversizedArtifact::Commit, size_class);
+            return Some(OversizedEvent {
+                artifact: OversizedArtifact::Commit,
+                size_class,
+            });
         }
         // The same check a founding create runs on its Welcomes.
         let welcome_sizes = WelcomeSizes {
             adapter,
             routing: &self.routing,
         };
-        let size_class = welcome_sizes.oversized_welcome(&prepared.welcomes).await?;
-        refused(OversizedArtifact::Welcome, size_class)
+        let size_class = welcome_sizes.oversized_welcome(welcomes).await?;
+        Some(OversizedEvent {
+            artifact: OversizedArtifact::Welcome,
+            size_class,
+        })
     }
 
     /// Roll back a prepared commit before that commit has any transport side
@@ -5200,6 +5211,28 @@ where
             return Ok(());
         }
 
+        // A queued invite the drain prepared is judged as a direct invite
+        // is, before its commit is published: one whose commit or Welcome
+        // fits none of its relays is retired unsent (mdk#2334).
+        if self.session.pending_is_queued_invite(pending)?
+            && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
+        {
+            let effects = self
+                .session
+                .publish_refused_as_too_large(
+                    pending,
+                    None,
+                    oversized.artifact,
+                    oversized.size_class,
+                )
+                .await?;
+            output
+                .pending
+                .push(PendingResolution::RolledBack { pending });
+            output.absorb_session_effects(effects, queue);
+            return Ok(());
+        }
+
         Box::pin(self.publish_one_with_post_confirmation_welcomes(
             commit,
             Some(PendingFanoutContinuation {
@@ -5954,7 +5987,22 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let effects = self.session.publish_failed_fanout(pending, fanout).await?;
+            // A commit every relay refused for its size cannot fit on a
+            // retry: one drained from the queue is retired, not re-drained
+            // (mdk#2334).
+            let effects = match OversizedEvent::of_fanout(fanout) {
+                Some(oversized) => {
+                    self.session
+                        .publish_refused_as_too_large(
+                            pending,
+                            Some(fanout),
+                            oversized.artifact,
+                            oversized.size_class,
+                        )
+                        .await?
+                }
+                None => self.session.publish_failed_fanout(pending, fanout).await?,
+            };
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7353,31 +7401,7 @@ pub struct PublishFailure {
     pub oversized: Option<OversizedEvent>,
 }
 
-/// Semantic artifact known by the publication owner, never inferred from ciphertext.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OversizedArtifact {
-    Commit,
-    Welcome,
-    ApplicationMessage,
-    Other,
-}
-
-impl OversizedArtifact {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Commit => "commit",
-            Self::Welcome => "welcome",
-            Self::ApplicationMessage => "application_message",
-            Self::Other => "other",
-        }
-    }
-}
-
-impl std::fmt::Display for OversizedArtifact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+pub use cgka_traits::OversizedArtifact;
 
 /// Privacy-safe explanation of an observed all-target size refusal, without
 /// exact sizes, identifiers, relay details, or an inferred relay limit.

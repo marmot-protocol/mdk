@@ -9,6 +9,13 @@
   nor a re-join clears it, and the next account open restores the live state. Kotlin `when` and Swift `switch`
   statements that cover every case must add it. Use the matching native library with regenerated bindings.
 
+- `GroupEventKindFfi::QueuedIntentRefused` adds `artifact: OversizedArtifactFfi?` and
+  `size_class: EventSizeClassFfi?` (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's
+  Welcome fits none of its relays' known size limits, or every relay refused it for size: `artifact` names that event
+  and `size_class` its coarse size. Both are `nil` for other reasons. Swift `case` patterns that bind the variant's
+  values positionally add the two fields. Before, a queued commit that every group relay refused for size was re-sent
+  on every drain; it is now dropped and announced once.
+
 ### Added
 
 - `MarmotDeploymentFfi` adds `relay_event_limits: [RelayEventLimitFfi]`, empty by default in Swift and Kotlin: the

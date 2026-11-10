@@ -1,0 +1,24 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::QueuedIntentRefused\n{\n    group_id: gid(), intent_id: mid(), intent_kind: \"invite\".into(), reason:\n    \"event_too_large\".into(), artifact:\n    Some(cgka_traits::OversizedArtifact::Welcome), size_class:\n    Some(cgka_traits::EventSizeClass::From64To128Kib),\n}"
+---
+{
+  "QueuedIntentRefused": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "intent_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "intent_kind": "invite",
+    "reason": "event_too_large",
+    "artifact": "welcome",
+    "size_class": "from_64_to_128_kib"
+  }
+}

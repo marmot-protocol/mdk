@@ -88,6 +88,14 @@ pub enum MarmotGroupEventKind {
         intent_id_hex: *mut c_char,
         intent_kind: *mut c_char,
         reason: *mut c_char,
+        /// With `reason` `event_too_large`, the event that fits none of its
+        /// relays' known size limits: `commit` or `welcome`. NULL for every
+        /// other reason.
+        artifact: *mut c_char,
+        /// True only with `reason` `event_too_large`.
+        has_size_class: bool,
+        /// Only meaningful when has_size_class is true.
+        size_class: MarmotEventSizeClass,
     },
 }
 
@@ -103,10 +111,15 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 intent_id_hex,
                 intent_kind,
                 reason,
+                artifact,
+                size_class,
             } => Self::QueuedIntentRefused {
                 intent_id_hex: owned_c_string(intent_id_hex),
                 intent_kind: owned_c_string(intent_kind),
                 reason: owned_c_string(reason),
+                artifact: owned_opt_c_string(artifact.map(|artifact| artifact.to_string())),
+                has_size_class: size_class.is_some(),
+                size_class: size_class.map(Into::into).unwrap_or_default(),
             },
             F::GroupMemberLeavesRemoved { epoch } => Self::GroupMemberLeavesRemoved { epoch },
             F::GroupCreated => Self::GroupCreated,
@@ -220,10 +233,13 @@ impl CFree for MarmotGroupEventKind {
                     intent_id_hex,
                     intent_kind,
                     reason,
+                    artifact,
+                    ..
                 } => {
                     free_c_string(*intent_id_hex);
                     free_c_string(*intent_kind);
                     free_c_string(*reason);
+                    free_c_string(*artifact);
                 }
                 Self::MessageReceived { sender_id_hex, .. } => free_c_string(*sender_id_hex),
                 Self::AppMessageInvalidated {
@@ -1024,6 +1040,59 @@ mod tests {
                             MarmotGroupEventKind::GroupMemberLeavesRemoved { epoch: 42 }
                         )
                 ));
+                marmot_event_free(event);
+            }
+            assert_eq!(audit::live_allocations(), before);
+        }
+    }
+    #[test]
+    fn a_queued_intent_refusal_names_an_oversized_event_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        for (artifact, size_class) in [
+            (
+                Some(marmot_uniffi::OversizedArtifactFfi::Welcome),
+                Some(marmot_uniffi::EventSizeClassFfi::From64To128Kib),
+            ),
+            (None, None),
+        ] {
+            let event = boxed(MarmotEvent::from(MarmotEventFfi::GroupEvent {
+                account_id_hex: "account".into(),
+                account_label: "alice".into(),
+                group_id_hex: "31".repeat(16),
+                event: GroupEventKindFfi::QueuedIntentRefused {
+                    intent_id_hex: "42".repeat(32),
+                    intent_kind: "invite".into(),
+                    reason: "event_too_large".into(),
+                    artifact,
+                    size_class,
+                },
+            }));
+            unsafe {
+                let MarmotEvent::GroupEvent {
+                    event:
+                        MarmotGroupEventKind::QueuedIntentRefused {
+                            artifact: c_artifact,
+                            has_size_class,
+                            size_class: c_size_class,
+                            ..
+                        },
+                    ..
+                } = &*event
+                else {
+                    panic!("queued intent refusal");
+                };
+                if artifact.is_some() {
+                    assert_eq!(
+                        std::ffi::CStr::from_ptr(*c_artifact).to_str().unwrap(),
+                        "welcome"
+                    );
+                    assert!(*has_size_class);
+                    assert!(matches!(c_size_class, MarmotEventSizeClass::From64To128Kib));
+                } else {
+                    assert!(c_artifact.is_null());
+                    assert!(!*has_size_class);
+                }
                 marmot_event_free(event);
             }
             assert_eq!(audit::live_allocations(), before);

@@ -558,14 +558,17 @@ impl From<AuditUploadError> for AppError {
     }
 }
 
-fn welcome_too_large(error: &cgka_traits::error::EngineError) -> Option<crate::OversizedEvent> {
+fn engine_event_too_large(
+    error: &cgka_traits::error::EngineError,
+) -> Option<crate::OversizedEvent> {
     match error {
-        cgka_traits::error::EngineError::WelcomeTooLarge { size_class } => {
-            Some(crate::OversizedEvent {
-                artifact: crate::OversizedArtifact::Welcome,
-                size_class: *size_class,
-            })
-        }
+        cgka_traits::error::EngineError::EventTooLarge {
+            artifact,
+            size_class,
+        } => Some(crate::OversizedEvent {
+            artifact: *artifact,
+            size_class: *size_class,
+        }),
         _ => None,
     }
 }
@@ -670,9 +673,9 @@ impl AppError {
                 }),
             // A founding create refused before it wrote anything (mdk#2334).
             Self::Session(error) | Self::Account(AccountError::Session(error)) => {
-                welcome_too_large(error.as_engine_error())
+                engine_event_too_large(error.as_engine_error())
             }
-            Self::Account(AccountError::Engine(error)) => welcome_too_large(error),
+            Self::Account(AccountError::Engine(error)) => engine_event_too_large(error),
             _ => None,
         }
     }

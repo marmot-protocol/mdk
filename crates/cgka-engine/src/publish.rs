@@ -474,13 +474,20 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
-        self.do_publish_failed_with_fanout(pending, None).await
+        self.do_publish_failed_with_fanout(pending, None, None)
+            .await
     }
 
+    /// Roll back `pending`, which no endpoint accepted. With `too_large`, its
+    /// event fits none of its relays (mdk#2334): the queued intent it was
+    /// drained from is deleted in the rollback's transaction and announced
+    /// once that commits, so no later drain prepares it again. Without it, a
+    /// drained intent stays queued for the next drain.
     pub(crate) async fn do_publish_failed_with_fanout(
         &mut self,
         pending: PendingStateRef,
         mut fanout: Option<&mut OutboundFanout>,
+        too_large: Option<(cgka_traits::OversizedArtifact, cgka_traits::EventSizeClass)>,
     ) -> Result<(), EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let origin_commit_id = self.peek_pending_origin_commit(pending);
@@ -519,6 +526,16 @@ impl<S: StorageProvider> Engine<S> {
             })
             .transpose()?;
 
+        // Read before the transaction, so a failed read writes nothing.
+        let retired_intent = match (too_large, self.queued_intent_by_pending.get(&pending)) {
+            (Some(_), Some((queued_group_id, intent_id))) => self
+                .storage
+                .list_queued_outbound_intents(queued_group_id)?
+                .into_iter()
+                .find(|record| record.id == *intent_id),
+            _ => None,
+        };
+
         let has_pending_commit = mls_group.pending_commit().is_some();
         let pending_was_self_remove_only = mls_group.pending_commit().is_some_and(|staged| {
             let mut count = 0usize;
@@ -534,6 +551,12 @@ impl<S: StorageProvider> Engine<S> {
                 // the retained intent must not be re-issued behind its back.
                 if let Some(origin_commit_id) = origin_commit_id.as_ref() {
                     storage.delete_own_commit_intent(origin_commit_id)?;
+                }
+                // Republishing the same event cannot succeed, so retire the
+                // intent with the rollback that undoes it: a failure or a
+                // crash leaves both, and the refusal can run again.
+                if let Some(record) = retired_intent.as_ref() {
+                    storage.delete_queued_outbound_intent(&record.id)?;
                 }
                 if has_pending_commit {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
@@ -602,6 +625,16 @@ impl<S: StorageProvider> Engine<S> {
 
         if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
             *fanout = rolled_back;
+        }
+        // Announced before any fallible step below: the retirement is durable.
+        if let (Some(record), Some((artifact, size_class))) = (retired_intent.as_ref(), too_large) {
+            self.announce_refused_queued_intent(
+                record,
+                &EngineError::EventTooLarge {
+                    artifact,
+                    size_class,
+                },
+            );
         }
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
