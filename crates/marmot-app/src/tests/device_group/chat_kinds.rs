@@ -6,7 +6,9 @@
 //! host sends one as a custom event.
 
 use super::*;
-use crate::notifications::{notification_update_from_event, recover_notification_updates};
+use crate::notifications::{
+    NotificationResolver, notification_update_from_event_cached, recover_notification_updates,
+};
 
 const DEVICE_GROUP_KINDS: [u64; 8] = [457, 458, 459, 460, 461, 473, 475, 476];
 
@@ -111,12 +113,14 @@ async fn device_group_kinds_in_a_chat_are_ignored_and_never_sent_as_custom_event
     assert!(stored.is_empty(), "{stored:?}");
 
     // Only the chat message notifies, live or recovered from storage.
+    let mut resolver = NotificationResolver::default();
     let live: Vec<_> = summary
         .messages
         .iter()
         .filter_map(|message| {
-            notification_update_from_event(
+            notification_update_from_event_cached(
                 &app,
+                &mut resolver,
                 &MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
                     account_id_hex: bob_id.clone(),
                     account_label: "bob".to_owned(),

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Reuse notification settings, chat mutes, group records, and directory users
+  across live subscription events (#1800). Invalidate cached values when they
+  change, honor timed mute expiry, and skip non-notifying kinds before storage
+  reads or blocking-task dispatch.
+
 ## 0.15.0 - 2026-11-09
 
 ### Added

@@ -1994,7 +1994,7 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
 
     resolver
         .chat_muted
-        .insert(("alice".to_owned(), group), false);
+        .insert(("alice".to_owned(), group), Some(0));
     let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
         account_id_hex: receiver,
         account_label: "alice".to_owned(),
@@ -2280,7 +2280,7 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     );
     let conversation = (account_label.to_owned(), group_id_hex.clone());
     resolver.groups.insert(conversation.clone(), None);
-    resolver.chat_muted.insert(conversation.clone(), false);
+    resolver.chat_muted.insert(conversation.clone(), Some(0));
     for account_id in [&account_id_hex, &sender_id_hex] {
         resolver.users.insert(
             account_id.clone(),
@@ -2302,7 +2302,7 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     assert_eq!(update.preview_text.as_deref(), Some("Searching relays"));
     assert!(!update.is_mention);
 
-    resolver.chat_muted.insert(conversation, true);
+    resolver.chat_muted.insert(conversation, None);
     assert_eq!(
         notification_update_from_message(&app, &mut resolver, &message).unwrap(),
         None,
@@ -2843,7 +2843,9 @@ fn seed_group_state_resolver(
     );
     let conversation = (account_label.to_owned(), group_id_hex.to_owned());
     resolver.groups.insert(conversation.clone(), None);
-    resolver.chat_muted.insert(conversation, muted);
+    resolver
+        .chat_muted
+        .insert(conversation, (!muted).then_some(0));
     let mut users = vec![account_id_hex];
     if let Some(actor_id_hex) = actor_id_hex {
         users.push(actor_id_hex);
@@ -2989,7 +2991,7 @@ fn group_state_live_classification_respects_settings_and_mute() {
 
     resolver
         .chat_muted
-        .insert((account_label.to_owned(), group_id_hex.clone()), true);
+        .insert((account_label.to_owned(), group_id_hex.clone()), None);
     assert_eq!(
         notification_update_from_event_cached(&app, &mut resolver, &event).unwrap(),
         None,

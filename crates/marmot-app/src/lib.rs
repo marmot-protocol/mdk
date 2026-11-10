@@ -7,7 +7,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -559,6 +559,9 @@ pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
+    notification_revision: Arc<AtomicU64>,
+    #[cfg(test)]
+    notification_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     root: PathBuf,
     /// Present for exclusive-root entry points. Every clone shares this cell,
     /// so the root remains exclusively owned until all database-capable app and
@@ -1733,6 +1736,9 @@ impl MarmotApp {
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
+            notification_revision: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             account_home: AccountHome::open(&root),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
@@ -1854,6 +1860,9 @@ impl MarmotApp {
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
+            notification_revision: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
@@ -3898,6 +3907,7 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .set_chat_muted(group_id_hex, muted_until_ms)?;
+        self.notification_revision.fetch_add(1, Ordering::Release);
         Ok(chat_notification_settings_from_account(
             account.label,
             account.account_id_hex,
@@ -3918,6 +3928,7 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .clear_chat_muted(group_id_hex)?;
+        self.notification_revision.fetch_add(1, Ordering::Release);
         Ok(chat_notification_settings_from_account(
             account.label,
             account.account_id_hex,
@@ -3932,15 +3943,12 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        Ok(notification_settings_from_account(
-            self.account_storage(&account.label)?
-                .app_storage()
-                .set_local_notifications_enabled(
-                    &account.label,
-                    &account.account_id_hex,
-                    enabled,
-                )?,
-        ))
+        let settings = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .set_local_notifications_enabled(&account.label, &account.account_id_hex, enabled)?;
+        self.notification_revision.fetch_add(1, Ordering::Release);
+        Ok(notification_settings_from_account(settings))
     }
 
     pub fn set_native_push_enabled(
@@ -3950,11 +3958,12 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        Ok(notification_settings_from_account(
-            self.account_storage(&account.label)?
-                .app_storage()
-                .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?,
-        ))
+        let settings = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?;
+        self.notification_revision.fetch_add(1, Ordering::Release);
+        Ok(notification_settings_from_account(settings))
     }
 
     pub fn push_registration(
@@ -7736,11 +7745,13 @@ impl MarmotApp {
                 &settings.account_id_hex,
                 settings.local_notifications_enabled,
             )?;
+            self.notification_revision.fetch_add(1, Ordering::Release);
             app.set_native_push_enabled(
                 label,
                 &settings.account_id_hex,
                 settings.native_push_enabled,
             )?;
+            self.notification_revision.fetch_add(1, Ordering::Release);
         }
         if let Some(registration) = legacy.push_registration(label)? {
             app.upsert_push_registration(
