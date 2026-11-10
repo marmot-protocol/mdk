@@ -33,7 +33,7 @@ impl Transport {
                 .await
                 .map_err(|_| Nip46Error::Unavailable)?;
         }
-        self.client.connect().and_wait(Duration::from_secs(5)).await;
+        self.client.connect().and_wait(RELAY_READY_WAIT).await;
         self.client
             .subscribe(
                 Filter::new()
@@ -83,7 +83,7 @@ impl Transport {
         Ok(())
     }
     async fn listen(&mut self, shared: &Shared, context: &Context<'_>) -> Result<String> {
-        let (relays, keys, secret) = {
+        let (mut relays, keys, secret) = {
             let data = lock(&shared.data);
             Shared::check(&data, context.generation)?;
             if !data.client_pairing || data.pairing_established {
@@ -106,16 +106,18 @@ impl Transport {
             .map_err(|_| Nip46Error::Unavailable)?;
         let id = ready.value;
         let mut awaiting = ready.success;
-        if awaiting.len() != relays.len() {
+        if awaiting.is_empty() {
             return Err(Nip46Error::Unavailable);
         }
+        relays.retain(|relay| awaiting.contains_key(relay));
+        let deadline = tokio::time::Instant::now() + RELAY_READY_WAIT;
         while !awaiting.is_empty() {
-            match self.notifications.next().await {
-                Some(ClientNotification::Message { relay_url, message }) if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(received) if received.as_ref() == &id) =>
+            match tokio::time::timeout_at(deadline, self.notifications.next()).await {
+                Ok(Some(ClientNotification::Message { relay_url, message })) if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(received) if received.as_ref() == &id) =>
                 {
                     awaiting.remove(&relay_url);
                 }
-                Some(ClientNotification::Event { event, .. }) => {
+                Ok(Some(ClientNotification::Event { event, .. })) => {
                     if self.pairing_reply.is_none()
                         && let Some(payload) = validated_payload(&event, &keys, None)
                         && pairing_response(&payload, &secret)
@@ -123,16 +125,23 @@ impl Transport {
                         self.pairing_reply = Some((event.pubkey, payload));
                     }
                 }
-                None => return Err(Nip46Error::Unavailable),
+                Ok(None) => return Err(Nip46Error::Unavailable),
+                Err(_) => break,
                 _ => {}
             }
+        }
+        relays.retain(|relay| !awaiting.contains_key(relay));
+        if relays.is_empty() {
+            return Err(Nip46Error::Unavailable);
         }
         self.client
             .unsubscribe(&id)
             .await
             .map_err(|_| Nip46Error::Unavailable)?;
+        self.configure(&relays, client).await?;
         let mut data = lock(&shared.data);
         Shared::check(&data, context.generation)?;
+        data.relays = relays;
         data.status.state = Nip46State::Listening;
         protocol::uri(&data)
     }

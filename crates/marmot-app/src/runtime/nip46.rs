@@ -23,7 +23,7 @@ impl MarmotAppRuntime {
         let public_key = session.connect_async().await?;
         let gate = self.accounts.onboarding_transaction(&public_key);
         let _transaction = gate.lock().await;
-        self.check_nip46_slot(&public_key, &session)?;
+        let previously_bound = self.check_nip46_slot(&public_key, &session)?;
         let request = AccountSetupRequest {
             default_relays,
             bootstrap_relays,
@@ -35,8 +35,31 @@ impl MarmotAppRuntime {
         };
         let result = self
             .accounts
-            .login_with_external(public_key, session.clone(), request, Some(session))
+            .login_with_external(
+                public_key.clone(),
+                session.clone(),
+                request,
+                Some(session.clone()),
+            )
+            .await;
+        if result.is_err() && !previously_bound {
+            let registry = self.accounts.app.nip46_sessions.clone();
+            let id = public_key.clone();
+            blocking_app_task(move || {
+                let current = registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&id)
+                    .is_some_and(|current| current.same_session(&session));
+                if current {
+                    session.unbind_account()?;
+                }
+                Ok(())
+            })
             .await?;
+            self.accounts.reconcile_for_account(&public_key).await?;
+        }
+        let result = result?;
         Ok(result.account)
     }
 
@@ -97,7 +120,7 @@ impl MarmotAppRuntime {
         self.accounts.reconcile().await
     }
 
-    fn check_nip46_slot(&self, id: &str, session: &Nip46Session) -> Result<(), AppError> {
+    fn check_nip46_slot(&self, id: &str, session: &Nip46Session) -> Result<bool, AppError> {
         let sessions = self
             .accounts
             .app
@@ -110,7 +133,7 @@ impl MarmotAppRuntime {
         {
             return Err(Nip46Error::Busy.into());
         }
-        Ok(())
+        Ok(sessions.contains_key(id))
     }
 
     async fn load_nip46_session(
@@ -156,7 +179,7 @@ impl MarmotAppRuntime {
             app.pin_external_signer(
                 &account.account_id_hex,
                 session.public_key()?,
-                Arc::new(session.clone()),
+                session.registered_signer(),
             );
             sessions.insert(account.account_id_hex, session.clone());
             Ok(Some(session))
@@ -216,7 +239,7 @@ impl AccountManager {
         self.app.pin_external_signer(
             &account.account_id_hex,
             public_key,
-            Arc::new(session.clone()),
+            session.registered_signer(),
         );
         sessions.insert(account.account_id_hex, session);
         Ok(())
@@ -231,15 +254,15 @@ impl AccountManager {
         if !account.external_signing {
             return Ok(());
         }
-        let mut sessions = self
+        let session = self
             .app
             .nip46_sessions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(session) = sessions.get(&account.account_id_hex) {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account.account_id_hex)
+            .cloned();
+        if let Some(session) = session {
             session.erase_local()?;
-            sessions.remove(&account.account_id_hex);
-            self.app.forget_external_signer(&account.account_id_hex);
         } else {
             self.app
                 .account_home()

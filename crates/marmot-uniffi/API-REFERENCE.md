@@ -5967,7 +5967,7 @@ Permanently cancel this session and interrupt pending work, including synchronou
 pub async fn logout(&self) -> Result<(), Nip46ErrorFfi>
 ```
 
-Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. This is distinct from MDK account sign-out and credential removal; account sign-out already leaves attached handles logged out.
+Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. Detaches the revoked signer so a fresh pairing can be registered in the same process. This does not sign out the MDK account; account sign-out already leaves attached handles logged out.
 
 [Source](src/nip46.rs#L238)
 

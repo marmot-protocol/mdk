@@ -559,9 +559,12 @@ RPC requests have a 90-second budget; MDK account setup can time out sooner.
 
 `marmot_nip46_ping` checks the remote signer; `marmot_nip46_disconnect` interrupts
 transport work but permits explicit reconnection. `marmot_nip46_cancel` permanently
-interrupts that session without removing its persisted credentials or saved export.
-For lock, reload, or shutdown, cancel, join every borrower, then free sessions
-before their creating client. Free cancels the handle without remote logout.
+interrupts the shared session, including its account signer and other handles,
+without removing its persisted credentials or saved export.
+`marmot_nip46_free` releases only the C handle. Attached sessions remain owned by
+MDK, so freeing a login or resumed handle does not stop account signing or other
+handles. An unbound session stops when its final owner drops. Join every borrower
+before freeing a handle, and free all handles before their creating client.
 MDK account signout removes its owned signer credentials and leaves attached
 handles logged out; remove any optional host vault export too.
 `marmot_nip46_logout` is direct session revocation, not account signout. Its

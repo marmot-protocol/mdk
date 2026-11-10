@@ -1583,6 +1583,100 @@ fn main() -> Result<()> {
         "PASS one-session cancel and unacknowledged logout preserve local/other remote accounts"
     );
 
+    let retry = Session::new(client, &export_a);
+    let mut refused = ptr::dangling_mut();
+    assert_ne!(
+        unsafe {
+            marmot_nip46_login(
+                client.0,
+                retry.0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut refused,
+            )
+        },
+        MarmotStatus::Ok,
+        "missing messaging relays must refuse reactivation"
+    );
+    assert!(refused.is_null());
+    assert_eq!(retry.state()["state"], "disconnected");
+    assert_eq!(
+        SECRETS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(label, _, _)| label.starts_with(".nip46-client/"))
+            .count(),
+        1,
+        "failed reactivation retained account A's communication credential"
+    );
+    assert_accounts(client, &local_id, &account_a, &account_b, true);
+    assert_eq!(
+        retry.login(client, &relay_url, fixture_a.user.public_key()),
+        account_a
+    );
+    check(
+        client.profile(&account_a, "after-reactivation-retry"),
+        "same pairing after failed reactivation",
+    );
+    check(
+        unsafe { marmot_nip46_logout(retry.0) },
+        "logout attached signer",
+    );
+    let mut absent = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { marmot_nip46_resume(client.0, account_a_c.as_ptr(), &mut absent) },
+        MarmotStatus::ExternalSignerUnavailable
+    );
+    assert!(absent.is_null());
+
+    let replacement_a = Session::new(
+        client,
+        &json!({"relays":[replacement_url],"name":"Replacement pairing"}),
+    );
+    let mut offer = ptr::null_mut();
+    check(
+        unsafe { marmot_nip46_pairing_offer(replacement_a.0, &mut offer) },
+        "replacement pairing offer",
+    );
+    let offer = take_string(offer);
+    let offer = url::Url::parse(&offer)?;
+    let pairing_client = PublicKey::from_hex(offer.host_str().ok_or("pairing client key")?)?;
+    let secret = offer
+        .query_pairs()
+        .find(|(key, _)| key == "secret")
+        .ok_or("pairing secret")?
+        .1
+        .into_owned();
+    runtime.block_on(fixture_a.pairing.send(Pairing {
+        client: pairing_client,
+        secret,
+        author: fixture_a.bunker.clone(),
+    }))?;
+    assert_eq!(
+        replacement_a.login(client, &relay_url, fixture_a.user.public_key()),
+        account_a
+    );
+    assert_eq!(
+        unsafe { marmot_nip46_logout(session_a.0) },
+        MarmotStatus::ExternalSignerUnavailable
+    );
+    check(
+        client.profile(&account_a, "after-same-process-repair"),
+        "fresh signer after attached logout and stale-handle logout",
+    );
+    client.keypackage(&account_a);
+    sign_out(client, &account_a);
+    drop(replacement_a);
+    drop(retry);
+    println!(
+        "PASS failed reactivation rolls back its binding; attached logout permits immediate fresh pairing"
+    );
+
     drop(session_a);
     drop(session_b);
     drop(owner);

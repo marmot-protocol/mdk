@@ -1094,7 +1094,8 @@ impl AccountHome {
     }
 
     /// Store a verified remote-signing session without storing its key in metadata.
-    /// Replacing the communication key requires explicit session removal first.
+    /// A confirmed missing key permits explicit re-pairing after an interrupted store.
+    /// Replacing an existing key requires explicit session removal first.
     pub fn store_nip46_session(
         &self,
         account_ref: &str,
@@ -1117,21 +1118,18 @@ impl AccountHome {
         }
         let path = directory.join(NIP46_SESSION_FILE);
         let previous = self.read_nip46_record(&account)?;
-        if previous.as_ref().is_some_and(|previous| {
-            previous.client_public_key != record.client_public_key
-                || previous.remote_signer_public_key != record.remote_signer_public_key
-        }) {
-            return Err(AccountHomeError::AccountIdMismatch);
-        }
         let credential = synthetic_credential(&account, NIP46_CREDENTIAL_PREFIX);
         let exists = self.secret_store.has_secret_for_label(&credential.label)?
             || self
                 .secret_store
                 .has_secret_for_account_id(&credential.account_id_hex)?;
-        if previous.is_some() && !exists {
-            return Err(AccountHomeError::SecretNotFound(credential.label));
-        }
         if exists {
+            if previous.as_ref().is_some_and(|previous| {
+                previous.client_public_key != record.client_public_key
+                    || previous.remote_signer_public_key != record.remote_signer_public_key
+            }) {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
             if self.secret_store.load_secret(&credential)?.secret_key() != keys.secret_key() {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
@@ -1200,24 +1198,7 @@ impl AccountHome {
     ) -> AccountHomeResult<()> {
         let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         let account = self.account(account_ref)?;
-        if removal == Nip46Removal::Recorded {
-            let directory = self.account_dir(&account.label);
-            let mut recorded = false;
-            for name in [NIP46_SESSION_FILE, NIP46_REMOVING_FILE] {
-                match fs::symlink_metadata(directory.join(name)) {
-                    Ok(_) => {
-                        recorded = true;
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if !recorded {
-                return Ok(());
-            }
-        }
-        self.remove_nip46_session_inner(&account)
+        self.remove_nip46_session_inner(&account, removal)
     }
 
     fn read_nip46_record(
@@ -1239,8 +1220,28 @@ impl AccountHome {
         Ok(Some(record))
     }
 
-    fn remove_nip46_session_inner(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+    fn remove_nip46_session_inner(
+        &self,
+        account: &AccountSummary,
+        removal: Nip46Removal,
+    ) -> AccountHomeResult<()> {
         let directory = self.account_dir(&account.label);
+        if removal == Nip46Removal::Recorded {
+            let mut recorded = false;
+            for name in [NIP46_SESSION_FILE, NIP46_REMOVING_FILE] {
+                match fs::symlink_metadata(directory.join(name)) {
+                    Ok(_) => {
+                        recorded = true;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !recorded {
+                return Ok(());
+            }
+        }
         let path = directory.join(NIP46_SESSION_FILE);
         let removing = directory.join(NIP46_REMOVING_FILE);
         let credential = synthetic_credential(account, NIP46_CREDENTIAL_PREFIX);
@@ -1457,7 +1458,7 @@ impl AccountHome {
 
         // The session credential lives outside the account directory. Delete it
         // before the wipe commits so a vault failure remains actionable.
-        self.remove_nip46_session_inner(&account)?;
+        self.remove_nip46_session_inner(&account, Nip46Removal::Recorded)?;
 
         // Commit point: atomically move the live account directory into the
         // tombstone namespace. After this returns Ok the account is no longer a

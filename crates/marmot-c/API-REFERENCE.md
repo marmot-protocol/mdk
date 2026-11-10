@@ -3232,7 +3232,7 @@ Install the client-pairing listener and await relay subscription acknowledgement
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13056)
+[Header contract](include/marmot.h#L13057)
 
 ### `marmot_nip46_approve_grants`
 
@@ -3244,7 +3244,7 @@ Approve the exact version and grants previously returned by review, after user c
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13124)
+[Header contract](include/marmot.h#L13125)
 
 ### `marmot_nip46_cancel_request`
 
@@ -3256,7 +3256,7 @@ Cancel one matching pending request without terminally cancelling the session. S
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13148)
+[Header contract](include/marmot.h#L13149)
 
 ### `marmot_nip46_complete_auth`
 
@@ -3268,7 +3268,7 @@ Acknowledge the auth challenge identified by the current status request ID. This
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13156)
+[Header contract](include/marmot.h#L13157)
 
 ### `marmot_nip46_disconnect`
 
@@ -3280,7 +3280,7 @@ Interrupt transport work and advance the session generation. A later explicit co
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13141)
+[Header contract](include/marmot.h#L13142)
 
 ### `marmot_nip46_ping`
 
@@ -3292,7 +3292,7 @@ Check the remote signer through the shared transport. Blocks; run off the UI thr
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13134)
+[Header contract](include/marmot.h#L13135)
 
 ### `marmot_nip46_remove`
 
@@ -3304,7 +3304,7 @@ Detach the account-scoped shared signer and remove its persisted communication c
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13173)
+[Header contract](include/marmot.h#L13174)
 
 ### `marmot_nip46_resume`
 
@@ -3312,11 +3312,11 @@ Detach the account-scoped shared signer and remove its persisted communication c
 MarmotStatus marmot_nip46_resume(const struct MarmotClient *client, const char *account_ref, struct MarmotNip46Session **out);
 ```
 
-Obtain the session restored from MDK-owned account credentials, without a host descriptor or callback. Persisted permission approval is retained. Out is cleared before runtime work; free the handle with `marmot_nip46_free` before its creating client.
+Obtain the shared session restored from MDK-owned account credentials, without a host descriptor or callback. Persisted permission approval is retained. Out is cleared before runtime work; free the handle with `marmot_nip46_free` before its creating client. Freeing this handle leaves the account signer and other handles usable.
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13164)
+[Header contract](include/marmot.h#L13165)
 
 ### `marmot_nip46_review_grants`
 
@@ -3328,7 +3328,7 @@ Record the required permission snapshot and return JSON `version` and `grants` f
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13117)
+[Header contract](include/marmot.h#L13118)
 
 ### `marmot_nip46_cancel`
  
@@ -3337,7 +3337,7 @@ Record the required permission snapshot and return JSON `version` and `grants` f
 void marmot_nip46_cancel(const struct MarmotNip46Session *session);
 ```
 
-Permanently cancel this session's pending work without removing MDK-owned credentials or revoking a saved export. Nonblocking and NULL-safe; may race calls, never free.
+Permanently cancel the shared session's pending work, including its account signer and other handles, without removing MDK-owned credentials or revoking a saved export. Nonblocking and NULL-safe; may race calls, never free.
 
 [Header contract](include/marmot.h#L13279)
 
@@ -3367,7 +3367,7 @@ Return durable client credentials and pinned identities as JSON. Store only in a
 void marmot_nip46_free(struct MarmotNip46Session *session);
 ```
 
-Cancel and release transport without remote logout. Join all callers first and free before the creating client. NULL is a no-op.
+Release only this C handle without cancelling the shared session, remote logout, or removing persisted credentials. MDK retains attached sessions, so account signing and other handles remain usable. An unbound session stops when its final owner drops. Explicit `marmot_nip46_cancel` remains terminal. Join all callers first and free before the creating client. NULL is a no-op.
 
 [Header contract](include/marmot.h#L13295)
 
@@ -3432,7 +3432,7 @@ Read local typed state/error vocabulary, optional auth URL and request ID, and g
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13109)
+[Header contract](include/marmot.h#L13110)
 
 ### `marmot_nip46_status_free`
 
@@ -3444,7 +3444,7 @@ Deep-free the status record and its optional strings. NULL is a no-op. Embedded 
 
 [Session contract](README.md#nip-46-accounts)
 
-[Header contract](include/marmot.h#L13032)
+[Header contract](include/marmot.h#L13033)
 
 ### `marmot_nip46_uri`
 

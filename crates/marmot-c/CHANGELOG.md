@@ -21,6 +21,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Login/register persist account-scoped credentials through the configured secret
   store; client startup restores them before workers. State/export JSON retains
   its existing fields and adds versioned permission and typed status metadata.
+  `marmot_nip46_free` releases only its C handle, preserving the runtime-owned
+  account signer and other handles. Explicit `marmot_nip46_cancel` remains
+  terminal for the shared session. Join handle borrowers before freeing.
   Optional host exports remain secret and require encrypted storage.
 
 ## [0.16.0] - 2026-11-11

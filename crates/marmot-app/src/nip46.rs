@@ -26,6 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_READY_WAIT: Duration = Duration::from_secs(5);
 const MAX_PAYLOAD: usize = 2 * 1024 * 1024;
 const MAX_PENDING: usize = 32;
 const PERMISSION_VERSION: u32 = 1;
@@ -192,10 +193,13 @@ struct Data {
     pending: HashMap<String, watch::Sender<bool>>,
     active: Option<String>,
     account: Option<String>,
+    registration: Option<Weak<dyn crate::ExternalAccountSigner>>,
 }
 struct Shared {
     data: Mutex<Data>,
     owner: Weak<()>,
+    sessions: Weak<Mutex<HashMap<String, Nip46Session>>>,
+    signers: Weak<Mutex<HashMap<String, crate::RegisteredExternalSigner>>>,
     home: AccountHome,
     relay_policy: RelaySafetyPolicy,
 }
@@ -240,6 +244,11 @@ enum Operation {
     Crypto(&'static str, Vec<String>),
     Ping,
     Logout,
+}
+
+enum BindingCleanup {
+    Revoke,
+    RetainPairing,
 }
 
 #[derive(Debug, PartialEq)]
@@ -417,6 +426,8 @@ impl Nip46Session {
         let shared = Arc::new(Shared {
             data: Mutex::new(data),
             owner: Arc::downgrade(&app.nip46_owner),
+            sessions: Arc::downgrade(&app.nip46_sessions),
+            signers: Arc::downgrade(&app.external_signers),
             home: app.account_home.clone(),
             relay_policy,
         });
@@ -491,6 +502,11 @@ impl Nip46Session {
     }
     pub(crate) fn same_session(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.core, &other.core)
+    }
+    pub(crate) fn registered_signer(&self) -> Arc<dyn crate::ExternalAccountSigner> {
+        let signer: Arc<dyn crate::ExternalAccountSigner> = Arc::new(self.clone());
+        lock(&self.core.shared.data).registration = Some(Arc::downgrade(&signer));
+        signer
     }
     pub fn permissions() -> Nip46Permissions {
         Nip46Permissions {
@@ -647,10 +663,32 @@ impl Nip46Session {
         result
     }
     pub fn erase_local(&self) -> Result<()> {
+        self.clear_binding(BindingCleanup::Revoke)
+    }
+    pub(crate) fn unbind_account(&self) -> Result<()> {
+        self.clear_binding(BindingCleanup::RetainPairing)
+    }
+    fn clear_binding(&self, cleanup: BindingCleanup) -> Result<()> {
+        let account_id = {
+            let data = lock(&self.core.shared.data);
+            data.user.map(|key| key.to_hex())
+        };
+        let registry = self.core.shared.sessions.upgrade();
+        let mut sessions = registry.as_ref().map(|registry| lock(registry));
+        let current = account_id.as_ref().is_some_and(|id| {
+            sessions.as_ref().is_some_and(|sessions| {
+                sessions
+                    .get(id)
+                    .is_some_and(|session| session.same_session(self))
+            })
+        });
+        // Registry -> session -> secret store is also the binding lock order.
+        // A retired handle must not erase a replacement session's credentials.
         let mut data = lock(&self.core.shared.data);
         let removal = data
             .account
             .as_ref()
+            .filter(|_| current)
             .map(|account| {
                 self.core
                     .shared
@@ -659,11 +697,29 @@ impl Nip46Session {
             })
             .transpose()
             .map_err(|_| Nip46Error::Storage);
-        data.keys = None;
-        data.secret = None;
+        if matches!(cleanup, BindingCleanup::Revoke) {
+            data.keys = None;
+            data.secret = None;
+        }
         data.verified = false;
+        data.account = None;
+        let registration = data
+            .registration
+            .take()
+            .and_then(|registration| registration.upgrade());
         data.status.generation = data.status.generation.wrapping_add(1);
-        data.status.state = Nip46State::LoggedOut;
+        data.status.state = match cleanup {
+            BindingCleanup::Revoke => Nip46State::LoggedOut,
+            BindingCleanup::RetainPairing
+                if matches!(
+                    data.status.state,
+                    Nip46State::Cancelled | Nip46State::LoggedOut
+                ) =>
+            {
+                data.status.state
+            }
+            BindingCleanup::RetainPairing => Nip46State::Disconnected,
+        };
         data.status.auth_url = None;
         data.status.request_id = None;
         data.status.last_error = removal.as_ref().err().cloned();
@@ -671,6 +727,18 @@ impl Nip46Session {
             sender.send_replace(true);
         }
         self.core.control.send_replace(data.status.generation);
+        drop(data);
+        if let (Some(id), Some(sessions)) = (account_id.as_ref(), sessions.as_mut())
+            && current
+        {
+            sessions.remove(id);
+            if let (Some(signers), Some(registration)) =
+                (self.core.shared.signers.upgrade(), registration)
+                && let Some(current) = lock(&signers).get(id)
+            {
+                current.clear_if(&registration);
+            }
+        }
         removal?;
         Ok(())
     }

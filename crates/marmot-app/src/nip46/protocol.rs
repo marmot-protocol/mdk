@@ -58,6 +58,7 @@ fn initial_data(keys: Keys, name: String, relays: Vec<RelayUrl>) -> Data {
         pending: HashMap::new(),
         active: None,
         account: None,
+        registration: None,
     }
 }
 struct PairingUri {

@@ -8137,6 +8137,7 @@ impl MarmotApp {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&account.account_id_hex)
+                .filter(|signer| signer.has_signer())
                 .map(RegisteredExternalSigner::account_signer)
                 .ok_or_else(|| {
                     AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
@@ -8162,7 +8163,8 @@ impl MarmotApp {
         self.external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(account_id_hex)
+            .get(account_id_hex)
+            .is_some_and(RegisteredExternalSigner::has_signer)
     }
 
     fn account_home(&self) -> AccountHome {

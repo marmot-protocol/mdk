@@ -32,6 +32,9 @@
   approval, relay-ready pairing offers, and request-scoped cancellation (#828).
   Sign-out and wipe erase communication keys; host NIP-55 callbacks and local
   signing accounts keep their existing APIs.
+  Freeing a C handle preserves the runtime-owned signer. Logout detaches the
+  revoked signer for fresh pairing; failed login releases only its new binding.
+  Explicit pairing can repair metadata-only interrupted credential writes.
 
 ## 0.16.0 - 2026-11-11
 

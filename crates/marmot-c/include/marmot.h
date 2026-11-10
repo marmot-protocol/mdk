@@ -1899,6 +1899,7 @@ typedef struct MarmotMessagesSubscription MarmotMessagesSubscription;
 
 /**
  * Opaque per-account remote signer. The creating client must outlive this handle.
+ * Free releases only this handle; attached sessions remain owned by MDK.
  * Cancellation is thread-safe; free must not race an in-flight call.
  */
 typedef struct MarmotNip46Session MarmotNip46Session;
@@ -13407,7 +13408,8 @@ MarmotStatus marmot_nip46_resume(const struct MarmotClient *client,
 MarmotStatus marmot_nip46_remove(const struct MarmotClient *client, const char *account_ref);
 
 /**
- * Permanently interrupt pending requests, including identity-proof callbacks.
+ * Permanently interrupt the shared session, including identity-proof callbacks.
+ * This affects the account signer and every handle sharing this session.
  * # Safety
  * Session must be NULL or live; may race operations, but not free.
  */
@@ -13421,7 +13423,9 @@ void marmot_nip46_cancel(const struct MarmotNip46Session *session);
 MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
 
 /**
- * Cancel and release a handle without remote logout or removing persisted credentials.
+ * Release only this handle without cancelling the shared session or logging out.
+ * MDK retains attached sessions. An unbound session stops when its final owner drops.
+ * Persisted credentials are unchanged; use marmot_nip46_cancel for terminal cancellation.
  * # Safety
  * Session must be NULL or uniquely owned; no other call may be in flight.
  */

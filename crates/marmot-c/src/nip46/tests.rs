@@ -194,6 +194,19 @@ impl OwnedSession {
         session.approve();
         session
     }
+    fn resume(client: &OwnedClient, account: &std::ffi::CStr, peers: &PeerSessions) -> Self {
+        let mut session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { marmot_nip46_resume(client.0, account.as_ptr(), &mut session) },
+            MarmotStatus::Ok
+        );
+        assert!(!session.is_null());
+        peers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&unsafe { &*session }.inner));
+        Self(session)
+    }
     fn approve(&self) {
         let mut out = std::ptr::null_mut();
         assert_eq!(
@@ -267,6 +280,56 @@ unsafe fn account_snapshot(client: &OwnedClient) -> (String, bool, bool) {
     assert!(!account.local_signing);
     unsafe { crate::types::account::marmot_account_summary_list_free(output) };
     result
+}
+
+fn assert_profile_signed(
+    client: &OwnedClient,
+    account: &std::ffi::CStr,
+    name: &str,
+    signed: &Mutex<Vec<Event>>,
+    user: PublicKey,
+) {
+    let name = std::ffi::CString::new(name).unwrap();
+    let profile = crate::types::account::MarmotUserProfileMetadata {
+        name: name.as_ptr().cast_mut(),
+        display_name: std::ptr::null_mut(),
+        about: std::ptr::null_mut(),
+        picture: std::ptr::null_mut(),
+        banner: std::ptr::null_mut(),
+        nip05: std::ptr::null_mut(),
+        lud16: std::ptr::null_mut(),
+    };
+    let mut output = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            crate::commands::marmot_publish_user_profile_using_account_relays(
+                client.0,
+                account.as_ptr(),
+                &profile,
+                &mut output,
+            )
+        },
+        MarmotStatus::Ok,
+        "{:?}",
+        crate::status::take_last_error()
+    );
+    assert!(!output.is_null());
+    assert!(!unsafe { &*output }.name.is_null());
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr((*output).name) },
+        name.as_c_str()
+    );
+    unsafe { crate::types::account::marmot_user_profile_metadata_free(output) };
+    let signed = signed.lock().unwrap();
+    let event = signed
+        .iter()
+        .find(|event| {
+            serde_json::from_str::<Value>(&event.content).unwrap()["name"] == name.to_str().unwrap()
+        })
+        .expect("account did not request the edited profile signature");
+    event.verify().unwrap();
+    assert_eq!(event.pubkey, user);
+    assert_eq!(event.kind, Kind::Metadata);
 }
 
 #[test]
@@ -445,12 +508,14 @@ fn nip46_live_lifecycle() {
         .unwrap();
     });
     let observed = Arc::new(Mutex::new(Vec::<(PublicKey, String, Option<Kind>)>::new()));
+    let signed_profiles = Arc::new(Mutex::new(Vec::<Event>::new()));
     let peers = PeerSessions::default();
     let peer_task = {
         let peer = peer.clone();
         let remote = remote.clone();
         let user = user.clone();
         let observed = observed.clone();
+        let signed_profiles = signed_profiles.clone();
         let url = url.clone();
         let peers = peers.clone();
         peer_runtime.spawn(async move {
@@ -498,6 +563,7 @@ fn nip46_live_lifecycle() {
                     }
                     let result = match method {
                         "connect" => json!("ack"),
+                        "ping" => json!("pong"),
                         "get_public_key" => {
                             // A genuine encrypted but unrelated response must be
                             // ignored by the live RPC loop, not pinned as the user.
@@ -512,7 +578,11 @@ fn nip46_live_lifecycle() {
                             let tags = serde_json::from_value::<Tags>(value["tags"].clone()).unwrap();
                             let at = serde_json::from_value::<Timestamp>(value["created_at"].clone()).unwrap();
                             let signed = EventBuilder::new(kind, value["content"].as_str().unwrap()).tags(tags).custom_created_at(at).finalize(&user).unwrap();
-                            json!(signed.as_json())
+                            let result = json!(signed.as_json());
+                            if kind == Kind::Metadata {
+                                signed_profiles.lock().unwrap().push(signed);
+                            }
+                            result
                         }
                         "nip44_encrypt" => {
                             let to = PublicKey::from_hex(params[0].as_str().unwrap()).unwrap();
@@ -631,7 +701,34 @@ fn nip46_live_lifecycle() {
             && !export.contains("fixture-b")
     );
     drop(independent);
+    let resumed = OwnedSession::resume(&client, &account_ref, &peers);
     drop(session);
+    assert_profile_signed(
+        &client,
+        &account_ref,
+        "after-original-free",
+        &signed_profiles,
+        user.public_key(),
+    );
+    assert_eq!(unsafe { marmot_nip46_ping(resumed.0) }, MarmotStatus::Ok);
+    let retained = OwnedSession::resume(&client, &account_ref, &peers);
+    drop(resumed);
+    assert_profile_signed(
+        &client,
+        &account_ref,
+        "after-resumed-free",
+        &signed_profiles,
+        user.public_key(),
+    );
+    assert_eq!(unsafe { marmot_nip46_ping(retained.0) }, MarmotStatus::Ok);
+    drop(retained);
+    assert_profile_signed(
+        &client,
+        &account_ref,
+        "after-final-handle-free",
+        &signed_profiles,
+        user.public_key(),
+    );
     drop(client);
     assert!(
         !observed
@@ -649,17 +746,23 @@ fn nip46_live_lifecycle() {
         unsafe { account_snapshot(&client) },
         (user.public_key().to_hex(), true, false)
     );
-    let mut resumed = std::ptr::null_mut();
+    let resumed = OwnedSession::resume(&client, &account_ref, &peers);
+    assert_eq!(resumed.connect(), user.public_key().to_hex());
+    let retained = OwnedSession::resume(&client, &account_ref, &peers);
+    unsafe { marmot_nip46_cancel(resumed.0) };
     assert_eq!(
-        unsafe { marmot_nip46_resume(client.0, account_ref.as_ptr(), &mut resumed) },
+        unsafe { marmot_nip46_ping(retained.0) },
+        MarmotStatus::ExternalSignerRejected
+    );
+    let mut status = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { marmot_nip46_status(retained.0, &mut status) },
         MarmotStatus::Ok
     );
-    let resumed = OwnedSession(resumed);
-    peers
-        .lock()
-        .unwrap()
-        .push(Arc::downgrade(&unsafe { &*resumed.0 }.inner));
-    assert_eq!(resumed.connect(), user.public_key().to_hex());
+    assert!(unsafe { &*status }.has_last_error);
+    assert_eq!(unsafe { &*status }.last_error, MarmotNip46Error::Cancelled);
+    unsafe { marmot_nip46_status_free(status) };
+    drop(retained);
     drop(resumed);
     assert_eq!(
         unsafe { marmot_nip46_remove(client.0, account_ref.as_ptr()) },

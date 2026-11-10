@@ -75,6 +75,8 @@ an ephemeral signer response can arrive before `connect` starts. Display the URI
 only after that call succeeds, then await `connect` concurrently with the pairing
 UI. The offline `uri` accessor alone does not install a listener. An interrupted
 unpaired offer gets a fresh secret; display the replacement offer, not the old QR.
+Only relays with acknowledged listeners appear in the returned offer; an offline
+configured relay does not prevent pairing through a ready relay.
 
 For a bunker URI, call `connect` directly. Both paths verify `get_public_key`
 and pin the user key separately from the remote signer and communication keys.
@@ -82,12 +84,17 @@ and pin the user key separately from the remote signer and communication keys.
 before account setup asks for signatures. `nip46_register` attaches an imported
 session to an existing account. Only one communication key can own an account,
 and a bound communication key cannot be imported into another session.
+A failed login releases a binding created by that attempt, without discarding
+the in-memory pairing needed for retry. Already attached sessions remain bound.
 
 MDK stores the communication secret through `AccountSecretStore` under
 `.nip46-client/<account label>`, with a separate SHA-256-derived credential id.
 The private `.nip46-session.json` contains public keys, relays, a client name,
 and the approved permission snapshot, never the secret or one-use bunker token.
 The communication key, SQLCipher credential, and user's signing key are distinct.
+A crash before the first secret-store write can leave metadata without a key.
+Restoration reports the missing key; explicit approved pairing can repair that
+state after the secret store confirms absence. An existing key is never overwritten.
 
 Runtime startup restores each stored session before reconciling account workers.
 Restoration is local; later signer work reconnects with a 90-second request
@@ -134,7 +141,8 @@ reversible sign-out. `shutdown_and_close` cancels actors but preserves stored
 sessions. Delete any host-owned credential backups on logout too.
 
 Generic host-callback/NIP-55 sign-out does not query the NIP-46 credential
-namespace when no session record exists. Explicit NIP-46 removal also probes for
+namespace when no session record exists; generic account wipe follows the same rule.
+Explicit NIP-46 removal also probes for
 an orphaned communication key if its metadata was lost.
 
 Every signer relay passes the shared retired-relay and endpoint policy and uses

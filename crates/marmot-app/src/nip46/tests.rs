@@ -518,9 +518,11 @@ async fn live_session_isolation() {
         user_b.public_key().to_hex()
     );
     let pairing_keys = keys(6);
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_url = format!("ws://{}", unavailable.local_addr().unwrap());
     let pairing = Nip46Session::new(
         &app,
-        &json!({"relays":[url],"client_secret":pairing_keys.secret_key().to_secret_hex()})
+        &json!({"relays":[url, unavailable_url],"client_secret":pairing_keys.secret_key().to_secret_hex()})
             .to_string(),
     )
     .unwrap();
@@ -535,7 +537,16 @@ async fn live_session_isolation() {
             .1
             .into_owned()
     };
-    pairing.pairing_offer().await.unwrap();
+    let ready_offer = pairing.pairing_offer().await.unwrap();
+    assert_eq!(
+        url::Url::parse(&ready_offer)
+            .unwrap()
+            .query_pairs()
+            .filter(|(key, _)| key == "relay")
+            .map(|(_, value)| value.into_owned())
+            .collect::<Vec<_>>(),
+        vec![url.clone()]
+    );
     let stale_secret = offer_secret(&pairing);
     pairing.disconnect();
     pairing.pairing_offer().await.unwrap();

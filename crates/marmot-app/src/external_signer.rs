@@ -71,14 +71,14 @@ impl AccountIdentityProofSigner for LocalAccountIdentityProofSigner {
 #[derive(Clone)]
 pub(crate) struct RegisteredExternalSigner {
     public_key: PublicKey,
-    signer: Arc<RwLock<Arc<dyn ExternalAccountSigner>>>,
+    signer: Arc<RwLock<Option<Arc<dyn ExternalAccountSigner>>>>,
 }
 
 impl RegisteredExternalSigner {
     pub(crate) fn new(public_key: PublicKey, signer: Arc<dyn ExternalAccountSigner>) -> Self {
         Self {
             public_key,
-            signer: Arc::new(RwLock::new(signer)),
+            signer: Arc::new(RwLock::new(Some(signer))),
         }
     }
 
@@ -88,14 +88,35 @@ impl RegisteredExternalSigner {
         *self
             .signer
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = signer;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(signer);
     }
 
-    fn signer(&self) -> Arc<dyn ExternalAccountSigner> {
+    pub(super) fn clear_if(&self, signer: &Arc<dyn ExternalAccountSigner>) {
+        let mut current = self
+            .signer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, signer))
+        {
+            *current = None;
+        }
+    }
+
+    pub(super) fn has_signer(&self) -> bool {
+        self.signer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn signer(&self) -> Result<Arc<dyn ExternalAccountSigner>, &'static str> {
         self.signer
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+            .ok_or("external signer unavailable")
     }
 
     pub(crate) fn account_signer(&self) -> AccountSigner {
@@ -127,7 +148,7 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
             let expected_id = unsigned
                 .id
                 .ok_or_else(|| MarmotSignerError::from("unsigned event id was not set"))?;
-            let event = signer.sign_event(unsigned).await?;
+            let event = signer?.sign_event(unsigned).await?;
             if event.pubkey != public_key || event.id != expected_id {
                 return Err(MarmotSignerError::from(
                     "external signer returned a different event than requested",
@@ -146,7 +167,7 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer.nip04_encrypt(public_key, content).await })
+        Box::pin(async move { signer?.nip04_encrypt(public_key, content).await })
     }
 
     fn nip04_decrypt<'a>(
@@ -155,7 +176,7 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         encrypted_content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer.nip04_decrypt(public_key, encrypted_content).await })
+        Box::pin(async move { signer?.nip04_decrypt(public_key, encrypted_content).await })
     }
 
     fn nip44_encrypt<'a>(
@@ -164,7 +185,7 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer.nip44_encrypt(public_key, content).await })
+        Box::pin(async move { signer?.nip44_encrypt(public_key, content).await })
     }
 
     fn nip44_decrypt<'a>(
@@ -173,7 +194,7 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         payload: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
         let signer = self.signer();
-        Box::pin(async move { signer.nip44_decrypt(public_key, payload).await })
+        Box::pin(async move { signer?.nip44_decrypt(public_key, payload).await })
     }
 }
 
@@ -187,7 +208,7 @@ impl AccountIdentityProofSigner for RegisteredExternalSigner {
                 "request account identity does not match registered external signer".into(),
             );
         }
-        let signature = self.signer().sign_account_identity_proof(request)?;
+        let signature = self.signer()?.sign_account_identity_proof(request)?;
         let proof_event = request.proof_event()?;
         let signature_value = Signature::from_slice(&signature).map_err(|err| err.to_string())?;
         proof_event

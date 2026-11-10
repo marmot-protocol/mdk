@@ -112,6 +112,52 @@ async fn nip46_restore_and_signout() {
         accounts[0].account_id_hex
     );
 
+    let (_, mut record) = home
+        .load_nip46_session(&accounts[0].label)
+        .unwrap()
+        .unwrap();
+    recovered_a.cancel();
+    let logging_out = recovered_a.clone();
+    assert_eq!(
+        tokio::task::spawn_blocking(move || logging_out.logout())
+            .await
+            .unwrap(),
+        Err(Nip46Error::Cancelled)
+    );
+    assert!(!app.has_external_signer(&accounts[0].account_id_hex));
+    assert!(
+        home.load_nip46_session(&accounts[0].label)
+            .unwrap()
+            .is_none()
+    );
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = runtime.accounts().managed_accounts().unwrap();
+    assert!(managed.iter().any(
+        |account| account.account_id_hex == accounts[0].account_id_hex
+            && !account.running
+            && !account.signed_out
+    ));
+    assert!(
+        managed
+            .iter()
+            .any(|account| account.account_id_hex == accounts[1].account_id_hex && account.running)
+    );
+    let replacement_key = Keys::generate();
+    record.client_public_key = replacement_key.public_key().to_hex();
+    home.store_nip46_session(&accounts[0].label, &replacement_key, &record)
+        .unwrap();
+    let replacement = runtime.nip46_resume(&accounts[0].label).await.unwrap();
+    recovered_a.erase_local().unwrap();
+    assert_eq!(
+        home.load_nip46_session(&accounts[0].label)
+            .unwrap()
+            .unwrap()
+            .0
+            .public_key(),
+        replacement_key.public_key()
+    );
+    let recovered_a = replacement;
+
     let outcome = runtime
         .sign_out(
             &accounts[0].label,
