@@ -384,7 +384,7 @@ MarmotStatus marmot_agent_publisher_new(const struct MarmotClient *client, const
 
 Anchor a new stream and return its publisher. Broker connection happens in the background. Invalid inputs/out-pointers fail before anchoring.
 
-[Header contract](include/marmot.h#L13181)
+[Header contract](include/marmot.h#L13182)
 
 ### `marmot_agent_publisher_info`
 
@@ -394,7 +394,7 @@ MarmotStatus marmot_agent_publisher_info(const struct MarmotAgentPublisher *publ
 
 Read stream identifiers. Free with `marmot_publisher_info_free`.
 
-[Header contract](include/marmot.h#L13193)
+[Header contract](include/marmot.h#L13194)
 
 ### `marmot_agent_publisher_append`
 
@@ -404,7 +404,7 @@ MarmotStatus marmot_agent_publisher_append(const struct MarmotAgentPublisher *pu
 
 Append one text/status/progress record; free the receipt with `marmot_publisher_ack_free`. Unknown record types fail before appending.
 
-[Header contract](include/marmot.h#L13203)
+[Header contract](include/marmot.h#L13204)
 
 ### `marmot_agent_publisher_finish`
 
@@ -414,7 +414,7 @@ MarmotStatus marmot_agent_publisher_finish(const struct MarmotAgentPublisher *pu
 
 Seal and send the final transcript. Failed sends retain the sealed request for retry; a successful repeated call returns the original receipt. Free with `marmot_send_summary_free`. Inspect its delivery disposition.
 
-[Header contract](include/marmot.h#L13216)
+[Header contract](include/marmot.h#L13217)
 
 ### `marmot_agent_publisher_cancel`
 
@@ -424,7 +424,7 @@ MarmotStatus marmot_agent_publisher_cancel(const struct MarmotAgentPublisher *pu
 
 Cancel the preview. Does not retract a final already being published.
 
-[Header contract](include/marmot.h#L13225)
+[Header contract](include/marmot.h#L13226)
 
 ### `marmot_agent_publisher_free`
 
@@ -434,7 +434,7 @@ void marmot_agent_publisher_free(struct MarmotAgentPublisher *publisher);
 
 Release a publisher, requesting preview cancellation. NULL is a no-op.
 
-[Header contract](include/marmot.h#L13234)
+[Header contract](include/marmot.h#L13235)
 
 ### `marmot_agent_stream_subscription_next`
 
@@ -444,7 +444,7 @@ MarmotStatus marmot_agent_stream_subscription_next(const struct MarmotAgentStrea
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_agent_stream_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13785)
+[Header contract](include/marmot.h#L13786)
 
 ### `marmot_agent_stream_subscription_set_callback`
 
@@ -454,7 +454,7 @@ MarmotStatus marmot_agent_stream_subscription_set_callback(const struct MarmotAg
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13802)
+[Header contract](include/marmot.h#L13803)
 
 ### `marmot_agent_stream_subscription_clear_callback`
 
@@ -464,7 +464,7 @@ MarmotStatus marmot_agent_stream_subscription_clear_callback(const struct Marmot
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13814)
+[Header contract](include/marmot.h#L13815)
 
 ### `marmot_agent_stream_subscription_free`
 
@@ -474,7 +474,7 @@ void marmot_agent_stream_subscription_free(struct MarmotAgentStreamSubscription 
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13826)
+[Header contract](include/marmot.h#L13827)
 
 ### `marmot_agent_stream_subscription_stream_id_hex`
 
@@ -484,7 +484,7 @@ MarmotStatus marmot_agent_stream_subscription_stream_id_hex(const struct MarmotA
 
 The resolved stream id this watch is following (hex). Writes an owned copy: free it with `marmot_string_free`.
 
-[Header contract](include/marmot.h#L13860)
+[Header contract](include/marmot.h#L13861)
 
 ### `marmot_attachment_transfer_subscription_next`
 
@@ -494,7 +494,7 @@ MarmotStatus marmot_attachment_transfer_subscription_next(const struct MarmotAtt
 
 Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely. Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free. # Safety Sub must be live and out writable. Use one receiver per handle.
 
-[Header contract](include/marmot.h#L14251)
+[Header contract](include/marmot.h#L14252)
 
 ### `marmot_attachment_transfer_subscription_cancel`
 
@@ -504,7 +504,7 @@ MarmotStatus marmot_attachment_transfer_subscription_cancel(const struct MarmotA
 
 Close observation and wake receivers. Does not cancel downloads. # Safety Sub must remain live throughout the call.
 
-[Header contract](include/marmot.h#L14260)
+[Header contract](include/marmot.h#L14261)
 
 ### `marmot_attachment_transfer_subscription_free`
 
@@ -514,7 +514,7 @@ void marmot_attachment_transfer_subscription_free(struct MarmotAttachmentTransfe
 
 NULL-safe free. Already returned snapshots remain separately owned. # Safety Sub must be NULL or library-owned with no active calls.
 
-[Header contract](include/marmot.h#L14267)
+[Header contract](include/marmot.h#L14268)
 
 ### `marmot_account_attention_subscription_snapshot`
 
@@ -524,7 +524,7 @@ MarmotStatus marmot_account_attention_subscription_snapshot(const struct MarmotA
 
 Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed. # Safety sub must be live and out writable.
 
-[Header contract](include/marmot.h#L14299)
+[Header contract](include/marmot.h#L14300)
 
 ### `marmot_account_attention_subscription_next`
 
@@ -534,7 +534,7 @@ MarmotStatus marmot_account_attention_subscription_next(const struct MarmotAccou
 
 Receive a complete replacement. Zero timeout waits indefinitely. Timeout/error/closed leaves out NULL. Timeout does not consume an update. Free results with the matching snapshot_free. # Safety sub must remain live throughout the call; out must be writable. Use one receiver per handle.
 
-[Header contract](include/marmot.h#L14308)
+[Header contract](include/marmot.h#L14309)
 
 ### `marmot_account_attention_subscription_free`
 
@@ -544,7 +544,7 @@ void marmot_account_attention_subscription_free(struct MarmotAccountAttentionSub
 
 Cancel and free. NULL is a no-op; does not free previously returned snapshots. # Safety sub must be NULL or a library-owned handle with no active calls.
 
-[Header contract](include/marmot.h#L14317)
+[Header contract](include/marmot.h#L14318)
 
 ### `marmot_account_summary_free`
 
@@ -554,7 +554,7 @@ void marmot_account_summary_free(struct MarmotAccountSummary *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14594)
+[Header contract](include/marmot.h#L14595)
 
 ### `marmot_account_summary_list_free`
 
@@ -564,7 +564,7 @@ void marmot_account_summary_list_free(struct MarmotAccountSummaryList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14603)
+[Header contract](include/marmot.h#L14604)
 
 ### `marmot_account_unread_list_free`
 
@@ -574,7 +574,7 @@ void marmot_account_unread_list_free(struct MarmotAccountUnreadList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14612)
+[Header contract](include/marmot.h#L14613)
 
 ### `marmot_account_key_package_list_free`
 
@@ -584,7 +584,7 @@ void marmot_account_key_package_list_free(struct MarmotAccountKeyPackageList *li
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14631)
+[Header contract](include/marmot.h#L14632)
 
 ### `marmot_account_key_package_inventory_entry_list_free`
 
@@ -594,7 +594,7 @@ void marmot_account_key_package_inventory_entry_list_free(struct MarmotAccountKe
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14640)
+[Header contract](include/marmot.h#L14641)
 
 ### `marmot_account_key_package_relay_event_list_free`
 
@@ -604,7 +604,7 @@ void marmot_account_key_package_relay_event_list_free(struct MarmotAccountKeyPac
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14649)
+[Header contract](include/marmot.h#L14650)
 
 ### `marmot_agent_stream_start_free`
 
@@ -614,7 +614,7 @@ void marmot_agent_stream_start_free(struct MarmotAgentStreamStart *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14699)
+[Header contract](include/marmot.h#L14700)
 
 ### `marmot_agent_stream_update_free`
 
@@ -624,7 +624,7 @@ void marmot_agent_stream_update_free(struct MarmotAgentStreamUpdate *update);
 
 Free an agent-stream update returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14707)
+[Header contract](include/marmot.h#L14708)
 
 ### `marmot_audit_log_settings_free`
 
@@ -634,7 +634,7 @@ void marmot_audit_log_settings_free(struct MarmotAuditLogSettings *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14717)
+[Header contract](include/marmot.h#L14718)
 
 ### `marmot_audit_log_tracker_config_v4_free`
 
@@ -644,7 +644,7 @@ void marmot_audit_log_tracker_config_v4_free(struct MarmotAuditLogTrackerConfigV
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14727)
+[Header contract](include/marmot.h#L14728)
 
 ### `marmot_audit_log_tracker_config_free`
 
@@ -654,7 +654,7 @@ void marmot_audit_log_tracker_config_free(struct MarmotAuditLogTrackerConfig *pt
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14737)
+[Header contract](include/marmot.h#L14738)
 
 ### `marmot_audit_log_file_free`
 
@@ -664,7 +664,7 @@ void marmot_audit_log_file_free(struct MarmotAuditLogFile *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14747)
+[Header contract](include/marmot.h#L14748)
 
 ### `marmot_audit_log_file_list_free`
 
@@ -674,7 +674,7 @@ void marmot_audit_log_file_list_free(struct MarmotAuditLogFileList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14756)
+[Header contract](include/marmot.h#L14757)
 
 ### `marmot_audit_log_upload_result_free`
 
@@ -684,7 +684,7 @@ void marmot_audit_log_upload_result_free(struct MarmotAuditLogUploadResult *ptr)
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14766)
+[Header contract](include/marmot.h#L14767)
 
 ### `marmot_audit_log_delete_result_free`
 
@@ -694,7 +694,7 @@ void marmot_audit_log_delete_result_free(struct MarmotAuditLogDeleteResult *ptr)
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14776)
+[Header contract](include/marmot.h#L14777)
 
 ### `marmot_audit_log_tracker_update_result_free`
 
@@ -704,7 +704,7 @@ void marmot_audit_log_tracker_update_result_free(struct MarmotAuditLogTrackerUpd
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14786)
+[Header contract](include/marmot.h#L14787)
 
 ### `marmot_app_group_record_free`
 
@@ -714,7 +714,7 @@ void marmot_app_group_record_free(struct MarmotAppGroupRecord *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15160)
+[Header contract](include/marmot.h#L15161)
 
 ### `marmot_app_group_record_list_free`
 
@@ -724,7 +724,7 @@ void marmot_app_group_record_list_free(struct MarmotAppGroupRecordList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15169)
+[Header contract](include/marmot.h#L15170)
 
 ### `marmot_app_group_member_record_list_free`
 
@@ -734,7 +734,7 @@ void marmot_app_group_member_record_list_free(struct MarmotAppGroupMemberRecordL
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15178)
+[Header contract](include/marmot.h#L15179)
 
 ### `marmot_app_group_mls_state_free`
 
@@ -744,7 +744,7 @@ void marmot_app_group_mls_state_free(struct MarmotAppGroupMlsState *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15198)
+[Header contract](include/marmot.h#L15199)
 
 ### `marmot_app_quarantined_group_list_free`
 
@@ -754,7 +754,7 @@ void marmot_app_quarantined_group_list_free(struct MarmotAppQuarantinedGroupList
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15247)
+[Header contract](include/marmot.h#L15248)
 
 ### `marmot_app_group_member_ids_free`
 
@@ -764,7 +764,7 @@ void marmot_app_group_member_ids_free(struct MarmotAppGroupMemberIds *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15277)
+[Header contract](include/marmot.h#L15278)
 
 ### `marmot_app_group_member_ids_list_free`
 
@@ -774,7 +774,7 @@ void marmot_app_group_member_ids_list_free(struct MarmotAppGroupMemberIdsList *l
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15286)
+[Header contract](include/marmot.h#L15287)
 
 ### `marmot_app_message_record_free`
 
@@ -784,7 +784,7 @@ void marmot_app_message_record_free(struct MarmotAppMessageRecord *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15481)
+[Header contract](include/marmot.h#L15482)
 
 ### `marmot_app_message_record_list_free`
 
@@ -794,7 +794,7 @@ void marmot_app_message_record_list_free(struct MarmotAppMessageRecordList *list
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15490)
+[Header contract](include/marmot.h#L15491)
 
 ### `marmot_account_relay_lists_free`
 
@@ -804,7 +804,7 @@ void marmot_account_relay_lists_free(struct MarmotAccountRelayLists *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15627)
+[Header contract](include/marmot.h#L15628)
 
 ### `marmot_app_performance_snapshot_free`
 
@@ -814,7 +814,7 @@ void marmot_app_performance_snapshot_free(struct MarmotAppPerformanceSnapshot *p
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15762)
+[Header contract](include/marmot.h#L15763)
 
 ### `marmot_account_attention_snapshot_free`
 
@@ -824,7 +824,7 @@ void marmot_account_attention_snapshot_free(struct MarmotAccountAttentionSnapsho
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15900)
+[Header contract](include/marmot.h#L15901)
 
 ### `marmot_avatar_asset_free`
 
@@ -834,7 +834,7 @@ void marmot_avatar_asset_free(struct MarmotAvatarAsset *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15949)
+[Header contract](include/marmot.h#L15950)
 
 ### `marmot_avatar_asset_list_free`
 
@@ -844,7 +844,7 @@ void marmot_avatar_asset_list_free(struct MarmotAvatarAssetList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15958)
+[Header contract](include/marmot.h#L15959)
 
 ### `marmot_avatar_bytes_free`
 
@@ -854,7 +854,7 @@ void marmot_avatar_bytes_free(struct MarmotAvatarBytes *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15968)
+[Header contract](include/marmot.h#L15969)
 
 ### `marmot_avatar_bytes_list_free`
 
@@ -864,7 +864,7 @@ void marmot_avatar_bytes_list_free(struct MarmotAvatarBytesList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15977)
+[Header contract](include/marmot.h#L15978)
 
 ### `marmot_attachment_download_policy_free`
 
@@ -874,7 +874,7 @@ void marmot_attachment_download_policy_free(struct MarmotAttachmentDownloadPolic
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L16046)
+[Header contract](include/marmot.h#L16047)
 
 ### `marmot_attachment_transfer_snapshot_free`
 
@@ -884,7 +884,7 @@ void marmot_attachment_transfer_snapshot_free(struct MarmotAttachmentTransferSna
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L16056)
+[Header contract](include/marmot.h#L16057)
 
 ### `marmot_attachment_download_policy`
 
@@ -894,7 +894,7 @@ MarmotStatus marmot_attachment_download_policy(const struct MarmotClient *client
 
 Read the effective durable policy. # Safety Client and strings must be live, out writable. Free the returned record.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotattachment_download_policy) · [Header contract](include/marmot.h#L16063)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotattachment_download_policy) · [Header contract](include/marmot.h#L16064)
 
 ### `marmot_attachment_transfer_snapshot`
 
@@ -904,7 +904,7 @@ MarmotStatus marmot_attachment_transfer_snapshot(const struct MarmotClient *clie
 
 Read up to 64 progress entries in input order. No network demand is created. # Safety Inputs must be live; targets may be NULL only for zero length; out writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotattachment_transfer_snapshot) · [Header contract](include/marmot.h#L16115)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotattachment_transfer_snapshot) · [Header contract](include/marmot.h#L16116)
 
 ### `marmot_group_app_component_free`
 
@@ -914,7 +914,7 @@ void marmot_group_app_component_free(struct MarmotGroupAppComponent *ptr);
 
 Free a record returned by `marmot_group_app_component`. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15131)
+[Header contract](include/marmot.h#L15132)
 
 ### `marmot_group_commit_delivery_free`
 
@@ -924,7 +924,7 @@ void marmot_group_commit_delivery_free(struct MarmotGroupCommitDelivery *ptr);
 
 Free a record returned by `marmot_group_commit_delivery`. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15141)
+[Header contract](include/marmot.h#L15142)
 
 </details>
 
@@ -984,7 +984,7 @@ MarmotStatus marmot_block_list_subscription_next(const struct MarmotBlockListSub
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_block_list_snapshot_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L14102)
+[Header contract](include/marmot.h#L14103)
 
 ### `marmot_block_list_subscription_set_callback`
 
@@ -994,7 +994,7 @@ MarmotStatus marmot_block_list_subscription_set_callback(const struct MarmotBloc
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L14119)
+[Header contract](include/marmot.h#L14120)
 
 ### `marmot_block_list_subscription_clear_callback`
 
@@ -1004,7 +1004,7 @@ MarmotStatus marmot_block_list_subscription_clear_callback(const struct MarmotBl
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L14131)
+[Header contract](include/marmot.h#L14132)
 
 ### `marmot_block_list_subscription_free`
 
@@ -1014,7 +1014,7 @@ void marmot_block_list_subscription_free(struct MarmotBlockListSubscription *sub
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L14143)
+[Header contract](include/marmot.h#L14144)
 
 ### `marmot_block_list_subscription_snapshot`
 
@@ -1024,7 +1024,7 @@ MarmotStatus marmot_block_list_subscription_snapshot(const struct MarmotBlockLis
 
 Take the initial snapshot once; subsequent calls return NULL. # Safety Subscription and output pointer must be valid.
 
-[Header contract](include/marmot.h#L14159)
+[Header contract](include/marmot.h#L14160)
 
 ### `marmot_background_notification_collection_free`
 
@@ -1034,7 +1034,7 @@ void marmot_background_notification_collection_free(struct MarmotBackgroundNotif
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15558)
+[Header contract](include/marmot.h#L15559)
 
 ### `marmot_blocked_user_list_free`
 
@@ -1044,7 +1044,7 @@ void marmot_blocked_user_list_free(struct MarmotBlockedUserList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15929)
+[Header contract](include/marmot.h#L15930)
 
 ### `marmot_block_list_snapshot_free`
 
@@ -1054,7 +1054,7 @@ void marmot_block_list_snapshot_free(struct MarmotBlockListSnapshot *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15939)
+[Header contract](include/marmot.h#L15940)
 
 </details>
 
@@ -1481,7 +1481,7 @@ MarmotStatus marmot_chats_subscription_next(const struct MarmotChatsSubscription
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_app_group_record_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13473)
+[Header contract](include/marmot.h#L13474)
 
 ### `marmot_chats_subscription_set_callback`
 
@@ -1491,7 +1491,7 @@ MarmotStatus marmot_chats_subscription_set_callback(const struct MarmotChatsSubs
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13490)
+[Header contract](include/marmot.h#L13491)
 
 ### `marmot_chats_subscription_clear_callback`
 
@@ -1501,7 +1501,7 @@ MarmotStatus marmot_chats_subscription_clear_callback(const struct MarmotChatsSu
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13502)
+[Header contract](include/marmot.h#L13503)
 
 ### `marmot_chats_subscription_free`
 
@@ -1511,7 +1511,7 @@ void marmot_chats_subscription_free(struct MarmotChatsSubscription *sub);
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13514)
+[Header contract](include/marmot.h#L13515)
 
 ### `marmot_chats_subscription_snapshot`
 
@@ -1521,7 +1521,7 @@ MarmotStatus marmot_chats_subscription_snapshot(const struct MarmotChatsSubscrip
 
 Take the initial chats snapshot. Yields the populated list exactly once: later calls write an EMPTY list, still with `MARMOT_STATUS_OK`. Free the list with `marmot_app_group_record_list_free`.
 
-[Header contract](include/marmot.h#L13538)
+[Header contract](include/marmot.h#L13539)
 
 ### `marmot_chat_list_subscription_next`
 
@@ -1531,7 +1531,7 @@ MarmotStatus marmot_chat_list_subscription_next(const struct MarmotChatListSubsc
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_chat_list_row_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13547)
+[Header contract](include/marmot.h#L13548)
 
 ### `marmot_chat_list_subscription_set_callback`
 
@@ -1541,7 +1541,7 @@ MarmotStatus marmot_chat_list_subscription_set_callback(const struct MarmotChatL
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13564)
+[Header contract](include/marmot.h#L13565)
 
 ### `marmot_chat_list_subscription_clear_callback`
 
@@ -1551,7 +1551,7 @@ MarmotStatus marmot_chat_list_subscription_clear_callback(const struct MarmotCha
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13576)
+[Header contract](include/marmot.h#L13577)
 
 ### `marmot_chat_list_subscription_free`
 
@@ -1561,7 +1561,7 @@ void marmot_chat_list_subscription_free(struct MarmotChatListSubscription *sub);
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13588)
+[Header contract](include/marmot.h#L13589)
 
 ### `marmot_chat_list_subscription_snapshot`
 
@@ -1571,7 +1571,7 @@ MarmotStatus marmot_chat_list_subscription_snapshot(const struct MarmotChatListS
 
 Take the initial chat-list snapshot. Yields the populated list exactly once: later calls write an EMPTY list, still with `MARMOT_STATUS_OK`. Free with `marmot_chat_list_row_list_free`.
 
-[Header contract](include/marmot.h#L13611)
+[Header contract](include/marmot.h#L13612)
 
 ### `marmot_chat_list_subscription_next_update`
 
@@ -1581,7 +1581,7 @@ MarmotStatus marmot_chat_list_subscription_next_update(const struct MarmotChatLi
 
 Block until the next raw chat-list delta (row upsert or removal). Free with `marmot_chat_list_subscription_update_free`.
 
-[Header contract](include/marmot.h#L13621)
+[Header contract](include/marmot.h#L13622)
 
 ### `marmot_chat_list_window_subscription_snapshot`
 
@@ -1591,7 +1591,7 @@ MarmotStatus marmot_chat_list_window_subscription_snapshot(const struct MarmotCh
 
 Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed. # Safety sub must be live and out writable.
 
-[Header contract](include/marmot.h#L14274)
+[Header contract](include/marmot.h#L14275)
 
 ### `marmot_chat_list_window_subscription_next`
 
@@ -1601,7 +1601,7 @@ MarmotStatus marmot_chat_list_window_subscription_next(const struct MarmotChatLi
 
 Receive a complete replacement. Zero timeout waits indefinitely. Timeout/error/closed leaves out NULL. Timeout does not consume an update. Free results with the matching snapshot_free. # Safety sub must remain live throughout the call; out must be writable. Use one receiver per handle.
 
-[Header contract](include/marmot.h#L14283)
+[Header contract](include/marmot.h#L14284)
 
 ### `marmot_chat_list_window_subscription_free`
 
@@ -1611,7 +1611,7 @@ void marmot_chat_list_window_subscription_free(struct MarmotChatListWindowSubscr
 
 Cancel and free. NULL is a no-op; does not free previously returned snapshots. # Safety sub must be NULL or a library-owned handle with no active calls.
 
-[Header contract](include/marmot.h#L14292)
+[Header contract](include/marmot.h#L14293)
 
 ### `marmot_chat_list_window_subscription_page`
 
@@ -1621,7 +1621,7 @@ MarmotStatus marmot_chat_list_window_subscription_page(const struct MarmotChatLi
 
 Apply a window command to the current viewport, returning a complete replacement. May run while next waits. Background content changes keep a sequence usable; one older than a published viewport move, or not yet published, returns CHAT_WINDOW_STALE. The same completion also arrives through next; deduplicate by generation/sequence. # Safety sub must be live, any input string valid, and out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14362)
+[Header contract](include/marmot.h#L14363)
 
 ### `marmot_chat_list_window_subscription_set_visible_anchor`
 
@@ -1631,7 +1631,7 @@ MarmotStatus marmot_chat_list_window_subscription_set_visible_anchor(const struc
 
 Apply a window command to the current viewport, returning a complete replacement. May run while next waits. Background content changes keep a sequence usable; one older than a published viewport move, or not yet published, returns CHAT_WINDOW_STALE, as does an older sequence whose anchor row a background replacement dropped. The same completion also arrives through next; deduplicate by generation/sequence. # Safety sub must be live, any input string valid, and out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14377)
+[Header contract](include/marmot.h#L14378)
 
 ### `marmot_chat_list_window_subscription_return_to_top`
 
@@ -1641,7 +1641,7 @@ MarmotStatus marmot_chat_list_window_subscription_return_to_top(const struct Mar
 
 Apply a window command to the current viewport, returning a complete replacement. May run while next waits. Background content changes keep a sequence usable; one older than a published viewport move, or not yet published, returns CHAT_WINDOW_STALE. The same completion also arrives through next; deduplicate by generation/sequence. # Safety sub must be live, any input string valid, and out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14390)
+[Header contract](include/marmot.h#L14391)
 
 ### `marmot_conversation_window_subscription_snapshot`
 
@@ -1651,7 +1651,7 @@ MarmotStatus marmot_conversation_window_subscription_snapshot(const struct Marmo
 
 Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed. # Safety sub must be live and out writable.
 
-[Header contract](include/marmot.h#L14399)
+[Header contract](include/marmot.h#L14400)
 
 ### `marmot_conversation_window_subscription_next`
 
@@ -1661,7 +1661,7 @@ MarmotStatus marmot_conversation_window_subscription_next(const struct MarmotCon
 
 Receive a complete replacement. Zero timeout waits indefinitely. Timeout/error/closed leaves out NULL. Timeout does not consume an update. Free results with the matching snapshot_free. # Safety sub must remain live throughout the call; out must be writable. Use one receiver per handle.
 
-[Header contract](include/marmot.h#L14408)
+[Header contract](include/marmot.h#L14409)
 
 ### `marmot_conversation_window_subscription_free`
 
@@ -1671,7 +1671,7 @@ void marmot_conversation_window_subscription_free(struct MarmotConversationWindo
 
 Cancel and free. NULL is a no-op; does not free previously returned snapshots. # Safety sub must be NULL or a library-owned handle with no active calls.
 
-[Header contract](include/marmot.h#L14417)
+[Header contract](include/marmot.h#L14418)
 
 ### `marmot_conversation_window_subscription_cancel`
 
@@ -1681,7 +1681,7 @@ MarmotStatus marmot_conversation_window_subscription_cancel(const struct MarmotC
 
 Close and wake pending receivers/commands. Idempotent; does not free this handle or snapshots. # Safety sub must remain live throughout all calls; free only after active calls return.
 
-[Header contract](include/marmot.h#L14424)
+[Header contract](include/marmot.h#L14425)
 
 ### `marmot_conversation_window_subscription_page`
 
@@ -1691,7 +1691,7 @@ MarmotStatus marmot_conversation_window_subscription_page(const struct MarmotCon
 
 Apply against the installed revision. May run while next waits; deduplicate completions by generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after timeout through next; refresh before retrying. Extend history around the visible anchor; paging preserves that anchor at the retained-row cap. # Safety sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14450)
+[Header contract](include/marmot.h#L14451)
 
 ### `marmot_conversation_window_subscription_set_visible_anchor`
 
@@ -1701,7 +1701,7 @@ MarmotStatus marmot_conversation_window_subscription_set_visible_anchor(const st
 
 Apply against the installed revision. May run while next waits; deduplicate completions by generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after timeout through next; refresh before retrying. Report a row in the installed window as the visible anchor; this does not acknowledge reads or encode pixel offsets. # Safety sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14465)
+[Header contract](include/marmot.h#L14466)
 
 ### `marmot_conversation_window_subscription_jump_to_message`
 
@@ -1711,7 +1711,7 @@ MarmotStatus marmot_conversation_window_subscription_jump_to_message(const struc
 
 Apply against the installed revision. May run while next waits; deduplicate completions by generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after timeout through next; refresh before retrying. Center the window on a retained message; a missing target fails explicitly. # Safety sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14479)
+[Header contract](include/marmot.h#L14480)
 
 ### `marmot_conversation_window_subscription_return_to_latest`
 
@@ -1721,7 +1721,7 @@ MarmotStatus marmot_conversation_window_subscription_return_to_latest(const stru
 
 Apply against the installed revision. May run while next waits; deduplicate completions by generation/sequence. Zero timeout uses 30 seconds. Accepted commands may complete after timeout through next; refresh before retrying. Move to the latest message and resume following arrivals, retaining the current row budget. # Safety sub and borrowed revision/strings must remain live; out writable. Never free during a call.
 
-[Header contract](include/marmot.h#L14493)
+[Header contract](include/marmot.h#L14494)
 
 ### `marmot_clear_message_draft_if_revision`
 
@@ -1731,7 +1731,7 @@ MarmotStatus marmot_clear_message_draft_if_revision(const struct MarmotClient *c
 
 Clear only this selected revision; later edits are preserved. # Safety client, account and revision valid; revision's owning snapshot/draft must remain live; out writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotclear_message_draft_if_revision) · [Header contract](include/marmot.h#L14524)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotclear_message_draft_if_revision) · [Header contract](include/marmot.h#L14525)
 
 ### `marmot_chat_pin_state_free`
 
@@ -1741,7 +1741,7 @@ void marmot_chat_pin_state_free(struct MarmotChatPinState *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14865)
+[Header contract](include/marmot.h#L14866)
 
 ### `marmot_chat_notification_settings_free`
 
@@ -1751,7 +1751,7 @@ void marmot_chat_notification_settings_free(struct MarmotChatNotificationSetting
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14875)
+[Header contract](include/marmot.h#L14876)
 
 ### `marmot_chat_list_row_free`
 
@@ -1761,7 +1761,7 @@ void marmot_chat_list_row_free(struct MarmotChatListRow *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14885)
+[Header contract](include/marmot.h#L14886)
 
 ### `marmot_chat_list_row_list_free`
 
@@ -1771,7 +1771,7 @@ void marmot_chat_list_row_list_free(struct MarmotChatListRowList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14894)
+[Header contract](include/marmot.h#L14895)
 
 ### `marmot_chat_list_subscription_update_free`
 
@@ -1781,7 +1781,7 @@ void marmot_chat_list_subscription_update_free(struct MarmotChatListSubscription
 
 Free a chat-list delta returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14902)
+[Header contract](include/marmot.h#L14903)
 
 ### `marmot_cached_identity_projection_free`
 
@@ -1791,7 +1791,7 @@ void marmot_cached_identity_projection_free(struct MarmotCachedIdentityProjectio
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14949)
+[Header contract](include/marmot.h#L14950)
 
 ### `marmot_cached_identity_projection_list_free`
 
@@ -1801,7 +1801,7 @@ void marmot_cached_identity_projection_list_free(struct MarmotCachedIdentityProj
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14958)
+[Header contract](include/marmot.h#L14959)
 
 ### `marmot_created_group_free`
 
@@ -1811,7 +1811,7 @@ void marmot_created_group_free(struct MarmotCreatedGroup *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15267)
+[Header contract](include/marmot.h#L15268)
 
 ### `marmot_chat_list_window_snapshot_free`
 
@@ -1821,7 +1821,7 @@ void marmot_chat_list_window_snapshot_free(struct MarmotChatListWindowSnapshot *
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15890)
+[Header contract](include/marmot.h#L15891)
 
 ### `marmot_conversation_window_snapshot_free`
 
@@ -1831,7 +1831,7 @@ void marmot_conversation_window_snapshot_free(struct MarmotConversationWindowSna
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15920)
+[Header contract](include/marmot.h#L15921)
 
 ### `marmot_content_report_page_free`
 
@@ -1841,7 +1841,7 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15997)
+[Header contract](include/marmot.h#L15998)
 
 ### `marmot_request_explicit_attachment`
 
@@ -1851,7 +1851,7 @@ MarmotStatus marmot_request_explicit_attachment(const struct MarmotClient *clien
 
 Blocking equivalent of [explicit demand](../marmot-uniffi/API-REFERENCE.md#marmotrequest_explicit_attachment). Joins/promotes without resetting budgets, backoff or active deadlines. Inputs are borrowed; free the optional opaque result with `marmot_string_free`. NULL means unavailable/suppressed, not a transfer failure. Use separate Retry/Download again operations for deliberate recovery.
 
-[Header contract](include/marmot.h#L16093)
+[Header contract](include/marmot.h#L16094)
 
 ### `marmot_control_attachment`
 
@@ -1861,7 +1861,7 @@ MarmotStatus marmot_control_attachment(const struct MarmotClient *client, const 
 
 Apply a MarmotAttachmentControl discriminant to an opaque reference. # Safety Client/strings must be live and out writable. No inputs are retained.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotcontrol_attachment) · [Header contract](include/marmot.h#L16081)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotcontrol_attachment) · [Header contract](include/marmot.h#L16082)
 
 ### `marmot_cancel_device_link`
 
@@ -1891,7 +1891,7 @@ void marmot_compromise_warning_item_list_free(struct MarmotCompromiseWarningItem
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14929)
+[Header contract](include/marmot.h#L14930)
 
 ### `marmot_confirm_device_link_match`
 
@@ -2096,7 +2096,7 @@ void marmot_disband_request_free(struct MarmotDisbandRequest *request);
 
 Free a disband request returned by `marmot_disband_group`. NULL is a no-op. (Embedded copies inside a chat row are released by the row.)
 
-[Header contract](include/marmot.h#L15150)
+[Header contract](include/marmot.h#L15151)
 
 ### `marmot_download_attachment_again`
 
@@ -2106,7 +2106,7 @@ MarmotStatus marmot_download_attachment_again(const struct MarmotClient *client,
 
 Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable. # Safety Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotdownload_attachment_again) · [Header contract](include/marmot.h#L16104)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotdownload_attachment_again) · [Header contract](include/marmot.h#L16105)
 
 ### `marmot_decline_device_link`
 
@@ -2136,7 +2136,7 @@ void marmot_device_link_snapshot_free(struct MarmotDeviceLinkSnapshot *ptr);
 
 Free a snapshot returned by this library, with every nested emoji, string and prompt. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14939)
+[Header contract](include/marmot.h#L14940)
 
 </details>
 
@@ -2211,7 +2211,7 @@ MarmotStatus marmot_events_subscription_next(const struct MarmotEventsSubscripti
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13242)
+[Header contract](include/marmot.h#L13243)
 
 ### `marmot_events_subscription_set_callback`
 
@@ -2221,7 +2221,7 @@ MarmotStatus marmot_events_subscription_set_callback(const struct MarmotEventsSu
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13259)
+[Header contract](include/marmot.h#L13260)
 
 ### `marmot_events_subscription_clear_callback`
 
@@ -2231,7 +2231,7 @@ MarmotStatus marmot_events_subscription_clear_callback(const struct MarmotEvents
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13271)
+[Header contract](include/marmot.h#L13272)
 
 ### `marmot_events_subscription_free`
 
@@ -2241,7 +2241,7 @@ void marmot_events_subscription_free(struct MarmotEventsSubscription *sub);
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13283)
+[Header contract](include/marmot.h#L13284)
 
 ### `marmot_existing_direct_conversation_free`
 
@@ -2251,7 +2251,7 @@ void marmot_existing_direct_conversation_free(struct MarmotExistingDirectConvers
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14855)
+[Header contract](include/marmot.h#L14856)
 
 ### `marmot_event_free`
 
@@ -2261,7 +2261,7 @@ void marmot_event_free(struct MarmotEvent *event);
 
 Free an event returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15112)
+[Header contract](include/marmot.h#L15113)
 
 </details>
 
@@ -2491,7 +2491,7 @@ MarmotStatus marmot_group_state_subscription_next(const struct MarmotGroupStateS
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_app_group_record_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13712)
+[Header contract](include/marmot.h#L13713)
 
 ### `marmot_group_state_subscription_set_callback`
 
@@ -2501,7 +2501,7 @@ MarmotStatus marmot_group_state_subscription_set_callback(const struct MarmotGro
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13729)
+[Header contract](include/marmot.h#L13730)
 
 ### `marmot_group_state_subscription_clear_callback`
 
@@ -2511,7 +2511,7 @@ MarmotStatus marmot_group_state_subscription_clear_callback(const struct MarmotG
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13741)
+[Header contract](include/marmot.h#L13742)
 
 ### `marmot_group_state_subscription_free`
 
@@ -2521,7 +2521,7 @@ void marmot_group_state_subscription_free(struct MarmotGroupStateSubscription *s
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13753)
+[Header contract](include/marmot.h#L13754)
 
 ### `marmot_group_state_subscription_snapshot`
 
@@ -2531,7 +2531,7 @@ MarmotStatus marmot_group_state_subscription_snapshot(const struct MarmotGroupSt
 
 Take the initial group-record snapshot. Yields the record exactly once: later calls write NULL with `MARMOT_STATUS_OK`. Free with `marmot_app_group_record_free`.
 
-[Header contract](include/marmot.h#L13776)
+[Header contract](include/marmot.h#L13777)
 
 ### `marmot_group_details_free`
 
@@ -2541,7 +2541,7 @@ void marmot_group_details_free(struct MarmotGroupDetails *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15208)
+[Header contract](include/marmot.h#L15209)
 
 ### `marmot_group_management_state_free`
 
@@ -2551,7 +2551,7 @@ void marmot_group_management_state_free(struct MarmotGroupManagementState *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15218)
+[Header contract](include/marmot.h#L15219)
 
 ### `marmot_group_mutation_result_free`
 
@@ -2561,7 +2561,7 @@ void marmot_group_mutation_result_free(struct MarmotGroupMutationResult *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15228)
+[Header contract](include/marmot.h#L15229)
 
 ### `marmot_group_invite_decline_result_free`
 
@@ -2571,7 +2571,7 @@ void marmot_group_invite_decline_result_free(struct MarmotGroupInviteDeclineResu
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15238)
+[Header contract](include/marmot.h#L15239)
 
 ### `marmot_group_conversation_snapshot_free`
 
@@ -2581,7 +2581,7 @@ void marmot_group_conversation_snapshot_free(struct MarmotGroupConversationSnaps
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15296)
+[Header contract](include/marmot.h#L15297)
 
 ### `marmot_group_roster_free`
 
@@ -2591,7 +2591,7 @@ void marmot_group_roster_free(struct MarmotGroupRoster *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15306)
+[Header contract](include/marmot.h#L15307)
 
 ### `marmot_group_recovery_status_free`
 
@@ -2601,7 +2601,7 @@ void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15335)
+[Header contract](include/marmot.h#L15336)
 
 ### `marmot_group_maintenance_status_free`
 
@@ -2611,7 +2611,7 @@ void marmot_group_maintenance_status_free(struct MarmotGroupMaintenanceStatus *p
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15412)
+[Header contract](include/marmot.h#L15413)
 
 ### `marmot_group_push_debug_info_free`
 
@@ -2621,7 +2621,7 @@ void marmot_group_push_debug_info_free(struct MarmotGroupPushDebugInfo *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15598)
+[Header contract](include/marmot.h#L15599)
 
 </details>
 
@@ -2646,7 +2646,7 @@ void marmot_history_notice_list_free(struct MarmotHistoryNoticeList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15353)
+[Header contract](include/marmot.h#L15354)
 
 ### `marmot_account_recovery_status`
 
@@ -2670,7 +2670,7 @@ void marmot_account_recovery_status_free(struct MarmotAccountRecoveryStatus *ptr
 
 Free a status returned by `marmot_account_recovery_status`, its group ids and notices included. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15363)
+[Header contract](include/marmot.h#L15364)
 
 </details>
 
@@ -2775,7 +2775,7 @@ void marmot_identity_creation_result_free(struct MarmotIdentityCreationResult *p
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14669)
+[Header contract](include/marmot.h#L14670)
 
 </details>
 
@@ -2800,7 +2800,7 @@ void marmot_key_package_maintenance_status_free(struct MarmotKeyPackageMaintenan
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15422)
+[Header contract](include/marmot.h#L15423)
 
 </details>
 
@@ -2930,7 +2930,7 @@ void marmot_linked_device_list_free(struct MarmotLinkedDeviceList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15372)
+[Header contract](include/marmot.h#L15373)
 
 ### `marmot_chat_history_imports`
 
@@ -2950,7 +2950,7 @@ void marmot_chat_history_import_list_free(struct MarmotChatHistoryImportList *li
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15344)
+[Header contract](include/marmot.h#L15345)
 
 ### `marmot_link_device`
 
@@ -3025,7 +3025,7 @@ MarmotStatus marmot_messages_subscription_next(const struct MarmotMessagesSubscr
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_message_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13631)
+[Header contract](include/marmot.h#L13632)
 
 ### `marmot_messages_subscription_set_callback`
 
@@ -3035,7 +3035,7 @@ MarmotStatus marmot_messages_subscription_set_callback(const struct MarmotMessag
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13648)
+[Header contract](include/marmot.h#L13649)
 
 ### `marmot_messages_subscription_clear_callback`
 
@@ -3045,7 +3045,7 @@ MarmotStatus marmot_messages_subscription_clear_callback(const struct MarmotMess
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13660)
+[Header contract](include/marmot.h#L13661)
 
 ### `marmot_messages_subscription_free`
 
@@ -3055,7 +3055,7 @@ void marmot_messages_subscription_free(struct MarmotMessagesSubscription *sub);
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13672)
+[Header contract](include/marmot.h#L13673)
 
 ### `marmot_messages_subscription_snapshot`
 
@@ -3065,7 +3065,7 @@ MarmotStatus marmot_messages_subscription_snapshot(const struct MarmotMessagesSu
 
 Take the initial message-record snapshot. Yields the populated list exactly once: later calls write an EMPTY list, still with `MARMOT_STATUS_OK`. Free with `marmot_app_message_record_list_free`.
 
-[Header contract](include/marmot.h#L13703)
+[Header contract](include/marmot.h#L13704)
 
 ### `marmot_message_draft_attachment_if_revision`
 
@@ -3075,7 +3075,7 @@ MarmotStatus marmot_message_draft_attachment_if_revision(const struct MarmotClie
 
 Read one selected attachment. found=0 distinguishes absence from an empty acquired attachment. Free returned bytes with marmot_bytes_free; revision conflicts return an error. # Safety client, strings, revision valid; revision's owning draft stays live; all out pointers writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotmessage_draft_attachment_if_revision) · [Header contract](include/marmot.h#L14550)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotmessage_draft_attachment_if_revision) · [Header contract](include/marmot.h#L14551)
 
 ### `marmot_message_tag_free`
 
@@ -3085,7 +3085,7 @@ void marmot_message_tag_free(struct MarmotMessageTag *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14920)
+[Header contract](include/marmot.h#L14921)
 
 ### `marmot_message_draft_free`
 
@@ -3095,7 +3095,7 @@ void marmot_message_draft_free(struct MarmotMessageDraft *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14987)
+[Header contract](include/marmot.h#L14988)
 
 ### `marmot_message_draft_summary_free`
 
@@ -3105,7 +3105,7 @@ void marmot_message_draft_summary_free(struct MarmotMessageDraftSummary *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14997)
+[Header contract](include/marmot.h#L14998)
 
 ### `marmot_message_draft_summary_list_free`
 
@@ -3115,7 +3115,7 @@ void marmot_message_draft_summary_list_free(struct MarmotMessageDraftSummaryList
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15006)
+[Header contract](include/marmot.h#L15007)
 
 ### `marmot_member_ref_free`
 
@@ -3125,7 +3125,7 @@ void marmot_member_ref_free(struct MarmotMemberRef *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15188)
+[Header contract](include/marmot.h#L15189)
 
 ### `marmot_member_key_package_prewarm_summary_free`
 
@@ -3135,7 +3135,7 @@ void marmot_member_key_package_prewarm_summary_free(struct MarmotMemberKeyPackag
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15257)
+[Header contract](include/marmot.h#L15258)
 
 ### `marmot_maintenance_run_summary_free`
 
@@ -3145,7 +3145,7 @@ void marmot_maintenance_run_summary_free(struct MarmotMaintenanceRunSummary *ptr
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15432)
+[Header contract](include/marmot.h#L15433)
 
 ### `marmot_markdown_document_free`
 
@@ -3155,7 +3155,7 @@ void marmot_markdown_document_free(struct MarmotMarkdownDocument *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15442)
+[Header contract](include/marmot.h#L15443)
 
 ### `marmot_media_upload_result_free`
 
@@ -3165,7 +3165,7 @@ void marmot_media_upload_result_free(struct MarmotMediaUploadResult *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15452)
+[Header contract](include/marmot.h#L15453)
 
 ### `marmot_media_download_result_free`
 
@@ -3175,7 +3175,7 @@ void marmot_media_download_result_free(struct MarmotMediaDownloadResult *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15462)
+[Header contract](include/marmot.h#L15463)
 
 ### `marmot_media_record_list_free`
 
@@ -3185,7 +3185,7 @@ void marmot_media_record_list_free(struct MarmotMediaRecordList *list);
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15471)
+[Header contract](include/marmot.h#L15472)
 
 ### `marmot_message_update_free`
 
@@ -3195,7 +3195,7 @@ void marmot_message_update_free(struct MarmotMessageUpdate *update);
 
 Free a message update returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15518)
+[Header contract](include/marmot.h#L15519)
 
 </details>
 
@@ -3210,7 +3210,7 @@ void marmot_nip46_cancel(const struct MarmotNip46Session *session);
 
 Interrupt pending requests without revoking a saved export. Nonblocking and NULL-safe; may race calls, never free.
 
-[Header contract](include/marmot.h#L13134)
+[Header contract](include/marmot.h#L13135)
 
 ### `marmot_nip46_connect`
 
@@ -3220,7 +3220,7 @@ MarmotStatus marmot_nip46_connect(const struct MarmotNip46Session *session, char
 
 Connect, verify the pinned user key, and adopt allowed signer relay changes. Run off UI. Free the returned user hex with `marmot_string_free`.
 
-[Header contract](include/marmot.h#L13083)
+[Header contract](include/marmot.h#L13084)
 
 ### `marmot_nip46_export`
 
@@ -3230,7 +3230,7 @@ MarmotStatus marmot_nip46_export(const struct MarmotNip46Session *session, char 
 
 Return durable client credentials and pinned identities as JSON. Store only in an encrypted vault; never log it. Free with `marmot_string_free`.
 
-[Header contract](include/marmot.h#L13090)
+[Header contract](include/marmot.h#L13091)
 
 ### `marmot_nip46_free`
 
@@ -3240,7 +3240,7 @@ void marmot_nip46_free(struct MarmotNip46Session *session);
 
 Cancel and release transport without remote logout. Join all callers first and free before the creating client. NULL is a no-op.
 
-[Header contract](include/marmot.h#L13150)
+[Header contract](include/marmot.h#L13151)
 
 ### `marmot_nip46_login`
 
@@ -3251,7 +3251,7 @@ MarmotStatus marmot_nip46_login(const struct MarmotClient *client, const struct 
 Create or reopen an external account using the verified session signer. Run off UI; free the returned summary with `marmot_account_summary_free`.
 Set `inbox_relays` independently, or pass `NULL, 0` to reuse the default relays.
 
-[Header contract](include/marmot.h#L13099)
+[Header contract](include/marmot.h#L13100)
 
 ### `marmot_nip46_logout`
 
@@ -3261,7 +3261,7 @@ MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
 
 Attempt bounded remote logout and clear local session keys even without acknowledgement. Complete MDK signout and remove the vault export first. Run off UI.
 
-[Header contract](include/marmot.h#L13142)
+[Header contract](include/marmot.h#L13143)
 
 ### `marmot_nip46_new`
 
@@ -3271,7 +3271,7 @@ MarmotStatus marmot_nip46_new(const struct MarmotClient *client, const char *con
 
 Create an offline session from a bunker URI, pairing configuration, or exported descriptor. The client must outlive the handle. See the session lifecycle for configuration fields.
 
-[Header contract](include/marmot.h#L13067)
+[Header contract](include/marmot.h#L13068)
 
 ### `marmot_nip46_register`
 
@@ -3281,7 +3281,7 @@ MarmotStatus marmot_nip46_register(const struct MarmotClient *client, const char
 
 Attach the pinned signer to an existing account and activate its worker. On restart, start local accounts first, then connect/register each external account independently off UI.
 
-[Header contract](include/marmot.h#L13118)
+[Header contract](include/marmot.h#L13119)
 
 ### `marmot_nip46_state`
 
@@ -3291,7 +3291,7 @@ MarmotStatus marmot_nip46_state(const struct MarmotNip46Session *session, char *
 
 Read nonblocking JSON status and any intermediate approval URL, without session keys or RPC payloads. Free with `marmot_string_free`.
 
-[Header contract](include/marmot.h#L13127)
+[Header contract](include/marmot.h#L13128)
 
 ### `marmot_nip46_uri`
 
@@ -3301,7 +3301,7 @@ MarmotStatus marmot_nip46_uri(const struct MarmotNip46Session *session, char **o
 
 Read the credential-bearing pairing link without network IO. Show or copy it only for the user; free with `marmot_string_free`.
 
-[Header contract](include/marmot.h#L13076)
+[Header contract](include/marmot.h#L13077)
 
 ### `marmot_normalize_member_ref`
 
@@ -3351,7 +3351,7 @@ MarmotStatus marmot_notifications_subscription_next(const struct MarmotNotificat
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_notification_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13414)
+[Header contract](include/marmot.h#L13415)
 
 ### `marmot_notifications_subscription_set_callback`
 
@@ -3361,7 +3361,7 @@ MarmotStatus marmot_notifications_subscription_set_callback(const struct MarmotN
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13431)
+[Header contract](include/marmot.h#L13432)
 
 ### `marmot_notifications_subscription_clear_callback`
 
@@ -3371,7 +3371,7 @@ MarmotStatus marmot_notifications_subscription_clear_callback(const struct Marmo
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13443)
+[Header contract](include/marmot.h#L13444)
 
 ### `marmot_notifications_subscription_free`
 
@@ -3381,7 +3381,7 @@ void marmot_notifications_subscription_free(struct MarmotNotificationsSubscripti
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13455)
+[Header contract](include/marmot.h#L13456)
 
 ### `marmot_notification_settings_free`
 
@@ -3391,7 +3391,7 @@ void marmot_notification_settings_free(struct MarmotNotificationSettings *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15538)
+[Header contract](include/marmot.h#L15539)
 
 ### `marmot_notification_update_free`
 
@@ -3401,7 +3401,7 @@ void marmot_notification_update_free(struct MarmotNotificationUpdate *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15548)
+[Header contract](include/marmot.h#L15549)
 
 </details>
 
@@ -3436,7 +3436,7 @@ MarmotStatus marmot_onboarding_subscription_next(const struct MarmotOnboardingSu
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_onboarding_snapshot_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13935)
+[Header contract](include/marmot.h#L13936)
 
 ### `marmot_onboarding_subscription_set_callback`
 
@@ -3446,7 +3446,7 @@ MarmotStatus marmot_onboarding_subscription_set_callback(const struct MarmotOnbo
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13952)
+[Header contract](include/marmot.h#L13953)
 
 ### `marmot_onboarding_subscription_clear_callback`
 
@@ -3456,7 +3456,7 @@ MarmotStatus marmot_onboarding_subscription_clear_callback(const struct MarmotOn
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13964)
+[Header contract](include/marmot.h#L13965)
 
 ### `marmot_onboarding_subscription_free`
 
@@ -3466,7 +3466,7 @@ void marmot_onboarding_subscription_free(struct MarmotOnboardingSubscription *su
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13976)
+[Header contract](include/marmot.h#L13977)
 
 ### `marmot_onboarding_subscription_snapshot`
 
@@ -3476,7 +3476,7 @@ MarmotStatus marmot_onboarding_subscription_snapshot(const struct MarmotOnboardi
 
 Return the initial snapshot. Free with marmot_onboarding_snapshot_free.
 
-[Header contract](include/marmot.h#L13994)
+[Header contract](include/marmot.h#L13995)
 
 ### `marmot_open_attachment_handoff`
 
@@ -3496,7 +3496,7 @@ MarmotStatus marmot_open_presented_chat_list(const struct MarmotClient *client, 
 
 Open a complete chat list with both invalidation sources already attached. Take the initial snapshot once, then call next. Free with marmot_presented_chat_list_subscription_free. # Safety Client and string must be valid; out_sub must be writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_presented_chat_list) · [Header contract](include/marmot.h#L14003)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_presented_chat_list) · [Header contract](include/marmot.h#L14004)
 
 ### `marmot_open_chat_list_window`
 
@@ -3506,7 +3506,7 @@ MarmotStatus marmot_open_chat_list_window(const struct MarmotClient *client, con
 
 Open one account/view. A NULL initial_rows uses 50; otherwise requires 1–100. View is a MarmotChatListView discriminant. Take snapshot once, then receive replacements. # Safety client/string must be valid; initial_rows must be NULL or readable, out_sub writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_chat_list_window) · [Header contract](include/marmot.h#L14325)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_chat_list_window) · [Header contract](include/marmot.h#L14326)
 
 ### `marmot_open_chat_list_query_window`
 
@@ -3516,7 +3516,7 @@ MarmotStatus marmot_open_chat_list_query_window(const struct MarmotClient *clien
 
 `marmot_open_chat_list_window` narrowed by a filter. `query->view` is a MarmotChatListView discriminant; `query->filter[0..filter_len]` is the node list (NULL only with zero length, meaning no filter). Each `MarmotChatListFilterNode` sets `kind` and only that kind's fields: `children` for `All`/`Any`, exactly one child for `Not`, `condition` for `Condition`, `group_ids` for `GroupIds`, `text` for `Text` and `MessageText`. Node 0 is the root and every other node is the child of exactly one earlier node. A `Text` node matches chats whose title, group name, description or direct-chat peer profile name contains `text`, trimmed and lowercased, as a literal substring; a NULL `text` returns `MARMOT_STATUS_NULL_POINTER`. While any chat in the view still has presentation pending, a query with a `Text` node returns `MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY` (an open window delivers it and retries), never part of the set. A `MessageText` node matches chats with a visible message containing `text` by the same rule; a window refuses it with `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY` (`MARMOT_CHAT_LIST_QUERY_ERROR_MESSAGE_TEXT_IN_WINDOW`) before any read. Shape or bound violations (8 levels, 64 nodes, 500 group IDs, 1024 bytes of text) return `MARMOT_STATUS_INVALID_CHAT_LIST_QUERY`; an out-of-range discriminant or a `Not` without exactly one child returns `MARMOT_STATUS_INVALID_ARGUMENT`. The query and its arrays are borrowed for the call. Free with `marmot_chat_list_window_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_chat_list_query_window) · [Header contract](include/marmot.h#L14340)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_chat_list_query_window) · [Header contract](include/marmot.h#L14341)
 
 ### `marmot_chat_list_query_ids`
 
@@ -3546,7 +3546,7 @@ MarmotStatus marmot_open_conversation_window(const struct MarmotClient *client, 
 
 Open one account/group. mode is a MarmotConversationOpenMode discriminant. Message mode requires message_id_hex; other modes require NULL. initial_rows NULL uses 50. Zero timeout uses 30 seconds; opening timeout abandons the opening. No mark-read occurs. # Safety client/strings must be valid; optional pointers readable or NULL, out_sub writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_conversation_window) · [Header contract](include/marmot.h#L14433)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotopen_conversation_window) · [Header contract](include/marmot.h#L14434)
 
 ### `marmot_onboarding_snapshot_free`
 
@@ -3556,7 +3556,7 @@ void marmot_onboarding_snapshot_free(struct MarmotOnboardingSnapshot *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15830)
+[Header contract](include/marmot.h#L15831)
 
 </details>
 
@@ -3791,7 +3791,7 @@ void marmot_pending_welcome_delivery_list_free(struct MarmotPendingWelcomeDelive
 
 Deep-free the complete list returned by `marmot_pending_welcome_deliveries`, including each repair handle's owned strings. NULL is a no-op. Do not free individual items/fields, pass a borrowed pointer, or reuse the list after this call.
 
-[Header contract](include/marmot.h#L15121)
+[Header contract](include/marmot.h#L15122)
 
 ### `marmot_publisher_info_free`
 
@@ -3801,7 +3801,7 @@ void marmot_publisher_info_free(struct MarmotPublisherInfo *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L13160)
+[Header contract](include/marmot.h#L13161)
 
 ### `marmot_publisher_ack_free`
 
@@ -3811,7 +3811,7 @@ void marmot_publisher_ack_free(struct MarmotPublisherAck *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L13170)
+[Header contract](include/marmot.h#L13171)
 
 ### `marmot_presented_chat_list_subscription_snapshot`
 
@@ -3821,7 +3821,7 @@ MarmotStatus marmot_presented_chat_list_subscription_snapshot(const struct Marmo
 
 Take the initial snapshot with sequence zero. A second call returns CLOSED and NULL. Free the result with marmot_presented_chat_list_update_free. # Safety sub must be live; out must be writable.
 
-[Header contract](include/marmot.h#L14014)
+[Header contract](include/marmot.h#L14015)
 
 ### `marmot_presented_chat_list_subscription_next`
 
@@ -3831,7 +3831,7 @@ MarmotStatus marmot_presented_chat_list_subscription_next(const struct MarmotPre
 
 Read a whole replacement. timeout_ms zero waits indefinitely. Timeout/closed/error leave out NULL; timeout or a storage error does not discard the pending refresh. Retry according to the typed status. Free results with marmot_presented_chat_list_update_free. # Safety sub must be live; out must be writable.
 
-[Header contract](include/marmot.h#L14024)
+[Header contract](include/marmot.h#L14025)
 
 ### `marmot_presented_chat_list_subscription_free`
 
@@ -3841,7 +3841,7 @@ void marmot_presented_chat_list_subscription_free(struct MarmotPresentedChatList
 
 Cancel and free a presented-list handle. NULL is a no-op. # Safety sub must be NULL or a live library-owned handle not in use by another call.
 
-[Header contract](include/marmot.h#L14033)
+[Header contract](include/marmot.h#L14034)
 
 ### `marmot_prepared_group_image_upload_free`
 
@@ -3851,7 +3851,7 @@ void marmot_prepared_group_image_upload_free(struct MarmotPreparedGroupImageUplo
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15316)
+[Header contract](include/marmot.h#L15317)
 
 ### `marmot_prepared_group_image_upload_list_free`
 
@@ -3861,7 +3861,7 @@ void marmot_prepared_group_image_upload_list_free(struct MarmotPreparedGroupImag
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15325)
+[Header contract](include/marmot.h#L15326)
 
 ### `marmot_push_registration_free`
 
@@ -3871,7 +3871,7 @@ void marmot_push_registration_free(struct MarmotPushRegistration *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15568)
+[Header contract](include/marmot.h#L15569)
 
 ### `marmot_push_registration_share_outcome_free`
 
@@ -3881,7 +3881,7 @@ void marmot_push_registration_share_outcome_free(struct MarmotPushRegistrationSh
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15578)
+[Header contract](include/marmot.h#L15579)
 
 ### `marmot_push_registration_sync_result_free`
 
@@ -3891,7 +3891,7 @@ void marmot_push_registration_sync_result_free(struct MarmotPushRegistrationSync
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15588)
+[Header contract](include/marmot.h#L15589)
 
 ### `marmot_presented_chat_row_free`
 
@@ -3901,7 +3901,7 @@ void marmot_presented_chat_row_free(struct MarmotPresentedChatRow *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15860)
+[Header contract](include/marmot.h#L15861)
 
 ### `marmot_presented_chat_list_snapshot_free`
 
@@ -3911,7 +3911,7 @@ void marmot_presented_chat_list_snapshot_free(struct MarmotPresentedChatListSnap
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15870)
+[Header contract](include/marmot.h#L15871)
 
 ### `marmot_presented_chat_list_update_free`
 
@@ -3921,7 +3921,7 @@ void marmot_presented_chat_list_update_free(struct MarmotPresentedChatListUpdate
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15880)
+[Header contract](include/marmot.h#L15881)
 
 </details>
 
@@ -4402,7 +4402,7 @@ void marmot_runtime_message_received_free(struct MarmotRuntimeMessageReceived *p
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15510)
+[Header contract](include/marmot.h#L15511)
 
 ### `marmot_retention_sweep_report_free`
 
@@ -4412,7 +4412,7 @@ void marmot_retention_sweep_report_free(struct MarmotRetentionSweepReport *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15528)
+[Header contract](include/marmot.h#L15529)
 
 ### `marmot_relay_health_free`
 
@@ -4422,7 +4422,7 @@ void marmot_relay_health_free(struct MarmotRelayHealth *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15637)
+[Header contract](include/marmot.h#L15638)
 
 ### `marmot_relay_telemetry_settings_free`
 
@@ -4432,7 +4432,7 @@ void marmot_relay_telemetry_settings_free(struct MarmotRelayTelemetrySettings *p
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15647)
+[Header contract](include/marmot.h#L15648)
 
 ### `marmot_relay_endpoint_classification_free`
 
@@ -4442,7 +4442,7 @@ void marmot_relay_endpoint_classification_free(struct MarmotRelayEndpointClassif
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15657)
+[Header contract](include/marmot.h#L15658)
 
 ### `marmot_relay_endpoint_classification_list_free`
 
@@ -4452,7 +4452,7 @@ void marmot_relay_endpoint_classification_list_free(struct MarmotRelayEndpointCl
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15666)
+[Header contract](include/marmot.h#L15667)
 
 ### `marmot_report_dismissal_page_free`
 
@@ -4462,7 +4462,7 @@ void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L16007)
+[Header contract](include/marmot.h#L16008)
 
 </details>
 
@@ -4487,7 +4487,7 @@ void marmot_sticker_asset_free(struct MarmotStickerAsset *ptr);
 
 Frees a sticker asset and its owned bytes. NULL is safe.
 
-[Header contract](include/marmot.h#L15733)
+[Header contract](include/marmot.h#L15734)
 
 ### `marmot_sticker_free`
 
@@ -4497,7 +4497,7 @@ void marmot_sticker_free(struct MarmotSticker *ptr);
 
 Frees one embedded sticker record returned as a root. NULL is safe.
 
-[Header contract](include/marmot.h#L15695)
+[Header contract](include/marmot.h#L15696)
 
 ### `marmot_sticker_import_result_free`
 
@@ -4507,7 +4507,7 @@ void marmot_sticker_import_result_free(struct MarmotStickerImportResult *value);
 
 Frees an import result, its pack, and skipped-id strings. NULL is safe.
 
-[Header contract](include/marmot.h#L15752)
+[Header contract](include/marmot.h#L15753)
 
 ### `marmot_sticker_list_free`
 
@@ -4517,7 +4517,7 @@ void marmot_sticker_list_free(struct MarmotStickerList *list);
 
 Frees a sticker list and every owned element. NULL is safe.
 
-[Header contract](include/marmot.h#L15704)
+[Header contract](include/marmot.h#L15705)
 
 ### `marmot_sticker_pack`
 
@@ -4537,7 +4537,7 @@ void marmot_sticker_pack_free(struct MarmotStickerPack *ptr);
 
 Frees one pack, its cover, and sticker vector. NULL is safe.
 
-[Header contract](include/marmot.h#L15714)
+[Header contract](include/marmot.h#L15715)
 
 ### `marmot_sticker_pack_list_free`
 
@@ -4547,7 +4547,7 @@ void marmot_sticker_pack_list_free(struct MarmotStickerPackList *list);
 
 Frees a pack list and every owned pack. NULL is safe.
 
-[Header contract](include/marmot.h#L15723)
+[Header contract](include/marmot.h#L15724)
 
 ### `marmot_sticker_packs`
 
@@ -4567,7 +4567,7 @@ void marmot_sticker_ref_free(struct MarmotStickerRef *ptr);
 
 Frees one exact sticker reference. NULL is safe.
 
-[Header contract](include/marmot.h#L15685)
+[Header contract](include/marmot.h#L15686)
 
 ### `marmot_sticker_sync_result_free`
 
@@ -4577,7 +4577,7 @@ void marmot_sticker_sync_result_free(struct MarmotStickerSyncResult *ptr);
 
 Frees a sync result. NULL is safe.
 
-[Header contract](include/marmot.h#L15743)
+[Header contract](include/marmot.h#L15744)
 
 ### `marmot_string_free`
 
@@ -5020,7 +5020,7 @@ void marmot_timeline_user_reaction_list_free(struct MarmotTimelineUserReactionLi
 
 Deep-free a root reaction list returned by `marmot_message_reactions`, including strings and items. NULL is a no-op; never free embedded items separately, and never use the list after freeing it.
 
-[Header contract](include/marmot.h#L15781)
+[Header contract](include/marmot.h#L15782)
 
 ### `marmot_poll_votes`
 
@@ -5047,7 +5047,7 @@ void marmot_poll_vote_page_free(struct MarmotPollVotePage *ptr);
 
 Free a page returned by `marmot_poll_votes`, including its votes. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15772)
+[Header contract](include/marmot.h#L15773)
 
 ### `marmot_set_usage_diagnostics_consent`
 
@@ -5087,7 +5087,7 @@ MarmotStatus marmot_subscribe_events(const struct MarmotClient *client, struct M
 
 Subscribe to the event firehose. Free with `marmot_events_subscription_free` (before freeing the client).
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_events) · [Header contract](include/marmot.h#L13292)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_events) · [Header contract](include/marmot.h#L13293)
 
 ### `marmot_subscribe_timeline_messages`
 
@@ -5097,7 +5097,7 @@ MarmotStatus marmot_subscribe_timeline_messages(const struct MarmotClient *clien
 
 Subscribe to live materialized timeline updates for a group (`group_id_hex` non-NULL) or the account-wide tail (NULL). `has_limit` plus `limit` cap the initial window. Free with `marmot_timeline_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_timeline_messages) · [Header contract](include/marmot.h#L13354)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_timeline_messages) · [Header contract](include/marmot.h#L13355)
 
 ### `marmot_subscribe_notifications`
 
@@ -5107,7 +5107,7 @@ MarmotStatus marmot_subscribe_notifications(const struct MarmotClient *client, s
 
 Subscribe to notification updates. Free with `marmot_notifications_subscription_free` (before freeing the client).
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_notifications) · [Header contract](include/marmot.h#L13464)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_notifications) · [Header contract](include/marmot.h#L13465)
 
 ### `marmot_subscribe_chats`
 
@@ -5117,7 +5117,7 @@ MarmotStatus marmot_subscribe_chats(const struct MarmotClient *client, const cha
 
 Subscribe to one account's chats list. Emits whenever a group's projection changes; `include_archived` widens the filter. Free with `marmot_chats_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_chats) · [Header contract](include/marmot.h#L13525)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_chats) · [Header contract](include/marmot.h#L13526)
 
 ### `marmot_subscribe_chat_list`
 
@@ -5127,7 +5127,7 @@ MarmotStatus marmot_subscribe_chat_list(const struct MarmotClient *client, const
 
 Subscribe to one account's durable chat-list projection. Free with `marmot_chat_list_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_chat_list) · [Header contract](include/marmot.h#L13598)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_chat_list) · [Header contract](include/marmot.h#L13599)
 
 ### `marmot_subscribe_messages`
 
@@ -5137,7 +5137,7 @@ MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client, const 
 
 Subscribe to messages for a specific group (`group_id_hex` non-NULL) or every message across the account (NULL). `has_limit` + `limit` cap the initial snapshot to the latest N rows. `kinds` restricts the stream to those Nostr event kinds; pass NULL with length 0 for every kind. Free with `marmot_messages_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_messages) · [Header contract](include/marmot.h#L13686)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_messages) · [Header contract](include/marmot.h#L13687)
 
 ### `marmot_subscribe_group_state`
 
@@ -5147,7 +5147,7 @@ MarmotStatus marmot_subscribe_group_state(const struct MarmotClient *client, con
 
 Subscribe to member/profile/roster changes for one group. Free with `marmot_group_state_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_group_state) · [Header contract](include/marmot.h#L13763)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_group_state) · [Header contract](include/marmot.h#L13764)
 
 ### `marmot_search_users`
 
@@ -5157,7 +5157,7 @@ MarmotStatus marmot_search_users(const struct MarmotClient *client, const char *
 
 Search the identity directory outward from `account_id_hex`, widening from `radius_start` to `radius_end` social hops. Results stream in through the returned handle. Free it with `marmot_user_search_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsearch_users) · [Header contract](include/marmot.h#L13922)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsearch_users) · [Header contract](include/marmot.h#L13923)
 
 ### `marmot_subscribe_onboarding`
 
@@ -5167,7 +5167,7 @@ MarmotStatus marmot_subscribe_onboarding(const struct MarmotClient *client, cons
 
 Subscribe to durable onboarding state for an account.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_onboarding) · [Header contract](include/marmot.h#L13984)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_onboarding) · [Header contract](include/marmot.h#L13985)
 
 ### `marmot_subscribe_blocked_users`
 
@@ -5177,7 +5177,7 @@ MarmotStatus marmot_subscribe_blocked_users(const struct MarmotClient *client, c
 
 Subscribe to an account's block list. # Safety Client, account string and output pointer must be valid.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_blocked_users) · [Header contract](include/marmot.h#L14150)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_blocked_users) · [Header contract](include/marmot.h#L14151)
 
 ### `marmot_subscribe_attachment_transfers`
 
@@ -5187,7 +5187,7 @@ MarmotStatus marmot_subscribe_attachment_transfers(const struct MarmotClient *cl
 
 Open a bounded progress stream. First next returns the initial snapshot. # Safety Inputs must be live, targets NULL only with zero length, out writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_attachment_transfers) · [Header contract](include/marmot.h#L14237)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_attachment_transfers) · [Header contract](include/marmot.h#L14238)
 
 ### `marmot_subscribe_account_attention`
 
@@ -5197,7 +5197,7 @@ MarmotStatus marmot_subscribe_account_attention(const struct MarmotClient *clien
 
 Open independent signed-in account summaries; requires no active chat-list handle. # Safety client must be valid; out_sub writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_account_attention) · [Header contract](include/marmot.h#L14351)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsubscribe_account_attention) · [Header contract](include/marmot.h#L14352)
 
 ### `marmot_selected_message_draft`
 
@@ -5207,7 +5207,7 @@ MarmotStatus marmot_selected_message_draft(const struct MarmotClient *client, co
 
 Descriptor-only draft; result owns the revision handle and must be deep-freed. # Safety client and strings valid; out writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotselected_message_draft) · [Header contract](include/marmot.h#L14503)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotselected_message_draft) · [Header contract](include/marmot.h#L14504)
 
 ### `marmot_save_message_draft_if_revision`
 
@@ -5217,7 +5217,7 @@ MarmotStatus marmot_save_message_draft_if_revision(const struct MarmotClient *cl
 
 Save only if the selected revision still matches. Attachment inputs are copied, never retained. # Safety client, account, content and revision valid; reply nullable; attachments points to len readable items (or NULL with zero len). Revision's owner stays live; out writable.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsave_message_draft_if_revision) · [Header contract](include/marmot.h#L14535)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsave_message_draft_if_revision) · [Header contract](include/marmot.h#L14536)
 
 ### `marmot_send_message_draft`
 
@@ -5227,7 +5227,7 @@ MarmotStatus marmot_send_message_draft(const struct MarmotClient *client, const 
 
 Send the exact selected revision; successful durable acceptance clears it atomically. Hosts must not independently delete the draft on delivery. Prepared media must match descriptors. # Safety client, account, revision valid; revision owner stays live; attachments readable for length, or NULL with zero length; out writable. Free result with marmot_send_summary_free.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsend_message_draft) · [Header contract](include/marmot.h#L14565)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsend_message_draft) · [Header contract](include/marmot.h#L14566)
 
 ### `marmot_send_summary_free`
 
@@ -5237,7 +5237,7 @@ void marmot_send_summary_free(struct MarmotSendSummary *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14622)
+[Header contract](include/marmot.h#L14623)
 
 ### `marmot_sign_out_outcome_free`
 
@@ -5247,7 +5247,7 @@ void marmot_sign_out_outcome_free(struct MarmotSignOutOutcome *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14689)
+[Header contract](include/marmot.h#L14690)
 
 ### `marmot_string_list_free`
 
@@ -5257,7 +5257,7 @@ void marmot_string_list_free(struct MarmotStringList *list);
 
 Free a string list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14910)
+[Header contract](include/marmot.h#L14911)
 
 ### `marmot_secure_delete_expired_result_free`
 
@@ -5267,7 +5267,7 @@ void marmot_secure_delete_expired_result_free(struct MarmotSecureDeleteExpiredRe
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15500)
+[Header contract](include/marmot.h#L15501)
 
 ### `marmot_selected_message_draft_free`
 
@@ -5277,7 +5277,7 @@ void marmot_selected_message_draft_free(struct MarmotSelectedMessageDraft *p);
 
 Deep-free a selected draft and its opaque revision. NULL is allowed. Only for drafts returned directly by this library. A snapshot's embedded draft is freed by `marmot_conversation_window_snapshot_free`. # Safety p must be NULL or a library-owned unfreed selected-draft root pointer, never the address of a snapshot's embedded draft.
 
-[Header contract](include/marmot.h#L15910)
+[Header contract](include/marmot.h#L15911)
 
 ### `marmot_set_attachment_download_policy`
 
@@ -5287,7 +5287,7 @@ MarmotStatus marmot_set_attachment_download_policy(const struct MarmotClient *cl
 
 Persist policy. Disable pauses automatic work but preserves explicit transfers and cached bytes. # Safety Client, strings and policy must be live throughout this call. Inputs are borrowed.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotset_attachment_download_policy) · [Header contract](include/marmot.h#L16072)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotset_attachment_download_policy) · [Header contract](include/marmot.h#L16073)
 
 ### `marmot_submit_moderation_report`
 
@@ -5368,7 +5368,7 @@ MarmotStatus marmot_timeline_subscription_next(const struct MarmotTimelineSubscr
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_timeline_page_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13301)
+[Header contract](include/marmot.h#L13302)
 
 ### `marmot_timeline_subscription_set_callback`
 
@@ -5378,7 +5378,7 @@ MarmotStatus marmot_timeline_subscription_set_callback(const struct MarmotTimeli
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13318)
+[Header contract](include/marmot.h#L13319)
 
 ### `marmot_timeline_subscription_clear_callback`
 
@@ -5388,7 +5388,7 @@ MarmotStatus marmot_timeline_subscription_clear_callback(const struct MarmotTime
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13330)
+[Header contract](include/marmot.h#L13331)
 
 ### `marmot_timeline_subscription_free`
 
@@ -5398,7 +5398,7 @@ void marmot_timeline_subscription_free(struct MarmotTimelineSubscription *sub);
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13342)
+[Header contract](include/marmot.h#L13343)
 
 ### `marmot_timeline_subscription_snapshot`
 
@@ -5408,7 +5408,7 @@ MarmotStatus marmot_timeline_subscription_snapshot(const struct MarmotTimelineSu
 
 Take the initial window snapshot. Yields the page exactly once: later calls write NULL with `MARMOT_STATUS_OK`. Free the page with `marmot_timeline_page_free`.
 
-[Header contract](include/marmot.h#L13369)
+[Header contract](include/marmot.h#L13370)
 
 ### `marmot_timeline_subscription_next_update`
 
@@ -5418,7 +5418,7 @@ MarmotStatus marmot_timeline_subscription_next_update(const struct MarmotTimelin
 
 Block until the next raw delta (page replacement or projection update). Free with `marmot_timeline_subscription_update_free`.
 
-[Header contract](include/marmot.h#L13379)
+[Header contract](include/marmot.h#L13380)
 
 ### `marmot_timeline_subscription_paginate_backwards`
 
@@ -5428,7 +5428,7 @@ MarmotStatus marmot_timeline_subscription_paginate_backwards(const struct Marmot
 
 Extend the window toward older history by up to `count` messages and return the new window. Runs on the runtime off the caller's lock, so a concurrent blocking `next` on another thread is not blocked. Free with `marmot_timeline_page_free`.
 
-[Header contract](include/marmot.h#L13392)
+[Header contract](include/marmot.h#L13393)
 
 ### `marmot_timeline_subscription_paginate_forwards`
 
@@ -5438,7 +5438,7 @@ MarmotStatus marmot_timeline_subscription_paginate_forwards(const struct MarmotT
 
 Extend the window toward the live head by up to `count` messages and return the new window. Reaching the head re-anchors the window. Free with `marmot_timeline_page_free`.
 
-[Header contract](include/marmot.h#L13404)
+[Header contract](include/marmot.h#L13405)
 
 ### `marmot_timeline_message_record_free`
 
@@ -5448,7 +5448,7 @@ void marmot_timeline_message_record_free(struct MarmotTimelineMessageRecord *ptr
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15791)
+[Header contract](include/marmot.h#L15792)
 
 ### `marmot_timeline_page_free`
 
@@ -5458,7 +5458,7 @@ void marmot_timeline_page_free(struct MarmotTimelinePage *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15801)
+[Header contract](include/marmot.h#L15802)
 
 ### `marmot_timeline_subscription_update_free`
 
@@ -5468,7 +5468,7 @@ void marmot_timeline_subscription_update_free(struct MarmotTimelineSubscriptionU
 
 Free a timeline-subscription delta returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15810)
+[Header contract](include/marmot.h#L15811)
 
 ### `marmot_timeline_edit_history_page_free`
 
@@ -5478,7 +5478,7 @@ void marmot_timeline_edit_history_page_free(struct MarmotTimelineEditHistoryPage
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15820)
+[Header contract](include/marmot.h#L15821)
 
 </details>
 
@@ -5503,7 +5503,7 @@ void marmot_unrecognized_sign_in_list_free(struct MarmotUnrecognizedSignInList *
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15675)
+[Header contract](include/marmot.h#L15676)
 
 ### `marmot_unrecognized_sign_ins`
 
@@ -5693,7 +5693,7 @@ MarmotStatus marmot_user_search_subscription_next(const struct MarmotUserSearchS
 
 Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_user_search_update_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
 
-[Header contract](include/marmot.h#L13869)
+[Header contract](include/marmot.h#L13870)
 
 ### `marmot_user_search_subscription_set_callback`
 
@@ -5703,7 +5703,7 @@ MarmotStatus marmot_user_search_subscription_set_callback(const struct MarmotUse
 
 Install a callback pump for this subscription. `callback` runs on a runtime worker thread with a borrowed item pointer (valid only during the call; do not store or free it) and a final NULL item on close. `callback` and `user_data` access must be thread-safe. Fails if a callback is already installed.
 
-[Header contract](include/marmot.h#L13886)
+[Header contract](include/marmot.h#L13887)
 
 ### `marmot_user_search_subscription_clear_callback`
 
@@ -5713,7 +5713,7 @@ MarmotStatus marmot_user_search_subscription_clear_callback(const struct MarmotU
 
 Request cancellation of this subscription's callback pump, if any. Non-blocking: a callback already running keeps executing after this returns (see the module docs).
 
-[Header contract](include/marmot.h#L13898)
+[Header contract](include/marmot.h#L13899)
 
 ### `marmot_user_search_subscription_free`
 
@@ -5723,7 +5723,7 @@ void marmot_user_search_subscription_free(struct MarmotUserSearchSubscription *s
 
 Free the subscription handle. Requests callback-pump cancellation without waiting (a callback may still be running after this returns — do not free `user_data` on that basis). NULL is a no-op. Free every handle before the client that created it.
 
-[Header contract](include/marmot.h#L13910)
+[Header contract](include/marmot.h#L13911)
 
 ### `marmot_user_profile_metadata_free`
 
@@ -5733,7 +5733,7 @@ void marmot_user_profile_metadata_free(struct MarmotUserProfileMetadata *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14659)
+[Header contract](include/marmot.h#L14660)
 
 ### `marmot_user_directory_search_result_list_free`
 
@@ -5743,7 +5743,7 @@ void marmot_user_directory_search_result_list_free(struct MarmotUserDirectorySea
 
 Free a list returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14967)
+[Header contract](include/marmot.h#L14968)
 
 ### `marmot_user_search_update_free`
 
@@ -5753,7 +5753,7 @@ void marmot_user_search_update_free(struct MarmotUserSearchUpdate *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14977)
+[Header contract](include/marmot.h#L14978)
 
 ### `marmot_usage_diagnostics_settings_free`
 
@@ -5763,7 +5763,7 @@ void marmot_usage_diagnostics_settings_free(struct MarmotUsageDiagnosticsSetting
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15840)
+[Header contract](include/marmot.h#L15841)
 
 ### `marmot_usage_diagnostics_status_free`
 
@@ -5773,7 +5773,7 @@ void marmot_usage_diagnostics_status_free(struct MarmotUsageDiagnosticsStatus *p
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15850)
+[Header contract](include/marmot.h#L15851)
 
 </details>
 
@@ -5788,7 +5788,7 @@ MarmotStatus marmot_watch_agent_text_stream(const struct MarmotClient *client, c
 
 Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_hex = NULL` to follow the latest stream in the group. `server_cert_der` (+ `server_cert_der_len`) pins a self-signed broker certificate; pass NULL with length 0 to use the bundled public-CA roots (not the OS trust store). The bytes are copied — the caller keeps ownership. `insecure_local` is loopback-only for testing. Free with `marmot_agent_stream_subscription_free`.
 
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotwatch_agent_text_stream) · [Header contract](include/marmot.h#L13844)
+[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotwatch_agent_text_stream) · [Header contract](include/marmot.h#L13845)
 
 ### `marmot_wipe_outcome_free`
 
@@ -5798,7 +5798,7 @@ void marmot_wipe_outcome_free(struct MarmotWipeOutcome *ptr);
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14679)
+[Header contract](include/marmot.h#L14680)
 
 </details>
 
@@ -5813,7 +5813,7 @@ void marmot_automatic_attachment_request_free(struct MarmotAutomaticAttachmentRe
 
 Deep-free the returned automatic-request record and its nested status/reference. NULL is a no-op; do not free nested fields separately.
 
-[Header contract](include/marmot.h#L16130)
+[Header contract](include/marmot.h#L16131)
 
 ### `marmot_begin_attachment_permission_update`
 
@@ -5823,7 +5823,7 @@ MarmotStatus marmot_begin_attachment_permission_update(const struct MarmotClient
 
 Blocking revocation and generation issuance for HostManaged mode. Inputs are borrowed; free the returned generation with marmot_string_free. Call before asynchronous policy evaluation and keep the token with that evaluation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Header contract](include/marmot.h#L16137)
+[Header contract](include/marmot.h#L16138)
 
 ### `marmot_request_automatic_attachment`
 
@@ -5833,7 +5833,7 @@ MarmotStatus marmot_request_automatic_attachment(const struct MarmotClient *clie
 
 Blocking, idempotent automatic demand for the exact source slot. Inputs are borrowed; free the returned status/result with marmot_automatic_attachment_request_free. Repeated requests preserve suppression, acquisition history and retry budgets. See the [migration contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#android-migration).
 
-[Header contract](include/marmot.h#L16157)
+[Header contract](include/marmot.h#L16158)
 
 ### `marmot_set_attachment_automatic_permission`
 
@@ -5843,7 +5843,7 @@ MarmotStatus marmot_set_attachment_automatic_permission(const struct MarmotClien
 
 Blocking application of runtime-only category permission. All inputs are borrowed; boolean input integers use nonzero for true. False output means the generation was stale, foreign or already consumed. Required output validation occurs before mutation. See the [shared permission contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Header contract](include/marmot.h#L16146)
+[Header contract](include/marmot.h#L16147)
 
 </details>
 
@@ -5859,7 +5859,7 @@ void marmot_local_send_acceptance_free(struct MarmotLocalSendAcceptance *ptr);
 Deep-free a returned local acceptance, including its token and message identity.
 NULL is permitted; embedded acceptances belong to their parent upload result.
 
-[Header contract](include/marmot.h#L15382)
+[Header contract](include/marmot.h#L15383)
 
 ### `marmot_local_send_status`
 
@@ -5881,7 +5881,7 @@ void marmot_local_send_status_free(struct MarmotLocalSendStatus *ptr);
 
 Deep-free a local status result and its optional completion summary. NULL is permitted.
 
-[Header contract](include/marmot.h#L15402)
+[Header contract](include/marmot.h#L15403)
 
 ### `marmot_media_upload_submission_free`
 
@@ -5892,7 +5892,7 @@ void marmot_media_upload_submission_free(struct MarmotMediaUploadSubmission *ptr
 Deep-free an upload/submission result, including references and its optional token-bound
 acceptance. NULL is permitted; never free its embedded records separately.
 
-[Header contract](include/marmot.h#L15392)
+[Header contract](include/marmot.h#L15393)
 
 ### `marmot_edit_local_message_with_client_token`
 
@@ -5932,7 +5932,7 @@ Keep its revision owner alive during the call; attachment inputs are borrowed.
 Free acceptance with `marmot_local_send_acceptance_free`; do not clear the composer
 on delivery. See [local sends](../marmot-uniffi/LOCAL-SENDS.md).
 
-[Header contract](include/marmot.h#L14578)
+[Header contract](include/marmot.h#L14579)
 
 ### `marmot_send_text_with_client_token`
 
@@ -5994,7 +5994,7 @@ void marmot_audit_log_tracker_update_result_v5_free(struct MarmotAuditLogTracker
 
 Free the additive v5-aware tracker result returned by `marmot_post_audit_log_tracker_update_v5`, including its nested v5 summary and v4 upload list. NULL is a no-op. The historical result keeps its existing layout and free function.
 
-[Header contract](include/marmot.h#L14806)
+[Header contract](include/marmot.h#L14807)
 
 ### `marmot_audit_otlp_config_v5_free`
 
@@ -6004,7 +6004,7 @@ void marmot_audit_otlp_config_v5_free(struct MarmotAuditOtlpConfigV5 *ptr);
 
 Free the redacted configuration returned by `marmot_set_audit_otlp_config_v5`. The returned bearer token pointer is NULL; the host remains responsible for its borrowed input strings. NULL is a no-op.
 
-[Header contract](include/marmot.h#L14796)
+[Header contract](include/marmot.h#L14797)
 
 ### `marmot_post_audit_log_tracker_update_v5`
 
@@ -6039,7 +6039,7 @@ uint64_t marmot_max_file_media_ciphertext_bytes(void);
 
 Return the finite per-batch ciphertext implementation bound, including a 16-byte AEAD tag for each attachment. It is not a server maximum or a preview/heap limit. No allocation is returned.
 
-[Header contract](include/marmot.h#L13032)
+[Header contract](include/marmot.h#L13033)
 
 ### `marmot_media_file_transfer_control_cancel`
 
@@ -6049,7 +6049,7 @@ MarmotStatus marmot_media_file_transfer_control_cancel(const struct MarmotMediaF
 
 Cancel snapshot preparation, transfer or fallback. Cancellation observed before message admission starts prevents publication; admission is not interruptible once started, even before durable acceptance returns. Delivery then belongs to the local-send queue. May run concurrently with the upload; never free the control while any call on it is active.
 
-[Header contract](include/marmot.h#L13004)
+[Header contract](include/marmot.h#L13005)
 
 ### `marmot_media_file_transfer_control_free`
 
@@ -6059,7 +6059,7 @@ void marmot_media_file_transfer_control_free(struct MarmotMediaFileTransferContr
 
 Release the control after upload and all query/cancel calls return. NULL is accepted. Freeing is not cancellation; use the explicit cancel method before releasing an active operation.
 
-[Header contract](include/marmot.h#L13027)
+[Header contract](include/marmot.h#L13028)
 
 ### `marmot_media_file_transfer_control_is_cancelled`
 
@@ -6069,7 +6069,7 @@ MarmotStatus marmot_media_file_transfer_control_is_cancelled(const struct Marmot
 
 Read cancellation into a required output (0 or 1). The output is cleared before input validation. May run concurrently with upload; the handle must remain live throughout the call.
 
-[Header contract](include/marmot.h#L13011)
+[Header contract](include/marmot.h#L13012)
 
 ### `marmot_media_file_transfer_control_new`
 
@@ -6079,7 +6079,7 @@ MarmotStatus marmot_media_file_transfer_control_new(struct MarmotMediaFileTransf
 
 Create one owned control per file upload. The required output is checked and cleared before allocation. Keep it live through the blocking upload, and release it with `marmot_media_file_transfer_control_free` after all calls return; do not reuse a cancelled control.
 
-[Header contract](include/marmot.h#L12996)
+[Header contract](include/marmot.h#L12997)
 
 ### `marmot_media_file_transfer_control_processed_bytes`
 
@@ -6089,7 +6089,7 @@ MarmotStatus marmot_media_file_transfer_control_processed_bytes(const struct Mar
 
 Read monotonic processed bytes into a required cleared output. It counts the copy into the encrypted media store, the digest pass and the transfer, including retries, so it can exceed the source length; this is not a percentage. Query concurrently without freeing the handle.
 
-[Header contract](include/marmot.h#L13019)
+[Header contract](include/marmot.h#L13020)
 
 ### `marmot_upload_media_files`
 
@@ -6099,7 +6099,7 @@ MarmotStatus marmot_upload_media_files(const struct MarmotClient *client, const 
 
 Blocking file-backed upload using borrowed regular-file inputs, copied into the account's encrypted media store before PUT; `MARMOT_STATUS_STORAGE_FULL` when the disk cannot hold a source beyond its reserve, before anything is uploaded. Use off the UI thread and keep strings, request and source paths valid until return. Required output preflight precedes work. Ordered fallback preserves identical ciphertext; signer denial/cancellation stops. Free the owned result with `marmot_media_upload_result_free`. See the [shared contract](../marmot-uniffi/README.md#file-backed-media-upload).
 
-[Header contract](include/marmot.h#L13039)
+[Header contract](include/marmot.h#L13040)
 
 ### `marmot_upload_media_files_with_client_token`
 
@@ -6109,7 +6109,7 @@ MarmotStatus marmot_upload_media_files_with_client_token(const struct MarmotClie
 
 Token-aware blocking twin: upload all files, then optionally admit the resulting message when `send` is set. Keep one token for the logical submission and probe `marmot_local_send_status` after an interrupted/unknown outcome before reuploading. Input and control lifetimes match `marmot_upload_media_files`; free the result with `marmot_media_upload_submission_free`. Admission is not interruptible once started and does not certify relay delivery. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
-[Header contract](include/marmot.h#L13052)
+[Header contract](include/marmot.h#L13053)
 
 </details>
 
@@ -6121,7 +6121,7 @@ MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const stru
 
 Compare the opaque `draft_version` from a presented chat-list row with a live captured draft revision. Returns 1 only for the same account-store/group scope at or before that captured revision; foreign and newer versions return 0. Borrow both opaque handles for the call while their owning selected draft and presented row remain live and supply a non-NULL output byte, which is reset on errors. Treat the version as private presentation correlation: never parse, log or persist it, and never use it to select a newer draft for deletion. Revision-checked draft cleanup remains authoritative. Regenerate bindings and consume the matching native binary before adopting this added row field.
 
-[Header contract](include/marmot.h#L14515)
+[Header contract](include/marmot.h#L14516)
 
 <details>
 <summary>Account attachment history</summary>
@@ -6209,7 +6209,7 @@ void marmot_moderation_report_outcome_free(struct MarmotModerationReportOutcome 
 
 Free a value of this type returned by this library. NULL is a no-op.
 
-[Header contract](include/marmot.h#L15987)
+[Header contract](include/marmot.h#L15988)
 
 ### `marmot_moderation_reporting_available`
 
@@ -6234,7 +6234,7 @@ void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr
 
 Release the owned native-startup snapshot and both record arrays returned by `marmot_startup_diagnostics_snapshot`. Passing NULL is safe. Do not free embedded records separately or retain pointers after this call.
 
-[Header contract](include/marmot.h#L16036)
+[Header contract](include/marmot.h#L16037)
 
 ### `marmot_set_startup_diagnostics_enabled`
 
@@ -6294,7 +6294,7 @@ void marmot_public_event_preview_free(struct MarmotPublicEventPreview *ptr);
 
 Free one `MarmotPublicEventPreview` returned by `marmot_resolve_public_event_preview`, including its strings. NULL is a no-op.
 
-[Header contract](include/marmot.h#L16017)
+[Header contract](include/marmot.h#L16018)
 
 ### `marmot_public_event_preview_list_free`
 
@@ -6304,7 +6304,7 @@ void marmot_public_event_preview_list_free(struct MarmotPublicEventPreviewList *
 
 Free a `MarmotPublicEventPreviewList` and every row in it. Do not free individual rows. NULL is a no-op.
 
-[Header contract](include/marmot.h#L16026)
+[Header contract](include/marmot.h#L16027)
 
 ### `marmot_resolve_public_event_preview`
 
@@ -6421,7 +6421,7 @@ MarmotStatus marmot_deployment_set_moderation_label_namespace(struct MarmotDeplo
 
 Set the NIP-32 namespace on moderation report labels, which the operator's report parser matches, or unset it with NULL. With no namespace, `marmot_configure_moderation_reporting` refuses a destination.
 
-[Header contract](include/marmot.h#L12918)
+[Header contract](include/marmot.h#L12919)
 
 ### `marmot_deployment_set_keychain_service`
 
@@ -6431,7 +6431,7 @@ MarmotStatus marmot_deployment_set_keychain_service(struct MarmotDeployment *dep
 
 Set the platform keychain service used for account secrets when no secret store is supplied. A blank name is the neutral one. Changing it for an existing install strands the secrets stored under the old name.
 
-[Header contract](include/marmot.h#L12928)
+[Header contract](include/marmot.h#L12929)
 
 ### `marmot_deployment_set_relay_event_limits`
 
@@ -6439,9 +6439,9 @@ Set the platform keychain service used for account secrets when no secret store 
 MarmotStatus marmot_deployment_set_relay_event_limits(struct MarmotDeployment *deployment, const char *const *relays, const uint64_t *max_event_bytes, uintptr_t len);
 ```
 
-Replace the largest event, in bytes of serialized event JSON, each listed relay accepts when it does not advertise it: `relays[i]` takes `max_event_bytes[i]`. MDK sends no event over a relay's known limit, and a send that fits none of its relays fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero limit is ignored, a relay listed twice keeps the smaller limit, and NULL with 0 clears the list.
+Replace the largest event, in bytes of serialized event JSON, each listed relay accepts when it does not advertise it: `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event, Welcome or account-signed event over a relay's known limit. A send that fits none of its relays reaches none, and a call that returns relay errors then fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero limit is ignored, a relay listed twice keeps the smaller limit, and NULL with 0 clears the list.
 
-[Header contract](include/marmot.h#L12907)
+[Header contract](include/marmot.h#L12908)
 
 </details>
 
@@ -6466,7 +6466,7 @@ void marmot_backup_history_availability_list_free(struct MarmotBackupHistoryAvai
 
 Deep-free the owned availability list and its strings; NULL is allowed. Do not free its embedded elements separately.
 
-[Header contract](include/marmot.h#L14845)
+[Header contract](include/marmot.h#L14846)
 
 ### `marmot_backup_restore_status`
 
@@ -6486,7 +6486,7 @@ void marmot_backup_restore_status_free(struct MarmotBackupRestoreStatus *ptr);
 
 Deep-free an owned status and its optional operation token. NULL is allowed. Do not free callback-borrowed status pointers.
 
-[Header contract](include/marmot.h#L14836)
+[Header contract](include/marmot.h#L14837)
 
 ### `marmot_backup_restore_subscription_clear_callback`
 
@@ -6496,7 +6496,7 @@ MarmotStatus marmot_backup_restore_subscription_clear_callback(const struct Marm
 
 Stop future observer callbacks; an already running callback may still use user_data. This does not cancel restore or wait for that callback. Preserve user_data until all invocations finish.
 
-[Header contract](include/marmot.h#L14197)
+[Header contract](include/marmot.h#L14198)
 
 ### `marmot_backup_restore_subscription_free`
 
@@ -6506,7 +6506,7 @@ void marmot_backup_restore_subscription_free(struct MarmotBackupRestoreSubscript
 
 Release the observer handle before its client, with no concurrent calls using it. Restore continues until explicit cancellation, terminal completion or worker shutdown; running callbacks retain the usual lifetime obligations.
 
-[Header contract](include/marmot.h#L14209)
+[Header contract](include/marmot.h#L14210)
 
 ### `marmot_backup_restore_subscription_next`
 
@@ -6516,7 +6516,7 @@ MarmotStatus marmot_backup_restore_subscription_next(const struct MarmotBackupRe
 
 Wait for a progress/availability revision. Zero timeout waits indefinitely; TIMEOUT or CLOSED returns no item. On OK, free the owned status with `marmot_backup_restore_status_free`. Closing observation never cancels the job.
 
-[Header contract](include/marmot.h#L14168)
+[Header contract](include/marmot.h#L14169)
 
 ### `marmot_backup_restore_subscription_set_callback`
 
@@ -6526,7 +6526,7 @@ MarmotStatus marmot_backup_restore_subscription_set_callback(const struct Marmot
 
 Install a progress observer. Item pointers are borrowed only during the callback and must not be freed. Keep user_data alive through any running callback; clear/free does not cancel restore or join callbacks.
 
-[Header contract](include/marmot.h#L14185)
+[Header contract](include/marmot.h#L14186)
 
 ### `marmot_backup_restore_subscription_snapshot`
 
@@ -6536,7 +6536,7 @@ MarmotStatus marmot_backup_restore_subscription_snapshot(const struct MarmotBack
 
 Take the initial status once. OK with NULL means already consumed; free a non-NULL status with `marmot_backup_restore_status_free`. Use next or callbacks for subsequent revisions.
 
-[Header contract](include/marmot.h#L14229)
+[Header contract](include/marmot.h#L14230)
 
 ### `marmot_backup_settings`
 
@@ -6556,7 +6556,7 @@ void marmot_backup_settings_free(struct MarmotBackupSettings *ptr);
 
 Deep-free an owned settings record; NULL is allowed. This changes no backup settings.
 
-[Header contract](include/marmot.h#L14826)
+[Header contract](include/marmot.h#L14827)
 
 ### `marmot_begin_backup_restore`
 
@@ -6616,7 +6616,7 @@ void marmot_recovery_words_free(struct MarmotRecoveryWords *ptr);
 
 Erase the returned word buffers, then deep-free the record and confirmation positions; NULL is allowed. It does not erase host copies or earlier managed/FFI copies. This is not the pending setup cancel command.
 
-[Header contract](include/marmot.h#L14816)
+[Header contract](include/marmot.h#L14817)
 
 ### `marmot_run_due_backup_pass`
 
@@ -6666,7 +6666,7 @@ MarmotStatus marmot_watch_backup_restore(const struct MarmotClient *client, cons
 
 Create an observer for initial snapshot and later aggregate revisions. Free the handle before the client; freeing it does not cancel restore. Read snapshot once, then use next or callbacks with their usual ownership rules.
 
-[Header contract](include/marmot.h#L14218)
+[Header contract](include/marmot.h#L14219)
 
 </details>
 
@@ -6716,7 +6716,7 @@ void marmot_emoji_set_asset_free(struct MarmotEmojiSetAsset *ptr);
 
 Frees a preview asset and its bytes. NULL is safe.
 
-[Header contract](include/marmot.h#L15065)
+[Header contract](include/marmot.h#L15066)
 
 ### `marmot_emoji_set_cover_free`
 
@@ -6726,7 +6726,7 @@ void marmot_emoji_set_cover_free(struct MarmotEmojiSetCover *ptr);
 
 Frees a cover image and its bytes. NULL is safe.
 
-[Header contract](include/marmot.h#L15075)
+[Header contract](include/marmot.h#L15076)
 
 ### `marmot_emoji_set_free`
 
@@ -6736,7 +6736,7 @@ void marmot_emoji_set_free(struct MarmotEmojiSet *ptr);
 
 Frees one emoji set, its entries, skips and installed state. NULL is safe.
 
-[Header contract](include/marmot.h#L15016)
+[Header contract](include/marmot.h#L15017)
 
 ### `marmot_emoji_set_install_control_cancel`
 
@@ -6746,7 +6746,7 @@ MarmotStatus marmot_emoji_set_install_control_cancel(const struct MarmotEmojiSet
 
 Cancel the install from any thread: no new download starts, those in flight are dropped, nothing is stored and `marmot_install_emoji_set` returns `MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED`; a cancelled reinstall leaves the previous snapshot readable. Too late once the final atomic write has started. Never free the control while any call on it is active.
 
-[Header contract](include/marmot.h#L12947)
+[Header contract](include/marmot.h#L12948)
 
 ### `marmot_emoji_set_install_control_free`
 
@@ -6756,7 +6756,7 @@ void marmot_emoji_set_install_control_free(struct MarmotEmojiSetInstallControl *
 
 Release the control after the install and all query/cancel calls return. NULL is accepted. Freeing is not cancellation.
 
-[Header contract](include/marmot.h#L12971)
+[Header contract](include/marmot.h#L12972)
 
 ### `marmot_emoji_set_install_control_is_cancelled`
 
@@ -6766,7 +6766,7 @@ MarmotStatus marmot_emoji_set_install_control_is_cancelled(const struct MarmotEm
 
 Writes 1 when cancellation was requested, by the host or by runtime shutdown or close (which cancel every running install), else 0.
 
-[Header contract](include/marmot.h#L12954)
+[Header contract](include/marmot.h#L12955)
 
 ### `marmot_emoji_set_install_control_new`
 
@@ -6776,7 +6776,7 @@ MarmotStatus marmot_emoji_set_install_control_new(struct MarmotEmojiSetInstallCo
 
 Create one control per `marmot_install_emoji_set` call; it is never reused across installs. Free with `marmot_emoji_set_install_control_free`.
 
-[Header contract](include/marmot.h#L12937)
+[Header contract](include/marmot.h#L12938)
 
 ### `marmot_emoji_set_install_control_progress`
 
@@ -6786,7 +6786,7 @@ MarmotStatus marmot_emoji_set_install_control_progress(const struct MarmotEmojiS
 
 Writes entries finished (`completed_emoji`), entries to try (`total_emoji`, 0 until the install has read the stored version) and response bytes received (`transferred_bytes`, counted as each download finishes). A plain value: nothing to free.
 
-[Header contract](include/marmot.h#L12963)
+[Header contract](include/marmot.h#L12964)
 
 ### `marmot_emoji_set_install_result_free`
 
@@ -6796,7 +6796,7 @@ void marmot_emoji_set_install_result_free(struct MarmotEmojiSetInstallResult *pt
 
 Frees an install result, its set and skips. NULL is safe.
 
-[Header contract](include/marmot.h#L15045)
+[Header contract](include/marmot.h#L15046)
 
 ### `marmot_emoji_set_list_free`
 
@@ -6806,7 +6806,7 @@ void marmot_emoji_set_list_free(struct MarmotEmojiSetList *list);
 
 Frees an emoji set list and every set in it. NULL is safe.
 
-[Header contract](include/marmot.h#L15025)
+[Header contract](include/marmot.h#L15026)
 
 ### `marmot_emoji_set_sync_result_free`
 
@@ -6816,7 +6816,7 @@ void marmot_emoji_set_sync_result_free(struct MarmotEmojiSetSyncResult *ptr);
 
 Frees an emoji set sync result. NULL is safe.
 
-[Header contract](include/marmot.h#L15035)
+[Header contract](include/marmot.h#L15036)
 
 ### `marmot_emoji_sets`
 
@@ -6866,7 +6866,7 @@ MarmotStatus marmot_install_emoji_set(const struct MarmotClient *client, const c
 
 Snapshots the stored set version, downloads and validates each emoji once, and stores the bytes and SHA-256. Skipped entries are listed, not fatal. Reveals the user's IP address to the set's image hosts: call only after the user taps Install. `expected_event_id_hex` is the version the user was shown: another stored version is `MARMOT_STATUS_EMOJI_SET_CHANGED` (detail names the current id) and nothing stored is `MARMOT_STATUS_EMOJI_SET_NOT_FOUND`, both before any download. `control` (from `marmot_emoji_set_install_control_new`) reports progress and cancels; a cancelled install, or one stopped by runtime shutdown or close, is `MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED` and stores nothing. Free with `marmot_emoji_set_install_result_free`.
 
-[Header contract](include/marmot.h#L12984)
+[Header contract](include/marmot.h#L12985)
 
 ### `marmot_installed_custom_emoji`
 
@@ -6886,7 +6886,7 @@ void marmot_installed_custom_emoji_asset_free(struct MarmotInstalledCustomEmojiA
 
 Frees an installed emoji asset and its bytes. NULL is safe.
 
-[Header contract](include/marmot.h#L15104)
+[Header contract](include/marmot.h#L15105)
 
 ### `marmot_installed_custom_emoji_free`
 
@@ -6896,7 +6896,7 @@ void marmot_installed_custom_emoji_free(struct MarmotInstalledCustomEmoji *ptr);
 
 Frees one installed emoji record. NULL is safe.
 
-[Header contract](include/marmot.h#L15085)
+[Header contract](include/marmot.h#L15086)
 
 ### `marmot_installed_custom_emoji_list_free`
 
@@ -6906,7 +6906,7 @@ void marmot_installed_custom_emoji_list_free(struct MarmotInstalledCustomEmojiLi
 
 Frees an installed emoji list. NULL is safe.
 
-[Header contract](include/marmot.h#L15094)
+[Header contract](include/marmot.h#L15095)
 
 ### `marmot_read_installed_custom_emoji`
 
@@ -6956,7 +6956,7 @@ void marmot_user_emoji_list_free(struct MarmotUserEmojiList *ptr);
 
 Frees a user emoji list, its sets and missing coordinates. NULL is safe.
 
-[Header contract](include/marmot.h#L15055)
+[Header contract](include/marmot.h#L15056)
 
 </details>
 
@@ -6995,7 +6995,7 @@ void marmot_relay_liveness_free(struct MarmotRelayLiveness *ptr);
 Deep-free a record returned by `marmot_reconnect_relay`, including its URL and optional error string.
 NULL is a no-op. Never free a record embedded in a list or borrowed by a callback separately.
 
-[Header contract](include/marmot.h#L15608)
+[Header contract](include/marmot.h#L15609)
 
 ### `marmot_relay_liveness_list_free`
 
@@ -7006,7 +7006,7 @@ void marmot_relay_liveness_list_free(struct MarmotRelayLivenessList *list);
 Deep-free a snapshot list and all its nested records and strings. NULL is a no-op.
 Use only for owned getter, snapshot, or blocking-next results, never callback payloads.
 
-[Header contract](include/marmot.h#L15617)
+[Header contract](include/marmot.h#L15618)
 
 ### `marmot_relay_liveness_subscription_clear_callback`
 
@@ -7017,7 +7017,7 @@ MarmotStatus marmot_relay_liveness_subscription_clear_callback(const struct Marm
 Request cancellation of the installed callback pump without closing the observer. The call does not wait for an
 executing callback and does not guarantee a terminal callback. Keep `user_data` live until callbacks are quiescent.
 
-[Header contract](include/marmot.h#L14062)
+[Header contract](include/marmot.h#L14063)
 
 ### `marmot_relay_liveness_subscription_cancel`
 
@@ -7028,7 +7028,7 @@ MarmotStatus marmot_relay_liveness_subscription_cancel(const struct MarmotRelayL
 Close only this observer; pending and future reads return `MARMOT_STATUS_CLOSED`. The account's connections
 remain unchanged. Free the handle separately after all concurrent calls have ended.
 
-[Header contract](include/marmot.h#L14094)
+[Header contract](include/marmot.h#L14095)
 
 ### `marmot_relay_liveness_subscription_free`
 
@@ -7039,7 +7039,7 @@ void marmot_relay_liveness_subscription_free(struct MarmotRelayLivenessSubscript
 Free the observer handle before freeing its client. NULL is a no-op. No calls may still be using the handle.
 Callback cancellation does not wait for an already executing callback; its context must remain valid.
 
-[Header contract](include/marmot.h#L14069)
+[Header contract](include/marmot.h#L14070)
 
 ### `marmot_relay_liveness_subscription_next`
 
@@ -7051,7 +7051,7 @@ Block for the next complete replacement list. Zero timeout waits indefinitely; a
 Success returns an owned list to free with `marmot_relay_liveness_list_free`. Timeout, close, and mapped read errors
 leave `out` NULL. A timed-out call consumes no update. Do not mix blocking reads with an installed callback.
 
-[Header contract](include/marmot.h#L14042)
+[Header contract](include/marmot.h#L14043)
 
 ### `marmot_relay_liveness_subscription_set_callback`
 
@@ -7063,7 +7063,7 @@ Install one callback pump instead of blocking reads. `MARMOT_STATUS_OK` accompan
 during the callback; the pump deep-frees it afterward. Terminal NULL carries `MARMOT_STATUS_CLOSED` or a mapped
 read-error status. Callbacks run on runtime workers. `user_data` must outlive every executing callback.
 
-[Header contract](include/marmot.h#L14053)
+[Header contract](include/marmot.h#L14054)
 
 ### `marmot_relay_liveness_subscription_snapshot`
 
@@ -7074,7 +7074,7 @@ MarmotStatus marmot_relay_liveness_subscription_snapshot(const struct MarmotRela
 Take the initial owned snapshot once; subsequent calls return owned empty lists. Free each result with
 `marmot_relay_liveness_list_free`. Reading the initial snapshot does not consume a later update.
 
-[Header contract](include/marmot.h#L14086)
+[Header contract](include/marmot.h#L14087)
 
 ### `marmot_subscribe_relay_liveness`
 
@@ -7086,4 +7086,4 @@ Create an account-scoped relay observer. Take its initial snapshot, then use blo
 for complete replacement lists. Intermediate states may coalesce. Close the watch when it is no longer needed,
 then free its handle before freeing the client. Client and account inputs remain borrowed.
 
-[Header contract](include/marmot.h#L14076)
+[Header contract](include/marmot.h#L14077)

@@ -38,9 +38,10 @@ pub struct MarmotDeployment {
     /// existing install strands the secrets stored under the old name.
     pub keychain_service: String,
     /// The largest event each listed relay accepts, for relays that do not
-    /// advertise it (mdk#2334). MDK sends no event over a relay's known
-    /// limit, and a send that fits none of its relays fails as
-    /// `EventTooLarge`. An unlisted relay is limited only by the message size
+    /// advertise it (mdk#2334). MDK sends no group event, Welcome or
+    /// account-signed event over a relay's known limit. A send that fits none
+    /// of its relays reaches none, and a call that returns relay errors then
+    /// fails as `EventTooLarge`. An unlisted relay is limited only by the message size
     /// its NIP-11 document advertises, and otherwise not at all.
     pub relay_event_limits: Vec<RelayEventLimit>,
 }
