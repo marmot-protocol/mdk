@@ -3638,9 +3638,9 @@ where
     /// before [`Self::publish_prepared_session_effects_with_audit_context`]
     /// exposes the commit on the wire. An invite whose commit or Welcome fits
     /// none of its relays' known limits is rolled back here instead, unsent,
-    /// as [`PreparedSessionSend::Refused`]. A queued invite is not checked:
-    /// when it drains, its commit is sent and the adapter refuses such a
-    /// Welcome, which stays owed with its size class.
+    /// as [`PreparedSessionSend::Refused`]. A queued invite is judged by the
+    /// same check when it drains, before its commit is published, and one
+    /// that fits none is retired unsent as `QueuedIntentRefused`.
     pub async fn confirm_commit_without_publish_with_audit_context(
         &mut self,
         intent: SendIntent,
