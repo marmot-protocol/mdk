@@ -579,6 +579,11 @@ pub enum AppGroupHydrationQuarantineReason {
     GroupRecordLoadFailed,
     /// Hydrate found a stranded pending commit, but recovery itself failed.
     PendingCommitRecoveryFailed,
+    /// A read of past group state could not restore the live group, which
+    /// sits on that past state, in session or at account open. A retry or
+    /// re-join cannot clear it, and the next account open restores the live
+    /// state.
+    RewindRestoreFailed,
 }
 
 impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason {
@@ -591,6 +596,7 @@ impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason 
             GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
                 Self::PendingCommitRecoveryFailed
             }
+            GroupHydrationQuarantineReason::RewindRestoreFailed => Self::RewindRestoreFailed,
         }
     }
 }

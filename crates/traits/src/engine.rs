@@ -735,6 +735,15 @@ pub enum GroupHydrationQuarantineReason {
     GroupRecordLoadFailed,
     /// Hydrate found a stranded pending commit, but recovery itself failed.
     PendingCommitRecoveryFailed,
+    /// A read of past group state rewound the live group onto a retained
+    /// anchor and could not restore it, so the stored group sits on that past
+    /// state; or it restored the live state but could not release the copy it
+    /// restored from. Opening the account restores that copy before anything
+    /// reads the group, and quarantines the group for this reason if that
+    /// restore fails too. Neither a hydration retry nor a re-join clears it:
+    /// the group stays quarantined until the account is reopened. Input that
+    /// arrives meanwhile is retained and replays then.
+    RewindRestoreFailed,
 }
 
 /// Encrypted-media exporter secret carried on [`GroupEvent::MessageReceived`].

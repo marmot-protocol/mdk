@@ -95,7 +95,7 @@ impl<S: StorageProvider> Engine<S> {
             }));
         }
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
-        let existing = self.storage.get_group(&group_id)?;
+        let existing = self.live_group_record(&group_id)?;
         let parsed_kp = self.link_key_package(&mls_group, &existing, &key_package)?;
         validate_link_roster_update(&roster_update)?;
 
@@ -246,7 +246,7 @@ impl<S: StorageProvider> Engine<S> {
             }));
         }
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
-        let existing = self.storage.get_group(&group_id)?;
+        let existing = self.live_group_record(&group_id)?;
         let account = crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         // The leaf may already be gone, removed by another Commit or by its
         // device leaving; the roster entry goes either way, so a failed link

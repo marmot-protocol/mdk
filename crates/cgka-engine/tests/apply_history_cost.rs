@@ -17,6 +17,9 @@
 //! below the retained-anchor rewind horizon, the common case for a long-lived
 //! group.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};

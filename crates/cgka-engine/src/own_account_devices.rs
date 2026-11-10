@@ -195,7 +195,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             let account =
                 crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
-            let existing = self.storage.get_group(group_id)?;
+            let existing = self.live_group_record(group_id)?;
             let checked = self
                 .own_account_key_packages(
                     mls_group,
@@ -290,7 +290,7 @@ impl<S: StorageProvider> Engine<S> {
             }));
         }
         let account = crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
-        let existing = self.storage.get_group(&group_id)?;
+        let existing = self.live_group_record(&group_id)?;
         let key_packages: Vec<KeyPackage> = siblings
             .iter()
             .map(|sibling| sibling.key_package.clone())
@@ -499,14 +499,12 @@ impl<S: StorageProvider> Engine<S> {
         // Creation uses this same admission before its first Group record is
         // inserted. A fresh membership has no departure history. All other
         // read failures remain errors; no historical hold is guessed.
-        let departed = match self
-            .storage
-            .get_group(&GroupId::new(mls_group.group_id().as_slice().to_vec()))
-        {
-            Ok(group) => group.self_removed_sibling_slots,
-            Err(StorageError::NotFound) => Default::default(),
-            Err(error) => return Err(error.into()),
-        };
+        let departed =
+            match self.live_group_record(&GroupId::new(mls_group.group_id().as_slice().to_vec())) {
+                Ok(group) => group.self_removed_sibling_slots,
+                Err(EngineError::Storage(StorageError::NotFound)) => Default::default(),
+                Err(error) => return Err(error),
+            };
         let mut slots = HashSet::new();
         for sibling in siblings {
             if sibling.key_package.source.is_some() {
@@ -863,10 +861,16 @@ impl<S: StorageProvider> Engine<S> {
         }
         let terminal_chat = self.epoch_manager.is_unrecoverable(&record.group_id)
             || self.epoch_manager.is_disbanded(&record.group_id)
-            || match self.storage.get_group(&record.group_id) {
+            || match self.live_group_record(&record.group_id) {
                 Ok(group) => group.disbanded.is_some(),
-                Err(StorageError::NotFound) => true,
-                Err(error) => return Err(error.into()),
+                Err(EngineError::Storage(StorageError::NotFound)) => true,
+                // A quarantined group's record is not live state (mdk#364,
+                // mdk#3272). The disband tombstone, written with the record's
+                // marker and outside every snapshot, answers from live state.
+                Err(EngineError::UnknownGroup(_)) => {
+                    self.storage.disband_tombstone(&record.group_id)?.is_some()
+                }
+                Err(error) => return Err(error),
             };
         let disposition = if terminal_chat {
             Withdrawn

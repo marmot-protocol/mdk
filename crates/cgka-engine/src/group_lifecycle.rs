@@ -331,6 +331,8 @@ impl<S: StorageProvider> Engine<S> {
     /// OpenMLS refuses an id with live state on its own, but a removed or
     /// forgotten copy can keep a Marmot record without it, and the cleanup
     /// guard of a failed creation would delete that record.
+    // A quarantined group's id is taken too (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     fn ensure_chosen_group_id_is_free(&self, group_id: &GroupId) -> Result<(), EngineError> {
         if !(1..=MAX_CHOSEN_GROUP_ID_LEN).contains(&group_id.as_slice().len()) {
             return Err(EngineError::Other(format!(
@@ -1186,6 +1188,15 @@ impl<S: StorageProvider> Engine<S> {
             let Some(rejoin) = &mut candidate.rejoin else {
                 continue;
             };
+            // A failed rewind restore left this group's OpenMLS state on a
+            // retained anchor until the next open (mdk#3272), so its token
+            // would offer the anchor branch for consent. Every other
+            // quarantine keeps genuine local state, and a re-join repairs it.
+            if self.quarantined_reason(&candidate.group_id)
+                == Some(cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
+            {
+                continue;
+            }
             let group = match MlsGroup::load(
                 provider.storage(),
                 &openmls::group::GroupId::from_slice(candidate.group_id.as_slice()),
@@ -1239,7 +1250,7 @@ impl<S: StorageProvider> Engine<S> {
                 }
             };
             if self.ensure_hydrated(&candidate.group_id).is_err()
-                || self.quarantined_groups.contains_key(&candidate.group_id)
+                || self.quarantined_reason(&candidate.group_id).is_some()
             {
                 tracing::debug!(target: "cgka_engine::group_lifecycle",
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
@@ -1281,6 +1292,14 @@ impl<S: StorageProvider> Engine<S> {
             .rejoin
             .as_ref()
             .ok_or(EngineError::InvalidWelcome)?;
+        // The local branch is a retained anchor's until the next open
+        // (mdk#3272): no token can consent to discarding it. The offer stays
+        // stored and is offered again then.
+        if self.quarantined_reason(&candidate.group_id)
+            == Some(cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
+        {
+            return Err(EngineError::UnknownGroup(candidate.group_id));
+        }
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group = MlsGroup::load(
             provider.storage(),
@@ -1632,11 +1651,32 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
+            // A failed rewind restore left this group's stored state on a
+            // retained anchor, and the next open restores its kept live state
+            // over anything written meanwhile (mdk#3272), so unlike the other
+            // reasons this quarantine does not yield to a re-join. Refuse
+            // non-terminally, like the held publication below, so the same
+            // Welcome retries.
+            if self.quarantined_reason(&group_id)
+                == Some(cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
+            {
+                return Err(EngineError::InvalidTransition(
+                    cgka_traits::engine_state::InvalidTransition {
+                        from: "RewindRestoreFailed",
+                        to: "JoinWelcome",
+                        reason: "a failed rewind restore quarantines the group until the next open",
+                    },
+                ));
+            }
+
             let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
             let mut confirmation_token = None;
             // The discarded local copy's record, read once: the join needs its
             // membership and `unrecoverable` flag here, and its `removed` flag
-            // and epoch in the post-commit tail.
+            // and epoch in the post-commit tail. A re-join replaces a copy in
+            // any other quarantine, so this reads the record the gate refuses
+            // (see clippy.toml).
+            #[allow(clippy::disallowed_methods)]
             let discarded = match storage.get_group(&group_id) {
                 Ok(group) => Some(group),
                 Err(cgka_traits::storage::StorageError::NotFound) if consent.is_some() => {
@@ -2306,7 +2346,7 @@ impl<S: StorageProvider> Engine<S> {
         // and publish_failed re-derive from MLS state. Reading from
         // Marmot keeps `members()` consistent with the engine's reported
         // `EpochState` even during `PendingPublish`.
-        let group = self.storage.get_group(group_id)?;
+        let group = self.live_group_record(group_id)?;
         Ok(group.members)
     }
 
@@ -2584,14 +2624,17 @@ impl<S: StorageProvider> Engine<S> {
     /// supersedes the removal that set it — the convergence reorg path
     /// re-derives membership from the selected canonical branch
     /// (`emit_convergence_events`).
+    ///
+    /// Refused with `UnknownGroup` for a quarantined group, like
+    /// [`Self::live_group_record`]: its stored record is not live state.
     pub(crate) fn stored_group_record(
         &self,
         group_id: &GroupId,
     ) -> Result<Option<Group>, EngineError> {
-        match self.storage.get_group(group_id) {
+        match self.live_group_record(group_id) {
             Ok(group) => Ok(Some(group)),
-            Err(StorageError::NotFound) => Ok(None),
-            Err(err) => Err(EngineError::Storage(err)),
+            Err(EngineError::Storage(StorageError::NotFound)) => Ok(None),
+            Err(err) => Err(err),
         }
     }
 

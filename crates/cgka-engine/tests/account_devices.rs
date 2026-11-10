@@ -22,6 +22,9 @@
 //! refuses a crafted Welcome). Before a group requires 0x800d, its data is
 //! accepted like any unknown component's, and only an admin's Welcome joins.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::account_identity_proof_component;
 use cgka_engine::canonicalization::{CanonicalizationResult, DroppedMessageReason};

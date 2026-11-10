@@ -48,10 +48,10 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(Vec::new());
         }
-        let group = match self.storage.get_group(group_id) {
+        let group = match self.live_group_record(group_id) {
             Ok(group) => group,
-            Err(StorageError::NotFound) => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
+            Err(EngineError::Storage(StorageError::NotFound)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
         };
         if group.is_terminal() || group.unrecoverable {
             return Ok(Vec::new());
@@ -212,7 +212,7 @@ impl<S: StorageProvider> Engine<S> {
         if messages.is_empty() {
             return Ok(AdvanceConvergenceStatus::Settled);
         }
-        let tip = self.storage.get_group(group_id)?.epoch.0;
+        let tip = self.live_group_record(group_id)?.epoch.0;
         let policy = self
             .convergence_policy_for_group(group_id)
             .map_err(replay_error)?;

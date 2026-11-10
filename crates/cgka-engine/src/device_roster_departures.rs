@@ -27,6 +27,8 @@ pub(crate) fn capture(group: &MlsGroup) -> Result<Option<BeforeRoster>, EngineEr
     }))
 }
 
+// Runs inside publish confirm's and the pass apply's transactions, which act only on a live group (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn record<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,

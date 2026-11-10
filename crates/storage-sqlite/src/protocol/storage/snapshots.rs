@@ -31,6 +31,13 @@ pub(super) fn list(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageR
     lifecycle::list(store, group_id)
 }
 
+pub(crate) fn list_with_prefixes(
+    store: &SqliteAccountStorage,
+    prefixes: &[&str],
+) -> StorageResult<Vec<(GroupId, String)>> {
+    lifecycle::list_with_prefixes(store, prefixes)
+}
+
 pub(super) fn rollback(
     store: &SqliteAccountStorage,
     group_id: &GroupId,
@@ -410,6 +417,49 @@ mod tests {
         );
         assert_eq!(store.get_group(&group.id).unwrap(), group);
         assert_eq!(store.get_message(&message.id).unwrap(), message);
+    }
+
+    // Engine construction runs this listing on every account open, so its
+    // cost must not grow with snapshot bodies: it finds each group's matching
+    // names in one scan of the key index.
+    #[test]
+    fn listing_snapshots_by_prefix_finds_every_group_from_the_key_index() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        for n in 1..=3 {
+            store.put_group(&sample_group(gid(n), 0, 1)).unwrap();
+        }
+        for (group, name) in [
+            (gid(1), "guard-a"),
+            (gid(1), "anchor-0"),
+            (gid(3), "other-b"),
+            (gid(3), "anchor-0"),
+        ] {
+            store.create_group_state_snapshot(&group, name).unwrap();
+        }
+
+        let mut found = store
+            .list_snapshots_with_prefixes(&["guard-", "other-"])
+            .unwrap();
+        found.sort_by(|a, b| (a.0.as_slice(), &a.1).cmp(&(b.0.as_slice(), &b.1)));
+        assert_eq!(
+            found,
+            vec![
+                (gid(1), "guard-a".to_string()),
+                (gid(3), "other-b".to_string())
+            ]
+        );
+        assert!(store.list_snapshots_with_prefixes(&[]).unwrap().is_empty());
+
+        let plan: String = store
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {}", super::lifecycle::SNAPSHOT_KEYS),
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("USING COVERING INDEX"), "{plan}");
     }
 
     #[test]

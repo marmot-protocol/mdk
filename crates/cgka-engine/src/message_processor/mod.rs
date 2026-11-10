@@ -10,6 +10,8 @@
 
 mod application_replay;
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 #[path = "tests/application_replay.rs"]
 mod application_replay_tests;
 mod ingest;
@@ -92,6 +94,8 @@ pub(crate) struct LocalGroupTermination {
 
 /// Persist the entire terminal transition inside the caller's transaction.
 /// No engine events, caches, or capacity counters change before commit.
+// Runs inside a termination its caller reached through a gated read: eviction, the pass's membership effects, or a live group's queue discard (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn prepare_local_group_termination<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -876,7 +880,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<(), EngineError> {
         if has_addition
             && self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
-            && self.storage.get_group(group_id)?.protocol_profile
+            && self.live_group_record(group_id)?.protocol_profile
                 == cgka_traits::group::ProtocolProfile::Legacy
         {
             return Err(EngineError::InvalidTransition(
@@ -1951,7 +1955,7 @@ impl<S: StorageProvider> Engine<S> {
         // Already-quarantined groups keep their pre-existing semantics
         // (`ensure_hydrated` no-ops; converge reports the blocked run).
         self.ensure_hydrated(group_id)?;
-        let initial_epoch = self.storage.get_group(group_id)?.epoch;
+        let initial_epoch = self.live_group_record(group_id)?.epoch;
         let yield_for_transport_redelivery = self
             .deferred_peel
             .get(group_id)
@@ -1970,7 +1974,7 @@ impl<S: StorageProvider> Engine<S> {
             // the caller gets another opportunity to redeliver it.
             if yield_for_transport_redelivery
                 && matches!(execution, DeferredPeelExecution::Background { .. })
-                && self.storage.get_group(group_id)?.epoch != initial_epoch
+                && self.live_group_record(group_id)?.epoch != initial_epoch
             {
                 self.schedule_pending_convergence_group(group_id);
                 return Ok(AdvanceConvergenceStatus::Pending);
@@ -2068,10 +2072,15 @@ impl<S: StorageProvider> Engine<S> {
         if self.has_unresolved_non_record_convergence_state(group_id)? {
             return Ok(true);
         }
-        let group = match self.storage.get_group(group_id) {
+        let group = match self.live_group_record(group_id) {
             Ok(group) => group,
-            Err(StorageError::NotFound) => return Ok(false),
-            Err(e) => return Err(EngineError::Storage(e)),
+            // A quarantined group's record is refused, and like a group with
+            // no record it has no input this device can resolve until it
+            // returns.
+            Err(EngineError::Storage(StorageError::NotFound) | EngineError::UnknownGroup(_)) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
         };
         let (anchor, ceiling) = self.convergence_gate_horizon(group_id, &group)?;
         // Indexed fast path: `any_gating_convergence_input` can only report a
@@ -2493,9 +2502,13 @@ impl<S: StorageProvider> Engine<S> {
     ///   reconstruction. `Engine::enter_hydration_quarantine` moves the group's
     ///   bytes out of the account total at that moment (and
     ///   `leave_hydration_quarantine` back in), so the ordering cannot change
-    ///   the total.
+    ///   the total. For that reason this reads the quarantine map itself, not
+    ///   [`Engine::quarantined_reason`]: a failed rewind restore (mdk#3272)
+    ///   counts from the moment `Engine::quarantine_failed_rewinds` moves it
+    ///   into the map, which is when its bytes leave the total.
     pub(crate) fn deferred_peel_sweep_is_blocked(&self, group_id: &GroupId) -> bool {
-        self.quarantined_reason(group_id).is_some() || self.epoch_manager.is_unrecoverable(group_id)
+        self.quarantined_groups.contains_key(group_id)
+            || self.epoch_manager.is_unrecoverable(group_id)
     }
 
     async fn retry_deferred_peels_with_execution(
@@ -2518,7 +2531,9 @@ impl<S: StorageProvider> Engine<S> {
         };
         // Durably blocked: quarantined or halted Unrecoverable. This is the
         // same question `ensure_peel_deferred_usage_initialized` asks when it
-        // decides whose rows the account budget is bounding.
+        // decides whose rows the account budget is bounding. A failed rewind
+        // restore quarantines first, so the check sees it (mdk#3272).
+        self.quarantine_failed_rewinds();
         if self.deferred_peel_sweep_is_blocked(group_id) {
             self.note_foreground_deferred_phase(
                 sweep_started,
@@ -2837,9 +2852,12 @@ impl<S: StorageProvider> Engine<S> {
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_miss();
             let candidate_enumeration_started = Instant::now();
-            let enumerated = match self
-                .candidate_branch_peel_with_deadline(group_id, execution.replay_deadline())
-            {
+            let enumerated =
+                self.candidate_branch_peel_with_deadline(group_id, execution.replay_deadline());
+            // A candidate replay whose restore failed quarantines the group
+            // now (mdk#3272).
+            self.quarantine_failed_rewinds();
+            let enumerated = match enumerated {
                 Ok(Some(peel)) => peel,
                 Ok(None) => {
                     self.schedule_pending_convergence_group(group_id);
@@ -3170,7 +3188,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<DeferralLineage, EngineError> {
         self.engine_metrics.note_deferred_lineage_classification();
-        let group = self.storage.get_group(group_id)?;
+        let group = self.live_group_record(group_id)?;
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
             .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
@@ -3199,9 +3217,9 @@ impl<S: StorageProvider> Engine<S> {
         crate::openmls_projection::CandidateBranchPeel,
         DeferredPeelCandidateEnumerationFailure,
     > {
-        let group = self.storage.get_group(group_id).map_err(|error| {
+        let group = self.live_group_record(group_id).map_err(|error| {
             DeferredPeelCandidateEnumerationFailure {
-                error: error.into(),
+                error,
                 replay_probe_count: 0,
             }
         })?;
@@ -3214,6 +3232,7 @@ impl<S: StorageProvider> Engine<S> {
         let max_rewind_commits = policy.convergence.max_rewind_commits;
         crate::openmls_projection::candidate_branch_peel(
             &self.storage,
+            &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind_commits),
             max_rewind_commits,
@@ -3241,9 +3260,9 @@ impl<S: StorageProvider> Engine<S> {
             self.peel_replays.remove(group_id);
             return self.candidate_branch_peel(group_id).map(Some);
         };
-        let group = self.storage.get_group(group_id).map_err(|error| {
+        let group = self.live_group_record(group_id).map_err(|error| {
             DeferredPeelCandidateEnumerationFailure {
-                error: error.into(),
+                error,
                 replay_probe_count: 0,
             }
         })?;
@@ -3257,6 +3276,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut continuation = self.peel_replays.remove(group_id);
         let result = crate::openmls_projection::candidate_peel_slice(
             &self.storage,
+            &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind),
             max_rewind,
@@ -3671,6 +3691,11 @@ impl<S: StorageProvider> Engine<S> {
         self.deferred_peel_account.bytes = self.deferred_peel_account.bytes.saturating_add(bytes);
     }
 
+    // Reads the durable halt marker of a group entering or leaving quarantine,
+    // which the gated read refuses (see clippy.toml). After a failed rewind
+    // restore it is the anchor's record: a halted group never enters a rewind
+    // window, and a window that halts the group writes the marker.
+    #[allow(clippy::disallowed_methods)]
     fn charged_deferred_peel_bytes(&self, group_id: &GroupId) -> usize {
         if !self.deferred_peel_account.counted {
             return 0;
@@ -3688,8 +3713,9 @@ impl<S: StorageProvider> Engine<S> {
         // bytes that the next reconstruction puts back.
         if self.epoch_manager.is_unrecoverable(group_id)
             || self
-                .stored_group_record(group_id)
-                .is_ok_and(|group| group.is_some_and(|group| group.unrecoverable))
+                .storage
+                .get_group(group_id)
+                .is_ok_and(|group| group.unrecoverable)
         {
             return 0;
         }

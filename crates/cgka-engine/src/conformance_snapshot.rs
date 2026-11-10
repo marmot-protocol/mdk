@@ -316,6 +316,8 @@ pub struct ConformanceStructuralProgressSnapshot {
     pub terminal_unrecoverable: bool,
 }
 
+// The conformance snapshot reports stored state as it is (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn capture_group_snapshot<S: StorageProvider>(
     storage: &S,
     crypto: &RustCrypto,
@@ -562,9 +564,13 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
     // quiescent. Content-derived `Retryable` rows on the same copy still count:
     // they are convergence inputs the re-join's pass owns, and removal never
     // retires them.
-    let removed = engine
-        .stored_group_record(group_id)?
-        .is_some_and(|group| group.removed);
+    // The snapshot reports stored state as it is (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
+    let removed = match engine.storage.get_group(group_id) {
+        Ok(group) => group.removed,
+        Err(StorageError::NotFound) => false,
+        Err(error) => return Err(EngineError::Storage(error)),
+    };
     let parked_on_removed_copy = |message: &MessageRecord| {
         removed
             && StoredMessagePayload::decode(&message.payload)

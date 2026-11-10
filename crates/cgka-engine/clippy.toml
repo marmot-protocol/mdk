@@ -1,0 +1,11 @@
+# Engine paths read a group's stored record only through
+# `Engine::live_group_record` / `Engine::stored_group_record`, which refuse a
+# quarantined group: after a failed rewind restore its stored record is a
+# retained anchor's, not live state (mdk#3272). A read that needs a
+# quarantined group's raw record (open-time recovery and hydration, forget,
+# routing and retention of its input, code inside an already gated pass or
+# window) allows this lint at the site and says why.
+disallowed-methods = [
+    { path = "cgka_traits::storage::GroupStorage::get_group", reason = "read through Engine::live_group_record or Engine::stored_group_record, which refuse a quarantined group" },
+    { path = "cgka_traits::storage::GroupStorage::list_group_records", reason = "a listing includes quarantined groups; filter them or read through Engine::live_group_record" },
+]

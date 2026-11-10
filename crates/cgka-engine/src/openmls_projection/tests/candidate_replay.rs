@@ -359,7 +359,7 @@ fn observer_self_update_proposal(
     let before = storage.group_replay_state_fingerprint(group_id).unwrap();
     assert!(before.is_some());
     let proposal = {
-        let authoring = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+        let authoring = crate::snapshot_guard::SnapshotRollbackGuard::create_for_test(
             storage,
             group_id.clone(),
             crate::snapshot_guard::RewindSite::Replay,
@@ -456,7 +456,7 @@ async fn a_proposal_sealed_on_a_rival_branch_does_not_fail_this_path() {
     let fork_epoch = storage.get_group(&group_id).unwrap().epoch.0;
     // Seal the proposal at the sealing branch's tip, then return to the fork.
     let proposal = {
-        let on_branch = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+        let on_branch = crate::snapshot_guard::SnapshotRollbackGuard::create_for_test(
             &storage,
             group_id.clone(),
             crate::snapshot_guard::RewindSite::Replay,
@@ -630,6 +630,7 @@ fn peel(
     let epoch = storage.get_group(group_id).unwrap().epoch.0;
     candidate_branch_peel(
         storage,
+        &crate::snapshot_guard::Rewinds::default(),
         group_id,
         epoch.saturating_sub(max_rewind_commits),
         max_rewind_commits,
@@ -651,6 +652,7 @@ fn sliced_peel(
     for _ in 0..512 {
         let result = super::candidate_peel_slice(
             storage,
+            &crate::snapshot_guard::Rewinds::default(),
             group_id,
             epoch.saturating_sub(max_rewind_commits),
             max_rewind_commits,
@@ -780,7 +782,7 @@ async fn encrypted_replay_graph_fixture_with_apps(
     }
     let mut messages = Vec::new();
     for _ in 0..width {
-        let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_group_state(
+        let guard = crate::snapshot_guard::SnapshotRollbackGuard::create_for_test(
             &alice_store,
             group_id.clone(),
             crate::snapshot_guard::RewindSite::CandidateBranchSweep,
@@ -976,6 +978,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
     let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
     let expected = super::canonicalize_stored_openmls_messages_with_profile_policy(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         reconstruction_state(2),
         vec![],
@@ -995,6 +998,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
         loop {
             let output = super::canonicalize_stored_slice(
                 &storage,
+                &crate::snapshot_guard::Rewinds::default(),
                 &group_id,
                 reconstruction_state(2),
                 vec![],
@@ -1044,6 +1048,7 @@ async fn resumable_selection_and_peeling_restore_historical_state_and_match_comp
     let actual = loop {
         let output = super::candidate_peel_slice(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             0,
             64,
@@ -1175,6 +1180,7 @@ async fn resumable_frozen_membership_ignores_later_arrivals_and_new_pass_discard
     };
     let expected = super::canonicalize_stored_openmls_messages_with_profile_policy(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         reconstruction_state(1),
         vec![],
@@ -1186,6 +1192,7 @@ async fn resumable_frozen_membership_ignores_later_arrivals_and_new_pass_discard
     let advance = |slot: &mut Option<super::CanonicalReplay>, generation| {
         super::canonicalize_stored_slice(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             reconstruction_state(1),
             vec![],
@@ -1258,6 +1265,7 @@ async fn resumable_invalidation_restart_panic_and_cumulative_budget_preserve_sta
     let advance = |slot: &mut Option<super::CanonicalReplay>, options| {
         super::canonicalize_stored_slice(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             state.clone(),
             vec![],
@@ -1318,6 +1326,7 @@ async fn resumable_invalidation_restart_panic_and_cumulative_budget_preserve_sta
         .expect("eventually completes after restart");
     let expected = super::canonicalize_stored_openmls_messages_with_profile_policy(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         state.clone(),
         vec![],
@@ -1574,8 +1583,8 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
         check();
     };
     check_caught_panic();
-    // Nested transactions have no savepoint: the snapshot guard must also
-    // restore a panic caught by a caller that then commits its outer work.
+    // Inside a caller's transaction the window's savepoint undoes a panic
+    // the caller catches before it commits its outer work.
     storage
         .with_transaction(|_| -> Result<(), super::OpenMlsProjectionError> {
             check_caught_panic();
@@ -2640,6 +2649,7 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
             .find_map(|_| {
                 let result = super::canonicalize_stored_slice(
                     &alice_storage,
+                    &crate::snapshot_guard::Rewinds::default(),
                     &group_id,
                     super::CanonicalizationState {
                         retained_anchor_epoch: 2,
@@ -2908,6 +2918,7 @@ async fn an_evicted_candidate_is_silent_and_preserves_readable_rivals() {
     let actual = loop {
         let output = super::candidate_peel_slice(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             0,
             V1_MAX_REWIND_COMMITS,
@@ -2942,6 +2953,7 @@ async fn uncontested_peel_skips_replay_state_fingerprint() {
     super::resumable::REPLAY_FINGERPRINT_READS.with(|reads| reads.set(0));
     let result = super::candidate_peel_slice(
         &storage,
+        &crate::snapshot_guard::Rewinds::default(),
         &group_id,
         0,
         64,
@@ -3119,6 +3131,7 @@ async fn candidate_survey_snapshot_failures_keep_state_and_consumed_work() {
     let survey = || {
         super::candidate_branch_peel(
             &storage,
+            &crate::snapshot_guard::Rewinds::default(),
             &group_id,
             0,
             V1_MAX_REWIND_COMMITS,

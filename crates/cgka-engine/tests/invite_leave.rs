@@ -1,5 +1,8 @@
 //! Invite and MIP-03 SelfRemove round trips.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::canonicalization::ConvergenceStatus;
 use cgka_engine::feature_registry::FeatureRegistry;

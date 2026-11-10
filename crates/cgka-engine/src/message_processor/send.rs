@@ -328,7 +328,7 @@ impl<S: StorageProvider> Engine<S> {
         // `required_member_roles` mask demands (#177,
         // agent-text-stream-quic-v1.md): a client MUST NOT invite a member whose
         // KeyPackage does not advertise every required role capability.
-        let existing = self.storage.get_group(&group_id)?;
+        let existing = self.live_group_record(&group_id)?;
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && existing.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
         {
@@ -851,7 +851,7 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        let existing = self.storage.get_group(&group_id)?;
+        let existing = self.live_group_record(&group_id)?;
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
         let admins = crate::app_components::admins_of_group(&mls_group)?;
 
@@ -1062,11 +1062,12 @@ impl<S: StorageProvider> Engine<S> {
             |request| request.requested_at_ms,
         );
         let current_epoch = self
-            .storage
-            .get_group(&group_id)
+            .live_group_record(&group_id)
             .map_err(|e| match e {
-                StorageError::NotFound => EngineError::UnknownGroup(group_id.clone()),
-                other => EngineError::Storage(other),
+                EngineError::Storage(StorageError::NotFound) => {
+                    EngineError::UnknownGroup(group_id.clone())
+                }
+                other => other,
             })?
             .epoch;
         if existing
@@ -1305,13 +1306,13 @@ impl<S: StorageProvider> Engine<S> {
             self.leaving_groups.remove(group_id);
             return Ok(LeaveRedrive::Idle);
         };
-        let group = match self.storage.get_group(group_id) {
+        let group = match self.live_group_record(group_id) {
             Ok(group) => group,
-            Err(StorageError::NotFound) => {
+            Err(EngineError::Storage(StorageError::NotFound)) => {
                 self.clear_leave_request_state(group_id)?;
                 return Ok(LeaveRedrive::Idle);
             }
-            Err(e) => return Err(EngineError::Storage(e)),
+            Err(e) => return Err(e),
         };
         if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
             self.clear_leave_request_state(group_id)?;

@@ -835,6 +835,12 @@ typedef enum MarmotAppGroupHydrationQuarantineReason {
    * Hydrate found a stranded pending commit, but recovery failed.
    */
   MARMOT_APP_GROUP_HYDRATION_QUARANTINE_REASON_PENDING_COMMIT_RECOVERY_FAILED,
+  /**
+   * A read of past group state could not restore the live group, in
+   * session or at account open. A retry or re-join cannot clear it,
+   * and the next account open restores the live state.
+   */
+  MARMOT_APP_GROUP_HYDRATION_QUARANTINE_REASON_REWIND_RESTORE_FAILED,
 } MarmotAppGroupHydrationQuarantineReason;
 
 /**

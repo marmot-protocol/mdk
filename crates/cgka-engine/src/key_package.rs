@@ -303,7 +303,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &cgka_traits::GroupId,
     ) -> Result<KeyPackageRequirements, EngineError> {
         self.ensure_group_live(group_id)?;
-        let record = self.storage.get_group(group_id)?;
+        let record = self.live_group_record(group_id)?;
         self.with_mls_group(group_id, |group| {
             let mut required = record.required_capabilities.clone();
             crate::capability_manager::merge_capabilities(
@@ -354,7 +354,7 @@ impl<S: StorageProvider> Engine<S> {
         requirements: &KeyPackageRequirements,
     ) -> Result<bool, EngineError> {
         self.ensure_group_live(group_id)?;
-        let profile = self.storage.get_group(group_id)?.protocol_profile;
+        let profile = self.live_group_record(group_id)?.protocol_profile;
         self.with_mls_group(group_id, |group| {
             let own_leaf = group.own_leaf_index();
             Ok(group.members().any(|member| {

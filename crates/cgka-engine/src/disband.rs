@@ -362,7 +362,7 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let wrapped = crate::message_processor::route_wrapped_group_message(wrapped, &context);
-        let former_members = deduplicated_roster(&self.storage.get_group(group_id)?.members);
+        let former_members = deduplicated_roster(&self.live_group_record(group_id)?.members);
         let candidate = DisbandCandidate {
             group_id: group_id.clone(),
             source_epoch,
@@ -499,7 +499,7 @@ impl<S: StorageProvider> Engine<S> {
         let retired_deferred_rows = self.storage.with_transaction(
             |storage| -> Result<Vec<DeferredMessageMetadata>, EngineError> {
                 storage.put_disband_tombstone(group_id, &tombstone)?;
-                let mut group = storage.get_group(group_id)?;
+                let mut group = self.live_group_record_in(storage, group_id)?;
                 group.epoch = epoch;
                 group.members = tombstone.former_members.clone();
                 group.removed = false;

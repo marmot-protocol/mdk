@@ -2,8 +2,17 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `GroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272): a read of past group state rewound the live
+  group onto a retained anchor and could not restore it, in this session or when the account opened. Neither a retry
+  nor a re-join clears it, and the next open restores the live state. Exhaustive matches must add it.
+
 ### Added
 
+- `StorageProvider::list_snapshots_with_prefixes` lists every group's snapshots whose names start with given prefixes
+  in one read (mdk#3272). Engine construction uses it to find interrupted rewinds. It defaults to listing each stored
+  group's snapshots, so existing providers build unchanged.
 - `TransportEndpointFailure::over_known_limit` is an adapter's refusal to send an event over an endpoint's known limit
   (mdk#2334): `NotExposed` with the `TooLarge` category and the event's size class. `TooLarge` now also covers this
   refusal, and `EventSizeClass::from_rejected_targets` counts it, alone or mixed with endpoints' own size refusals.

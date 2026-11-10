@@ -49,6 +49,7 @@ use cgka_traits::convergence_pass::{
 };
 use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateInvalidationReason};
 use cgka_traits::engine_state::EpochState;
+use cgka_traits::error::EngineError;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{OpenMlsContentFilter, StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
@@ -86,6 +87,16 @@ fn convergence_run_context(run_id: &str, phase: ConvergencePhase) -> AuditEventC
 
 fn storage_projection_error(error: StorageError) -> OpenMlsProjectionError {
     OpenMlsProjectionError::Storage(format!("{error:?}"))
+}
+
+/// A gated record read's refusal in this layer's terms: a quarantined group
+/// is a missing one (mdk#364, mdk#3272).
+fn engine_projection_error(error: EngineError) -> OpenMlsProjectionError {
+    match error {
+        EngineError::UnknownGroup(_) => OpenMlsProjectionError::MissingGroup,
+        EngineError::Storage(error) => storage_projection_error(error),
+        other => OpenMlsProjectionError::Storage(format!("{other:?}")),
+    }
 }
 
 /// Delay before the second attempt at a frozen batch that failed (mdk#2684).
@@ -354,9 +365,8 @@ impl<S: StorageProvider> Engine<S> {
                     .is_none_or(|state| matches!(state, EpochState::Stable { .. }))
                 && {
                     let group = self
-                        .storage
-                        .get_group(group_id)
-                        .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+                        .live_group_record(group_id)
+                        .map_err(engine_projection_error)?;
                     !group.is_terminal() && !group.unrecoverable
                 } =>
             {
@@ -476,6 +486,14 @@ impl<S: StorageProvider> Engine<S> {
         // quarantines and the write proceeds as it does for quarantined
         // groups today (the policy is durable config, not group state).
         let _ = self.ensure_hydrated(group_id);
+        // Unlike the other reasons, a failed rewind restore (mdk#3272) kept a
+        // snapshot that carries the policy row, and the next open restores it,
+        // so a write now would be silently undone.
+        if self.quarantined_reason(group_id)
+            == Some(cgka_traits::engine::GroupHydrationQuarantineReason::RewindRestoreFailed)
+        {
+            return Err(OpenMlsProjectionError::MissingGroup);
+        }
         self.accept_convergence_policy(&policy)?;
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
@@ -681,6 +699,12 @@ impl<S: StorageProvider> Engine<S> {
         now: ConvergenceTime,
         processed_transport_id: Option<&MessageId>,
     ) -> Result<(), OpenMlsProjectionError> {
+        // Admission reads stored group state and may write it back, and a
+        // quarantined group's is not live (mdk#364, mdk#3272). Ingest retains
+        // such input before it gets here.
+        if self.quarantined_reason(group_id).is_some() {
+            return Err(OpenMlsProjectionError::MissingGroup);
+        }
         let transport_id = processed_transport_id.unwrap_or(&message.id).clone();
         // Key the convergence store on the content-derived dedup id (SHA-256 of
         // the recovered MLS bytes), not the outer transport id (#238). This
@@ -741,7 +765,9 @@ impl<S: StorageProvider> Engine<S> {
             let (admission, opened) =
                 self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?;
             if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
-                let mut group = storage.get_group(group_id)?;
+                let mut group = self
+                    .live_group_record_in(storage, group_id)
+                    .map_err(engine_projection_error)?;
                 group.unrecoverable = true;
                 storage.put_group(&group)?;
             }
@@ -752,9 +778,8 @@ impl<S: StorageProvider> Engine<S> {
         }
         if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
             let epoch = self
-                .storage
-                .get_group(group_id)
-                .map_err(storage_projection_error)?
+                .live_group_record(group_id)
+                .map_err(engine_projection_error)?
                 .epoch;
             self.realize_group_unrecoverable_for_frozen_pass(group_id, epoch);
         }
@@ -883,9 +908,8 @@ impl<S: StorageProvider> Engine<S> {
         match self.epoch_manager.epoch(group_id) {
             Some(epoch) => Ok(epoch),
             None => Ok(self
-                .storage
-                .get_group(group_id)
-                .map_err(storage_projection_error)?
+                .live_group_record(group_id)
+                .map_err(engine_projection_error)?
                 .epoch),
         }
     }
@@ -1416,10 +1440,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         base_epoch: EpochId,
     ) -> Result<u64, OpenMlsProjectionError> {
-        match self.storage.get_group(group_id) {
+        match self.live_group_record(group_id) {
             Ok(group) => Ok(base_epoch.0.min(group.epoch.0)),
-            Err(StorageError::NotFound) => Ok(base_epoch.0),
-            Err(error) => Err(storage_projection_error(error)),
+            Err(EngineError::Storage(StorageError::NotFound)) => Ok(base_epoch.0),
+            Err(error) => Err(engine_projection_error(error)),
         }
     }
 
@@ -1612,9 +1636,8 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
     ) -> Result<(), OpenMlsProjectionError> {
         let mut group = self
-            .storage
-            .get_group(group_id)
-            .map_err(storage_projection_error)?;
+            .live_group_record(group_id)
+            .map_err(engine_projection_error)?;
         if !group.unrecoverable {
             group.unrecoverable = true;
             self.storage
@@ -1880,15 +1903,7 @@ impl<S: StorageProvider> Engine<S> {
             .0
             .saturating_sub(policy.convergence.max_rewind_commits);
         let run_id = convergence_run_id(group_id, previous_tip.0);
-        let AppliedConvergencePass {
-            result,
-            completed_pass,
-            disposition_transitions,
-            pre_apply_commit_states,
-            group_changes,
-            application_events,
-            membership_effects,
-        } = match self.resolve_frozen_convergence_pass(
+        let resolution = self.resolve_frozen_convergence_pass(
             group_id,
             &pass,
             previous_tip,
@@ -1897,7 +1912,18 @@ impl<S: StorageProvider> Engine<S> {
             deadline,
             retained_anchor_epoch,
             &run_id,
-        ) {
+        );
+        // A replay whose restore failed quarantines the group now (mdk#3272).
+        self.quarantine_failed_rewinds();
+        let AppliedConvergencePass {
+            result,
+            completed_pass,
+            disposition_transitions,
+            pre_apply_commit_states,
+            group_changes,
+            application_events,
+            membership_effects,
+        } = match resolution {
             Ok(FrozenPassResolution::Yielded) => return Ok(waiting_result(previous_tip.0)),
             Ok(FrozenPassResolution::Finished(result)) => return Ok(*result),
             Ok(FrozenPassResolution::Applied(applied)) => *applied,
@@ -2147,6 +2173,7 @@ impl<S: StorageProvider> Engine<S> {
             let mut continuation = self.canonical_replays.remove(group_id);
             let result = crate::openmls_projection::canonicalize_stored_slice(
                 &self.storage,
+                &self.rewinds,
                 group_id,
                 state,
                 vec![],
@@ -2174,6 +2201,7 @@ impl<S: StorageProvider> Engine<S> {
             self.canonical_replays.remove(group_id);
             canonicalize_stored_openmls_messages_with_profile_policy(
                 &self.storage,
+                &self.rewinds,
                 group_id,
                 state,
                 vec![],
@@ -2252,9 +2280,8 @@ impl<S: StorageProvider> Engine<S> {
             let error_kind = canonicalization_error_tag(missing_retained_state);
             let halt = ConvergencePassFailure::at(ConvergencePassStep::Halt);
             let mut group = self
-                .storage
-                .get_group(group_id)
-                .map_err(|e| halt(OpenMlsProjectionError::Storage(format!("{e:?}"))))?;
+                .live_group_record(group_id)
+                .map_err(|e| halt(engine_projection_error(e)))?;
             if !group.unrecoverable {
                 group.unrecoverable = true;
                 self.storage
@@ -2408,7 +2435,9 @@ impl<S: StorageProvider> Engine<S> {
                         let after = crate::membership_effects::MembershipSnapshot::capture(
                             &group,
                             self.identity.self_id(),
-                            storage.get_group(group_id)?.removed,
+                            self.live_group_record_in(storage, group_id)
+                                .map_err(engine_projection_error)?
+                                .removed,
                         );
                         Some(
                             self.prepare_canonical_membership_effects_on_storage(
