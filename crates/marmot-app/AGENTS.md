@@ -17,8 +17,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
   (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (account
-  setup: durable preflight, cancellation, advisory installation detection, and generated setup's procedures in
-  `onboarding/generated_setup.rs`), `audit_tracker.rs` (the forensic audit-log tracker
+  setup: durable preflight, cancellation, advisory installation detection, generated setup's procedures in
+  `onboarding/generated_setup.rs`, and its background tasks and teardown fence in `onboarding/generated_setup_tasks.rs`), `audit_tracker.rs` (the forensic audit-log tracker
   upload worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt), `event_routing.rs` (pure
   `MarmotAppEvent` classification/routing helpers), `avatar.rs` (local identity-avatar demand and bounded maintenance),
   `avatar_access.rs` (bounded local native batches), `attachment_history.rs` (bounded local attachment discovery and
@@ -32,9 +32,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   debug tokio worker stack in the CLI daemon test; spawned tasks capture the owned pair and borrow it inside), and
   generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
   `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
-  `AccountManager` holds one `SetupState` for three hooks only, each where it is called: reconcile (worker transaction
-  held; it never takes it again), removal (under the transaction, after the removal commit point) and shutdown's two
-  phases (before the invite catch-up drain; after the first reaper drain). It checks the worker gate through
+  `AccountManager` holds one `SetupState` for four hooks only, each where it is called: reconcile (worker transaction
+  held; it never takes it again), the teardown fence (removal and sign-out, before the worker transaction), removal
+  (under the transaction, after the removal commit point) and shutdown's two phases (before the invite catch-up drain;
+  after the first reaper drain). A generated setup background task continues only the account it was scheduled for
+  and ends once that account is removed, signed out or set up; it never resumes or creates another identity
+  (whitenoise-ios#1302). Every teardown takes the fence before it touches the account, and the runtime's `sign_out`
+  and `sign_out_and_wipe` take it before their first stage. The fence cancels the attempt in flight (an attempt
+  inside synchronous code stops when that code returns) and holds the task; no attempt starts while any fence is
+  held. When the last one drops the task checks again, so a cancelled or failed teardown leaves the account
+  publishing, and `sign_in_account` schedules a setup its sign-out ended. It checks the worker gate through
   `SetupRecords`, which reads durable records only. Setup reaches workers only through the worker-lifecycle surface
   commented on `AccountManager` in `runtime/mod.rs`, each call keeping its lock state: the worker transaction is a
   tokio `Mutex` and not reentrant. A worker setup takes out of the map is reaped through setup's cancellation

@@ -23,6 +23,9 @@ struct Network {
     block_publish: AtomicBool,
     publishing: Notify,
     release_publish: Notify,
+    /// Publishes waiting on `release_publish` whose caller is still waiting
+    /// for them. A cancelled caller drops its publish and leaves this count.
+    held_publishes: Arc<std::sync::atomic::AtomicUsize>,
     /// What its relays send the plane: an EOSE for each accepted REQ on each
     /// relay.
     messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
@@ -1405,9 +1408,24 @@ impl NostrRelayClient for Network {
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
         );
-        self.publishing.notify_one();
         if self.block_publish.load(Ordering::SeqCst) {
-            self.release_publish.notified().await;
+            struct Held(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Held {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            // Wait for the release before announcing the hold, so
+            // `notify_waiters` always reaches it.
+            let release = self.release_publish.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            self.held_publishes.fetch_add(1, Ordering::SeqCst);
+            let _held = Held(self.held_publishes.clone());
+            self.publishing.notify_one();
+            release.await;
+        } else {
+            self.publishing.notify_one();
         }
         if self.zero_acks.load(Ordering::SeqCst) {
             return Ok(NostrPublishOutcome::default());
@@ -8009,4 +8027,457 @@ async fn manual_relay_edit_unchanged_selection_cannot_publish() {
     );
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
+}
+
+/// What a test does to a just-created generated identity while its
+/// background publication is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeneratedSetupRemoval {
+    /// `sign_out_and_wipe`, as a host does (whitenoise-ios#1302).
+    Wipe,
+    /// The non-destructive `sign_out`.
+    SignOut,
+    /// `sign_out`, then `sign_in_account` once it has returned.
+    SignOutThenSignIn,
+    /// `sign_out`, cancelled by the host after it fenced generated setup.
+    CancelledSignOut,
+    /// The account directory removed without any runtime call, so nothing
+    /// can stop the background task first.
+    Directory,
+}
+
+/// A local file secret store that records every account it writes a secret
+/// for, so a test sees an identity even if setup rolls it back at once.
+struct RecordingSecretStore {
+    inner: marmot_account::LocalFileSecretStore,
+    written: FixtureMutex<Vec<String>>,
+}
+
+impl marmot_account::AccountSecretStore for RecordingSecretStore {
+    fn has_secret_for_label(&self, label: &str) -> marmot_account::AccountHomeResult<bool> {
+        self.inner.has_secret_for_label(label)
+    }
+    fn write_secret(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::prelude::Keys,
+    ) -> marmot_account::AccountHomeResult<()> {
+        self.written.lock().push(account.account_id_hex.clone());
+        self.inner.write_secret(account, keys)
+    }
+    fn load_secret(
+        &self,
+        account: &AccountSummary,
+    ) -> marmot_account::AccountHomeResult<nostr::prelude::Keys> {
+        self.inner.load_secret(account)
+    }
+    fn remove_secret(&self, account: &AccountSummary) -> marmot_account::AccountHomeResult<()> {
+        self.inner.remove_secret(account)
+    }
+}
+
+struct GeneratedSetupRemovalRun {
+    account_id_hex: String,
+    /// Every account a secret was ever written for, in order.
+    secrets_written: Vec<String>,
+    /// Every event publication attempted, in order.
+    published: Vec<NostrTransportEvent>,
+    /// The background task's reports of failed attempts, in order.
+    publication_failures: Vec<String>,
+    /// The account list once the background task has ended.
+    accounts: Vec<ManagedAccount>,
+}
+
+impl GeneratedSetupRemovalRun {
+    /// Whether a KeyPackage was published after the teardown withdrew the
+    /// slot (its kind-5 deletion), which must be the last word on it.
+    fn key_package_after_withdrawal(&self) -> bool {
+        let withdrawal = self
+            .published
+            .iter()
+            .rposition(|event| event.kind == 5)
+            .expect("the teardown withdraws the KeyPackage slot");
+        self.published[withdrawal..]
+            .iter()
+            .any(|event| event.kind == 30443)
+    }
+
+    /// Whether the background task ran its attempts out after `removal`.
+    fn setup_carried_on(&self) -> bool {
+        self.publication_failures
+            .last()
+            .is_some_and(|message| message.starts_with("generated account publication deferred"))
+    }
+}
+
+/// Create a generated identity at local readiness against relays that never
+/// acknowledge, and hold the account's first publication (the worker's
+/// initial KeyPackage), which the background setup attempt queues behind.
+/// Apply `removal` while that attempt is pending, release the publication,
+/// and let the background task run every attempt it has left.
+async fn remove_generated_identity_while_publishing(
+    removal: GeneratedSetupRemoval,
+) -> GeneratedSetupRemovalRun {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(RecordingSecretStore {
+        inner: marmot_account::LocalFileSecretStore::new(dir.path()),
+        written: FixtureMutex::new(Vec::new()),
+    });
+    let network = Arc::new(Network::default());
+    network.zero_acks.store(true, Ordering::SeqCst);
+    network.block_publish.store(true, Ordering::SeqCst);
+    let mut app = MarmotApp::with_relays_and_account_home(
+        dir.path(),
+        vec!["wss://default.example".into()],
+        AccountHome::open_with_secret_store(dir.path(), secrets.clone()),
+    )
+    .with_test_relay_client(network.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        network.clone(),
+        network.clone(),
+        false,
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let mut events = runtime.subscribe();
+    let created = timeout(
+        Duration::from_secs(30),
+        runtime.create_identity_local_ready(AccountSetupRequest {
+            default_relays: vec![TransportEndpoint("wss://default.example".into())],
+            bootstrap_relays: vec![TransportEndpoint("wss://default.example".into())],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("local readiness publishes nothing")
+    .unwrap();
+    assert_eq!(created.readiness, AccountSetupReadiness::LocalReady);
+    let id = created.account.account_id_hex.clone();
+
+    timeout(Duration::from_secs(30), network.publishing.notified())
+        .await
+        .expect("generated setup publishes in the background");
+    assert_eq!(network.held_publishes.load(Ordering::SeqCst), 1);
+    // Later publishes, the removal's own included, answer at once.
+    network.block_publish.store(false, Ordering::SeqCst);
+
+    let teardown = match removal {
+        GeneratedSetupRemoval::Directory => {
+            runtime
+                .accounts()
+                .app
+                .account_home()
+                .remove_account(&id)
+                .unwrap();
+            None
+        }
+        _ => {
+            let (teardown, account) = (runtime.clone(), id.clone());
+            let task = tokio::spawn(async move {
+                match removal {
+                    GeneratedSetupRemoval::Wipe => teardown
+                        .sign_out_and_wipe(&account)
+                        .await
+                        .map(|outcome| outcome.local_cleanup.completed),
+                    _ => teardown
+                        .sign_out(&account, SignOutOptions::default())
+                        .await
+                        .map(|outcome| outcome.local_cleanup.completed),
+                }
+            });
+            // The teardown queues behind the worker's held publication, so
+            // wait for it to take the account's setup fence first.
+            timeout(Duration::from_secs(30), async {
+                while !runtime.setup.generated_setup_fenced_for_test(&id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the teardown fences generated setup first");
+            if removal == GeneratedSetupRemoval::CancelledSignOut {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                None
+            } else {
+                Some(task)
+            }
+        }
+    };
+    network.release_publish.notify_waiters();
+    if let Some(task) = teardown {
+        let completed = timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the teardown ends once the publication answers")
+            .unwrap()
+            .unwrap();
+        assert!(completed, "{removal:?} completes its local cleanup");
+    }
+    if removal == GeneratedSetupRemoval::SignOutThenSignIn {
+        // The sign-out ended the task; only the sign-in can start another.
+        timeout(
+            Duration::from_secs(30),
+            runtime.setup.join_generated_setup_tasks_for_test(),
+        )
+        .await
+        .expect("the sign-out ends generated setup");
+        runtime.sign_in_account(&id).await.unwrap();
+    }
+    timeout(
+        Duration::from_secs(30),
+        runtime.setup.join_generated_setup_tasks_for_test(),
+    )
+    .await
+    .expect("generated setup ends");
+    let published = network.attempts.lock().clone();
+    let accounts = runtime.accounts().managed_accounts().unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+    let mut publication_failures = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let MarmotAppEvent::AccountError(error) = event
+            && error.message.starts_with("generated account publication")
+        {
+            assert_eq!(error.account_id_hex, id);
+            publication_failures.push(error.message);
+        }
+    }
+    let secrets_written = secrets.written.lock().clone();
+    GeneratedSetupRemovalRun {
+        account_id_hex: id,
+        secrets_written,
+        published,
+        publication_failures,
+        accounts,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_publishing_generated_identity_mints_no_other_account() {
+    let run = remove_generated_identity_while_publishing(GeneratedSetupRemoval::Wipe).await;
+    assert_eq!(
+        run.secrets_written,
+        vec![run.account_id_hex.clone()],
+        "only the created identity ever gets a secret"
+    );
+    assert!(
+        run.published
+            .iter()
+            .all(|event| event.pubkey == run.account_id_hex)
+    );
+    assert!(
+        !run.setup_carried_on(),
+        "setup stops with the wipe: {:?}",
+        run.publication_failures
+    );
+    assert!(!run.key_package_after_withdrawal());
+    assert!(run.accounts.is_empty(), "the wipe leaves no account behind");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_out_a_publishing_generated_identity_stops_its_setup() {
+    let run = remove_generated_identity_while_publishing(GeneratedSetupRemoval::SignOut).await;
+    assert_eq!(run.secrets_written, vec![run.account_id_hex.clone()]);
+    assert!(
+        !run.setup_carried_on(),
+        "setup stops with the sign-out: {:?}",
+        run.publication_failures
+    );
+    assert!(
+        !run.key_package_after_withdrawal(),
+        "no KeyPackage is published after the sign-out withdraws the slot"
+    );
+    assert_eq!(run.accounts.len(), 1);
+    assert_eq!(run.accounts[0].account_id_hex, run.account_id_hex);
+    assert!(run.accounts[0].signed_out);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_a_generated_identity_back_in_resumes_its_setup() {
+    let run =
+        remove_generated_identity_while_publishing(GeneratedSetupRemoval::SignOutThenSignIn).await;
+    assert_eq!(run.secrets_written, vec![run.account_id_hex.clone()]);
+    assert!(
+        run.setup_carried_on(),
+        "setup publishes again after sign-in: {:?}",
+        run.publication_failures
+    );
+    assert_eq!(run.accounts.len(), 1);
+    assert!(!run.accounts[0].signed_out);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_sign_out_leaves_generated_setup_publishing() {
+    let run =
+        remove_generated_identity_while_publishing(GeneratedSetupRemoval::CancelledSignOut).await;
+    assert_eq!(run.secrets_written, vec![run.account_id_hex.clone()]);
+    assert!(
+        run.setup_carried_on(),
+        "setup keeps publishing the account the sign-out left: {:?}",
+        run.publication_failures
+    );
+    assert_eq!(run.accounts.len(), 1);
+    assert!(!run.accounts[0].signed_out);
+}
+
+/// Removal the runtime never hears of: the background task alone must
+/// notice that its account is gone and stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_setup_never_continues_another_account_than_its_own() {
+    let run = remove_generated_identity_while_publishing(GeneratedSetupRemoval::Directory).await;
+    assert_eq!(
+        run.secrets_written,
+        vec![run.account_id_hex.clone()],
+        "a background attempt minted another identity"
+    );
+    assert!(
+        run.published
+            .iter()
+            .all(|event| event.pubkey == run.account_id_hex)
+    );
+    assert!(run.accounts.is_empty());
+}
+
+/// Start a generated setup task whose first attempt is stuck in synchronous
+/// code, as one doing account I/O is: a fence reaches it only once that code
+/// returns. Its second attempt runs once no fence is held. It returns once
+/// the first attempt runs, with the sender that lets it return and a
+/// receiver for whether each attempt ran to completion.
+async fn spawn_blocked_generated_setup(
+    state: &SetupState,
+    account_id: &str,
+) -> (
+    std::sync::mpsc::Sender<()>,
+    tokio::sync::oneshot::Receiver<(bool, bool)>,
+) {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (finished, attempts) = tokio::sync::oneshot::channel();
+    assert!(
+        state
+            .generated_setup_tasks
+            .spawn(account_id, move |gate| async move {
+                let first = gate
+                    .attempt(async move {
+                        let _ = started.send(());
+                        let _ = released.recv();
+                    })
+                    .await;
+                gate.wait_unfenced().await;
+                let second = gate.attempt(async {}).await;
+                let _ = finished.send((first.is_some(), second.is_some()));
+            })
+    );
+    running.await.unwrap();
+    (release, attempts)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_teardowns_all_wait_for_the_generated_setup_attempt_to_stop() {
+    let state = SetupState::new();
+    let (release, attempts) = spawn_blocked_generated_setup(&state, "account").await;
+    let mut first = Box::pin(state.fence_generated_setup("account"));
+    let mut second = Box::pin(state.fence_generated_setup("account"));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(
+        futures::poll!(second.as_mut()).is_pending(),
+        "a second teardown waits for the attempt the first one stops"
+    );
+    release.send(()).unwrap();
+    let first = first.await;
+    let second = second.await;
+    drop(first);
+    // One teardown still holds the fence, so the next attempt waits.
+    assert!(state.generated_setup_fenced_for_test("account"));
+    drop(second);
+    assert_eq!(attempts.await.unwrap(), (true, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_teardown_releases_the_generated_setup_fence() {
+    let state = SetupState::new();
+    let (release, attempts) = spawn_blocked_generated_setup(&state, "account").await;
+    let mut teardown = Box::pin(state.fence_generated_setup("account"));
+    assert!(futures::poll!(teardown.as_mut()).is_pending());
+    // The host cancels the teardown while it waits for the attempt.
+    drop(teardown);
+    release.send(()).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(30), attempts)
+            .await
+            .expect("a cancelled teardown leaves no fence behind")
+            .unwrap(),
+        (true, true)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_cancels_the_attempt_in_flight_and_holds_the_next_one() {
+    let state = SetupState::new();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (finished, mut attempts) = tokio::sync::oneshot::channel();
+    assert!(
+        state
+            .generated_setup_tasks
+            .spawn("account", move |gate| async move {
+                let first = gate
+                    .attempt(async move {
+                        let _ = started.send(());
+                        std::future::pending::<()>().await;
+                    })
+                    .await;
+                gate.wait_unfenced().await;
+                let second = gate.attempt(async {}).await;
+                let _ = finished.send((first.is_some(), second.is_some()));
+            })
+    );
+    running.await.unwrap();
+    let fence = timeout(
+        Duration::from_secs(30),
+        state.fence_generated_setup("account"),
+    )
+    .await
+    .expect("the fence cancels a pending attempt");
+    assert!(
+        attempts.try_recv().is_err(),
+        "no attempt runs while the fence is held"
+    );
+    assert!(
+        !state.generated_setup_tasks.spawn("account", |_| async {}),
+        "an account whose task is held gets no second one"
+    );
+    drop(fence);
+    assert_eq!(attempts.await.unwrap(), (false, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_scheduled_under_a_fence_waits_for_it_to_drop() {
+    let state = SetupState::new();
+    // A teardown fences the account before its setup task exists, as when
+    // it lands between local readiness and the task's start.
+    let fence = state.fence_generated_setup("account").await;
+    let (finished, mut attempted) = tokio::sync::oneshot::channel();
+    assert!(
+        state
+            .generated_setup_tasks
+            .spawn("account", move |gate| async move {
+                gate.wait_unfenced().await;
+                let ran = gate.attempt(async {}).await;
+                let _ = finished.send(ran.is_some());
+            }),
+        "a fenced account still gets its task"
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        attempted.try_recv().is_err(),
+        "no attempt runs while the fence is held"
+    );
+    // The teardown is cancelled or fails: the account stays published.
+    drop(fence);
+    assert!(
+        timeout(Duration::from_secs(30), attempted)
+            .await
+            .expect("the task runs once the fence drops")
+            .unwrap()
+    );
 }
