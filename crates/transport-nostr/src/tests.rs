@@ -7278,6 +7278,45 @@ async fn an_event_over_every_known_limit_is_refused_unsent() {
     assert_eq!(counted, (0, 0, 0), "no relay was contacted");
 }
 
+/// mdk#2334: the size preflight counts only the relays `publish` would send
+/// to. An unsafe group relay is never sent to, so it does not hide a refusal;
+/// an unsafe inbox relay fails the whole publish, which is not a size refusal.
+#[tokio::test]
+async fn the_size_preflight_counts_only_relays_publish_would_send_to() {
+    let over = TransportEndpoint("wss://over.example".into());
+    let unsafe_relay = TransportEndpoint("ws://plaintext.example".into());
+    let client = Arc::new(SizeRefusingClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
+    let adapter = relay_plane
+        .account_adapter(MemberId::new(vec![0xA1; 32]), client.clone())
+        .with_event_limits(Arc::new(KnownLimits(vec![(over.clone(), 100)])));
+    let transport_group_id = vec![0xD4; 32];
+    let event = group_event("44", &transport_group_id);
+    let message = event.to_transport_message().unwrap();
+    let endpoints = vec![unsafe_relay, over];
+
+    let group = TransportPublishTarget::Group {
+        group_id: GroupId::new(vec![0xC3; 16]),
+        transport_group_id,
+        endpoints: endpoints.clone(),
+    };
+    assert_eq!(
+        adapter.size_class_over_known_limits(&message, &group).await,
+        Some(cgka_traits::EventSizeClass::of_bytes(event_json_bytes(
+            &event
+        )))
+    );
+    let inbox = TransportPublishTarget::Inbox {
+        recipient: MemberId::new(vec![0xB2; 32]),
+        endpoints,
+    };
+    assert_eq!(
+        adapter.size_class_over_known_limits(&message, &inbox).await,
+        None
+    );
+    assert!(client.sent_to.lock().unwrap().is_empty());
+}
+
 /// A refused relay joins the result of the relays the event was sent to. A
 /// refusal mixed with relay size answers still proves size, but not once any
 /// relay accepted the event.

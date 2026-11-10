@@ -4561,18 +4561,29 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         }
     }
 
-    async fn refusals_over_known_limits(
+    async fn size_class_over_known_limits(
         &self,
         message: &cgka_traits::TransportMessage,
-        endpoints: &[TransportEndpoint],
-    ) -> Vec<TransportEndpointFailure> {
+        target: &cgka_traits::TransportPublishTarget,
+    ) -> Option<cgka_traits::EventSizeClass> {
         // An unreadable payload is refused by `publish` itself.
-        let Ok(event) = NostrTransportEvent::from_transport_message(message) else {
-            return Vec::new();
+        let event = NostrTransportEvent::from_transport_message(message).ok()?;
+        // Only the endpoints `publish` would send to count. A group fanout
+        // publishes to each endpoint on its own, so every safe one is sent
+        // to; an inbox publish fails outright on an unsafe endpoint.
+        let safety = &self.relay_plane.inner.relay_safety;
+        let endpoints = match target {
+            cgka_traits::TransportPublishTarget::Group { endpoints, .. } => {
+                safety.retain_safe_endpoints(endpoints.clone(), "group publish")
+            }
+            cgka_traits::TransportPublishTarget::Inbox { endpoints, .. } => safety
+                .sanitize_endpoints(endpoints.clone(), "inbox publish")
+                .ok()?,
         };
-        self.refuse_over_known_limits(endpoints, event_json_bytes(&event))
-            .await
-            .1
+        let (_, refused) = self
+            .refuse_over_known_limits(&endpoints, event_json_bytes(&event))
+            .await;
+        cgka_traits::EventSizeClass::from_rejected_targets(&endpoints, &refused)
     }
 }
 

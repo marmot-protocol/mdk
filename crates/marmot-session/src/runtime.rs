@@ -3662,7 +3662,8 @@ where
     /// The commit's id and the oversized artifact when an invite must be
     /// refused before its commit is published (mdk#2334): the commit fits
     /// none of its group relays' known limits, or a Welcome fits none of its
-    /// invitee's inbox relays'. A relay with no known limit fits.
+    /// invitee's inbox relays'. A relay with no known limit fits; one the
+    /// adapter would never send to does not count.
     async fn oversized_invite(
         &self,
         prepared: &PreparedSessionCommit,
@@ -3690,12 +3691,13 @@ where
         };
         // A commit or Welcome without a route fails when it is published.
         let target = self.routing.publish_target(commit).ok()?;
-        if let Some(size_class) = self.fits_no_known_limit(commit, &target).await {
+        let adapter = &self.adapter;
+        if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
             return refused(OversizedArtifact::Commit, size_class);
         }
         let welcomes = prepared.welcomes.iter().filter_map(|welcome| {
             let target = self.routing.publish_target(welcome).ok()?;
-            Some(async move { self.fits_no_known_limit(welcome, &target).await })
+            Some(async move { adapter.size_class_over_known_limits(welcome, &target).await })
         });
         let size_class = futures::future::join_all(welcomes)
             .await
@@ -5589,21 +5591,6 @@ where
             output.absorb_session_effects(effects, queue);
         }
         Ok(())
-    }
-
-    /// The message's size class when the adapter would refuse it, unsent, on
-    /// every endpoint of its target.
-    async fn fits_no_known_limit(
-        &self,
-        message: &TransportMessage,
-        target: &TransportPublishTarget,
-    ) -> Option<cgka_traits::EventSizeClass> {
-        let endpoints = target.endpoints();
-        let refusals = self
-            .adapter
-            .refusals_over_known_limits(message, endpoints)
-            .await;
-        cgka_traits::EventSizeClass::from_rejected_targets(endpoints, &refusals)
     }
 
     async fn drive_outbound_fanout(
