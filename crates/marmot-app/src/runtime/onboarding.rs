@@ -9,6 +9,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 mod cancellation;
 mod generated_setup;
+mod generated_setup_tasks;
 mod recovery;
 mod relay_edits;
 mod relay_repair;
@@ -16,8 +17,8 @@ mod single_device;
 
 /// Account setup's in-memory state: interactive onboarding and generated
 /// setup. Its fields are private to this module tree. `AccountManager` holds
-/// one handle for its three hooks (reconcile, removal and the two shutdown
-/// phases) and reaches nothing else through it.
+/// one handle for its hooks (reconcile, the teardown fence, removal and the
+/// two shutdown phases) and reaches nothing else through it.
 #[derive(Clone)]
 pub(super) struct SetupState {
     generated_setup_local_transaction: Arc<Mutex<()>>,
@@ -29,8 +30,10 @@ pub(super) struct SetupState {
         Arc<StdMutex<HashMap<String, watch::Sender<Option<OnboardingAttempt>>>>>,
     #[cfg(test)]
     onboarding_test_holds: Arc<OnboardingTestHolds>,
-    generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
+    generated_setup_tasks: generated_setup_tasks::GeneratedSetupTasks,
 }
+
+pub(super) use generated_setup_tasks::GeneratedSetupFence;
 
 /// Account setup: interactive onboarding, its recovery and its sign-in
 /// notices, reached through `MarmotAppRuntime::account_setup`.
@@ -52,12 +55,6 @@ pub(super) struct SetupRecords<'a> {
     app: &'a MarmotApp,
 }
 
-struct GeneratedSetupTasks {
-    accepting: bool,
-    active_accounts: HashSet<String>,
-    handles: Vec<JoinHandle<()>>,
-}
-
 impl SetupState {
     pub(super) fn new() -> Self {
         Self {
@@ -74,11 +71,7 @@ impl SetupState {
             onboarding_retirements: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
-            generated_setup_tasks: Arc::new(StdMutex::new(GeneratedSetupTasks {
-                accepting: true,
-                active_accounts: HashSet::new(),
-                handles: Vec::new(),
-            })),
+            generated_setup_tasks: generated_setup_tasks::GeneratedSetupTasks::new(),
         }
     }
 
@@ -91,6 +84,15 @@ impl SetupState {
         manager: &'a AccountManager,
     ) -> impl Future<Output = ()> + Send + 'a {
         AccountSetup::new(self, manager).finish_pending_onboarding_cancellations()
+    }
+
+    /// Teardown fence, taken by removal and sign-out before the worker
+    /// transaction and before they touch the account. Once it returns no
+    /// generated setup attempt for the account is in flight, and none starts
+    /// while it is held; the account's task carries on afterwards only if the
+    /// account is still pending (`generated_setup_tasks`).
+    pub(super) async fn fence_generated_setup(&self, account_id: &str) -> GeneratedSetupFence {
+        self.generated_setup_tasks.fence(account_id).await
     }
 
     /// Removal hook, called under the worker transaction after the removal
@@ -121,19 +123,19 @@ impl SetupState {
         for task in onboarding_cancellation_tasks {
             let _ = task.await;
         }
-        let generated_setup_tasks = {
-            let mut tasks = self
-                .generated_setup_tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tasks.accepting = false;
-            tasks.active_accounts.clear();
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in generated_setup_tasks {
-            task.abort();
-            let _ = task.await;
-        }
+        self.generated_setup_tasks.shutdown().await;
+    }
+
+    /// Whether a teardown holds `account_id`'s generated setup fence.
+    #[cfg(test)]
+    pub(super) fn generated_setup_fenced_for_test(&self, account_id: &str) -> bool {
+        self.generated_setup_tasks.fenced_for_test(account_id)
+    }
+
+    /// Wait for every generated setup task to end on its own.
+    #[cfg(test)]
+    pub(super) async fn join_generated_setup_tasks_for_test(&self) {
+        self.generated_setup_tasks.join_for_test().await;
     }
 
     /// Shutdown's second phase, under the worker transaction after the first

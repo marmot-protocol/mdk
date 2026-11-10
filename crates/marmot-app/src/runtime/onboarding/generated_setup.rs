@@ -1,6 +1,7 @@
 //! Generated setup: the procedures behind `create_identity` and its
 //! local-ready variants. They stay `MarmotAppRuntime` methods; living in setup's
 //! module tree lets them reach its transaction and background task registry.
+use super::generated_setup_tasks::GeneratedSetupGate;
 use super::*;
 
 const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
@@ -111,9 +112,10 @@ impl MarmotAppRuntime {
                 .validate_account_relay_list_declarations(&bootstrap, None)?;
 
             let identity_started = Instant::now();
-            let identity_result = self
-                .accounts
-                .create_nostr_account_from_setup(&effective_request);
+            let identity_result = self.accounts.create_nostr_account_from_setup(
+                &effective_request,
+                GeneratedIdentity::ResumeOrCreate,
+            );
             self.shared.observer.performance().record(
                 AppPerformanceOperation::AccountSetupIdentityLocal,
                 identity_started.elapsed(),
@@ -306,73 +308,124 @@ impl MarmotAppRuntime {
         Ok(result)
     }
 
+    /// Publish `account`'s generated setup in the background. The task
+    /// continues that account only: it ends once the account is removed,
+    /// signed out or set up, and never resumes or creates another identity.
+    /// Every attempt runs through the account's gate, so a teardown's fence
+    /// cancels the attempt in flight and holds the task until the teardown
+    /// returns (`generated_setup_tasks`).
     fn schedule_generated_account_setup(
         &self,
         account: AccountSummary,
         context: GeneratedAccountSetupContext,
     ) {
-        let mut tasks = self
-            .setup
-            .generated_setup_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tasks.handles.retain(|handle| !handle.is_finished());
-        if !tasks.accepting || !tasks.active_accounts.insert(account.account_id_hex.clone()) {
-            return;
-        }
         let manager = self.clone();
-        let active = self.setup.generated_setup_tasks.clone();
         let account_id_hex = account.account_id_hex.clone();
-        let account_label = account.label.clone();
-        let handle = tokio::spawn(async move {
-            for attempt in 0..GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS {
-                let started_at = Instant::now();
-                let result = manager
-                    .create_or_import_account_network_ready(context.request())
+        self.setup
+            .generated_setup_tasks
+            .spawn(&account_id_hex, move |gate| async move {
+                manager
+                    .run_generated_account_setup(gate, account, context)
                     .await;
-                manager.shared.observer.performance().record(
-                    AppPerformanceOperation::AccountSetupNetworkReady,
-                    started_at.elapsed(),
-                    result.is_ok(),
-                );
-                match result {
-                    Ok(_) => break,
-                    Err(error) => {
-                        let final_attempt = attempt + 1 == GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS;
-                        let status = if final_attempt {
-                            "deferred"
-                        } else {
-                            "retry scheduled"
-                        };
-                        let _ = manager.events.send(MarmotAppEvent::AccountError(
-                            RuntimeAccountError {
-                                account_id_hex: account_id_hex.clone(),
-                                account_label: account_label.clone(),
-                                message: format!(
-                                    "generated account publication {status}: {}",
-                                    error.privacy_safe_kind()
-                                ),
-                            },
-                        ));
-                        if final_attempt {
-                            break;
-                        }
-                        let multiplier = 1_u32
-                            .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
-                            .unwrap_or(u32::MAX);
-                        tokio::time::sleep(
-                            GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY.saturating_mul(multiplier),
-                        )
-                        .await;
-                    }
-                }
+            });
+    }
+
+    async fn run_generated_account_setup(
+        &self,
+        gate: GeneratedSetupGate,
+        account: AccountSummary,
+        context: GeneratedAccountSetupContext,
+    ) {
+        // Only a definite answer ends the task: the account was removed,
+        // signed out or set up. A failed lookup is retried and reported like
+        // any failed attempt, and the attempt itself never resumes or creates
+        // another identity.
+        let gone = || {
+            matches!(
+                self.accounts
+                    .pending_generated_account(&account.account_id_hex),
+                Ok(None)
+            )
+        };
+        let mut failures = 0;
+        loop {
+            gate.wait_unfenced().await;
+            if gate.end_if(gone) {
+                return;
             }
-            active
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .active_accounts
-                .remove(&account_id_hex);
-        });
-        tasks.handles.push(handle);
+            let started_at = Instant::now();
+            let Some(result) = gate
+                .attempt(
+                    self.accounts.continue_generated_account_setup(
+                        &account.account_id_hex,
+                        context.request(),
+                    ),
+                )
+                .await
+            else {
+                // A teardown fenced the account; check again once it returns.
+                continue;
+            };
+            self.shared.observer.performance().record(
+                AppPerformanceOperation::AccountSetupNetworkReady,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            let error = match result {
+                Ok(_) => return,
+                // An account that went away mid-attempt has nothing left to
+                // retry or report.
+                Err(_) if gate.end_if(gone) => return,
+                Err(error) => error,
+            };
+            failures += 1;
+            let final_attempt = failures == GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS;
+            let status = if final_attempt {
+                "deferred"
+            } else {
+                "retry scheduled"
+            };
+            let _ = self
+                .events
+                .send(MarmotAppEvent::AccountError(RuntimeAccountError {
+                    account_id_hex: account.account_id_hex.clone(),
+                    account_label: account.label.clone(),
+                    message: format!(
+                        "generated account publication {status}: {}",
+                        error.privacy_safe_kind()
+                    ),
+                }));
+            if final_attempt {
+                return;
+            }
+            let multiplier = 1_u32
+                .checked_shl(u32::try_from(failures - 1).unwrap_or(u32::MAX))
+                .unwrap_or(u32::MAX);
+            tokio::time::sleep(
+                GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY.saturating_mul(multiplier),
+            )
+            .await;
+        }
+    }
+
+    /// Start publishing `account_id_hex` again if its generated setup is
+    /// still pending, as after it is signed back in: its sign-out ended the
+    /// task. A missing or unreadable setup context waits for the next
+    /// runtime start, as resume does.
+    pub(in crate::runtime) fn continue_pending_generated_setup(&self, account_id_hex: &str) {
+        let Ok(Some(account)) = self.accounts.pending_generated_account(account_id_hex) else {
+            return;
+        };
+        let Ok(Some(bytes)) = self
+            .accounts
+            .app
+            .account_home()
+            .account_setup_context(&account.label)
+        else {
+            return;
+        };
+        if let Ok(context) = serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
+            self.schedule_generated_account_setup(account, context);
+        }
     }
 }

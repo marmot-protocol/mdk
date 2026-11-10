@@ -1367,6 +1367,17 @@ pub enum AccountSetupReadiness {
     RecoveryRequired,
 }
 
+/// Which generated identity a setup request without an identity or nsec
+/// may use.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GeneratedIdentity<'a> {
+    /// A host's create: resume the one pending generated setup, so
+    /// concurrent creates coalesce, or create a new identity.
+    ResumeOrCreate,
+    /// Continue this account's pending setup only; never another identity.
+    Continue(&'a str),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct GeneratedAccountSetupContext {
     default_relays: Vec<String>,
@@ -1903,7 +1914,10 @@ impl MarmotAppRuntime {
     }
 
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
-        self.accounts.sign_in_account(account_ref).await
+        let account = self.accounts.sign_in_account(account_ref).await?;
+        // A generated setup its sign-out stopped carries on.
+        self.continue_pending_generated_setup(&account.account_id_hex);
+        Ok(account)
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
@@ -4828,6 +4842,12 @@ impl MarmotAppRuntime {
                 return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
             }
 
+            // A pending generated setup stops before anything else, so no
+            // background attempt republishes after the KeyPackage step below.
+            let _generated_setup_fence = self
+                .setup
+                .fence_generated_setup(&account.account_id_hex)
+                .await;
             let mut outcome = SignOutOutcome::default();
 
             // Step 1 (KeyPackage hygiene): delete this device's slot before
@@ -4951,6 +4971,13 @@ impl MarmotAppRuntime {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
 
+        // A pending generated setup stops before any stage, so no background
+        // attempt publishes after stage 2 or outlives the account
+        // (whitenoise-ios#1302).
+        let _generated_setup_fence = self
+            .setup
+            .fence_generated_setup(&account.account_id_hex)
+            .await;
         let mut outcome = WipeOutcome::default();
 
         // From here until the wipe returns, the device group's removal of
@@ -7051,6 +7078,7 @@ impl AccountManager {
         // Fenced before the global lock: the purge may open account storage.
         // Removing the directory deletes the rows even if this purge fails.
         let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
+        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
         let lock_wait = self
             .shared
             .observer
@@ -7266,6 +7294,28 @@ impl AccountManager {
         (Some(fence), purged.map(|_| ()))
     }
 
+    /// Stop `account_ref`'s generated setup for a teardown, before the
+    /// worker transaction: no background attempt is in flight once this
+    /// returns, and none starts while the fence is held. Only an account
+    /// known to be unknown goes unfenced; the teardown reports that itself.
+    /// Any other lookup failure fails the teardown rather than letting it
+    /// run beside an attempt.
+    async fn fence_generated_setup(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<onboarding::GeneratedSetupFence>, AppError> {
+        let account = match self.app.account_home().account(account_ref) {
+            Ok(account) => account,
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(
+            self.setup
+                .fence_generated_setup(&account.account_id_hex)
+                .await,
+        ))
+    }
+
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
         self.deactivate_account_marking(account_ref, false).await
     }
@@ -7283,6 +7333,7 @@ impl AccountManager {
         // purge does not stop the sign-out, but it is reported: reports left on
         // disk would be retried at the next sign-in.
         let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
+        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
         let lock_wait = self
             .shared
             .observer
@@ -8217,6 +8268,53 @@ impl AccountManager {
         &self,
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
+        self.create_or_import_account_as(request, GeneratedIdentity::ResumeOrCreate)
+            .await
+    }
+
+    /// Continue the pending generated setup of `account_id_hex`, and only
+    /// that account's: it fails with `UnknownAccount` once the account is
+    /// removed, signed out or set up, instead of resuming or creating another
+    /// identity (whitenoise-ios#1302).
+    pub(super) async fn continue_generated_account_setup(
+        &self,
+        account_id_hex: &str,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        self.create_or_import_account_as(request, GeneratedIdentity::Continue(account_id_hex))
+            .await
+    }
+
+    /// `account_id_hex` while its generated setup is still pending and may
+    /// publish: present, signed in and journaled as a generated identity.
+    pub(super) fn pending_generated_account(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<AccountSummary>, AppError> {
+        let home = self.app.account_home();
+        let account = match home.account(account_id_hex) {
+            Ok(account) => account,
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if account.account_id_hex != account_id_hex
+            || account.signed_out
+            || account.unlinked
+            || !account.local_signing
+        {
+            return Ok(None);
+        }
+        Ok(home
+            .account_setup_state(&account.label)?
+            .filter(|state| state.kind == AccountSetupKind::GeneratedIdentity)
+            .map(|_| account))
+    }
+
+    async fn create_or_import_account_as(
+        &self,
+        request: AccountSetupRequest,
+        generated: GeneratedIdentity<'_>,
+    ) -> Result<AccountSetupResult, AppError> {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             if request.import_nsec.is_some() {
@@ -8263,10 +8361,10 @@ impl AccountManager {
                     }
                     match self.signed_out_account_for_identity(identity)? {
                         Some(account) => (account, None),
-                        None => self.create_nostr_account_from_setup(&request)?,
+                        None => self.create_nostr_account_from_setup(&request, generated)?,
                     }
                 } else {
-                    self.create_nostr_account_from_setup(&request)?
+                    self.create_nostr_account_from_setup(&request, generated)?
                 };
                 let reactivating_existing = account.signed_out;
                 let recent_relay_lists =
@@ -9172,8 +9270,9 @@ impl AccountManager {
     fn create_nostr_account_from_setup(
         &self,
         request: &AccountSetupRequest,
+        generated: GeneratedIdentity<'_>,
     ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
-        let result = self.create_nostr_account_from_setup_inner(request);
+        let result = self.create_nostr_account_from_setup_inner(request, generated);
         self.app.presentation_signals.catalog_changed();
         result
     }
@@ -9181,6 +9280,7 @@ impl AccountManager {
     fn create_nostr_account_from_setup_inner(
         &self,
         request: &AccountSetupRequest,
+        generated: GeneratedIdentity<'_>,
     ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
         let account_home = self.app.account_home();
         if let Some(nsec) = request.import_nsec.as_deref() {
@@ -9202,9 +9302,18 @@ impl AccountManager {
                 Ok((account, None))
             }
             None => {
-                let account = match account_home.resumable_generated_account_setup()? {
-                    Some(account) => account,
-                    None => account_home.create_nostr_account_for_setup()?,
+                let account = match generated {
+                    GeneratedIdentity::ResumeOrCreate => {
+                        match account_home.resumable_generated_account_setup()? {
+                            Some(account) => account,
+                            None => account_home.create_nostr_account_for_setup()?,
+                        }
+                    }
+                    GeneratedIdentity::Continue(account_id_hex) => self
+                        .pending_generated_account(account_id_hex)?
+                        .ok_or_else(|| {
+                            AccountHomeError::UnknownAccount(account_id_hex.to_owned())
+                        })?,
                 };
                 Ok((account, None))
             }
