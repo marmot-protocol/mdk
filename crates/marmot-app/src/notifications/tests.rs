@@ -1952,15 +1952,7 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
     let sender = "bb".repeat(32);
     let group = "ee".repeat(32);
     let mut resolver = NotificationResolver::default();
-    seed_group_state_resolver(
-        &mut resolver,
-        "alice",
-        &receiver,
-        &group,
-        Some(&sender),
-        true,
-        true,
-    );
+    seed_group_state_resolver(&app, &mut resolver, "alice", &group, Some(&sender), true);
 
     let mut cases = vec![
         ("ordinary", received_chat("hi", vec![]), false),
@@ -1992,9 +1984,7 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
         }
     }
 
-    resolver
-        .chat_muted
-        .insert(("alice".to_owned(), group), Some(0));
+    app.clear_chat_muted("alice", &group).unwrap();
     let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
         account_id_hex: receiver,
         account_label: "alice".to_owned(),
@@ -2243,9 +2233,12 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
 
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
-    let account_id_hex = "aa".repeat(32);
+    let account_id_hex = app
+        .account_home()
+        .create_account(account_label)
+        .unwrap()
+        .account_id_hex;
     let sender_id_hex = "bb".repeat(32);
     let group_id_hex = "ee".repeat(32);
     let message = RuntimeMessageReceived {
@@ -2269,28 +2262,14 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
         },
     };
     let mut resolver = NotificationResolver::default();
-    resolver.settings.insert(
-        account_label.to_owned(),
-        NotificationSettings {
-            account_ref: account_label.to_owned(),
-            account_id_hex: account_id_hex.clone(),
-            local_notifications_enabled: true,
-            native_push_enabled: true,
-        },
+    seed_group_state_resolver(
+        &app,
+        &mut resolver,
+        account_label,
+        &group_id_hex,
+        Some(&sender_id_hex),
+        false,
     );
-    let conversation = (account_label.to_owned(), group_id_hex.clone());
-    resolver.groups.insert(conversation.clone(), None);
-    resolver.chat_muted.insert(conversation.clone(), Some(0));
-    for account_id in [&account_id_hex, &sender_id_hex] {
-        resolver.users.insert(
-            account_id.clone(),
-            NotificationUser {
-                account_id_hex: account_id.clone(),
-                display_name: None,
-                picture_url: None,
-            },
-        );
-    }
 
     let update = notification_update_from_message(&app, &mut resolver, &message)
         .unwrap()
@@ -2302,7 +2281,8 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     assert_eq!(update.preview_text.as_deref(), Some("Searching relays"));
     assert!(!update.is_mention);
 
-    resolver.chat_muted.insert(conversation, None);
+    app.set_chat_muted(account_label, &group_id_hex, None)
+        .unwrap();
     assert_eq!(
         notification_update_from_message(&app, &mut resolver, &message).unwrap(),
         None,
@@ -2824,29 +2804,36 @@ fn group_state_event(
 }
 
 fn seed_group_state_resolver(
+    app: &MarmotApp,
     resolver: &mut NotificationResolver,
     account_label: &str,
-    account_id_hex: &str,
     group_id_hex: &str,
     actor_id_hex: Option<&str>,
-    local_enabled: bool,
     muted: bool,
 ) {
-    resolver.settings.insert(
-        account_label.to_owned(),
-        NotificationSettings {
-            account_ref: account_label.to_owned(),
-            account_id_hex: account_id_hex.to_owned(),
-            local_notifications_enabled: local_enabled,
-            native_push_enabled: true,
-        },
-    );
-    let conversation = (account_label.to_owned(), group_id_hex.to_owned());
-    resolver.groups.insert(conversation.clone(), None);
-    resolver
-        .chat_muted
-        .insert(conversation, (!muted).then_some(0));
-    let mut users = vec![account_id_hex];
+    let account = app.account_home().account(account_label).unwrap();
+    let mut state = app.load_state(account_label).unwrap();
+    state.groups.push(crate::AppGroupRecord::new(
+        group_id_hex.to_owned(),
+        crate::groups::AppGroupNostrRoutingComponent::new(cgka_traits::NostrRoutingV1 {
+            nostr_group_id: [0xDD; 32],
+            relays: vec!["wss://relay.example".into()],
+        })
+        .unwrap(),
+        String::new(),
+        String::new(),
+        crate::AppGroupImageInput::default(),
+        crate::groups::AppGroupAdminPolicyComponent::new(Vec::new()),
+        crate::groups::AppGroupMessageRetentionComponent::disabled(),
+    ));
+    app.save_state(&state).unwrap();
+    app.set_local_notifications_enabled(account_label, true)
+        .unwrap();
+    if muted {
+        app.set_chat_muted(account_label, group_id_hex, None)
+            .unwrap();
+    }
+    let mut users = vec![account.account_id_hex.as_str()];
     if let Some(actor_id_hex) = actor_id_hex {
         users.push(actor_id_hex);
     }
@@ -2950,9 +2937,12 @@ fn group_state_classifier_notifies_only_local_self_affecting_changes() {
 fn group_state_live_classification_respects_settings_and_mute() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
-    let local = "aa".repeat(32);
+    let local = app
+        .account_home()
+        .create_account(account_label)
+        .unwrap()
+        .account_id_hex;
     let actor = "bb".repeat(32);
     let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -2970,12 +2960,11 @@ fn group_state_live_classification_respects_settings_and_mute() {
 
     let mut resolver = NotificationResolver::default();
     seed_group_state_resolver(
+        &app,
         &mut resolver,
         account_label,
-        &local,
         &group_id_hex,
         Some(&actor),
-        true,
         false,
     );
     let update = notification_update_from_event_cached(&app, &mut resolver, &event)
@@ -2989,24 +2978,17 @@ fn group_state_live_classification_respects_settings_and_mute() {
     assert!(!update.is_from_self);
     assert!(update.notification_key.starts_with("group-state:"));
 
-    resolver
-        .chat_muted
-        .insert((account_label.to_owned(), group_id_hex.clone()), None);
+    app.set_chat_muted(account_label, &group_id_hex, None)
+        .unwrap();
     assert_eq!(
         notification_update_from_event_cached(&app, &mut resolver, &event).unwrap(),
         None,
         "muted groups must suppress membership notifications"
     );
 
-    seed_group_state_resolver(
-        &mut resolver,
-        account_label,
-        &local,
-        &group_id_hex,
-        Some(&actor),
-        false,
-        false,
-    );
+    app.clear_chat_muted(account_label, &group_id_hex).unwrap();
+    app.set_local_notifications_enabled(account_label, false)
+        .unwrap();
     assert!(
         matches!(
             notification_update_from_event_cached(&app, &mut resolver, &event),
@@ -3020,9 +3002,12 @@ fn group_state_live_classification_respects_settings_and_mute() {
 fn group_state_live_and_recovery_share_a_deterministic_key() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
-    let local = "aa".repeat(32);
+    let local = app
+        .account_home()
+        .create_account(account_label)
+        .unwrap()
+        .account_id_hex;
     let actor = "bb".repeat(32);
     let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -3036,12 +3021,11 @@ fn group_state_live_and_recovery_share_a_deterministic_key() {
 
     let mut resolver = NotificationResolver::default();
     seed_group_state_resolver(
+        &app,
         &mut resolver,
         account_label,
-        &local,
         &group_id_hex,
         Some(&actor),
-        true,
         false,
     );
     let live = notification_update_from_event_cached(
@@ -3329,15 +3313,7 @@ fn system_reaction_notifications_use_stored_actor_and_respect_origin_withdrawal(
     let group = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_hex = hex::encode(group.as_slice());
     let mut resolver = NotificationResolver::default();
-    seed_group_state_resolver(
-        &mut resolver,
-        "alice",
-        &local,
-        &group_hex,
-        Some(&peer),
-        true,
-        false,
-    );
+    seed_group_state_resolver(&app, &mut resolver, "alice", &group_hex, Some(&peer), false);
     for (index, actor) in [Some(local.as_str()), Some(peer.as_str()), None]
         .into_iter()
         .enumerate()

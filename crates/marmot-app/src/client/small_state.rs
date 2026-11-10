@@ -15,7 +15,6 @@
 //! broadcast request. Nothing tracks what a sibling holds.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
 
 use cgka_traits::GroupId;
 use marmot_session::CanonicalizationPolicy;
@@ -167,15 +166,6 @@ impl AppClient {
             &SmallStateMergeRule,
             &classifier,
         )?;
-        if outcome
-            .applied
-            .values()
-            .any(|names| names.contains(&SmallStateItemName::Mute))
-        {
-            self.app
-                .notification_revision
-                .fetch_add(1, Ordering::Release);
-        }
         let mut recorded = outcome.recorded;
         let mut changed = outcome.applied;
         let archived = self.apply_sibling_archives(outcome.archive_to_apply);
@@ -197,15 +187,6 @@ impl AppClient {
                 &SmallStateMergeRule,
                 &classifier,
             )?;
-            if outcome
-                .applied
-                .values()
-                .any(|names| names.contains(&SmallStateItemName::Mute))
-            {
-                self.app
-                    .notification_revision
-                    .fetch_add(1, Ordering::Release);
-            }
             recorded += outcome.recorded;
             for (group_id_hex, names) in outcome.applied {
                 changed.entry(group_id_hex).or_default().extend(names);

@@ -7,7 +7,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -559,7 +559,6 @@ pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
-    notification_revision: Arc<AtomicU64>,
     #[cfg(test)]
     notification_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     root: PathBuf,
@@ -1736,7 +1735,6 @@ impl MarmotApp {
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
-            notification_revision: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             account_home: AccountHome::open(&root),
@@ -1860,7 +1858,6 @@ impl MarmotApp {
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
-            notification_revision: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
@@ -3907,7 +3904,6 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .set_chat_muted(group_id_hex, muted_until_ms)?;
-        self.notification_revision.fetch_add(1, Ordering::Release);
         Ok(chat_notification_settings_from_account(
             account.label,
             account.account_id_hex,
@@ -3928,7 +3924,6 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .clear_chat_muted(group_id_hex)?;
-        self.notification_revision.fetch_add(1, Ordering::Release);
         Ok(chat_notification_settings_from_account(
             account.label,
             account.account_id_hex,
@@ -3943,12 +3938,15 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let settings = self
-            .account_storage(&account.label)?
-            .app_storage()
-            .set_local_notifications_enabled(&account.label, &account.account_id_hex, enabled)?;
-        self.notification_revision.fetch_add(1, Ordering::Release);
-        Ok(notification_settings_from_account(settings))
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .app_storage()
+                .set_local_notifications_enabled(
+                    &account.label,
+                    &account.account_id_hex,
+                    enabled,
+                )?,
+        ))
     }
 
     pub fn set_native_push_enabled(
@@ -3958,12 +3956,11 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let settings = self
-            .account_storage(&account.label)?
-            .app_storage()
-            .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?;
-        self.notification_revision.fetch_add(1, Ordering::Release);
-        Ok(notification_settings_from_account(settings))
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .app_storage()
+                .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?,
+        ))
     }
 
     pub fn push_registration(
@@ -6557,9 +6554,6 @@ impl MarmotApp {
                 frontiers_to_clear,
                 application_event_ids_to_ack,
             )?;
-        if !delta.groups.is_empty() {
-            self.notification_revision.fetch_add(1, Ordering::Release);
-        }
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6581,7 +6575,7 @@ impl MarmotApp {
             .groups
             .iter()
             .any(|group| group.group_id_hex != group_id_hex);
-        let row = self
+        let mut row = self
             .account_storage(&delta.label)?
             .app_storage()
             .save_account_projection_delta_and_refresh_chat_list_row(
@@ -6593,11 +6587,8 @@ impl MarmotApp {
                 &account.account_id_hex,
                 group_id_hex,
                 &classifier,
-            )?;
-        if !delta.groups.is_empty() {
-            self.notification_revision.fetch_add(1, Ordering::Release);
-        }
-        let mut row = row.ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+            )?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         self.presentation_signals.wake();
         self.hydrate_chat_list_row(Some(&mut row));
 
@@ -6630,7 +6621,6 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
-        self.notification_revision.fetch_add(1, Ordering::Release);
         self.presentation_signals.wake();
         self.chat_list_projection_stale
             .lock()
@@ -7752,13 +7742,11 @@ impl MarmotApp {
                 &settings.account_id_hex,
                 settings.local_notifications_enabled,
             )?;
-            self.notification_revision.fetch_add(1, Ordering::Release);
             app.set_native_push_enabled(
                 label,
                 &settings.account_id_hex,
                 settings.native_push_enabled,
             )?;
-            self.notification_revision.fetch_add(1, Ordering::Release);
         }
         if let Some(registration) = legacy.push_registration(label)? {
             app.upsert_push_registration(
@@ -7977,7 +7965,6 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .forget(label);
-        self.notification_revision.fetch_add(1, Ordering::Release);
     }
 
     fn shared_storage_path(&self) -> PathBuf {

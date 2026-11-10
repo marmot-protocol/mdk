@@ -9,6 +9,7 @@ use crate::base::connection::{finish_account_open, open_account_unkeyed};
 use crate::protocol::openmls_storage::SqliteOpenMlsStorage;
 use cgka_traits::storage::StorageResult;
 use std::path::Path;
+use std::sync::{Arc, atomic::AtomicU64};
 use std::time::Duration;
 
 /// The engine's handle on an account database: the protocol traits, open and
@@ -20,6 +21,7 @@ pub struct SqliteAccountStorage {
     migrations_applied: usize,
     migration_duration: Duration,
     pub(crate) connection: SharedConnection,
+    pub(crate) notification_revision: Arc<AtomicU64>,
     pub(crate) openmls: SqliteOpenMlsStorage,
 }
 
@@ -29,15 +31,20 @@ pub struct SqliteAccountStorage {
 pub type SqliteStorage = SqliteAccountStorage;
 
 impl SqliteAccountStorage {
-    pub(crate) fn from_opened(opened: OpenedAccount) -> Self {
+    pub(crate) fn from_opened(opened: OpenedAccount) -> StorageResult<Self> {
+        let notification_revision = {
+            let conn = opened.connection.lock()?;
+            crate::cross::handles::notification_counter(&conn)?
+        };
         let openmls = SqliteOpenMlsStorage::new(opened.connection.clone());
-        Self {
+        Ok(Self {
             connection: opened.connection,
+            notification_revision,
             openmls,
             draft_commit_observer: Default::default(),
             migrations_applied: opened.migrations_applied,
             migration_duration: opened.migration_duration,
-        }
+        })
     }
 
     /// Neutral open-time result. Existing ledger entries are not new migrations.
@@ -93,11 +100,11 @@ impl SqliteAccountStorage {
             cipher_memory_security: false,
             ..SqliteStorageOptions::default()
         })
-        .map(Self::from_opened)
+        .and_then(Self::from_opened)
     }
 
     pub fn in_memory_with_options(options: SqliteStorageOptions) -> StorageResult<Self> {
-        open_account_in_memory(options).map(Self::from_opened)
+        open_account_in_memory(options).and_then(Self::from_opened)
     }
 
     /// Open a private encrypted account store with the standard privacy and durability defaults.
@@ -111,7 +118,7 @@ impl SqliteAccountStorage {
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
-        open_account_encrypted(path.as_ref(), key, options, None).map(Self::from_opened)
+        open_account_encrypted(path.as_ref(), key, options, None).and_then(Self::from_opened)
     }
 
     /// Observe fixed phases and migration numbers without exposing database paths, SQL or keys.
@@ -127,7 +134,7 @@ impl SqliteAccountStorage {
             SqliteStorageOptions::default(),
             Some(observer),
         )
-        .map(Self::from_opened)
+        .and_then(Self::from_opened)
     }
 
     /// Exercise raw unkeyed connections with production keying defaults and no diagnostic callback.
@@ -137,7 +144,7 @@ impl SqliteAccountStorage {
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
-        open_account_unkeyed(connection, key, options, None).map(Self::from_opened)
+        open_account_unkeyed(connection, key, options, None).and_then(Self::from_opened)
     }
 
     /// Finish an existing connection without recording progress; options and migrations remain identical.
@@ -146,7 +153,7 @@ impl SqliteAccountStorage {
         connection: rusqlite::Connection,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
-        finish_account_open(connection, options, None).map(Self::from_opened)
+        finish_account_open(connection, options, None).and_then(Self::from_opened)
     }
 
     /// Set an aggregate-only observer shared by all clones. No identities or SQL

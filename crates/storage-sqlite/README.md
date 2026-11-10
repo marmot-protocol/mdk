@@ -83,6 +83,14 @@ only in this crate's own tests or with the `test-support` feature, and do nothin
 Long-lived connections are closeable so a host can release file locks before suspending; closing is terminal and
 surviving clones return `StorageError::Closed`.
 
+`SqliteAppStorage::notification_policy_snapshot(label, account_id_hex)` returns committed notification settings with
+their matching `notification_revision()`. It initializes missing defaults and rejects caller-owned transactions.
+The revision is a SQL-free, process-local counter shared by the opened account's protocol and app handles. TEMP
+triggers advance it for projected-group, notification-policy, and chat-mute writes, including protocol forget;
+rolled-back writes may also advance it. Unchanged policy upserts and mute timestamps do not invalidate it.
+Pair it with `connection_serial()` when caching across opens. It is not persisted and does not track writes from
+other connections or processes.
+
 The shared store is unencrypted and owner-only, with WAL, `synchronous=NORMAL`, a 5-second busy timeout, foreign keys
 ON, `trusted_schema=OFF`, `temp_store=MEMORY`, and terminal close. See the
 [app storage boundaries](../../docs/marmot-architecture/further-context/app-sqlite-storage-boundaries.md).

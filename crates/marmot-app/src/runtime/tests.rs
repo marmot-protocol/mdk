@@ -195,14 +195,6 @@ mod live_notifications {
             &cgka_traits::encode_component_vectors(&[b"After", b""]),
         );
         app.save_state(&state).unwrap();
-        runtime
-            .events
-            .send(MarmotAppEvent::GroupStateUpdated {
-                account_id_hex: account.account_id_hex.clone(),
-                account_label: account.label.clone(),
-                group_id: group.clone(),
-            })
-            .unwrap();
         runtime.events.send(message(&account, &group, 2)).unwrap();
         let update = next(&mut subscription).await;
         assert_eq!(update.preview_text.as_deref(), Some("Message 2"));
@@ -371,7 +363,7 @@ mod live_notifications {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_catalog_refreshes_policy() {
+    async fn live_persisted_policy() {
         let (_root, app, account, group) = fixture();
         let barrier = app.account_home().create_account("barrier").unwrap();
         let mut state = app.load_state("barrier").unwrap();
@@ -385,18 +377,11 @@ mod live_notifications {
             Some("Before")
         );
 
-        // A restored account brings persisted policy without a preference command.
         app.account_storage("alice")
             .unwrap()
             .app_storage()
             .set_local_notifications_enabled("alice", &account.account_id_hex, false)
             .unwrap();
-        let mut state = app.load_state("alice").unwrap();
-        state.groups[0].profile = crate::groups::AppGroupProfileComponent::from_bytes(
-            &cgka_traits::encode_component_vectors(&[b"Restored", b""]),
-        );
-        app.save_state(&state).unwrap();
-        app.presentation_signals.catalog_changed();
         runtime.events.send(message(&account, &group, 2)).unwrap();
         runtime.events.send(message(&barrier, &group, 3)).unwrap();
         assert_eq!(
@@ -404,41 +389,57 @@ mod live_notifications {
             barrier.account_id_hex
         );
 
-        app.set_local_notifications_enabled("alice", true).unwrap();
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_local_notifications_enabled("alice", &account.account_id_hex, true)
+            .unwrap();
         runtime.events.send(message(&account, &group, 4)).unwrap();
         let update = next(&mut subscription).await;
         assert_eq!(update.message_id_hex, Some(format!("{:064x}", 4)));
-        assert_eq!(update.group_name.as_deref(), Some("Restored"));
+        assert_eq!(update.group_name.as_deref(), Some("Before"));
         runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_deleted_group_is_silent() {
-        let (_root, app, account, group) = fixture();
-        let barrier = app.account_home().create_account("barrier").unwrap();
-        let mut state = app.load_state("barrier").unwrap();
-        state.groups = app.groups("alice").unwrap();
-        app.save_state(&state).unwrap();
-        let runtime = app.runtime();
-        let mut subscription = runtime.subscribe_notifications().unwrap();
-        runtime.events.send(message(&account, &group, 1)).unwrap();
-        assert_eq!(
-            next(&mut subscription).await.group_name.as_deref(),
-            Some("Before")
-        );
+        for forget in [false, true] {
+            let (_root, app, account, group) = fixture();
+            let barrier = app.account_home().create_account("barrier").unwrap();
+            let mut state = app.load_state("barrier").unwrap();
+            state.groups = app.groups("alice").unwrap();
+            app.save_state(&state).unwrap();
+            let runtime = app.runtime();
+            let mut subscription = runtime.subscribe_notifications().unwrap();
+            runtime.events.send(message(&account, &group, 1)).unwrap();
+            assert_eq!(
+                next(&mut subscription).await.group_name.as_deref(),
+                Some("Before")
+            );
 
-        assert!(
-            app.delete_group_local_data("alice", &hex::encode(group.as_slice()))
+            let changed = if forget {
+                cgka_traits::storage::GroupStorage::forget_group_local(
+                    &app.account_storage("alice").unwrap(),
+                    &group,
+                    cgka_traits::Timestamp(100),
+                )
                 .unwrap()
-        );
-        // An already queued message can precede the deletion's GroupStateUpdated.
-        runtime.events.send(message(&account, &group, 2)).unwrap();
-        runtime.events.send(message(&barrier, &group, 3)).unwrap();
-        assert_eq!(
-            next(&mut subscription).await.account_id_hex,
-            barrier.account_id_hex
-        );
-        runtime.shutdown().await;
+            } else {
+                app.delete_group_local_data("alice", &hex::encode(group.as_slice()))
+                    .unwrap()
+            };
+            assert!(changed, "forget={forget}");
+            // No GroupStateUpdated has reached this subscription.
+            runtime.events.send(message(&account, &group, 2)).unwrap();
+            runtime.events.send(message(&barrier, &group, 3)).unwrap();
+            let update = next(&mut subscription).await;
+            assert_eq!(
+                update.account_id_hex, barrier.account_id_hex,
+                "forget={forget}"
+            );
+            assert_eq!(update.message_id_hex, Some(format!("{:064x}", 3)));
+            runtime.shutdown().await;
+        }
     }
 }
 
