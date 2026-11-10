@@ -5267,11 +5267,7 @@ impl MarmotApp {
                     Some(recovery_marker),
                     Some(spill_store),
                 )
-                .with_event_limits(Arc::new(relay_event_limits::AppRelayEventLimits::new(
-                    &self.config.deployment.relay_event_limits,
-                    self.relay_caps.clone(),
-                    self.config.allow_loopback_relay_endpoints,
-                )));
+                .with_event_limits(self.relay_event_limits());
             // The router spills what a raised cursor alone stopped a restart from
             // fetching again, measured from this persisted floor.
             adapter.open_transport_cursor(state.last_transport_timestamp);
@@ -7998,20 +7994,36 @@ impl MarmotApp {
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
         let stop = self.account_publish_stop(account_id_hex);
+        // The publisher sends nothing once the account is unlinked, and no
+        // event over a relay's known limit (mdk#2334).
+        let guard = |client: Arc<dyn NostrRelayClient>| -> Arc<dyn NostrRelayClient> {
+            let client = Arc::new(transport_nostr::KnownLimitPublishClient::new(
+                client,
+                self.relay_event_limits(),
+            ));
+            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
+                client, stop,
+            ))
+        };
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
-            return Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
-                client.clone(),
-                stop,
-            ));
+            return guard(client.clone());
         }
         // The one place an account publisher is built (see clippy.toml).
         #[allow(clippy::disallowed_methods)]
         let client = self
             .relay_plane
             .account_publish_client(account_id_hex, signer);
-        Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
-            client, stop,
+        guard(client)
+    }
+
+    /// The relay event limits every publish of this app keeps to (mdk#2334):
+    /// the deployment's, and for large events the relays' NIP-11 documents.
+    fn relay_event_limits(&self) -> Arc<dyn transport_nostr::RelayEventLimits> {
+        Arc::new(relay_event_limits::AppRelayEventLimits::new(
+            &self.config.deployment.relay_event_limits,
+            self.relay_caps.clone(),
+            self.config.allow_loopback_relay_endpoints,
         ))
     }
 

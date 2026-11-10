@@ -12902,9 +12902,10 @@ MarmotStatus marmot_deployment_set_open_ranking(struct MarmotDeployment *deploym
 /**
  * Replace the largest event each listed relay accepts, in bytes of
  * serialized event JSON, for relays that do not advertise it (mdk#2334).
- * `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event or
- * Welcome over a relay's known limit, and a send that fits none of its
- * relays fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero
+ * `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event, Welcome
+ * or account-signed event over a relay's known limit. A send that fits none
+ * of its relays reaches none, and a call that returns relay errors then
+ * fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero
  * limit is ignored; a relay listed twice keeps the smaller limit.
  * # Safety
  * deployment must be live; relays must point to len valid strings and

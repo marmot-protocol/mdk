@@ -7536,3 +7536,192 @@ fn the_refusal_measure_is_the_relays_measure() {
     event.sig = None;
     assert_eq!(event_json_bytes(&event), signed.as_json().len());
 }
+
+/// An account publish client over a recording relay client, knowing `limits`.
+fn known_limit_client(
+    limits: Vec<(TransportEndpoint, usize)>,
+    too_large: Vec<TransportEndpoint>,
+) -> (Arc<SizeRefusingClient>, KnownLimitPublishClient) {
+    let inner = Arc::new(SizeRefusingClient {
+        too_large,
+        ..SizeRefusingClient::default()
+    });
+    let client = KnownLimitPublishClient::new(inner.clone(), Arc::new(KnownLimits(limits)));
+    (inner, client)
+}
+
+/// mdk#2334: an account publish sends no event to a relay over its known
+/// limit. An event over every limit is sent nowhere and proves its size; a
+/// refused relay otherwise joins the result of the relays sent to and counts
+/// against the required acknowledgements.
+#[tokio::test]
+async fn account_publishes_send_no_event_over_a_known_limit() {
+    let over = TransportEndpoint("wss://over.example".into());
+    let fits = TransportEndpoint("wss://fits.example".into());
+    let unknown = TransportEndpoint("wss://unknown.example".into());
+    let refuses = TransportEndpoint("wss://refuses.example".into());
+    let limits = || vec![(over.clone(), 100), (fits.clone(), usize::MAX)];
+    let account = MemberId::new(vec![0xA1; 32]);
+    let event = group_event("44", &[0xD4; 32]);
+    let bytes = event_json_bytes(&event);
+    let refusal = TransportEndpointFailure::over_known_limit(over.clone(), bytes);
+    let too_large = Some(cgka_traits::EventSizeClass::of_bytes(bytes));
+
+    let (inner, client) = known_limit_client(limits(), Vec::new());
+    let result = client
+        .publish_event_for_account(&account, std::slice::from_ref(&over), &event, 1)
+        .await;
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(failure.endpoint_failures, std::slice::from_ref(&refusal));
+    assert_eq!(failure.event_size_class, too_large);
+    assert_eq!(
+        failure.message_id,
+        hex::decode(&event.id).ok().map(MessageId::new)
+    );
+    assert!(inner.sent_to.lock().unwrap().is_empty(), "sent nowhere");
+
+    let outcome = client
+        .publish_event(&[over.clone(), fits.clone(), unknown.clone()], &event, 2)
+        .await
+        .unwrap();
+    assert_eq!(*inner.sent_to.lock().unwrap(), [fits.clone(), unknown]);
+    assert_eq!(outcome.accepted.len(), 2);
+    assert_eq!(outcome.failed, std::slice::from_ref(&refusal));
+
+    let (_, client) = known_limit_client(limits(), Vec::new());
+    let result = client
+        .publish_event(&[over.clone(), fits.clone()], &event, 2)
+        .await;
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+        panic!("the refused relay counts against the quorum, got {result:?}");
+    };
+    assert_eq!(failure.endpoint_failures, std::slice::from_ref(&refusal));
+    assert_eq!(failure.event_size_class, None, "a relay accepted the event");
+
+    let (_, client) = known_limit_client(limits(), vec![refuses.clone()]);
+    let result = client.publish_event(&[over, refuses], &event, 1).await;
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+        panic!("expected a size refusal, got {result:?}");
+    };
+    assert_eq!(failure.endpoint_failures.len(), 2);
+    assert_eq!(
+        failure.event_size_class, too_large,
+        "a local refusal and a relay's size answer prove size together"
+    );
+}
+
+/// mdk#2334: a batch refuses each request on its own. A request over every
+/// limit is answered unsent, and the rest go out together, in order.
+#[tokio::test]
+async fn an_account_publish_batch_refuses_each_request_on_its_own() {
+    let over = TransportEndpoint("wss://over.example".into());
+    let fits = TransportEndpoint("wss://fits.example".into());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let event = group_event("44", &[0xD4; 32]);
+    let refusal =
+        TransportEndpointFailure::over_known_limit(over.clone(), event_json_bytes(&event));
+    let (inner, client) = known_limit_client(vec![(over.clone(), 100)], Vec::new());
+    let request =
+        |endpoints: Vec<TransportEndpoint>| transport_nostr_adapter::NostrEventPublishRequest {
+            endpoints,
+            event: event.clone(),
+            required_acks: 1,
+        };
+    let requests = [
+        request(vec![over.clone()]),
+        request(vec![over.clone(), fits.clone()]),
+        request(vec![fits.clone()]),
+    ];
+
+    let batch = client
+        .publish_events_for_account_with_timings(&account, &requests)
+        .await;
+
+    assert_eq!(batch.outcomes.len(), 3);
+    assert_eq!(batch.request_durations.len(), 3);
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = &batch.outcomes[0] else {
+        panic!("expected a refusal, got {:?}", batch.outcomes[0]);
+    };
+    assert_eq!(failure.endpoint_failures, std::slice::from_ref(&refusal));
+    assert!(failure.event_size_class.is_some());
+    assert_eq!(batch.request_durations[0], Duration::ZERO);
+    assert_eq!(batch.outcomes[1].as_ref().unwrap().failed, [refusal]);
+    assert!(batch.outcomes[2].as_ref().unwrap().failed.is_empty());
+    assert_eq!(*inner.sent_to.lock().unwrap(), [fits.clone(), fits]);
+}
+
+/// mdk#2334: account publishes and the account adapter refuse the same
+/// relays for the same event and send it to the same others, whether some
+/// relays or every relay refuses it.
+#[tokio::test]
+async fn account_publishes_and_the_adapter_refuse_the_same_relays() {
+    let relay = |url: &str| TransportEndpoint(url.into());
+    let over = relay("wss://over.example");
+    let also_over = relay("wss://also-over.example");
+    let fits = relay("wss://fits.example");
+    let unknown = relay("wss://unknown.example");
+    let limits = || {
+        Arc::new(KnownLimits(vec![
+            (over.clone(), 100),
+            (also_over.clone(), 200),
+            (fits.clone(), usize::MAX),
+        ]))
+    };
+    let account = MemberId::new(vec![0xA1; 32]);
+    let welcome = welcome_message();
+    let TransportEnvelope::Welcome { recipient } = welcome.envelope.clone() else {
+        panic!("a gift wrap is a Welcome");
+    };
+    let event = NostrTransportEvent::from_transport_message(&welcome).unwrap();
+
+    for endpoints in [
+        vec![over.clone(), fits.clone(), unknown.clone()],
+        vec![over.clone(), also_over.clone()],
+    ] {
+        let adapter_client = Arc::new(SizeRefusingClient::default());
+        let relay_plane =
+            MarmotRelayPlane::new(Some(Duration::from_secs(30)), adapter_client.clone());
+        let adapter = relay_plane
+            .account_adapter(account.clone(), adapter_client.clone())
+            .with_event_limits(limits());
+        let adapter_result = adapter
+            .publish(TransportPublishRequest {
+                account_id: account.clone(),
+                message: welcome.clone(),
+                target: TransportPublishTarget::Inbox {
+                    recipient: recipient.clone(),
+                    endpoints: endpoints.clone(),
+                },
+                required_acks: 1,
+            })
+            .await;
+
+        let account_client = Arc::new(SizeRefusingClient::default());
+        let client = KnownLimitPublishClient::new(account_client.clone(), limits());
+        let result = client
+            .publish_event_for_account(&account, &endpoints, &event, 1)
+            .await;
+
+        assert_eq!(
+            *account_client.sent_to.lock().unwrap(),
+            *adapter_client.sent_to.lock().unwrap(),
+            "{endpoints:?}"
+        );
+        match (adapter_result, result) {
+            (Ok(report), Ok(outcome)) => assert_eq!(report.failed, outcome.failed),
+            (
+                Err(TransportAdapterError::PublishEndpoints(adapter_failure)),
+                Err(TransportAdapterError::PublishEndpoints(failure)),
+            ) => {
+                assert_eq!(adapter_failure.endpoint_failures, failure.endpoint_failures);
+                assert_eq!(adapter_failure.event_size_class, failure.event_size_class);
+                assert!(failure.event_size_class.is_some());
+            }
+            (adapter_result, result) => {
+                panic!("the paths disagree: {adapter_result:?} against {result:?}")
+            }
+        }
+    }
+}
