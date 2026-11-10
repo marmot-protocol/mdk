@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `start_direct_conversation(account_ref, peer_account_id)` exposes shared
+  local reuse and creation with both participants as founding admins
+  (mdk#464). Cancellation detaches the wait; retry reuses canonical state.
+  Generic creation and legacy admin roles remain unchanged.
+
 - Add `account_relay_liveness`, `subscribe_relay_liveness`, and `reconnect_relay` (mdk#329), with
   `RelayLivenessFfi`, stable `RelayStatusFfi`, and a closeable `RelayLivenessSubscription`.
   Rows include session-local attempt times and available connection-error categories. Additive; aggregate health

@@ -2,10 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotAppRuntime::start_direct_conversation` serializes peer lookup and
+  creation on the account worker (mdk#464). New direct conversations include
+  both accounts as founding admins. Retries reuse canonical local state,
+  including after a lost response or projection failure. Recovery restores
+  only missing direct projections for the requested peer and announces the
+  repaired row. Device groups and unrelated groups remain untouched.
+  A matching quarantined group still eligible for reuse blocks creation on
+  repeated retries, even without a projection. Removed and disbanded copies
+  do not block a fresh direct. Generic creation and existing
+  conversations retain their current admin semantics.
+
 - Add account-scoped relay liveness snapshots, event-driven subscriptions, and safety-checked per-relay reconnects
   (mdk#329). Unobserved configured relays remain `Unknown`; closed sessions retain available attempt/error details.
   Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
   is unchanged. Malformed cached URLs are excluded without blocking receive startup or valid retries.
+  Directory-cache failures do not gate receive activation; queued reconnects use the long worker response wait.
 
 ## 0.15.0 - 2026-11-09
 

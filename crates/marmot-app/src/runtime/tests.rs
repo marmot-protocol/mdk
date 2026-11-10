@@ -5063,3 +5063,67 @@ fn generated_setup_profile_adopts_a_selected_profile_only_before_local_readiness
         assert!(store, "{phase:?}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_invite_decline_does_not_leave_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = transport_nostr::MarmotRelayPlane::new(None, relay);
+    let group = {
+        let mut alice = app
+            .client_with_relay_plane("alice", &plane, None)
+            .await
+            .unwrap();
+        let mut bob_client = app
+            .client_with_relay_plane("bob", &plane, None)
+            .await
+            .unwrap();
+        bob_client.sync().await.unwrap();
+        let group = alice
+            .create_group("Invite", &[&bob.account_id_hex])
+            .await
+            .unwrap();
+        assert!(
+            bob_client
+                .sync()
+                .await
+                .unwrap()
+                .joined_groups
+                .contains(&group)
+        );
+        group
+    };
+    let id = hex::encode(group.as_slice());
+    assert!(app.group("bob", &id).unwrap().unwrap().pending_confirmation);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let commands = runtime.accounts().worker_commands("bob").await.unwrap();
+    // Startup hydration defers declines but runs accepts immediately; the
+    // incident ordering needs the steady-state worker's FIFO.
+    runtime.catch_up_accounts().await.unwrap();
+    let (respond, response) = oneshot::channel();
+    drop(response);
+    commands
+        .send(AccountWorkerCommand::DeclineGroupInvite {
+            group_id: group.clone(),
+            respond,
+        })
+        .await
+        .unwrap();
+
+    // A caller that gave up on that decline accepts instead. The accept is
+    // queued behind the abandoned decline, which must not leave the group.
+    let accepted = runtime
+        .accept_group_invite("bob", &group)
+        .await
+        .expect("an abandoned decline must not consume the pending invite");
+    assert!(!accepted.pending_confirmation);
+    assert_eq!(accepted.self_membership, crate::SelfMembership::Member);
+    runtime.shutdown_and_close().await.unwrap();
+}

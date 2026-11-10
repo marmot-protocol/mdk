@@ -100,9 +100,11 @@ sample. These measurements do not include host rendering or every subsequent eng
 last attempt time, and available connection-error category. `subscribe_relay_liveness` supplies an initial snapshot
 and event-driven replacement lists; `RuntimeRelayLivenessSubscription::close` stops only the observer.
 `reconnect_relay` requires a running managed account and checks configured membership and dial safety. Its worker
-serializes reconnect with configuration reconciliation; after dispatch, the dial wait is capped at five seconds.
+serializes reconnect with configuration reconciliation. The response wait is capped at sixteen minutes to allow
+queued long-running commands; after dispatch, the dial wait is capped at five seconds.
 Existing roles and ownership remain unchanged. Managed workers
 retire newly dialed manual connections when their configured membership ends, independently of UI observers.
+Configuration-cache errors are reported and retried on worker maintenance ticks without blocking receive startup.
 These session-local rows do not establish message delivery.
 See the [binding contract](../marmot-uniffi/README.md#relay-liveness) for state and privacy semantics.
 
@@ -277,6 +279,34 @@ keeps its radius, candidate, batch, and timeout bounds. Aggregate `search_stage`
 membership, provider response, profile hydration, and network completion, without logging queries or identities.
 
 ## Groups and invitations
+
+### Start a direct conversation
+
+```rust
+pub async fn start_direct_conversation(
+    &self,
+    account_ref: &str,
+    peer_account_id: &str,
+) -> Result<GroupId, AppError>
+```
+
+`MarmotAppRuntime::start_direct_conversation` accepts a hex or npub peer identity. The account worker serializes the
+existing deterministic direct-conversation lookup with creation. If no reusable conversation exists, it creates an unnamed
+group with the creator and peer as admins in the same founding state and Welcome. Reusing a group preserves its roles
+without an admin-policy update. Generic creation remains separate and does not infer direct-chat intent from a name or roster.
+
+The returned opaque MLS group id confirms canonical local state, not Welcome delivery. Retained Welcome delivery continues
+independently. Cancellation after command admission detaches the caller while the worker completes creation and retains
+delivery work. Retry after cancellation, response loss, or projection failure recovers and reuses the canonical engine group,
+even when the chat-list projection is missing. If a matching canonical group is eligible for reuse but cannot hydrate, retry
+returns an error rather than creating another group. Removed and disbanded copies do not block a fresh start. Concurrent
+starts on the same account return one local group. Simultaneous starts by different accounts can create two groups, each
+with both accounts as founding admins.
+
+There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
+Legacy and generic groups retain their authoritative roles, including unnamed two-member groups. Clients using generic
+creator-only creation remain interoperable: recipients accept the founding admin set through the Welcome, but cannot
+self-promote if they are not admins. Those clients must adopt the explicit start operation to create symmetric direct chats.
 
 **Experimental shared invitation decisions.** With device groups enabled, updated clients share Accept/Decline for
 one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch

@@ -1270,9 +1270,6 @@ impl AppClient {
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
             .await
             .map_err(|error| (SyncFailureStage::TransportActivation, error.into()))?;
-        self.sync_relay_liveness()
-            .await
-            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
         let rebuild_since = self.subscription_rebuild_since();
         let activation = self.runtime.activate_transport(rebuild_since).await;
         if let Some(telemetry) = telemetry {

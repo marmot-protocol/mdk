@@ -562,6 +562,55 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_cache_failure() {
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let alice = app.account_home().create_account("alice").unwrap();
+    let mut client = app
+        .local_client_with_relay_plane(&alice.label, &app.relay_plane, None)
+        .await
+        .unwrap();
+    let bob = app.account_home().create_account("bob").unwrap();
+    std::fs::create_dir(app.directory_cache_path(&bob.label)).unwrap();
+
+    client
+        .prepare_transport()
+        .await
+        .expect("diagnostic cache failures must not prevent receive activation");
+    assert!(client.adapter.replay_admission().await.active());
+    let mut changes = app.relay_plane.relay_liveness_changes().unwrap();
+    let sdk = app
+        .relay_plane
+        .account_history_relay_client(client.adapter.account_id())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if sdk
+                .relay_liveness()
+                .await
+                .iter()
+                .any(|row| row.status == crate::RelayLivenessStatus::Connected)
+            {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the account installs a real receive connection despite the other cache");
+    app.relay_plane.shutdown().await;
+    relay.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_manual_lifetime() {
     let receive = nostr_relay_builder::MockRelay::run().await.unwrap();
     let manual = nostr_relay_builder::MockRelay::run().await.unwrap();

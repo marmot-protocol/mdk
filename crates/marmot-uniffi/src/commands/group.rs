@@ -413,6 +413,23 @@ impl Marmot {
             .into())
     }
 
+    /// Reuse a local direct conversation with this hex or npub peer, or create
+    /// an unnamed group with both accounts as founding admins. Returns the
+    /// canonical MLS group id as hex, not a Welcome delivery acknowledgement.
+    /// Cancellation detaches the wait; retry reuses canonical local state.
+    #[marmot_uniffi_macros::survives_cancellation]
+    pub async fn start_direct_conversation(
+        &self,
+        account_ref: String,
+        peer_account_id: String,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = self
+            .runtime
+            .start_direct_conversation(&account_ref, &peer_account_id)
+            .await?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
     /// Create a new MLS group with `name` and the given members. Members are
     /// referenced by `npub` or hex account id. Returns the locally canonical
     /// group id as hex; this confirms local canonicalization, not Welcome
@@ -1583,7 +1600,7 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn app_component_and_key_package_status_ffi_roundtrip() {
         let relay = MockRelay::run().await.unwrap();
         let url = relay.url().await.to_string();
@@ -1741,6 +1758,49 @@ mod tests {
             ),
             (None, 0, None)
         );
+        let peer_endpoint = TransportEndpoint(relay.url().await.to_string());
+        let peer = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![peer_endpoint.clone()],
+                bootstrap_relays: vec![peer_endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .unwrap()
+            .account
+            .account_id_hex;
+        let direct = kit
+            .start_direct_conversation(account.clone(), peer.clone())
+            .await
+            .expect("start through the exported binding");
+        let details = kit
+            .group_details(account.clone(), direct.clone())
+            .await
+            .expect("returned hex MLS id is accepted by binding queries");
+        assert_eq!(details.group.name, "");
+        let mut admins = details.group.admins;
+        admins.sort();
+        let mut expected_admins = vec![account.clone(), peer.clone()];
+        expected_admins.sort();
+        assert_eq!(admins, expected_admins);
+        assert_eq!(
+            kit.start_direct_conversation(account.clone(), npub(&peer))
+                .await
+                .unwrap(),
+            direct
+        );
+        for name in ["generic", ""] {
+            let generic = kit
+                .create_group(account.clone(), name.into(), vec![peer.clone()], None)
+                .await
+                .unwrap();
+            let details = kit.group_details(account.clone(), generic).await.unwrap();
+            assert_eq!(details.group.admins, vec![account.clone()]);
+        }
+
         let group = kit
             .create_group(account.clone(), "components".into(), vec![], None)
             .await

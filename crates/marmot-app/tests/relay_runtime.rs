@@ -13269,6 +13269,341 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     runtime.shutdown().await;
 }
 
+async fn direct_roles(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+) -> (u64, std::collections::BTreeMap<String, bool>) {
+    let roster = runtime.group_roster(account, group).await.unwrap();
+    (
+        roster.epoch,
+        roster
+            .members
+            .into_iter()
+            .map(|member| (member.member_id_hex, member.is_admin))
+            .collect(),
+    )
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_is_shared() {
+    use std::task::Poll;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGiftWraps::new();
+    let (_relay, app, url) = gift_wrap_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let bob_npub = marmot_app::npub_for_account_id(bob_id).unwrap();
+    let expected =
+        std::collections::BTreeMap::from([(alice_id.clone(), true), (bob_id.clone(), true)]);
+    let mut events = runtime.subscribe();
+
+    runtime.catch_up_accounts().await.unwrap();
+    let startup = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup.clone());
+    runtime.restart_account(alice_id).await.unwrap();
+    timeout(Duration::from_secs(5), startup.wait())
+        .await
+        .expect("the restarted worker must hold startup before either start");
+    gate.arm(1);
+    let mut lost_response = Box::pin(runtime.start_direct_conversation(alice_id, &bob_npub));
+    std::future::poll_fn(|cx| {
+        assert!(lost_response.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let mut concurrent = Box::pin(runtime.start_direct_conversation(alice_id, bob_id));
+    std::future::poll_fn(|cx| {
+        assert!(concurrent.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(app.groups(&alice.account.label).unwrap().is_empty());
+    timeout(Duration::from_secs(5), startup.wait())
+        .await
+        .expect("both starts must be admitted before startup resumes");
+    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+        .await
+        .expect("the admitted command must create and retain its founding Welcome");
+    drop(lost_response);
+    let groups = app.groups(&alice.account.label).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].profile.name.is_empty());
+    let created_hex = groups[0].group_id_hex.clone();
+    gate.release();
+    let (first, second) = tokio::join!(
+        concurrent,
+        runtime.start_direct_conversation(alice_id, &bob_npub)
+    );
+    let group_id = first.unwrap();
+    assert_eq!(second.unwrap(), group_id);
+    assert_eq!(hex::encode(group_id.as_slice()), created_hex);
+    assert_eq!(app.groups(&alice.account.label).unwrap().len(), 1);
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected.clone())
+    );
+
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == bob_id && joined == &group_id
+        )
+    })
+    .await;
+    assert_eq!(
+        direct_roles(&runtime, bob_id, &group_id).await,
+        (1, expected.clone())
+    );
+    for _ in 0..2 {
+        for (account, peer) in [(alice_id, bob_id), (bob_id, alice_id)] {
+            assert_eq!(
+                runtime
+                    .start_direct_conversation(account, peer)
+                    .await
+                    .unwrap(),
+                group_id
+            );
+            assert_eq!(
+                direct_roles(&runtime, account, &group_id).await,
+                (1, expected.clone())
+            );
+        }
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_reuse_preserves_roles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let mut group_ids = Vec::new();
+    for name in ["generic named group", "", ""] {
+        let group_id = runtime
+            .create_group(alice_id, name, std::slice::from_ref(bob_id), None)
+            .await
+            .unwrap();
+        wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                    if account_id_hex == bob_id && joined == &group_id
+            )
+        })
+        .await;
+        group_ids.push(group_id);
+    }
+    let expected =
+        std::collections::BTreeMap::from([(alice_id.clone(), true), (bob_id.clone(), false)]);
+    for _ in 0..2 {
+        for (account, peer) in [(alice_id, bob_id), (bob_id, alice_id)] {
+            let selected = runtime
+                .existing_direct_conversation(account, peer)
+                .await
+                .unwrap()
+                .expect("the generic unnamed conversations are eligible for reuse");
+            assert_ne!(selected.group_id_hex, hex::encode(group_ids[0].as_slice()));
+            assert!(
+                group_ids[1..]
+                    .iter()
+                    .any(|group| { hex::encode(group.as_slice()) == selected.group_id_hex })
+            );
+            assert_eq!(
+                hex::encode(
+                    runtime
+                        .start_direct_conversation(account, peer)
+                        .await
+                        .unwrap()
+                        .as_slice()
+                ),
+                selected.group_id_hex
+            );
+            for group_id in &group_ids {
+                assert_eq!(
+                    direct_roles(&runtime, account, group_id).await,
+                    (1, expected.clone())
+                );
+            }
+        }
+    }
+    assert_eq!(app.groups(&alice.account.label).unwrap().len(), 3);
+    assert_eq!(app.groups(&bob.account.label).unwrap().len(), 3);
+    runtime.shutdown().await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_retry_survives_restart() {
+    storage_sqlite::relax_storage_for_test_process();
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::white_noise()
+        .with_allow_loopback_relay_endpoints(true)
+        .with_dev_fail_create_local_projection(true);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let expected =
+        std::collections::BTreeMap::from([(alice_id.clone(), true), (bob_id.clone(), true)]);
+    let catch_up = Arc::new(Notify::new());
+    runtime
+        .shared_services()
+        .set_create_group_catch_up_barrier(Some(catch_up.clone()));
+    rejecting.store(true, Ordering::Relaxed);
+    let group_id = runtime
+        .start_direct_conversation(alice_id, bob_id)
+        .await
+        .unwrap();
+    assert!(app.groups(&alice.account.label).unwrap().is_empty());
+    let group_hex = hex::encode(group_id.as_slice());
+    let pending = timeout(Duration::from_secs(5), async {
+        loop {
+            let pending = runtime.pending_welcome_deliveries(alice_id).await.unwrap();
+            if !pending.is_empty() {
+                break pending;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("post-canonical projection failure must retain the founding Welcome");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].group_id_hex, group_hex);
+    let mut repaired_events = runtime.subscribe();
+    assert_eq!(
+        runtime
+            .start_direct_conversation(alice_id, bob_id)
+            .await
+            .unwrap(),
+        group_id
+    );
+    wait_for_event(&mut repaired_events, |event| {
+        matches!(event, MarmotAppEvent::ProjectionUpdated(update)
+            if update.account_id_hex == *alice_id
+                && update.update.chat_list_trigger == marmot_app::ChatListUpdateTrigger::NewGroup
+                && update.update.chat_list_row.as_ref()
+                    .is_some_and(|row| row.group_id_hex == group_hex))
+    })
+    .await;
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected.clone())
+    );
+    assert!(app.groups(&bob.account.label).unwrap().is_empty());
+    catch_up.notify_one();
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert_eq!(
+        runtime
+            .start_direct_conversation(alice_id, bob_id)
+            .await
+            .unwrap(),
+        group_id
+    );
+    assert_eq!(app.groups(&alice.account.label).unwrap().len(), 1);
+    let pending = runtime.pending_welcome_deliveries(alice_id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].group_id_hex, group_hex);
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected.clone())
+    );
+
+    rejecting.store(false, Ordering::Relaxed);
+    runtime.restart_account(alice_id).await.unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == bob_id && joined == &group_id
+        )
+    })
+    .await;
+    assert_eq!(
+        direct_roles(&runtime, bob_id, &group_id).await,
+        (1, expected.clone())
+    );
+    assert_eq!(
+        runtime
+            .start_direct_conversation(bob_id, alice_id)
+            .await
+            .unwrap(),
+        group_id
+    );
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected)
+    );
+    assert_eq!(app.groups(&bob.account.label).unwrap().len(), 1);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .pending_welcome_deliveries(alice_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("successful retained Welcome delivery must retire its obligation");
+    runtime.shutdown().await;
+}
+
 /// mdk#1487: the detailed create response carries the exact durable chat-list
 /// row emitted to subscribers at the response boundary. Ordinary queries keep
 /// its content, while projection maintenance may advance `updated_at`.

@@ -2011,6 +2011,142 @@ impl AppClient {
         Ok(prepared_group_image_status(&record))
     }
 
+    pub(crate) fn reusable_direct_group(
+        &mut self,
+        peer_account_id_hex: &str,
+    ) -> Result<Option<CanonicalCreatedGroup>, AppError> {
+        if let Some(group_id) = self.find_direct_group(peer_account_id_hex)? {
+            return Ok(Some(CanonicalCreatedGroup {
+                group_id,
+                chat_list_row: None,
+            }));
+        }
+        // A canonical create can outlive its response and projection. Repair
+        // only a missing direct with this peer. Hidden and unrelated groups
+        // remain untouched, even when their projection cannot be repaired.
+        let mut missing = self.runtime.live_group_ids()?;
+        missing.extend(
+            self.runtime
+                .quarantined_groups()
+                .into_iter()
+                .map(|(id, _)| id),
+        );
+        {
+            let projected = self
+                .state
+                .groups
+                .iter()
+                .map(|group| group.group_id_hex.as_str())
+                .collect::<HashSet<_>>();
+            missing
+                .retain(|group_id| !projected.contains(hex::encode(group_id.as_slice()).as_str()));
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let local = self.app.member_id(&self.state.label)?;
+        let peer = self.app.member_id(peer_account_id_hex)?;
+        for group_id in missing {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            if storage
+                .local_group_deletion_frontier(&group_id_hex)?
+                .is_some()
+                || storage.device_group(&group_id_hex)?.is_some()
+            {
+                continue;
+            }
+            let group = self
+                .stored_group(&group_id)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+            if group.removed
+                || group.disbanded.is_some()
+                || group
+                    .required_capabilities
+                    .app_components
+                    .contains(cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID)
+                || !group.name.trim().is_empty()
+            {
+                continue;
+            }
+            let (mut has_local, mut has_peer, mut has_other) = (false, false, false);
+            for member in &group.members {
+                if member.id == local {
+                    has_local = true;
+                } else if member.id == peer {
+                    has_peer = true;
+                } else {
+                    has_other = true;
+                    break;
+                }
+            }
+            if !has_local || !has_peer || has_other {
+                continue;
+            }
+            if !self.runtime.ensure_group_hydrated(&group_id)? {
+                return Err(AppError::UnknownGroup(hex::encode(group_id.as_slice())));
+            }
+            self.add_group(&group_id)?;
+        }
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        let Some(group_id) = self.find_direct_group(peer_account_id_hex)? else {
+            return Ok(None);
+        };
+        let chat_list_row = self
+            .app
+            .chat_list_row(&self.state.label, &hex::encode(group_id.as_slice()))?;
+        Ok(Some(CanonicalCreatedGroup {
+            group_id,
+            chat_list_row,
+        }))
+    }
+
+    fn find_direct_group(
+        &mut self,
+        peer_account_id_hex: &str,
+    ) -> Result<Option<GroupId>, AppError> {
+        if !self.app.account_import_marker(
+            &self.state.label,
+            crate::DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+        )? {
+            return Err(AppError::DirectConversationIndexNotReady);
+        }
+        let candidates = self
+            .app
+            .direct_conversation_candidates(&self.state.label, peer_account_id_hex)?;
+        let mut memberships = HashMap::with_capacity(candidates.len());
+        for row in &candidates {
+            if row.conversation_kind != crate::ChatConversationKind::Direct
+                || row.self_membership != crate::SelfMembership::Member
+                || row.lifecycle_state == cgka_traits::GroupLifecycleState::Disbanded
+                || row.disbanding
+                || row.leave_requested_at_ms.is_some()
+            {
+                continue;
+            }
+            let bytes = hex::decode(&row.group_id_hex)?;
+            if bytes.is_empty() {
+                return Err(AppError::InvalidGroupMembershipPage(
+                    "direct conversation group id is empty".to_owned(),
+                ));
+            }
+            let group_id = GroupId::new(bytes);
+            self.runtime.ensure_group_hydrated(&group_id)?;
+            let members = crate::groups::member_accounts(&self.runtime.members(&group_id)?)
+                .into_iter()
+                .map(|(member_id, _)| hex::encode(member_id.as_slice()))
+                .collect();
+            memberships.insert(row.group_id_hex.clone(), members);
+        }
+        let account = self.app.account_home().account(&self.state.label)?;
+        storage_sqlite::select_reusable_direct_conversation(
+            &candidates,
+            &account.account_id_hex,
+            peer_account_id_hex,
+            &memberships,
+        )
+        .map(|conversation| hex::decode(conversation.group_id_hex).map(GroupId::new))
+        .transpose()
+        .map_err(AppError::from)
+    }
+
     /// Create a locally canonical group and attempt each founding Welcome.
     ///
     /// `Ok(group_id)` reports group creation, not blanket invitation success.

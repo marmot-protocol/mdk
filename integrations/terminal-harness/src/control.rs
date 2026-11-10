@@ -470,6 +470,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::GroupCreated { .. } => "group_created",
         AgentControlResponse::GroupCreateCapabilities { .. } => "group_create_capabilities",
         AgentControlResponse::GroupInfo { .. } => "group_info",
+        AgentControlResponse::GroupAdminStatus { .. } => "group_admin_status",
         AgentControlResponse::GroupProfileUpdated { .. } => "group_profile_updated",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {

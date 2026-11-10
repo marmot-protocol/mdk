@@ -7,6 +7,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_start_direct_chat` for shared local direct-chat reuse or creation with both accounts as
+  founding admins. It returns an owned hex MLS group id, released with `marmot_string_free`; local success does
+  not acknowledge Welcome delivery. Generic creation and existing groups' roles remain unchanged. Additive;
+  use the matching generated header and library.
+
 - Add account relay liveness snapshots, single-relay reconnect, and a closeable
   subscription with blocking reads and callbacks. `MarmotRelayLivenessList` owns
   its records and strings; free it with `marmot_relay_liveness_list_free`.
