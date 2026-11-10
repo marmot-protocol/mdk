@@ -1855,6 +1855,7 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let mut profiles = app.presentation_signals.profile_updates.subscribe();
         let mut account_resets = app.presentation_signals.account_resets.subscribe();
+        let mut catalog = app.presentation_signals.subscribe_catalog();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
@@ -1871,9 +1872,10 @@ impl MarmotAppRuntime {
                     Ok(event) => {
                         // Coalesce invalidations before resolving this event. A lagged
                         // signal receiver also has pending entries and clears the cache.
-                        if !account_resets.is_empty() {
+                        if !account_resets.is_empty() || matches!(catalog.has_changed(), Ok(true)) {
                             resolver = notifications::NotificationResolver::default();
                             account_resets = app.presentation_signals.account_resets.subscribe();
+                            catalog.borrow_and_update();
                         }
                         if !profiles.is_empty() {
                             resolver.invalidate_users();

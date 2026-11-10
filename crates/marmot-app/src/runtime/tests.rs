@@ -355,6 +355,91 @@ mod live_notifications {
         ));
         runtime.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_missing_group_is_silent() {
+        let (_root, app, account, group) = fixture();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        let missing = GroupId::new(vec![0xAA; 16]);
+        runtime.events.send(message(&account, &missing, 1)).unwrap();
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 2)));
+        assert_eq!(update.group_name.as_deref(), Some("Before"));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_catalog_refreshes_policy() {
+        let (_root, app, account, group) = fixture();
+        let barrier = app.account_home().create_account("barrier").unwrap();
+        let mut state = app.load_state("barrier").unwrap();
+        state.groups = app.groups("alice").unwrap();
+        app.save_state(&state).unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.group_name.as_deref(),
+            Some("Before")
+        );
+
+        // A restored account brings persisted policy without a preference command.
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .set_local_notifications_enabled("alice", &account.account_id_hex, false)
+            .unwrap();
+        let mut state = app.load_state("alice").unwrap();
+        state.groups[0].profile = crate::groups::AppGroupProfileComponent::from_bytes(
+            &cgka_traits::encode_component_vectors(&[b"Restored", b""]),
+        );
+        app.save_state(&state).unwrap();
+        app.presentation_signals.catalog_changed();
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        runtime.events.send(message(&barrier, &group, 3)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.account_id_hex,
+            barrier.account_id_hex
+        );
+
+        app.set_local_notifications_enabled("alice", true).unwrap();
+        runtime.events.send(message(&account, &group, 4)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 4)));
+        assert_eq!(update.group_name.as_deref(), Some("Restored"));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_deleted_group_is_silent() {
+        let (_root, app, account, group) = fixture();
+        let barrier = app.account_home().create_account("barrier").unwrap();
+        let mut state = app.load_state("barrier").unwrap();
+        state.groups = app.groups("alice").unwrap();
+        app.save_state(&state).unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.group_name.as_deref(),
+            Some("Before")
+        );
+
+        assert!(
+            app.delete_group_local_data("alice", &hex::encode(group.as_slice()))
+                .unwrap()
+        );
+        // An already queued message can precede the deletion's GroupStateUpdated.
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        runtime.events.send(message(&barrier, &group, 3)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.account_id_hex,
+            barrier.account_id_hex
+        );
+        runtime.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

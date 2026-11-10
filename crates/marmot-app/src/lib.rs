@@ -6557,6 +6557,9 @@ impl MarmotApp {
                 frontiers_to_clear,
                 application_event_ids_to_ack,
             )?;
+        if !delta.groups.is_empty() {
+            self.notification_revision.fetch_add(1, Ordering::Release);
+        }
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6578,7 +6581,7 @@ impl MarmotApp {
             .groups
             .iter()
             .any(|group| group.group_id_hex != group_id_hex);
-        let mut row = self
+        let row = self
             .account_storage(&delta.label)?
             .app_storage()
             .save_account_projection_delta_and_refresh_chat_list_row(
@@ -6590,8 +6593,11 @@ impl MarmotApp {
                 &account.account_id_hex,
                 group_id_hex,
                 &classifier,
-            )?
-            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+            )?;
+        if !delta.groups.is_empty() {
+            self.notification_revision.fetch_add(1, Ordering::Release);
+        }
+        let mut row = row.ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         self.presentation_signals.wake();
         self.hydrate_chat_list_row(Some(&mut row));
 
@@ -6624,6 +6630,7 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
+        self.notification_revision.fetch_add(1, Ordering::Release);
         self.presentation_signals.wake();
         self.chat_list_projection_stale
             .lock()
@@ -7970,6 +7977,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .forget(label);
+        self.notification_revision.fetch_add(1, Ordering::Release);
     }
 
     fn shared_storage_path(&self) -> PathBuf {

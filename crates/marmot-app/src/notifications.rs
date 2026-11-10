@@ -1640,6 +1640,7 @@ impl NotificationResolver {
         if self.revision != revision {
             self.settings.clear();
             self.chat_muted.clear();
+            self.groups.clear();
             self.revision = revision;
         }
         if let Some(settings) = self.settings.get(account_label) {
@@ -1677,6 +1678,9 @@ impl NotificationResolver {
             return Ok(until.is_none_or(|until| until > unix_now_ms()));
         }
         // The caller already resolved the group. Avoid a second group lookup.
+        if self.groups.get(&key).is_some_and(Option::is_none) {
+            return Err(AppError::UnknownGroup(group_id_hex.to_owned()));
+        }
         let settings = app
             .account_storage(account_label)?
             .app_storage()
