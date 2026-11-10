@@ -114,9 +114,13 @@ pub(crate) fn is_replaceable(kind: Kind) -> bool {
 }
 
 /// The narrow account-key parser: hex or `npub`, never a profile. The
-/// 0.45 SDK parser also accepts `nprofile`, which this contract excludes.
+/// 0.45 SDK parser also accepts `nprofile`, which this contract excludes
+/// for every letter case: bech32 hrps decode case-insensitively, so an
+/// uppercase `NPROFILE` body must not reach the key-only result through
+/// `npub`-shaped or `nostr:`-URI dispatch.
 pub(crate) fn parse_account_key(value: &str) -> Result<PublicKey, DirectoryError> {
-    if value.starts_with("nprofile1") || value.starts_with("nostr:nprofile1") {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("nprofile1") || lower.starts_with("nostr:nprofile1") {
         return Err(DirectoryError::InvalidPublicKey);
     }
     PublicKey::parse(value).map_err(|_| DirectoryError::InvalidPublicKey)
@@ -422,6 +426,11 @@ mod tests {
             for reference in [
                 BOOTSTRAP_NPROFILE.to_string(),
                 format!("nostr:{BOOTSTRAP_NPROFILE}"),
+                // Review round 2 (B1): the SDK's key-only URI parser accepts
+                // an uppercase profile body the lowercase exclusion misses,
+                // so the uppercase spellings must decode identically too.
+                BOOTSTRAP_NPROFILE.to_ascii_uppercase(),
+                format!("nostr:{}", BOOTSTRAP_NPROFILE.to_ascii_uppercase()),
             ] {
                 let decoded = decode_reference(&reference, context)
                     .unwrap_or_else(|_| panic!("{reference} should decode"));
