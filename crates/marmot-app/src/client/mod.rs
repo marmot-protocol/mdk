@@ -3198,7 +3198,7 @@ impl AppClient {
         let adds_leaves = match &commit {
             Ok(PreparedSessionSend::Commit(prepared)) => !prepared.welcomes().is_empty(),
             Ok(PreparedSessionSend::Queued(_)) => true,
-            Err(_) => false,
+            Ok(PreparedSessionSend::Refused(_)) | Err(_) => false,
         };
         if !adds_leaves && let Some(snapshot) = push_snapshot.take() {
             self.restore_push_snapshot_owed(snapshot);
@@ -3222,6 +3222,22 @@ impl AppClient {
                     queued.is_ok(),
                 );
                 return queued.map(|effects| send_summary_from_effects(&effects));
+            }
+            // The commit or a Welcome fit none of its relays' known limits,
+            // so the runtime rolled it back with nothing sent (mdk#2334).
+            Ok(PreparedSessionSend::Refused(effects)) => {
+                record_app_performance(
+                    telemetry,
+                    AppPerformanceOperation::GroupInviteEnginePublish,
+                    engine_publish_started_at.elapsed(),
+                    false,
+                );
+                let refused = self
+                    .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                    .await;
+                return Err(refused
+                    .err()
+                    .unwrap_or_else(|| publish_failure_error(&effects.failures)));
             }
             Err(error) => {
                 record_app_performance(

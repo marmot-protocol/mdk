@@ -4560,6 +4560,20 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             None => Ok(None),
         }
     }
+
+    async fn refusals_over_known_limits(
+        &self,
+        message: &cgka_traits::TransportMessage,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<TransportEndpointFailure> {
+        // An unreadable payload is refused by `publish` itself.
+        let Ok(event) = NostrTransportEvent::from_transport_message(message) else {
+            return Vec::new();
+        };
+        self.refuse_over_known_limits(endpoints, event_json_bytes(&event))
+            .await
+            .1
+    }
 }
 
 /// Hand one delivery to its account without awaiting the account queue: a

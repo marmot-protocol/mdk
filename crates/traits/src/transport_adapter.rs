@@ -1408,6 +1408,22 @@ pub trait TransportAdapter: Send + Sync {
     /// Receive the next account-scoped delivery. Returning `Ok(None)` means
     /// the adapter has shut down and will not produce more deliveries.
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError>;
+
+    /// The endpoints among `endpoints` that [`Self::publish`] would refuse
+    /// `message` on, unsent, because it is over their known size limit, as
+    /// [`TransportEndpointFailure::over_known_limit`] failures. Sends nothing.
+    ///
+    /// A publication owner asks this before recording a fanout, so a change
+    /// whose artifact fits none of its relays is refused before any of it is
+    /// sent. An endpoint with no known limit is never returned; an adapter
+    /// that knows no limits returns none.
+    async fn refusals_over_known_limits(
+        &self,
+        _message: &TransportMessage,
+        _endpoints: &[TransportEndpoint],
+    ) -> Vec<TransportEndpointFailure> {
+        Vec::new()
+    }
 }
 
 fn envelope_label(envelope: &TransportEnvelope) -> &'static str {
