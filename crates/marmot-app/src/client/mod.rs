@@ -52,16 +52,15 @@ use crate::messages::{
 };
 use crate::notifications;
 use crate::{
-    AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupAdminPolicyComponent,
-    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
-    AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupRecord, AppInitialGroupImage, AppPreparedGroupImageUpload,
-    AppPreparedGroupImageUploadState, AppQuarantinedGroup, AppRoutingState, AppRuntime,
-    AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, unix_now_seconds,
+    AccountState, AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions,
+    AppDisbandRequest, AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
+    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
+    AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
+    AppQuarantinedGroup, AppRoutingState, AppRuntime, AppTransportRouting, CanonicalCreatedGroup,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    PendingWelcomeDelivery, SelfMembership, SendSummary, unix_now_seconds,
 };
 use marmot_observability::AppPerformanceOperation;
 use marmot_observability::PerformanceRecorder;
@@ -1862,21 +1861,6 @@ impl AppClient {
         let sign_out_step = self.sign_out_step_permit()?;
         Ok(sign_out_step
             .run(self.runtime.withdraw_key_package_slot())
-            .await?)
-    }
-
-    /// Fetch current relay KeyPackages for the composition roster without
-    /// reserving or consuming them. Group creation fetches again before the
-    /// MLS mutation; cached packages only inform discovery.
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn prewarm_group_member_key_packages(
-        &self,
-        member_refs: &[&str],
-    ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
-        Ok(self
-            .app
-            .directory()
-            .prewarm_group_member_key_packages(member_refs)
             .await?)
     }
 
@@ -5403,38 +5387,6 @@ impl AppClient {
     }
 
     #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn unreact_from_message(
-        &mut self,
-        group_id: &GroupId,
-        target_message_id: &str,
-    ) -> Result<SendSummary, AppError> {
-        self.unreact_from_message_matching(group_id, target_message_id, None)
-            .await
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn unreact_from_message_matching(
-        &mut self,
-        group_id: &GroupId,
-        target_message_id: &str,
-        emoji: Option<&str>,
-    ) -> Result<SendSummary, AppError> {
-        if let Some(emoji) = emoji {
-            crate::messages::validate_reaction_content(emoji)?;
-        }
-        let (_event, summary) = self
-            .send_app_event(
-                group_id,
-                AppMessageIntent::Unreact {
-                    target_message_id: target_message_id.to_owned(),
-                    emoji: emoji.map(str::to_owned),
-                },
-            )
-            .await?;
-        Ok(summary)
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn report_message(
         &mut self,
         group_id: &GroupId,
@@ -5489,25 +5441,6 @@ impl AppClient {
                 group_id,
                 AppMessageIntent::Delete {
                     target_message_id: target_message_id.to_owned(),
-                },
-            )
-            .await?;
-        Ok(summary)
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn reply_to_message(
-        &mut self,
-        group_id: &GroupId,
-        target_message_id: &str,
-        text: &str,
-    ) -> Result<SendSummary, AppError> {
-        let (_event, summary) = self
-            .send_app_event(
-                group_id,
-                AppMessageIntent::Reply {
-                    target_message_id: target_message_id.to_owned(),
-                    text: text.to_owned(),
                 },
             )
             .await?;
@@ -6182,18 +6115,6 @@ impl AppClient {
             .await
     }
 
-    /// Fetch + decrypt the group's avatar. Errors when the group has no image set.
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn download_group_blossom_image(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<Vec<u8>, AppError> {
-        self.prepare_group_image_download(group_id)
-            .await?
-            .run()
-            .await
-    }
-
     pub(crate) async fn prepare_group_image_download(
         &mut self,
         group_id: &GroupId,
@@ -6215,35 +6136,6 @@ impl AppClient {
             server: self.app.deployment().group_image_endpoint_for(None)?,
             transport: self.blossom_http_transport.clone(),
         })
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn start_agent_text_stream(
-        &mut self,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.start_agent_text_stream_with_parent(group_id, stream_id, None, quic_candidates)
-            .await
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn start_agent_text_stream_with_parent(
-        &mut self,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.start_agent_text_stream_with_local_projection(
-            group_id,
-            stream_id,
-            parent_message_id,
-            quic_candidates,
-            |_| {},
-        )
-        .await
     }
 
     pub(crate) async fn start_agent_text_stream_with_local_projection<F>(
@@ -6269,16 +6161,6 @@ impl AppClient {
         .await
     }
 
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn finish_agent_text_stream(
-        &mut self,
-        group_id: &GroupId,
-        request: AgentTextStreamFinishRequest,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.finish_agent_text_stream_with_local_projection(group_id, request, |_| {})
-            .await
-    }
-
     pub(crate) async fn finish_agent_text_stream_with_local_projection<F>(
         &mut self,
         group_id: &GroupId,
@@ -6294,94 +6176,6 @@ impl AppClient {
             on_local_projection,
         )
         .await
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn send_agent_activity(
-        &mut self,
-        group_id: &GroupId,
-        status: String,
-        text: String,
-        reply_to_message_id: Option<String>,
-        extra: Option<serde_json::Value>,
-    ) -> Result<SendSummary, AppError> {
-        let (_event, summary) = self
-            .send_app_event(
-                group_id,
-                AppMessageIntent::AgentActivity {
-                    status,
-                    text,
-                    reply_to_message_id,
-                    extra,
-                },
-            )
-            .await?;
-        Ok(summary)
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn send_agent_operation_event(
-        &mut self,
-        group_id: &GroupId,
-        request: AgentOperationEventRequest,
-    ) -> Result<SendSummary, AppError> {
-        let AgentOperationEventRequest {
-            event_type,
-            status,
-            operation_id,
-            run_id,
-            turn_id,
-            name,
-            text,
-            preview,
-            details,
-            sequence,
-            ok,
-            duration_ms,
-            reply_to_message_id,
-        } = request;
-        let (_event, summary) = self
-            .send_app_event(
-                group_id,
-                AppMessageIntent::AgentOperation {
-                    event_type,
-                    status,
-                    operation_id,
-                    run_id,
-                    turn_id,
-                    name,
-                    text,
-                    preview,
-                    details,
-                    sequence,
-                    ok,
-                    duration_ms,
-                    reply_to_message_id,
-                },
-            )
-            .await?;
-        Ok(summary)
-    }
-
-    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-    pub async fn send_group_system_event(
-        &mut self,
-        group_id: &GroupId,
-        system_type: String,
-        text: String,
-        data: Option<serde_json::Value>,
-    ) -> Result<SendSummary, AppError> {
-        let (_event, summary) = self
-            .send_app_event(
-                group_id,
-                AppMessageIntent::GroupSystem {
-                    system_type,
-                    text,
-                    data,
-                },
-            )
-            .await?;
-        Ok(summary)
     }
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`

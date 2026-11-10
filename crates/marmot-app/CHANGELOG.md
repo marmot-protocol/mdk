@@ -11,6 +11,11 @@
   it. It returns `Err(AppError)` when the open fails and `Ok(Err(SyncFailure))`,
   with the durably applied prefix, when the pass fails.
 
+- `AppClient` (`test-support`) drops eleven methods no build called (mdk#2782): `prewarm_group_member_key_packages`,
+  `reply_to_message`, `unreact_from_message`, `unreact_from_message_matching`, `download_group_blossom_image`,
+  `start_agent_text_stream`, `start_agent_text_stream_with_parent`, `finish_agent_text_stream`, `send_agent_activity`,
+  `send_agent_operation_event` and `send_group_system_event`. Call the `MarmotAppRuntime` method of the same name.
+
 - Rust hosts reach onboarding through `MarmotAppRuntime::account_setup()`, which returns the new `AccountSetup`
   (mdk#2782). `AccountManager`'s twenty onboarding methods moved there with unchanged signatures:
   `onboarding_snapshot`, `subscribe_onboarding`, `begin_onboarding`, `begin_external_signer_onboarding`,
