@@ -964,7 +964,9 @@ pub enum TransportEndpointRejectionCategory {
     Unsupported,
     AuthRequired,
     Restricted,
-    /// An explicit, event-correlated refusal because the event is too large.
+    /// An explicit, event-correlated refusal because the event is too large:
+    /// the endpoint's answer, or, with [`TransportEndpointFailureKind::NotExposed`],
+    /// the adapter's refusal to send an event over the endpoint's known limit.
     /// This category does not discover an endpoint's configured size limit.
     TooLarge,
 }
@@ -1038,9 +1040,11 @@ impl EventSizeClass {
         }
     }
 
-    /// Classify a complete, distinct target set's explicit size refusals.
-    /// The caller must separately establish zero acceptance and no earlier
-    /// ambiguous exposure; a partial failure list cannot establish this proof.
+    /// Classify a complete, distinct target set's explicit size refusals: an
+    /// endpoint's terminal answer or the adapter's unexposed refusal against a
+    /// known limit, in any mix. The caller must separately establish zero
+    /// acceptance and no earlier ambiguous exposure; a partial failure list
+    /// cannot establish this proof.
     pub fn from_rejected_targets(
         targets: &[TransportEndpoint],
         failures: &[TransportEndpointFailure],
@@ -1058,7 +1062,11 @@ impl EventSizeClass {
                 .filter(|failure| &failure.endpoint == target);
             let failure = matching.next()?;
             if matching.next().is_some()
-                || failure.kind != TransportEndpointFailureKind::TerminalRejected
+                || !matches!(
+                    failure.kind,
+                    TransportEndpointFailureKind::TerminalRejected
+                        | TransportEndpointFailureKind::NotExposed
+                )
                 || failure.rejection_category != Some(TransportEndpointRejectionCategory::TooLarge)
             {
                 return None;
@@ -1116,6 +1124,25 @@ pub struct TransportEndpointFailure {
     /// Absent on old persisted failures and when the size cannot be established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_class: Option<EventSizeClass>,
+}
+
+impl TransportEndpointFailure {
+    /// The fixed reason of [`Self::over_known_limit`], which audit records as
+    /// a failure before exposure.
+    pub const OVER_KNOWN_LIMIT_REASON: &'static str = "event exceeds the endpoint's known limit";
+
+    /// The adapter's refusal to send an event of `event_bytes` serialized
+    /// bytes over the endpoint's known limit: nothing was sent, and the same
+    /// event cannot succeed there.
+    pub fn over_known_limit(endpoint: TransportEndpoint, event_bytes: usize) -> Self {
+        Self {
+            endpoint,
+            reason: Self::OVER_KNOWN_LIMIT_REASON.to_owned(),
+            kind: TransportEndpointFailureKind::NotExposed,
+            rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+            size_class: Some(EventSizeClass::of_bytes(event_bytes)),
+        }
+    }
 }
 
 /// Publish failure surfaced by transport adapters.
@@ -1705,6 +1732,40 @@ mod tests {
         );
         assert!(!fanout.possible_exposure());
         assert_eq!(fanout.target_status(0), Some(FanoutTargetStatus::Failed));
+    }
+
+    /// A refusal before sending against a known limit proves size like a
+    /// relay's size answer does, alone or mixed with relay answers, while an
+    /// unexposed failure of any other cause proves nothing (mdk#2334).
+    #[test]
+    fn local_refusals_over_known_limits_prove_size_like_relay_refusals() {
+        let a = TransportEndpoint("wss://first.example".into());
+        let b = TransportEndpoint("wss://second.example".into());
+        let targets = [a.clone(), b.clone()];
+        let local = |endpoint: &TransportEndpoint| {
+            TransportEndpointFailure::over_known_limit(endpoint.clone(), 70 * 1024)
+        };
+        let relay = TransportEndpointFailure {
+            endpoint: b.clone(),
+            reason: "relay rejected event (too-large)".into(),
+            kind: TransportEndpointFailureKind::TerminalRejected,
+            rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+            size_class: Some(EventSizeClass::From64To128Kib),
+        };
+        assert_eq!(
+            EventSizeClass::from_rejected_targets(&targets, &[local(&a), local(&b)]),
+            Some(EventSizeClass::From64To128Kib)
+        );
+        assert_eq!(
+            EventSizeClass::from_rejected_targets(&targets, &[local(&a), relay]),
+            Some(EventSizeClass::From64To128Kib)
+        );
+        let mut offline = local(&b);
+        offline.rejection_category = None;
+        assert_eq!(
+            EventSizeClass::from_rejected_targets(&targets, &[local(&a), offline]),
+            None
+        );
     }
 
     #[test]

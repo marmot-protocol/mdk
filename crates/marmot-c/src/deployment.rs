@@ -5,9 +5,11 @@
 
 use std::ffi::c_char;
 
-use marmot_uniffi::{MarmotDeploymentFfi, OpenRankingProviderFfi};
+use marmot_uniffi::{MarmotDeploymentFfi, OpenRankingProviderFfi, RelayEventLimitFfi};
 
-use crate::memory::{CFree, boxed, free_boxed, free_guard, optional_str, required_str, str_array};
+use crate::memory::{
+    CFree, boxed, free_boxed, free_guard, opt_num_array, optional_str, required_str, str_array,
+};
 use crate::{MarmotStatus, ffi_guard, preflight_out_ptr};
 
 /// One deployment's services and identifiers. Create it with
@@ -189,6 +191,39 @@ pub unsafe extern "C" fn marmot_deployment_set_open_ranking(
     }
 }
 
+/// Replace the largest event each listed relay accepts, in bytes of
+/// serialized event JSON, for relays that do not advertise it (mdk#2334).
+/// `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event or
+/// Welcome over a relay's known limit, and a send that fits none of its
+/// relays fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero
+/// limit is ignored; a relay listed twice keeps the smaller limit.
+/// # Safety
+/// deployment must be live; relays must point to len valid strings and
+/// max_event_bytes to len values (or both be NULL with 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_deployment_set_relay_event_limits(
+    deployment: *mut MarmotDeployment,
+    relays: *const *const c_char,
+    max_event_bytes: *const u64,
+    len: usize,
+) -> MarmotStatus {
+    unsafe {
+        edit(deployment, |inner| {
+            let relays = str_array(relays, len)?;
+            let limits = opt_num_array(max_event_bytes, len)?.unwrap_or_default();
+            inner.relay_event_limits = relays
+                .into_iter()
+                .zip(limits)
+                .map(|(relay, max_event_bytes)| RelayEventLimitFfi {
+                    relay,
+                    max_event_bytes,
+                })
+                .collect();
+            Ok(())
+        })
+    }
+}
+
 /// Set the NIP-32 namespace on moderation report labels; NULL unsets it, and
 /// reporting then refuses a destination.
 /// # Safety
@@ -316,6 +351,16 @@ mod tests {
                 marmot_deployment_set_keychain_service(deployment, keychain.as_ptr()),
                 MarmotStatus::Ok
             );
+            let limits = [65_536_u64];
+            assert_eq!(
+                marmot_deployment_set_relay_event_limits(
+                    deployment,
+                    relays.as_ptr(),
+                    limits.as_ptr(),
+                    1
+                ),
+                MarmotStatus::Ok
+            );
             let inner = &(*deployment).inner;
             assert_eq!(inner.recovery_operated_relays, ["wss://relay.example"]);
             assert!(inner.discovery_indexer_relays.is_empty());
@@ -331,6 +376,33 @@ mod tests {
                 Some("org.example.report")
             );
             assert_eq!(inner.keychain_service, "org.example.app");
+            assert_eq!(
+                inner.relay_event_limits,
+                [RelayEventLimitFfi {
+                    relay: "wss://relay.example".into(),
+                    max_event_bytes: 65_536,
+                }]
+            );
+            assert_eq!(
+                marmot_deployment_set_relay_event_limits(
+                    deployment,
+                    relays.as_ptr(),
+                    std::ptr::null(),
+                    1
+                ),
+                MarmotStatus::NullPointer,
+                "a relay without its limit is refused"
+            );
+            assert_eq!(
+                marmot_deployment_set_relay_event_limits(
+                    deployment,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0
+                ),
+                MarmotStatus::Ok
+            );
+            assert!((*deployment).inner.relay_event_limits.is_empty());
             marmot_deployment_free(deployment);
         }
     }

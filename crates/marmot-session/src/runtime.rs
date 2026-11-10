@@ -7603,7 +7603,8 @@ mod tests {
 
     /// A publish outcome records each failed relay's adapter reason, and audit
     /// v5 keeps only reasons it knows. Every rejection category must reach v5
-    /// as its category, not `unclassified` as `too-large` did (mdk#2334).
+    /// as its category, not `unclassified` as `too-large` did, and a refusal
+    /// over a known limit as a failure before exposure (mdk#2334).
     #[test]
     fn every_relay_rejection_keeps_its_category_in_audit_v5() {
         use TransportEndpointRejectionCategory as Category;
@@ -7633,11 +7634,20 @@ mod tests {
             Restricted => "relay_rejected_restricted",
             TooLarge => "relay_rejected_invalid",
         };
-        for (category, expected) in cases {
-            let reason = match category {
-                Category::Error => "publish acknowledgement unknown (error)".to_owned(),
-                category => format!("relay rejected event ({})", category.as_str()),
-            };
+        let reasons = cases
+            .into_iter()
+            .map(|(category, expected)| {
+                let reason = match category {
+                    Category::Error => "publish acknowledgement unknown (error)".to_owned(),
+                    category => format!("relay rejected event ({})", category.as_str()),
+                };
+                (reason, expected)
+            })
+            .chain([(
+                TransportEndpointFailure::OVER_KNOWN_LIMIT_REASON.to_owned(),
+                "publish_attempt_failed_before_exposure",
+            )]);
+        for (reason, expected) in reasons {
             let record = AuditRecord::new(
                 None,
                 AuditEventKind::PublishOutcome {
@@ -7648,7 +7658,7 @@ mod tests {
                     accepted_relay_urls: Vec::new(),
                     failed_relays: vec![PublishRelayFailure {
                         relay_url: "wss://relay.example".into(),
-                        reason,
+                        reason: reason.clone(),
                     }],
                     required_acks: 1,
                     met_required_acks: false,
@@ -7660,10 +7670,7 @@ mod tests {
                 audit_v5::OperationalEvent::from_audit(record),
             )))
             .unwrap();
-            assert_eq!(
-                event["failed_relays"][0]["reason"], expected,
-                "{category:?}"
-            );
+            assert_eq!(event["failed_relays"][0]["reason"], expected, "{reason}");
         }
     }
 

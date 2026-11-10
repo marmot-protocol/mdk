@@ -350,7 +350,10 @@ fn a_full_cache_drops_the_idle_entry_due_soonest() {
         slots.insert(
             key.to_owned(),
             Arc::new(tokio::sync::Mutex::new(Some(CachedCaps {
-                caps: Some(RelayCaps::default()),
+                document: Some(Nip11Document {
+                    caps: RelayCaps::default(),
+                    max_message_length: None,
+                }),
                 fresh_until: now + Duration::from_secs(fresh_for),
             }))),
         );
@@ -403,4 +406,48 @@ async fn the_app_fetches_loopback_relays_only_under_the_dev_flag() {
     assert_eq!(server.connections(), 0);
     assert_eq!(dev.relay_caps(&relay).await.unwrap().max_limit, Some(500));
     assert_eq!(server.connections(), 1);
+}
+
+/// The message limit comes from the same cached document as the caps, so
+/// asking for both costs one fetch (mdk#2334).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_message_limit_shares_the_caps_document() {
+    let server = DocumentServer::start(Reply::Document {
+        status: 200,
+        body:
+            r#"{"supported_nips":[11],"limitation":{"max_limit":500,"max_message_length":131072}}"#
+                .to_owned(),
+    })
+    .await;
+    let cache = cache_with(no_dns());
+    let relay = server.relay("/");
+
+    assert_eq!(cache.max_message_length(&relay, true).await, Some(131_072));
+    assert_eq!(
+        cache
+            .caps(&relay, true)
+            .await
+            .and_then(|caps| caps.max_limit),
+        Some(500)
+    );
+    assert_eq!(server.connections(), 1);
+
+    for body in [
+        STRFRY_NIP11,
+        r#"{"limitation":{"max_message_length":"131072"}}"#,
+        r#"{"limitation":{"max_message_length":0}}"#,
+    ] {
+        let server = DocumentServer::start(Reply::Document {
+            status: 200,
+            body: body.to_owned(),
+        })
+        .await;
+        assert_eq!(
+            cache_with(no_dns())
+                .max_message_length(&server.relay("/"), true)
+                .await,
+            None,
+            "{body}"
+        );
+    }
 }

@@ -33,6 +33,7 @@ mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
 mod push_token_reshare;
 mod quarantine_receive;
+mod relay_event_limits;
 mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;

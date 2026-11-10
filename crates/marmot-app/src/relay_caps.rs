@@ -15,6 +15,9 @@
 //! unknown read is never mistaken for a change. The sweep then infers the cap
 //! from full replies. Unknown caps are retried sooner than a document is
 //! refreshed.
+//!
+//! The same document's `limitation.max_message_length` bounds the events MDK
+//! sends the relay (mdk#2334); see [`RelayCapsCache::max_message_length`].
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -95,9 +98,46 @@ impl Default for Nip11Fetch {
     }
 }
 
+/// What MDK reads from one relay information document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nip11Document {
+    caps: RelayCaps,
+    /// `limitation.max_message_length`: the largest WebSocket message the
+    /// relay accepts, in bytes.
+    max_message_length: Option<usize>,
+}
+
+impl Nip11Document {
+    fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        let document = serde_json::from_str::<serde_json::Value>(json)?;
+        let max_message_length = document
+            .get("limitation")
+            .and_then(|limitation| limitation.get("max_message_length"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|length| *length > 0)
+            .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
+        Ok(Self {
+            caps: RelayCaps::from_nip11(&document),
+            max_message_length,
+        })
+    }
+}
+
 impl Nip11Fetch {
     /// `url` comes from [`document_url`], which already cleared the dial gate.
+    #[cfg(test)]
     async fn caps(&self, url: Url, allow_loopback: bool) -> Result<RelayCaps, Nip11Failure> {
+        self.document(url, allow_loopback)
+            .await
+            .map(|document| document.caps)
+    }
+
+    /// `url` comes from [`document_url`], which already cleared the dial gate.
+    async fn document(
+        &self,
+        url: Url,
+        allow_loopback: bool,
+    ) -> Result<Nip11Document, Nip11Failure> {
         let loopback = allow_loopback && url.host().is_some_and(is_loopback_host);
         let resolver = self.resolver.clone();
         let pin = pin_with(url, loopback, self.connect_timeout, |host, port| {
@@ -132,7 +172,7 @@ impl Nip11Fetch {
             body.extend_from_slice(&chunk);
         }
         let json = std::str::from_utf8(&body).map_err(|_| Nip11Failure::Malformed)?;
-        RelayCaps::from_nip11_json(json).map_err(|_| Nip11Failure::Malformed)
+        Nip11Document::from_json(json).map_err(|_| Nip11Failure::Malformed)
     }
 }
 
@@ -169,7 +209,7 @@ fn document_url(endpoint: &str, allow_loopback: bool) -> Result<Url, Nip11Failur
 
 struct CachedCaps {
     /// `None` when unknown.
-    caps: Option<RelayCaps>,
+    document: Option<Nip11Document>,
     fresh_until: Instant,
 }
 
@@ -187,6 +227,25 @@ impl RelayCapsCache {
     /// The relay's caps, from cache or a fresh fetch. `None` (unknown) when
     /// the document is missing, malformed, unreachable or refused.
     pub(crate) async fn caps(&self, endpoint: &str, allow_loopback: bool) -> Option<RelayCaps> {
+        self.document(endpoint, allow_loopback)
+            .await
+            .map(|document| document.caps)
+    }
+
+    /// The largest WebSocket message the relay advertises, from the same
+    /// cached document as [`Self::caps`]. `None` when it advertises none or
+    /// the document is unknown.
+    pub(crate) async fn max_message_length(
+        &self,
+        endpoint: &str,
+        allow_loopback: bool,
+    ) -> Option<usize> {
+        self.document(endpoint, allow_loopback)
+            .await
+            .and_then(|document| document.max_message_length)
+    }
+
+    async fn document(&self, endpoint: &str, allow_loopback: bool) -> Option<Nip11Document> {
         // Refused relays cost no I/O, so they take no cache entry.
         let url = match document_url(endpoint, allow_loopback) {
             Ok(url) => url,
@@ -200,20 +259,20 @@ impl RelayCapsCache {
         if let Some(entry) = cached.as_ref()
             && Instant::now() < entry.fresh_until
         {
-            return entry.caps;
+            return entry.document;
         }
-        let (caps, fresh_for) = match self.fetch.caps(url, allow_loopback).await {
-            Ok(caps) => (Some(caps), DOCUMENT_FRESH_FOR),
+        let (document, fresh_for) = match self.fetch.document(url, allow_loopback).await {
+            Ok(document) => (Some(document), DOCUMENT_FRESH_FOR),
             Err(failure) => {
                 log_unknown(failure);
                 (None, UNKNOWN_FRESH_FOR)
             }
         };
         *cached = Some(CachedCaps {
-            caps,
+            document,
             fresh_until: Instant::now() + fresh_for,
         });
-        caps
+        document
     }
 
     /// The slot for one relay, keyed by its normalized document URL.
@@ -235,7 +294,7 @@ fn log_unknown(failure: Nip11Failure) {
         target: "marmot_app::relay_caps",
         method = "caps",
         outcome = failure.label(),
-        "relay information document unavailable; sweep caps are inferred"
+        "relay information document unavailable; its caps and limits are unknown"
     );
 }
 

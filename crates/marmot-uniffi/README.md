@@ -178,7 +178,8 @@ before retrying. Do not translate every error into an empty list, restart the en
 every subscription update, or delete lock/database files to recover ownership.
 
 `EventTooLarge { artifact, sizeClass }` reports a size refusal of one serialized event by every requested relay on
-the observed attempt. The artifact is Commit, Welcome, ApplicationMessage or Other; size classes are coarse diagnostic
+the observed attempt, whether the relay refused it or MDK refused to send it over the relay's
+[known limit](#deployment). The artifact is Commit, Welcome, ApplicationMessage or Other; size classes are coarse diagnostic
 buckets from under 64 KiB through over 4 MiB, not relay limits. Do not infer this error from generic relay text, a
 timeout, or one refusal among mixed outcomes. Frozen native fanouts retain their strong proof: no accepted,
 outstanding or ambiguously exposed targets in their retained history, and complete matching typed refusals.
@@ -387,6 +388,13 @@ means every route's history needs all its relays to certify, no discovery indexe
 discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, and no moderation label namespace leaves reporting
 unconfigured. The neutral keychain service
 is `org.marmot-protocol.mdk`.
+
+`relayEventLimits` lists the largest event, in bytes of serialized event JSON, that relays accept when they do not
+advertise it; the White Noise preset sets 2 MiB on its two relays. For events over 64 KiB, MDK also reads the
+WebSocket message limit a relay's NIP-11 document advertises, and uses the smaller known value. It sends no group
+event or Welcome to a relay over that relay's limit. A send that fits none of its relays fails with `EventTooLarge`
+(see [errors](#runtime-lifecycle-threads-and-errors)) without reaching any relay; a relay with no known limit gets every event, and
+its own size refusal arrives as the same error.
 
 ```swift
 let options = MarmotOptions(clientName: "whitenoise", deployment: marmotDeploymentWhiteNoise())

@@ -88,7 +88,9 @@ mod chat_presentation;
 mod client;
 mod config;
 mod deployment;
-pub use deployment::{MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME, OpenRankingProvider};
+pub use deployment::{
+    MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME, OpenRankingProvider, RelayEventLimit,
+};
 pub mod conversation_presentation;
 mod conversions;
 mod directory_resources;
@@ -136,6 +138,7 @@ mod profile_publication;
 mod projection;
 mod publisher_sequences;
 mod relay_caps;
+mod relay_event_limits;
 mod root_closers;
 mod root_runtime_lease;
 mod runtime;
@@ -5257,12 +5260,18 @@ impl MarmotApp {
                             }
                         })
                 });
-            let adapter = relay_plane.account_adapter_with_recovery_marker(
-                account_id.clone(),
-                publish_client,
-                Some(recovery_marker),
-                Some(spill_store),
-            );
+            let adapter = relay_plane
+                .account_adapter_with_recovery_marker(
+                    account_id.clone(),
+                    publish_client,
+                    Some(recovery_marker),
+                    Some(spill_store),
+                )
+                .with_event_limits(Arc::new(relay_event_limits::AppRelayEventLimits::new(
+                    &self.config.deployment.relay_event_limits,
+                    self.relay_caps.clone(),
+                    self.config.allow_loopback_relay_endpoints,
+                )));
             // The router spills what a raised cursor alone stopped a restart from
             // fetching again, measured from this persisted floor.
             adapter.open_transport_cursor(state.last_transport_timestamp);

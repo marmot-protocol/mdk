@@ -7096,3 +7096,254 @@ async fn dropping_the_last_plane_handle_releases_its_transport() {
         .expect("a dropped plane kept its relay connection open")
         .unwrap();
 }
+
+/// Each relay's known event limit, by endpoint.
+struct KnownLimits(Vec<(TransportEndpoint, usize)>);
+
+#[async_trait]
+impl RelayEventLimits for KnownLimits {
+    async fn max_event_bytes(
+        &self,
+        endpoint: &TransportEndpoint,
+        _event_bytes: usize,
+    ) -> Option<usize> {
+        self.0
+            .iter()
+            .find(|(known, _)| known == endpoint)
+            .map(|(_, limit)| *limit)
+    }
+}
+
+/// Accepts the event everywhere except at relays that refuse it for size,
+/// answering below quorum as the SDK client does, and records every relay it
+/// was asked to send to.
+#[derive(Default)]
+struct SizeRefusingClient {
+    too_large: Vec<TransportEndpoint>,
+    sent_to: StdMutex<Vec<TransportEndpoint>>,
+}
+
+#[async_trait]
+impl NostrRelayClient for SizeRefusingClient {
+    async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _: &MemberId,
+        _: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.sent_to.lock().unwrap().extend_from_slice(endpoints);
+        let (refusing, accepting): (Vec<_>, Vec<_>) = endpoints
+            .iter()
+            .partition(|endpoint| self.too_large.contains(endpoint));
+        let failed = refusing
+            .into_iter()
+            .map(|endpoint| TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: "relay rejected event (too-large)".into(),
+                kind: TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: Some(TransportEndpointRejectionCategory::TooLarge),
+                size_class: Some(cgka_traits::EventSizeClass::of_bytes(event_json_bytes(
+                    event,
+                ))),
+            })
+            .collect::<Vec<_>>();
+        let accepted = accepting
+            .into_iter()
+            .map(|endpoint| TransportEndpointReceipt {
+                endpoint: endpoint.clone(),
+                accepted_at: None,
+                ack_kind: None,
+            })
+            .collect::<Vec<_>>();
+        if accepted.len() >= required_acks.max(1) {
+            return Ok(NostrPublishOutcome {
+                message_id: None,
+                accepted,
+                failed,
+            });
+        }
+        let mut failure = TransportPublishFailure::with_endpoint_failures("refused", failed);
+        if accepted.is_empty() {
+            failure.event_size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+                endpoints,
+                &failure.endpoint_failures,
+            );
+        }
+        Err(TransportAdapterError::PublishEndpoints(failure))
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        _: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
+}
+
+/// Publish one group event through an account adapter that knows `limits`,
+/// to `endpoints` in order. Also returns the plane's counted publish
+/// attempts, successes and failures.
+async fn publish_with_limits(
+    client: Arc<SizeRefusingClient>,
+    limits: Vec<(TransportEndpoint, usize)>,
+    endpoints: Vec<TransportEndpoint>,
+    required_acks: usize,
+) -> (
+    NostrTransportEvent,
+    Result<TransportPublishReport, TransportAdapterError>,
+    (usize, usize, usize),
+) {
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = relay_plane
+        .account_adapter(account.clone(), client)
+        .with_event_limits(Arc::new(KnownLimits(limits)));
+    let transport_group_id = vec![0xD4; 32];
+    let event = group_event("44", &transport_group_id);
+    let result = adapter
+        .publish(TransportPublishRequest {
+            account_id: account,
+            message: event.to_transport_message().unwrap(),
+            target: TransportPublishTarget::Group {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id,
+                endpoints,
+            },
+            required_acks,
+        })
+        .await;
+    let metrics = relay_plane.relay_telemetry().await.metrics;
+    let counted = (
+        metrics.publish_attempts,
+        metrics.publish_successes,
+        metrics.publish_failures,
+    );
+    (event, result, counted)
+}
+
+/// mdk#2334: an event over every relay's known limit is sent nowhere, and the
+/// refusal proves its size like the relays' own size answers would.
+#[tokio::test]
+async fn an_event_over_every_known_limit_is_refused_unsent() {
+    let a = TransportEndpoint("wss://a.example".into());
+    let b = TransportEndpoint("wss://b.example".into());
+    let client = Arc::new(SizeRefusingClient::default());
+    let (event, result, counted) = publish_with_limits(
+        client.clone(),
+        vec![(a.clone(), 100), (b.clone(), 200)],
+        vec![a.clone(), b.clone()],
+        1,
+    )
+    .await;
+
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    let bytes = event_json_bytes(&event);
+    assert_eq!(
+        failure.endpoint_failures,
+        [
+            TransportEndpointFailure::over_known_limit(a, bytes),
+            TransportEndpointFailure::over_known_limit(b, bytes),
+        ]
+    );
+    assert_eq!(
+        failure.event_size_class,
+        Some(cgka_traits::EventSizeClass::of_bytes(bytes))
+    );
+    assert_eq!(
+        failure.message_id,
+        hex::decode(&event.id).ok().map(MessageId::new)
+    );
+    assert!(client.sent_to.lock().unwrap().is_empty());
+    assert_eq!(counted, (0, 0, 0), "no relay was contacted");
+}
+
+/// A refused relay joins the result of the relays the event was sent to. A
+/// refusal mixed with relay size answers still proves size, but not once any
+/// relay accepted the event.
+#[tokio::test]
+async fn refused_relays_join_the_result_of_relays_sent_to() {
+    let over = TransportEndpoint("wss://over.example".into());
+    let fits = TransportEndpoint("wss://fits.example".into());
+    let unknown = TransportEndpoint("wss://unknown.example".into());
+    let refuses = TransportEndpoint("wss://refuses.example".into());
+    let limits = || vec![(over.clone(), 100), (fits.clone(), usize::MAX)];
+
+    let client = Arc::new(SizeRefusingClient::default());
+    let (event, result, counted) = publish_with_limits(
+        client.clone(),
+        limits(),
+        vec![over.clone(), fits.clone(), unknown.clone()],
+        3,
+    )
+    .await;
+    let refusal =
+        TransportEndpointFailure::over_known_limit(over.clone(), event_json_bytes(&event));
+    let report = result.unwrap();
+    assert_eq!(*client.sent_to.lock().unwrap(), [fits.clone(), unknown]);
+    assert_eq!(report.accepted.len(), 2);
+    assert_eq!(report.failed, [refusal]);
+    assert_eq!(report.required_acks, 3, "the refused relay still counts");
+    assert!(!report.met_required_acks());
+    assert_eq!(counted, (1, 0, 1), "the publish fell short of its goal");
+
+    let client = Arc::new(SizeRefusingClient {
+        too_large: vec![refuses.clone()],
+        ..SizeRefusingClient::default()
+    });
+    let (event, result, _) =
+        publish_with_limits(client, limits(), vec![over.clone(), refuses.clone()], 1).await;
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(failure.endpoint_failures.len(), 2);
+    assert_eq!(
+        failure.event_size_class,
+        Some(cgka_traits::EventSizeClass::of_bytes(event_json_bytes(
+            &event
+        )))
+    );
+
+    let client = Arc::new(SizeRefusingClient {
+        too_large: vec![refuses.clone()],
+        ..SizeRefusingClient::default()
+    });
+    let (_, result, _) = publish_with_limits(client, limits(), vec![over, refuses, fits], 3).await;
+    let Err(TransportAdapterError::PublishEndpoints(failure)) = result else {
+        panic!("expected a failure below quorum, got {result:?}");
+    };
+    assert_eq!(failure.event_size_class, None, "a relay accepted the event");
+}
+
+/// Local refusals and relay size answers are classed by one measure: the
+/// signed event JSON a relay receives.
+#[test]
+fn the_refusal_measure_is_the_relays_measure() {
+    let mut event = group_event("55", &[0xD4; 32]);
+    event.content = "quote \" backslash \\ newline \n snow \u{2603} nul \u{0}".to_owned();
+    sign_group_event(&mut event);
+    let signed = event.to_verified_nostr_event().unwrap();
+    assert_eq!(event_json_bytes(&event), signed.as_json().len());
+    event.sig = None;
+    assert_eq!(event_json_bytes(&event), signed.as_json().len());
+}

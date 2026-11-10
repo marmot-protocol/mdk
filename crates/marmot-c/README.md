@@ -236,13 +236,14 @@ the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
 
 Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just before `out_client`: the
-deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, moderation label namespace
-and keychain service. Create one with `marmot_deployment_white_noise` or
+deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, moderation label namespace,
+keychain service and relay event limits. Create one with `marmot_deployment_white_noise` or
 `marmot_deployment_neutral`, adjust it with the `marmot_deployment_set_*` functions, construct, then free it with
 `marmot_deployment_free`; the client keeps its own copy. For an available constructor, a NULL deployment returns `MARMOT_STATUS_NULL_POINTER`
 before anything opens. The unavailable experimental constructor checks its capability immediately after
 required output preflight, before reading the remaining arguments. White Noise hosts pass `marmot_deployment_white_noise()`. The
-[shared contract](../marmot-uniffi/README.md#deployment) covers what neutral means and the keychain caveat.
+[shared contract](../marmot-uniffi/README.md#deployment) covers what neutral means, the keychain caveat and how
+`marmot_deployment_set_relay_event_limits` limits apply.
 
 For private integration fixtures, `marmot_client_new_with_options` accepts
 an explicit loopback relay policy and an optional host secret-store vtable.
