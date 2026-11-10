@@ -7278,42 +7278,60 @@ async fn an_event_over_every_known_limit_is_refused_unsent() {
     assert_eq!(counted, (0, 0, 0), "no relay was contacted");
 }
 
-/// mdk#2334: the size preflight counts only the relays `publish` would send
-/// to. An unsafe group relay is never sent to, so it does not hide a refusal;
-/// an unsafe inbox relay fails the whole publish, which is not a size refusal.
+/// mdk#2334: the size preflight counts every relay a publish can reach. Group
+/// fanouts and Welcome retries publish to one relay per request, so an unsafe
+/// relay, never sent to, does not hide a refusal, and an inbox longer than a
+/// route's relay cap still counts all its relays.
 #[tokio::test]
-async fn the_size_preflight_counts_only_relays_publish_would_send_to() {
-    let over = TransportEndpoint("wss://over.example".into());
+async fn the_size_preflight_counts_every_relay_a_publish_can_reach() {
     let unsafe_relay = TransportEndpoint("ws://plaintext.example".into());
+    let over: Vec<_> = (0..17)
+        .map(|n| TransportEndpoint(format!("wss://over-{n}.example")))
+        .collect();
+    let unknown = TransportEndpoint("wss://unknown.example".into());
     let client = Arc::new(SizeRefusingClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
     let adapter = relay_plane
         .account_adapter(MemberId::new(vec![0xA1; 32]), client.clone())
-        .with_event_limits(Arc::new(KnownLimits(vec![(over.clone(), 100)])));
+        .with_event_limits(Arc::new(KnownLimits(
+            over.iter()
+                .map(|endpoint| (endpoint.clone(), 100))
+                .collect(),
+        )));
     let transport_group_id = vec![0xD4; 32];
     let event = group_event("44", &transport_group_id);
     let message = event.to_transport_message().unwrap();
-    let endpoints = vec![unsafe_relay, over];
-
-    let group = TransportPublishTarget::Group {
+    let group = |endpoints: Vec<TransportEndpoint>| TransportPublishTarget::Group {
         group_id: GroupId::new(vec![0xC3; 16]),
-        transport_group_id,
-        endpoints: endpoints.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints,
     };
-    assert_eq!(
-        adapter.size_class_over_known_limits(&message, &group).await,
-        Some(cgka_traits::EventSizeClass::of_bytes(event_json_bytes(
-            &event
-        )))
-    );
-    let inbox = TransportPublishTarget::Inbox {
+    let inbox = |endpoints| TransportPublishTarget::Inbox {
         recipient: MemberId::new(vec![0xB2; 32]),
         endpoints,
     };
-    assert_eq!(
-        adapter.size_class_over_known_limits(&message, &inbox).await,
-        None
-    );
+    let too_large = Some(cgka_traits::EventSizeClass::of_bytes(event_json_bytes(
+        &event,
+    )));
+
+    let mixed = vec![unsafe_relay.clone(), over[0].clone()];
+    let long_inbox = [vec![unsafe_relay], over.clone()].concat();
+    let with_unknown = vec![over[0].clone(), unknown];
+    for (target, expected) in [
+        (group(mixed.clone()), too_large),
+        (inbox(mixed), too_large),
+        (inbox(long_inbox), too_large),
+        (group(with_unknown.clone()), None),
+        (inbox(with_unknown), None),
+    ] {
+        assert_eq!(
+            adapter
+                .size_class_over_known_limits(&message, &target)
+                .await,
+            expected,
+            "{target:?}"
+        );
+    }
     assert!(client.sent_to.lock().unwrap().is_empty());
 }
 
