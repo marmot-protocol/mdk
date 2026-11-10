@@ -757,8 +757,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   settled as `Unanswered` (`OpenAttempts`), through storage that is still open, and a settle whose write failed stays
   open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
   and after a crash, the charge stays until it ages out of the hour. A
-  directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
-  loss branch; `sync()` then reads the live frames the pass released before returning, since no worker will. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
+  directly owned client (`MarmotApp::sync_account`, or `MarmotApp::client()` under `test-support`) runs one pass in
+  place from `sync()` and from `next_event()`'s loss branch; `sync()` then reads the live frames the pass released before returning, since no worker will. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
   changes and returns its storage error without running the debt read. The existing admission/survey local-failure
   backoff schedules its retry; never add an immediate self-wake or report a successful zero-debt survey on failure.
   The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
@@ -1161,8 +1161,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build); forwards to `marmot-observability/otlp-export`.
 - `product-analytics-export`: product analytics export path; forwards to `marmot-observability/product-analytics-export`.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
-- `test-support`: exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
-  (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
+- `test-support`: makes `AppClient` and `MarmotApp::client` public for tests that drive a directly owned client
+  (mdk#2782), exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
+  (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency. This crate's own dev-dependency on
+  itself turns it on, so `-p marmot-app` test runs build every integration test. Hosts reach accounts through
+  `MarmotAppRuntime`; `wn sync` runs its one pass through `MarmotApp::sync_account`, whose outer error is the open and
+  whose inner `SyncFailure` is the pass. `AppClient` methods no production path calls carry
+  `#[cfg_attr(not(feature = "test-support"), allow(dead_code))]`.
 
 Background condition ownership extends `the_runtime_writes_a_due_backup`: durable pre-prepare ledger state proves
 closed/default admission, held real PUT proves current-pass settlement after false, and same-runtime worker replacement retains

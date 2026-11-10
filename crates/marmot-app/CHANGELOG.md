@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `marmot_app::AppClient` and `MarmotApp::client` are public only under the
+  `test-support` feature (mdk#2782). Hosts reach accounts through
+  `MarmotAppRuntime`. The new `MarmotApp::sync_account` runs the one-shot sync
+  `wn sync` runs: it opens the account's own client, runs one pass and drops
+  it. It returns `Err(AppError)` when the open fails and `Ok(Err(SyncFailure))`,
+  with the durably applied prefix, when the pass fails.
+
 ### Added
 
 - `MarmotAppRuntime::start_direct_conversation` serializes peer lookup and

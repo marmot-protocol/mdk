@@ -447,8 +447,8 @@ pub enum AppError {
     /// iOS notification extension can take its bounded fallback path.
     #[error("marmot runtime root is already in use")]
     RuntimeBusy,
-    /// Another [`crate::AppClient`] from this [`crate::MarmotApp`] currently
-    /// owns the account's in-memory engine session.
+    /// A runtime worker or another open from this [`crate::MarmotApp`]
+    /// currently owns the account's in-memory engine session.
     #[error("marmot account session is already in use")]
     AccountSessionBusy,
     /// The managed account worker is in an exclusive catch-up phase and did

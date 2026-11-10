@@ -13,8 +13,7 @@ pub(crate) async fn sync_command(
     account: marmot_account::AccountSummary,
 ) -> Result<CommandOutput, WnError> {
     app.status(&account.label)?;
-    let mut client = app.client(&account.label).await?;
-    let summary = match client.sync_with_partial_progress().await {
+    let summary = match app.sync_account(&account.label).await? {
         Ok(summary) => summary,
         Err(failure) => return Err(sync_failure_error(app, account, failure)),
     };

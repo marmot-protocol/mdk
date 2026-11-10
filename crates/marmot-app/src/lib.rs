@@ -234,7 +234,13 @@ pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
     PollProjection, PollType, PollVote, PollVotePage,
 };
+// The directly owned per-account client, for tests that drive it directly.
+// Hosts reach accounts through `MarmotAppRuntime`; `wn sync` runs its one pass
+// through `MarmotApp::sync_account`.
+#[cfg(feature = "test-support")]
 pub use client::AppClient;
+#[cfg(not(feature = "test-support"))]
+pub(crate) use client::AppClient;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
@@ -956,10 +962,9 @@ impl SyncSummary {
 ///
 /// Catch-up processes deliveries incrementally, so a later transport, engine,
 /// or projection error cannot roll back earlier deliveries. Callers of
-/// [`AppClient::sync_with_partial_progress`] must report or otherwise consume
+/// [`MarmotApp::sync_account`] must report or otherwise consume
 /// `partial_summary`; dropping it would hide durable progress until the host
-/// takes a fresh storage snapshot. The compatibility [`AppClient::sync`] entry
-/// point retains its original [`AppError`] result.
+/// takes a fresh storage snapshot.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct SyncFailure {
@@ -1203,7 +1208,7 @@ pub struct MaintenanceRunSummary {
 /// Group state is already durable; pending does not prove whether the recipient
 /// received the Welcome. Persisted so the repair
 /// handle survives the call return and a restart; re-deliver it with
-/// [`AppClient::redeliver_welcome`].
+/// [`MarmotAppRuntime::redeliver_welcome`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingWelcomeDelivery {
     pub group_id_hex: String,
@@ -1967,23 +1972,43 @@ impl MarmotApp {
     /// (including its clones and managed runtime workers). A concurrent open
     /// returns [`AppError::AccountSessionBusy`]. Drop the owning client before
     /// retrying.
+    #[cfg(feature = "test-support")]
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
-        #[cfg(test)]
-        let relay_plane = self
-            .test_relay_client
-            .as_ref()
-            .map(|client| MarmotRelayPlane::new(None, client.clone()))
-            .unwrap_or_else(|| {
-                MarmotRelayPlane::full_history_with_loopback(
-                    self.config.allow_loopback_relay_endpoints,
-                )
-            });
-        #[cfg(not(test))]
-        let relay_plane = MarmotRelayPlane::full_history_with_loopback(
-            self.config.allow_loopback_relay_endpoints,
-        );
-        self.client_with_relay_plane(label, &relay_plane, None)
+        self.client_with_relay_plane(label, &self.direct_client_relay_plane(), None)
             .await
+    }
+
+    /// Run one sync pass for the account on a client this call opens, owns
+    /// and drops: the one-shot catch-up `wn sync` runs. Hosts that keep
+    /// accounts running sync through [`MarmotAppRuntime`] instead.
+    ///
+    /// The two failures stay apart. The outer error is the open failing,
+    /// before anything syncs: an unknown account, or
+    /// [`AppError::AccountSessionBusy`] while a runtime worker or another open
+    /// from this [`MarmotApp`] holds the account's engine session. The inner
+    /// result is the pass: a [`SyncFailure`] carries the prefix the pass had
+    /// already applied durably, which the caller must report.
+    pub async fn sync_account(
+        &self,
+        label: &str,
+    ) -> Result<Result<SyncSummary, SyncFailure>, AppError> {
+        let mut client = self
+            .client_with_relay_plane(label, &self.direct_client_relay_plane(), None)
+            .await?;
+        // Boxed: the pass nests deep enough that one more layer of future
+        // overflows the compiler's layout query depth in a caller such as
+        // `wn`'s command future.
+        Ok(Box::pin(client.sync_with_partial_progress()).await)
+    }
+
+    /// The relay plane a directly owned client opens on: full history, or a
+    /// unit test's scripted relay client.
+    fn direct_client_relay_plane(&self) -> MarmotRelayPlane {
+        #[cfg(test)]
+        if let Some(client) = &self.test_relay_client {
+            return MarmotRelayPlane::new(None, client.clone());
+        }
+        MarmotRelayPlane::full_history_with_loopback(self.config.allow_loopback_relay_endpoints)
     }
 
     async fn runtime_local_client(
