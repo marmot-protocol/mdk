@@ -541,6 +541,10 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // A failed rewind restore quarantines its group before anything below
+        // reads the group's record (mdk#3272).
+        self.quarantine_failed_rewinds();
+
         // A copy already marked removed refuses group traffic on the durable
         // record alone — before hydration and before the OpenMLS load — so
         // continued relay traffic for a group this device left costs no epoch
@@ -568,21 +572,29 @@ impl<S: StorageProvider> Engine<S> {
         // and `recorded_message_outcome` answers `Duplicate` for every terminal
         // state, so a never-applied message would be dead for this device
         // (graph seeding is not the hazard: it skips raw-transport payloads).
-        if let Some(record) = self
-            .stored_group_record(&group_id)?
-            .filter(|group| group.removed)
-        {
-            self.retain_transport_message_refused_while_removed(msg, &group_id, record.epoch)?;
-            return reported(IngestOutcome::LocalState {
-                state: LocalIngestState::Removed,
-            });
-        }
+        //
+        // A quarantined group's record is not live state and the gated read
+        // refuses it (mdk#364, mdk#3272): after a failed rewind restore its
+        // `removed` flag is a retained anchor's. Its input goes straight to
+        // the quarantine gate below, which retains it.
+        if self.quarantined_reason(&group_id).is_none() {
+            if let Some(record) = self
+                .stored_group_record(&group_id)?
+                .filter(|group| group.removed)
+            {
+                self.retain_transport_message_refused_while_removed(msg, &group_id, record.epoch)?;
+                return reported(IngestOutcome::LocalState {
+                    state: LocalIngestState::Removed,
+                });
+            }
 
-        // mdk#1161: an inbound message for a seeded-but-unhydrated group runs
-        // that group's full hydration first, so the peel below sees validated
-        // live state. A hydration failure quarantines the group and the
-        // quarantine gate below retains this input for post-repair replay.
-        let _ = self.ensure_hydrated(&group_id);
+            // mdk#1161: an inbound message for a seeded-but-unhydrated group
+            // runs that group's full hydration first, so the peel below sees
+            // validated live state. A hydration failure quarantines the group
+            // and the quarantine gate below retains this input for post-repair
+            // replay.
+            let _ = self.ensure_hydrated(&group_id);
+        }
 
         // Quarantine gate (mdk#364): a group frozen by hydration
         // quarantine must not process any input — its OpenMLS state may load
@@ -1919,10 +1931,12 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         schedule: ScheduledSelfRemoveAutoCommit,
     ) -> Result<ScheduledAutoCommitReplay, EngineError> {
-        let group = match self.storage.get_group(&schedule.group_id) {
+        let group = match self.live_group_record(&schedule.group_id) {
             Ok(group) => group,
-            Err(StorageError::NotFound) => return Ok(ScheduledAutoCommitReplay::NotApplicable),
-            Err(err) => return Err(EngineError::Storage(err)),
+            Err(EngineError::Storage(StorageError::NotFound)) => {
+                return Ok(ScheduledAutoCommitReplay::NotApplicable);
+            }
+            Err(err) => return Err(err),
         };
         if group.epoch != schedule.source_epoch {
             return Ok(ScheduledAutoCommitReplay::NotApplicable);
@@ -2208,7 +2222,7 @@ impl<S: StorageProvider> Engine<S> {
                     .map(|member| member.signature_key)
             })
             .collect::<Vec<_>>();
-        let mut projected = self.storage.get_group(group_id)?;
+        let mut projected = self.live_group_record(group_id)?;
         projected.epoch = new_epoch;
         projected
             .members
@@ -2263,10 +2277,10 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
-        let mut group = match self.storage.get_group(group_id) {
+        let mut group = match self.live_group_record(group_id) {
             Ok(group) => group,
-            Err(StorageError::NotFound) => return Ok(()),
-            Err(err) => return Err(EngineError::Storage(err)),
+            Err(EngineError::Storage(StorageError::NotFound)) => return Ok(()),
+            Err(err) => return Err(err),
         };
         if group.removed {
             return Ok(());
@@ -2360,7 +2374,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         msg_epoch: EpochId,
     ) -> Option<BelowCopyHistory> {
-        let group = self.storage.get_group(group_id).ok()?;
+        let group = self.live_group_record(group_id).ok()?;
         let below = |floor: EpochId| floor.0 > 0 && msg_epoch < floor;
         if below(group.join_epoch) {
             Some(BelowCopyHistory::PreMembership)
@@ -2456,6 +2470,8 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
+    // Routing resolves a quarantined group too, so its input reaches the retaining gate (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     fn group_id_for_transport_group_id(
         &self,
         transport_group_id: &[u8],
@@ -2511,6 +2527,8 @@ impl<S: StorageProvider> Engine<S> {
     /// MLS load failure keeps the id pending because full hydration owns that
     /// failure — every backfill-pending group is also in `unhydrated_groups`,
     /// so `ensure_hydrated` will either index its route or quarantine it.
+    // Routing resolves a quarantined group too, so its input reaches the retaining gate (see clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     fn resolve_or_backfill_group_id_for_transport(
         &mut self,
         transport_group_id: &[u8],
@@ -2743,13 +2761,16 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(b"cgka-engine-peel-restore/v2");
         hasher.update(group_id.as_slice());
         hasher.update(snapshot_name.as_bytes());
-        let guard = SnapshotRollbackGuard::create_group_state(
+        let guard = SnapshotRollbackGuard::rewind(
             &self.storage,
+            &self.rewinds,
             group_id.clone(),
             RewindSite::PastPeelContext,
             &hex::encode(&hasher.finalize()[..8]),
-        )?;
-        let context = self.context_from_group_snapshot(group_id, snapshot_name);
+            snapshot_name,
+        )??;
+        crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
+        let context = self.context_from_rewound_group(group_id);
         guard.commit()?;
         Ok(context?.map(|(context, message_retention_seconds)| {
             Arc::new(PastPeelContext {
@@ -2857,10 +2878,11 @@ impl<S: StorageProvider> Engine<S> {
     /// (`UseAfterEviction`). A re-added member keeps such snapshots from its
     /// pre-removal era; they must be skipped like an undecryptable snapshot,
     /// not surfaced as an ingest failure.
-    fn context_from_group_snapshot(
+    /// The exporter context and retention policy of `group_id`'s live
+    /// OpenMLS state, which a past-peel window has rewound onto an anchor.
+    fn context_from_rewound_group(
         &self,
         group_id: &GroupId,
-        snapshot_name: &str,
     ) -> Result<
         Option<(
             cgka_traits::group_context::GroupContextSnapshot,
@@ -2868,9 +2890,6 @@ impl<S: StorageProvider> Engine<S> {
         )>,
         EngineError,
     > {
-        self.storage
-            .rollback_group_state_keeping_live_records(group_id, snapshot_name)?;
-        crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mls_group = MlsGroup::load(

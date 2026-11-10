@@ -884,6 +884,8 @@ impl MessageStorage for SqliteAccountStorage {
     }
 
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.connection.snapshot_release_fault(group_id, name)?;
         snapshots::release(self, group_id, name)
     }
 }

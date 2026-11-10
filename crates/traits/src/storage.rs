@@ -1469,6 +1469,29 @@ pub trait StorageProvider:
         rollback_group_state_and_put_back_live_records(self, group_id, name)
     }
 
+    /// Every snapshot, in any group, whose name starts with one of `prefixes`,
+    /// as `(group, name)` pairs in no particular order. Engine construction
+    /// uses this to find interrupted rewinds in every group before it reads
+    /// any group's state, so it should cost one read rather than one per
+    /// group.
+    ///
+    /// The default lists each stored group's snapshots. SQLite overrides it
+    /// with one scan of the snapshot keys that reads no snapshot body.
+    fn list_snapshots_with_prefixes(
+        &self,
+        prefixes: &[&str],
+    ) -> StorageResult<Vec<(GroupId, String)>> {
+        let mut found = Vec::new();
+        for group_id in self.list_groups()? {
+            for name in self.list_group_snapshots(&group_id)? {
+                if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                    found.push((group_id.clone(), name));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     fn backend(&self) -> Backend;
 }
 

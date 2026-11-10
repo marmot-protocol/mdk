@@ -6686,6 +6686,7 @@ fn controlled_reap_worker() -> (
             handle,
             shutdown,
             commands,
+            unit: Default::default(),
         },
         release,
         dropped,

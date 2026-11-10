@@ -594,7 +594,7 @@ impl<S: StorageProvider> Engine<S> {
         };
         // Derive the app projection before writing any outbound rows. The
         // synchronous staging unit commits both before installing pending state.
-        let mut group = self.storage.get_group(&group_id)?;
+        let mut group = self.live_group_record(&group_id)?;
         for update in &updates {
             if update.component_id == GROUP_PROFILE_COMPONENT_ID {
                 let (name, description) =

@@ -815,6 +815,11 @@ pub enum AppGroupHydrationQuarantineReasonFfi {
     GroupRecordLoadFailed,
     /// Hydrate found a stranded pending commit, but recovery itself failed.
     PendingCommitRecoveryFailed,
+    /// A read of past group state could not restore the live group, which
+    /// sits on that past state, in session or at account open. A retry or
+    /// re-join cannot clear it, and the next account open restores the live
+    /// state.
+    RewindRestoreFailed,
 }
 
 impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReasonFfi {
@@ -829,6 +834,7 @@ impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReas
             AppGroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
                 Self::PendingCommitRecoveryFailed
             }
+            AppGroupHydrationQuarantineReason::RewindRestoreFailed => Self::RewindRestoreFailed,
         }
     }
 }
@@ -1169,6 +1175,7 @@ mod group_state_tests {
                 Native::PendingCommitRecoveryFailed,
                 Ffi::PendingCommitRecoveryFailed,
             ),
+            (Native::RewindRestoreFailed, Ffi::RewindRestoreFailed),
         ] {
             let ffi = Ffi::from(native);
             assert_eq!(

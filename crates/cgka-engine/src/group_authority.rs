@@ -63,7 +63,7 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<CanonicalGroupMembership, EngineError> {
         self.ensure_group_live(group_id)?;
         self.storage.with_read_snapshot(|storage| {
-            let terminal = storage.get_group(group_id)?.is_terminal();
+            let terminal = self.live_group_record_in(storage, group_id)?.is_terminal();
             self.with_mls_group(group_id, |group| {
                 let member_leaves = group
                     .members()
@@ -120,7 +120,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<GroupAuthorityFacts, EngineError> {
-        let group = self.storage.get_group(group_id)?;
+        let group = self.live_group_record(group_id)?;
         let account_listed = group
             .members
             .iter()
@@ -172,6 +172,8 @@ impl<S: StorageProvider> Engine<S> {
 }
 
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::distributed_convergence::tests::test_engine;

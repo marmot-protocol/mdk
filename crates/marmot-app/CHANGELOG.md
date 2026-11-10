@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `AppGroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272), reported by the quarantined-groups read:
+  a read of past group state could not restore the live group. Neither a retry nor a re-join clears it, and the next
+  account open restores the live state. Exhaustive matches must add it.
+
 - `marmot_app::AppClient` and `MarmotApp::client` are public only under the
   `test-support` feature (mdk#2782). Hosts reach accounts through
   `MarmotAppRuntime`. The new `MarmotApp::sync_account` runs the one-shot sync

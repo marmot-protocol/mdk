@@ -19,6 +19,33 @@ pub(super) fn list(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageR
         .storage()
 }
 
+/// Selects only the key columns, which the primary-key index covers, so the
+/// scan reads index pages and never a snapshot body.
+pub(super) const SNAPSHOT_KEYS: &str = "SELECT group_id, name FROM cgka_group_snapshots";
+
+/// Every group's snapshot names that start with one of `prefixes`, in one scan
+/// of [`SNAPSHOT_KEYS`].
+pub(super) fn list_with_prefixes(
+    store: &SqliteAccountStorage,
+    prefixes: &[&str],
+) -> StorageResult<Vec<(GroupId, String)>> {
+    let conn = store.lock()?;
+    let mut stmt = conn.prepare_cached(SNAPSHOT_KEYS).storage()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })
+        .storage()?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (group_id, name) = row.storage()?;
+        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            found.push((GroupId::new(group_id), name));
+        }
+    }
+    Ok(found)
+}
+
 pub(super) fn release(
     store: &SqliteAccountStorage,
     group_id: &GroupId,

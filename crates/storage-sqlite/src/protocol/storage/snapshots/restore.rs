@@ -48,6 +48,8 @@ fn rollback_with_scope(
     name: &str,
     scope: RestoreScope,
 ) -> StorageResult<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    store.connection.snapshot_restore_fault(group_id, name)?;
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
         return rollback_on_connection(&conn, group_id, name, scope);

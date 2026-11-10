@@ -2,7 +2,12 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
+mod read_queue;
 pub(crate) mod recovery_credits;
+
+pub(crate) use read_queue::{
+    ReadClass, ReadReply, WorkerLane, WorkerReply, WorkerUnit, WorkerUnitGauge,
+};
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use marmot_observability::{Observation, Outcome as TelemetryOutcome};
@@ -60,6 +65,8 @@ pub(crate) struct ManagedAccountWorker {
     pub(crate) commands: mpsc::Sender<AccountWorkerCommand>,
     pub(crate) media_admission: Arc<Semaphore>,
     pub(crate) shutdown: oneshot::Sender<()>,
+    /// Which long unit the worker is inside, for host-read telemetry.
+    pub(crate) unit: Arc<WorkerUnitGauge>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,6 +77,10 @@ enum RelayConfigWork {
 }
 
 impl ManagedAccountWorker {
+    pub(crate) fn lane(&self) -> WorkerLane {
+        WorkerLane::new(self.commands.clone(), self.unit.clone())
+    }
+
     pub(crate) async fn shutdown(self) {
         self.shutdown_with_timeout(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT)
             .await;
@@ -327,6 +338,8 @@ pub(crate) struct AccountWorkerRuntime {
     /// Fired once when the device group unlinks this device and the worker
     /// stops, so the runtime deactivates the account (mdk#2628 D67).
     pub(crate) unlinked: oneshot::Sender<()>,
+    /// The gauge the worker sets while it is inside a long unit.
+    pub(crate) unit: Arc<WorkerUnitGauge>,
 }
 
 pub(crate) enum GroupCreationRequest {
@@ -378,18 +391,18 @@ pub(crate) enum AccountWorkerCommand {
     },
     PreparedGroupImageStatus {
         upload_id: String,
-        respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
+        respond: ReadReply<Result<AppPreparedGroupImageUpload, AppError>>,
     },
     PreparedGroupImages {
-        respond: oneshot::Sender<Result<Vec<AppPreparedGroupImageUpload>, AppError>>,
+        respond: ReadReply<Result<Vec<AppPreparedGroupImageUpload>, AppError>>,
     },
     Members {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<Vec<AppGroupMemberRecord>, AppError>>,
+        respond: ReadReply<Result<Vec<AppGroupMemberRecord>, AppError>>,
     },
     MemberIdsPage {
         group_ids: Vec<GroupId>,
-        respond: oneshot::Sender<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
     },
     CaptureConversation {
         queued: Option<Observation>,
@@ -397,15 +410,15 @@ pub(crate) enum AccountWorkerCommand {
         query: storage_sqlite::ConversationWindowQuery,
         store_epoch: Vec<u8>,
         observer: Option<std::sync::Weak<super::SendCapture>>,
-        respond: oneshot::Sender<Result<CapturedConversation, ConversationWindowError>>,
+        respond: ReadReply<Result<CapturedConversation, ConversationWindowError>>,
     },
     GroupMlsState {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
+        respond: ReadReply<Result<AppGroupMlsState, AppError>>,
     },
     GroupRoster {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<crate::groups::AppGroupRosterSession, AppError>>,
+        respond: ReadReply<Result<crate::groups::AppGroupRosterSession, AppError>>,
     },
     EnableGroupDisbanding {
         group_id: GroupId,
@@ -413,7 +426,7 @@ pub(crate) enum AccountWorkerCommand {
     },
     AccountDevicesActivation {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<crate::AppAccountDevicesActivation, AppError>>,
+        respond: ReadReply<Result<crate::AppAccountDevicesActivation, AppError>>,
     },
     EnableAccountDevices {
         group_id: GroupId,
@@ -428,7 +441,7 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
     QuarantinedGroups {
-        respond: oneshot::Sender<Result<Vec<AppQuarantinedGroup>, AppError>>,
+        respond: ReadReply<Result<Vec<AppQuarantinedGroup>, AppError>>,
     },
     NetworkStartupSettled {
         respond: oneshot::Sender<()>,
@@ -446,13 +459,13 @@ pub(crate) enum AccountWorkerCommand {
     SafeExportSecret {
         group_id: GroupId,
         component_id: cgka_traits::AppComponentId,
-        respond: oneshot::Sender<Result<SecretBytes, AppError>>,
+        respond: ReadReply<Result<SecretBytes, AppError>>,
     },
     ExporterSecret {
         group_id: GroupId,
         label: String,
         length: usize,
-        respond: oneshot::Sender<Result<SecretBytes, AppError>>,
+        respond: ReadReply<Result<SecretBytes, AppError>>,
     },
     InviteMembers {
         group_id: GroupId,
@@ -494,25 +507,25 @@ pub(crate) enum AccountWorkerCommand {
     },
     GroupRecoveryStatus {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+        respond: ReadReply<Result<crate::GroupRecoveryStatus, AppError>>,
     },
     HistoryNotices {
-        respond: oneshot::Sender<Result<Vec<crate::HistoryNotice>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::HistoryNotice>, AppError>>,
     },
     AccountRecoveryStatus {
-        respond: oneshot::Sender<Result<crate::AccountRecoveryStatus, AppError>>,
+        respond: ReadReply<Result<crate::AccountRecoveryStatus, AppError>>,
     },
     LinkedDevices {
-        respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::LinkedDevice>, AppError>>,
     },
     ChatHistoryImports {
-        respond: oneshot::Sender<Result<Vec<crate::ChatHistoryImport>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::ChatHistoryImport>, AppError>>,
     },
     KeyPackageRefreshOverdue {
-        respond: oneshot::Sender<Result<bool, AppError>>,
+        respond: ReadReply<Result<bool, AppError>>,
     },
     UnrecognizedSignIns {
-        respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
     },
     AnswerSignIn {
         slot_id_hex: String,
@@ -526,10 +539,10 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     StartedFresh {
-        respond: oneshot::Sender<Result<bool, AppError>>,
+        respond: ReadReply<Result<bool, AppError>>,
     },
     CompromiseWarning {
-        respond: oneshot::Sender<Result<Vec<crate::CompromiseWarningItem>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::CompromiseWarningItem>, AppError>>,
     },
     DismissCompromiseWarning {
         respond: oneshot::Sender<Result<(), AppError>>,
@@ -551,10 +564,10 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     RemovedDeviceLeftoverChats {
-        respond: oneshot::Sender<Result<u32, AppError>>,
+        respond: ReadReply<Result<u32, AppError>>,
     },
     ChatsClosedToLinkedDevices {
-        respond: oneshot::Sender<Result<u32, AppError>>,
+        respond: ReadReply<Result<u32, AppError>>,
     },
     SignOutThroughSiblingsStep {
         respond: oneshot::Sender<Result<crate::client::sign_out::SiblingSignOut, AppError>>,
@@ -584,22 +597,22 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
     BackupRestoreStatus {
-        respond: oneshot::Sender<Result<crate::BackupRestoreStatus, AppError>>,
+        respond: ReadReply<Result<crate::BackupRestoreStatus, AppError>>,
     },
     WatchBackupRestore {
-        respond: oneshot::Sender<Result<crate::BackupRestoreWatch, AppError>>,
+        respond: ReadReply<Result<crate::BackupRestoreWatch, AppError>>,
     },
     HistoryImportProvenance {
         group_id: GroupId,
         event_id: String,
-        respond: oneshot::Sender<Result<Option<crate::HistoryImportProvenance>, AppError>>,
+        respond: ReadReply<Result<Option<crate::HistoryImportProvenance>, AppError>>,
     },
     BackupHistoryAvailability {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<Vec<crate::BackupHistoryAvailability>, AppError>>,
+        respond: ReadReply<Result<Vec<crate::BackupHistoryAvailability>, AppError>>,
     },
     BackupSettings {
-        respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
+        respond: ReadReply<Result<crate::BackupSettings, AppError>>,
     },
     DismissHistoryNotice {
         notice_id: String,
@@ -615,7 +628,7 @@ pub(crate) enum AccountWorkerCommand {
     },
     GroupCommitDelivery {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<Option<crate::GroupCommitDelivery>, AppError>>,
+        respond: ReadReply<Result<Option<crate::GroupCommitDelivery>, AppError>>,
     },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
@@ -673,7 +686,7 @@ pub(crate) enum AccountWorkerCommand {
     GroupAppComponent {
         group_id: GroupId,
         component_id: u16,
-        respond: oneshot::Sender<Result<Option<Vec<u8>>, AppError>>,
+        respond: ReadReply<Result<Option<Vec<u8>>, AppError>>,
     },
     UpdateAppComponent {
         group_id: GroupId,
@@ -722,7 +735,7 @@ pub(crate) enum AccountWorkerCommand {
     BuildMediaImetaTag {
         group_id: GroupId,
         reference: MediaAttachmentReference,
-        respond: oneshot::Sender<Result<Vec<String>, AppError>>,
+        respond: ReadReply<Result<Vec<String>, AppError>>,
     },
     UploadMedia {
         admission: OwnedSemaphorePermit,
@@ -762,7 +775,7 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     PendingWelcomeDeliveries {
-        respond: oneshot::Sender<Result<Vec<PendingWelcomeDelivery>, AppError>>,
+        respond: ReadReply<Result<Vec<PendingWelcomeDelivery>, AppError>>,
     },
     RedeliverWelcome {
         message_id_hex: String,
@@ -791,21 +804,21 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
     KeyPackageMaintenanceStatus {
-        respond: oneshot::Sender<Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError>>,
+        respond: ReadReply<Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError>>,
     },
     DurablyOwnedKeyPackages {
-        respond: oneshot::Sender<Result<Vec<KeyPackage>, AppError>>,
+        respond: ReadReply<Result<Vec<KeyPackage>, AppError>>,
     },
     MaintenanceStatus {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<cgka_traits::GroupMaintenanceStatus, AppError>>,
+        respond: ReadReply<Result<cgka_traits::GroupMaintenanceStatus, AppError>>,
     },
     ScheduleManualSelfUpdate {
         group_id: GroupId,
         respond: oneshot::Sender<Result<String, AppError>>,
     },
     PeriodicMaintenancePolicy {
-        respond: oneshot::Sender<Result<cgka_traits::PeriodicMaintenancePolicy, AppError>>,
+        respond: ReadReply<Result<cgka_traits::PeriodicMaintenancePolicy, AppError>>,
     },
     SetPeriodicMaintenancePolicy {
         policy: cgka_traits::PeriodicMaintenancePolicy,
@@ -843,7 +856,7 @@ pub(crate) enum AccountWorkerCommand {
     },
     GroupPushDebugInfo {
         group_id: GroupId,
-        respond: oneshot::Sender<Result<crate::GroupPushDebugInfo, AppError>>,
+        respond: ReadReply<Result<crate::GroupPushDebugInfo, AppError>>,
     },
     RetryPushRegistration {
         respond: oneshot::Sender<bool>,
@@ -947,7 +960,7 @@ fn handle_startup_sync_command(
     match command {
         AccountWorkerCommand::Members { group_id, respond } => {
             if let Some(snapshot) = read_snapshot {
-                let _ = respond.send(snapshot.members(&group_id));
+                let _ = respond.send_with(|| snapshot.members(&group_id));
             } else {
                 deferred.push(DeferredStartupCommand::Command(Box::new(
                     AccountWorkerCommand::Members { group_id, respond },
@@ -956,7 +969,7 @@ fn handle_startup_sync_command(
         }
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
             if let Some(snapshot) = read_snapshot {
-                let _ = respond.send(snapshot.member_ids_page(&group_ids));
+                let _ = respond.send_with(|| snapshot.member_ids_page(&group_ids));
             } else {
                 deferred.push(DeferredStartupCommand::Command(Box::new(
                     AccountWorkerCommand::MemberIdsPage { group_ids, respond },
@@ -969,11 +982,11 @@ fn handle_startup_sync_command(
             if let Some(queued) = queued {
                 queued.finish(TelemetryOutcome::NotReady);
             }
-            let _ = respond.send(Err(ConversationWindowError::NotReady));
+            let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             if let Some(snapshot) = read_snapshot {
-                let _ = respond.send(snapshot.group_mls_state(&group_id));
+                let _ = respond.send_with(|| snapshot.group_mls_state(&group_id));
             } else {
                 deferred.push(DeferredStartupCommand::Command(Box::new(
                     AccountWorkerCommand::GroupMlsState { group_id, respond },
@@ -982,12 +995,9 @@ fn handle_startup_sync_command(
         }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
             if let Some(snapshot) = read_snapshot {
-                let _ = respond.send(group_roster_from_snapshot(
-                    app,
-                    account_label,
-                    snapshot,
-                    &group_id,
-                ));
+                let _ = respond.send_with(|| {
+                    group_roster_from_snapshot(app, account_label, snapshot, &group_id)
+                });
             } else {
                 deferred.push(DeferredStartupCommand::Command(Box::new(
                     AccountWorkerCommand::GroupRoster { group_id, respond },
@@ -996,7 +1006,7 @@ fn handle_startup_sync_command(
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             if let Some(snapshot) = read_snapshot {
-                let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                let _ = respond.send_with(|| Ok(snapshot.quarantined_groups()));
             } else {
                 deferred.push(DeferredStartupCommand::Command(Box::new(
                     AccountWorkerCommand::QuarantinedGroups { respond },
@@ -1127,6 +1137,7 @@ async fn run_app_runtime_account_worker(
         lifecycle,
         shared,
         unlinked,
+        unit,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
@@ -1391,6 +1402,7 @@ async fn run_app_runtime_account_worker(
         post_join_errors: &report_startup_join_errors,
     };
     let startup_sync_result = {
+        let _unit = unit.enter(WorkerUnit::StartupSync);
         let mut initial_sync: Pin<
             Box<dyn Future<Output = Result<SyncSummary, ClassifiedSyncFailure>> + Send + '_>,
         > = Box::pin(async {
@@ -1640,6 +1652,7 @@ async fn run_app_runtime_account_worker(
                         account_id_hex: &account_id_hex,
                         account_label: &account_label,
                         shared: &shared,
+                        unit: &unit,
                     },
                 )
                 .await;
@@ -1671,6 +1684,7 @@ async fn run_app_runtime_account_worker(
                         media_http: &media_http,
                         scheduled_convergence: &mut scheduled_convergence,
                         recovery_runner: recovery_runner.as_mut(),
+                        unit: &unit,
                     },
                 )
                 .await;
@@ -2048,6 +2062,7 @@ async fn run_app_runtime_account_worker(
                                         account_id_hex: &account_id_hex,
                                         account_label: &account_label,
                                         shared: &shared,
+                                        unit: &unit,
                                     },
                                 )
                                 .await;
@@ -2074,6 +2089,7 @@ async fn run_app_runtime_account_worker(
                                         media_http: &media_http,
                                         scheduled_convergence: &mut scheduled_convergence,
                                         recovery_runner: recovery_runner.as_mut(),
+                                        unit: &unit,
                                     },
                                 )
                                 .await;
@@ -2111,7 +2127,7 @@ async fn run_app_runtime_account_worker(
                 // have arrived while the normal command arm was fairness-gated.
                 if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
                 let retry = publish_next_local_submission(
-                    &mut client, &app, &shared, &events,
+                    &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
                 ).await;
                 local_submission_service_owed = false;
@@ -2133,6 +2149,7 @@ async fn run_app_runtime_account_worker(
                 ).boxed().shared();
                 let yield_observation = secondary_retry_yield.clone();
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerConvergence);
+                let _unit = unit.enter(WorkerUnit::Convergence);
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
                 // Mutations retain worker FIFO order; reads use the snapshot.
@@ -2466,7 +2483,7 @@ async fn run_app_runtime_account_worker(
                                                         }
                                                         AccountWorkerCommand::CaptureConversation { respond, queued, .. } => {
                                                             if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
-                                                            let _ = respond.send(Err(ConversationWindowError::NotReady));
+                                                            let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                                                         }
                                                         command => {
                                                             shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
@@ -2489,7 +2506,7 @@ async fn run_app_runtime_account_worker(
                                             }
                                             Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
                                                 if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
-                                                let _ = respond.send(Err(ConversationWindowError::NotReady));
+                                                let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                                             }
                                             // There is deliberately no engine
                                             // session during this backoff.
@@ -2685,7 +2702,7 @@ async fn run_app_runtime_account_worker(
                 if local_submission_due && (!local_submission_service_owed
                     || (pending.is_empty() && commands.is_empty())) => {
                 let retry = publish_next_local_submission(
-                    &mut client, &app, &shared, &events,
+                    &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
                 ).await;
                 local_submission_service_owed = false;
@@ -2754,6 +2771,7 @@ async fn run_app_runtime_account_worker(
                     continue 'worker;
                 }
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
+                let _unit = unit.enter(WorkerUnit::Maintenance);
                 // Each phase below is also timed on its own, so a profile can
                 // name the one an idle tick spends its time in (mdk#2923).
                 let telemetry = shared.observer.performance().clone();
@@ -3048,6 +3066,7 @@ struct AccountWorkerCatchUpContext<'a> {
     account_id_hex: &'a str,
     account_label: &'a str,
     shared: &'a RuntimeSharedServices,
+    unit: &'a WorkerUnitGauge,
 }
 
 async fn handle_account_worker_catch_up(
@@ -3057,6 +3076,7 @@ async fn handle_account_worker_catch_up(
     pending: &mut VecDeque<AccountWorkerCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
+    let _unit = context.unit.enter(WorkerUnit::CatchUp);
     let telemetry = context.shared.observer.performance().clone();
     let catch_up_observation = telemetry.observe(RuntimeOp::WorkerCatchUp);
     let snapshot_observation = telemetry.observe(RuntimeOp::WorkerSnapshot);
@@ -3123,7 +3143,7 @@ async fn handle_account_worker_catch_up(
                     let snapshot = read_snapshot
                         .as_ref()
                         .expect("snapshot availability checked above");
-                    let _ = respond.send(snapshot.members(&group_id));
+                    let _ = respond.send_with(|| snapshot.members(&group_id));
                 }
                 AccountWorkerCommand::MemberIdsPage { group_ids, respond }
                     if snapshot_reads_available =>
@@ -3131,7 +3151,7 @@ async fn handle_account_worker_catch_up(
                     let snapshot = read_snapshot
                         .as_ref()
                         .expect("snapshot availability checked above");
-                    let _ = respond.send(snapshot.member_ids_page(&group_ids));
+                    let _ = respond.send_with(|| snapshot.member_ids_page(&group_ids));
                 }
                 AccountWorkerCommand::CaptureConversation {
                     respond, queued, ..
@@ -3139,7 +3159,7 @@ async fn handle_account_worker_catch_up(
                     if let Some(queued) = queued {
                         queued.finish(TelemetryOutcome::NotReady);
                     }
-                    let _ = respond.send(Err(ConversationWindowError::NotReady));
+                    let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                 }
                 AccountWorkerCommand::GroupMlsState { group_id, respond }
                     if snapshot_reads_available =>
@@ -3147,7 +3167,7 @@ async fn handle_account_worker_catch_up(
                     let snapshot = read_snapshot
                         .as_ref()
                         .expect("snapshot availability checked above");
-                    let _ = respond.send(snapshot.group_mls_state(&group_id));
+                    let _ = respond.send_with(|| snapshot.group_mls_state(&group_id));
                 }
                 AccountWorkerCommand::GroupRoster { group_id, respond }
                     if snapshot_reads_available =>
@@ -3155,18 +3175,20 @@ async fn handle_account_worker_catch_up(
                     let snapshot = read_snapshot
                         .as_ref()
                         .expect("snapshot availability checked above");
-                    let _ = respond.send(group_roster_from_snapshot(
-                        context.app,
-                        context.account_label,
-                        snapshot,
-                        &group_id,
-                    ));
+                    let _ = respond.send_with(|| {
+                        group_roster_from_snapshot(
+                            context.app,
+                            context.account_label,
+                            snapshot,
+                            &group_id,
+                        )
+                    });
                 }
                 AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
                     let snapshot = read_snapshot
                         .as_ref()
                         .expect("snapshot availability checked above");
-                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                    let _ = respond.send_with(|| Ok(snapshot.quarantined_groups()));
                 }
                 AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
                     let _ = respond.send(Err(AppError::AccountWorkerBusy));
@@ -3672,7 +3694,7 @@ async fn handle_startup_hydration_command(
 ) {
     match command {
         AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => {
-            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+            let _ = respond.send_with(|| group_recovery_after_hydration(client, &group_id));
         }
         AccountWorkerCommand::ConfirmGroupRejoin {
             welcome_id,
@@ -3702,11 +3724,19 @@ async fn handle_startup_hydration_command(
             );
             let _ = respond.send(result);
         }
-        AccountWorkerCommand::Members { group_id, respond } => {
+        AccountWorkerCommand::Members {
+            group_id,
+            mut respond,
+        } => {
+            respond.dispatched();
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.members(&group_id));
         }
-        AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
+        AccountWorkerCommand::MemberIdsPage {
+            group_ids,
+            mut respond,
+        } => {
+            respond.dispatched();
             let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
         }
         AccountWorkerCommand::CaptureConversation {
@@ -3715,8 +3745,9 @@ async fn handle_startup_hydration_command(
             query,
             store_epoch,
             observer,
-            respond,
+            mut respond,
         } => {
+            respond.dispatched();
             if let Some(queued) = queued {
                 queued.finish(if respond.is_closed() {
                     TelemetryOutcome::Cancelled
@@ -3737,23 +3768,39 @@ async fn handle_startup_hydration_command(
                 let _ = respond.send(result);
             }
         }
-        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+        AccountWorkerCommand::GroupMlsState {
+            group_id,
+            mut respond,
+        } => {
+            respond.dispatched();
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_mls_state(&group_id));
         }
-        AccountWorkerCommand::GroupRoster { group_id, respond } => {
+        AccountWorkerCommand::GroupRoster {
+            group_id,
+            mut respond,
+        } => {
+            respond.dispatched();
             let _ = respond.send(group_roster_after_hydration(client, &group_id));
         }
-        AccountWorkerCommand::GroupPushDebugInfo { group_id, respond } => {
+        AccountWorkerCommand::GroupPushDebugInfo {
+            group_id,
+            mut respond,
+        } => {
+            respond.dispatched();
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_push_debug_info(&group_id));
         }
-        AccountWorkerCommand::AccountDevicesActivation { group_id, respond } => {
+        AccountWorkerCommand::AccountDevicesActivation {
+            group_id,
+            mut respond,
+        } => {
+            respond.dispatched();
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.account_devices_activation(&group_id));
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
-            let _ = respond.send(Ok(client.quarantined_groups()));
+            let _ = respond.send_with(|| Ok(client.quarantined_groups()));
         }
         AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => {
             // Invite confirmation is a projection-only mutation and does not
@@ -4553,7 +4600,7 @@ where
                 let snapshot = read_snapshot
                     .as_ref()
                     .expect("snapshot availability checked above");
-                let _ = respond.send(snapshot.members(&group_id));
+                let _ = respond.send_with(|| snapshot.members(&group_id));
             }
             AccountWorkerCommand::MemberIdsPage { group_ids, respond }
                 if snapshot_reads_available =>
@@ -4561,7 +4608,7 @@ where
                 let snapshot = read_snapshot
                     .as_ref()
                     .expect("snapshot availability checked above");
-                let _ = respond.send(snapshot.member_ids_page(&group_ids));
+                let _ = respond.send_with(|| snapshot.member_ids_page(&group_ids));
             }
             AccountWorkerCommand::CaptureConversation {
                 respond, queued, ..
@@ -4569,7 +4616,7 @@ where
                 if let Some(queued) = queued {
                     queued.finish(TelemetryOutcome::NotReady);
                 }
-                let _ = respond.send(Err(ConversationWindowError::NotReady));
+                let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
             }
             AccountWorkerCommand::GroupMlsState { group_id, respond }
                 if snapshot_reads_available =>
@@ -4577,24 +4624,21 @@ where
                 let snapshot = read_snapshot
                     .as_ref()
                     .expect("snapshot availability checked above");
-                let _ = respond.send(snapshot.group_mls_state(&group_id));
+                let _ = respond.send_with(|| snapshot.group_mls_state(&group_id));
             }
             AccountWorkerCommand::GroupRoster { group_id, respond } if snapshot_reads_available => {
                 let snapshot = read_snapshot
                     .as_ref()
                     .expect("snapshot availability checked above");
-                let _ = respond.send(group_roster_from_snapshot(
-                    app,
-                    account_label,
-                    snapshot,
-                    &group_id,
-                ));
+                let _ = respond.send_with(|| {
+                    group_roster_from_snapshot(app, account_label, snapshot, &group_id)
+                });
             }
             AccountWorkerCommand::QuarantinedGroups { respond } if snapshot_reads_available => {
                 let snapshot = read_snapshot
                     .as_ref()
                     .expect("snapshot availability checked above");
-                let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                let _ = respond.send_with(|| Ok(snapshot.quarantined_groups()));
             }
             AccountWorkerCommand::CatchUp { .. } => {
                 catch_up_seen = true;
@@ -4625,6 +4669,7 @@ struct AccountWorkerCommandContext<'a> {
     /// The account's recovery runner: explicit repair serves its turns while
     /// it waits on it.
     recovery_runner: Option<&'a mut SpawnedRunner>,
+    unit: &'a WorkerUnitGauge,
 }
 
 // Keep response ownership and error classification outside the large async dispatch
@@ -4633,13 +4678,13 @@ struct AccountWorkerCommandContext<'a> {
 fn respond_diagnosed<T>(
     shared: &RuntimeSharedServices,
     permit: Option<&crate::DiagnosticsPermit>,
-    respond: oneshot::Sender<Result<T, AppError>>,
+    respond: impl WorkerReply<Result<T, AppError>>,
     result: Result<T, AppError>,
 ) -> Result<(), Result<T, AppError>> {
     if let Err(error) = &result {
         shared.observer.product().storage_failure(permit, error);
     }
-    respond.send(result)
+    respond.send_reply(result)
 }
 
 /// Commands that arrived while a previous handler held `&mut client` stay in
@@ -4649,7 +4694,7 @@ fn respond_diagnosed<T>(
 /// `GroupReadSnapshot`; here they read the live session.
 async fn handle_account_worker_command(
     client: &mut AppClient,
-    command: AccountWorkerCommand,
+    mut command: AccountWorkerCommand,
     context: AccountWorkerCommandContext<'_>,
 ) {
     if (context.media_http.permits.is_closed()
@@ -4663,6 +4708,8 @@ async fn handle_account_worker_command(
     let events = context.events;
     let account_id_hex = context.account_id_hex;
     let account_label = context.account_label;
+    // A host read's wait on the worker ends here, before it runs.
+    command.read_dispatched();
     if account_worker_command_future(client, command, context).await {
         // One publication seam covers all successful dispatch completions. Early
         // admission failures and cancelled commands retain their previous behavior.
@@ -4690,6 +4737,7 @@ fn account_worker_command_future<'a>(
         media_http,
         scheduled_convergence,
         recovery_runner,
+        unit,
     } = context;
     let storage_permit = shared.observer.product().permit();
     match command {
@@ -4834,6 +4882,7 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::RepairFullHistory { respond } => Box::pin(async move {
+            let _unit = unit.enter(WorkerUnit::Repair);
             let sync_started_at = Instant::now();
             let read_snapshot = capture_group_read_snapshot(
                 client,
@@ -4914,6 +4963,7 @@ fn account_worker_command_future<'a>(
             mut options,
             respond,
         } => Box::pin(async move {
+            let create_unit = unit.enter(WorkerUnit::InviteOrCreate);
             let telemetry = shared.observer.performance().clone();
             telemetry.record(
                 AppPerformanceOperation::GroupCreateQueueWait,
@@ -5010,7 +5060,9 @@ fn account_worker_command_future<'a>(
                 response_handoff_started_at.elapsed(),
                 response_sent,
             );
+            drop(create_unit);
             if created {
+                let _unit = unit.enter(WorkerUnit::WelcomeFanout);
                 let read_snapshot = capture_group_read_snapshot(
                     client,
                     events,
@@ -5436,6 +5488,7 @@ fn account_worker_command_future<'a>(
             initial_admins,
             respond,
         } => Box::pin(async move {
+            let invite_unit = unit.enter(WorkerUnit::InviteOrCreate);
             let telemetry = shared.observer.performance().clone();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
@@ -5466,7 +5519,9 @@ fn account_worker_command_future<'a>(
                 );
             }
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            drop(invite_unit);
             if canonical {
+                let _unit = unit.enter(WorkerUnit::WelcomeFanout);
                 // Reply first so the inviter is not blocked on Welcome publish.
                 // Snapshot reads (members, MLS state, roster) are served from a
                 // post-commit snapshot while fanout owns the live client.
@@ -6149,6 +6204,7 @@ fn account_worker_command_future<'a>(
             attachments,
             respond,
         } => Box::pin(async move {
+            let _unit = unit.enter(WorkerUnit::Send);
             if let Some(queued) = queued {
                 queued.finish(TelemetryOutcome::Success);
             }
@@ -6202,6 +6258,7 @@ fn account_worker_command_future<'a>(
             payload,
             respond,
         } => Box::pin(async move {
+            let _unit = unit.enter(WorkerUnit::Send);
             send_message_on_worker(
                 client,
                 enqueued_at,
@@ -6224,6 +6281,7 @@ fn account_worker_command_future<'a>(
             intent,
             respond,
         } => Box::pin(async move {
+            let _unit = unit.enter(WorkerUnit::Send);
             let send_started_at = Instant::now();
             shared.observer.performance().record(
                 AppPerformanceOperation::OutboundMessageQueueWait,
@@ -6447,6 +6505,7 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => Box::pin(async move {
+            let _unit = unit.enter(WorkerUnit::Convergence);
             let result = client.retry_group_convergence(&group_id).await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
@@ -6747,6 +6806,7 @@ async fn publish_next_local_submission(
     client: &mut AppClient,
     app: &MarmotApp,
     shared: &RuntimeSharedServices,
+    unit: &WorkerUnitGauge,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
@@ -6776,6 +6836,7 @@ async fn publish_next_local_submission(
     if let Some(queued) = queued {
         queued.finish(shared.observer.performance());
     }
+    let _unit = unit.enter(WorkerUnit::Send);
     let execution = shared
         .observer
         .performance()
@@ -8270,6 +8331,7 @@ mod tests {
     #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;
     mod publication_progress_tests;
+    mod read_queue_tests;
     mod recovery_runner_host_tests;
     mod refused_subscription_send_tests;
     mod resource_bounds_tests;
@@ -8388,7 +8450,7 @@ mod tests {
         for available in [true, false] {
             let snapshot = available.then(|| client.group_read_snapshot().unwrap());
             let (commands, mut receiver) = mpsc::channel(8);
-            let (respond, response) = oneshot::channel();
+            let (respond, response) = ReadReply::unobserved();
             commands
                 .try_send(AccountWorkerCommand::CaptureConversation {
                     queued: None,
@@ -8443,7 +8505,7 @@ mod tests {
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
             .unwrap();
-        let (respond, read) = oneshot::channel();
+        let (respond, read) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
             .unwrap();
@@ -8505,7 +8567,7 @@ mod tests {
         commands
             .try_send(AccountWorkerCommand::Drain { respond })
             .unwrap();
-        let (respond, read) = oneshot::channel();
+        let (respond, read) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
             .unwrap();
@@ -8668,7 +8730,7 @@ mod tests {
             .set_next_scheduled_convergence_barrier(next_pass.clone());
         let mut responses = Vec::new();
         for _ in 0..8 {
-            let (respond, response) = oneshot::channel();
+            let (respond, response) = ReadReply::unobserved();
             commands
                 .try_send(AccountWorkerCommand::GroupRecoveryStatus {
                     group_id: first.clone(),
@@ -9318,6 +9380,7 @@ mod tests {
                 lifecycle: shared.lifecycle(),
                 shared: shared.clone(),
                 unlinked: oneshot::channel().0,
+                unit: Arc::default(),
             },
             commands.clone(),
             receiver,
@@ -9335,6 +9398,7 @@ mod tests {
                 commands: commands.clone(),
                 shutdown,
                 media_admission: admission.clone(),
+                unit: Default::default(),
             },
         );
         timeout(Duration::from_secs(5), readiness)
@@ -9346,7 +9410,7 @@ mod tests {
             .await
             .unwrap();
         // A snapshot reply proves every preceding command entered startup replay.
-        let (respond, snapshot) = oneshot::channel();
+        let (respond, snapshot) = ReadReply::unobserved();
         commands
             .send(AccountWorkerCommand::QuarantinedGroups { respond })
             .await

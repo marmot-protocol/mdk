@@ -27,8 +27,8 @@ cargo insta review
 `MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>` opened with `in_memory_for_test()`, which skips
 SQLCipher's per-allocation memory locking; `sqlite_storage.rs` keeps the encrypted file-backed backend on the same rail.
 
-Snapshot-guard source policy is defined in [`../src/snapshot_guard.rs`](../src/snapshot_guard.rs): ordinary `Drop`
-attempts release even after rollback failure.
+Snapshot-guard source policy is defined in [`../src/snapshot_guard.rs`](../src/snapshot_guard.rs): `Drop` releases
+after a failed restore unless a committing window had rewound, which keeps the snapshot for the next open (mdk#3272).
 
 **Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
 production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
@@ -233,8 +233,15 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open.
     `hydration_recovers_interrupted_candidate_branch_probe` preserves the recovery image and live work when restore is
     refused; `hydration_recovers_the_outermost_of_two_nested_interrupted_guards` refuses outer restoration when nested
-    cleanup fails, retaining both images and live work. Both fixtures check quarantine and successful public retry
-    after the private refusal is disarmed, plus a same-storage rebuild.
+    cleanup fails, retaining both images and live work. Both fixtures check the `RewindRestoreFailed` quarantine, a
+    refused public retry after the private refusal is disarmed, and recovery at a same-storage rebuild.
+    `hydration_quarantine/rewind_restore_fault.rs` owns mdk#3272: a committing window (pass, pass slice, sweep,
+    past-epoch peel) whose restore fails on `commit` or on `Drop` after an unwind quarantines the group for the session
+    as `RewindRestoreFailed`, announced once (reads, sends, the settle API, the pass and the sweep refused, retry and a
+    re-join refused, a stored rejoin offer hidden and its confirm refused, ingest retained whatever the anchor record reads, nothing committed), and the next open restores
+    the live image and replays the input; a failed rewind and a failed contained restore leave the group live. After a
+    failed restore or a crash inside a committing window, an engine reopened without hydration ingests and answers a
+    Welcome on live state, not on an anchor record that reads removed.
 
 - **File:** `two_phase_hydration.rs`
   - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`

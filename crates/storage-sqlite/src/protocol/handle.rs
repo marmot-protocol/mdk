@@ -155,6 +155,26 @@ impl SqliteAccountStorage {
         self.connection.set_timing_observer(observer);
     }
 
+    /// Run `fault` before every snapshot restore on this database: a rewind
+    /// onto a retained anchor, a rewind guard's restore of the live state it
+    /// captured, and open-time recovery. It receives the group, the snapshot
+    /// name and whether the restore runs inside an open transaction; an error
+    /// it returns fails that restore before anything is written, and it may
+    /// panic. `None` removes it. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_snapshot_restores_for_test(&self, fault: Option<crate::SnapshotFault>) {
+        self.connection.set_snapshot_restore_fault(fault);
+    }
+
+    /// Run `fault` before every snapshot release on this database, as
+    /// [`Self::fail_snapshot_restores_for_test`] does before every restore.
+    /// An error it returns fails that release, leaving the snapshot in place.
+    /// `None` removes it. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_snapshot_releases_for_test(&self, fault: Option<crate::SnapshotFault>) {
+        self.connection.set_snapshot_release_fault(fault);
+    }
+
     /// Install a SQLite statement/row trace for dependent-crate regression tests.
     /// SQL and row identities must never be logged by production code.
     #[cfg(any(test, feature = "test-support"))]

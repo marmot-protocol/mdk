@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::account_worker::ManagedAccountWorker;
+use crate::runtime::account_worker::{ManagedAccountWorker, ReadReply};
 use marmot_account::AccountHome;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
@@ -118,6 +118,7 @@ impl Fixture {
                 commands,
                 media_admission: Arc::new(Semaphore::new(1)),
                 shutdown,
+                unit: Default::default(),
             },
         );
         let f = Self {
@@ -1141,7 +1142,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
         );
     }
     let capture = || {
-        let (respond, response) = oneshot::channel();
+        let (respond, response) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::CaptureConversation {
                 queued: None,
@@ -1558,7 +1559,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
         .chat_presentation_version()
         .unwrap()
         .store_epoch;
-    let (respond, response) = oneshot::channel();
+    let (respond, response) = ReadReply::unobserved();
     worker
         .send(AccountWorkerCommand::CaptureConversation {
             queued: None,
@@ -1586,7 +1587,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
         account_id: f.account.clone(),
         group: f.group.clone(),
         store_epoch: epoch,
-        worker: watch::channel(Some(Ok(worker))).1,
+        worker: watch::channel(Some(Ok(worker.into()))).1,
         send_capture: capture,
     };
     let sources = Sources {
@@ -1790,6 +1791,7 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
             commands,
             shutdown,
             media_admission: Arc::new(Semaphore::new(1)),
+            unit: Default::default(),
         },
     );
     let mut sub = f
@@ -2065,7 +2067,7 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
                 .unwrap()
                 .store_epoch;
             f.draft("checkpoint composer");
-            let (respond, response) = oneshot::channel();
+            let (respond, response) = ReadReply::unobserved();
             worker
                 .send(AccountWorkerCommand::CaptureConversation {
                     queued: None,
@@ -2096,7 +2098,7 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
                 account_id: f.account.clone(),
                 group: f.group.clone(),
                 store_epoch: epoch,
-                worker: watch::channel(Some(Ok(worker))).1,
+                worker: watch::channel(Some(Ok(worker.into()))).1,
                 send_capture: capture.clone(),
             };
             let sources = Sources {
@@ -2423,7 +2425,7 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         .unwrap()
         .store_epoch;
     f.add(99);
-    let (respond, response) = oneshot::channel();
+    let (respond, response) = ReadReply::unobserved();
     worker
         .send(AccountWorkerCommand::CaptureConversation {
             queued: None,
@@ -2480,7 +2482,7 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         account_id: f.account.clone(),
         group: f.group.clone(),
         store_epoch: epoch,
-        worker: watch::channel(Some(Ok(worker))).1,
+        worker: watch::channel(Some(Ok(worker.into()))).1,
         send_capture: capture.clone(),
     };
     let sources = Sources {

@@ -438,7 +438,7 @@ impl<S: StorageProvider> Engine<S> {
         device_key_hash: &[u8; 32],
     ) -> Result<GroupRecoverySource, EngineError> {
         self.ensure_group_live(group_id)?;
-        let record = self.storage.get_group(group_id)?;
+        let record = self.live_group_record(group_id)?;
         if record.is_terminal() {
             return Err(EngineError::NotAMember {
                 group_id: group_id.clone(),
@@ -620,7 +620,7 @@ impl<S: StorageProvider> Engine<S> {
         let group = openmls::group::MlsGroup::load(provider.storage(), &mls_gid)
             .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        let record = self.storage.get_group(group_id)?;
+        let record = self.live_group_record(group_id)?;
         let mut required = record.required_capabilities.clone();
         crate::capability_manager::merge_capabilities(
             &mut required,
@@ -645,7 +645,7 @@ impl<S: StorageProvider> Engine<S> {
         use cgka_traits::group_recovery::{GroupRecoveryBody, group_recovery_grant_bytes};
         use openmls_traits::signatures::Signer as _;
         self.ensure_group_live(group_id)?;
-        let record = self.storage.get_group(group_id)?;
+        let record = self.live_group_record(group_id)?;
         if record.is_terminal() {
             return Err(EngineError::NotAMember {
                 group_id: group_id.clone(),
@@ -733,6 +733,8 @@ impl<S: StorageProvider> Engine<S> {
 /// Compensate an evolution whose exact bytes have never left the engine.
 /// Hydration may call this only for Preparing; a live send guard also owns a
 /// Prepared row until the pending handle is handed to its caller.
+// Pending-commit recovery: hydration and the pending-commit guard roll a recovery stage back before the group is live (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn rollback_recovery_stage<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,

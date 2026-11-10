@@ -9,6 +9,9 @@
 //! - Validation: empty intent (no fields) errors with `EngineError::Other`.
 //! - State guard: not allowed during PendingPublish.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::DEFAULT_CIPHERSUITE;
 use cgka_engine::canonicalization::{

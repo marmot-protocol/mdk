@@ -1,5 +1,8 @@
 //! Engine integration for stored-message distributed convergence.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, ConvergenceStatus, DeferredMessageReason,

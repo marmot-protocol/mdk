@@ -417,7 +417,23 @@ struct SharedConnectionInner {
     /// Unique to this opened handle within the process, never reused: what
     /// state derived from this database's data is keyed to (mdk#2923).
     serial: u64,
+    /// See [`SharedConnection::set_snapshot_restore_fault`].
+    #[cfg(any(test, feature = "test-support"))]
+    snapshot_restore_fault: Mutex<Option<SnapshotFault>>,
+    /// See [`SharedConnection::set_snapshot_release_fault`].
+    #[cfg(any(test, feature = "test-support"))]
+    snapshot_release_fault: Mutex<Option<SnapshotFault>>,
 }
+
+/// Test support: run before every snapshot restore or release on a database,
+/// with the group, the snapshot name, and whether the operation runs inside an
+/// open transaction. An error it returns fails that operation before it writes
+/// anything; it may also panic. See
+/// [`crate::SqliteAccountStorage::fail_snapshot_restores_for_test`] and
+/// [`crate::SqliteAccountStorage::fail_snapshot_releases_for_test`].
+#[cfg(any(test, feature = "test-support"))]
+pub type SnapshotFault =
+    Arc<dyn Fn(&cgka_traits::types::GroupId, &str, bool) -> StorageResult<()> + Send + Sync>;
 
 impl fmt::Debug for SharedConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -442,6 +458,10 @@ impl SharedConnection {
                 openmls_writes: AtomicU64::new(0),
                 wal_truncate_pending: AtomicBool::new(false),
                 serial: NEXT_CONNECTION_SERIAL.fetch_add(1, Ordering::Relaxed),
+                #[cfg(any(test, feature = "test-support"))]
+                snapshot_restore_fault: Mutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                snapshot_release_fault: Mutex::new(None),
             }),
         }
     }
@@ -591,6 +611,60 @@ impl SharedConnection {
 
     pub(crate) fn openmls_write_generation(&self) -> u64 {
         self.inner.openmls_writes.load(Ordering::Relaxed)
+    }
+
+    /// Install or remove the test fault every snapshot restore runs first.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_snapshot_restore_fault(&self, fault: Option<SnapshotFault>) {
+        *self
+            .inner
+            .snapshot_restore_fault
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = fault;
+    }
+
+    /// Install or remove the test fault every snapshot release runs first.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_snapshot_release_fault(&self, fault: Option<SnapshotFault>) {
+        *self
+            .inner
+            .snapshot_release_fault
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = fault;
+    }
+
+    /// Run the installed test fault, if any, for a restore of `name`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn snapshot_restore_fault(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+        name: &str,
+    ) -> StorageResult<()> {
+        self.run_snapshot_fault(&self.inner.snapshot_restore_fault, group_id, name)
+    }
+
+    /// Run the installed test fault, if any, for a release of `name`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn snapshot_release_fault(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+        name: &str,
+    ) -> StorageResult<()> {
+        self.run_snapshot_fault(&self.inner.snapshot_release_fault, group_id, name)
+    }
+
+    /// The lock is released first, so the fault may panic or install another.
+    #[cfg(any(test, feature = "test-support"))]
+    fn run_snapshot_fault(
+        &self,
+        slot: &Mutex<Option<SnapshotFault>>,
+        group_id: &cgka_traits::types::GroupId,
+        name: &str,
+    ) -> StorageResult<()> {
+        let fault = slot.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        fault.map_or(Ok(()), |fault| {
+            fault(group_id, name, self.is_current_thread_transaction_owner())
+        })
     }
 
     pub(crate) fn is_current_thread_transaction_owner(&self) -> bool {

@@ -13,6 +13,9 @@
 //! publish-failed), re-derive the Marmot record, and surface a typed
 //! `GroupEvent::PendingCommitRecovered` so the app can resync.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;

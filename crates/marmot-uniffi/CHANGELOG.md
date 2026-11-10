@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `AppGroupHydrationQuarantineReasonFfi` adds `REWIND_RESTORE_FAILED` (Swift `.rewindRestoreFailed`), reported by the
+  quarantined-groups read (mdk#3272): a read of past group state could not restore the live group. Neither a retry
+  nor a re-join clears it, and the next account open restores the live state. Kotlin `when` and Swift `switch`
+  statements that cover every case must add it. Use the matching native library with regenerated bindings.
+
 ### Added
 
 - `MarmotDeploymentFfi` adds `relay_event_limits: [RelayEventLimitFfi]`, empty by default in Swift and Kotlin: the

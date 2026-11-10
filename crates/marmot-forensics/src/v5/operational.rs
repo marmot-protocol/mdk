@@ -405,6 +405,7 @@ fn safe_failure_category(input: &str) -> String {
         | "member_validation_failed"
         | "group_record_load_failed"
         | "pending_commit_recovery_failed"
+        | "rewind_restore_failed"
         | "founding_welcome_persisted"
         | "founding_create"
         | "superseded_by_replacement_welcome"

@@ -194,7 +194,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<MembershipSnapshot, EngineError> {
-        let removed = self.storage.get_group(group_id)?.removed;
+        let removed = self.live_group_record(group_id)?.removed;
         self.with_mls_group(group_id, |group| {
             Ok(MembershipSnapshot::capture(
                 group,
@@ -229,7 +229,7 @@ impl<S: StorageProvider> Engine<S> {
         before: &MembershipSnapshot,
         after: &MembershipSnapshot,
     ) -> Result<CanonicalMembershipEffects, EngineError> {
-        let mut record = storage.get_group(group_id)?;
+        let mut record = self.live_group_record_in(storage, group_id)?;
         let mut events = Vec::new();
         if let Some(event) = before.departed_leaf_event(after, group_id, record.epoch) {
             events.push(event);
@@ -280,6 +280,8 @@ impl<S: StorageProvider> Engine<S> {
 }
 
 #[cfg(test)]
+// Tests read stored records directly (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::distributed_convergence::tests::test_engine;

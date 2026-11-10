@@ -3,6 +3,9 @@
 //! flood cap on retained `PeelDeferred` rows, and post-peel pre-membership
 //! classification against `Group::join_epoch`.
 
+// Tests read stored records directly (see the crate clippy.toml).
+#![allow(clippy::disallowed_methods)]
+
 use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;

@@ -1,7 +1,7 @@
 ---
 title: "Conversation readiness and runtime latency telemetry"
 created: 2026-09-18
-updated: 2026-11-08
+updated: 2026-11-10
 status: implementation
 tags: [marmot, runtime, telemetry, performance]
 ---
@@ -71,6 +71,8 @@ Names below omit `app_runtime_` and the suffix. Durations nest and overlap: **do
 | `send_queue` | Channel admission start to worker execution; includes admission wait, excludes worker acquisition |
 | `send_execution` | Worker-side direct/draft send through completion of publication and projection work |
 | `worker_acquire` | General worker lookup/reconciliation, across callers |
+| `read_queue_r1` … `read_queue_r9` | One per [host read class](#host-read-classes): a host read's wait on its account worker, from just before channel admission until the worker takes it up, answers it from a snapshot, or answers `not_ready` because the current phase cannot serve it. Includes waiting for a channel slot; excludes worker acquisition and the read's own work. A read dropped unanswered, or whose caller has gone when the worker takes it up, ends as cancelled |
+| `read_queue_behind_startup_sync`, `read_queue_behind_catch_up`, `read_queue_behind_convergence`, `read_queue_behind_welcome_fanout`, `read_queue_behind_repair`, `read_queue_behind_send`, `read_queue_behind_invite_or_create`, `read_queue_behind_maintenance` | The same wait recorded again for a read that arrived while its worker was inside that unit: startup sync, an explicit catch-up, a convergence pass (scheduled or retried), a Welcome fanout, a full-history repair, a send awaiting its relays, a create or invite including KeyPackage resolution, a periodic maintenance tick. The unit is sampled once, when the read is created, and is the innermost one: a fanout inside a create counts as the fanout |
 | `lifecycle_lock_wait` | Wait for the account manager's lifecycle transaction lock |
 | `account_startup`, `worker_reopen` | Initial/reconnect runtime client open; existing account stage metrics provide additional subdivision |
 | `account_startup_retry_suppressed` | Zero-duration completed-only `not_ready` count for each eligible account whose trigger was deferred by the worker-start cooldown |
@@ -150,6 +152,33 @@ failure text. An expired ready-wait names its startup stage in the reconcile err
 local projection, publication and caller-response metrics now also cover draft sends. Compare
 build cohorts separately: increased outbound sample coverage is not itself a performance regression.
 Publication success retains the existing required-ack semantics, not recipient delivery semantics.
+
+### Host read classes
+
+The `read_queue_r<n>` series follow the read classes of the read-path plan (mdk#3273), sorted
+by what a read needs from the account worker. Reads are named by their `AccountManager` method.
+
+| Class | Reads |
+| --- | --- |
+| R1, prepared group images | `prepared_group_image_status`, `prepared_group_images` |
+| R2, device-group history | `chat_history_imports`, `started_fresh`, `history_import_provenance` |
+| R3, durable engine facts | `group_members`, `group_member_ids_page`, `group_conversation_snapshot`, `quarantined_groups`, `group_commit_delivery`, `pending_welcome_deliveries`, `key_package_maintenance_status` and its diagnostic form, `durably_owned_key_packages`, `maintenance_status`, `periodic_maintenance_policy` |
+| R4, facts that need a hydrated group | `group_mls_state` and its diagnostic form, `account_devices_activation`, `group_app_component`, `group_push_debug_info`, the conversation window's authority capture |
+| R5, exporter secrets | `exporter_secret`, `safe_export_secret` |
+| R6, device roster | `linked_devices`, `key_package_refresh_overdue`, `unrecognized_sign_ins`, `compromise_warning`, `removed_device_leftover_chats`, `chats_closed_to_linked_devices`, `backup_history_availability`, `backup_settings` |
+| R7, backup restore | `backup_restore_status`, `watch_backup_restore` |
+| R8, media imeta tag | `build_media_imeta_tag` |
+| R9, recovery state | `group_recovery_status`, `history_notices`, `account_recovery_status` |
+
+Startup sync, an explicit catch-up, a scheduled convergence pass, a full-history repair and a
+Welcome fanout answer the members, member-id page, MLS state, roster and quarantine reads from
+the snapshot they took when they started, and answer the authority capture `not_ready`; every
+other read waits until the unit ends. The other units take no command at all: a send awaiting
+its relays, a host-requested convergence retry, a create or invite until its Welcome fanout, and
+a maintenance tick. While one runs, the account's eight-slot lane fills and later reads wait for
+a slot. `read_queue_behind_convergence` therefore mixes scheduled passes, which answer those five
+reads, with retries, which answer none. `src/runtime/account_worker/tests/read_queue_tests.rs` in
+`marmot-app` pins this for startup sync, a catch-up, a scheduled pass and a send.
 
 ### Reading account startup stages
 

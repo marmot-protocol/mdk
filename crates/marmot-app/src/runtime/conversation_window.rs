@@ -1,6 +1,6 @@
 //! Local-first bounded windows with optional coherent live-authority capture.
 //! Account-owned fields share a read boundary; directory enrichment is separate.
-use super::account_worker::AccountWorkerCommand;
+use super::account_worker::{AccountWorkerCommand, ReadClass, WorkerLane};
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
 use super::{AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
 use crate::RuntimePerformanceOperation as RuntimeOp;
@@ -550,8 +550,7 @@ struct Command {
     action: Action,
     reply: oneshot::Sender<Result<ConversationWindowSnapshot, ConversationWindowError>>,
 }
-type WorkerConnection =
-    watch::Receiver<Option<Result<mpsc::Sender<AccountWorkerCommand>, ConversationWindowError>>>;
+type WorkerConnection = watch::Receiver<Option<Result<WorkerLane, ConversationWindowError>>>;
 
 // This future is joined with the window actor, not polled under its display
 // timeout. Every admitted reconcile runs to completion, even if the window
@@ -560,9 +559,7 @@ async fn acquire_worker(
     accounts: AccountManager,
     label: String,
     account_id: String,
-    ready: watch::Sender<
-        Option<Result<mpsc::Sender<AccountWorkerCommand>, ConversationWindowError>>,
-    >,
+    ready: watch::Sender<Option<Result<WorkerLane, ConversationWindowError>>>,
 ) {
     while !ready.is_closed() {
         let observation = accounts
@@ -580,7 +577,7 @@ async fn acquire_worker(
             if account.signed_out {
                 return Err(ConversationWindowError::Closed);
             }
-            accounts.worker_commands(&label).await.map_err(Into::into)
+            accounts.worker_lane(&label).await.map_err(Into::into)
         }
         .await;
         observation.finish(telemetry_outcome(&result));
@@ -641,7 +638,7 @@ impl Reader {
             Some(Err(error)) if error.terminal() => return Err(error.clone()),
             _ => return Err(ConversationWindowError::NotReady),
         };
-        if worker.is_closed() {
+        if worker.commands.is_closed() {
             return Err(ConversationWindowError::Closed);
         }
         self.send_capture.set_query(query);
@@ -649,9 +646,10 @@ impl Reader {
         if allow_checkpoint && let Some((captured, generation)) = self.send_capture.checkpoint() {
             return Ok((captured, Some(generation)));
         }
-        let (respond, rx) = oneshot::channel();
+        let (respond, rx) = worker.read_reply(&self.telemetry, ReadClass::R4);
         let capture = async {
             worker
+                .commands
                 .send(AccountWorkerCommand::CaptureConversation {
                     queued: Some(self.telemetry.observe(RuntimeOp::ConversationCaptureQueue)),
                     group_id: self.group.clone(),
@@ -670,7 +668,7 @@ impl Reader {
                 biased;
                 result = &mut capture => return result.map(|captured| (captured, None)),
                 _ = changed.changed(), if allow_checkpoint => {
-                    if worker.is_closed() { return Err(ConversationWindowError::Closed); }
+                    if worker.commands.is_closed() { return Err(ConversationWindowError::Closed); }
                     if let Some((captured, generation)) = self.send_capture.checkpoint() { return Ok((captured, Some(generation))); }
                 }
             }

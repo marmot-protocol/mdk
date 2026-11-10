@@ -107,6 +107,13 @@ impl StorageProvider for SqliteAccountStorage {
         cgka_traits::storage::MessageStorage::rollback_group_state_to_snapshot(self, group_id, name)
     }
 
+    fn list_snapshots_with_prefixes(
+        &self,
+        prefixes: &[&str],
+    ) -> StorageResult<Vec<(cgka_traits::types::GroupId, String)>> {
+        crate::protocol::storage::snapshots::list_with_prefixes(self, prefixes)
+    }
+
     fn backend(&self) -> Backend {
         Backend::Sqlite
     }
