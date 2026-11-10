@@ -7335,6 +7335,138 @@ async fn the_size_preflight_counts_every_relay_a_publish_can_reach() {
     assert!(client.sent_to.lock().unwrap().is_empty());
 }
 
+/// mdk#2334: the size preflight judges exactly the relays publish reaches,
+/// sending the event or refusing it over a known limit. Requests take the
+/// shapes the session sends: a group event one relay per request
+/// (`drive_outbound_fanout`), and a Welcome first to its whole inbox list
+/// (`prepare_legacy_publish`), then one relay per request on retry
+/// (`finish_transport_fanout`).
+#[tokio::test]
+async fn the_size_preflight_judges_the_relays_publish_reaches() {
+    let relay = |url: &str| TransportEndpoint(url.into());
+    let over = relay("wss://over.example");
+    let fits = relay("wss://fits.example");
+    let unknown = relay("wss://unknown.example");
+    let unsafe_relay = relay("ws://plaintext.example");
+    let inbox_relays: Vec<_> = (0..17)
+        .map(|n| relay(&format!("wss://inbox-{n}.example")))
+        .collect();
+    let client = Arc::new(SizeRefusingClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = relay_plane
+        .account_adapter(account.clone(), client.clone())
+        .with_event_limits(Arc::new(KnownLimits(vec![
+            (over.clone(), 100),
+            (fits.clone(), usize::MAX),
+            (inbox_relays[0].clone(), 100),
+        ])));
+
+    let transport_group_id = vec![0xD4; 32];
+    let group_message = group_event("44", &transport_group_id)
+        .to_transport_message()
+        .unwrap();
+    let group = TransportPublishTarget::Group {
+        group_id: GroupId::new(vec![0xC3; 16]),
+        transport_group_id,
+        endpoints: vec![over, unsafe_relay.clone(), fits, unknown],
+    };
+    let welcome_message = welcome_message();
+    let TransportEnvelope::Welcome { recipient } = welcome_message.envelope.clone() else {
+        panic!("a gift wrap is a Welcome");
+    };
+    let inbox = TransportPublishTarget::Inbox {
+        recipient,
+        endpoints: [vec![unsafe_relay], inbox_relays].concat(),
+    };
+
+    let one_per_relay = |target: &TransportPublishTarget| {
+        target
+            .endpoints()
+            .iter()
+            .map(|endpoint| vec![endpoint.clone()])
+            .collect::<Vec<_>>()
+    };
+    let group_requests = one_per_relay(&group);
+    let welcome_requests = [vec![inbox.endpoints().to_vec()], one_per_relay(&inbox)].concat();
+    for (message, target, requests) in [
+        (group_message, group, group_requests),
+        (welcome_message, inbox, welcome_requests),
+    ] {
+        client.sent_to.lock().unwrap().clear();
+        let mut reached = Vec::new();
+        for endpoints in requests {
+            let result = adapter
+                .publish(TransportPublishRequest {
+                    account_id: account.clone(),
+                    message: message.clone(),
+                    target: with_endpoints(&target, endpoints),
+                    required_acks: 1,
+                })
+                .await;
+            let failures = match &result {
+                Ok(report) => report.failed.clone(),
+                Err(error) => error.publish_endpoint_failures().to_vec(),
+            };
+            reached.extend(
+                failures
+                    .into_iter()
+                    .filter(|failure| {
+                        failure.reason == TransportEndpointFailure::OVER_KNOWN_LIMIT_REASON
+                    })
+                    .map(|failure| failure.endpoint),
+            );
+        }
+        reached.append(&mut client.sent_to.lock().unwrap());
+        reached.sort();
+        reached.dedup();
+        let mut judged = adapter
+            .relay_plane
+            .inner
+            .relay_safety
+            .reachable_publish_endpoints(&target);
+        judged.sort();
+        assert_eq!(judged, reached, "{target:?}");
+    }
+}
+
+/// `target` with `endpoints` in place of its own.
+fn with_endpoints(
+    target: &TransportPublishTarget,
+    endpoints: Vec<TransportEndpoint>,
+) -> TransportPublishTarget {
+    match target {
+        TransportPublishTarget::Group {
+            group_id,
+            transport_group_id,
+            ..
+        } => TransportPublishTarget::Group {
+            group_id: group_id.clone(),
+            transport_group_id: transport_group_id.clone(),
+            endpoints,
+        },
+        TransportPublishTarget::Inbox { recipient, .. } => TransportPublishTarget::Inbox {
+            recipient: recipient.clone(),
+            endpoints,
+        },
+    }
+}
+
+/// A Welcome's gift wrap to a fresh recipient, as a transport message.
+fn welcome_message() -> TransportMessage {
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+
+    let recipient = Keys::parse(&"33".repeat(32)).unwrap().public_key();
+    let signed = EventBuilder::new(Kind::GiftWrap, "sealed welcome")
+        .tags([Tag::public_key(recipient)])
+        .finalize(&Keys::parse(&"11".repeat(32)).unwrap())
+        .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed)
+        .unwrap()
+        .to_transport_message()
+        .unwrap()
+}
+
 /// A refused relay joins the result of the relays the event was sent to. A
 /// refusal mixed with relay size answers still proves size, but not once any
 /// relay accepted the event.

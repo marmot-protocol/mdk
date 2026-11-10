@@ -4568,15 +4568,13 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     ) -> Option<cgka_traits::EventSizeClass> {
         // An unreadable payload is refused by `publish` itself.
         let event = NostrTransportEvent::from_transport_message(message).ok()?;
-        // Only the endpoints a publish can reach count. A group fanout, and
-        // every Welcome retry, publishes to one endpoint per request, so each
-        // safe endpoint counts with no route-count cap, and an unsafe one is
-        // never sent to.
+        // Judge the endpoints `publish` can reach, by the rule it applies to
+        // each request, and refuse them by the limits it applies.
         let endpoints = self
             .relay_plane
             .inner
             .relay_safety
-            .retain_safe_endpoints(target.endpoints().to_vec(), "size preflight");
+            .reachable_publish_endpoints(target);
         let (_, refused) = self
             .refuse_over_known_limits(&endpoints, event_json_bytes(&event))
             .await;

@@ -149,7 +149,18 @@ impl RelaySafetyPolicy {
         &self,
         mut request: TransportPublishRequest,
     ) -> Result<TransportPublishRequest, String> {
-        match &mut request.target {
+        request.target = self.sanitize_publish_target(request.target)?;
+        Ok(request)
+    }
+
+    /// The endpoints one publish request to `target` may send to, or why it
+    /// may send to none. Every publish request passes here, and so does the
+    /// size preflight, through [`Self::reachable_publish_endpoints`].
+    fn sanitize_publish_target(
+        &self,
+        mut target: TransportPublishTarget,
+    ) -> Result<TransportPublishTarget, String> {
+        match &mut target {
             TransportPublishTarget::Group { endpoints, .. } => {
                 *endpoints =
                     self.usable_group_endpoints(std::mem::take(endpoints), "group publish");
@@ -161,7 +172,47 @@ impl RelaySafetyPolicy {
                 *endpoints = self.sanitize_endpoints(endpoints.clone(), "inbox publish")?;
             }
         }
-        Ok(request)
+        Ok(target)
+    }
+
+    /// Every endpoint of `target` that some publish request to it can send to.
+    ///
+    /// The session publishes a group event one endpoint per request, and
+    /// retries a Welcome the same way after its first request for the whole
+    /// inbox list. So this is each endpoint a one-endpoint request keeps. A
+    /// request for several endpoints reaches no other: sanitizing a list only
+    /// drops endpoints, caps them, or refuses the list.
+    pub(crate) fn reachable_publish_endpoints(
+        &self,
+        target: &TransportPublishTarget,
+    ) -> Vec<TransportEndpoint> {
+        let mut reachable: Vec<TransportEndpoint> = Vec::new();
+        for endpoint in target.endpoints() {
+            let one = match target {
+                TransportPublishTarget::Group {
+                    group_id,
+                    transport_group_id,
+                    ..
+                } => TransportPublishTarget::Group {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![endpoint.clone()],
+                },
+                TransportPublishTarget::Inbox { recipient, .. } => TransportPublishTarget::Inbox {
+                    recipient: recipient.clone(),
+                    endpoints: vec![endpoint.clone()],
+                },
+            };
+            let Ok(one) = self.sanitize_publish_target(one) else {
+                continue;
+            };
+            for endpoint in one.endpoints() {
+                if !reachable.contains(endpoint) {
+                    reachable.push(endpoint.clone());
+                }
+            }
+        }
+        reachable
     }
 
     /// Keep the endpoints that pass the host-safety rule and drop the rest.
