@@ -77,6 +77,7 @@ UI. The offline `uri` accessor alone does not install a listener. An interrupted
 unpaired offer gets a fresh secret; display the replacement offer, not the old QR.
 Only relays with acknowledged listeners appear in the returned offer; an offline
 configured relay does not prevent pairing through a ready relay.
+Later offers retry the configured endpoints rather than permanently dropping them.
 
 For a bunker URI, call `connect` directly. Both paths verify `get_public_key`
 and pin the user key separately from the remote signer and communication keys.
@@ -84,8 +85,12 @@ and pin the user key separately from the remote signer and communication keys.
 before account setup asks for signatures. `nip46_register` attaches an imported
 session to an existing account. Only one communication key can own an account,
 and a bound communication key cannot be imported into another session.
-A failed login releases a binding created by that attempt, without discarding
-the in-memory pairing needed for retry. Already attached sessions remain bound.
+Before setup commits, a failed handoff restores the prior callback and stored
+grant record; only credentials created by that attempt are removed.
+Already-attached sessions remain bound. For an active account without a prior
+callback, possibly exposed publication retains its pairing for restart retry.
+Journal cleanup errors do not revoke a network-ready account.
+Account setup transactions share the app's signer-registry scope across runtime handles.
 
 MDK stores the communication secret through `AccountSecretStore` under
 `.nip46-client/<account label>`, with a separate SHA-256-derived credential id.
@@ -94,7 +99,8 @@ and the approved permission snapshot, never the secret or one-use bunker token.
 The communication key, SQLCipher credential, and user's signing key are distinct.
 A crash before the first secret-store write can leave metadata without a key.
 Restoration reports the missing key; explicit approved pairing can repair that
-state after the secret store confirms absence. An existing key is never overwritten.
+state after a credential load confirms absence. An unavailable or malformed key
+does not permit repair. An existing key is never overwritten.
 
 Runtime startup restores each stored session before reconciling account workers.
 Restoration is local; later signer work reconnects with a 90-second request
@@ -139,11 +145,14 @@ remote result. Account sign-out, session removal, and wipe erase the key without
 requiring the signer; encrypted history and its database credential remain on
 reversible sign-out. `shutdown_and_close` cancels actors but preserves stored
 sessions. Delete any host-owned credential backups on logout too.
+If vault deletion fails, signing stays stopped and cleanup ownership remains
+retryable. Retry local erasure or `nip46_remove` after the vault recovers; pending
+removal cannot restore or authorize a signer.
 
 Generic host-callback/NIP-55 sign-out does not query the NIP-46 credential
 namespace when no session record exists; generic account wipe follows the same rule.
-Explicit NIP-46 removal also probes for
-an orphaned communication key if its metadata was lost.
+Explicit NIP-46 removal also revokes an orphaned communication key if its metadata
+was lost, retaining a removal intent when vault deletion fails.
 
 Every signer relay passes the shared retired-relay and endpoint policy and uses
 the configured process proxy. It retains the documented

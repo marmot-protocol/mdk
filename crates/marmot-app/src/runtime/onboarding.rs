@@ -1065,7 +1065,7 @@ fn decode_onboarding_checkpoint(
 impl AccountManager {
     pub(super) fn onboarding_transaction(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self
-            .setup
+            .app
             .onboarding_transactions
             .lock()
             .unwrap_or_else(|p| p.into_inner());

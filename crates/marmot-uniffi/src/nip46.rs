@@ -234,6 +234,8 @@ impl Nip46SessionFfi {
     }
 
     /// Attempt bounded remote logout and erase local communication credentials.
+    /// A vault deletion error stops signing but retains cleanup ownership;
+    /// retry logout or account-level removal after the vault recovers.
     #[marmot_uniffi_macros::survives_cancellation]
     pub async fn logout(&self) -> Result<(), Nip46ErrorFfi> {
         let session = self.inner.clone();

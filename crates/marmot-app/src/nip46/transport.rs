@@ -138,12 +138,10 @@ impl Transport {
             .unsubscribe(&id)
             .await
             .map_err(|_| Nip46Error::Unavailable)?;
-        self.configure(&relays, client).await?;
         let mut data = lock(&shared.data);
         Shared::check(&data, context.generation)?;
-        data.relays = relays;
         data.status.state = Nip46State::Listening;
-        protocol::uri(&data)
+        protocol::uri(&data, &relays)
     }
     async fn next(
         &mut self,

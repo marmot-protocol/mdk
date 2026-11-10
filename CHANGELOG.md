@@ -33,7 +33,10 @@
   Sign-out and wipe erase communication keys; host NIP-55 callbacks and local
   signing accounts keep their existing APIs.
   Freeing a C handle preserves the runtime-owned signer. Logout detaches the
-  revoked signer for fresh pairing; failed login releases only its new binding.
+  revoked signer after credential erasure; storage failures retain stopped,
+  retryable cleanup ownership. Setup rollback restores prior callbacks and
+  grant records while publication retries retain their paired credentials.
+  Post-commit journal cleanup failures do not revoke a ready account.
   Explicit pairing can repair metadata-only interrupted credential writes.
 
 ## 0.16.0 - 2026-11-11

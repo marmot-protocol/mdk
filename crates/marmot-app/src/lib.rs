@@ -575,6 +575,8 @@ pub struct MarmotApp {
     /// it counts against the same App Group suspension rule as the databases
     /// (see [`Self::close_storage`]).
     root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
+    /// Account setup and signer handoff share one guard across runtime handles.
+    onboarding_transactions: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     /// Latched as soon as [`Self::close_storage`] starts. Every database
     /// accessor checks it so a late call cannot silently reopen a database
     /// while terminal close is in progress or after it completes.
@@ -1747,6 +1749,7 @@ impl MarmotApp {
             account_home: AccountHome::open(&root),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -1871,6 +1874,7 @@ impl MarmotApp {
             notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -8107,19 +8111,21 @@ impl MarmotApp {
         account_id: &str,
         public_key: nostr::prelude::PublicKey,
         signer: Arc<dyn ExternalAccountSigner>,
-    ) {
+    ) -> Option<Arc<dyn ExternalAccountSigner>> {
         let mut signers = self
             .external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match signers.entry(account_id.to_owned()) {
+        let previous = match signers.entry(account_id.to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RegisteredExternalSigner::new(public_key, signer));
+                None
             }
-        }
+        };
         drop(signers);
         self.relay_plane.evict_account_publish_client(account_id);
+        previous
     }
 
     fn account_signer_for_summary(

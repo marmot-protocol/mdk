@@ -24,6 +24,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_nip46_free` releases only its C handle, preserving the runtime-owned
   account signer and other handles. Explicit `marmot_nip46_cancel` remains
   terminal for the shared session. Join handle borrowers before freeing.
+  Setup rollback restores prior signer ownership and grants; publication retries
+  retain paired credentials across restart. Vault deletion failures leave a
+  stopped signer with retryable cleanup ownership.
   Optional host exports remain secret and require encrypted storage.
 
 ## [0.16.0] - 2026-11-11

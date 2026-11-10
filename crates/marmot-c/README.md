@@ -569,9 +569,14 @@ MDK account signout removes its owned signer credentials and leaves attached
 handles logged out; remove any optional host vault export too.
 `marmot_nip46_logout` is direct session revocation, not account signout. Its
 five-second courtesy request clears local client keys even without acknowledgement.
+If vault deletion fails, signing remains stopped and cleanup can be retried with
+logout or `marmot_nip46_remove` after the vault recovers.
 After account signout it reports an already logged-out session rather than sending
 another remote request. Do not free a handle while calls are in flight. Returned
 strings use `marmot_string_free`.
+
+New-account publication retries retain pairing credentials across restart;
+a post-commit journal cleanup error does not revoke the ready account.
 
 The loopback example exercises the C ABI with real NIP-44 websocket traffic,
 distinct user/bunker/client keys, mixed accounts, approvals and logout:

@@ -1363,6 +1363,23 @@ pub struct AccountSetupResult {
     pub readiness: AccountSetupReadiness,
 }
 
+enum ExternalSetupSigner {
+    Host(Arc<dyn crate::ExternalAccountSigner>),
+    Nip46(crate::Nip46Session),
+}
+
+enum ExternalSetupOrigin {
+    Created,
+    Promoted,
+    Existing,
+}
+
+struct Nip46Binding {
+    session: crate::Nip46Session,
+    previous: marmot_account::Nip46SessionWrite,
+    previous_signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+}
+
 /// Host-visible readiness for account setup. Local readiness is sufficient
 /// for local reads and profile rendering but is deliberately not evidence that another
 /// user can fetch this account's KeyPackage yet.
@@ -8670,20 +8687,20 @@ impl AccountManager {
     where
         S: crate::ExternalAccountSigner + 'static,
     {
-        self.login_with_external(public_key, signer, request, None)
-            .await
+        self.login_with_external(
+            public_key,
+            ExternalSetupSigner::Host(Arc::new(signer)),
+            request,
+        )
+        .await
     }
 
-    async fn login_with_external<S>(
+    async fn login_with_external(
         &self,
         public_key: String,
-        signer: S,
+        signer: ExternalSetupSigner,
         request: AccountSetupRequest,
-        remote: Option<crate::Nip46Session>,
-    ) -> Result<AccountSetupResult, AppError>
-    where
-        S: crate::ExternalAccountSigner + 'static,
-    {
+    ) -> Result<AccountSetupResult, AppError> {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "external_signer",
@@ -8692,119 +8709,152 @@ impl AccountManager {
         let work = async move {
             let result = async {
                 self.shared.lifecycle().ensure_running()?;
-                let signer_public_key = signer
-                    .get_public_key()
-                    .await
-                    .map_err(crate::external_signer_public_key_error)?;
+                let signer_public_key = match &signer {
+                    ExternalSetupSigner::Host(signer) => signer
+                        .get_public_key()
+                        .await
+                        .map_err(crate::external_signer_public_key_error)?,
+                    ExternalSetupSigner::Nip46(session) => session.public_key()?,
+                };
                 let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
                 if signer_public_key.to_hex() != account_id_hex {
                     return Err(AppError::ExternalSignerMismatch);
                 }
+                let gate = self.onboarding_transaction(&account_id_hex);
+                let _transaction = gate.lock().await;
                 let existing_account = self.app.account_home().account(&account_id_hex).ok();
                 if let Some(account) = existing_account.as_ref() {
                     refuse_unlinked(account)?;
                     self.setup_records()
                         .require_onboarding_complete(&account.label)?;
                 }
-                let created_account = existing_account.is_none();
-                // add_external_signer_account below promotes a pre-existing tracked
-                // (public) account to external_signing, so a later setup failure must
-                // revert that promotion — not skip cleanup and leave a torn account.
-                // Created accounts are deleted, already-external accounts are left as-is.
-                let upgraded_public_account = existing_account
-                    .is_some_and(|account| !account.external_signing && !account.local_signing);
+                let origin = match existing_account {
+                    None => ExternalSetupOrigin::Created,
+                    Some(account) if !account.external_signing && !account.local_signing => {
+                        ExternalSetupOrigin::Promoted
+                    }
+                    Some(_) => ExternalSetupOrigin::Existing,
+                };
                 let mut account = self
                     .app
                     .account_home()
                     .add_external_signer_account(&public_key)?;
                 self.app.presentation_signals.catalog_changed();
                 let reactivating_existing = account.signed_out;
-                if let Some(session) = remote.as_ref() {
-                    let binding = session.clone();
-                    let accounts = self.clone();
-                    let label = account.label.clone();
-                    if let Err(error) =
-                        blocking_app_task(move || accounts.track_nip46_session(&label, binding))
-                            .await
-                    {
-                        return self.rollback_external_signer_setup(
-                            &account.label,
-                            created_account,
-                            upgraded_public_account,
-                            error,
-                        );
-                    }
-                }
-                if remote.is_none()
-                    && let Err(err) = self
+                let mut binding = None;
+                let mut previous_setup = None;
+                let mut readiness = AccountSetupReadiness::Initializing;
+                let setup = async {
+                    previous_setup = self
                         .app
-                        .register_external_signer(&account.account_id_hex, signer)
-                        .await
-                {
-                    return self.rollback_external_signer_setup(
-                        &account.label,
-                        created_account,
-                        upgraded_public_account,
-                        err,
-                    );
-                }
-                if self
-                    .app
-                    .account_home()
-                    .account_setup_state(&account.label)?
-                    .is_none()
-                {
-                    self.app.account_home().begin_account_setup_with(
-                        &account,
-                        false,
-                        AccountSetupKind::ExternalSigner,
-                        AccountSetupPhase::LocalStateCreated,
-                    )?;
-                }
-                let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-                // An external-signer account is pre-existing by definition, so resolve
-                // its profile from public indexers (its outbox metadata does not live on
-                // the app's messaging relays). Runs before the relay-list setup so
-                // discovery keeps its anti-clobber ordering.
-                // Discovery is advisory (its error path already proceeds without it),
-                // so a stalled indexer must not hold the whole login hostage.
-                let recent_relay_lists = bounded_advisory_step(
-                    self.shared.observer.performance(),
-                    ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
-                    "login_directory_preflight",
-                    self.preflight_existing_account_directory(
-                        &account.account_id_hex,
-                        directory_discovery_relays_for_setup(&request),
-                    ),
-                )
-                .await
-                .flatten();
-
-                let relay_lists = match self
-                    .setup_relay_lists_for_account(
-                        &account,
-                        &request,
-                        true,
-                        false,
-                        recent_relay_lists,
+                        .account_home()
+                        .account_setup_state(&account.label)?;
+                    match signer {
+                        ExternalSetupSigner::Nip46(session) => {
+                            let accounts = self.clone();
+                            let label = account.label.clone();
+                            binding = blocking_app_task(move || {
+                                accounts.track_nip46_session(&label, session)
+                            })
+                            .await?;
+                        }
+                        ExternalSetupSigner::Host(signer) => {
+                            self.app.pin_external_signer(
+                                &account.account_id_hex,
+                                signer_public_key,
+                                signer,
+                            );
+                        }
+                    }
+                    if previous_setup.is_none() {
+                        self.app.account_home().begin_account_setup_with(
+                            &account,
+                            false,
+                            AccountSetupKind::ExternalSigner,
+                            AccountSetupPhase::LocalStateCreated,
+                        )?;
+                    }
+                    let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+                    // An external-signer account is pre-existing by definition, so resolve
+                    // its profile from public indexers (its outbox metadata does not live on
+                    // the app's messaging relays). Runs before the relay-list setup so
+                    // discovery keeps its anti-clobber ordering.
+                    // Discovery is advisory (its error path already proceeds without it),
+                    // so a stalled indexer must not hold the whole login hostage.
+                    let recent_relay_lists = bounded_advisory_step(
+                        self.shared.observer.performance(),
+                        ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
+                        "login_directory_preflight",
+                        self.preflight_existing_account_directory(
+                            &account.account_id_hex,
+                            directory_discovery_relays_for_setup(&request),
+                        ),
                     )
                     .await
-                {
-                    Ok(relay_lists) => relay_lists,
-                    Err(err) => {
-                        if !self.setup_failure_can_roll_back(&account, account.signed_out)? {
-                            return Err(err);
-                        }
-                        return self.rollback_external_signer_setup(
-                            &account.label,
-                            created_account,
-                            upgraded_public_account,
-                            err,
-                        );
-                    }
-                };
+                    .flatten();
 
-                let key_package_bytes = if request.publish_initial_key_package {
+                    let relay_lists = self
+                        .setup_relay_lists_for_account(
+                            &account,
+                            &request,
+                            true,
+                            false,
+                            recent_relay_lists,
+                        )
+                        .await?;
+
+                    let key_package_bytes = if request.publish_initial_key_package {
+                        if account.signed_out {
+                            account = self
+                                .app
+                                .account_home()
+                                .set_account_signed_out(&account.label, false)?;
+                            self.app.presentation_signals.catalog_changed();
+                        }
+                        self.app.account_home().set_account_setup_phase(
+                            &account.label,
+                            AccountSetupPhase::KeyPackagePublicationStarted,
+                        )?;
+                        match self.publish_initial_key_package_for_account(&account).await {
+                            Ok(bytes) => {
+                                self.app.account_home().set_account_setup_phase(
+                                    &account.label,
+                                    AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                )?;
+                                Some(bytes)
+                            }
+                            Err(err) => {
+                                // Session lifecycle state owns exact signed bytes and
+                                // private material before network exposure. Once
+                                // KeyPackage setup has started, deleting a freshly-added
+                                // external account could orphan an ambiguously accepted
+                                // publication; keep it for an exact-byte retry instead.
+                                // A previously signed-out account is different: restore
+                                // that durable state while retaining its setup journal.
+                                if reactivating_existing {
+                                    self.restore_signed_out_after_key_package_failure(
+                                        &account.label,
+                                    )
+                                    .await;
+                                }
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Single-hop advisory refresh keeps the shorter profile-refresh bound.
+                    let _ = bounded_advisory_step(
+                        self.shared.observer.performance(),
+                        ACCOUNT_SETUP_ADVISORY_WAIT,
+                        "login_directory_refresh",
+                        self.app.directory().refresh_user_directory_for_account_id(
+                            &account.account_id_hex,
+                            directory_bootstrap_relays,
+                        ),
+                    )
+                    .await;
                     if account.signed_out {
                         account = self
                             .app
@@ -8812,68 +8862,91 @@ impl AccountManager {
                             .set_account_signed_out(&account.label, false)?;
                         self.app.presentation_signals.catalog_changed();
                     }
-                    self.app.account_home().set_account_setup_phase(
-                        &account.label,
-                        AccountSetupPhase::KeyPackagePublicationStarted,
-                    )?;
-                    match self.publish_initial_key_package_for_account(&account).await {
-                        Ok(bytes) => {
-                            self.app.account_home().set_account_setup_phase(
-                                &account.label,
-                                AccountSetupPhase::KeyPackagePublicationConfirmed,
-                            )?;
-                            Some(bytes)
-                        }
-                        Err(err) => {
-                            // Session lifecycle state owns exact signed bytes and
-                            // private material before network exposure. Once
-                            // KeyPackage setup has started, deleting a freshly-added
-                            // external account could orphan an ambiguously accepted
-                            // publication; keep it for an exact-byte retry instead.
-                            // A previously signed-out account is different: restore
-                            // that durable state while retaining its setup journal.
-                            if reactivating_existing {
-                                self.restore_signed_out_after_key_package_failure(&account.label)
-                                    .await;
-                            }
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // Single-hop advisory refresh keeps the shorter profile-refresh bound.
-                let _ = bounded_advisory_step(
-                    self.shared.observer.performance(),
-                    ACCOUNT_SETUP_ADVISORY_WAIT,
-                    "login_directory_refresh",
-                    self.app.directory().refresh_user_directory_for_account_id(
-                        &account.account_id_hex,
-                        directory_bootstrap_relays,
-                    ),
-                )
-                .await;
-                if account.signed_out {
-                    account = self
-                        .app
+                    self.retry_and_reconcile_for_account(&account.account_id_hex)
+                        .await?;
+                    // Journal cleanup may remove its first file before failing.
+                    // A network-ready account and signer are already committed.
+                    readiness = AccountSetupReadiness::NetworkReady;
+                    self.app
                         .account_home()
-                        .set_account_signed_out(&account.label, false)?;
-                    self.app.presentation_signals.catalog_changed();
-                }
-                self.retry_and_reconcile_for_account(&account.account_id_hex)
-                    .await?;
-                self.app
-                    .account_home()
-                    .complete_account_setup(&account.label)?;
+                        .complete_account_setup(&account.label)?;
 
-                Ok(AccountSetupResult {
-                    account,
-                    relay_lists,
-                    key_package_bytes,
-                    profile: None,
-                    readiness: AccountSetupReadiness::NetworkReady,
-                })
+                    Ok((relay_lists, key_package_bytes))
+                }
+                .await;
+                match setup {
+                    Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
+                        account,
+                        relay_lists,
+                        key_package_bytes,
+                        profile: None,
+                        readiness,
+                    }),
+                    Err(error) => {
+                        let durable_account = self.app.account_home().account(&account.label);
+                        let setup_state =
+                            self.app.account_home().account_setup_state(&account.label);
+                        let credential_existed = binding.as_ref().is_some_and(|binding| {
+                            matches!(
+                                &binding.previous,
+                                marmot_account::Nip46SessionWrite::Existing(_)
+                            )
+                        });
+                        let unpublished = readiness != AccountSetupReadiness::NetworkReady
+                            && setup_state.as_ref().is_ok_and(|state| {
+                                state.as_ref().is_none_or(|state| {
+                                    state.phase == AccountSetupPhase::LocalStateCreated
+                                })
+                            });
+                        let rollback_account =
+                            !reactivating_existing && unpublished && !credential_existed;
+                        if let Some(binding) = binding {
+                            let restore_signer = binding.previous_signer.is_some();
+                            let signed_out = durable_account
+                                .as_ref()
+                                .is_ok_and(|account| account.signed_out);
+                            if readiness != AccountSetupReadiness::NetworkReady
+                                && (restore_signer || signed_out || rollback_account)
+                            {
+                                // Setup owns the handoff: retain committed retry material,
+                                // otherwise restore the prior callback and credential record.
+                                let cleanup = blocking_app_task(move || {
+                                    binding
+                                        .session
+                                        .unbind_account(&binding.previous, binding.previous_signer)
+                                        .map_err(AppError::from)
+                                })
+                                .await;
+                                let journal = if cleanup.is_ok()
+                                    && restore_signer
+                                    && unpublished
+                                    && previous_setup.is_none()
+                                {
+                                    self.app
+                                        .account_home()
+                                        .complete_account_setup(&account.label)
+                                } else {
+                                    Ok(())
+                                };
+                                let reconciliation =
+                                    self.reconcile_for_account(&account.account_id_hex).await;
+                                cleanup?;
+                                journal?;
+                                reconciliation?;
+                            }
+                        }
+                        durable_account?;
+                        setup_state?;
+                        if rollback_account {
+                            return self.rollback_external_signer_setup(
+                                &account.label,
+                                origin,
+                                error,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
             }
             .await;
             self.app.presentation_signals.catalog_changed();
@@ -9446,20 +9519,21 @@ impl AccountManager {
     fn rollback_external_signer_setup<T>(
         &self,
         label: &str,
-        created_account: bool,
-        upgraded_public_account: bool,
+        origin: ExternalSetupOrigin,
         err: AppError,
     ) -> Result<T, AppError> {
-        if created_account {
-            return self.rollback_account_after_setup_failure(label, err);
-        }
-        if upgraded_public_account {
-            self.erase_nip46_session(label, Nip46Removal::Recorded)?;
-            let _ = self.app.account_home().complete_account_setup(label);
-            let _ = self
-                .app
-                .account_home()
-                .revert_external_signer_upgrade(label);
+        match origin {
+            ExternalSetupOrigin::Created => {
+                return self.rollback_account_after_setup_failure(label, err);
+            }
+            ExternalSetupOrigin::Promoted => {
+                self.erase_nip46_session(label, Nip46Removal::Recorded)?;
+                self.app.account_home().complete_account_setup(label)?;
+                self.app
+                    .account_home()
+                    .revert_external_signer_upgrade(label)?;
+            }
+            ExternalSetupOrigin::Existing => {}
         }
         Err(err)
     }

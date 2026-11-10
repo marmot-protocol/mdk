@@ -938,14 +938,15 @@ fn nip46_metadata_only_repair() {
         } else {
             (client, record)
         };
-        store.fail_lookup.store(true, Ordering::SeqCst);
+        *store.load_error.lock().unwrap() = Some(AccountHomeError::SecretStore(
+            "injected locked vault".into(),
+        ));
         assert!(matches!(
             reopened.store_nip46_session(&account.label, &supplied, &pairing),
             Err(AccountHomeError::SecretStore(_))
         ));
         assert!(store.keys.lock().unwrap().is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        store.fail_lookup.store(false, Ordering::SeqCst);
         reopened
             .store_nip46_session(&account.label, &supplied, &pairing)
             .unwrap();
@@ -957,6 +958,93 @@ fn nip46_metadata_only_repair() {
             .unwrap();
         assert_eq!(restored.secret_key(), supplied.secret_key());
         assert_eq!(metadata, pairing);
+    }
+}
+
+#[test]
+fn nip46_false_absence_guard() {
+    enum CredentialState {
+        Present,
+        Locked,
+        Unavailable,
+        Malformed,
+    }
+
+    for state in [
+        CredentialState::Present,
+        CredentialState::Locked,
+        CredentialState::Unavailable,
+        CredentialState::Malformed,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemorySecretStore::default());
+        let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+        let user = nostr::prelude::Keys::generate();
+        let client = nostr::prelude::Keys::generate();
+        let account = home
+            .add_external_signer_account(&user.public_key().to_hex())
+            .unwrap();
+        let record = nip46_record(&user, &client);
+        home.store_nip46_session(&account.label, &client, &record)
+            .unwrap();
+        let path = home.account_dir(&account.label).join(".nip46-session.json");
+        let before = std::fs::read(&path).unwrap();
+        store.hide_presence.store(true, Ordering::SeqCst);
+        match state {
+            CredentialState::Present => {}
+            CredentialState::Locked => {
+                *store.load_error.lock().unwrap() = Some(AccountHomeError::SecretStore(
+                    "injected locked vault".into(),
+                ));
+            }
+            CredentialState::Unavailable => {
+                *store.load_error.lock().unwrap() = Some(AccountHomeError::SecretStoreUnavailable(
+                    "injected unavailable vault".into(),
+                ));
+            }
+            CredentialState::Malformed => {
+                let label = format!(".nip46-client/{}", account.label);
+                store.keys.lock().unwrap().insert(label, "not-a-key".into());
+            }
+        }
+        let secrets_before = store.keys.lock().unwrap().clone();
+        let replacement = nostr::prelude::Keys::generate();
+        let pairing = nip46_record(&user, &replacement);
+        let result = home.store_nip46_session(&account.label, &replacement, &pairing);
+        match state {
+            CredentialState::Present => {
+                assert!(matches!(result, Err(AccountHomeError::AccountIdMismatch)));
+            }
+            CredentialState::Locked => {
+                assert!(matches!(result, Err(AccountHomeError::SecretStore(_))));
+            }
+            CredentialState::Unavailable => {
+                assert!(matches!(
+                    result,
+                    Err(AccountHomeError::SecretStoreUnavailable(_))
+                ));
+            }
+            CredentialState::Malformed => {
+                assert!(matches!(result, Err(AccountHomeError::InvalidSecretKey)));
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(*store.keys.lock().unwrap(), secrets_before);
+        drop(home);
+        let reopened = AccountHome::open_with_secret_store(dir.path(), store);
+        if matches!(state, CredentialState::Malformed) {
+            assert!(matches!(
+                reopened.load_nip46_session(&account.label),
+                Err(AccountHomeError::InvalidSecretKey)
+            ));
+        } else {
+            let (restored, metadata) = reopened
+                .load_nip46_session(&account.label)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.secret_key(), client.secret_key());
+            assert_eq!(metadata, record);
+        }
     }
 }
 
@@ -1152,6 +1240,7 @@ fn nip46_corrupt_storage() {
         home.load_nip46_session(&account.label),
         Err(AccountHomeError::AccountIdMismatch)
     ));
+    store.hide_presence.store(true, Ordering::SeqCst);
     assert!(matches!(
         home.store_nip46_session(&account.label, &client, &record),
         Err(AccountHomeError::AccountIdMismatch)
@@ -1248,6 +1337,7 @@ fn nip46_orphaned_key_removal() {
     home.store_nip46_session(&account.label, &client, &nip46_record(&user, &client))
         .unwrap();
     std::fs::remove_file(home.account_dir(&account.label).join(".nip46-session.json")).unwrap();
+    store.hide_presence.store(true, Ordering::SeqCst);
     let label = format!(".nip46-client/{}", account.label);
     home.remove_nip46_session(&account.label, Nip46Removal::Recorded)
         .unwrap();
@@ -1255,6 +1345,15 @@ fn nip46_orphaned_key_removal() {
         store.keys.lock().unwrap()[&label],
         client.secret_key().to_secret_hex()
     );
+    store.fail_remove.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        home.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned),
+        Err(AccountHomeError::SecretStore(_))
+    ));
+    assert!(
+        matches!(home.load_nip46_session(&account.label), Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+    );
+    store.fail_remove.store(false, Ordering::SeqCst);
     home.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned)
         .unwrap();
     assert!(!store.keys.lock().unwrap().contains_key(&label));
@@ -1278,9 +1377,10 @@ fn nip46_storage_failure_retry() {
     assert_eq!(home.account(&account.label).unwrap(), account);
     store.fail_remove.store(false, Ordering::SeqCst);
     store.fail_write.store(true, Ordering::SeqCst);
-    assert!(
-        matches!(home.store_nip46_session(&account.label, &client, &record), Err(AccountHomeError::SecretStore(message)) if message == "injected write failure")
-    );
+    assert!(matches!(
+        home.store_nip46_session(&account.label, &client, &record),
+        Err(AccountHomeError::SecretStore(_))
+    ));
     assert!(store.keys.lock().unwrap().is_empty());
     assert!(home.load_nip46_session(&account.label).unwrap().is_none());
     store.fail_write.store(false, Ordering::SeqCst);
@@ -1290,9 +1390,10 @@ fn nip46_storage_failure_retry() {
         .external_database_secret(&account.label, ExternalSecretMode::Create)
         .unwrap();
     store.fail_remove.store(true, Ordering::SeqCst);
-    assert!(
-        matches!(home.remove_account(&account.label), Err(AccountHomeError::SecretStore(message)) if message == "injected removal failure")
-    );
+    assert!(matches!(
+        home.remove_account(&account.label),
+        Err(AccountHomeError::SecretStore(_))
+    ));
     assert_eq!(home.account(&account.label).unwrap(), account);
     assert!(!dir.path().join(".wipe-tombstones").exists());
     assert_eq!(store.keys.lock().unwrap().len(), 2);
@@ -1321,9 +1422,10 @@ fn nip46_storage_failure_retry() {
         .store_nip46_session(&account.label, &client, &record)
         .unwrap();
     store.fail_remove_after_delete.store(true, Ordering::SeqCst);
-    assert!(
-        matches!(reopened.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned), Err(AccountHomeError::SecretStore(message)) if message == "injected post-delete failure")
-    );
+    assert!(matches!(
+        reopened.remove_nip46_session(&account.label, Nip46Removal::IncludingOrphaned),
+        Err(AccountHomeError::SecretStore(_))
+    ));
     assert!(
         !reopened
             .account_dir(&account.label)
@@ -1913,6 +2015,8 @@ fn account_home_nip49_export_rejects_public_only_account() {
 struct MemorySecretStore {
     keys: Mutex<HashMap<String, String>>,
     fail_lookup: AtomicBool,
+    hide_presence: AtomicBool,
+    load_error: Mutex<Option<AccountHomeError>>,
     fail_write: AtomicBool,
     interrupt_before_write: AtomicBool,
     interrupt_after_write: AtomicBool,
@@ -1927,7 +2031,8 @@ impl AccountSecretStore for MemorySecretStore {
                 "injected locked vault".into(),
             ));
         }
-        Ok(self.keys.lock().unwrap().contains_key(label))
+        Ok(!self.hide_presence.load(Ordering::SeqCst)
+            && self.keys.lock().unwrap().contains_key(label))
     }
 
     fn write_secret(
@@ -1959,6 +2064,9 @@ impl AccountSecretStore for MemorySecretStore {
         &self,
         account: &marmot_account::AccountSummary,
     ) -> AccountHomeResult<nostr::prelude::Keys> {
+        if let Some(error) = self.load_error.lock().unwrap().take() {
+            return Err(error);
+        }
         let secret = self
             .keys
             .lock()
@@ -1966,7 +2074,7 @@ impl AccountSecretStore for MemorySecretStore {
             .get(&account.label)
             .ok_or_else(|| AccountHomeError::SecretNotFound(account.label.clone()))?
             .clone();
-        Ok(nostr::prelude::Keys::parse(&secret).unwrap())
+        nostr::prelude::Keys::parse(&secret).map_err(|_| AccountHomeError::InvalidSecretKey)
     }
 
     fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {

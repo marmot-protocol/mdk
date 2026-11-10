@@ -21,9 +21,6 @@ impl MarmotAppRuntime {
             return Err(Nip46Error::Mismatch.into());
         }
         let public_key = session.connect_async().await?;
-        let gate = self.accounts.onboarding_transaction(&public_key);
-        let _transaction = gate.lock().await;
-        let previously_bound = self.check_nip46_slot(&public_key, &session)?;
         let request = AccountSetupRequest {
             default_relays,
             bootstrap_relays,
@@ -35,31 +32,8 @@ impl MarmotAppRuntime {
         };
         let result = self
             .accounts
-            .login_with_external(
-                public_key.clone(),
-                session.clone(),
-                request,
-                Some(session.clone()),
-            )
-            .await;
-        if result.is_err() && !previously_bound {
-            let registry = self.accounts.app.nip46_sessions.clone();
-            let id = public_key.clone();
-            blocking_app_task(move || {
-                let current = registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(&id)
-                    .is_some_and(|current| current.same_session(&session));
-                if current {
-                    session.unbind_account()?;
-                }
-                Ok(())
-            })
+            .login_with_external(public_key, ExternalSetupSigner::Nip46(session), request)
             .await?;
-            self.accounts.reconcile_for_account(&public_key).await?;
-        }
-        let result = result?;
         Ok(result.account)
     }
 
@@ -81,13 +55,33 @@ impl MarmotAppRuntime {
             .accounts
             .onboarding_transaction(&account.account_id_hex);
         let _transaction = gate.lock().await;
-        self.check_nip46_slot(&account.account_id_hex, &session)?;
         let accounts = self.accounts.clone();
         let label = account.label.clone();
-        blocking_app_task(move || accounts.track_nip46_session(&label, session)).await?;
-        self.accounts
+        let binding =
+            blocking_app_task(move || accounts.track_nip46_session(&label, session)).await?;
+        let result = self
+            .accounts
             .retry_and_reconcile_for_account(&account.account_id_hex)
-            .await
+            .await;
+        if result.is_err()
+            && let Some(binding) = binding
+            && binding.previous_signer.is_some()
+        {
+            let cleanup = blocking_app_task(move || {
+                binding
+                    .session
+                    .unbind_account(&binding.previous, binding.previous_signer)
+                    .map_err(AppError::from)
+            })
+            .await;
+            let reconciliation = self
+                .accounts
+                .reconcile_for_account(&account.account_id_hex)
+                .await;
+            cleanup?;
+            reconciliation?;
+        }
+        result
     }
 
     /// Rehydrate locally; the first signer operation reconnects with a bounded deadline.
@@ -118,22 +112,6 @@ impl MarmotAppRuntime {
         })
         .await?;
         self.accounts.reconcile().await
-    }
-
-    fn check_nip46_slot(&self, id: &str, session: &Nip46Session) -> Result<bool, AppError> {
-        let sessions = self
-            .accounts
-            .app
-            .nip46_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sessions
-            .get(id)
-            .is_some_and(|current| !current.same_session(session))
-        {
-            return Err(Nip46Error::Busy.into());
-        }
-        Ok(sessions.contains_key(id))
     }
 
     async fn load_nip46_session(
@@ -212,7 +190,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         session: Nip46Session,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<Nip46Binding>, AppError> {
         let mut sessions = self
             .app
             .nip46_sessions
@@ -235,14 +213,23 @@ impl AccountManager {
         if public_key.to_hex() != account.account_id_hex {
             return Err(Nip46Error::Mismatch.into());
         }
-        session.bind_account(&account.label)?;
-        self.app.pin_external_signer(
-            &account.account_id_hex,
-            public_key,
-            session.registered_signer(),
-        );
-        sessions.insert(account.account_id_hex, session);
-        Ok(())
+        let previous = session.bind_account(&account.label)?;
+        let signer = session.registered_signer();
+        let previous_signer =
+            self.app
+                .pin_external_signer(&account.account_id_hex, public_key, signer.clone());
+        let already_attached = previous_signer
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, &signer));
+        sessions.insert(account.account_id_hex, session.clone());
+        if already_attached {
+            return Ok(None);
+        }
+        Ok(Some(Nip46Binding {
+            session,
+            previous,
+            previous_signer,
+        }))
     }
 
     pub(super) fn erase_nip46_session(

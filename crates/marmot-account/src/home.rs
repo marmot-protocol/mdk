@@ -109,6 +109,16 @@ pub struct Nip46SessionRecord {
     pub permissions: Vec<String>,
 }
 
+/// Credential ownership observed atomically while storing a pairing.
+#[derive(Debug)]
+pub enum Nip46SessionWrite {
+    /// This write created the communication credential.
+    Created,
+    /// Keep this record and its existing key if later account setup rolls back.
+    /// An orphaned existing key retains the newly repaired public record.
+    Existing(Nip46SessionRecord),
+}
+
 /// Whether cleanup knows that this account owns a NIP-46 credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nip46Removal {
@@ -1101,7 +1111,7 @@ impl AccountHome {
         account_ref: &str,
         keys: &nostr::prelude::Keys,
         record: &Nip46SessionRecord,
-    ) -> AccountHomeResult<()> {
+    ) -> AccountHomeResult<Nip46SessionWrite> {
         let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         let account = self.account(account_ref)?;
         record.validate(&account)?;
@@ -1119,21 +1129,28 @@ impl AccountHome {
         let path = directory.join(NIP46_SESSION_FILE);
         let previous = self.read_nip46_record(&account)?;
         let credential = synthetic_credential(&account, NIP46_CREDENTIAL_PREFIX);
-        let exists = self.secret_store.has_secret_for_label(&credential.label)?
-            || self
-                .secret_store
-                .has_secret_for_account_id(&credential.account_id_hex)?;
-        if exists {
+        let stored_keys = match self.secret_store.load_secret(&credential) {
+            Ok(keys) => Some(keys),
+            Err(AccountHomeError::SecretNotFound(_)) => None,
+            Err(AccountHomeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(stored_keys) = stored_keys {
             if previous.as_ref().is_some_and(|previous| {
                 previous.client_public_key != record.client_public_key
                     || previous.remote_signer_public_key != record.remote_signer_public_key
             }) {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
-            if self.secret_store.load_secret(&credential)?.secret_key() != keys.secret_key() {
+            if stored_keys.secret_key() != keys.secret_key() {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
             write_private_json(&path, record)?;
+            Ok(Nip46SessionWrite::Existing(
+                previous.unwrap_or_else(|| record.clone()),
+            ))
         } else {
             // Publish a public descriptor before entering the secret store. A
             // crash after the key write remains discoverable on cold restore.
@@ -1155,8 +1172,8 @@ impl AccountHome {
                 fs::File::open(directory)?.sync_all()?;
                 return Err(error);
             }
+            Ok(Nip46SessionWrite::Created)
         }
-        Ok(())
     }
 
     /// Restore metadata and its separate communication key. Corruption is an error.
@@ -1245,21 +1262,34 @@ impl AccountHome {
         let path = directory.join(NIP46_SESSION_FILE);
         let removing = directory.join(NIP46_REMOVING_FILE);
         let credential = synthetic_credential(account, NIP46_CREDENTIAL_PREFIX);
-        if !path.try_exists()?
+        if removal == Nip46Removal::IncludingOrphaned
+            && !path.try_exists()?
             && !removing.try_exists()?
-            && !self.secret_store.has_secret_for_label(&credential.label)?
-            && !self
-                .secret_store
-                .has_secret_for_account_id(&credential.account_id_hex)?
         {
-            return Ok(());
+            match self.secret_store.load_secret(&credential) {
+                Err(AccountHomeError::SecretNotFound(_)) => return Ok(()),
+                Err(AccountHomeError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(());
+                }
+                // Only confirmed absence permits a no-op. Deletion can still
+                // recover a credential that cannot be read or decoded.
+                _ => {}
+            }
         }
         match fs::rename(&path, &removing) {
             Ok(()) => {
                 #[cfg(unix)]
                 fs::File::open(&directory)?.sync_all()?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !removing.try_exists()? {
+                    // An orphan has no descriptor to rename, but deletion still
+                    // needs a durable intent before entering the host vault.
+                    write_private_json(&removing, &())?;
+                }
+            }
             Err(error) => return Err(error.into()),
         }
         self.secret_store.remove_secret(&credential)?;

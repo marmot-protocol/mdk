@@ -84,14 +84,21 @@ impl RegisteredExternalSigner {
 
     /// Existing SDK clients, workers, and proof contexts keep this same pinned
     /// per-account slot when the host restores/replaces its transport callback.
-    pub(crate) fn replace(&self, signer: Arc<dyn ExternalAccountSigner>) {
-        *self
-            .signer
+    pub(crate) fn replace(
+        &self,
+        signer: Arc<dyn ExternalAccountSigner>,
+    ) -> Option<Arc<dyn ExternalAccountSigner>> {
+        self.signer
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(signer);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(signer)
     }
 
-    pub(super) fn clear_if(&self, signer: &Arc<dyn ExternalAccountSigner>) {
+    pub(super) fn restore_if(
+        &self,
+        signer: &Arc<dyn ExternalAccountSigner>,
+        previous: Option<Arc<dyn ExternalAccountSigner>>,
+    ) {
         let mut current = self
             .signer
             .write()
@@ -100,7 +107,7 @@ impl RegisteredExternalSigner {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, signer))
         {
-            *current = None;
+            *current = previous;
         }
     }
 

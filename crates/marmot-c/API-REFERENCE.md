@@ -3390,7 +3390,9 @@ MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
 
 Attempt bounded remote logout and clear local session keys even without acknowledgement. This directly revokes a session, not the MDK account. Account signout already erases owned credentials, so a later logout reports an already logged-out session without another remote request. Run off UI; remove any optional host vault export when revoking credentials.
 
-[Header contract](include/marmot.h#L13287)
+A vault deletion error leaves signing stopped and retains cleanup ownership. Retry logout or `marmot_nip46_remove` after the vault recovers; a failed deletion does not authorize a fresh pairing over the pending credential.
+
+[Header contract](include/marmot.h#L13189)
 
 ### `marmot_nip46_new`
 

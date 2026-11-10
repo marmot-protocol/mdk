@@ -235,7 +235,7 @@ pub(super) fn restore_data(
     }
     Ok(data)
 }
-pub(super) fn uri(data: &Data) -> Result<String> {
+pub(super) fn uri(data: &Data, relays: &[RelayUrl]) -> Result<String> {
     let keys = data.keys.as_ref().ok_or(Nip46Error::LoggedOut)?;
     let client = data.client_pairing && data.remote.is_none();
     if client
@@ -259,7 +259,7 @@ pub(super) fn uri(data: &Data) -> Result<String> {
     .map_err(|_| Nip46Error::Invalid)?;
     {
         let mut query = uri.query_pairs_mut();
-        for relay in &data.relays {
+        for relay in relays {
             query.append_pair("relay", relay.as_str());
         }
         if let Some(secret) = &data.secret {

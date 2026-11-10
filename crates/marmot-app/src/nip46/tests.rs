@@ -528,8 +528,8 @@ async fn live_session_isolation() {
     .unwrap();
     approve(&pairing);
     cancel_on_failure.0.push(pairing.clone());
-    let offer_secret = |session: &Nip46Session| {
-        url::Url::parse(&session.uri().unwrap())
+    let offer_secret = |offer: &str| {
+        url::Url::parse(offer)
             .unwrap()
             .query_pairs()
             .find(|(key, _)| key == "secret")
@@ -547,25 +547,48 @@ async fn live_session_isolation() {
             .collect::<Vec<_>>(),
         vec![url.clone()]
     );
-    let stale_secret = offer_secret(&pairing);
+    let stale_secret = offer_secret(&ready_offer);
+    let recovered = nostr_relay_builder::LocalRelay::new(
+        nostr_relay_builder::RelayBuilder::default().port(unavailable.local_addr().unwrap().port()),
+    );
+    drop(unavailable);
+    recovered.run().await.unwrap();
+    let recovered_url = recovered.url().await.to_string();
     pairing.disconnect();
-    pairing.pairing_offer().await.unwrap();
-    let fresh_secret = offer_secret(&pairing);
+    let fresh_offer = pairing.pairing_offer().await.unwrap();
+    assert_eq!(
+        url::Url::parse(&fresh_offer)
+            .unwrap()
+            .query_pairs()
+            .filter(|(key, _)| key == "relay")
+            .map(|(_, value)| value.into_owned())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([url.clone(), recovered_url.clone()])
+    );
+    let fresh_secret = offer_secret(&fresh_offer);
     assert_ne!(stale_secret, fresh_secret);
-    peer.send_event(&response(
-        &keys(8),
-        pairing_keys.public_key(),
-        json!({"id":"stale-pairing","result":stale_secret}),
-    ))
-    .await
-    .unwrap();
-    peer.send_event(&response(
-        &remote,
-        pairing_keys.public_key(),
-        json!({"id":"fresh-pairing","result":fresh_secret}),
-    ))
-    .await
-    .unwrap();
+    let recovered_peer = network_proxy::nostr_builder(Ok(None)).build();
+    recovered_peer.add_relay(recovered_url).await.unwrap();
+    recovered_peer
+        .connect()
+        .and_wait(Duration::from_secs(5))
+        .await;
+    recovered_peer
+        .send_event(&response(
+            &keys(8),
+            pairing_keys.public_key(),
+            json!({"id":"stale-pairing","result":stale_secret}),
+        ))
+        .await
+        .unwrap();
+    recovered_peer
+        .send_event(&response(
+            &remote,
+            pairing_keys.public_key(),
+            json!({"id":"fresh-pairing","result":fresh_secret}),
+        ))
+        .await
+        .unwrap();
     // A UI can request the current offer again after its signer already replied.
     // Readiness acknowledgements must not consume that ephemeral response.
     pairing.pairing_offer().await.unwrap();
@@ -708,5 +731,7 @@ async fn live_session_isolation() {
     assert_eq!(b.status().state, Nip46State::Ready);
     peer_task.abort();
     peer.disconnect().await;
+    recovered_peer.disconnect().await;
+    recovered.shutdown();
     relay.shutdown();
 }

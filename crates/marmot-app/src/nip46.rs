@@ -6,7 +6,7 @@ mod tests;
 mod transport;
 
 use crate::MarmotApp;
-use marmot_account::{AccountHome, Nip46Removal, Nip46SessionRecord};
+use marmot_account::{AccountHome, Nip46Removal, Nip46SessionRecord, Nip46SessionWrite};
 use marmot_session::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -246,9 +246,12 @@ enum Operation {
     Logout,
 }
 
-enum BindingCleanup {
+enum BindingCleanup<'a> {
     Revoke,
-    RetainPairing,
+    Rollback {
+        previous: &'a Nip46SessionWrite,
+        signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -504,8 +507,12 @@ impl Nip46Session {
         Arc::ptr_eq(&self.core, &other.core)
     }
     pub(crate) fn registered_signer(&self) -> Arc<dyn crate::ExternalAccountSigner> {
+        let mut data = lock(&self.core.shared.data);
+        if let Some(signer) = data.registration.as_ref().and_then(Weak::upgrade) {
+            return signer;
+        }
         let signer: Arc<dyn crate::ExternalAccountSigner> = Arc::new(self.clone());
-        lock(&self.core.shared.data).registration = Some(Arc::downgrade(&signer));
+        data.registration = Some(Arc::downgrade(&signer));
         signer
     }
     pub fn permissions() -> Nip46Permissions {
@@ -560,9 +567,9 @@ impl Nip46Session {
         {
             return Err(Nip46Error::PermissionApprovalRequired);
         }
-        protocol::uri(&data)
+        protocol::uri(&data, &data.relays)
     }
-    pub(crate) fn bind_account(&self, account_ref: &str) -> Result<()> {
+    pub(crate) fn bind_account(&self, account_ref: &str) -> Result<Nip46SessionWrite> {
         let mut data = lock(&self.core.shared.data);
         Shared::check(&data, data.status.generation)?;
         let account = self
@@ -582,13 +589,14 @@ impl Nip46Session {
             return Err(Nip46Error::Unavailable);
         }
         let (keys, record) = Shared::record(&data)?;
-        self.core
+        let previous = self
+            .core
             .shared
             .home
             .store_nip46_session(&account.label, &keys, &record)
             .map_err(|_| Nip46Error::Storage)?;
         data.account = Some(account.label);
-        Ok(())
+        Ok(previous)
     }
     pub fn export(&self) -> Result<String> {
         let data = lock(&self.core.shared.data);
@@ -665,10 +673,14 @@ impl Nip46Session {
     pub fn erase_local(&self) -> Result<()> {
         self.clear_binding(BindingCleanup::Revoke)
     }
-    pub(crate) fn unbind_account(&self) -> Result<()> {
-        self.clear_binding(BindingCleanup::RetainPairing)
+    pub(crate) fn unbind_account(
+        &self,
+        previous: &Nip46SessionWrite,
+        signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+    ) -> Result<()> {
+        self.clear_binding(BindingCleanup::Rollback { previous, signer })
     }
-    fn clear_binding(&self, cleanup: BindingCleanup) -> Result<()> {
+    fn clear_binding(&self, cleanup: BindingCleanup<'_>) -> Result<()> {
         let account_id = {
             let data = lock(&self.core.shared.data);
             data.user.map(|key| key.to_hex())
@@ -689,28 +701,48 @@ impl Nip46Session {
             .account
             .as_ref()
             .filter(|_| current)
-            .map(|account| {
-                self.core
+            .map(|account| match &cleanup {
+                BindingCleanup::Revoke
+                | BindingCleanup::Rollback {
+                    previous: Nip46SessionWrite::Created,
+                    ..
+                } => self
+                    .core
                     .shared
                     .home
                     .remove_nip46_session(account, Nip46Removal::IncludingOrphaned)
+                    .map_err(|_| Nip46Error::Storage),
+                BindingCleanup::Rollback {
+                    previous: Nip46SessionWrite::Existing(record),
+                    ..
+                } => data
+                    .keys
+                    .as_ref()
+                    .ok_or(Nip46Error::Storage)
+                    .and_then(|keys| {
+                        self.core
+                            .shared
+                            .home
+                            .store_nip46_session(account, keys, record)
+                            .map(drop)
+                            .map_err(|_| Nip46Error::Storage)
+                    }),
             })
-            .transpose()
-            .map_err(|_| Nip46Error::Storage);
-        if matches!(cleanup, BindingCleanup::Revoke) {
+            .transpose();
+        if matches!(&cleanup, BindingCleanup::Revoke) {
             data.keys = None;
             data.secret = None;
         }
         data.verified = false;
-        data.account = None;
-        let registration = data
-            .registration
-            .take()
-            .and_then(|registration| registration.upgrade());
+        let registration = data.registration.as_ref().and_then(Weak::upgrade);
+        if removal.is_ok() {
+            data.account = None;
+            data.registration = None;
+        }
         data.status.generation = data.status.generation.wrapping_add(1);
-        data.status.state = match cleanup {
+        data.status.state = match &cleanup {
             BindingCleanup::Revoke => Nip46State::LoggedOut,
-            BindingCleanup::RetainPairing
+            BindingCleanup::Rollback { .. }
                 if matches!(
                     data.status.state,
                     Nip46State::Cancelled | Nip46State::LoggedOut
@@ -718,7 +750,7 @@ impl Nip46Session {
             {
                 data.status.state
             }
-            BindingCleanup::RetainPairing => Nip46State::Disconnected,
+            BindingCleanup::Rollback { .. } => Nip46State::Disconnected,
         };
         data.status.auth_url = None;
         data.status.request_id = None;
@@ -731,12 +763,19 @@ impl Nip46Session {
         if let (Some(id), Some(sessions)) = (account_id.as_ref(), sessions.as_mut())
             && current
         {
-            sessions.remove(id);
+            // Failed deletion retains a terminal owner for an exact cleanup retry.
+            if removal.is_ok() {
+                sessions.remove(id);
+            }
             if let (Some(signers), Some(registration)) =
                 (self.core.shared.signers.upgrade(), registration)
                 && let Some(current) = lock(&signers).get(id)
             {
-                current.clear_if(&registration);
+                let previous = match cleanup {
+                    BindingCleanup::Revoke => None,
+                    BindingCleanup::Rollback { signer, .. } => signer,
+                };
+                current.restore_if(&registration, previous);
             }
         }
         removal?;

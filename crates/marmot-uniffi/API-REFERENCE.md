@@ -5779,7 +5779,7 @@ pub fn nip46_new(&self, config_json: String) -> Result<Arc<Nip46SessionFfi>, Mar
 
 Create an offline MDK-owned session from a bunker URI, pairing config, or secret export. Review and approve permissions before URI access or connection. Imports do not silently approve grants. No host signer callback is retained; the handle belongs to its creating Marmot object.
 
-[Source](src/nip46.rs#L251) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L253) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_login`
 
@@ -5789,7 +5789,9 @@ pub async fn nip46_login( &self, session: Arc<Nip46SessionFfi>, default_relays: 
 
 Create or reopen the external account using the verified shared signer and persist its communication credentials through MDK's configured secret store. Messaging relay-list discovery and default publication follow external-signer login. Empty inbox relays reuse defaults. A session from another Marmot object returns `ExternalSignerMismatch` before network work.
 
-[Source](src/nip46.rs#L258) · [Session lifecycle](README.md#nip-46-accounts)
+Before commit, a failed handoff restores the previous callback and grant record without deleting pre-existing credentials. A new account's possibly exposed publication retains its pairing for restart retry. Post-commit journal cleanup errors do not revoke a network-ready account.
+
+[Source](src/nip46.rs#L260) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_register`
 
@@ -5799,7 +5801,7 @@ pub async fn nip46_register( &self, account_ref: String, session: Arc<Nip46Sessi
 
 Attach a verified imported session to an existing account, persist credentials, and activate the worker. A different attached session must be removed before replacement. A foreign-owner handle returns `ExternalSignerMismatch`. Ordinary cold startup restores MDK-owned sessions without this import path.
 
-[Source](src/nip46.rs#L287) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L289) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_resume`
 
@@ -5809,7 +5811,7 @@ pub async fn nip46_resume( &self, account_ref: String, ) -> Result<Arc<Nip46Sess
 
 Obtain the account's shared session from MDK-owned credentials, without a host descriptor or signer callback. Persisted approval is retained unchanged; changed required grants need explicit review. Startup restores local credentials before workers; a missing account-identity proof can require bounded remote signing.
 
-[Source](src/nip46.rs#L300) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L302) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_remove`
 
@@ -5819,7 +5821,7 @@ pub async fn nip46_remove(&self, account_ref: String) -> Result<(), MarmotKitErr
 
 Detach the account's shared session and remove its persisted communication credentials. This does not replace account sign-out or data wiping.
 
-[Source](src/nip46.rs#L309) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L311) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Nip46SessionFfi::permissions`
 
@@ -5967,8 +5969,8 @@ Permanently cancel this session and interrupt pending work, including synchronou
 pub async fn logout(&self) -> Result<(), Nip46ErrorFfi>
 ```
 
-Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. Detaches the revoked signer so a fresh pairing can be registered in the same process. This does not sign out the MDK account; account sign-out already leaves attached handles logged out.
+Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. Successful local erasure detaches the revoked signer so a fresh pairing can be registered in the same process. A vault deletion error stops signing but retains cleanup ownership; retry logout or account-level removal after the vault recovers. This does not sign out the MDK account; account sign-out already leaves attached handles logged out.
 
-[Source](src/nip46.rs#L238)
+[Source](src/nip46.rs#L240)
 
 </details>

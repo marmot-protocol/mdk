@@ -532,7 +532,9 @@ communication credentials; never put it in logs or ordinary preferences.
 ordinary account sign-out/wipe applies its own lifecycle cleanup. `logout` attempts
 a bounded remote courtesy request and erases this session's local communication
 key even when the signer is unavailable. It detaches the revoked signer so fresh
-pairing can be registered immediately. It does not replace MDK account sign-out.
+pairing can be registered after local erasure succeeds. A vault deletion error
+leaves signing stopped; retry `logout` or `nip46Remove` after the vault recovers.
+It does not replace MDK account sign-out.
 
 Local-key and arbitrary host callback APIs are unchanged. For C ownership and
 blocking-call rules, see [NIP-46 accounts in the C guide](../marmot-c/README.md#nip-46-accounts).

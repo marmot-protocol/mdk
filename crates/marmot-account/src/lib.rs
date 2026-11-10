@@ -16,6 +16,6 @@ pub use error::{AccountHomeError, AccountHomeResult};
 pub use home::{
     AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
     EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, Nip46Removal, Nip46SessionRecord,
-    NostrAccountImport,
+    Nip46SessionWrite, NostrAccountImport,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
