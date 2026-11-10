@@ -391,8 +391,8 @@ is `org.marmot-protocol.mdk`.
 
 `relayEventLimits` lists the largest event, in bytes of serialized event JSON, that relays accept when they do not
 advertise it; the White Noise preset sets 2 MiB on its two relays. For events over 64 KiB, MDK also reads the
-WebSocket message limit a relay's NIP-11 document advertises, and uses the smaller known value. It sends no group
-event or Welcome to a relay over that relay's limit. A send that fits none of its relays fails with `EventTooLarge`
+WebSocket message limit a relay's NIP-11 document advertises, and uses the smaller known value. It sends no event
+to a relay over that relay's limit. A send that fits none of its relays fails with `EventTooLarge`
 (see [errors](#runtime-lifecycle-threads-and-errors)) without reaching any relay; a relay with no known limit gets every event, and
 its own size refusal arrives as the same error.
 

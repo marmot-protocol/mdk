@@ -6439,7 +6439,7 @@ Set the platform keychain service used for account secrets when no secret store 
 MarmotStatus marmot_deployment_set_relay_event_limits(struct MarmotDeployment *deployment, const char *const *relays, const uint64_t *max_event_bytes, uintptr_t len);
 ```
 
-Replace the largest event, in bytes of serialized event JSON, each listed relay accepts when it does not advertise it: `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event or Welcome over a relay's known limit, and a send that fits none of its relays fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero limit is ignored, a relay listed twice keeps the smaller limit, and NULL with 0 clears the list.
+Replace the largest event, in bytes of serialized event JSON, each listed relay accepts when it does not advertise it: `relays[i]` takes `max_event_bytes[i]`. MDK sends no event over a relay's known limit, and a send that fits none of its relays fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero limit is ignored, a relay listed twice keeps the smaller limit, and NULL with 0 clears the list.
 
 [Header contract](include/marmot.h#L12907)
 

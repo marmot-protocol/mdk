@@ -49,8 +49,8 @@ pub struct MarmotDeploymentFfi {
     /// stored under the old name.
     pub keychain_service: String,
     /// The largest event each listed relay accepts, for relays that do not
-    /// advertise it. MDK sends no group event or Welcome over a relay's known
-    /// limit, and a send that fits none of its relays fails as
+    /// advertise it. MDK sends no event over a relay's known limit, and a
+    /// send that fits none of its relays fails as
     /// `MarmotKitError::EventTooLarge`. An unlisted relay is limited only by
     /// the message size its NIP-11 document advertises. A relay listed twice
     /// keeps the smaller limit.

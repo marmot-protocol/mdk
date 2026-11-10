@@ -26,6 +26,7 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 | `src/lib.rs` | `MarmotRelayPlane`: relay sessions, per-account delivery queues and publish clients, notification forwarding, native replay admission bridge, publish accounting, `nostr_builder()`. |
 | `src/delivery_spill.rs` | The plane's side of the durable overflow tail: when a full queue spills and how it reports the disposition. |
 | `src/directory.rs`, `src/directory_wire.rs` | Directory fetches and subscriptions, and their relay wire handling. |
+| `src/known_limits.rs` | `RelayEventLimits` and the one refusal of relays an event is over the known limit of, shared by the adapter's publish and `KnownLimitPublishClient`, which wraps every account publisher. |
 | `src/safety.rs` | `RelaySafetyPolicy`: the host-safety chokepoint every relay endpoint passes before a connect. |
 | `src/telemetry.rs` | Relay telemetry snapshots and the export rollup. |
 | `src/test_support.rs` | Publish-accounting fixtures and `ScriptedRelayMessages`, the relay messages a fake relay client sends the plane, shared with `marmot-app`'s tests (`test-support` feature). |

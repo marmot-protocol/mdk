@@ -14,7 +14,7 @@ disallowed-methods = [
     { path = "reqwest::Client::new", reason = "wrap with crate::network_proxy::http_builder()" },
     { path = "reqwest::ClientBuilder::new", reason = "wrap with crate::network_proxy::http_builder()" },
     { path = "reqwest::get", reason = "wrap with crate::network_proxy::http_builder()" },
-    { path = "transport_nostr::MarmotRelayPlane::account_publish_client", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },
+    { path = "transport_nostr::MarmotRelayPlane::account_publish_client", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account and events over known relay limits" },
     { path = "transport_nostr::MarmotRelayPlaneAccountAdapter::publish_signed_event", reason = "publish push triggers through Client::publish_notification_trigger_tokens, which refuses an unlinked account" },
     { path = "transport_nostr_adapter::NostrSdkRelayClient::new", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },
     { path = "transport_nostr_adapter::NostrSdkRelayClient::from_builder", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },

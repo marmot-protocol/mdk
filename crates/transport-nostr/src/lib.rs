@@ -44,6 +44,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 mod delivery_spill;
 mod directory;
 mod directory_wire;
+mod known_limits;
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
 mod safety;
@@ -51,6 +52,8 @@ mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use known_limits::{KnownLimitPublishClient, RelayEventLimits};
+use known_limits::{event_json_bytes, join_refusals, refuse_over_known_limits, refused_everywhere};
 pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay_hosts};
 pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
@@ -224,20 +227,6 @@ struct RelayNotificationForwarderHealthSnapshot {
 struct IncrementalActivation {
     inbox_endpoints: Vec<TransportEndpoint>,
     since: Timestamp,
-}
-
-/// The largest event each relay is known to accept (mdk#2334). The account
-/// adapter sends no event over an endpoint's known limit.
-#[async_trait]
-pub trait RelayEventLimits: Send + Sync {
-    /// The endpoint's limit in serialized event JSON bytes, or `None` when
-    /// unknown. `event_bytes` is the event about to be sent, so a source can
-    /// skip a lookup no known limit could change.
-    async fn max_event_bytes(
-        &self,
-        endpoint: &TransportEndpoint,
-        event_bytes: usize,
-    ) -> Option<usize>;
 }
 
 #[derive(Clone)]
@@ -3392,68 +3381,12 @@ fn recover_relay_notification_forwarder_scoped(
     }
 }
 
-/// `,"sig":"` and a 64-byte hex signature with its closing quote: what
-/// signing adds to an unsigned event's JSON.
-const SIGNATURE_FIELD_BYTES: usize = 137;
-
-/// An event's size as a relay receives it: its serialized JSON, signed. This
-/// is the measure relay size refusals are classed by.
-fn event_json_bytes(event: &NostrTransportEvent) -> usize {
-    let unsigned_extra = if event.sig.is_some() {
-        0
-    } else {
-        SIGNATURE_FIELD_BYTES
-    };
-    serde_json::to_vec(event).map_or(0, |json| json.len() + unsigned_extra)
-}
-
 impl MarmotRelayPlaneAccountAdapter {
     /// Send no event over a relay's known limit (mdk#2334).
     #[doc(hidden)]
     pub fn with_event_limits(mut self, limits: Arc<dyn RelayEventLimits>) -> Self {
         self.event_limits = Some(limits);
         self
-    }
-
-    /// Splits `endpoints` into those the event may fit and a refusal for each
-    /// whose known limit it exceeds. An unknown limit may fit. Limits are
-    /// looked up concurrently, since a lookup may fetch a relay document.
-    async fn refuse_over_known_limits(
-        &self,
-        endpoints: &[TransportEndpoint],
-        event_bytes: usize,
-    ) -> (Vec<TransportEndpoint>, Vec<TransportEndpointFailure>) {
-        let Some(limits) = self.event_limits.as_ref() else {
-            return (endpoints.to_vec(), Vec::new());
-        };
-        let known = futures::future::join_all(
-            endpoints
-                .iter()
-                .map(|endpoint| limits.max_event_bytes(endpoint, event_bytes)),
-        )
-        .await;
-        let mut sendable = Vec::with_capacity(endpoints.len());
-        let mut refused = Vec::new();
-        for (endpoint, limit) in endpoints.iter().zip(known) {
-            if limit.is_some_and(|limit| event_bytes > limit) {
-                refused.push(TransportEndpointFailure::over_known_limit(
-                    endpoint.clone(),
-                    event_bytes,
-                ));
-            } else {
-                sendable.push(endpoint.clone());
-            }
-        }
-        if !refused.is_empty() {
-            tracing::debug!(
-                target: "marmot_app::relay_plane",
-                method = "refuse_over_known_limits",
-                refused_endpoint_count = refused.len(),
-                sendable_endpoint_count = sendable.len(),
-                "event exceeds known relay limits; not sent there"
-            );
-        }
-        (sendable, refused)
     }
 
     #[doc(hidden)]
@@ -4457,21 +4390,19 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         // An event over a relay's known limit is never sent there: the relay
         // would refuse it, or close the socket on the oversized frame, which
         // reads as a possible exposure and resends the event (mdk#2334).
-        let (endpoints, refused) = self
-            .refuse_over_known_limits(request.target.endpoints(), event_json_bytes(&event))
-            .await;
+        let (endpoints, refused) = refuse_over_known_limits(
+            self.event_limits.as_deref(),
+            request.target.endpoints(),
+            event_json_bytes(&event),
+        )
+        .await;
         if endpoints.is_empty() && !refused.is_empty() {
             // No relay was contacted, so no publish attempt is counted.
-            let mut failure = TransportPublishFailure::with_endpoint_failures(
-                TransportEndpointFailure::OVER_KNOWN_LIMIT_REASON.to_owned(),
-                refused,
-            );
-            failure.event_size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+            return Err(refused_everywhere(
                 request.target.endpoints(),
-                &failure.endpoint_failures,
-            );
-            failure.message_id = hex::decode(&event.id).ok().map(MessageId::new);
-            return Err(TransportAdapterError::PublishEndpoints(failure));
+                refused,
+                &event,
+            ));
         }
         // Refused endpoints count against the request's threshold in the
         // report; the endpoints still sent to can meet at most their number.
@@ -4509,19 +4440,9 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .await
         {
             Ok(outcome) => outcome,
-            Err(TransportAdapterError::PublishEndpoints(mut failure)) if !refused.is_empty() => {
-                // The client's size proof covers only the relays sent to; it
-                // extends to the whole target only with every refusal.
-                failure.endpoint_failures.extend(refused);
-                failure.event_size_class = failure.event_size_class.and_then(|_| {
-                    cgka_traits::EventSizeClass::from_rejected_targets(
-                        request.target.endpoints(),
-                        &failure.endpoint_failures,
-                    )
-                });
-                return Err(TransportAdapterError::PublishEndpoints(failure));
+            Err(error) => {
+                return Err(join_refusals(error, request.target.endpoints(), refused));
             }
-            Err(error) => return Err(error),
         };
         let local_fanout_endpoints = if !outcome.accepted.is_empty() {
             outcome
@@ -4575,9 +4496,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .inner
             .relay_safety
             .reachable_publish_endpoints(target);
-        let (_, refused) = self
-            .refuse_over_known_limits(&endpoints, event_json_bytes(&event))
-            .await;
+        let (_, refused) = refuse_over_known_limits(
+            self.event_limits.as_deref(),
+            &endpoints,
+            event_json_bytes(&event),
+        )
+        .await;
         cgka_traits::EventSizeClass::from_rejected_targets(&endpoints, &refused)
     }
 }

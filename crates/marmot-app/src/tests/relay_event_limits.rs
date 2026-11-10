@@ -171,3 +171,58 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
         "neither the commit nor the Welcome reached a relay"
     );
 }
+
+/// Account publishes, a profile here, go through the same refusal: no relay is
+/// sent an event over its known limit, and an event over every relay's limit
+/// fails as too large, sent nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_publishes_over_a_known_limit_are_refused_unsent() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_with_event_limits(&dir, relay.clone(), &[("wss://limited.example", 200)]);
+    let limited = TransportEndpoint("wss://limited.example".into());
+    let open = TransportEndpoint("wss://open.example".into());
+    let profile = UserProfileMetadata {
+        about: Some("x".repeat(500)),
+        ..UserProfileMetadata::default()
+    };
+    let profile_routes = || {
+        relay
+            .attempted_routes()
+            .into_iter()
+            .filter(|(kind, _)| *kind == 0)
+            .collect::<Vec<_>>()
+    };
+
+    let error = app
+        .publish_user_profile(
+            &alice.label,
+            profile.clone(),
+            AccountRelayListBootstrap::new(vec![limited.clone()], Vec::new()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::EventTooLarge {
+                artifact: OversizedArtifact::Other,
+                size_class: EventSizeClass::Under64Kib,
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(profile_routes().is_empty(), "no relay was sent the profile");
+
+    app.publish_user_profile(
+        &alice.label,
+        profile,
+        AccountRelayListBootstrap::new(vec![limited, open.clone()], Vec::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(profile_routes(), [(0, vec![open])]);
+}

@@ -485,7 +485,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the copy is forgotten only once that mark lands, so a failed mark is made again at the next open.
   Every publisher `relay_client_for_account_id` hands out refuses to publish once the publish stop is set
   or the record says unlinked, so nothing goes out whichever path a publish comes from; build account publishers only
-  through it (`clippy.toml` bans the other ways). The engine stores a removal before the app marks it, so before it
+  through it (`clippy.toml` bans the other ways). They also send no event over a relay's known limit
+  (`transport_nostr::KnownLimitPublishClient`, mdk#2334). The engine stores a removal before the app marks it, so before it
   hands out the first publisher for an account in a process, it looks once for a stored removal no record shows (a crash
   between the two) and stops the account; only a client can tell an unlink from a failed link, so its open decides and
   lifts the stop for a failed link (`lift_failed_link_publish_stop`). The stop is in memory and otherwise cleared only
