@@ -1,0 +1,35 @@
+{
+  "notes": [
+    "Founding-create Welcome sizes for the White Noise profile, measured by marmot-app's tests::relay_event_limits::a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary with the real engine, peeler and relay-plane adapter (mdk#2334).",
+    "members counts the founder, so a create sends members - 1 gift wraps, one per invitee, all the same size.",
+    "mls_welcome_bytes is the MLS Welcome; rumor_json_bytes the kind 444 rumor JSON; seal_json_bytes the kind 13 seal JSON, which is the gift wrap's NIP-44 plaintext; gift_wrap_json_bytes the signed kind 1059 event JSON, the size relays limit and size classes bucket.",
+    "Rows: a two-member chat, then the largest roster whose gift wrap fits 64 KiB (65,536 bytes) and the next one up. NIP-44 padding grows the wrap in steps, so the boundary moves only when the codec does.",
+    "When the codec changes, the test fails and prints the measured rows; replace these with them, keeping the two rosters on either side of 64 KiB."
+  ],
+  "rows": [
+    {
+      "members": 2,
+      "mls_welcome_bytes": 1469,
+      "rumor_json_bytes": 2272,
+      "seal_json_bytes": 3847,
+      "gift_wrap_json_bytes": 5969,
+      "gift_wrap_size_class": "under_64_kib"
+    },
+    {
+      "members": 40,
+      "mls_welcome_bytes": 21265,
+      "rumor_json_bytes": 28668,
+      "seal_json_bytes": 38663,
+      "gift_wrap_json_bytes": 55121,
+      "gift_wrap_size_class": "under_64_kib"
+    },
+    {
+      "members": 41,
+      "mls_welcome_bytes": 21777,
+      "rumor_json_bytes": 29348,
+      "seal_json_bytes": 44123,
+      "gift_wrap_json_bytes": 66045,
+      "gift_wrap_size_class": "from_64_to_128_kib"
+    }
+  ]
+}
