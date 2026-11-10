@@ -42,6 +42,7 @@ use cgka_traits::{
     TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    WelcomeSizeCheck,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -3491,23 +3492,33 @@ where
         .await
     }
 
+    /// A founder's Welcome that fits none of the relays its publish would
+    /// reach refuses the create before anything is written, with
+    /// `EngineError::WelcomeTooLarge` (mdk#2334).
     pub async fn prepare_create_group_with_optional_app_components_and_audit_context(
         &mut self,
         request: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
+        let welcome_sizes = WelcomeSizes {
+            adapter: &self.adapter,
+            routing: &self.routing,
+        };
         Ok(self
             .session
             .create_group_with_optional_app_components_and_audit_context(
                 request,
                 optional_app_components,
+                Some(&welcome_sizes),
                 context,
             )
             .await?)
     }
 
     /// Prepare a chat whose founding Add includes authenticated private sibling KeyPackages.
+    /// The ordinary founders' Welcomes are checked as for
+    /// [`Self::prepare_create_group_with_optional_app_components_and_audit_context`].
     pub async fn prepare_create_group_with_siblings_and_audit_context(
         &mut self,
         request: CreateGroupRequest,
@@ -3515,12 +3526,17 @@ where
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
+        let welcome_sizes = WelcomeSizes {
+            adapter: &self.adapter,
+            routing: &self.routing,
+        };
         Ok(self
             .session
             .prepare_create_group_with_siblings_and_audit_context(
                 request,
                 optional_app_components,
                 siblings,
+                Some(&welcome_sizes),
                 context,
             )
             .await?)
@@ -3695,15 +3711,12 @@ where
         if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
             return refused(OversizedArtifact::Commit, size_class);
         }
-        let welcomes = prepared.welcomes.iter().filter_map(|welcome| {
-            let target = self.routing.publish_target(welcome).ok()?;
-            Some(async move { adapter.size_class_over_known_limits(welcome, &target).await })
-        });
-        let size_class = futures::future::join_all(welcomes)
-            .await
-            .into_iter()
-            .flatten()
-            .next()?;
+        // The same check a founding create runs on its Welcomes.
+        let welcome_sizes = WelcomeSizes {
+            adapter,
+            routing: &self.routing,
+        };
+        let size_class = welcome_sizes.oversized_welcome(&prepared.welcomes).await?;
         refused(OversizedArtifact::Welcome, size_class)
     }
 
@@ -7038,6 +7051,42 @@ fn transport_retry_delay_ms(target: &TransportFanoutTarget, now_ms: u64) -> Opti
 
 /// The failure of an invite refused before its commit was published because
 /// an artifact of it fits none of its relays' known limits (mdk#2334).
+/// Welcomes judged against the relays their publish would reach: each by the
+/// target the routing policy resolves for it, and the adapter's own endpoint
+/// rule for that target (mdk#2334).
+struct WelcomeSizes<'a, A, R> {
+    adapter: &'a A,
+    routing: &'a R,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl<A, R> WelcomeSizeCheck for WelcomeSizes<'_, A, R>
+where
+    A: TransportAdapter,
+    R: TransportRoutingPolicy,
+{
+    async fn oversized_welcome(
+        &self,
+        welcomes: &[TransportMessage],
+    ) -> Option<cgka_traits::EventSizeClass> {
+        // A Welcome without a route fails when it is published.
+        let checks = welcomes.iter().filter_map(|welcome| {
+            let target = self.routing.publish_target(welcome).ok()?;
+            Some(async move {
+                self.adapter
+                    .size_class_over_known_limits(welcome, &target)
+                    .await
+            })
+        });
+        futures::future::join_all(checks)
+            .await
+            .into_iter()
+            .flatten()
+            .next()
+    }
+}
+
 fn refused_before_publishing(
     message_id: cgka_traits::MessageId,
     oversized: OversizedEvent,

@@ -1352,18 +1352,34 @@ impl<S: StorageProvider> Engine<S> {
         req: CreateGroupRequest,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        self.create_group_with_optional_app_components_and_audit_context(req, Vec::new(), context)
-            .await
+        self.create_group_with_optional_app_components_and_audit_context(
+            req,
+            Vec::new(),
+            None,
+            context,
+        )
+        .await
     }
 
+    /// `welcome_check` judges the founders' Welcomes before anything is
+    /// written; a Welcome it finds too large refuses the create with
+    /// [`EngineError::WelcomeTooLarge`] (mdk#2334).
     pub async fn create_group_with_optional_app_components_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        self.create_group_audited(req, optional_app_components, Vec::new(), None, context)
-            .await
+        self.create_group_audited(
+            req,
+            optional_app_components,
+            Vec::new(),
+            None,
+            welcome_check,
+            context,
+        )
+        .await
     }
 
     /// Create a chat with private KeyPackages authenticated by the trusted device group.
@@ -1371,15 +1387,26 @@ impl<S: StorageProvider> Engine<S> {
     /// Welcomes are retained atomically with creation for delivery inside the device group.
     /// Siblings are optional: candidates whose eligibility cannot be established are
     /// omitted before staging, while ordinary-founder and creation failures remain errors.
+    /// `welcome_check` judges the ordinary founders' Welcomes, never the
+    /// siblings', as for
+    /// [`Self::create_group_with_optional_app_components_and_audit_context`].
     pub async fn create_group_with_siblings_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
+        welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        self.create_group_audited(req, optional_app_components, siblings, None, context)
-            .await
+        self.create_group_audited(
+            req,
+            optional_app_components,
+            siblings,
+            None,
+            welcome_check,
+            context,
+        )
+        .await
     }
 
     /// Create a group under `group_id`, chosen by the host before the group
@@ -1406,7 +1433,7 @@ impl<S: StorageProvider> Engine<S> {
             roster_update,
             welcome_deliver_until,
         };
-        self.create_group_audited(req, Vec::new(), Vec::new(), Some(chosen), context)
+        self.create_group_audited(req, Vec::new(), Vec::new(), Some(chosen), None, context)
             .await
     }
 
@@ -1416,6 +1443,7 @@ impl<S: StorageProvider> Engine<S> {
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         chosen: Option<crate::group_lifecycle::ChosenGroup>,
+        welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         let operation_id = self.next_audit_operation_id();
@@ -1437,7 +1465,13 @@ impl<S: StorageProvider> Engine<S> {
         // `group_context` row carries no context of its own and inherits it.
         let mut engine = OperationAuditScope::enter(self, context.clone());
         let result = engine
-            .do_create_group(req, optional_app_components, siblings, chosen)
+            .do_create_group(
+                req,
+                optional_app_components,
+                siblings,
+                chosen,
+                welcome_check,
+            )
             .await;
         match &result {
             Ok((group_id, send_result)) => {
@@ -4726,6 +4760,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.create_group_with_optional_app_components_and_audit_context(
             req,
             optional_app_components,
+            None,
             None,
         )
         .await

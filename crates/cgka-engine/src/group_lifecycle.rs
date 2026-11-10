@@ -377,6 +377,7 @@ impl<S: StorageProvider> Engine<S> {
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         chosen: Option<ChosenGroup>,
+        welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         if self.new_protocol_profile == ProtocolProfile::Legacy {
             self.epoch_manager.ensure_pending_space()?;
@@ -855,6 +856,14 @@ impl<S: StorageProvider> Engine<S> {
                 .map_err(EngineError::Peeler)?;
                 welcomes.push(wrapped);
             }
+        }
+        // A founder's Welcome that fits none of the relays its publish would
+        // reach refuses the creation here, before its canonical write; the
+        // cleanup guard removes the MLS group (mdk#2334).
+        if let Some(check) = welcome_check
+            && let Some(size_class) = check.oversized_welcome(&welcomes).await
+        {
+            return Err(EngineError::WelcomeTooLarge { size_class });
         }
 
         // Capture the authenticated founding result, not a later epoch. A

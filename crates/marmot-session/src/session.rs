@@ -1240,6 +1240,7 @@ impl AccountDeviceSession {
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
         tracing::debug!(
@@ -1255,6 +1256,7 @@ impl AccountDeviceSession {
             .create_group_with_optional_app_components_and_audit_context(
                 req,
                 optional_app_components,
+                welcome_check,
                 Some(context),
             )
             .await?;
@@ -1273,6 +1275,7 @@ impl AccountDeviceSession {
         request: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
+        welcome_check: Option<&dyn cgka_traits::WelcomeSizeCheck>,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
         let (group_id, result) = self
@@ -1281,6 +1284,7 @@ impl AccountDeviceSession {
                 request,
                 optional_app_components,
                 siblings,
+                welcome_check,
                 Some(context),
             )
             .await?;

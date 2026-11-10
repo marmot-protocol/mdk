@@ -5248,3 +5248,99 @@ async fn failed_legacy_founding_preserves_an_existing_live_route() {
         cgka_traits::ingest::IngestOutcome::Processed
     );
 }
+
+/// A create whose founders' Welcomes the size check finds too large is refused
+/// before its canonical write: no group, no events, no orphaned OpenMLS state,
+/// and the same founders can be added once the Welcomes fit (mdk#2334).
+#[tokio::test]
+async fn create_whose_welcome_fails_the_size_check_writes_no_group() {
+    use cgka_traits::{EventSizeClass, WelcomeSizeCheck};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Sizes {
+        answer: Option<EventSizeClass>,
+        judged: AtomicUsize,
+    }
+    #[async_trait]
+    impl WelcomeSizeCheck for Sizes {
+        async fn oversized_welcome(&self, welcomes: &[TransportMessage]) -> Option<EventSizeClass> {
+            self.judged.store(welcomes.len(), Ordering::SeqCst);
+            self.answer
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("oversized-welcome-create.sqlite");
+    let database_key = SqlCipherKey::raw([0x34; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
+    let mut alice = build_profile_client_on_storage(
+        b"alice-oversized-welcome",
+        storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let mut bob = build_current_client(b"bob-oversized-welcome");
+    let mut carol = build_current_client(b"carol-oversized-welcome");
+    let founders = vec![
+        bob.fresh_key_package().await.unwrap(),
+        carol.fresh_key_package().await.unwrap(),
+    ];
+    let request = || CreateGroupRequest {
+        name: "oversized welcome".into(),
+        description: String::new(),
+        members: founders.clone(),
+        required_features: vec![],
+        app_components: vec![],
+        initial_admins: vec![],
+    };
+    let before = encrypted_openmls_rows(&database, &database_key);
+
+    let too_large = Sizes {
+        answer: Some(EventSizeClass::From64To128Kib),
+        judged: AtomicUsize::new(0),
+    };
+    let refused = alice
+        .create_group_with_optional_app_components_and_audit_context(
+            request(),
+            Vec::new(),
+            Some(&too_large),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::WelcomeTooLarge {
+                size_class: EventSizeClass::From64To128Kib
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        too_large.judged.load(Ordering::SeqCst),
+        2,
+        "the check judged each founder's Welcome"
+    );
+    assert!(storage.list_groups().unwrap().is_empty());
+    assert!(alice.drain_events().is_empty());
+    assert!(
+        encrypted_openmls_rows(&database, &database_key) == before,
+        "the refused create left OpenMLS state"
+    );
+
+    let fits = Sizes {
+        answer: None,
+        judged: AtomicUsize::new(0),
+    };
+    let (group_id, _) = alice
+        .create_group_with_optional_app_components_and_audit_context(
+            request(),
+            Vec::new(),
+            Some(&fits),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fits.judged.load(Ordering::SeqCst), 2);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+}

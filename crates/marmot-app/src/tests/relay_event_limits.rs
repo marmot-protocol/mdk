@@ -84,10 +84,11 @@ async fn group_events_over_a_known_limit_are_refused_unsent() {
     );
 }
 
-/// A Welcome over every inbox relay's known limit is never sent. It stays
-/// owed, and its pending delivery names its size like a relay's refusal.
+/// A create whose founding Welcome fits none of the invitee's inbox relays is
+/// refused before anything is written: no group, no Welcome owed, and nothing
+/// reaches a relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_welcome_over_the_inbox_limit_stays_owed_with_its_size() {
+async fn a_create_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -102,21 +103,71 @@ async fn a_welcome_over_the_inbox_limit_stays_owed_with_its_size() {
         .await
         .unwrap();
     let mut alice = app.client("alice").await.unwrap();
+    let attempted = relay.attempted_events().len();
+
+    let error = alice
+        .create_group("invite", &[&bob.account_id_hex])
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            AppError::EventTooLarge {
+                artifact: OversizedArtifact::Welcome,
+                size_class: EventSizeClass::Under64Kib,
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(app.groups("alice").unwrap().is_empty(), "no group was made");
+    assert!(alice.pending_welcome_deliveries().unwrap().is_empty());
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "nothing reached a relay"
+    );
+}
+
+/// A founding Welcome that fits one of the invitee's inbox relays passes the
+/// check, and publish sends it to exactly that relay: the check and publish
+/// judge the same relays (mdk#2334).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_whose_welcome_fits_one_inbox_relay_sends_it_only_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_with_event_limits(&dir, relay.clone(), &[("wss://inbox.example", 200)]);
+    let mut inboxes = AccountRelayListStatus::empty();
+    inboxes.inbox.created_at = 1;
+    inboxes.inbox.relays = vec!["wss://inbox.example".into(), "wss://open.example".into()];
+    inboxes.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&bob.account_id_hex, &inboxes)
+        .unwrap();
+    app.client("bob")
+        .await
+        .unwrap()
+        .publish_key_package()
+        .await
+        .unwrap();
+    let mut alice = app.client("alice").await.unwrap();
 
     alice
         .create_group("invite", &[&bob.account_id_hex])
         .await
         .unwrap();
 
-    let owed = alice.pending_welcome_deliveries().unwrap();
-    assert_eq!(owed.len(), 1, "the refused Welcome stays owed");
-    assert_eq!(owed[0].size_class, Some(EventSizeClass::Under64Kib));
-    assert!(
-        relay
-            .attempted_events()
-            .iter()
-            .all(|event| event.kind != 1059),
-        "no Welcome reached a relay"
+    let welcome_routes: Vec<_> = relay
+        .attempted_routes()
+        .into_iter()
+        .filter(|(kind, _)| *kind == 1059)
+        .collect();
+    assert_eq!(
+        welcome_routes,
+        [(1059, vec![TransportEndpoint("wss://open.example".into())])]
     );
 }
 

@@ -112,6 +112,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::SiblingWelcomeHeld { .. }
         | EngineError::SiblingWelcomePredatesForget
         | EngineError::UnexpectedDeviceGroupWelcome
+        | EngineError::WelcomeTooLarge { .. }
         | EngineError::Other(_) => false,
     }
 }
