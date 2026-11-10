@@ -3222,13 +3222,122 @@ Free a message update returned by this library. NULL is a no-op.
 <details>
 <summary>marmot_n…</summary>
 
+### `marmot_nip46_pairing_offer`
+
+```c
+MarmotStatus marmot_nip46_pairing_offer(const struct MarmotNip46Session *session, char **out);
+```
+
+Install the client-pairing listener and await relay subscription acknowledgements before returning its credential-bearing URI. Display the URI only after this call succeeds, then connect while the pairing UI is visible. Requires explicit permission approval and an unpaired client-initiated session. Blocks; run off the UI thread. Free the URI with `marmot_string_free`.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13056)
+
+### `marmot_nip46_approve_grants`
+
+```c
+MarmotStatus marmot_nip46_approve_grants(const struct MarmotNip46Session *session, uint32_t version, const char *const *grants, uintptr_t grants_len);
+```
+
+Approve the exact version and grants previously returned by review, after user consent. Inputs are borrowed for the call. Missing review or changed grants return `MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED`; no network request starts.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13124)
+
+### `marmot_nip46_cancel_request`
+
+```c
+MarmotStatus marmot_nip46_cancel_request(const struct MarmotNip46Session *session, const char *request_id);
+```
+
+Cancel one matching pending request without terminally cancelling the session. Stale IDs return `MARMOT_STATUS_INVALID_ARGUMENT`. The string is borrowed for the call.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13148)
+
+### `marmot_nip46_complete_auth`
+
+```c
+MarmotStatus marmot_nip46_complete_auth(const struct MarmotNip46Session *session, const char *request_id);
+```
+
+Acknowledge the auth challenge identified by the current status request ID. This does not complete its RPC, which still requires the signer's final response. Stale IDs return `MARMOT_STATUS_INVALID_ARGUMENT`.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13156)
+
+### `marmot_nip46_disconnect`
+
+```c
+MarmotStatus marmot_nip46_disconnect(const struct MarmotNip46Session *session);
+```
+
+Interrupt transport work and advance the session generation. A later explicit connect can reconnect; persisted credentials are not removed. May race operations, but never handle free.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13141)
+
+### `marmot_nip46_ping`
+
+```c
+MarmotStatus marmot_nip46_ping(const struct MarmotNip46Session *session);
+```
+
+Check the remote signer through the shared transport. Blocks; run off the UI thread. Transport and signer failures use the existing timeout/external-signer status codes.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13134)
+
+### `marmot_nip46_remove`
+
+```c
+MarmotStatus marmot_nip46_remove(const struct MarmotClient *client, const char *account_ref);
+```
+
+Detach the account-scoped shared signer and remove its persisted communication credentials. This does not replace account sign-out or account data wiping. Account input is borrowed; blocks on the runtime.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13173)
+
+### `marmot_nip46_resume`
+
+```c
+MarmotStatus marmot_nip46_resume(const struct MarmotClient *client, const char *account_ref, struct MarmotNip46Session **out);
+```
+
+Obtain the session restored from MDK-owned account credentials, without a host descriptor or callback. Persisted permission approval is retained. Out is cleared before runtime work; free the handle with `marmot_nip46_free` before its creating client.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13164)
+
+### `marmot_nip46_review_grants`
+
+```c
+MarmotStatus marmot_nip46_review_grants(const struct MarmotNip46Session *session, char **out);
+```
+
+Record the required permission snapshot and return JSON `version` and `grants` for display. Review does not approve. No network access; free the JSON string with `marmot_string_free`. A NULL out pointer refuses the operation before recording review.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13117)
+
 ### `marmot_nip46_cancel`
+ 
 
 ```c
 void marmot_nip46_cancel(const struct MarmotNip46Session *session);
 ```
 
-Interrupt pending requests without revoking a saved export. Nonblocking and NULL-safe; may race calls, never free.
+Permanently cancel this session's pending work without removing MDK-owned credentials or revoking a saved export. Nonblocking and NULL-safe; may race calls, never free.
 
 [Header contract](include/marmot.h#L13279)
 
@@ -3279,7 +3388,7 @@ Set `inbox_relays` independently, or pass `NULL, 0` to reuse the default relays.
 MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
 ```
 
-Attempt bounded remote logout and clear local session keys even without acknowledgement. Complete MDK signout and remove the vault export first. Run off UI.
+Attempt bounded remote logout and clear local session keys even without acknowledgement. This directly revokes a session, not the MDK account. Account signout already erases owned credentials, so a later logout reports an already logged-out session without another remote request. Run off UI; remove any optional host vault export when revoking credentials.
 
 [Header contract](include/marmot.h#L13287)
 
@@ -3289,7 +3398,7 @@ Attempt bounded remote logout and clear local session keys even without acknowle
 MarmotStatus marmot_nip46_new(const struct MarmotClient *client, const char *config_json, struct MarmotNip46Session **out);
 ```
 
-Create an offline session from a bunker URI, pairing configuration, or exported descriptor. The client must outlive the handle. See the session lifecycle for configuration fields.
+Create an offline shared session from a bunker URI, pairing configuration, or exported descriptor. The client must outlive the handle. Review and approve permissions before URI access or connection; imports never silently approve grants. See the session lifecycle for configuration fields.
 
 [Header contract](include/marmot.h#L13212)
 
@@ -3299,7 +3408,7 @@ Create an offline session from a bunker URI, pairing configuration, or exported 
 MarmotStatus marmot_nip46_register(const struct MarmotClient *client, const char *account_ref, const struct MarmotNip46Session *session);
 ```
 
-Attach the pinned signer to an existing account and activate its worker. On restart, start local accounts first, then connect/register each external account independently off UI.
+Attach an explicitly approved imported descriptor to an existing account, persist its verified credentials, and activate its worker. Ordinary cold startup restores owned sessions automatically; use `marmot_nip46_resume` for their handles. A different attached session must be removed before replacement.
 
 [Header contract](include/marmot.h#L13263)
 
@@ -3313,13 +3422,37 @@ Read nonblocking JSON status and any intermediate approval URL, without session 
 
 [Header contract](include/marmot.h#L13272)
 
+### `marmot_nip46_status`
+
+```c
+MarmotStatus marmot_nip46_status(const struct MarmotNip46Session *session, struct MarmotNip46Status **out);
+```
+
+Read local typed state/error vocabulary, optional auth URL and request ID, and generation without keys or request payloads. `last_error` is valid only when `has_last_error` is true. Distinguishes cancellation from remote rejection independently of legacy status-code compatibility. Out is cleared before work; no network access.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13109)
+
+### `marmot_nip46_status_free`
+
+```c
+void marmot_nip46_status_free(struct MarmotNip46Status *ptr);
+```
+
+Deep-free the status record and its optional strings. NULL is a no-op. Embedded strings are owned by the record and must not be freed separately.
+
+[Session contract](README.md#nip-46-accounts)
+
+[Header contract](include/marmot.h#L13032)
+
 ### `marmot_nip46_uri`
 
 ```c
 MarmotStatus marmot_nip46_uri(const struct MarmotNip46Session *session, char **out);
 ```
 
-Read the credential-bearing pairing link without network IO. Show or copy it only for the user; free with `marmot_string_free`.
+Read the credential-bearing pairing link locally after permission approval. This accessor does not install a listener; use `marmot_nip46_pairing_offer` before displaying a client-initiated QR code. Never log either URI; free it with `marmot_string_free`.
 
 [Header contract](include/marmot.h#L13221)
 

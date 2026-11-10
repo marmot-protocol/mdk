@@ -7,6 +7,22 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Changed
+
+- NIP-46 handles wrap MDK's shared session transport instead of a C-only signer.
+  Existing C signatures and status numbers are unchanged. New permission review
+  and approval calls are required before pairing or connection, including imports
+  of old unversioned descriptors. Add relay-ready pairing offers, ping, reconnectable disconnect, request-scoped
+  cancellation, auth-challenge completion, MDK-owned resume, and credential removal.
+  `marmot_nip46_status` returns typed state/error metadata and owned optional
+  strings; release the record with `marmot_nip46_status_free`. Cancellation and
+  rejection remain distinct in the typed error vocabulary even when their legacy
+  `MarmotStatus` is the same.
+  Login/register persist account-scoped credentials through the configured secret
+  store; client startup restores them before workers. State/export JSON retains
+  its existing fields and adds versioned permission and typed status metadata.
+  Optional host exports remain secret and require encrypted storage.
+
 ## [0.16.0] - 2026-11-11
 
 ### Breaking changes

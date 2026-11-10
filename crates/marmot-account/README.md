@@ -13,6 +13,9 @@ account identity.
   external-signer account records.
 - Stores signing keys behind an injectable `AccountSecretStore`: a platform keychain/credential-store backend
   (patterned after White Noise) and a local file backend for deterministic tests and development.
+- Persists NIP-46 communication keys separately from user signing keys and database credentials, with
+  crash-discoverable metadata and retryable local removal. The protocol and permission approval live in
+  `marmot-app`; see [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions).
 - Journals account setup and onboarding so an interrupted setup can resume or be cancelled cleanly.
 - Exports a signing key as a NIP-49 `ncryptsec` backup.
 

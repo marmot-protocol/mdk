@@ -450,6 +450,8 @@ pub enum MarmotKitError {
     /// mismatch rather than a retryable runtime error.
     #[error("external signer public key does not match account")]
     ExternalSignerMismatch,
+    #[error("{reason}")]
+    Nip46 { reason: crate::Nip46ErrorFfi },
     /// The user rejected/cancelled an external signer prompt. Typed separately
     /// from runtime failures so clients can keep the user in the flow or offer a
     /// retry without treating the account as broken.
@@ -841,6 +843,9 @@ impl From<&AppError> for MarmotKitError {
                 account: account.clone(),
             },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
+            AppError::Nip46(error) => Self::Nip46 {
+                reason: error.clone().into(),
+            },
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
             AppError::InvalidSticker(details) => Self::InvalidSticker {
                 details: details.clone(),
@@ -1046,7 +1051,7 @@ mod tests {
     #[test]
     fn account_and_runtime_refusals_keep_distinct_host_actions() {
         type Expected = fn(&MarmotKitError) -> bool;
-        let cases: [(AppError, Expected); 8] = [
+        let cases: [(AppError, Expected); 9] = [
             (
                 AppError::AccountHome(AccountHomeError::AccountUnlinked("alice".into())),
                 |e| matches!(e, MarmotKitError::AccountUnlinked { account_ref } if account_ref == "alice"),
@@ -1060,6 +1065,17 @@ mod tests {
             (AppError::ExternalSignerMismatch, |e| {
                 matches!(e, MarmotKitError::ExternalSignerMismatch)
             }),
+            (
+                AppError::Nip46(marmot_app::Nip46Error::PermissionApprovalRequired),
+                |e| {
+                    matches!(
+                        e,
+                        MarmotKitError::Nip46 {
+                            reason: crate::Nip46ErrorFfi::PermissionApprovalRequired
+                        }
+                    )
+                },
+            ),
             (AppError::OnboardingActionUnavailable, |e| {
                 matches!(e, MarmotKitError::OnboardingActionUnavailable)
             }),

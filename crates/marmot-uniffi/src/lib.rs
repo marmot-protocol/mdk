@@ -45,6 +45,7 @@ pub use conversions::PendingWelcomeDeliveryFfi;
 mod errors;
 mod external_signer;
 mod markdown;
+mod nip46;
 mod publisher;
 mod secret_store;
 mod tokio_runtime;
@@ -65,6 +66,9 @@ pub use markdown::{
     MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
     MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
     MarkdownTimestampStyleFfi,
+};
+pub use nip46::{
+    Nip46ErrorFfi, Nip46PermissionsFfi, Nip46SessionFfi, Nip46StateFfi, Nip46StatusFfi,
 };
 pub use secret_store::SecretStore;
 pub use subscriptions::{ConversationWindowSubscription, RelayLivenessSubscription};

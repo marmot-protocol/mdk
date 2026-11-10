@@ -11,7 +11,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{
-    read_json, read_private_json, validate_account_label, write_private_bytes, write_private_json,
+    read_json, read_private_json, read_private_json_bounded, validate_account_label,
+    write_private_bytes, write_private_json,
 };
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
@@ -20,6 +21,10 @@ use crate::secret_store::{
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
 const EXTERNAL_DATABASE_CREDENTIAL_PREFIX: &str = ".external-sqlcipher/";
+const NIP46_CREDENTIAL_PREFIX: &str = ".nip46-client/";
+const NIP46_SESSION_FILE: &str = ".nip46-session.json";
+const NIP46_REMOVING_FILE: &str = ".nip46-session-removing.json";
+const MAX_NIP46_RECORD_BYTES: u64 = 128 * 1024;
 const ACCOUNT_SETUP_STATE_FILE: &str = ".account-setup.json";
 const ACCOUNT_SETUP_CONTEXT_FILE: &str = ".account-setup-context.json";
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
@@ -54,21 +59,16 @@ static TOMBSTONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// not atomic; callers needing concurrent imports must serialize
 /// mutations externally.
 ///
-/// [`AccountHome::remove_account`] is the exception: it holds an internal
-/// mutation lock across its shared-credential check and the matching
-/// `remove_secret` call, so concurrent `remove_account` calls on twin
-/// records sharing a credential cannot both skip deletion and orphan it.
+/// Session credential mutations and [`AccountHome::remove_account`] share an
+/// internal mutation lock. Removals on twin records sharing a credential cannot
+/// both skip deletion and orphan it.
 #[derive(Clone)]
 pub struct AccountHome {
     root: PathBuf,
     secret_store: Arc<dyn AccountSecretStore>,
     /// Serializes mutating operations whose check-then-act sequences would
-    /// otherwise race against concurrent callers. Currently held by
-    /// [`AccountHome::remove_account`] to make the
-    /// `secret_shared_with_other_record` check and the matching
-    /// `remove_secret` call atomic, so two concurrent removals on twin
-    /// records cannot both observe the other as still present and skip
-    /// deleting the shared credential.
+    /// otherwise race against concurrent callers, including session credential
+    /// writes/removals and the account wipe commit point.
     mutation_lock: Arc<Mutex<()>>,
 }
 
@@ -77,7 +77,7 @@ pub struct AccountSummary {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
-    /// The account signs through a host-provided external signer instead of a
+    /// The account signs through an external signer instead of a
     /// local nsec. Public/tracked accounts keep both signing flags false.
     #[serde(default)]
     pub external_signing: bool,
@@ -92,6 +92,83 @@ pub struct AccountSummary {
     /// only be wiped, and coming back is a new link (mdk#2628 D67).
     #[serde(default)]
     pub unlinked: bool,
+}
+
+/// Nonsecret, versioned metadata for an account's remote-signing session.
+/// The communication key is stored separately through [`AccountSecretStore`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Nip46SessionRecord {
+    pub version: u32,
+    pub user_public_key: String,
+    pub remote_signer_public_key: String,
+    pub client_public_key: String,
+    pub relays: Vec<String>,
+    pub name: String,
+    pub permission_version: u32,
+    pub permissions: Vec<String>,
+}
+
+/// Whether cleanup knows that this account owns a NIP-46 credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nip46Removal {
+    /// Generic external-account cleanup must not query an unrelated host vault.
+    Recorded,
+    /// Explicit NIP-46 removal also revokes a key whose metadata was lost.
+    IncludingOrphaned,
+}
+
+fn invalid_nip46_record() -> AccountHomeError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid NIP-46 session metadata",
+    )
+    .into()
+}
+
+impl Nip46SessionRecord {
+    fn validate(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        if !account.external_signing || account.local_signing {
+            return Err(AccountHomeError::InvalidSecretKey);
+        }
+        if self.version != 1
+            || self.permission_version == 0
+            || self.relays.is_empty()
+            || self.relays.len() > 16
+            || self.name.len() > 256
+            || self.name.chars().any(char::is_control)
+            || self.permissions.len() > 64
+            || self.permissions.iter().any(|grant| {
+                grant.is_empty()
+                    || grant.len() > 256
+                    || !grant.is_ascii()
+                    || grant.bytes().any(|byte| byte.is_ascii_control())
+            })
+            || self.relays.iter().any(|relay| {
+                relay.len() > 2048
+                    || relay.chars().any(char::is_control)
+                    || nostr::prelude::RelayUrl::parse(relay).is_err()
+            })
+        {
+            return Err(invalid_nip46_record());
+        }
+        for public_key in [
+            &self.user_public_key,
+            &self.remote_signer_public_key,
+            &self.client_public_key,
+        ] {
+            if public_key.len() != 64
+                || !nostr::prelude::PublicKey::from_hex(public_key)
+                    .is_ok_and(|key| key.to_hex() == *public_key)
+            {
+                return Err(AccountHomeError::InvalidPublicKey);
+            }
+        }
+        if self.user_public_key != account.account_id_hex {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Whether a missing external device key may be created before any database exists.
@@ -194,8 +271,12 @@ struct StoredKeySecurity {
 }
 
 fn external_database_credential(account: &AccountSummary) -> AccountSummary {
+    synthetic_credential(account, EXTERNAL_DATABASE_CREDENTIAL_PREFIX)
+}
+
+fn synthetic_credential(account: &AccountSummary, prefix: &str) -> AccountSummary {
     use sha2::{Digest, Sha256};
-    let label = format!("{EXTERNAL_DATABASE_CREDENTIAL_PREFIX}{}", account.label);
+    let label = format!("{prefix}{}", account.label);
     let account_id_hex = hex::encode(Sha256::digest(label.as_bytes()));
     AccountSummary {
         label,
@@ -1012,6 +1093,186 @@ impl AccountHome {
         Ok(Zeroizing::new(secret))
     }
 
+    /// Store a verified remote-signing session without storing its key in metadata.
+    /// Replacing the communication key requires explicit session removal first.
+    pub fn store_nip46_session(
+        &self,
+        account_ref: &str,
+        keys: &nostr::prelude::Keys,
+        record: &Nip46SessionRecord,
+    ) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        record.validate(&account)?;
+        if record.client_public_key != keys.public_key().to_hex() {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        let directory = self.account_dir(&account.label);
+        if directory.join(NIP46_REMOVING_FILE).try_exists()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "NIP-46 session removal is incomplete; retry removal",
+            )
+            .into());
+        }
+        let path = directory.join(NIP46_SESSION_FILE);
+        let previous = self.read_nip46_record(&account)?;
+        if previous.as_ref().is_some_and(|previous| {
+            previous.client_public_key != record.client_public_key
+                || previous.remote_signer_public_key != record.remote_signer_public_key
+        }) {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        let credential = synthetic_credential(&account, NIP46_CREDENTIAL_PREFIX);
+        let exists = self.secret_store.has_secret_for_label(&credential.label)?
+            || self
+                .secret_store
+                .has_secret_for_account_id(&credential.account_id_hex)?;
+        if previous.is_some() && !exists {
+            return Err(AccountHomeError::SecretNotFound(credential.label));
+        }
+        if exists {
+            if self.secret_store.load_secret(&credential)?.secret_key() != keys.secret_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            write_private_json(&path, record)?;
+        } else {
+            // Publish a public descriptor before entering the secret store. A
+            // crash after the key write remains discoverable on cold restore.
+            write_private_json(&path, record)?;
+            let written = self
+                .secret_store
+                .write_secret(&credential, keys)
+                .and_then(|()| {
+                    if self.secret_store.load_secret(&credential)?.secret_key() != keys.secret_key()
+                    {
+                        return Err(AccountHomeError::AccountIdMismatch);
+                    }
+                    Ok(())
+                });
+            if let Err(error) = written {
+                self.secret_store.remove_secret(&credential)?;
+                fs::remove_file(&path)?;
+                #[cfg(unix)]
+                fs::File::open(directory)?.sync_all()?;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore metadata and its separate communication key. Corruption is an error.
+    pub fn load_nip46_session(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<(nostr::prelude::Keys, Nip46SessionRecord)>> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if self
+            .account_dir(&account.label)
+            .join(NIP46_REMOVING_FILE)
+            .try_exists()?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "NIP-46 session removal is incomplete; retry removal",
+            )
+            .into());
+        }
+        let Some(record) = self.read_nip46_record(&account)? else {
+            return Ok(None);
+        };
+        let keys = self
+            .secret_store
+            .load_secret(&synthetic_credential(&account, NIP46_CREDENTIAL_PREFIX))?;
+        if keys.public_key().to_hex() != record.client_public_key {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        Ok(Some((keys, record)))
+    }
+
+    /// Remove the session locally, without requiring the remote signer to respond.
+    /// A failed secret-store deletion leaves a removal record for an explicit retry.
+    pub fn remove_nip46_session(
+        &self,
+        account_ref: &str,
+        removal: Nip46Removal,
+    ) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if removal == Nip46Removal::Recorded {
+            let directory = self.account_dir(&account.label);
+            let mut recorded = false;
+            for name in [NIP46_SESSION_FILE, NIP46_REMOVING_FILE] {
+                match fs::symlink_metadata(directory.join(name)) {
+                    Ok(_) => {
+                        recorded = true;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !recorded {
+                return Ok(());
+            }
+        }
+        self.remove_nip46_session_inner(&account)
+    }
+
+    fn read_nip46_record(
+        &self,
+        account: &AccountSummary,
+    ) -> AccountHomeResult<Option<Nip46SessionRecord>> {
+        let path = self.account_dir(&account.label).join(NIP46_SESSION_FILE);
+        let record: Nip46SessionRecord =
+            match read_private_json_bounded(&path, MAX_NIP46_RECORD_BYTES) {
+                Ok(record) => record,
+                Err(AccountHomeError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        record.validate(account)?;
+        Ok(Some(record))
+    }
+
+    fn remove_nip46_session_inner(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        let directory = self.account_dir(&account.label);
+        let path = directory.join(NIP46_SESSION_FILE);
+        let removing = directory.join(NIP46_REMOVING_FILE);
+        let credential = synthetic_credential(account, NIP46_CREDENTIAL_PREFIX);
+        if !path.try_exists()?
+            && !removing.try_exists()?
+            && !self.secret_store.has_secret_for_label(&credential.label)?
+            && !self
+                .secret_store
+                .has_secret_for_account_id(&credential.account_id_hex)?
+        {
+            return Ok(());
+        }
+        match fs::rename(&path, &removing) {
+            Ok(()) => {
+                #[cfg(unix)]
+                fs::File::open(&directory)?.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.secret_store.remove_secret(&credential)?;
+        match fs::remove_file(removing) {
+            Ok(()) => {
+                #[cfg(unix)]
+                fs::File::open(directory)?.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     /// List the complete account catalog or report a read error. Unlike `accounts`,
     /// this never hides an account whose record cannot be read or decoded.
     /// Metadata-probe errors also propagate: an inaccessible directory is not an
@@ -1120,7 +1381,9 @@ impl AccountHome {
     ///
     /// # All-or-nothing local wipe
     ///
-    /// The account directory is first **atomically renamed** out of the live
+    /// Any NIP-46 session credential is removed first; a secret-store failure
+    /// leaves the account live and its session removal available for retry.
+    /// The account directory is then **atomically renamed** out of the live
     /// `accounts/` namespace into a tombstone under [`WIPE_TOMBSTONE_DIR`]; only
     /// then are the secret and the tombstone bytes deleted. `fs::rename` within
     /// the same filesystem is atomic, so from the perspective of every live
@@ -1131,8 +1394,8 @@ impl AccountHome {
     /// This matters for destructive sign-out (`sign_out_and_wipe`): the issue
     /// invariant is that once the MLS-DB wipe starts it must complete, because a
     /// half-wiped MLS database is worse than either extreme. The rename is that
-    /// commit point. If the rename itself fails, nothing has been touched and
-    /// the error is safe to surface as "wipe did not start". If deleting the
+    /// commit point. If the rename itself fails, the account directory remains
+    /// intact, but its NIP-46 session may already be removed. If deleting the
     /// secret or the tombstone fails *after* the rename, the live account is
     /// already gone; the residual tombstone bytes are orphaned junk outside any
     /// live account, so the call still reports success rather than a forbidden
@@ -1191,6 +1454,10 @@ impl AccountHome {
                 return Err(AccountHomeError::AccountIdMismatch);
             }
         }
+
+        // The session credential lives outside the account directory. Delete it
+        // before the wipe commits so a vault failure remains actionable.
+        self.remove_nip46_session_inner(&account)?;
 
         // Commit point: atomically move the live account directory into the
         // tombstone namespace. After this returns Ok the account is no longer a

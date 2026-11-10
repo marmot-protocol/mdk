@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- Add `Nip46SessionFfi`, typed permission/status/state/error records, and Marmot
+  creation/login/register/resume/removal methods for Swift and Kotlin. MDK owns the
+  transport and account-scoped credentials; no host signer callback is retained.
+  New and imported sessions require explicit review and approval of the exact
+  permission snapshot. Runtime startup restores persisted sessions before workers.
+  Session operations include relay-ready pairing offers, ping, reconnectable disconnect, scoped cancellation,
+  auth-challenge completion, export, terminal cancellation, and bounded logout.
+  `MarmotKitError::Nip46` retains the typed session reason; exhaustive switches
+  need the new case. Local-key and arbitrary host callback APIs are unchanged.
+
 ## 0.16.0 - 2026-11-11
 
 ### Breaking changes

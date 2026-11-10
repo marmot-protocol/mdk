@@ -202,6 +202,87 @@ async fn root_lease_is_typed_busy_and_outlives_shutdown_until_handle_drop() {
     drop(reopened);
 }
 
+#[tokio::test]
+async fn nip46_binding_lifecycle() {
+    use marmot_uniffi::{Nip46ErrorFfi, Nip46StateFfi};
+
+    install_mock_keyring();
+    let root = tempfile::tempdir().unwrap();
+    let other_root = tempfile::tempdir().unwrap();
+    let open = |root: &std::path::Path| {
+        Marmot::new(
+            root.to_string_lossy().into_owned(),
+            vec!["wss://relay.invalid.test".into()],
+            marmot_uniffi::marmot_deployment_neutral(),
+        )
+        .unwrap()
+    };
+    let owner = open(root.path());
+    let other = open(other_root.path());
+    let session = owner
+        .clone()
+        .nip46_new(
+            serde_json::json!({"relays":["wss://relay.invalid.test"],"name":"Binding permissions"})
+                .to_string(),
+        )
+        .unwrap();
+    assert_eq!(session.status().state, Nip46StateFfi::PermissionApproval);
+    assert_eq!(
+        session.uri(),
+        Err(Nip46ErrorFfi::PermissionApprovalRequired)
+    );
+    let required = session.permissions();
+    assert_eq!(
+        session
+            .approve_permissions(required.version, required.grants.clone())
+            .await,
+        Err(Nip46ErrorFfi::PermissionApprovalRequired)
+    );
+    let reviewed = session.review_permissions();
+    let mut changed = reviewed.grants.clone();
+    changed.push("sign_event:1".into());
+    assert_eq!(
+        session.approve_permissions(reviewed.version, changed).await,
+        Err(Nip46ErrorFfi::PermissionApprovalRequired)
+    );
+    session
+        .approve_permissions(reviewed.version, reviewed.grants)
+        .await
+        .unwrap();
+    assert!(session.uri().unwrap().starts_with("nostrconnect://"));
+    assert!(matches!(
+        other
+            .clone()
+            .nip46_register("unknown".into(), session.clone())
+            .await,
+        Err(MarmotKitError::ExternalSignerMismatch)
+    ));
+    assert!(matches!(
+        other
+            .clone()
+            .nip46_login(session.clone(), vec![], vec![], vec![])
+            .await,
+        Err(MarmotKitError::ExternalSignerMismatch)
+    ));
+    assert_eq!(
+        session.cancel_request("stale".into()),
+        Err(Nip46ErrorFfi::RequestNotFound)
+    );
+    assert_eq!(
+        session.complete_auth("stale".into()),
+        Err(Nip46ErrorFfi::RequestNotFound)
+    );
+    let generation = session.status().generation;
+    session.disconnect();
+    assert_eq!(session.status().state, Nip46StateFfi::Disconnected);
+    assert!(session.status().generation > generation);
+    session.cancel();
+    assert_eq!(session.status().state, Nip46StateFfi::Cancelled);
+    assert_eq!(session.connect().await, Err(Nip46ErrorFfi::Cancelled));
+    owner.shutdown_and_close().await.unwrap();
+    other.shutdown_and_close().await.unwrap();
+}
+
 /// A Kotlin caller can cancel `shutdownAndClose()` after its first poll,
 /// before a runtime worker starts the work. Terminal close must still run and
 /// release the root.

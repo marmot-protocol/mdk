@@ -25,6 +25,14 @@
   retry interval, so a reconnect could miss its 5 s bound and fail with a
   reconnect observation timeout.
 
+### Added
+
+- Share NIP-46 remote signer sessions across Rust, UniFFI, and C, with
+  account-secret-store persistence, startup restoration, versioned permission
+  approval, relay-ready pairing offers, and request-scoped cancellation (#828).
+  Sign-out and wipe erase communication keys; host NIP-55 callbacks and local
+  signing accounts keep their existing APIs.
+
 ## 0.16.0 - 2026-11-11
 
 ### Fixed

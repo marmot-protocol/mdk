@@ -1062,6 +1062,23 @@ fn decode_onboarding_checkpoint(
     Ok(checkpoint)
 }
 
+impl AccountManager {
+    pub(super) fn onboarding_transaction(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .setup
+            .onboarding_transactions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
 impl<'a> SetupRecords<'a> {
     pub(super) fn new(app: &'a MarmotApp) -> Self {
         Self { app }

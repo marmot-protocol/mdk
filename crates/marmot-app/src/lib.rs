@@ -129,8 +129,10 @@ pub use moderation_reports::{
     ModerationReportOrigin, ModerationReportOutcome, ModerationReportRetrySummary,
     ModerationReportStatus,
 };
+mod nip46;
 mod nostr_secret;
 mod nostr_verification;
+pub use nip46::{Nip46Error, Nip46Permissions, Nip46Session, Nip46State, Nip46Status};
 mod notifications;
 #[cfg(test)]
 mod observability_tests;
@@ -673,6 +675,8 @@ pub struct MarmotApp {
     product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    nip46_owner: Arc<()>,
+    nip46_sessions: Arc<Mutex<HashMap<String, Nip46Session>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
@@ -1803,6 +1807,8 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            nip46_owner: Arc::new(()),
+            nip46_sessions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1926,6 +1932,8 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            nip46_owner: Arc::new(()),
+            nip46_sessions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -8090,20 +8098,28 @@ impl MarmotApp {
         if public_key.to_hex() != account.account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
+        self.pin_external_signer(&account.account_id_hex, public_key, signer);
+        Ok(())
+    }
+
+    fn pin_external_signer(
+        &self,
+        account_id: &str,
+        public_key: nostr::prelude::PublicKey,
+        signer: Arc<dyn ExternalAccountSigner>,
+    ) {
         let mut signers = self
             .external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match signers.entry(account.account_id_hex.clone()) {
+        match signers.entry(account_id.to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RegisteredExternalSigner::new(public_key, signer));
             }
         }
         drop(signers);
-        self.relay_plane
-            .evict_account_publish_client(&account.account_id_hex);
-        Ok(())
+        self.relay_plane.evict_account_publish_client(account_id);
     }
 
     fn account_signer_for_summary(

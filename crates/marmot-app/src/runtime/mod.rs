@@ -19,7 +19,7 @@ use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, Transpo
 use futures::stream::{FuturesUnordered, StreamExt};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
-    NostrAccountImport,
+    Nip46Removal, NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -121,6 +121,7 @@ mod commands;
 mod event_routing;
 mod local_submission_queue;
 mod local_submissions;
+mod nip46;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
@@ -1862,6 +1863,7 @@ impl MarmotAppRuntime {
                     self.shared.service_endpoints(),
                 );
             self.resume_generated_account_setup().await?;
+            self.restore_nip46_sessions().await?;
             self.reconcile_accounts().await?;
             self.shared.lifecycle().mark_running();
             Ok(config)
@@ -7204,6 +7206,7 @@ impl AccountManager {
                 // or async cleanup runs while this account gate is held.
                 let gate = self.shared.local_submission_gate(&account.account_id_hex);
                 let _admission = gate.lock().await;
+                self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
                 self.app.drop_account_caches(&account.label);
                 self.app
                     .remove_account_key_package_artifacts(&account.label)?;
@@ -7440,6 +7443,7 @@ impl AccountManager {
             } else {
                 home.set_account_signed_out(&account.label, true)?;
             }
+            self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
             self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
@@ -8666,6 +8670,20 @@ impl AccountManager {
     where
         S: crate::ExternalAccountSigner + 'static,
     {
+        self.login_with_external(public_key, signer, request, None)
+            .await
+    }
+
+    async fn login_with_external<S>(
+        &self,
+        public_key: String,
+        signer: S,
+        request: AccountSetupRequest,
+        remote: Option<crate::Nip46Session>,
+    ) -> Result<AccountSetupResult, AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "external_signer",
@@ -8701,10 +8719,27 @@ impl AccountManager {
                     .add_external_signer_account(&public_key)?;
                 self.app.presentation_signals.catalog_changed();
                 let reactivating_existing = account.signed_out;
-                if let Err(err) = self
-                    .app
-                    .register_external_signer(&account.account_id_hex, signer)
-                    .await
+                if let Some(session) = remote.as_ref() {
+                    let binding = session.clone();
+                    let accounts = self.clone();
+                    let label = account.label.clone();
+                    if let Err(error) =
+                        blocking_app_task(move || accounts.track_nip46_session(&label, binding))
+                            .await
+                    {
+                        return self.rollback_external_signer_setup(
+                            &account.label,
+                            created_account,
+                            upgraded_public_account,
+                            error,
+                        );
+                    }
+                }
+                if remote.is_none()
+                    && let Err(err) = self
+                        .app
+                        .register_external_signer(&account.account_id_hex, signer)
+                        .await
                 {
                     return self.rollback_external_signer_setup(
                         &account.label,
@@ -9419,6 +9454,7 @@ impl AccountManager {
             return self.rollback_account_after_setup_failure(label, err);
         }
         if upgraded_public_account {
+            self.erase_nip46_session(label, Nip46Removal::Recorded)?;
             let _ = self.app.account_home().complete_account_setup(label);
             let _ = self
                 .app
@@ -9437,6 +9473,7 @@ impl AccountManager {
         // storage/directory handles. Evict them before the directory is deleted
         // so a later re-import does not reuse a handle bound to the now-unlinked
         // inode. See `drop_account_caches` and mdk#220.
+        self.erase_nip46_session(account, Nip46Removal::Recorded)?;
         self.app.drop_account_caches(account);
         if let Err(rollback) = self.app.remove_account_key_package_artifacts(account) {
             return Err(AppError::RelayDirectory(format!(
