@@ -1181,8 +1181,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency. This crate's own dev-dependency on
   itself turns it on, so `-p marmot-app` test runs build every integration test. Hosts reach accounts through
   `MarmotAppRuntime`; `wn sync` runs its one pass through `MarmotApp::sync_account`, whose outer error is the open and
-  whose inner `SyncFailure` is the pass. `AppClient` methods no production path calls carry
-  `#[cfg_attr(not(feature = "test-support"), allow(dead_code))]`.
+  whose inner `SyncFailure` is the pass. `AppClient` methods only tests call carry
+  `#[cfg_attr(not(feature = "test-support"), allow(dead_code))]`; delete a method no build calls.
 
 Background condition ownership extends `the_runtime_writes_a_due_backup`: durable pre-prepare ledger state proves
 closed/default admission, held real PUT proves current-pass settlement after false, and same-runtime worker replacement retains
