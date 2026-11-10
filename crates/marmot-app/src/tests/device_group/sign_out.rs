@@ -959,7 +959,7 @@ async fn accounts_without_sibling_signout_commands_are_wiped_immediately() {
             // interrupted. Earlier checks are done, but ready is still false.
             let keys = home.load_signing_keys(&account.label).unwrap();
             let mut snapshot = runtime
-                .accounts()
+                .account_setup()
                 .begin_onboarding(
                     zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                     OnboardingOptions {

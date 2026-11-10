@@ -1735,6 +1735,13 @@ impl MarmotAppRuntime {
         self.accounts.clone()
     }
 
+    /// Account setup: interactive onboarding, its recovery and its sign-in
+    /// notices. Generated setup stays on the runtime (`create_identity` and
+    /// the other setup methods).
+    pub fn account_setup(&self) -> AccountSetup<'_> {
+        AccountSetup::new(&self.setup, &self.accounts)
+    }
+
     pub fn shared_services(&self) -> RuntimeSharedServices {
         self.shared.clone()
     }
@@ -6347,7 +6354,7 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupReadiness, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         if self
-            .accounts
+            .account_setup()
             .onboarding_snapshot(account_ref)?
             .is_some_and(|s| !s.ready || s.cancellation_pending)
         {
@@ -6794,233 +6801,16 @@ impl AccountManager {
         onboarding::SetupRecords::new(&self.app)
     }
 
-    /// Account setup paired with this manager, for the host methods below.
-    fn account_setup(&self) -> onboarding::AccountSetup<'_> {
+    /// Account setup paired with this manager, for unit tests that reach
+    /// setup's private helpers. Hosts use `MarmotAppRuntime::account_setup`.
+    #[cfg(test)]
+    pub(crate) fn account_setup(&self) -> onboarding::AccountSetup<'_> {
         onboarding::AccountSetup::new(&self.setup, self)
     }
 
     #[cfg(test)]
     pub(crate) async fn onboarding_worker_tracked(&self, account_id: &str) -> bool {
         self.workers.lock().await.contains_key(account_id)
-    }
-}
-
-// Account setup's host methods, forwarded to setup.
-impl AccountManager {
-    pub fn onboarding_snapshot(
-        &self,
-        account_ref: &str,
-    ) -> Result<Option<OnboardingSnapshot>, AppError> {
-        self.account_setup().onboarding_snapshot(account_ref)
-    }
-
-    pub fn subscribe_onboarding(
-        &self,
-        account_ref: &str,
-    ) -> Result<OnboardingSubscription, AppError> {
-        self.account_setup().subscribe_onboarding(account_ref)
-    }
-
-    /// Import only the identity. No relay records or KeyPackages are published.
-    /// A retained account/checkpoint is returned even if later checks fail.
-    pub async fn begin_onboarding(
-        &self,
-        nsec: Zeroizing<String>,
-        options: OnboardingOptions,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup().begin_onboarding(nsec, options).await
-    }
-
-    pub async fn begin_external_signer_onboarding<S: crate::ExternalAccountSigner + 'static>(
-        &self,
-        public_key: String,
-        signer: S,
-        options: OnboardingOptions,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .begin_external_signer_onboarding(public_key, signer, options)
-            .await
-    }
-
-    /// Run pending checks until a decision or retry is needed. Cancelling this
-    /// future is safe: the next call retries its last checkpointed operation.
-    pub async fn run_onboarding(&self, account_ref: &str) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup().run_onboarding(account_ref).await
-    }
-
-    pub async fn retry_onboarding_step(
-        &self,
-        account_ref: &str,
-        step: OnboardingStep,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .retry_onboarding_step(account_ref, step)
-            .await
-    }
-
-    /// Retry discovery through an explicitly selected source set. This never
-    /// changes published relay declarations or publishes defaults.
-    pub async fn set_onboarding_discovery_relays(
-        &self,
-        account_ref: &str,
-        discovery_relays: Vec<String>,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .set_onboarding_discovery_relays(account_ref, discovery_relays)
-            .await
-    }
-
-    pub async fn continue_onboarding_without(
-        &self,
-        account_ref: &str,
-        step: OnboardingStep,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .continue_onboarding_without(account_ref, step)
-            .await
-    }
-
-    /// Prepare a relay replacement without signing or publishing it. Passing
-    /// None appends the recommended defaults to the observed list, preserving
-    /// existing tags and read/write roles, independently of local dial policy.
-    /// An explicit selection edits known endpoint roles while preserving retained
-    /// tags verbatim (including duplicates, order and extension fields), unrelated
-    /// tags and event content. The typed preview is inert until approved; an
-    /// unchanged selection produces a manual-review preview without approval.
-    /// For inbox lists use read_relays; write_relays must be empty.
-    pub async fn propose_onboarding_relays(
-        &self,
-        account_ref: &str,
-        step: OnboardingStep,
-        selection: Option<(Vec<String>, Vec<String>)>,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .propose_onboarding_relays(account_ref, step, selection)
-            .await
-    }
-
-    pub async fn propose_onboarding_profile(
-        &self,
-        account_ref: &str,
-        profile: UserProfileMetadata,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .propose_onboarding_profile(account_ref, profile)
-            .await
-    }
-
-    pub async fn propose_onboarding_follows(
-        &self,
-        account_ref: &str,
-        follows: Vec<String>,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .propose_onboarding_follows(account_ref, follows)
-            .await
-    }
-
-    pub async fn cancel_onboarding_repair(
-        &self,
-        account_ref: &str,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .cancel_onboarding_repair(account_ref)
-            .await
-    }
-
-    pub async fn approve_onboarding_repair(
-        &self,
-        account_ref: &str,
-        revision: u64,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .approve_onboarding_repair(account_ref, revision)
-            .await
-    }
-
-    /// Approve a displayed repair in a recovered attempt. Stale epochs fail
-    /// even when their numeric revision happens to match the fresh proposal.
-    pub async fn approve_onboarding_repair_in_epoch(
-        &self,
-        account_ref: &str,
-        revision: u64,
-        recovery_epoch: &str,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .approve_onboarding_repair_in_epoch(account_ref, revision, recovery_epoch)
-            .await
-    }
-
-    /// Cancel an interactive onboarding attempt at any step, including approved
-    /// or ready checkpoints. The identity stays signed out. Already-sent events
-    /// are not rolled back; the local journal and signed bytes are retained.
-    pub async fn cancel_onboarding(&self, account_ref: &str) -> Result<(), AppError> {
-        self.account_setup().cancel_onboarding(account_ref).await
-    }
-
-    /// Hosts can offer explicit recovery when begin/cancel returns
-    /// OnboardingActionUnavailable and this query returns true. Recovery is not
-    /// automatic and never interprets unknown bytes as approval or retry intent.
-    pub fn onboarding_recovery_required(&self, account_ref: &str) -> Result<bool, AppError> {
-        self.account_setup()
-            .onboarding_recovery_required(account_ref)
-    }
-
-    /// Retire unreadable/unsupported or exhausted onboarding state explicitly.
-    /// Retains exact opaque bytes in the latest private recovery journal, keeps
-    /// identity/setup data, signs out and reaps the worker. The returned epoch
-    /// must accompany future approval/device-acknowledgment calls. A separate
-    /// begin is required; recovery never inherits a proposal or sends a repair.
-    ///
-    /// A true acknowledgment accepts latest-only evidence retention. Older
-    /// recovery evidence may be replaced by a later explicit recovery. Dropping
-    /// this caller does not stop owned cleanup; retry or reconcile completes it.
-    pub async fn recover_onboarding(
-        &self,
-        account_ref: &str,
-        acknowledge_latest_only_evidence: bool,
-    ) -> Result<String, AppError> {
-        self.account_setup()
-            .recover_onboarding(account_ref, acknowledge_latest_only_evidence)
-            .await
-    }
-
-    /// Prepare an exact, minimal relay repair without signing or publishing.
-    /// When no lossless candidate exists, return a typed manual-review preview
-    /// with no approval action; callers may open a prefilled manual editor.
-    pub async fn propose_onboarding_relay_repair(
-        &self,
-        account_ref: &str,
-        step: OnboardingStep,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .propose_onboarding_relay_repair(account_ref, step)
-            .await
-    }
-
-    /// Acknowledge the sign-in chat/history notice for this onboarding attempt. This
-    /// authorizes normal setup publication, never deletion of another slot.
-    /// Persist before resuming so cancellation/restart cannot lose the choice.
-    pub async fn acknowledge_onboarding_single_device(
-        &self,
-        account_ref: &str,
-        revision: u64,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .acknowledge_onboarding_single_device(account_ref, revision)
-            .await
-    }
-
-    /// Acknowledge the displayed device notice after explicit recovery.
-    pub async fn acknowledge_onboarding_single_device_in_epoch(
-        &self,
-        account_ref: &str,
-        revision: u64,
-        recovery_epoch: &str,
-    ) -> Result<OnboardingSnapshot, AppError> {
-        self.account_setup()
-            .acknowledge_onboarding_single_device_in_epoch(account_ref, revision, recovery_epoch)
-            .await
     }
 }
 

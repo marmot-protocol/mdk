@@ -32,13 +32,15 @@ pub(super) struct SetupState {
     generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
 }
 
-/// Account setup's handle: its state paired with the account manager whose
-/// worker-lifecycle surface it reaches workers through. It borrows both, so a
-/// call made through it carries two pointers, as a call on `&AccountManager`
-/// carried one. Setup's spawned tasks capture the owned pair and borrow it
-/// again inside.
+/// Account setup: interactive onboarding, its recovery and its sign-in
+/// notices, reached through `MarmotAppRuntime::account_setup`.
+///
+/// It pairs setup's state with the account manager whose worker-lifecycle
+/// surface it reaches workers through. It borrows both, so a call made through
+/// it carries two pointers, as a call on `&AccountManager` carried one.
+/// Setup's spawned tasks capture the owned pair and borrow it again inside.
 #[derive(Clone, Copy)]
-pub(super) struct AccountSetup<'a> {
+pub struct AccountSetup<'a> {
     state: &'a SetupState,
     manager: &'a AccountManager,
 }

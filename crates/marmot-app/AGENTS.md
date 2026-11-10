@@ -30,7 +30,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   fields are private to `runtime/onboarding/`; setup's code runs on `AccountSetup` (that state paired with an
   `AccountManager`, both borrowed: an owned manager clone is 3 KB and, nested under every reconcile, overflowed the
   debug tokio worker stack in the CLI daemon test; spawned tasks capture the owned pair and borrow it inside), and
-  generated setup's procedures stay `MarmotAppRuntime` methods in that module tree.
+  generated setup's procedures stay `MarmotAppRuntime` methods in that module tree. Hosts reach onboarding through
+  `MarmotAppRuntime::account_setup()`; `AccountManager` exposes no onboarding methods.
   `AccountManager` holds one `SetupState` for three hooks only, each where it is called: reconcile (worker transaction
   held; it never takes it again), removal (under the transaction, after the removal commit point) and shutdown's two
   phases (before the invite catch-up drain; after the first reaper drain). It checks the worker gate through
