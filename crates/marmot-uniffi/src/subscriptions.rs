@@ -27,11 +27,13 @@ use marmot_app::{
 use tokio::sync::Mutex;
 
 use crate::MarmotKitError;
+mod relay_liveness;
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, MarmotEventFfi, MessageUpdateFfi, NotificationUpdateFfi,
     TimelineMessageRecordFfi, TimelinePageFfi, TimelineSubscriptionUpdateFfi, UserSearchUpdateFfi,
 };
+pub use relay_liveness::RelayLivenessSubscription;
 
 #[derive(uniffi::Object)]
 pub struct ChatsSubscription {

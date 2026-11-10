@@ -236,6 +236,27 @@ impl MarmotApp {
             .map_err(AppError::from)
     }
 
+    pub(crate) fn relay_liveness_config(
+        &self,
+        label: &str,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let lists = self.account_relay_list_status(label)?;
+        let mut relays = lists
+            .default_relays
+            .into_iter()
+            .chain(lists.bootstrap_relays)
+            .chain(lists.nip65.relays)
+            .chain(lists.nip65.read_relays)
+            .chain(lists.nip65.write_relays)
+            .chain(lists.inbox.relays)
+            .filter(|url| nostr_sdk::prelude::RelayUrl::parse(url.trim()).is_ok())
+            .map(|url| TransportEndpoint(transport_nostr::canonical_relay(&url)))
+            .collect::<Vec<_>>();
+        relays.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        relays.dedup();
+        Ok(relays)
+    }
+
     pub(crate) fn directory_cache_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(APP_CACHE_DB_FILE)
     }

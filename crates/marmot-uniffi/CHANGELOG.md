@@ -9,6 +9,11 @@
   (mdk#464). Cancellation detaches the wait; retry reuses canonical state.
   Generic creation and legacy admin roles remain unchanged.
 
+- Add `account_relay_liveness`, `subscribe_relay_liveness`, and `reconnect_relay` (mdk#329), with
+  `RelayLivenessFfi`, stable `RelayStatusFfi`, and a closeable `RelayLivenessSubscription`.
+  Rows include session-local attempt times and available connection-error categories. Additive; aggregate health
+  remains unchanged.
+
 ## 0.15.0 - 2026-11-09
 
 Regenerate Swift/Kotlin bindings with the matching native library. The main

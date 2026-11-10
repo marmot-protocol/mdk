@@ -62,6 +62,13 @@ pub(crate) struct ManagedAccountWorker {
     pub(crate) shutdown: oneshot::Sender<()>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayConfigWork {
+    Idle,
+    Ready,
+    RetryOnTick,
+}
+
 impl ManagedAccountWorker {
     pub(crate) async fn shutdown(self) {
         self.shutdown_with_timeout(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT)
@@ -844,6 +851,10 @@ pub(crate) enum AccountWorkerCommand {
     RetryRuntimeGroupSubscriptions {
         respond: oneshot::Sender<bool>,
     },
+    ReconnectRelay {
+        canonical_url: String,
+        respond: oneshot::Sender<Result<crate::RelayLiveness, AppError>>,
+    },
     DeleteAuditLog {
         path: std::path::PathBuf,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -1118,6 +1129,7 @@ async fn run_app_runtime_account_worker(
         unlinked,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
+    let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
     let mut open_client = std::pin::pin!(app.runtime_local_client(
         &account_label,
         &relay_plane,
@@ -1692,6 +1704,7 @@ async fn run_app_runtime_account_worker(
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
+    let mut relay_config_work = RelayConfigWork::Ready;
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
@@ -1742,6 +1755,9 @@ async fn run_app_runtime_account_worker(
                 .replay_changes()
                 .await
                 .filter(|changes| changes.has_changed().is_ok());
+            if replay_changes.is_some() {
+                relay_config_work = RelayConfigWork::Ready;
+            }
         }
         // Native frames admit a few per turn; a failed turn paces its retry.
         let native_progress = match if !admission_retry.ready() {
@@ -1866,6 +1882,39 @@ async fn run_app_runtime_account_worker(
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
+            }
+            () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
+                relay_config_work = match client.sync_relay_liveness().await {
+                    Ok(_) => RelayConfigWork::Idle,
+                    Err(error) if error.is_account_not_active() => RelayConfigWork::RetryOnTick,
+                    Err(error) => {
+                        publish_app_runtime_account_error(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            account_error_message("relay configuration reconciliation failed", &error),
+                        );
+                        RelayConfigWork::RetryOnTick
+                    }
+                };
+            }
+            result = relay_config_updates.recv() => {
+                let mut changed = match result {
+                    Ok(account_id) => account_id == account_id_hex,
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(broadcast::error::RecvError::Closed) => break 'worker,
+                };
+                loop {
+                    match relay_config_updates.try_recv() {
+                        Ok(account_id) => changed |= account_id == account_id_hex,
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => changed = true,
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Closed) => break 'worker,
+                    }
+                }
+                if changed {
+                    relay_config_work = RelayConfigWork::Ready;
+                }
             }
             recovered = async {
                 let recovery = welcome_recovery
@@ -2591,6 +2640,7 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                         };
+                        relay_config_work = RelayConfigWork::Ready;
                         replay_changes = client.adapter.replay_changes().await;
                         recovery_runner = client.spawn_recovery_runner().await;
                         recovery_catching_up =
@@ -2692,6 +2742,9 @@ async fn run_app_runtime_account_worker(
                 attachment_due = true;
                 presentation_due = true;
                 avatar_due = true;
+                if relay_config_work == RelayConfigWork::RetryOnTick {
+                    relay_config_work = RelayConfigWork::Ready;
+                }
                 // Periodic maintenance is never urgent, and its longest leg
                 // runs past the whole shutdown budget: the key-package
                 // catch-up below is capped at 15s. Skip the tick outright once
@@ -6506,6 +6559,14 @@ fn account_worker_command_future<'a>(
                 true
             })
         }
+        AccountWorkerCommand::ReconnectRelay {
+            canonical_url,
+            respond,
+        } => Box::pin(async move {
+            let result = client.reconnect_relay(canonical_url).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::PeriodicMaintenancePolicy { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,

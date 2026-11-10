@@ -12,6 +12,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   not acknowledge Welcome delivery. Generic creation and existing groups' roles remain unchanged. Additive;
   use the matching generated header and library.
 
+- Add account relay liveness snapshots, single-relay reconnect, and a closeable
+  subscription with blocking reads and callbacks. `MarmotRelayLivenessList` owns
+  its records and strings; free it with `marmot_relay_liveness_list_free`.
+  Free reconnect results with `marmot_relay_liveness_free` and subscription handles
+  with `marmot_relay_liveness_subscription_free`. Callback snapshots are borrowed;
+  this callback receives an explicit status to distinguish errors from close.
+  Rebuild consumers against the matching generated header and library.
+
 ## [0.15.0] - 2026-11-09
 
 Recompile against the matching `marmot.h` and library: `marmot_deployment_set_key_package_client_preference` is

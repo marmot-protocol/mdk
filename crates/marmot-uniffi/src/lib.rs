@@ -67,7 +67,7 @@ pub use markdown::{
     MarkdownTimestampStyleFfi,
 };
 pub use secret_store::SecretStore;
-pub use subscriptions::ConversationWindowSubscription;
+pub use subscriptions::{ConversationWindowSubscription, RelayLivenessSubscription};
 
 uniffi::setup_scaffolding!();
 

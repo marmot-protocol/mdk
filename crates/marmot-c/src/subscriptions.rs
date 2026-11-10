@@ -1309,6 +1309,181 @@ pub unsafe extern "C" fn marmot_presented_chat_list_subscription_free(
     crate::memory::free_guard(|| unsafe { free_plain(sub) });
 }
 
+use crate::types::relay::MarmotRelayLivenessList;
+use marmot_uniffi::RelayLivenessSubscription;
+
+// The list and its nested records exclusively own their allocations.
+unsafe impl Send for MarmotRelayLivenessList {}
+/// Latest complete relay snapshot for one account; updates may coalesce.
+pub struct MarmotRelayLivenessSubscription {
+    core: SubscriptionCore,
+    inner: Arc<RelayLivenessSubscription>,
+}
+
+/// OK carries a borrowed list. Terminal error or CLOSED carries NULL.
+/// The list is valid only during the callback and must not be freed.
+pub type MarmotRelayLivenessCallback = Option<
+    unsafe extern "C" fn(
+        item: *const MarmotRelayLivenessList,
+        status: MarmotStatus,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Receive a complete snapshot; zero timeout waits indefinitely.
+/// Timeout, close and errors leave out NULL. Free successful results with
+/// `marmot_relay_liveness_list_free`.
+/// # Safety
+/// Subscription must remain live throughout the call; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_next(
+    sub: *const MarmotRelayLivenessSubscription,
+    timeout_ms: u32,
+    out: *mut *mut MarmotRelayLivenessList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let result = match sub
+            .core
+            .block_next(timeout_ms, async { Some(sub.inner.next().await) })
+        {
+            Ok(Some(Ok(item))) => Ok(item),
+            Ok(Some(Err(error))) => Err(status_from_error(&error)),
+            Ok(None) => Ok(None),
+            Err(status) => Err(status),
+        };
+        unsafe { deliver_next(result, out) }
+    })
+}
+
+/// Install a callback. Errors terminate the pump with NULL and the mapped status;
+/// natural close terminates it with NULL and CLOSED. Do not mix with blocking next.
+/// # Safety
+/// Subscription and callback must be valid. user_data must outlive all callbacks;
+/// clear/free request cancellation without waiting for an executing callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_set_callback(
+    sub: *const MarmotRelayLivenessSubscription,
+    callback: MarmotRelayLivenessCallback,
+    user_data: *mut c_void,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let Some(callback) = callback else {
+            set_last_error("callback function pointer was NULL");
+            return MarmotStatus::NullPointer;
+        };
+        let inner = sub.inner.clone();
+        let ctx = CallbackCtx { user_data };
+        sub.core.install(|runtime| {
+            runtime.spawn(async move {
+                loop {
+                    match inner.next().await {
+                        Ok(Some(item)) => {
+                            let mut mirror = MarmotRelayLivenessList::from(item);
+                            unsafe {
+                                callback(&raw const mirror, MarmotStatus::Ok, ctx.user_data())
+                            };
+                            unsafe { mirror.free_in_place() };
+                        }
+                        terminal => {
+                            let status = match terminal {
+                                Err(error) => status_from_error(&error),
+                                _ => MarmotStatus::Closed,
+                            };
+                            unsafe { callback(std::ptr::null(), status, ctx.user_data()) };
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+    })
+}
+
+/// Request callback cancellation without waiting; no terminal callback is guaranteed.
+/// # Safety
+/// Subscription must be live; callback context must outlive any executing callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_clear_callback(
+    sub: *const MarmotRelayLivenessSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        sub.core.clear();
+        MarmotStatus::Ok
+    })
+}
+
+/// Free before its client. NULL is a no-op; callback cancellation does not wait.
+/// # Safety
+/// Subscription must be NULL or library-owned with no active calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_free(
+    sub: *mut MarmotRelayLivenessSubscription,
+) {
+    crate::memory::free_guard(|| unsafe { free_plain(sub) });
+}
+
+/// Subscribe to one account's configured relay connection states.
+/// # Safety
+/// Client, account string and output pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_subscribe_relay_liveness(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out_sub: *mut *mut MarmotRelayLivenessSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        match client.block_on(client.marmot.subscribe_relay_liveness(account_ref)) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotRelayLivenessSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
+}
+
+/// Take the initial complete snapshot once; subsequent calls return an empty list.
+/// Free the result with `marmot_relay_liveness_list_free`.
+/// # Safety
+/// Subscription and output pointer must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_snapshot(
+    sub: *const MarmotRelayLivenessSubscription,
+    out: *mut *mut MarmotRelayLivenessList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        unsafe { deliver(Ok::<_, MarmotKitError>(sub.inner.snapshot()), out) }
+    })
+}
+
+/// Close the watch without freeing its handle. Pending reads wake as closed.
+/// # Safety
+/// Subscription must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_relay_liveness_subscription_cancel(
+    sub: *const MarmotRelayLivenessSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        sub.inner.cancel();
+        MarmotStatus::Ok
+    })
+}
+
 mod chat_window;
 pub use chat_window::*;
 

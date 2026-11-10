@@ -237,6 +237,41 @@ are not credentials. Never log message bodies, asset references, keys, account/g
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
 
+### Relay liveness
+
+`accountRelayLiveness(accountRef)` reads one row per configured relay, keyed by canonical URL.
+Root URLs omit the trailing slash; path trailing slashes retain their endpoint identity.
+The rows combine the account's cached NIP-65 read/write, inbox, default, and bootstrap lists.
+Malformed cached URLs are excluded, as in transport routing; they do not block receive startup or valid retries.
+`RelayStatusFfi` has `Unknown`, `Connecting`, `Connected`, and `Offline` variants for host localization.
+State comes from that account's pool, including receive/history and WRITE-only publication sockets, not another
+account or a separate directory pool. Configured URLs with no observed session are `Unknown`; closed sessions
+retain `Offline` and available attempt/error details while configured. Reads never dial or add receive sources.
+
+`subscribeRelayLiveness(accountRef)` returns a `RelayLivenessSubscription` with a one-shot initial `snapshot()`
+and complete replacement lists from `next()`. Updates cover socket transitions, account-pool replacement,
+and cached relay-list changes without polling. Slow readers may skip intermediate states.
+Snapshot production runs on MDK's runtime; cancellation does not consume an update.
+`cancel()` wakes pending receives and stops this observer without disconnecting relays.
+Release the foreign object separately; Kotlin's generated `close()` destroys its handle.
+Runtime shutdown ends receives; read failures propagate through `MarmotKitError`.
+
+`lastAttemptUnix` is a session-local Unix-seconds timestamp, and `lastError` is an optional, bounded SDK
+connection-error category rather than raw transport text. A new attempt clears the previous error.
+Attempt times require the transport tap. Errors the SDK does not expose, including external cancellation,
+remain absent.
+The rows are private settings data: do not log them or send their URLs through diagnostics exports.
+
+`reconnectRelay(accountRef, url)` accepts only a relay configured for that account and applies the normal
+dial-safety policy. The account must be running. Its worker serializes reconnect with configuration reconciliation;
+after dispatch, the dial wait is capped at five seconds. The next observed attempt state may still be `Connecting`;
+the watch reports the outcome.
+Existing sockets keep their roles and owners. A missing socket gets manual ownership without inherited REQs or
+receive routing. Managed account workers release that ownership when the URL leaves the configured union,
+even without a liveness observer; other actors keep their subscription, history, and publication ownership.
+Removing a URL from only one list does not release it while another configured list still contains it.
+Neither `Connected` nor a successful reconnect return proves subscription readiness or message delivery.
+
 ### Markdown rendering
 
 Render the typed Markdown tokens on message, timeline and reply-preview records.

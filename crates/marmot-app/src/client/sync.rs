@@ -1201,6 +1201,46 @@ impl AppClient {
         Ok(self.has_pending_runtime_group_subscription_refresh())
     }
 
+    pub(crate) async fn sync_relay_liveness(
+        &self,
+    ) -> Result<Vec<cgka_traits::TransportEndpoint>, AppError> {
+        let configured = self.app.relay_liveness_config(&self.state.label)?;
+        let client = self
+            .relay_plane
+            .account_history_relay_client(self.adapter.account_id())
+            .await
+            .ok_or_else(|| {
+                cgka_traits::TransportAdapterError::AccountNotActive(
+                    self.adapter.account_id().clone(),
+                )
+            })?;
+        client.sync_liveness_config(&configured).await?;
+        Ok(configured)
+    }
+
+    pub(crate) async fn reconnect_relay(
+        &self,
+        canonical_url: String,
+    ) -> Result<crate::RelayLiveness, AppError> {
+        let configured = self.sync_relay_liveness().await?;
+        if configured
+            .binary_search_by(|endpoint| endpoint.as_str().cmp(canonical_url.as_str()))
+            .is_err()
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "relay is not configured for this account".into(),
+            )
+            .into());
+        }
+        self.relay_plane
+            .reconnect_relay(
+                self.adapter.account_id(),
+                cgka_traits::TransportEndpoint(canonical_url),
+            )
+            .await
+            .map_err(AppError::from)
+    }
+
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
         self.prepare_transport_with_telemetry(None).await
     }

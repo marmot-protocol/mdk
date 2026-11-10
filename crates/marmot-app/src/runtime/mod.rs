@@ -124,6 +124,7 @@ mod onboarding;
 mod presentation;
 mod presented_chat_list;
 mod reactions;
+mod relay_liveness;
 pub use chat_list_window::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
     ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
@@ -133,6 +134,7 @@ pub use chat_list_window::{
 };
 pub use onboarding::*;
 pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
+pub use relay_liveness::RuntimeRelayLivenessSubscription;
 mod subscriptions;
 mod user_blocks;
 pub use user_blocks::RuntimeBlockListSubscription;

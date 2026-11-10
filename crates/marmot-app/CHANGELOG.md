@@ -15,6 +15,13 @@
   do not block a fresh direct. Generic creation and existing
   conversations retain their current admin semantics.
 
+- Add account-scoped relay liveness snapshots, event-driven subscriptions, and safety-checked per-relay reconnects
+  (mdk#329). Unobserved configured relays remain `Unknown`; closed sessions retain available attempt/error details.
+  Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
+  is unchanged. Malformed cached URLs are excluded without blocking receive startup or valid retries.
+  Directory-cache failures do not gate receive activation; queued reconnects use the long worker response wait.
+  Late transport activation on the same client also reconciles configuration, preserving closed-session details.
+
 ## 0.15.0 - 2026-11-09
 
 Multi-device accounts in groups, automatic rejoin, recovery-owned account history, typed chat-list queries, advanced

@@ -56,6 +56,43 @@ impl Marmot {
         Ok(self.runtime.relay_telemetry_settings()?.into())
     }
 
+    /// Read configured relays and the account's current connection state without dialing.
+    pub async fn account_relay_liveness(
+        &self,
+        account_ref: String,
+    ) -> Result<Vec<conversions::RelayLivenessFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_relay_liveness(&account_ref)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Watch complete account-scoped snapshots; slow readers may skip intermediate states.
+    pub async fn subscribe_relay_liveness(
+        &self,
+        account_ref: String,
+    ) -> Result<std::sync::Arc<crate::RelayLivenessSubscription>, MarmotKitError> {
+        Ok(crate::RelayLivenessSubscription::new(
+            self.runtime.subscribe_relay_liveness(&account_ref).await?,
+        ))
+    }
+
+    /// Attempt a configured relay connection and return its next observed state.
+    pub async fn reconnect_relay(
+        &self,
+        account_ref: String,
+        url: String,
+    ) -> Result<conversions::RelayLivenessFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .reconnect_relay(&account_ref, &url)
+            .await?
+            .into())
+    }
+
     /// Consent-bound random OTLP identifier, stable until revocation. Requires
     /// a current combined grant; never use this value in product events.
     pub fn telemetry_install_id(&self) -> Result<String, MarmotKitError> {
