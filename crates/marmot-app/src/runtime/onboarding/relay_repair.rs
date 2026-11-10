@@ -90,7 +90,7 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     }
 }
 
-impl AccountManager {
+impl AccountSetup<'_> {
     pub(super) fn minimal_relay_repair(
         &self,
         step: OnboardingStep,
@@ -116,7 +116,7 @@ impl AccountManager {
             return manual();
         }
 
-        let classifications = self.app.relay_plane.classify_relay_endpoints(
+        let classifications = self.app().relay_plane.classify_relay_endpoints(
             before
                 .iter()
                 .filter_map(|tag| tag.endpoint.clone())
@@ -197,7 +197,7 @@ impl AccountManager {
         let mut added = false;
         if missing_read || missing_write || missing_inbox {
             let allowed_defaults = self
-                .app
+                .app()
                 .relay_plane
                 .classify_relay_endpoints(defaults.to_vec())
                 .into_iter()
@@ -298,10 +298,11 @@ impl AccountManager {
         account_ref: &str,
         step: OnboardingStep,
     ) -> Result<OnboardingSnapshot, AppError> {
-        let (account_id, attempt) = self.peek_onboarding_attempt(account_ref)?;
+        let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
         let transaction = self.onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut c = self
+            .records()
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;

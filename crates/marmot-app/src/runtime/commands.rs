@@ -1439,7 +1439,8 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        self.require_onboarding_complete_for(&account)?;
+        self.setup_records()
+            .require_onboarding_complete_for(&account)?;
         if !account.can_sign() {
             return Err(
                 marmot_account::AccountHomeError::SecretNotFound(account.account_id_hex).into(),

@@ -142,7 +142,10 @@ async fn read_accounts(
                         AccountAttentionUnavailable::Resetting,
                     ));
                 }
-                if !manager.onboarding_worker_allowed(&current.label)? {
+                if !manager
+                    .setup_records()
+                    .onboarding_worker_allowed(&current.label)?
+                {
                     return Err(AppError::ChatPresentationNotReady);
                 }
                 app.ensure_account_state(&current.label)?;

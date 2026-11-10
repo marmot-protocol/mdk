@@ -16,8 +16,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `account_worker.rs` (the per-account worker: command enum, worker loop, reconnect backoff, runtime-event publishers),
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
-  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable
-  preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log tracker
+  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (account
+  setup: durable preflight, cancellation, advisory installation detection, and generated setup's procedures in
+  `onboarding/generated_setup.rs`), `audit_tracker.rs` (the forensic audit-log tracker
   upload worker), `audit_otlp_delivery.rs` (the explicit one-account v5 OTLP attempt), `event_routing.rs` (pure
   `MarmotAppEvent` classification/routing helpers), `avatar.rs` (local identity-avatar demand and bounded maintenance),
   `avatar_access.rs` (bounded local native batches), `attachment_history.rs` (bounded local attachment discovery and
@@ -25,6 +26,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   ranges), and `account_worker/attachments.rs` (durable attachment demand admission, fair background transfer capacity
   and publication into the account's media store). Other runtime modules are listed in the Code map below. Keep `mod.rs` re-exporting the
   moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
+- Keep account setup's state out of `AccountManager` (mdk#2782). Setup's in-memory state is `SetupState`, whose
+  fields are private to `runtime/onboarding/`; setup's code runs on `AccountSetup` (that state paired with an
+  `AccountManager`, both borrowed: an owned manager clone is 3 KB and, nested under every reconcile, overflowed the
+  debug tokio worker stack in the CLI daemon test; spawned tasks capture the owned pair and borrow it inside), and
+  generated setup's procedures stay `MarmotAppRuntime` methods in that module tree.
+  `AccountManager` holds one `SetupState` for three hooks only, each where it is called: reconcile (worker transaction
+  held; it never takes it again), removal (under the transaction, after the removal commit point) and shutdown's two
+  phases (before the invite catch-up drain; after the first reaper drain). It checks the worker gate through
+  `SetupRecords`, which reads durable records only. Setup reaches workers only through the worker-lifecycle surface
+  commented on `AccountManager` in `runtime/mod.rs`, each call keeping its lock state: the worker transaction is a
+  tokio `Mutex` and not reentrant. A worker setup takes out of the map is reaped through setup's cancellation
+  registry, never `worker_reapers`. Lock order: the per-account onboarding transaction, then the worker transaction,
+  then the worker map; the cancellation registry before the per-account state lock.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
   (the `AppClient` struct plus the broadly-shared command/query API — key-package, group lifecycle, message/media/agent

@@ -1,20 +1,22 @@
 //! Advisory installation detection without opening a worker or publishing.
 use super::*;
 
-impl AccountManager {
+impl AccountSetup<'_> {
     pub(super) async fn check_onboarding_single_device(
         &self,
         checkpoint: &mut OnboardingCheckpoint,
     ) -> Result<(), AppError> {
         let id = &checkpoint.snapshot.account_id_hex;
-        let account = self.resolve(id)?;
-        let storage = self.app.account_storage(&account.label)?;
+        let account = self.records().resolve(id)?;
+        let storage = self.app().account_storage(&account.label)?;
         let owned = marmot_session::durably_owned_key_packages(
             &storage,
             cgka_traits::group::ProtocolProfile::Current,
         )
         .map_err(marmot_session::SessionError::from)?;
-        let local = self.app.local_key_package_records(&account.label, owned)?;
+        let local = self
+            .app()
+            .local_key_package_records(&account.label, owned)?;
         let mut slots: HashSet<String> = local.iter().map(|p| p.key_package_id.clone()).collect();
         if let Some(lifecycle) = storage.key_package_lifecycle()? {
             slots.insert(lifecycle.stable_slot_id);
@@ -140,10 +142,11 @@ impl AccountManager {
         revision: u64,
         recovery_epoch: Option<&str>,
     ) -> Result<OnboardingSnapshot, AppError> {
-        let (account_id, attempt) = self.peek_onboarding_attempt(account_ref)?;
+        let (account_id, attempt) = self.records().peek_onboarding_attempt(account_ref)?;
         let transaction = self.onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut checkpoint = self
+            .records()
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&checkpoint, attempt)?;
