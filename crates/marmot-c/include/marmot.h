@@ -6569,6 +6569,20 @@ typedef struct MarmotGroupEventKind_QueuedIntentRefused_Body {
   char *intent_id_hex;
   char *intent_kind;
   char *reason;
+  /**
+   * With `reason` `event_too_large`, the event that fits none of its
+   * relays' known size limits: `commit` or `welcome`. NULL for every
+   * other reason.
+   */
+  char *artifact;
+  /**
+   * True only with `reason` `event_too_large`.
+   */
+  bool has_size_class;
+  /**
+   * Only meaningful when has_size_class is true.
+   */
+  enum MarmotEventSizeClass size_class;
 } MarmotGroupEventKind_QueuedIntentRefused_Body;
 
 typedef struct MarmotGroupEventKind {

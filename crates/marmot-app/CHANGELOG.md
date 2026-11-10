@@ -37,8 +37,9 @@
   advertises. A send that fits none of its relays fails as `AppError::EventTooLarge`, rolled back with nothing sent:
   a commit, and an invite staged at once whose Welcome fits none of the invitee's inbox relays. A group create whose
   founding Welcome fits none of an invitee's inbox relays fails as `EventTooLarge { artifact: Welcome }` before
-  anything is created or sent. An invite queued behind an unsettled group keeps such a Welcome owed with its size
-  class. Every other event an account publishes (profile, follow and relay lists, KeyPackages, the block list,
+  anything is created or sent. A send queued behind an unsettled group whose commit or Welcome fits none of its
+  relays when the group settles is dropped unsent, not retried, and announced as `QueuedIntentRefused` with reason
+  `event_too_large`, the artifact and its size class. Every other event an account publishes (profile, follow and relay lists, KeyPackages, the block list,
   stickers, the backup pointer) goes only to the relays it fits, and nowhere when it fits none; the profile,
   follow-list and relay-list publishes then fail as `EventTooLarge { artifact: Other }`. A relay with no known limit
   is sent to as before.

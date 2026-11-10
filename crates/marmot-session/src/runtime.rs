@@ -12,6 +12,7 @@ pub enum AccountIngestPhase {
 }
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -3494,7 +3495,7 @@ where
 
     /// A founder's Welcome that fits none of the relays its publish would
     /// reach refuses the create before anything is written, with
-    /// `EngineError::WelcomeTooLarge` (mdk#2334).
+    /// `EngineError::EventTooLarge` (mdk#2334).
     pub async fn prepare_create_group_with_optional_app_components_and_audit_context(
         &mut self,
         request: CreateGroupRequest,
@@ -3638,9 +3639,9 @@ where
     /// before [`Self::publish_prepared_session_effects_with_audit_context`]
     /// exposes the commit on the wire. An invite whose commit or Welcome fits
     /// none of its relays' known limits is rolled back here instead, unsent,
-    /// as [`PreparedSessionSend::Refused`]. A queued invite is not checked:
-    /// when it drains, its commit is sent and the adapter refuses such a
-    /// Welcome, which stays owed with its size class.
+    /// as [`PreparedSessionSend::Refused`]. A queued invite is judged by the
+    /// same check when it drains, before its commit is published, and one
+    /// that fits none is retired unsent as `QueuedIntentRefused`.
     pub async fn confirm_commit_without_publish_with_audit_context(
         &mut self,
         intent: SendIntent,
@@ -3676,10 +3677,8 @@ where
     }
 
     /// The commit's id and the oversized artifact when an invite must be
-    /// refused before its commit is published (mdk#2334): the commit fits
-    /// none of its group relays' known limits, or a Welcome fits none of its
-    /// invitee's inbox relays'. A relay with no known limit fits; one the
-    /// adapter would never send to does not count.
+    /// refused before its commit is published (mdk#2334); see
+    /// [`Self::oversized_invite_events`].
     async fn oversized_invite(
         &self,
         prepared: &PreparedSessionCommit,
@@ -3696,28 +3695,47 @@ where
                 }
                 _ => None,
             })?;
-        let refused = |artifact, size_class| {
-            Some((
-                commit.id.clone(),
-                OversizedEvent {
-                    artifact,
+        let oversized = self
+            .oversized_invite_events(commit, &prepared.welcomes)
+            .await?;
+        Some((commit.id.clone(), oversized))
+    }
+
+    /// The oversized artifact when an invite's commit fits none of its group
+    /// relays' known limits, or a Welcome fits none of its invitee's inbox
+    /// relays'. A relay with no known limit fits; one the adapter would never
+    /// send to does not count. A direct invite and a queued one the drain
+    /// prepared are both judged here, before the commit is published.
+    ///
+    /// The future is boxed in this plain function so a caller's poll frame
+    /// holds only the box; see [`refuse_too_large`].
+    #[inline(never)]
+    fn oversized_invite_events(
+        &self,
+        commit: &TransportMessage,
+        welcomes: &[TransportMessage],
+    ) -> Pin<Box<impl Future<Output = Option<OversizedEvent>>>> {
+        Box::pin(async move {
+            // A commit or Welcome without a route fails when it is published.
+            let target = self.routing.publish_target(commit).ok()?;
+            let adapter = &self.adapter;
+            if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
+                return Some(OversizedEvent {
+                    artifact: OversizedArtifact::Commit,
                     size_class,
-                },
-            ))
-        };
-        // A commit or Welcome without a route fails when it is published.
-        let target = self.routing.publish_target(commit).ok()?;
-        let adapter = &self.adapter;
-        if let Some(size_class) = adapter.size_class_over_known_limits(commit, &target).await {
-            return refused(OversizedArtifact::Commit, size_class);
-        }
-        // The same check a founding create runs on its Welcomes.
-        let welcome_sizes = WelcomeSizes {
-            adapter,
-            routing: &self.routing,
-        };
-        let size_class = welcome_sizes.oversized_welcome(&prepared.welcomes).await?;
-        refused(OversizedArtifact::Welcome, size_class)
+                });
+            }
+            // The same check a founding create runs on its Welcomes.
+            let welcome_sizes = WelcomeSizes {
+                adapter,
+                routing: &self.routing,
+            };
+            let size_class = welcome_sizes.oversized_welcome(welcomes).await?;
+            Some(OversizedEvent {
+                artifact: OversizedArtifact::Welcome,
+                size_class,
+            })
+        })
     }
 
     /// Roll back a prepared commit before that commit has any transport side
@@ -5200,6 +5218,20 @@ where
             return Ok(());
         }
 
+        // A queued invite the drain prepared is judged as a direct invite
+        // is, before its commit is published: one whose commit or Welcome
+        // fits none of its relays is retired unsent (mdk#2334).
+        if self.session.pending_is_queued_invite(pending)?
+            && let Some(oversized) = self.oversized_invite_events(&commit, &welcomes).await
+        {
+            let effects = refuse_too_large(&mut self.session, pending, None, oversized).await?;
+            output
+                .pending
+                .push(PendingResolution::RolledBack { pending });
+            output.absorb_session_effects(effects, queue);
+            return Ok(());
+        }
+
         Box::pin(self.publish_one_with_post_confirmation_welcomes(
             commit,
             Some(PendingFanoutContinuation {
@@ -5954,7 +5986,7 @@ where
             && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
-            let effects = self.session.publish_failed_fanout(pending, fanout).await?;
+            let effects = roll_back_failed_fanout(&mut self.session, pending, fanout).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -7353,30 +7385,54 @@ pub struct PublishFailure {
     pub oversized: Option<OversizedEvent>,
 }
 
-/// Semantic artifact known by the publication owner, never inferred from ciphertext.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OversizedArtifact {
-    Commit,
-    Welcome,
-    ApplicationMessage,
-    Other,
+pub use cgka_traits::OversizedArtifact;
+
+/// [`AccountDeviceSession::publish_refused_as_too_large`] for `oversized`,
+/// boxed in this plain function. `Box::pin` called in an async body still
+/// builds the future in that body's poll frame, and every poll of the body
+/// then carries it, the paths that never refuse included. The drain and
+/// fanout bodies that call these helpers run within a few KiB of a test
+/// thread's stack, so they hold only the box (mdk#2334).
+#[inline(never)]
+fn refuse_too_large<'a>(
+    session: &'a mut AccountDeviceSession,
+    pending: PendingStateRef,
+    fanout: Option<&'a mut OutboundFanout>,
+    oversized: OversizedEvent,
+) -> Pin<Box<impl Future<Output = SessionResult<SessionEffects>> + 'a>> {
+    Box::pin(session.publish_refused_as_too_large(
+        pending,
+        fanout,
+        oversized.artifact,
+        oversized.size_class,
+    ))
 }
 
-impl OversizedArtifact {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Commit => "commit",
-            Self::Welcome => "welcome",
-            Self::ApplicationMessage => "application_message",
-            Self::Other => "other",
+/// Roll back `pending`, which no relay of `fanout` accepted, boxed as
+/// [`refuse_too_large`] is. A commit every relay refused for its size cannot
+/// fit on a retry: one drained from the queue is retired, not re-drained
+/// (mdk#2334).
+#[inline(never)]
+fn roll_back_failed_fanout<'a>(
+    session: &'a mut AccountDeviceSession,
+    pending: PendingStateRef,
+    fanout: &'a mut OutboundFanout,
+) -> Pin<Box<impl Future<Output = SessionResult<SessionEffects>> + 'a>> {
+    Box::pin(async move {
+        match OversizedEvent::of_fanout(fanout) {
+            Some(oversized) => {
+                session
+                    .publish_refused_as_too_large(
+                        pending,
+                        Some(fanout),
+                        oversized.artifact,
+                        oversized.size_class,
+                    )
+                    .await
+            }
+            None => session.publish_failed_fanout(pending, fanout).await,
         }
-    }
-}
-
-impl std::fmt::Display for OversizedArtifact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+    })
 }
 
 /// Privacy-safe explanation of an observed all-target size refusal, without

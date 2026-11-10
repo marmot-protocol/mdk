@@ -487,3 +487,243 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
         serde_json::to_string_pretty(&measured).unwrap()
     );
 }
+
+// The queued-intent tests use `push_token_reshare::Device`, which is built
+// only with test policy overrides.
+
+/// An app whose relays have these known limits and whose settlement window
+/// holds a send behind a peer's commit, so the send is queued and the next
+/// convergence drains it. Its relay is `wss://relay.example`.
+#[cfg(feature = "test-policy-overrides")]
+fn queueing_app_with_event_limits(
+    dir: &tempfile::TempDir,
+    relay: Arc<ScriptedPushRelayClient>,
+    limits: &[(&str, u64)],
+    quiescence_ms: u64,
+) -> MarmotApp {
+    let deployment = MarmotDeployment {
+        relay_event_limits: limits
+            .iter()
+            .map(|(relay, max_event_bytes)| RelayEventLimit {
+                relay: (*relay).to_owned(),
+                max_event_bytes: *max_event_bytes,
+            })
+            .collect(),
+        ..MarmotDeployment::white_noise()
+    };
+    MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_deployment(deployment)
+            .with_dev_settlement_quiescence_ms(quiescence_ms)
+            .with_dev_scheduled_convergence_delay_ms(0),
+    )
+    .with_test_relay_client(relay)
+}
+
+/// Alice and Bob share a chat, and Bob's commit opens a settlement window on
+/// Alice, so her next send is queued for convergence to drain.
+#[cfg(feature = "test-policy-overrides")]
+async fn chat_with_an_open_settlement_window(
+    home: &AccountHome,
+    app: &MarmotApp,
+    relay: &ScriptedPushRelayClient,
+) -> (
+    super::push_token_reshare::Device,
+    super::push_token_reshare::Device,
+    GroupId,
+) {
+    use super::push_token_reshare::Device;
+    let mut alice = Device::create(home, app, "alice").await;
+    let mut bob = Device::create(home, app, "bob").await;
+    remember_member_inbox_at(app, &bob.account_id_hex, "wss://inbox.example", 2);
+    let group = alice
+        .client
+        .create_group("queued", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    bob.join(relay, &group).await;
+    bob.client
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    alice.receive(relay).await;
+    (alice, bob, group)
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn queued_refusals(events: &[GroupEvent]) -> Vec<GroupEvent> {
+    events
+        .iter()
+        .filter(|event| matches!(event, GroupEvent::QueuedIntentRefused { .. }))
+        .cloned()
+        .collect()
+}
+
+/// A queued commit that fits none of its group relays is refused when the
+/// drain prepares it: the commit rolls back, the queued record is retired
+/// and announced as too large, and the drain does not prepare it again
+/// (mdk#2334). It used to roll back and re-drain without end.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_commit_too_large_for_every_group_relay_is_retired() {
+    const QUIESCENCE_MS: u64 = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = queueing_app_with_event_limits(
+        &dir,
+        relay.clone(),
+        &[("wss://relay.example", 5_000)],
+        QUIESCENCE_MS,
+    );
+    let (mut alice, _bob, group) = chat_with_an_open_settlement_window(&home, &app, &relay).await;
+    alice
+        .client
+        .update_group_profile(&group, None, Some(&"d".repeat(4_096)))
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+    let sent_before = relay.attempted_events().len();
+
+    tokio::time::sleep(Duration::from_millis(QUIESCENCE_MS + 200)).await;
+    let effects = alice
+        .client
+        .runtime
+        .advance_convergence(&group)
+        .await
+        .unwrap();
+
+    assert!(
+        !alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap(),
+        "the refused intent is retired, not drained again"
+    );
+    let refusals = queued_refusals(&effects.events);
+    assert!(
+        matches!(
+            refusals.as_slice(),
+            [GroupEvent::QueuedIntentRefused {
+                reason,
+                artifact: Some(OversizedArtifact::Commit),
+                size_class: Some(EventSizeClass::Under64Kib),
+                ..
+            }] if reason == "event_too_large"
+        ),
+        "{refusals:?}"
+    );
+    assert!(matches!(
+        alice.client.runtime.epoch_state(&group).unwrap(),
+        cgka_traits::engine_state::EpochState::Stable { .. }
+    ));
+    assert!(
+        relay.attempted_events()[sent_before..]
+            .iter()
+            .all(|event| event.kind != transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the commit reached no relay"
+    );
+    let again = alice
+        .client
+        .runtime
+        .advance_convergence(&group)
+        .await
+        .unwrap();
+    assert!(queued_refusals(&again.events).is_empty());
+}
+
+/// A queued invite whose Welcome fits none of the invitee's inbox relays is
+/// refused before its commit is published, as a direct invite is: nothing is
+/// sent, the invitee is not added, and the queued record is retired and
+/// announced as too large (mdk#2334). Its commit used to confirm while the
+/// Welcome stayed owed.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
+    const QUIESCENCE_MS: u64 = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = queueing_app_with_event_limits(
+        &dir,
+        relay.clone(),
+        &[("wss://small-inbox.example", 200)],
+        QUIESCENCE_MS,
+    );
+    let carol = super::push_token_reshare::Device::create(&home, &app, "carol").await;
+    remember_member_inbox_at(&app, &carol.account_id_hex, "wss://small-inbox.example", 2);
+    let (mut alice, _bob, group) = chat_with_an_open_settlement_window(&home, &app, &relay).await;
+    let members = alice.client.runtime.group_record(&group).unwrap().members;
+    alice
+        .client
+        .invite_members(&group, &[carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+    let sent_before = relay.attempted_events().len();
+
+    tokio::time::sleep(Duration::from_millis(QUIESCENCE_MS + 200)).await;
+    let effects = alice
+        .client
+        .runtime
+        .advance_convergence(&group)
+        .await
+        .unwrap();
+
+    assert!(
+        !alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+    let refusals = queued_refusals(&effects.events);
+    assert!(
+        matches!(
+            refusals.as_slice(),
+            [GroupEvent::QueuedIntentRefused {
+                intent_kind,
+                reason,
+                artifact: Some(OversizedArtifact::Welcome),
+                size_class: Some(EventSizeClass::Under64Kib),
+                ..
+            }] if intent_kind == "invite" && reason == "event_too_large"
+        ),
+        "{refusals:?}"
+    );
+    assert_eq!(
+        alice.client.runtime.group_record(&group).unwrap().members,
+        members,
+        "carol was not added"
+    );
+    assert!(
+        alice
+            .client
+            .pending_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        relay.attempted_events().len(),
+        sent_before,
+        "neither the commit nor the Welcome was sent"
+    );
+}

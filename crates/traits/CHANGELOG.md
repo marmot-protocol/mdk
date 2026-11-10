@@ -7,14 +7,22 @@
 - `GroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272): a read of past group state rewound the live
   group onto a retained anchor and could not restore it, in this session or when the account opened. Neither a retry
   nor a re-join clears it, and the next open restores the live state. Exhaustive matches must add it.
-- `EngineError::WelcomeTooLarge { size_class }` refuses a group create whose founding Welcome fits none of the relays
-  its publish would reach (mdk#2334). Exhaustive matches add it.
+- `EngineError::EventTooLarge { artifact, size_class }` refuses a change whose event fits none of the relays its
+  publish would reach (mdk#2334): a group create whose founding Welcome fails the `WelcomeSizeCheck`, or a queued
+  intent the drain retires. Exhaustive matches add it.
+- `GroupEvent::QueuedIntentRefused` adds `artifact: Option<OversizedArtifact>` and
+  `size_class: Option<EventSizeClass>` (mdk#2334). Both are set only with `reason` `event_too_large`: the event that
+  fits none of its relays' known size limits, or that every relay refused for size, and its size class. Struct
+  patterns add them or `..`. Serialized events without the fields still deserialize, and events without a size
+  refusal serialize as before.
 
 ### Added
 
 - `StorageProvider::list_snapshots_with_prefixes` lists every group's snapshots whose names start with given prefixes
   in one read (mdk#3272). Engine construction uses it to find interrupted rewinds. It defaults to listing each stored
   group's snapshots, so existing providers build unchanged.
+- `OversizedArtifact` (commit, Welcome, application message or other) moves here from marmot-session, which re-exports
+  it (mdk#2334).
 - `WelcomeSizeCheck` judges a founding create's Welcomes before the engine writes anything (mdk#2334): the size
   class of the first that fits none of the endpoints its publish would reach.
 

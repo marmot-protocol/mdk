@@ -1169,6 +1169,8 @@ async fn session_advance_convergence_announces_a_refused_queued_intent() {
                 intent_id,
                 intent_kind,
                 reason,
+                artifact: None,
+                size_class: None,
             } => Some((group_id, intent_id, intent_kind.as_str(), reason.as_str())),
             _ => None,
         })

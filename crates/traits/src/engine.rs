@@ -807,8 +807,9 @@ pub enum GroupEvent {
     /// A queued intent was dropped unsent: once the group settled, the
     /// settled state refused it, as it would have refused the same intent
     /// sent directly (the sender is no longer an admin, a precondition no
-    /// longer holds, the change is not valid on that state). The engine does
-    /// not prepare it again; the user may ask again (mdk#2694).
+    /// longer holds, the change is not valid on that state), or one of its
+    /// events fits none of its relays (mdk#2334). The engine does not prepare
+    /// it again; the user may ask again (mdk#2694).
     QueuedIntentRefused {
         group_id: GroupId,
         /// The id [`SendResult::Queued`] returned for the intent.
@@ -817,8 +818,18 @@ pub enum GroupEvent {
         intent_kind: String,
         /// Stable, privacy-safe name of the refusal: the
         /// [`EngineError::privacy_safe_kind`](crate::error::EngineError::privacy_safe_kind)
-        /// of the error the preparation returned, such as `not_group_admin`.
+        /// of the error the preparation returned, such as `not_group_admin`,
+        /// or `event_too_large`.
         reason: String,
+        /// For `event_too_large`, which event fit none of its relays: the
+        /// commit, or a Welcome whose invitee's inbox relays all refuse it.
+        /// `None` for every other reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<crate::OversizedArtifact>,
+        /// For `event_too_large`, that event's size class. `None` for every
+        /// other reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_class: Option<crate::EventSizeClass>,
     },
     /// Device destinations invalidated by an actual canonical state transition.
     /// Derived from the live pre-apply tree and the final selected tree, rather

@@ -1837,6 +1837,26 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    /// Roll back a commit none of whose relays will take it, retiring the
+    /// queued intent it was drained from (mdk#2334).
+    pub async fn publish_refused_as_too_large(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: Option<&mut OutboundFanout>,
+        artifact: cgka_traits::OversizedArtifact,
+        size_class: cgka_traits::EventSizeClass,
+    ) -> SessionResult<SessionEffects> {
+        self.engine
+            .publish_refused_as_too_large(pending, fanout, artifact, size_class)
+            .await?;
+        Ok(self.collect_effects(vec![]))
+    }
+
+    /// Whether `pending` is the commit of a queued invite the drain prepared.
+    pub fn pending_is_queued_invite(&self, pending: PendingStateRef) -> SessionResult<bool> {
+        Ok(self.engine.pending_is_queued_invite(pending)?)
+    }
+
     /// Bounded local policy recovery, driven by account maintenance.
     pub fn recover_pending_application_authority(&mut self) -> SessionResult<()> {
         self.engine.recover_pending_application_authority()?;

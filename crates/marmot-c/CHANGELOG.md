@@ -12,6 +12,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Neither a retry nor a re-join clears it, and the next account open restores the live state. A `switch` that covers
   every case must add it. Use the matching generated header and library.
 
+- `MarmotGroupEventKind`'s `QueuedIntentRefused` body appends `artifact`, `has_size_class` and `size_class`
+  (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's Welcome fits none of its relays'
+  known size limits, or every relay refused it for size: `artifact` is `commit` or `welcome`, freed with the event, and
+  `size_class` its coarse size. `artifact` is NULL and `has_size_class` false for other reasons. Rebuild against the
+  matching generated header and library.
+
 - Add `marmot_deployment_set_relay_event_limits`, which replaces the largest event each listed relay accepts, for
   relays that do not advertise it (mdk#2334): `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event,
   Welcome or account-signed event over a relay's known limit. A send that fits none of its relays reaches none, and a

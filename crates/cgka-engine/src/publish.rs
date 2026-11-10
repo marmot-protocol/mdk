@@ -34,7 +34,7 @@ use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{QueuedOutboundIntent, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider as _;
@@ -474,13 +474,21 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
-        self.do_publish_failed_with_fanout(pending, None).await
+        self.do_publish_failed_with_fanout(pending, None, None)
+            .await
     }
 
+    /// Roll back `pending`, which no endpoint accepted. With `retired`, the
+    /// queued intent it was drained from is refused for good, as when its
+    /// event fits none of its relays (mdk#2334): the record is deleted in the
+    /// rollback's transaction and the refusal announced once that commits, so
+    /// no later drain prepares it again. Without it, a drained intent stays
+    /// queued for the next drain.
     pub(crate) async fn do_publish_failed_with_fanout(
         &mut self,
         pending: PendingStateRef,
         mut fanout: Option<&mut OutboundFanout>,
+        retired: Option<(&QueuedOutboundIntent, &EngineError)>,
     ) -> Result<(), EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let origin_commit_id = self.peek_pending_origin_commit(pending);
@@ -534,6 +542,12 @@ impl<S: StorageProvider> Engine<S> {
                 // the retained intent must not be re-issued behind its back.
                 if let Some(origin_commit_id) = origin_commit_id.as_ref() {
                     storage.delete_own_commit_intent(origin_commit_id)?;
+                }
+                // Republishing the same event cannot succeed, so retire the
+                // intent with the rollback that undoes it: a failure or a
+                // crash leaves both, and the refusal can run again.
+                if let Some((record, _)) = retired {
+                    storage.delete_queued_outbound_intent(&record.id)?;
                 }
                 if has_pending_commit {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
@@ -602,6 +616,10 @@ impl<S: StorageProvider> Engine<S> {
 
         if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
             *fanout = rolled_back;
+        }
+        // Announced before any fallible step below: the retirement is durable.
+        if let Some((record, refusal)) = retired {
+            self.announce_refused_queued_intent(record, refusal);
         }
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);

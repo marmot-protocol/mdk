@@ -988,6 +988,34 @@ impl TransportEndpointRejectionCategory {
     }
 }
 
+/// Which event a size refusal concerns, named by the code that publishes it,
+/// never inferred from ciphertext (mdk#2334).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OversizedArtifact {
+    Commit,
+    Welcome,
+    ApplicationMessage,
+    Other,
+}
+
+impl OversizedArtifact {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Welcome => "welcome",
+            Self::ApplicationMessage => "application_message",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for OversizedArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Coarse serialized-event sizes for a proven size refusal, never a relay limit.
 /// Exact byte counts must not cross the host diagnostic boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1430,7 +1458,7 @@ pub trait TransportAdapter: Send + Sync {
 
 /// Judges a founding create's Welcomes before the engine writes anything
 /// (mdk#2334). The engine refuses the create with
-/// [`crate::EngineError::WelcomeTooLarge`] when this names a size class.
+/// [`crate::EngineError::EventTooLarge`] when this names a size class.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait WelcomeSizeCheck: Send + Sync {

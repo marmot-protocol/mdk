@@ -7,8 +7,13 @@
 - `Engine::create_group_with_optional_app_components_and_audit_context` and
   `Engine::create_group_with_siblings_and_audit_context` take `welcome_check: Option<&dyn WelcomeSizeCheck>`
   (mdk#2334). After wrapping the founders' Welcomes, and before the creation's canonical write, a Welcome the check
-  finds too large refuses the create with `EngineError::WelcomeTooLarge`; the new group's OpenMLS state is removed.
-  Sibling Welcomes and chosen-id creates are not checked. Pass `None` to keep the old behaviour.
+  finds too large refuses the create with `EngineError::EventTooLarge { artifact: Welcome }`; the new group's OpenMLS
+  state is removed. Sibling Welcomes and chosen-id creates are not checked. Pass `None` to keep the old behaviour.
+- A queued intent whose event fits none of its relays is retired, not re-drained forever (mdk#2334). Before, a drained
+  commit that every group relay refused for size was rolled back and the drain staged it again on the next pass. The
+  new `Engine::publish_refused_as_too_large` rolls the pending commit back like `publish_failed_with_fanout`, deletes
+  the queued intent in the same transaction, and announces `GroupEvent::QueuedIntentRefused` with reason
+  `event_too_large`, the artifact and its size class. `Engine::pending_is_queued_invite` tells a drained invite from a direct one.
 - Engine paths read a group's stored record only through accessors that refuse a quarantined group, and the crate's
   `clippy.toml` bans the raw reads (mdk#3272). For any quarantined group, the settle API and `cancel_leave` return
   `UnknownGroup`, `has_pending_convergence_inputs` answers `false` unless a pass or replay is outstanding,

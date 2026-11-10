@@ -122,6 +122,8 @@ fn assert_refused_and_retired(drain: &DemotedDrain, intent_kind: &str) {
                 intent_id,
                 intent_kind: kind,
                 reason,
+                artifact: None,
+                size_class: None,
             },
         ] => {
             assert_eq!(group_id, &drain.group_id);

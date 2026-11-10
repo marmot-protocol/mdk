@@ -1150,8 +1150,68 @@ impl<S: StorageProvider> Engine<S> {
             self.ensure_group_live(group_id)?;
         }
         self.pending_group_id(pending)?;
-        self.do_publish_failed_with_fanout(pending, Some(fanout))
+        self.do_publish_failed_with_fanout(pending, Some(fanout), None)
             .await
+    }
+
+    /// Whether `pending` is the commit of a queued invite that the drain
+    /// prepared. Its Welcomes are checked before the commit is published, as
+    /// a direct invite's are (mdk#2334).
+    pub fn pending_is_queued_invite(&self, pending: PendingStateRef) -> Result<bool, EngineError> {
+        Ok(self
+            .queued_intent_for_pending(pending)?
+            .is_some_and(|record| matches!(record.intent, SendIntent::Invite { .. })))
+    }
+
+    /// The queued intent the drain prepared `pending` from, while it is
+    /// still queued.
+    fn queued_intent_for_pending(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<Option<cgka_traits::storage::QueuedOutboundIntent>, EngineError> {
+        let Some((group_id, intent_id)) = self.queued_intent_by_pending.get(&pending) else {
+            return Ok(None);
+        };
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .into_iter()
+            .find(|record| record.id == *intent_id))
+    }
+
+    /// Roll back a commit that none of its relays will take, and retire the
+    /// queued intent it was drained from (mdk#2334). Publishing the same
+    /// event again cannot succeed, so where [`Self::publish_failed_fanout`]
+    /// keeps a queued intent for the next drain, this deletes the record in
+    /// the rollback's transaction and then announces
+    /// [`GroupEvent::QueuedIntentRefused`] naming the event. A commit not
+    /// drained from the queue rolls back as `publish_failed` does, and its
+    /// caller reports the refusal. With `fanout`, its all-failed edge is
+    /// written in the same transaction.
+    pub async fn publish_refused_as_too_large(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: Option<&mut OutboundFanout>,
+        artifact: cgka_traits::OversizedArtifact,
+        size_class: cgka_traits::EventSizeClass,
+    ) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.as_ref().and_then(|fanout| fanout.group_id()) {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
+        // Read before the rollback's transaction, so a failed read writes
+        // nothing.
+        let retired = self.queued_intent_for_pending(pending)?;
+        let refusal = EngineError::EventTooLarge {
+            artifact,
+            size_class,
+        };
+        self.do_publish_failed_with_fanout(
+            pending,
+            fanout,
+            retired.as_ref().map(|record| (record, &refusal)),
+        )
+        .await
     }
 
     pub fn drain_valid_proposal_groups(&mut self) -> Vec<GroupId> {
@@ -1363,7 +1423,7 @@ impl<S: StorageProvider> Engine<S> {
 
     /// `welcome_check` judges the founders' Welcomes before anything is
     /// written; a Welcome it finds too large refuses the create with
-    /// [`EngineError::WelcomeTooLarge`] (mdk#2334).
+    /// [`EngineError::EventTooLarge`] (mdk#2334).
     pub async fn create_group_with_optional_app_components_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
