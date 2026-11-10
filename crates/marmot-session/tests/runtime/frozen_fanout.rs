@@ -627,12 +627,20 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 async fn terminal_application_fanout_replays_failure_after_restart_before_delete() {
     // None is also the real SDK shape after an earlier ambiguous attempt:
     // reopening must never infer a size proof from the payload or last category.
-    for (category, size_class) in [
-        (TransportEndpointRejectionCategory::Blocked, None),
-        (TransportEndpointRejectionCategory::TooLarge, None),
+    // A refusal before sending, over the relay's known limit, proves size too.
+    use TransportEndpointFailureKind::{NotExposed, TerminalRejected};
+    for (kind, category, size_class) in [
+        (TerminalRejected, TransportEndpointRejectionCategory::Blocked, None),
+        (TerminalRejected, TransportEndpointRejectionCategory::TooLarge, None),
         (
+            TerminalRejected,
             TransportEndpointRejectionCategory::TooLarge,
             Some(cgka_traits::EventSizeClass::Under64Kib),
+        ),
+        (
+            NotExposed,
+            TransportEndpointRejectionCategory::TooLarge,
+            Some(cgka_traits::EventSizeClass::From64To128Kib),
         ),
     ] {
 
@@ -702,7 +710,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
                 size_class,
                 endpoint: endpoint.clone(),
                 reason: "relay rejected the event".into(),
-                kind: TransportEndpointFailureKind::TerminalRejected,
+                kind,
                 rejection_category: Some(category),
             },
         )

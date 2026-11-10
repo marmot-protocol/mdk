@@ -12894,6 +12894,22 @@ MarmotStatus marmot_deployment_set_open_ranking(struct MarmotDeployment *deploym
                                                 uintptr_t profile_relays_len);
 
 /**
+ * Replace the largest event each listed relay accepts, in bytes of
+ * serialized event JSON, for relays that do not advertise it (mdk#2334).
+ * `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event or
+ * Welcome over a relay's known limit, and a send that fits none of its
+ * relays fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A blank relay or a zero
+ * limit is ignored; a relay listed twice keeps the smaller limit.
+ * # Safety
+ * deployment must be live; relays must point to len valid strings and
+ * max_event_bytes to len values (or both be NULL with 0).
+ */
+MarmotStatus marmot_deployment_set_relay_event_limits(struct MarmotDeployment *deployment,
+                                                      const char *const *relays,
+                                                      const uint64_t *max_event_bytes,
+                                                      uintptr_t len);
+
+/**
  * Set the NIP-32 namespace on moderation report labels; NULL unsets it, and
  * reporting then refuses a destination.
  * # Safety

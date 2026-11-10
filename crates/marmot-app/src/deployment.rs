@@ -37,6 +37,19 @@ pub struct MarmotDeployment {
     /// Platform keychain service name for account secrets. Changing it for an
     /// existing install strands the secrets stored under the old name.
     pub keychain_service: String,
+    /// The largest event each listed relay accepts, for relays that do not
+    /// advertise it (mdk#2334). MDK sends no group event or Welcome over a
+    /// relay's known limit, and a send that fits none of its relays fails as
+    /// `EventTooLarge`. An unlisted relay is limited only by the message size
+    /// its NIP-11 document advertises, and otherwise not at all.
+    pub relay_event_limits: Vec<RelayEventLimit>,
+}
+
+/// The largest event, in bytes of serialized event JSON, one relay accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayEventLimit {
+    pub relay: String,
+    pub max_event_bytes: u64,
 }
 
 /// Neutral keychain service name for hosts that never chose one.
@@ -65,6 +78,9 @@ mod white_noise {
     pub(super) const OPEN_RANKING_SEARCH: &str = "https://ranking.vertexlab.io/search/pubkeys";
     pub(super) const MODERATION_LABEL_NAMESPACE: &str = "chat.whitenoise.report";
     pub(super) const KEYCHAIN_SERVICE: &str = "com.marmot.whitenoise";
+    /// The operated relays' strfry `events.maxEventSize`, which their NIP-11
+    /// documents do not advertise.
+    pub(super) const OPERATED_RELAY_MAX_EVENT_BYTES: u64 = 2 * 1024 * 1024;
 }
 
 fn owned(values: &[&str]) -> Vec<String> {
@@ -84,11 +100,12 @@ impl MarmotDeployment {
             open_ranking: None,
             moderation_label_namespace: None,
             keychain_service: NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
+            relay_event_limits: Vec::new(),
         }
     }
 
     /// White Noise's deployment, byte for byte what MDK compiled in before
-    /// these became configuration.
+    /// these became configuration, plus its operated relays' event limit.
     pub fn white_noise() -> Self {
         Self {
             recovery_operated_relays: owned(white_noise::OPERATED_RELAYS),
@@ -102,6 +119,13 @@ impl MarmotDeployment {
             }),
             moderation_label_namespace: Some(white_noise::MODERATION_LABEL_NAMESPACE.to_owned()),
             keychain_service: white_noise::KEYCHAIN_SERVICE.to_owned(),
+            relay_event_limits: white_noise::OPERATED_RELAYS
+                .iter()
+                .map(|relay| RelayEventLimit {
+                    relay: (*relay).to_owned(),
+                    max_event_bytes: white_noise::OPERATED_RELAY_MAX_EVENT_BYTES,
+                })
+                .collect(),
         }
     }
 
@@ -128,6 +152,7 @@ impl MarmotDeployment {
             "" => NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
             name => name.to_owned(),
         };
+        self.relay_event_limits = normalize_event_limits(self.relay_event_limits);
         self
     }
 
@@ -183,6 +208,26 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// Trimmed relays with a nonzero limit, one entry per relay: a relay listed
+/// twice keeps the smaller limit.
+fn normalize_event_limits(limits: Vec<RelayEventLimit>) -> Vec<RelayEventLimit> {
+    let mut normalized: Vec<RelayEventLimit> = Vec::new();
+    for limit in limits {
+        let relay = limit.relay.trim().to_owned();
+        if relay.is_empty() || limit.max_event_bytes == 0 {
+            continue;
+        }
+        match normalized.iter_mut().find(|known| known.relay == relay) {
+            Some(known) => known.max_event_bytes = known.max_event_bytes.min(limit.max_event_bytes),
+            None => normalized.push(RelayEventLimit {
+                relay,
+                max_event_bytes: limit.max_event_bytes,
+            }),
+        }
+    }
+    normalized
 }
 
 fn normalize_list(values: Vec<String>) -> Vec<String> {
@@ -252,6 +297,19 @@ mod tests {
             Some("chat.whitenoise.report")
         );
         assert_eq!(deployment.keychain_service, "com.marmot.whitenoise");
+        assert_eq!(
+            deployment.relay_event_limits,
+            [
+                RelayEventLimit {
+                    relay: "wss://relay.eu.whitenoise.chat".into(),
+                    max_event_bytes: 2 * 1024 * 1024,
+                },
+                RelayEventLimit {
+                    relay: "wss://relay.us.whitenoise.chat".into(),
+                    max_event_bytes: 2 * 1024 * 1024,
+                },
+            ]
+        );
         assert_eq!(deployment.clone().normalize(), deployment);
     }
 
@@ -266,6 +324,7 @@ mod tests {
         assert_eq!(deployment.open_ranking, None);
         assert_eq!(deployment.moderation_label_namespace, None);
         assert_eq!(deployment.keychain_service, NEUTRAL_KEYCHAIN_SERVICE_NAME);
+        assert!(deployment.relay_event_limits.is_empty());
     }
 
     #[test]
@@ -296,6 +355,25 @@ mod tests {
         assert_eq!(
             blank_keychain.keychain_service,
             NEUTRAL_KEYCHAIN_SERVICE_NAME
+        );
+        let limit = |relay: &str, max_event_bytes| RelayEventLimit {
+            relay: relay.into(),
+            max_event_bytes,
+        };
+        let limits = MarmotDeployment {
+            relay_event_limits: vec![
+                limit(" wss://a.example ", 200),
+                limit("  ", 100),
+                limit("wss://b.example", 0),
+                limit("wss://a.example", 150),
+            ],
+            ..MarmotDeployment::neutral()
+        }
+        .normalize();
+        assert_eq!(
+            limits.relay_event_limits,
+            [limit("wss://a.example", 150)],
+            "blank relays and zero limits are unset; a repeat keeps the smaller"
         );
     }
 

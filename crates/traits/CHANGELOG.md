@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- `TransportEndpointFailure::over_known_limit` is an adapter's refusal to send an event over an endpoint's known limit
+  (mdk#2334): `NotExposed` with the `TooLarge` category and the event's size class. `TooLarge` now also covers this
+  refusal, and `EventSizeClass::from_rejected_targets` counts it, alone or mixed with endpoints' own size refusals.
+
 ## 0.15.0 - 2026-11-09
 
 Third-party `StorageProvider`, `CgkaEngine` and `TransportPeeler` implementations must add the required methods below.

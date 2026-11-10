@@ -22,6 +22,14 @@
   `runtime.accounts().begin_onboarding(..)` with `runtime.account_setup().begin_onboarding(..)`. The UniFFI and C
   bindings do not change.
 
+- `MarmotDeployment` adds `relay_event_limits`, a list of `RelayEventLimit { relay, max_event_bytes }` for relays that
+  do not advertise their event limit (mdk#2334). MDK sends no group event or Welcome over a relay's known limit, which
+  for events over 64 KiB also counts the WebSocket message size a relay's NIP-11 document advertises. A send that fits
+  none of its relays fails as `AppError::EventTooLarge`: a commit refused this way is rolled back with nothing sent,
+  and a Welcome stays owed with its size class. A relay with no known limit is sent to as before.
+  `MarmotDeployment::white_noise()` sets 2 MiB on White Noise's two relays; `neutral()` sets none. Struct literals add
+  the field.
+
 ### Added
 
 - `MarmotAppRuntime::start_direct_conversation` serializes peer lookup and

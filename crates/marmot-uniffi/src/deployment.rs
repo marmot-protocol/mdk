@@ -1,7 +1,7 @@
 //! The deployment record a host passes at construction. It mirrors
 //! `marmot_app::MarmotDeployment`.
 
-use marmot_app::{MarmotDeployment, OpenRankingProvider};
+use marmot_app::{MarmotDeployment, OpenRankingProvider, RelayEventLimit};
 
 /// An Open Ranking pubkey-search endpoint and the relays that hydrate its
 /// results into signed kind-0 profiles. With no profile relay the tier is off.
@@ -9,6 +9,13 @@ use marmot_app::{MarmotDeployment, OpenRankingProvider};
 pub struct OpenRankingProviderFfi {
     pub search_endpoint: String,
     pub profile_relays: Vec<String>,
+}
+
+/// The largest event, in bytes of serialized event JSON, one relay accepts.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RelayEventLimitFfi {
+    pub relay: String,
+    pub max_event_bytes: u64,
 }
 
 /// The services and identifiers one deployment's users rely on. Start from
@@ -41,6 +48,14 @@ pub struct MarmotDeploymentFfi {
     /// is supplied. Changing it for an existing install strands the secrets
     /// stored under the old name.
     pub keychain_service: String,
+    /// The largest event each listed relay accepts, for relays that do not
+    /// advertise it. MDK sends no group event or Welcome over a relay's known
+    /// limit, and a send that fits none of its relays fails as
+    /// `MarmotKitError::EventTooLarge`. An unlisted relay is limited only by
+    /// the message size its NIP-11 document advertises. A relay listed twice
+    /// keeps the smaller limit.
+    #[uniffi(default = [])]
+    pub relay_event_limits: Vec<RelayEventLimitFfi>,
 }
 
 impl From<MarmotDeployment> for MarmotDeploymentFfi {
@@ -59,6 +74,14 @@ impl From<MarmotDeployment> for MarmotDeploymentFfi {
                 }),
             moderation_label_namespace: deployment.moderation_label_namespace,
             keychain_service: deployment.keychain_service,
+            relay_event_limits: deployment
+                .relay_event_limits
+                .into_iter()
+                .map(|limit| RelayEventLimitFfi {
+                    relay: limit.relay,
+                    max_event_bytes: limit.max_event_bytes,
+                })
+                .collect(),
         }
     }
 }
@@ -77,14 +100,23 @@ impl From<MarmotDeploymentFfi> for MarmotDeployment {
             }),
             moderation_label_namespace: deployment.moderation_label_namespace,
             keychain_service: deployment.keychain_service,
+            relay_event_limits: deployment
+                .relay_event_limits
+                .into_iter()
+                .map(|limit| RelayEventLimit {
+                    relay: limit.relay,
+                    max_event_bytes: limit.max_event_bytes,
+                })
+                .collect(),
         }
         .normalize()
     }
 }
 
 /// White Noise's deployment: its recovery relays, discovery indexers, media
-/// and image servers, Vertex Open Ranking, moderation label namespace and
-/// keychain service `com.marmot.whitenoise`.
+/// and image servers, Vertex Open Ranking, moderation label namespace,
+/// keychain service `com.marmot.whitenoise` and its relays' 2 MiB event
+/// limit.
 /// White Noise apps pass it to every constructor.
 #[uniffi::export]
 pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi {

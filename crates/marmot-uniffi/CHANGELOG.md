@@ -4,6 +4,12 @@
 
 ### Added
 
+- `MarmotDeploymentFfi` adds `relay_event_limits: [RelayEventLimitFfi]`, empty by default in Swift and Kotlin: the
+  largest event each listed relay accepts, for relays that do not advertise it (mdk#2334). MDK sends no group event
+  or Welcome over a relay's known limit, and a send that fits none of its relays fails as
+  `MarmotKitError::EventTooLarge`. `marmot_deployment_white_noise()` sets 2 MiB on White Noise's two relays. Use the
+  matching native library with regenerated bindings.
+
 - `start_direct_conversation(account_ref, peer_account_id)` exposes shared
   local reuse and creation with both participants as founding admins
   (mdk#464). Cancellation detaches the wait; retry reuses canonical state.

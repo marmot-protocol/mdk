@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add `marmot_deployment_set_relay_event_limits`, which replaces the largest event each listed relay accepts, for
+  relays that do not advertise it (mdk#2334): `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event or
+  Welcome over a relay's known limit, and a send that fits none of its relays fails as
+  `MARMOT_STATUS_EVENT_TOO_LARGE`. `marmot_deployment_white_noise` sets 2 MiB on White Noise's two relays. Additive;
+  use the matching generated header and library.
+
 - Add `marmot_start_direct_chat` for shared local direct-chat reuse or creation with both accounts as
   founding admins. It returns an owned hex MLS group id, released with `marmot_string_free`; local success does
   not acknowledge Welcome delivery. Generic creation and existing groups' roles remain unchanged. Additive;

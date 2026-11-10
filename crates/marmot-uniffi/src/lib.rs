@@ -34,7 +34,7 @@ mod commands;
 mod deployment;
 pub use commands::user_blocks::{BlockListSnapshotFfi, BlockListSubscription, BlockedUserFfi};
 pub use deployment::{
-    MarmotDeploymentFfi, OpenRankingProviderFfi, marmot_deployment_neutral,
+    MarmotDeploymentFfi, OpenRankingProviderFfi, RelayEventLimitFfi, marmot_deployment_neutral,
     marmot_deployment_white_noise,
 };
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so

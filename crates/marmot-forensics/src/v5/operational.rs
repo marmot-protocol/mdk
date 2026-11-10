@@ -444,6 +444,10 @@ fn safe_failure_category(input: &str) -> String {
         "publish attempt failed before exposure" => {
             "publish_attempt_failed_before_exposure".to_owned()
         }
+        // `TransportEndpointFailure::over_known_limit`: refused unsent (mdk#2334).
+        "event exceeds the endpoint's known limit" => {
+            "publish_attempt_failed_before_exposure".to_owned()
+        }
         // Fixed Nostr adapter failure phrases. The SDK's free-form relay
         // suffix is never preserved; only typed protocol-prefix outcomes and
         // these locally authored phrases have an audit category.
