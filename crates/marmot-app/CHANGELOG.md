@@ -20,6 +20,7 @@
   Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
   is unchanged. Malformed cached URLs are excluded without blocking receive startup or valid retries.
   Directory-cache failures do not gate receive activation; queued reconnects use the long worker response wait.
+  Late transport activation on the same client also reconciles configuration, preserving closed-session details.
 
 ## 0.15.0 - 2026-11-09
 

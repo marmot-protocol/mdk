@@ -610,6 +610,100 @@ async fn liveness_cache_failure() {
     relay.shutdown();
 }
 
+#[tokio::test]
+async fn late_activation_liveness() {
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+
+    let receive = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let writer = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let receive_url = receive.url().await.to_string();
+    let writer_url = writer.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        receive_url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let account = app.account_home().create_account("alice").unwrap();
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![receive_url];
+    lists.nip65.write_relays = vec![writer_url.clone()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    app.test_fail_runner_preparation
+        .store(true, std::sync::atomic::Ordering::Release);
+    let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let mut changes = app.relay_plane.relay_liveness_changes().unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let sdk = timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if let Some(client) = app
+                .relay_plane
+                .account_history_relay_client(&account_id)
+                .await
+                && client
+                    .relay_liveness()
+                    .await
+                    .iter()
+                    .any(|row| row.status == crate::RelayLivenessStatus::Connected)
+            {
+                break client;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the subscription retry activates transport after preparation recovers");
+    runtime.periodic_maintenance_policy("alice").await.unwrap();
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "late activation")
+        .tag(Tag::custom("h", ["ab".repeat(32)]))
+        .finalize(&Keys::generate())
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&event).unwrap();
+    let endpoint = TransportEndpoint(writer_url.clone());
+    sdk.publish_event(std::slice::from_ref(&endpoint), &event, 1)
+        .await
+        .unwrap();
+    let before = runtime.account_relay_liveness("alice").await.unwrap();
+    let before = before.iter().find(|row| row.url == writer_url).unwrap();
+    assert_eq!(before.status, crate::RelayLivenessStatus::Connected);
+    assert!(before.last_attempt_unix.is_some());
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..1000 {
+        if sdk
+            .client()
+            .relay(writer_url.as_str())
+            .await
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        sdk.client()
+            .relay(writer_url.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after = runtime.account_relay_liveness("alice").await.unwrap();
+    let after = after.iter().find(|row| row.url == writer_url).unwrap();
+    assert_eq!(after.status, crate::RelayLivenessStatus::Offline);
+    assert_eq!(after.last_attempt_unix, before.last_attempt_unix);
+    runtime.shutdown().await;
+    writer.shutdown();
+    receive.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_manual_lifetime() {
     let receive = nostr_relay_builder::MockRelay::run().await.unwrap();

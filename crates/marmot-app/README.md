@@ -105,6 +105,7 @@ queued long-running commands; after dispatch, the dial wait is capped at five se
 Existing roles and ownership remain unchanged. Managed workers
 retire newly dialed manual connections when their configured membership ends, independently of UI observers.
 Configuration-cache errors are reported and retried on worker maintenance ticks without blocking receive startup.
+Reconciliation is rearmed on transport activation, including in-place startup retries.
 These session-local rows do not establish message delivery.
 See the [binding contract](../marmot-uniffi/README.md#relay-liveness) for state and privacy semantics.
 

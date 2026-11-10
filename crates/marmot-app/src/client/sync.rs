@@ -1205,13 +1205,16 @@ impl AppClient {
         &self,
     ) -> Result<Vec<cgka_traits::TransportEndpoint>, AppError> {
         let configured = self.app.relay_liveness_config(&self.state.label)?;
-        if let Some(client) = self
+        let client = self
             .relay_plane
             .account_history_relay_client(self.adapter.account_id())
             .await
-        {
-            client.sync_liveness_config(&configured).await?;
-        }
+            .ok_or_else(|| {
+                cgka_traits::TransportAdapterError::AccountNotActive(
+                    self.adapter.account_id().clone(),
+                )
+            })?;
+        client.sync_liveness_config(&configured).await?;
         Ok(configured)
     }
 

@@ -631,6 +631,8 @@ pub struct MarmotApp {
     /// would. The runtime's own mark as it deactivates still lands.
     #[cfg(test)]
     test_fail_unlink_mark: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_fail_runner_preparation: Arc<AtomicBool>,
     /// How long `sign_out_and_wipe` waits for its `leaving` commit, in
     /// place of about 30 seconds.
     #[cfg(test)]
@@ -1770,6 +1772,8 @@ impl MarmotApp {
             #[cfg(test)]
             test_fail_unlink_mark: Arc::default(),
             #[cfg(test)]
+            test_fail_runner_preparation: Arc::default(),
+            #[cfg(test)]
             test_sign_out_leaving_wait: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
@@ -1888,6 +1892,8 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             #[cfg(test)]
             test_fail_unlink_mark: Arc::default(),
+            #[cfg(test)]
+            test_fail_runner_preparation: Arc::default(),
             #[cfg(test)]
             test_sign_out_leaving_wait: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
@@ -2222,7 +2228,9 @@ impl MarmotApp {
             // Set with the open's goals, just below.
             runner_prune_clock: unix_now_seconds(),
             #[cfg(test)]
-            fail_next_runner_preparation: false,
+            fail_next_runner_preparation: self
+                .test_fail_runner_preparation
+                .swap(false, std::sync::atomic::Ordering::AcqRel),
             checkpointed_transport_timestamp,
             saved_transport_timestamp: checkpointed_transport_timestamp,
             observed_commit_version: None,

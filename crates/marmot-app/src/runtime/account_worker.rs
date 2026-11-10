@@ -1755,6 +1755,9 @@ async fn run_app_runtime_account_worker(
                 .replay_changes()
                 .await
                 .filter(|changes| changes.has_changed().is_ok());
+            if replay_changes.is_some() {
+                relay_config_work = RelayConfigWork::Ready;
+            }
         }
         // Native frames admit a few per turn; a failed turn paces its retry.
         let native_progress = match if !admission_retry.ready() {
@@ -1883,6 +1886,7 @@ async fn run_app_runtime_account_worker(
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
                 relay_config_work = match client.sync_relay_liveness().await {
                     Ok(_) => RelayConfigWork::Idle,
+                    Err(error) if error.is_account_not_active() => RelayConfigWork::RetryOnTick,
                     Err(error) => {
                         publish_app_runtime_account_error(
                             &events,
