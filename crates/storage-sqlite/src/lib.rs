@@ -137,7 +137,7 @@ pub use app::recovery_coverage::{
 pub use app::recovery_epoch_gap::RecoveryEpochGapRetry;
 pub use app::recovery_staging::{
     RecoveryStaged, RecoveryStagedSlice, RecoveryStagedUsage, StagedRecoveryEvent,
-    StagedRecoveryEvents,
+    StagedRecoveryEvents, StagedRecoverySettlement,
 };
 pub use app::recovery_units::{
     RecoveryAccountUsage, RecoveryParkedRoute, RecoveryRecheckPass, RecoveryRelayCaps,

@@ -2314,6 +2314,25 @@ async fn the_runner_sweeps_rather_than_parks_what_the_open_seeded() {
     );
 }
 
+/// The host tells admission an event refused for its group's resources from
+/// one the engine kept no trace of for any other reason: admission lets the
+/// first go, and holds its group behind the second.
+#[tokio::test]
+async fn admission_learns_an_event_was_refused_for_its_groups_resources() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = unix_now_seconds() - HOUR;
+    let (_app, mut client, route) =
+        crate::tests::group_at_the_undecryptable_retention_cap(&dir, at).await;
+    let mut inventory = Vec::new();
+    let admitted = super::admit(
+        &mut client,
+        &route.probe(at, "past-the-cap"),
+        &mut inventory,
+    )
+    .await;
+    assert_eq!(admitted, Ok(super::super::admission::Admitted::Refused));
+}
+
 /// Sleep into the next wall-clock second. The ledger's clock is wall-clock
 /// seconds with no seam, so a test of a second boundary waits for one.
 async fn next_second() {

@@ -294,11 +294,13 @@ impl RunnerHost for AccountRunnerHost {
                 let mut inventory = Vec::with_capacity(deliveries.len());
                 for delivery in deliveries {
                     let outcome = admit(client, &delivery, &mut inventory).await;
-                    let stopped = !matches!(outcome, Ok(Admitted::Kept));
+                    let stopped = !matches!(outcome, Ok(Admitted::Kept | Admitted::Refused));
                     outcomes.push(outcome);
                     // Same bounded batch as comparison admission. Publish any
                     // effects or honor self-removal before another input; a
-                    // failed/untraced prefix never admits anything newer.
+                    // failed/untraced prefix never admits anything newer. An
+                    // event refused for resources is let go of, so the rest
+                    // of the batch goes on.
                     if stopped
                         || client.device_unlinked()
                         || client.has_pending_effect_projections()
@@ -340,8 +342,9 @@ impl RunnerHost for AccountRunnerHost {
 }
 
 /// Admit one staged delivery through the account's recovered-ingest path. An
-/// event the account holds, or now persisted, is kept; one the engine kept no
-/// trace of, or refused for its group's resources, stays fetchable. A plain
+/// event the account holds, or now persisted, is kept; one the engine refused
+/// for its group's resources is reported so admission lets it go; any other
+/// the engine kept no trace of stays fetchable. A plain
 /// message's or a held event's inventory row joins `inventory`, which the
 /// command records once at its end; structural input records its own row at
 /// once, as the native path's turns do (`InventoryWrite::NativeTurn`).
@@ -362,6 +365,10 @@ async fn admit(
             unpersisted: false,
             refused_group: None,
         } => Admitted::Kept,
+        RecoveredDelivery::Ingested {
+            refused_group: Some(_),
+            ..
+        } => Admitted::Refused,
         RecoveredDelivery::Ingested { .. } => Admitted::NoTrace,
     })
 }

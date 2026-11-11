@@ -5,10 +5,11 @@
 //! to the coverage ledger through the subtracting write. A crash after that
 //! loses nothing and refetches nothing: the ledger-derived cursor is past the
 //! slice and its events are durable. Staging is not admission. A staged row
-//! leaves only once its event is in the seen index, or, when it no longer
-//! decodes or its route is no longer swept, by un-covering its second so the
-//! history is fetched again. Rows are encoded like spill rows, in the
-//! account's encrypted database.
+//! leaves once its event is in the seen index, or once the engine refused it
+//! for its group's resources (still covered: fetching it again would only be
+//! refused again), or, when it no longer decodes or its route is no longer
+//! swept, by un-covering its second so the history is fetched again. Rows are
+//! encoded like spill rows, in the account's encrypted database.
 //!
 //! Only the recovery runner stages, and nothing starts it yet. Route ids,
 //! relay URLs and event ids are account-private and must never be logged.
@@ -77,6 +78,16 @@ pub struct StagedRecoveryEvents {
     /// Event ids of rows that no longer decode, for
     /// [`SqliteAppStorage::discard_undecodable_staged_recovery_event`].
     pub undecodable: Vec<Vec<u8>>,
+}
+
+/// What admission did with one staged event, for
+/// [`SqliteAppStorage::settle_staged_recovery_events`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedRecoverySettlement {
+    /// Handed to the engine: the row may leave once the seen index holds it.
+    Admitted,
+    /// Refused for its group's resources after the engine could not open it.
+    Refused,
 }
 
 /// How much is staged.
@@ -252,19 +263,28 @@ impl SqliteAppStorage {
         Ok(items)
     }
 
-    /// Remove staged rows whose events are now in the seen index, in one
-    /// transaction: a failure removes none. Rows whose events are not stay.
-    /// Returns, for each id, whether its row left.
-    pub fn remove_seen_staged_recovery_events(
+    /// Settle one admission batch in one transaction: a failure removes none
+    /// of its rows. An admitted row leaves once its event is in the seen
+    /// index, and stays otherwise. A refused row leaves whatever the index
+    /// says, and its second stays covered: the relay served the event and the
+    /// engine could neither open it nor keep it, so fetching it again would
+    /// only be refused again. The seen index still lacks it, so a later
+    /// delivery of the same event reaches the engine. Returns, for each row,
+    /// whether it left.
+    pub fn settle_staged_recovery_events(
         &self,
-        event_ids: &[&[u8]],
+        settled: &[(&[u8], StagedRecoverySettlement)],
     ) -> StorageResult<Vec<bool>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let mut removed = Vec::with_capacity(event_ids.len());
-            for event_id in event_ids {
+            let mut removed = Vec::with_capacity(settled.len());
+            for (event_id, settlement) in settled {
+                let leaves = match settlement {
+                    StagedRecoverySettlement::Admitted => already_seen(&conn, event_id)?,
+                    StagedRecoverySettlement::Refused => true,
+                };
                 removed.push(
-                    already_seen(&conn, event_id)?
+                    leaves
                         && conn
                             .execute_cached(
                                 "DELETE FROM account_recovery_staged WHERE event_id = ?1",

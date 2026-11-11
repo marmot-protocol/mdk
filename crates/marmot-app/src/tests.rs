@@ -20050,7 +20050,7 @@ impl UndecryptableProbeRoute {
 /// Every filling probe is dated `filled_through` so a later probe's effect on
 /// the transport cursor is unambiguous, and each is ingested through the receive
 /// seam because that is the cheapest way to reach the engine 256 times.
-async fn group_at_the_undecryptable_retention_cap(
+pub(crate) async fn group_at_the_undecryptable_retention_cap(
     dir: &tempfile::TempDir,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
