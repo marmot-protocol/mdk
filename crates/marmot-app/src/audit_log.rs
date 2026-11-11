@@ -160,10 +160,10 @@ pub struct AuditDeliveryStatus {
     pub account_ref: String,
     /// Whether the host has configured a v5 audit OTLP destination.
     pub destination_configured: bool,
-    /// Last pass that delivered a batch or found nothing left to deliver.
+    /// Last delivery attempt that delivered a batch or found nothing left to deliver.
     pub last_success_at_ms: Option<u64>,
     pub last_failure: Option<AuditDeliveryFailure>,
-    /// Passes that ended in a failure since the last success.
+    /// Failed delivery attempts since the last success.
     pub consecutive_failures: u64,
     /// Batches the receiver rejected, in total.
     pub rejected_batches: u64,

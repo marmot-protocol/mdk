@@ -242,14 +242,12 @@ async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
     // V4 exits with its own missing-endpoint result before enumerating the
     // account catalog. V5 must report the catalog failure independently.
     std::fs::write(tmp.path().join("accounts"), b"not a directory").unwrap();
-    let sender = Arc::new(
-        AuditOtlpSender::for_loopback_dev(
-            "audit-v5-test",
-            "http://127.0.0.1:1/v1/logs",
-            "test-token",
-        )
-        .unwrap(),
-    );
+    let sender = AuditOtlpSender::for_loopback_dev(
+        "audit-v5-test",
+        "http://127.0.0.1:1/v1/logs",
+        "test-token",
+    )
+    .unwrap();
     let mut schedule = AuditPassSchedule::default();
     let result = post_audit_log_tracker_update_with_v5(
         &app,
@@ -562,7 +560,7 @@ async fn automatic_v5_pass(
     let result = post_audit_log_tracker_update_with_v5(
         app,
         AuditLogTrackerConfig::default(),
-        sender.as_ref(),
+        sender.as_deref(),
         Some(&runtime.shared.audit_otlp_sender),
         &runtime.shared.lifecycle(),
         true,

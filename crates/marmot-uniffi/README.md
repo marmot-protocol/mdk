@@ -1820,9 +1820,9 @@ pause survives restarts with the same configuration. Changing the destination, e
 token in `set_audit_otlp_config_v5`, or calling `post_audit_log_tracker_update_v5()`, retries
 it. `ReceiverRejected` (`400`, `413`, `422`) means the receiver refused those rows: delivery
 continues past them and `rejected_batches` counts them. `409`, `429` and `5xx` are
-`ReceiverRetryable` and resend the same range. Only a pass that delivers lifts a pause; a
-journal still held by an earlier rejection keeps reporting `ReceiverRejected` with its status. `last_success_at_ms` is the last pass that
-delivered or found nothing left; `consecutive_failures` counts failed passes since then.
+`ReceiverRetryable` and resend the same range. Only an attempt that delivers lifts a pause; a
+journal still held by an earlier rejection keeps reporting `ReceiverRejected` with its status. `last_success_at_ms` is the last attempt that
+delivered or found nothing left; `consecutive_failures` counts failed attempts since then.
 `backlog` reports undelivered bytes and segments, recorded gaps, and the oldest undelivered
 record's time as measured at `observed_at_ms`; it is not refreshed while the local cursor cannot
 open or delivery is paused.

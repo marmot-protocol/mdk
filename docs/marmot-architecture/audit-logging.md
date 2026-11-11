@@ -51,14 +51,14 @@ delivery for that account and destination pauses until the host changes the send
 configuration or runs a manual tracker update. Unknown outcomes retain the range. Deleting or
 disabling a live audit file fences in-flight acknowledgments.
 
-Each tracker pass persists the account's delivery status in
+Each tracker attempt persists the account's delivery status, inside its own admission, in
 `audit-otlp-delivery-v5/delivery-status.json`, separate from the cursor: the last success, the
 last typed failure (state over its size limit, out of file descriptors, other local I/O, a
 blocked local journal, receiver blocked, rejected or retryable with its HTTP status, no
 response), consecutive failed passes, rejected batches, the pause with a one-way fingerprint of
-the sender configuration it applies to, and the last measured backlog. Only a pass that delivers
-lifts a pause, and a pass older than the recorded status is dropped, so a concurrent manual and
-automatic pass cannot reorder it. Hosts read it through
+the sender configuration it applies to, and the last measured backlog. Only an attempt that
+delivers lifts a pause. Writes follow attempt order because each one happens before the attempt
+releases its account reservation; routine healthy outcomes rewrite the file at most every 10 s. Hosts read it through
 `audit_delivery_status_v5`. The tracker's `warn` log carries the same failure category and HTTP
 status, nothing else.
 

@@ -208,7 +208,7 @@ impl From<AuditDeliveryBacklog> for AuditDeliveryBacklogV5Ffi {
 pub struct AuditDeliveryStatusV5Ffi {
     pub account_ref: String,
     pub destination_configured: bool,
-    /// Unix milliseconds of the last pass that delivered or found nothing left.
+    /// Unix milliseconds of the last attempt that delivered or found nothing left.
     pub last_success_at_ms: Option<u64>,
     pub last_failure: Option<AuditDeliveryFailureV5Ffi>,
     pub consecutive_failures: u64,

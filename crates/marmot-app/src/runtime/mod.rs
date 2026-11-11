@@ -75,7 +75,7 @@ mod account_attention;
 mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
-pub(crate) use audit_otlp_delivery::{attempt_audit_otlp_once, record_audit_delivery_pass};
+pub(crate) use audit_otlp_delivery::attempt_audit_otlp_once;
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -3892,7 +3892,7 @@ impl MarmotAppRuntime {
         post_audit_log_tracker_update_for_runtime(
             &self.accounts.app,
             config,
-            sender.as_ref(),
+            sender.as_deref(),
             &self.shared.audit_otlp_sender,
             &self.shared.lifecycle(),
         )

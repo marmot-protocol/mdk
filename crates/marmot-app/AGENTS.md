@@ -878,8 +878,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   receiver outcomes to local finish actions. Blocked and unknown outcomes retain the prepared range. Runtime
   tracker/manual triggers and additive native bindings configure it; there is no default v5 destination.
 - Keep per-account v5 delivery status in `runtime/audit_delivery_status.rs`, in its own
-  `audit-otlp-delivery-v5/delivery-status.json` beside (never inside) the cursor, written only under the account's
-  audit export admission. Each tracker pass records its typed outcome there. A receiver block pauses automatic
+  `audit-otlp-delivery-v5/delivery-status.json` beside (never inside) the cursor. Each tracker attempt records its
+  typed outcome there inside its own audit export admission, before its reservation drops, so status writes follow
+  attempt order; never record from a separate reservation. Routine healthy outcomes rewrite it at most every 10 s. A receiver block pauses automatic
   passes for the sender fingerprint it was recorded under; a changed sender or a manual tracker update is the
   retry. Local failures keep the bounded retry timer. `audit_delivery_status` only reads these files.
 - Keep process-local audit export admission in `src/audit_export_lifecycle.rs`: one active attempt per account, short
