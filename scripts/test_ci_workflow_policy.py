@@ -1213,6 +1213,29 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertIn(b"checksum", result.stderr)
             self.assertFalse((Path(tmp) / "maude-3.5.1").exists())
 
+    def test_windows_nextest_download_tolerates_only_an_offline_revocation_check(self):
+        # SChannel fails a handshake whose revocation server is offline; the
+        # step skips only that check, and a bad archive still never installs.
+        script = workflow_step("ci.yml", "Install pinned cargo-nextest")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(["bash", "-c", '''
+cygpath() { printf '%s\\n' "$2"; }
+curl() {
+  printf '%s\\n' "$@" > "$RUNNER_TEMP/curl-args"
+  while [ "$1" != --output ]; do shift; done
+  printf 'corrupt transfer' > "$2"
+}
+sha256sum() { shasum -a 256 "$@"; }
+''' + script], env={**os.environ, "RUNNER_TEMP": tmp, "GITHUB_PATH": tmp + "/path"},
+                capture_output=True)
+            arguments = (Path(tmp) / "curl-args").read_text().splitlines()
+            self.assertIn("--ssl-revoke-best-effort", arguments)
+            self.assertFalse({"-k", "--insecure", "--ssl-no-revoke"} & set(arguments))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"checksum", result.stderr)
+            self.assertFalse((Path(tmp) / "cargo-nextest-0.9.132").exists())
+            self.assertFalse((Path(tmp) / "path").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

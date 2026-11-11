@@ -1600,10 +1600,31 @@ jobs:
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
-        with:
-          tool: cargo-nextest@0.9.132
+      # On Windows, SChannel fails the TLS handshake whenever the certificate
+      # authority's revocation server is unreachable
+      # (CRYPT_E_REVOCATION_OFFLINE), and such outages have outlasted
+      # install-action's minute of retries. --ssl-revoke-best-effort skips only
+      # a revocation check that cannot be made; a certificate reported revoked
+      # still fails. The archive is trusted only once it matches its pin.
+      - name: Install pinned cargo-nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.9.132
+          temporary="$(cygpath -u "$RUNNER_TEMP")"
+          archive="$temporary/cargo-nextest.tar.gz"
+          # Retry any failure, doubling the wait (1 s, 2 s, 4 s ...); none is scheduled after 300 s.
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --ssl-revoke-best-effort --connect-timeout 20 --max-time 300 \
+            --retry 10 --retry-all-errors --retry-max-time 300 \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$version/cargo-nextest-$version-x86_64-pc-windows-msvc.tar.gz" \
+            --output "$archive"
+          echo "6f934574f621613d7d759547401a04619b3e1ebe1f4e8f624880197d566fa6ad  $archive" | sha256sum --check --strict
+          directory="$temporary/cargo-nextest-$version"
+          mkdir -p "$directory"
+          tar -xzf "$archive" -C "$directory"
+          cygpath -w "$directory" >> "$GITHUB_PATH"
+          "$directory/cargo-nextest.exe" nextest --version | grep -F "cargo-nextest $version ("
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
