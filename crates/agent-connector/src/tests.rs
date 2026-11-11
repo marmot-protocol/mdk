@@ -325,6 +325,7 @@ fn profile_field_validation_bounds_free_text_and_rejects_control_characters() {
 
 #[tokio::test]
 async fn connector_profile_publish_rejects_hostile_optional_fields_without_publishing() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -389,11 +390,6 @@ pub(crate) fn test_config(
     dev_allow_any_invites: bool,
     debug_controls: bool,
 ) -> AgentConnectorConfig {
-    // Every connector this suite opens skips SQLCipher's memory security and
-    // full fsync, as storage-sqlite's test support allows. No test here
-    // observes either setting, and creating each account's database with
-    // memory security on dominated these tests' run time.
-    storage_sqlite::relax_storage_for_test_process();
     let mut config = AgentConnectorConfig::new(home);
     config.socket = socket.into();
     config.relays = relays;
@@ -809,6 +805,7 @@ async fn inbound_catch_up_driver_resets_promptly_on_runtime_activity() {
 
 #[tokio::test]
 async fn invite_policy_worker_backs_off_with_zero_candidates() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let account_home = AccountHome::open(dir.path());
     account_home.create_account("agent").unwrap();
@@ -3380,6 +3377,7 @@ async fn connector_socket_creates_local_account() {
 
 #[tokio::test]
 async fn connector_socket_publishes_key_package() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3439,6 +3437,7 @@ async fn connector_socket_publishes_key_package() {
 
 #[tokio::test]
 async fn connector_socket_publishes_profile_metadata() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3513,6 +3512,7 @@ async fn connector_socket_publishes_profile_metadata() {
 
 #[tokio::test]
 async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3813,6 +3813,7 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
 
 #[tokio::test]
 async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3895,6 +3896,7 @@ async fn connector_profile_lookup_without_relays_is_indeterminate() {
 
 #[tokio::test]
 async fn connector_start_publishes_key_package_for_existing_local_account() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -7349,6 +7351,7 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
 /// Verify co-admin validation, alias deduplication, and rights in the initial Welcome.
 #[tokio::test]
 async fn connector_creates_admin_in_founding_state() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
@@ -7463,6 +7466,7 @@ async fn connector_creates_admin_in_founding_state() {
 
 #[tokio::test]
 async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -7638,6 +7642,7 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
 
 #[tokio::test]
 async fn connector_group_profile_update_preserves_fields_and_requires_current_admin() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
@@ -7774,6 +7779,7 @@ async fn connector_group_profile_update_preserves_fields_and_requires_current_ad
 
 #[tokio::test]
 async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
     let connector = AgentConnector::open(test_config(
@@ -7972,11 +7978,13 @@ fn agent_created_groups_store_removal_is_durable_and_scoped() {
 
 #[tokio::test]
 async fn connector_socket_leaves_group_and_removes_activation_provenance() {
+    storage_sqlite::relax_storage_for_test_process();
     connector_leave_group_case(false).await;
 }
 
 #[tokio::test]
 async fn connector_leave_acknowledges_success_when_provenance_cleanup_fails() {
+    storage_sqlite::relax_storage_for_test_process();
     connector_leave_group_case(true).await;
 }
 
@@ -8485,6 +8493,7 @@ async fn connector_relay_lists_reports_the_cached_lists() {
 
 #[tokio::test]
 async fn connector_relay_list_edit_refuses_an_unconfirmed_published_list() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     // The relay the connector reads through holds no relay-list event, and the
     // account has never published one: the read is unconfirmed, so the edit must
@@ -8804,6 +8813,7 @@ async fn connector_start_adopts_relay_lists_an_imported_identity_already_publish
 
 #[tokio::test]
 async fn connector_start_publishes_configured_relay_lists_once_their_absence_is_read() {
+    storage_sqlite::relax_storage_for_test_process();
     let (_relay, relay_url) = mock_relay_url().await;
     let relay_endpoint = crate::validation::endpoint(&relay_url);
     let dir = tempfile::tempdir().unwrap();
@@ -8846,6 +8856,7 @@ async fn connector_start_publishes_configured_relay_lists_once_their_absence_is_
 
 #[tokio::test]
 async fn connector_start_publishes_no_relay_list_when_a_configured_relay_cannot_answer() {
+    storage_sqlite::relax_storage_for_test_process();
     let (_relay, relay_url) = mock_relay_url().await;
     // A loopback port nothing listens on: that relay cannot confirm absence.
     let unreachable_url = {
@@ -8899,6 +8910,7 @@ async fn connector_start_publishes_no_relay_list_when_a_configured_relay_cannot_
 
 #[tokio::test]
 async fn connector_start_without_relays_reports_missing_relay_lists() {
+    storage_sqlite::relax_storage_for_test_process();
     // An imported identity on a daemon run with no relays: nothing can read or
     // publish its lists, so startup names that instead of `app_error`.
     let dir = tempfile::tempdir().unwrap();
@@ -9039,6 +9051,7 @@ async fn connector_restarts_keep_an_imported_read_only_relay_list() {
 
 #[tokio::test]
 async fn group_admin_checks_authority_changes_membership_and_reads_back() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let connector = AgentConnector::open(test_config(
