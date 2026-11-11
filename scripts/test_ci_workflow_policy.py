@@ -861,6 +861,42 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
 
 
+class FlakeReportPolicyTests(unittest.TestCase):
+    def test_reads_actions_and_writes_only_issues(self):
+        workflow = (ROOT / ".github/workflows/flake-report.yml").read_text()
+        self.assertIn("permissions:\n  actions: read\n  contents: read\n  issues: write\n\n", workflow)
+        self.assertNotIn("pull_request", workflow)
+        # GITHUB_TOKEN's hourly budget is shared with CI; leave most of it.
+        self.assertIn("--reserve 600", workflow_step("flake-report.yml", "Build the leaderboard"))
+
+    def test_replaces_the_body_of_one_open_leaderboard_issue(self):
+        script = workflow_step("flake-report.yml", "Replace the leaderboard issue body")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$1 $2" == "issue list" ]]; then
+                while [[ "$1" != --jq ]]; do shift; done
+                jq -r "$2" <<<"$ISSUES"
+                return
+              fi
+              printf '%s\\n' "$*" >>"$LOG"
+            }
+        """)
+        for issues, expected in [
+            ([{"number": 9, "title": "Flaky test leaderboard (old)"}],
+             "issue create --repo o/r --title Flaky test leaderboard --body-file board.md"),
+            ([{"number": 9, "title": "Flaky test leaderboard (old)"}, {"number": 12, "title": "Flaky test leaderboard"}],
+             "issue edit 12 --repo o/r --body-file board.md"),
+        ]:
+            with self.subTest(issues=issues), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "gh.log"
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script], check=True, timeout=10,
+                    env={**os.environ, "ISSUES": json.dumps(issues), "LOG": str(log), "REPO": "o/r",
+                         "LEADERBOARD": "board.md"},
+                )
+                self.assertEqual(log.read_text(), expected + "\n")
+
+
 class FakeNightlyGitHub:
     """In-memory stand-in for the GitHub calls that publish_nightly makes."""
 
