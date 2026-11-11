@@ -5,10 +5,11 @@
 ### Fixed
 
 - Resume v5 audit delivery of a file a receiver's `409` blocked under 0.15.0
-  (#3300). 0.15.0 blocked such a file for good as partial acceptance; the
-  upgraded cursor now clears that block as it does a 0.15.0 rejection, resends
-  the file's pending range, and retries a later `409`. Before, the file stayed
-  blocked until age expiry deleted it.
+  (#3300). 0.15.0 blocked such a file for good as partial acceptance; loading
+  the cursor now clears that block as it does a 0.15.0 rejection, including a
+  cursor already rewritten as version 2, resends the file's pending range, and
+  retries a later `409`. Before, the file stayed blocked until age expiry
+  deleted it.
 - Report each relay's answer to a publish under the spelling the group or
   inbox list gave it (#3305). A relay spelled with an upper-case host or an
   explicit default port read as possibly exposed whatever it answered, so a
