@@ -860,9 +860,13 @@ impl CaptureSink {
                         // while its request is still deliberately in flight, which
                         // the coalescing test's contract cannot tolerate.
                         requests.lock().unwrap().push(request);
+                        // Leave the in-flight count before answering, for the
+                        // same reason: a client that sends its next request
+                        // only after this answer must not be counted as
+                        // overlapping this one while the socket closes.
+                        in_flight.lock().unwrap().0 -= 1;
                         write_http_response(&mut stream, status).await;
                         let _ = stream.shutdown().await;
-                        in_flight.lock().unwrap().0 -= 1;
                         finished.notify_one();
                     });
                 }
