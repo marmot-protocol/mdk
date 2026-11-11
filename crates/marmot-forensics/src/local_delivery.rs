@@ -3347,13 +3347,50 @@ mod tests {
             .unwrap()
             .write_all(&bytes)
             .unwrap();
-        let view = DeliveryCursorView::load(&state_dir).unwrap();
-        assert_eq!(
-            view.source_delivery(&delivered).unwrap(),
-            SourceDelivery::Undelivered
+        for discovered in [false, true] {
+            if discovered {
+                // Discovery sees the changed head and adopts a new generation.
+                worker.discover().unwrap();
+            }
+            let view = DeliveryCursorView::load(&state_dir).unwrap();
+            assert_eq!(
+                view.source_delivery(&delivered).unwrap(),
+                SourceDelivery::Undelivered
+            );
+            assert!(!retention::evict_delivered_source(&delivered, &state_dir).unwrap());
+            assert!(delivered.exists());
+        }
+    }
+
+    #[test]
+    fn repeated_expiry_while_delivery_is_idle_keeps_the_cursor_bounded() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        drop(worker);
+        // No discovery runs: only retention touches the cursor.
+        for index in 1..=(MAX_GAPS as u32 + 16) {
+            let sealed = seal_segments(&recorder, &active, index, 1).remove(0);
+            assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+        }
+        let state = load_state(
+            &state_dir.join("local-delivery.json"),
+            "receiver-A",
+            active.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state.journals.len() <= MAX_GAPS + 1,
+            "{}",
+            state.journals.len()
         );
-        assert!(!retention::evict_delivered_source(&delivered, &state_dir).unwrap());
-        assert!(delivered.exists());
+        assert_eq!(state.gaps.len(), MAX_GAPS);
+        assert_eq!(state.dropped_gaps, 16);
+        assert!(
+            state_len(&state_dir) < 128 * 1024,
+            "{}",
+            state_len(&state_dir)
+        );
     }
 
     #[test]
@@ -3371,9 +3408,10 @@ mod tests {
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
         let source = worker.state.source.clone();
         worker.state.journals.retain(|j| j.segment == source);
-        worker.state.overflow_floor = Some(2);
-        worker.publish().unwrap();
         let shed = seal_segments(&recorder, &active, 2, 2);
+        worker.state.overflow_floor = Some(2);
+        worker.state.overflow_floor_modified = modified_ns(&fs::metadata(&shed[0]).unwrap());
+        worker.publish().unwrap();
         let view = DeliveryCursorView::load(&state_dir).unwrap();
         assert_eq!(
             view.source_delivery(&shed[0]).unwrap(),

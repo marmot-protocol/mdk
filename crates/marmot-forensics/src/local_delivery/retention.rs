@@ -145,6 +145,7 @@ pub(super) fn expire_with(
     let Some(mut state) = decode_for_family(&bytes, &active_name)? else {
         return remove_without_cursor(path, unlink);
     };
+    drop_retired(&mut state);
     let matched = find_journal(&state, identity);
     let status = classify(&state, matched, segment_index, len, modified);
     if status == SourceDelivery::Untracked {
@@ -301,7 +302,23 @@ pub(super) fn expire_with(
         }
         return Err(error);
     }
+    // The source is gone. Retire its journal as discovery would, so a cursor
+    // that delivery no longer reads does not grow with every expired file.
+    // Best effort: discovery reaches the same state if this write fails.
+    let journal = &mut delivery.state.journals[index];
+    journal.missing = true;
+    journal.prepared = None;
+    drop_retired(&mut delivery.state);
+    let _ = delivery.publish_inner();
     result
+}
+
+/// Drop retired journals that no recorded gap names, as discovery does.
+fn drop_retired(state: &mut State) {
+    let named: std::collections::HashSet<_> = state.gaps.iter().map(|gap| gap.generation).collect();
+    state
+        .journals
+        .retain(|journal| !journal.missing || named.contains(&journal.generation));
 }
 
 /// The live journal with this file's identity. Callers confirm it still

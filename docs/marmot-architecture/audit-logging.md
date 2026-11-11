@@ -1557,8 +1557,9 @@ or a durably retired alias; publication/unlink errors compensate both cursor and
 compensation cannot complete. Acknowledged sources disappear without false gaps. When age expiry deletes a source
 with undelivered bytes (an unobserved or prepared unsent tail, or a segment the cursor never adopted), the same
 publication records an `ExpiredUndelivered` gap over the unaccepted extent and advances past it, before the unlink, so
-delivery continues with later data and discovery records no second gap. Generic missing-active detection stays
-conservative. Delivery drops retired,
+delivery continues with later data and discovery records no second gap. After the unlink, retention retires that
+journal as discovery would, so a cursor that delivery no longer reads stays bounded. Generic missing-active detection
+stays conservative. Delivery drops retired,
 gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
 reached a receiver.
 
