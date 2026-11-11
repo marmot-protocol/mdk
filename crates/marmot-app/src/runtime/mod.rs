@@ -7546,22 +7546,16 @@ impl AccountManager {
     /// command permission. An eligible account's temporary startup failure
     /// must not mean it has no worker.
     fn account_worker_eligible(&self, account: &AccountSummary) -> Result<bool, AppError> {
-        if self.account_is_tearing_down(&account.account_id_hex) || !self.signs_on_worker(account) {
+        if self.account_is_tearing_down(&account.account_id_hex)
+            || !(account.is_active_local_signing()
+                || (account.external_signing
+                    && !account.signed_out
+                    && self.app.has_external_signer(&account.account_id_hex)))
+        {
             return Ok(false);
         }
         self.setup_records()
             .onboarding_worker_allowed(&account.label)
-    }
-
-    /// Whether `account` signs on a worker: a local signer, or an external
-    /// one registered with the app. Its group writes go through that worker,
-    /// which holds the account's state in memory and publishes its read state
-    /// before each host event; only other accounts write storage directly.
-    pub(super) fn signs_on_worker(&self, account: &AccountSummary) -> bool {
-        account.is_active_local_signing()
-            || (account.external_signing
-                && !account.signed_out
-                && self.app.has_external_signer(&account.account_id_hex))
     }
 
     /// Assumes the worker transaction is held.

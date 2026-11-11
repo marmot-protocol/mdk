@@ -25,10 +25,6 @@
   explicit default port read as possibly exposed whatever it answered, so a
   group whose only relay was spelled that way never confirmed or rolled back a
   commit.
-- Forget and delete an external-signer account's group through its running
-  account worker, as for a local-signing account, instead of writing storage
-  directly while the worker still held the group and kept answering for it
-  (mdk#3273).
 - Fail `durably_owned_key_packages` with the storage error when proving a
   stored bundle fails to read (I/O, busy, closed), instead of returning a
   partial list that reports this device's own KeyPackages as not owned.
