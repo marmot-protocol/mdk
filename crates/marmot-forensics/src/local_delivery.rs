@@ -3363,6 +3363,66 @@ mod tests {
     }
 
     #[test]
+    fn age_expiry_of_changed_bytes_on_a_known_inode_records_their_loss() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let mut bytes = fs::read(&sealed).unwrap();
+        bytes[0] = b' ';
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&sealed)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+        drain(&mut worker, &mut sink);
+        // The delivered generation retires without a gap; the bytes that
+        // replaced it are recorded as expired under their own generation.
+        let gaps = worker.gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].reason, GapReason::ExpiredUndelivered);
+        assert_eq!((gaps[0].start, gaps[0].end), (0, Some(bytes.len() as u64)));
+    }
+
+    #[test]
+    fn age_expiry_during_a_split_leaves_a_cursor_that_reopens_and_delivers() {
+        let (_dir, active, state_dir, recorder) = setup();
+        for index in 0..3 {
+            record(&recorder, &format!("split-{index}"));
+        }
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Permanent),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Split);
+        drop(recorder);
+        assert!(
+            crate::NoopRecorder
+                .expire_file_before(&active, u64::MAX, &mut |p| {
+                    retention::expire_closed_source(p, &state_dir)
+                })
+                .unwrap()
+        );
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+        record(&recorder, "after-split");
+        let before = sink.batches.len();
+        drain(&mut worker, &mut sink);
+        assert!(
+            sink.batches[before..]
+                .iter()
+                .flat_map(|batch| &batch.bodies)
+                .any(|body| body.windows(11).any(|w| w == b"after-split"))
+        );
+        assert_eq!(worker.gaps().len(), 1);
+        assert_eq!(worker.gaps()[0].reason, GapReason::ExpiredUndelivered);
+    }
+
+    #[test]
     fn repeated_expiry_while_delivery_is_idle_keeps_the_cursor_bounded() {
         let (_dir, active, state_dir, recorder) = setup();
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();

@@ -146,29 +146,38 @@ pub(super) fn expire_with(
         return remove_without_cursor(path, unlink);
     };
     drop_retired(&mut state);
-    let matched = find_journal(&state, identity);
-    let status = classify(&state, matched, segment_index, len, modified);
-    if status == SourceDelivery::Untracked {
-        return remove_without_cursor(path, unlink);
-    }
+    let mut matched = find_journal(&state, identity);
     if let Some(index) = matched {
         let journal = &state.journals[index];
-        // Reused identities or externally changed sources retain the ordinary
-        // conservative missing-source behavior. Never bless those bytes as ACKed,
-        // and never without a stored head to compare against.
-        if journal.fingerprint.is_empty()
-            || len < journal.observed_len
+        // Never bless bytes as ACKed without a stored head to compare
+        // against; such a source keeps the generic missing-source handling.
+        if journal.fingerprint.is_empty() {
+            return match expiry {
+                Expiry::Age => remove_without_cursor(path, unlink),
+                Expiry::Budget => Ok(false),
+            };
+        }
+        // A reused inode or an externally changed source holds other bytes.
+        // As discovery does, retire the old generation with its own loss
+        // evidence and treat these bytes as an unadopted source.
+        if len < journal.observed_len
             || len < journal.fingerprint_len as u64
             || !fingerprint_matches(
                 &journal.fingerprint,
                 &fingerprint(&mut source, journal.fingerprint_len as usize)?,
             )
         {
-            return match expiry {
-                Expiry::Age => remove_without_cursor(path, unlink),
-                Expiry::Budget => Ok(false),
-            };
+            if expiry == Expiry::Budget {
+                return Ok(false);
+            }
+            let was_active = journal.segment == active_name;
+            retire_missing(&mut state, index, was_active);
+            matched = None;
         }
+    }
+    let status = classify(&state, matched, segment_index, len, modified);
+    if status == SourceDelivery::Untracked {
+        return remove_without_cursor(path, unlink);
     }
     let delivered = status == SourceDelivery::Delivered;
     if !delivered && expiry == Expiry::Budget {
@@ -278,6 +287,7 @@ pub(super) fn expire_with(
             journal.prepared = None;
             journal.blocked = None;
             journal.split_records = None;
+            journal.split_until = None;
             append_gap(&mut delivery.state, gap);
         }
         // This publication is the retirement intent: immutable closed source,
