@@ -514,7 +514,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["reply_to_message_id_hex"], "aa" * 32)
         self.assertNotIn("reply_to_message_id_hex", requests[1])
         self.assertNotIn("reply_to_message_id_hex", requests[2])
-        for target in ("", " ", "not-hex"):
+        for target in ("", " ", "not-hex", "ab", "ab" * 33):
             with self.subTest(target=target):
                 with self.assertRaises(self.adapter.AgentControlError) as raised:
                     await client.send_media(
@@ -6783,7 +6783,9 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 
     async def test_media_rejects_malformed_reply_before_staging(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, unittest.mock.patch.dict(
+            os.environ, {"MARMOT_HOME": tmpdir, "MARMOT_OUTBOUND_MEDIA_DIR": ""}
+        ):
             root = Path(tmpdir)
             image = root / "reply.png"
             image.write_bytes(b"reply")
@@ -6797,7 +6799,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 client=object(),
             )
-            for target in ("", " ", "not-hex"):
+            for target in ("", " ", "not-hex", "ab", "ab" * 33):
                 for method in (
                     adapter.send_image_file,
                     adapter.send_document,
@@ -6822,7 +6824,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                             await adapter.send_multiple_images(
                                 "22" * 32, [(image.as_uri(), "caption")], metadata={key: target},
                             )
-            self.assertFalse(adapter._outbound_media_dir.exists())
+            self.assertFalse((root / "dev" / "outbound-media").exists())
             self.assertEqual(image.read_bytes(), b"reply")
 
     async def test_standalone_media_files_use_one_batch_send(self):

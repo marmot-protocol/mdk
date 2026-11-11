@@ -811,8 +811,9 @@ Image, document, video, and voice sends accept `reply_to`, the original inner
 message id. Multi-image sends accept `reply_to_message_id_hex` in their metadata.
 The caption and all ordered attachments arrive on one reply message. The adapter
 captures the target before staging and retains it across retries. An omitted or
-null target sends an ordinary media message; malformed targets fail rather than
-silently dropping the reply. The Python control client's `send_media` exposes
+null target sends an ordinary media message. Targets must contain 32 bytes of
+hexadecimal; malformed or wrong-sized targets fail before staging. The Python
+control client's `send_media` exposes
 the same target as the optional `reply_to_message_id_hex` keyword.
 
 Large encrypted-media blobs retain the existing wire format, but every receiver

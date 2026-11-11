@@ -36,6 +36,7 @@ from .agent_control import (
     SEND_MEDIA_COMPLETION_TIMEOUT_S,
     _DEFAULT_READ_TIMEOUT,
     _normalize_hex,
+    _normalize_media_reply,
     _normalize_stream_capability,
     bounded_wait,
 )
@@ -2603,7 +2604,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         pinned_roots: list[tuple[Path, int]] = []
         try:
             reply_target = (
-                _normalize_hex(reply_to, "reply_to_message_id_hex")
+                _normalize_media_reply(reply_to)
                 if reply_to is not None
                 else None
             )

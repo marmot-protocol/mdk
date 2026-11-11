@@ -472,9 +472,7 @@ class MarmotAgentControlClient:
             "caption": str(caption) if caption is not None else None,
         }
         if reply_to_message_id_hex is not None:
-            payload["reply_to_message_id_hex"] = _normalize_hex(
-                reply_to_message_id_hex, "reply_to_message_id_hex"
-            )
+            payload["reply_to_message_id_hex"] = _normalize_media_reply(reply_to_message_id_hex)
         key = str(idempotency_key or "").strip()
         if key:
             payload["idempotency_key"] = key
@@ -903,6 +901,15 @@ def _normalize_hex(value: Any, field: str = "hex") -> str:
         bytes.fromhex(text)
     except ValueError as exc:
         raise AgentControlError(f"{field} must be hexadecimal", code="invalid_hex") from exc
+    return text
+
+
+def _normalize_media_reply(value: Any) -> str:
+    text = _normalize_hex(value, "reply_to_message_id_hex")
+    if len(text) != 64 or len(bytes.fromhex(text)) != 32:
+        raise AgentControlError(
+            "reply_to_message_id_hex must be exactly 32 bytes of hexadecimal", code="invalid_hex"
+        )
     return text
 
 
