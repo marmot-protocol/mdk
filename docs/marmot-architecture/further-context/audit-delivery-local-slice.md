@@ -1,7 +1,7 @@
 ---
 title: "Audit delivery local slice: recorder evidence and design delta"
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-11-11
 status: local testable slice; no production activation
 ---
 
@@ -31,6 +31,27 @@ session, and replays source context. Tests cover these boundaries in
 
 ## Local design delta
 
+The cursor stays bounded by in-flight work, not retained history (mdk#3300).
+Version 2 stores a sealed segment that is unread or fully acknowledged as one
+compact `[generation, index, device, inode, length, delivered, change time,
+fingerprint prefix]` row; full
+journals remain only for the active file and partially delivered, prepared or
+blocked segments. Discovery identifies such idle segments from metadata alone
+and opens other sources one at a time, so neither cursor size nor open
+descriptors grow with the number of retained files. A metadata match requires
+the same name, length and change time (the Unix inode change time, which
+`touch`, `cp -p` or `rsync -t` cannot restore; the modification time
+elsewhere). A source with unread data whose head changed within one change-time
+tick is caught by the prefix check before any read, persisted for a full
+discovery read, and re-read as a new generation. A fully delivered segment
+rewritten within one such tick is not detected.
+Version 1 cursors upgrade on load. Gap history keeps the newest 256 entries
+and counts the rest. If the cursor would still exceed its size limit,
+discovery gives up the oldest sealed segments, records a `CursorOverflow` gap
+for each abandoned undelivered extent, and does not re-adopt those files
+unless they are newer than the newest one it gave up, so a full cursor never
+stops newer delivery.
+
 `LocalAuditDelivery` reads the recorder's actual active and numbered segment
 files. It stores destination identity, monotonically assigned journal
 generation, current segment name, device/inode, a 192-byte head fingerprint,
@@ -58,8 +79,9 @@ matches. It does not reopen the source: an explicit complete acceptance of the
 owned batch
 can advance its cursor even if the source changed during the send. Retryable
 results, or a missing response for which `finish` is not called, keep the exact
-attempt for replay; permanent or partial results
-block only that journal. A lost acceptance response can duplicate rows on retry,
+attempt for replay. A permanent rejection halves the batch until the rejected
+record is alone, then records a `ReceiverRejected` gap for that one line and
+continues (mdk#3300); a partial result blocks only that journal. A lost acceptance response can duplicate rows on retry,
 so the eventual receiver must handle duplicate original rows.
 An interrupted staging write is discarded on restart because the rename is
 the commit point. If the first-byte fingerprint changes for a matching
