@@ -185,7 +185,12 @@ fn record(
     now_ms: u64,
 ) -> Result<(), AppError> {
     let mut stored = load(state_dir, Some(&target.destination));
+    // A new delivery gap is lost data; report it at once.
+    let gaps_changed = observation.backlog.is_some_and(|backlog| {
+        stored.backlog.as_ref().map(|stored| stored.gaps) != Some(backlog.gaps)
+    });
     let routine = !observation.notable()
+        && !gaps_changed
         && stored.updated_at_ms != 0
         && stored.consecutive_failures == 0
         && stored.paused_for.is_none()
@@ -442,6 +447,21 @@ mod tests {
                 .undelivered_bytes,
             100
         );
+        // A new gap is always written.
+        record(
+            &target,
+            dir.path(),
+            &observation(|o| {
+                o.observed(DeliveryBacklog {
+                    undelivered_bytes: 100,
+                    gaps: 1,
+                    ..DeliveryBacklog::default()
+                })
+            }),
+            1_001 + ROUTINE_WRITE_INTERVAL_MS,
+        )
+        .unwrap();
+        assert_eq!(load(dir.path(), Some("audit")).backlog.unwrap().gaps, 1);
         // Catching up is always written, so the backlog never reads stale
         // once delivery has drained it.
         record(
@@ -451,7 +471,7 @@ mod tests {
                 o.caught_up();
                 o.observed(backlog(0));
             }),
-            1_001 + ROUTINE_WRITE_INTERVAL_MS,
+            1_002 + ROUTINE_WRITE_INTERVAL_MS,
         )
         .unwrap();
         assert_eq!(
