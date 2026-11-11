@@ -69,7 +69,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   when every relay refuses their event for size, by its own answer or over its known limit (mdk#2334). Before, they
   returned `MARMOT_STATUS_RUNTIME`, `MARMOT_STATUS_BLOCK_LIST_UNAVAILABLE` and `MARMOT_STATUS_STICKER_NETWORK`. A
   block edit retried after an uncertain attempt still returns `MARMOT_STATUS_BLOCK_PUBLICATION_UNCERTAIN`, and a
-  sticker install or uninstall still succeeds, its list owed to the next sync.
+  sticker install or uninstall still succeeds, its list owed to the next sync. Profile, follow-list and relay-list
+  publishes whose event fits none of their relays' known limits also return `MARMOT_STATUS_EVENT_TOO_LARGE`, sent
+  nowhere.
 
 ### Fixed
 

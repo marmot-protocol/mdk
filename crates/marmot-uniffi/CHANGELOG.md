@@ -72,6 +72,8 @@
   event for size, by its own answer or over its known limit (mdk#2334). Before, they failed as `Runtime`,
   `BlockListUnavailable` and `StickerNetwork`. A block edit retried after an uncertain attempt stays
   `BlockPublicationUncertain`, and a sticker install or uninstall still succeeds, its list owed to the next sync.
+  Profile, follow-list and relay-list publishes (such as `publish_user_profile` and `publish_relay_lists`) whose event
+  fits none of their relays' known limits also fail as `EventTooLarge { artifact: Other }`, sent nowhere.
 
 ### Fixed
 
