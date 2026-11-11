@@ -34,8 +34,10 @@ class CountWaitsTests(unittest.TestCase):
                 timeout(Duration::from_secs_f64(0.25), ready).await.unwrap();
                 timeout(Duration::from_millis(500_u64), ready).await.unwrap();
                 timeout(Duration::from_millis(500,), ready).await.unwrap();
+                timeout(Duration::from_secs_f64(1e-3), ready).await.unwrap();
+                timeout(Duration::from_secs_f64(2.5E+1), ready).await.unwrap();
             }
-        """), {"sleep": 3, "short_timeout": 5})
+        """), {"sleep": 3, "short_timeout": 6})
 
     def test_ignores_long_timeouts_methods_definitions_comments_and_strings(self):
         self.assertEqual(waits("crates/a/src/tests.rs", """\
@@ -95,6 +97,24 @@ class CountWaitsTests(unittest.TestCase):
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         """), {"sleep": 3, "short_timeout": 1})
+        # Imported names: a bare `pause()` pauses, and an imported
+        # `std::thread::sleep` still blocks on paused time.
+        self.assertEqual(waits("crates/a/tests/imported.rs", """            use tokio::time::{pause, sleep as tokio_sleep, timeout};
+
+            #[tokio::test]
+            async fn paused_by_imported_call() {
+                pause();
+                timeout(Duration::from_millis(5), ready).await.unwrap();
+            }
+        """), {})
+        self.assertEqual(waits("crates/a/tests/blocking.rs", """            use std::thread::sleep;
+
+            #[tokio::test(start_paused = true)]
+            async fn blocks_the_thread_anyway() {
+                sleep(Duration::from_millis(5));
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        """), {"sleep": 1})
 
     def test_only_test_code_counts(self):
         production = """\
@@ -121,7 +141,17 @@ class CountWaitsTests(unittest.TestCase):
             #[cfg(test)]
             const SETTLE: u64 = 5;
             fn production() { std::thread::sleep(Duration::from_millis(SETTLE)); }
-        """), {"sleep": 2})
+
+            #[cfg(test)]
+            impl Hold {
+                fn settle(&self) { std::thread::sleep(Duration::from_millis(5)); }
+                async fn wait(&self) { timeout(Duration::from_millis(500), self.ready()).await.unwrap(); }
+            }
+
+            impl Production {
+                fn settle(&self) { std::thread::sleep(Duration::from_millis(5)); }
+            }
+        """), {"sleep": 3, "short_timeout": 1})
         gated = production.replace("#[cfg(test)]", "#[cfg(all(test, unix))]")
         self.assertEqual(waits("crates/a/src/lib.rs", gated), {"sleep": 1})
         nested = production.replace("#[cfg(test)]", "#[cfg(all(test, any(unix, windows)))]").replace(
