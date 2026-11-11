@@ -122,6 +122,9 @@ is restored. Journal cleanup errors do not revoke a network-ready account.
 Cancelling early provisioning can roll back the new account. Local removal then
 returns `UnknownAccount`, not a credential-store failure.
 Account setup transactions share the app's signer-registry scope across runtime handles.
+Account deletion holds that same transaction through credential erasure and removal.
+Concurrent session resume waits, then reports the removed account instead of retaining
+a session that blocks a fresh pairing's login.
 
 MDK stores the communication secret through `AccountSecretStore` under
 `.nip46-client/<account label>`, with a separate SHA-256-derived credential id.
@@ -190,6 +193,9 @@ was lost, retaining a removal intent when vault deletion fails.
 Every signer relay passes the shared retired-relay and endpoint policy and uses
 the configured process proxy. It retains the documented
 [Nostr SDK DNS-resolution residual](marmot-architecture/overview/dial-safety.md#accepted-residual).
+An unsupported `switch_relays` response, including `method not found`, keeps the
+current signer relays. Rejection, malformed responses, and transport failures still
+fail connection.
 See the [UniFFI lifecycle](../crates/marmot-uniffi/README.md#nip-46-accounts) and
 [C ownership rules](../crates/marmot-c/README.md#nip-46-accounts).
 

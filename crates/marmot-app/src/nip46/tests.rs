@@ -377,6 +377,7 @@ async fn live_session_isolation() {
         let b = user_b.clone();
         let relay_url = url.clone();
         let a_client = client_a.public_key();
+        let b_client = client_b.public_key();
         tokio::spawn(async move {
             let mut seen = std::collections::HashSet::new();
             while let Some(notification) = notifications.next().await {
@@ -412,6 +413,16 @@ async fn live_session_isolation() {
                             json!(user.public_key().to_hex())
                         }
                         "switch_relays" => {
+                            if event.pubkey == b_client {
+                                peer.send_event(&response(
+                                    &remote,
+                                    event.pubkey,
+                                    json!({"id":id,"error":"method not found"}),
+                                ))
+                                .await
+                                .unwrap();
+                                return;
+                            }
                             if event.pubkey == keys(7).public_key() {
                                 json!(["ws://unsafe.example"])
                             } else {
@@ -517,6 +528,8 @@ async fn live_session_isolation() {
         connect(b.clone()).await.unwrap().unwrap(),
         user_b.public_key().to_hex()
     );
+    assert_eq!(b.status().state, Nip46State::Ready);
+    assert_eq!(b.public_key().unwrap(), user_b.public_key());
     let pairing_keys = keys(6);
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let unavailable_url = format!("ws://{}", unavailable.local_addr().unwrap());

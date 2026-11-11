@@ -133,6 +133,8 @@ accepts only an already-verified `Ready` session and never silently connects.
 Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
 Reconnect never resumes an adoption retired by an earlier disconnect.
 Rollback still cleans its binding without cancelling a newer generation.
+Account deletion excludes session resume until credential erasure and removal finish;
+a queued resume reports the removed account, leaving a fresh pairing free to log in.
 Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
 interrupts and settles owned adoption before returning. Failed completed-account
 rebind restores prior local signer state and activation, but does not retract

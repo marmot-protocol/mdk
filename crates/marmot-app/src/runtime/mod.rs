@@ -61,6 +61,7 @@ use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
     SyncFailureStage, bounded_advisory_step,
 };
+use nostr::prelude::PublicKey;
 use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
@@ -7167,6 +7168,35 @@ impl AccountManager {
 
     fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
         self.shared.schedule_audit_log_tracker_update(trigger);
+    }
+
+    async fn lock_nip46_removal(
+        &self,
+        gate: Arc<Mutex<()>>,
+        account: &AccountSummary,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let user = PublicKey::from_hex(&account.account_id_hex).ok();
+        let acquisition = gate.lock_owned();
+        tokio::pin!(acquisition);
+        let ready = {
+            let adoptions = self
+                .app
+                .nip46_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Queue before releasing admission: later adoptions must wait behind removal.
+            let ready = futures::FutureExt::now_or_never(acquisition.as_mut());
+            for adoption in &adoptions.active {
+                if Some(adoption.user) == user {
+                    adoption.session.cancel();
+                }
+            }
+            ready
+        };
+        match ready {
+            Some(guard) => guard,
+            None => acquisition.await,
+        }
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {

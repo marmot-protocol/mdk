@@ -348,6 +348,7 @@ pub(super) fn matching_response(payload: &Value, id: &str) -> Response {
         return Response::Complete(Err(
             if error.contains("unsupported")
                 || error.contains("unknown method")
+                || error.contains("method not found")
                 || error.contains("not supported")
             {
                 Nip46Error::Unsupported

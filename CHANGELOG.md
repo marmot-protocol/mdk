@@ -50,6 +50,8 @@
   Post-commit journal cleanup failures do not revoke a ready account.
   Explicit pairing can repair metadata-only interrupted credential writes.
   Local removal reports account disappearance after cancellation instead of a vault failure.
+  Account deletion serializes session resume through credential erasure and removal.
+  Unsupported relay negotiation accepts `method not found` without hiding other errors.
 
 ## 0.16.0 - 2026-11-11
 

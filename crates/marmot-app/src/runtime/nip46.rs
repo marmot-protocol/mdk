@@ -296,35 +296,6 @@ impl MarmotAppRuntime {
 }
 
 impl AccountManager {
-    async fn lock_nip46_removal(
-        &self,
-        gate: Arc<Mutex<()>>,
-        account: &AccountSummary,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        let user = PublicKey::from_hex(&account.account_id_hex).ok();
-        let acquisition = gate.lock_owned();
-        tokio::pin!(acquisition);
-        let ready = {
-            let adoptions = self
-                .app
-                .nip46_adoptions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Queue before releasing admission: later adoptions must wait behind removal.
-            let ready = futures::FutureExt::now_or_never(acquisition.as_mut());
-            for adoption in &adoptions.active {
-                if Some(adoption.user) == user {
-                    adoption.session.cancel();
-                }
-            }
-            ready
-        };
-        match ready {
-            Some(guard) => guard,
-            None => acquisition.await,
-        }
-    }
-
     pub(super) async fn finish_nip46_adoptions(&self, scope: Nip46AdoptionScope) {
         let owner = Arc::downgrade(&self.nip46_adoption_owner);
         let mut active = {
