@@ -30,8 +30,15 @@ const STATE_VERSION: u8 = 2;
 // Hex characters of the head fingerprint a compact entry keeps: enough to
 // catch a replaced file, small enough for thousands of retained segments.
 const COMPACT_FINGERPRINT_HEX: usize = 16;
-// The block reason version 1 recorded for a permanent receiver rejection.
+// The block reasons 0.15.0 recorded for a receiver verdict: a permanent
+// rejection, and a `409`, which it read as partial acceptance. Both are
+// cleared on load, whatever the cursor version: opening a 0.15.0 cursor
+// rewrites it as version 2 before the journal is retried.
 const LEGACY_REJECTION_BLOCK: &str = "permanent receiver rejection";
+const LEGACY_PARTIAL_BLOCK: &str = "partial receiver acceptance";
+/// The block reason `finish` records for `ReceiverResult::Partial`, distinct
+/// from the 0.15.0 reason that load clears.
+pub const PARTIAL_RECEIVER_BLOCK: &str = "partial receiver verdict";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryBatch {
@@ -652,7 +659,7 @@ impl LocalAuditDelivery {
                 Ok(DeliveryStep::Split)
             }
             ReceiverResult::Partial => {
-                self.state.journals[index].blocked = Some("partial receiver acceptance".into());
+                self.state.journals[index].blocked = Some(PARTIAL_RECEIVER_BLOCK.into());
                 self.publish()?;
                 Ok(DeliveryStep::Blocked)
             }
@@ -1364,10 +1371,14 @@ fn decode_state(bytes: &[u8], fallback_source: &str) -> io::Result<State> {
         _ => return Err(invalid("incompatible delivery cursor")),
     }
     state.version = STATE_VERSION;
-    // Version 1 blocked a journal for good on a receiver rejection. Resume
-    // it from its prepared range; a new rejection now splits the batch.
+    // 0.15.0 blocked a journal for good on a receiver rejection or a `409`.
+    // Resume it from its prepared range; a new rejection now splits the
+    // batch, and a `409` is retried.
     for journal in &mut state.journals {
-        if journal.blocked.as_deref() == Some(LEGACY_REJECTION_BLOCK) {
+        if matches!(
+            journal.blocked.as_deref(),
+            Some(LEGACY_REJECTION_BLOCK | LEGACY_PARTIAL_BLOCK)
+        ) {
             journal.blocked = None;
         }
     }
@@ -2163,11 +2174,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Blocked);
-        assert_eq!(worker.blocked(), vec![(1, "partial receiver acceptance")]);
+        assert_eq!(worker.blocked(), vec![(1, PARTIAL_RECEIVER_BLOCK)]);
         assert_eq!(worker.state.journals[0].acknowledged, 0);
         drop(worker);
         let worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        assert_eq!(worker.blocked(), vec![(1, "partial receiver acceptance")]);
+        assert_eq!(worker.blocked(), vec![(1, PARTIAL_RECEIVER_BLOCK)]);
         drop(worker);
         fs::write(state_dir.join("local-delivery.json"), b"broken").unwrap();
         assert!(LocalAuditDelivery::open(&active, &state_dir, "receiver-A").is_err());
@@ -2620,31 +2631,41 @@ mod tests {
     }
 
     #[test]
-    fn version_one_rejection_block_resumes_its_prepared_range() {
-        let (_dir, active, state_dir, recorder) = setup();
-        record(&recorder, "one");
-        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        let mut sink = FakeReceiver {
-            next: Some(ReceiverResult::Retryable),
-            ..Default::default()
-        };
-        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
-        // What version 1 left after a 4xx: the journal blocked, its range kept.
-        worker.state.journals[0].blocked = Some(LEGACY_REJECTION_BLOCK.into());
-        let mut legacy = serde_json::to_value(&worker.state).unwrap();
-        legacy["version"] = 1.into();
-        legacy.as_object_mut().unwrap().remove("source");
-        drop(worker);
-        fs::write(
-            state_dir.join("local-delivery.json"),
-            serde_json::to_vec(&legacy).unwrap(),
-        )
-        .unwrap();
-        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        assert!(worker.blocked().is_empty());
-        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_eq!(sink.batches[1].token.start(), 0);
-        assert_eq!(sink.batches[1].bodies, sink.batches[0].bodies);
+    fn legacy_receiver_blocks_resume_their_prepared_range() {
+        // What 0.15.0 left after a 4xx rejection or a `409`: the journal
+        // blocked, its range kept. Opening that cursor rewrites it as
+        // version 2 before the journal is retried, so both versions resume.
+        for (reason, version) in [
+            (LEGACY_REJECTION_BLOCK, 1),
+            (LEGACY_PARTIAL_BLOCK, 1),
+            (LEGACY_PARTIAL_BLOCK, STATE_VERSION),
+        ] {
+            let (_dir, active, state_dir, recorder) = setup();
+            record(&recorder, "one");
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            let mut sink = FakeReceiver {
+                next: Some(ReceiverResult::Retryable),
+                ..Default::default()
+            };
+            assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
+            worker.state.journals[0].blocked = Some(reason.into());
+            let mut legacy = serde_json::to_value(&worker.state).unwrap();
+            if version == 1 {
+                legacy["version"] = 1.into();
+                legacy.as_object_mut().unwrap().remove("source");
+            }
+            drop(worker);
+            fs::write(
+                state_dir.join("local-delivery.json"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            assert!(worker.blocked().is_empty(), "{reason} v{version}");
+            assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+            assert_eq!(sink.batches[1].token.start(), 0);
+            assert_eq!(sink.batches[1].bodies, sink.batches[0].bodies);
+        }
     }
 
     #[test]
