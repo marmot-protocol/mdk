@@ -67,6 +67,14 @@ class ParseReportTests(unittest.TestCase):
         # The two attempts share one panic, so one sample remains.
         self.assertEqual(outcome.samples, [["crates/cli/tests/cli.rs:40:9", "receiver must see it: Elapsed(())"]])
 
+    def test_only_the_line_after_the_panic_is_reported(self):
+        # An empty panic message must not pull in whatever the test printed next.
+        case = 'quiet|<failure type="test failure">thread &apos;quiet&apos; panicked at src/lib.rs:3:5:\n\n' \
+            'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n' \
+            'PRIVATE LOG LINE</failure>'
+        _, outcomes = parse_report(report(case))
+        self.assertEqual(outcomes["wn-cli::cli::quiet"].samples, [["src/lib.rs:3:5", ""]])
+
     def test_a_failure_without_a_panic_reports_only_its_type(self):
         _, outcomes = parse_report(report(TIMEOUT))
         self.assertEqual(outcomes["wn-cli::cli::hangs"].samples, [["", "test timeout"]])
@@ -110,8 +118,8 @@ class FakeGitHub:
         return [{"id": artifact_id, "name": name, "expired": False}
                 for artifact_id, name, _ in self.artifacts_by_run[run_id]]
 
-    def artifact_zip(self, artifact_id, *, charged=True):
-        if charged:
+    def artifact_zip(self, artifact_id, *, prepaid=False):
+        if not prepaid:
             self.budget.take()
         self.downloads.append(artifact_id)
         for artifacts in self.artifacts_by_run.values():
@@ -153,11 +161,22 @@ class GhCallTests(unittest.TestCase):
         self.calls = lambda: int(count.read_text())
         return github
 
-    def test_a_transient_server_error_is_retried(self):
+    def test_a_transient_server_error_is_retried_and_charged(self):
         github = self.gh("gh: Server Error (HTTP 502)")
         with unittest.mock.patch.object(flake_report, "RETRY_DELAYS", (0, 0)):
-            self.assertEqual(github.artifact_zip(1), b"ok")
+            self.assertEqual(github.artifact_zip(1, prepaid=True), b"ok")
         self.assertEqual(self.calls(), 2)
+        # The prepaid first attempt cost nothing more; the retry cost one call.
+        github.budget.take(9)
+        with self.assertRaises(RateLimited):
+            github.budget.take()
+
+    def test_retries_stop_when_the_budget_is_spent(self):
+        github = self.gh("gh: Server Error (HTTP 502)", "gh: Server Error (HTTP 503)")
+        github.budget = Budget(1)
+        with unittest.mock.patch.object(flake_report, "RETRY_DELAYS", (0, 0)), self.assertRaises(RateLimited):
+            github.artifact_zip(1)
+        self.assertEqual(self.calls(), 1)
 
     def test_a_rate_limit_spends_the_budget(self):
         github = self.gh("gh: API rate limit exceeded for user ID 1. (HTTP 403)")
@@ -220,7 +239,7 @@ class LeaderboardTests(unittest.TestCase):
         self.assertTrue(data["partial"])
         self.assertEqual(github.downloads, [])
         self.assertIn("Partial data", markdown)
-        self.assertEqual(list(self.cache.glob("run-*")), [])
+        self.assertEqual(list(self.cache.rglob("run-*")), [])
 
     def test_rate_limit_errors_from_gh_stop_fetching(self):
         github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", RateLimited())]})
@@ -231,7 +250,7 @@ class LeaderboardTests(unittest.TestCase):
         github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", GhError("HTTP 500"))]})
         _, markdown, _ = self.main(github)
         self.assertIn("could not be fetched", markdown)
-        self.assertEqual(list(self.cache.glob("run-*")), [])
+        self.assertEqual(list(self.cache.rglob("run-*")), [])
 
     def test_a_rerun_attempt_is_fetched_again(self):
         first = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(PASS)))]})
@@ -243,15 +262,27 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual(sorted(second.downloads), [1, 2])
         self.assertEqual(data["tests"][0]["test"], "flaky")
 
+    def test_another_job_selection_does_not_reuse_cached_summaries(self):
+        artifacts = {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY))),
+                         (2, "ci-runner-relay-runtime-0-1", artifact_zip(report(PASS)))]}
+        github = FakeGitHub([run(1, 1)], artifacts)
+        _, _, data = self.main(github)
+        self.assertEqual(sorted(github.downloads), [1, 2])
+        self.assertEqual([row["test"] for row in data["tests"]], ["flaky"])
+        github = FakeGitHub([run(1, 1)], artifacts)
+        _, _, data = self.main(github, "--jobs", "relay-runtime")
+        self.assertEqual(github.downloads, [2])
+        self.assertEqual(data["tests"], [])
+
     def test_offline_reports_only_cached_runs_inside_the_window(self):
-        cache = flake_report.Cache(self.cache)
+        cache = flake_report.Cache(flake_report.cache_root(flake_report.parse_args(["--cache-dir", str(self.cache)])))
         for run_id, hours_ago, case in [(1, 1, FLAKY), (2, 24 * 10, FAILED)]:
             summary = flake_report.empty_summary(run(run_id, hours_ago))
             flake_report.add_report(summary, report(case))
             cache.store(summary)
         _, _, data = self.main(None, "--offline", "--prune")
         self.assertEqual([row["test"] for row in data["tests"]], ["flaky"])
-        self.assertEqual([path.name for path in self.cache.glob("run-*")], ["run-1.json.gz"])
+        self.assertEqual([path.name for path in self.cache.rglob("run-*")], ["run-1.json.gz"])
 
     def test_markdown_shrinks_to_fit_an_issue_body(self):
         report_data = {"generated_at": "now", "workflow": "ci.yml", "since": "then", "notes": [],

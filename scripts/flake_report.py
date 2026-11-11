@@ -20,6 +20,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -79,16 +80,18 @@ class Outcome:
 def failure_sample(element: ET.Element) -> list[str]:
     """Return [location, message line] for one failed attempt.
 
-    A panic yields its location and the first line after it. Anything else
-    (a timeout, a signal) yields only nextest's failure type, never output.
+    A panic yields its location and the line right after it, which is the
+    panic message (empty if the next line is not). Anything else (a timeout,
+    a signal) yields only nextest's failure type, never output.
     """
     lines = (element.text or element.get("message") or "").splitlines()
     for index, line in enumerate(lines):
         match = PANIC.search(line)
         if match is None:
             continue
-        message = next((rest.strip() for rest in lines[index + 1:]
-                        if rest.strip() and not rest.startswith("note: run with `RUST_BACKTRACE")), "")
+        message = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        if message.startswith("note: run with `RUST_BACKTRACE"):
+            message = ""
         return [match.group(1), message[:MAX_MESSAGE_CHARS]]
     return ["", (element.get("type") or "test failure")[:MAX_MESSAGE_CHARS]]
 
@@ -160,13 +163,21 @@ class GitHub:
         self.gh = gh
         self.budget = Budget(0)
 
-    def _call(self, path: str, params: dict[str, str] | None = None, *, charged: bool = True) -> bytes:
-        if charged:
+    def _call(self, path: str, params: dict[str, str] | None = None, *,
+              free: bool = False, prepaid: bool = False) -> bytes:
+        """Run `gh api`, charging each request to the budget.
+
+        `free` requests cost nothing; a `prepaid` request's first attempt was
+        already taken from the budget, but its retries are not.
+        """
+        if not (free or prepaid):
             self.budget.take()
         command = [self.gh, "api", "-X", "GET", path]
         for key, value in (params or {}).items():
             command += ["-f", f"{key}={value}"]
-        for delay in (*RETRY_DELAYS, None):
+        for attempt, delay in enumerate((*RETRY_DELAYS, None)):
+            if attempt and not free:
+                self.budget.take()
             try:
                 result = subprocess.run(command, capture_output=True, timeout=600, check=False)
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -184,15 +195,15 @@ class GitHub:
             time.sleep(delay)
         raise AssertionError("unreachable")
 
-    def _json(self, path: str, params: dict[str, str] | None = None, *, charged: bool = True):
+    def _json(self, path: str, params: dict[str, str] | None = None, *, free: bool = False):
         try:
-            return json.loads(self._call(path, params, charged=charged))
+            return json.loads(self._call(path, params, free=free))
         except json.JSONDecodeError as error:
             raise GhError(f"gh api {path}: invalid JSON") from error
 
     def core_remaining(self) -> int:
         # GET /rate_limit does not count against the limit.
-        return int(self._json("rate_limit", charged=False)["resources"]["core"]["remaining"])
+        return int(self._json("rate_limit", free=True)["resources"]["core"]["remaining"])
 
     def runs(self, workflow: str, event: str, since: dt.datetime) -> list[dict]:
         runs: list[dict] = []
@@ -217,8 +228,8 @@ class GitHub:
                 break
         return artifacts
 
-    def artifact_zip(self, artifact_id: int, *, charged: bool = True) -> bytes:
-        return self._call(f"repos/{self.repo}/actions/artifacts/{artifact_id}/zip", charged=charged)
+    def artifact_zip(self, artifact_id: int, *, prepaid: bool = False) -> bytes:
+        return self._call(f"repos/{self.repo}/actions/artifacts/{artifact_id}/zip", prepaid=prepaid)
 
 
 def empty_summary(run: dict) -> dict:
@@ -320,7 +331,7 @@ def fetch_run(github: GitHub, run: dict, artifact_name: re.Pattern[str]) -> dict
     summary = empty_summary(run)
     for index, artifact in enumerate(selected):
         try:
-            add_artifact(summary, github.artifact_zip(artifact["id"], charged=False))
+            add_artifact(summary, github.artifact_zip(artifact["id"], prepaid=True))
         except BaseException:
             github.budget.refund(len(selected) - index - 1)
             raise
@@ -338,8 +349,18 @@ class Collection:
     notes: list[str] = field(default_factory=list)
 
 
+def cache_root(args: argparse.Namespace) -> Path:
+    """A cache directory per repository, workflow, event and job selection.
+
+    A summary holds only the selected jobs' reports, so another selection
+    must not reuse it.
+    """
+    selection = json.dumps([args.repo, args.workflow, args.event, sorted(set(args.jobs))])
+    return args.cache_dir / f"v{CACHE_VERSION}-{hashlib.sha256(selection.encode()).hexdigest()[:16]}"
+
+
 def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None) -> Collection:
-    cache = Cache(args.cache_dir)
+    cache = Cache(cache_root(args))
     if args.prune:
         cache.prune(since)
     collection = Collection([])
