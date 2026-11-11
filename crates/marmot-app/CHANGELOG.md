@@ -2,11 +2,16 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-11-11
+
 ### Breaking changes
 
-- `AppGroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272), reported by the quarantined-groups read:
-  a read of past group state could not restore the live group. Neither a retry nor a re-join clears it, and the next
-  account open restores the live state. Exhaustive matches must add it.
+- `AppGroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272), reported by the quarantined-groups read
+  and the `GroupHydrationQuarantined` group event: a read of past group state could not restore the live group.
+  Neither a retry nor a re-join clears it: `retry_hydrate_quarantined_group` returns `false`, `group_recovery_status`
+  omits the group's `rejoin_invitations`, and `confirm_group_rejoin` fails as `UnknownGroup` for them. The next account
+  open restores the live state. A group with two interrupted rewinds, which reported `GroupRecordLoadFailed`, now
+  reports this reason. Exhaustive matches must add it.
 
 - `marmot_app::AppClient` and `MarmotApp::client` are public only under the
   `test-support` feature (mdk#2782). Hosts reach accounts through
@@ -29,47 +34,102 @@
   `cancel_onboarding`, `onboarding_recovery_required`, `recover_onboarding`, `propose_onboarding_relay_repair`,
   `acknowledge_onboarding_single_device` and `acknowledge_onboarding_single_device_in_epoch`. Replace
   `runtime.accounts().begin_onboarding(..)` with `runtime.account_setup().begin_onboarding(..)`. The UniFFI and C
-  bindings do not change.
+  bindings do not change. `AccountSetup<'_>` borrows the runtime; a spawned task clones
+  `MarmotAppRuntime` and calls `account_setup()` inside it.
 
 - `MarmotDeployment` adds `relay_event_limits`, a list of `RelayEventLimit { relay, max_event_bytes }` for relays that
   do not advertise their event limit (mdk#2334). MDK sends no group event, Welcome or account-signed event over a
   relay's known limit, which for events over 64 KiB also counts the WebSocket message size a relay's NIP-11 document
-  advertises. A send that fits none of its relays fails as `AppError::EventTooLarge`, rolled back with nothing sent:
-  a commit, and an invite staged at once whose Welcome fits none of the invitee's inbox relays. A group create whose
-  founding Welcome fits none of an invitee's inbox relays fails as `EventTooLarge { artifact: Welcome }` before
-  anything is created or sent. A send queued behind an unsettled group whose commit or Welcome fits none of its
-  relays when the group settles is dropped unsent, not retried, and announced as `QueuedIntentRefused` with reason
-  `event_too_large`, the artifact and its size class. Every other event an account publishes (profile, follow and relay lists, KeyPackages, the block list,
-  stickers, the backup pointer) goes only to the relays it fits, and nowhere when it fits none. The profile,
-  follow-list, relay-list, KeyPackage, block-list and sticker-sync calls then fail as `EventTooLarge { artifact: Other }`,
-  and so they do when every relay refuses the event for size itself: a KeyPackage publish no longer fails as an
-  `Account` error, `block_user` and `unblock_user` as `BlockListUnavailable`, or `sync_sticker_packs` as
-  `StickerRelay`. A block edit retried after an uncertain attempt stays `BlockPublicationUncertain`, and a sticker
-  install or uninstall still succeeds, its list owed to the next sync. The background backup pass and KeyPackage
-  maintenance log such a refusal as `event_too_large`. A relay with no known limit is sent to as before.
-  `MarmotDeployment::white_noise()` sets 2 MiB on White Noise's two relays; `neutral()` sets none. Struct literals add
-  the field, and those of `marmot_session::KeyPackagePublishError`, which is not `#[non_exhaustive]`, add
-  `event_size_class`; exhaustive patterns add it too.
+  advertises, under any deployment. A send that fits none of its relays fails as `AppError::EventTooLarge`, rolled
+  back with nothing sent: a commit, and an invite staged at once whose Welcome fits none of the invitee's inbox
+  relays. A group create whose founding Welcome fits none of an invitee's inbox relays fails as
+  `EventTooLarge { artifact: Welcome }` before anything is created or sent. A send queued behind an unsettled group
+  whose commit every group relay refuses for size, or whose Welcome fits none of the invitee's inbox relays, is
+  retired when the group settles, not re-drained, and announced as `QueuedIntentRefused` with reason
+  `event_too_large`, the artifact and its size class. Every other event an account publishes (profile, follow and
+  relay lists, KeyPackages, the block list, stickers, the backup pointer) goes only to the relays it fits, and nowhere
+  when it fits none. The profile, follow-list, relay-list, KeyPackage, block-list and sticker-sync calls then fail as
+  `EventTooLarge { artifact: Other }`, and so they do when every relay refuses the event for size itself: a KeyPackage
+  publish no longer fails as an `Account` error, `block_user` and `unblock_user` as `BlockListUnavailable`, or
+  `sync_sticker_packs` as `StickerRelay`. A block edit retried after an uncertain attempt stays
+  `BlockPublicationUncertain`, and a sticker install or uninstall still succeeds, its list owed to the next sync. The
+  background backup pass and KeyPackage maintenance log such a refusal as `event_too_large`. A relay with no known
+  limit is sent to as before. `MarmotDeployment::white_noise()` sets 2 MiB on White Noise's two relays; `neutral()`
+  sets none. Struct literals add the field, and those of `marmot_session::KeyPackagePublishError`, which is not
+  `#[non_exhaustive]`, add `event_size_class`; exhaustive patterns add it too.
+
+- `marmot_session::PreparedSessionSend` adds `Refused(Box<AccountDeviceEffects>)` (mdk#2334): an invite whose commit
+  fits none of its group relays' known limits, or whose Welcome fits none of its invitee's inbox relays', rolled back
+  by `confirm_commit_without_publish_with_audit_context` with nothing sent. Its effects carry the rollback and one
+  `PublishFailure` whose `oversized` names the artifact. The enum is not `#[non_exhaustive]`; exhaustive matches add it.
+
+- Runtime performance snapshots time each host read's wait on its account worker, per read class
+  (`read_queue_r1` … `read_queue_r9`), and again by the long unit it waited behind (`read_queue_behind_startup_sync`,
+  `_catch_up`, `_convergence`, `_welcome_fanout`, `_repair`, `_send`, `_invite_or_create`, `_maintenance`)
+  (mdk#3273). `RuntimePerformanceOperation` gains these 17 operations; exhaustive matches add the arms.
+
+- `audit_otlp_sender::AuditOtlpSendResult`, which `MarmotAppRuntime::send_audit_otlp_once` returns in
+  `AuditOtlpAttemptOutcome::Sent { receiver, .. }`, drops `Partial` and adds `Rejected { http_status: u16 }`
+  (mdk#3300). `Retryable` becomes `Retryable { http_status: u16 }` and `Blocked` becomes
+  `Blocked { http_status: Option<u16> }`. marmot-forensics `DeliveryStep` adds `Split`, and `GapReason` adds
+  `ReceiverRejected`, `ExpiredUndelivered` and `CursorOverflow`. Exhaustive matches add them.
 
 ### Added
 
-- `MarmotAppRuntime::start_direct_conversation` serializes peer lookup and
-  creation on the account worker (mdk#464). New direct conversations include
-  both accounts as founding admins. Retries reuse canonical local state,
-  including after a lost response or projection failure. Recovery restores
-  only missing direct projections for the requested peer and announces the
-  repaired row. Device groups and unrelated groups remain untouched.
-  A matching quarantined group still eligible for reuse blocks creation on
-  repeated retries, even without a projection. Removed and disbanded copies
-  do not block a fresh direct. Generic creation and existing
-  conversations retain their current admin semantics.
+- `MarmotAppRuntime::start_direct_conversation(account_ref, peer_account_id) -> Result<GroupId, AppError>` reuses
+  this account's direct conversation with a hex or npub peer, or creates an unnamed group in which both accounts are
+  founding admins (mdk#464). Lookup and creation run together on the account worker, so a retry after a lost response
+  or projection failure reuses the canonical group. It restores only that peer's missing direct projection and
+  announces the restored row. A matching canonical group that cannot be hydrated fails the call rather than being
+  duplicated. Removed or disbanded copies do not block a new one. Starting a chat with yourself fails as
+  `GroupCreateIncludesCreator`. The returned id is not a Welcome delivery acknowledgement. `create_group*` and the
+  admin roles of existing conversations are unchanged.
 
-- Add account-scoped relay liveness snapshots, event-driven subscriptions, and safety-checked per-relay reconnects
-  (mdk#329). Unobserved configured relays remain `Unknown`; closed sessions retain available attempt/error details.
-  Reconnect preserves existing roles and owners; new manual connections are configuration-scoped. Aggregate health
-  is unchanged. Malformed cached URLs are excluded without blocking receive startup or valid retries.
-  Directory-cache failures do not gate receive activation; queued reconnects use the long worker response wait.
-  Late transport activation on the same client also reconciles configuration, preserving closed-session details.
+- `MarmotAppRuntime::account_relay_liveness(account_ref) -> Vec<RelayLiveness>`,
+  `subscribe_relay_liveness(account_ref) -> RuntimeRelayLivenessSubscription` and
+  `reconnect_relay(account_ref, url) -> RelayLiveness` show each relay configured for an account (default, bootstrap,
+  NIP-65 and inbox relays, canonicalized) with its own pool's state (mdk#329). `RelayLiveness` has `url`, `status`
+  (`RelayLivenessStatus::{Unknown, Connecting, Connected, Offline}`), `last_attempt_unix: Option<u64>` and
+  `last_error: Option<String>`, the SDK's connection-error category. Reads never dial. A relay not yet observed is
+  `Unknown`. The subscription's `snapshot` comes first; `recv()` yields later complete lists, may skip intermediate
+  ones, and returns `Ok(None)` after `close()` or runtime shutdown. `close()` does not disconnect relays.
+  `reconnect_relay` dials only a configured relay through the account pool's dial checks, keeping that relay's roles
+  and owners, and fails for any other URL. Aggregate relay health and diagnostics are unchanged.
+
+- `MarmotAppRuntime::audit_delivery_status()` returns one `AuditDeliveryStatus` per account (mdk#3300): last success,
+  `last_failure: Option<AuditDeliveryFailure>` (`AuditDeliveryFailureKind` and the receiver's `http_status`),
+  `consecutive_failures`, `rejected_batches`, `paused` and `backlog: Option<AuditDeliveryBacklog>`. It reads small
+  local files and never dials. A receiver block pauses automatic delivery for that account, across restarts with the
+  same configuration; a changed destination, endpoint or token, or `post_audit_log_tracker_update`, lifts it.
+
+- `MarmotAppRuntime::audit_log_retention` and `set_audit_log_retention(AuditLogRetention)` (also on `MarmotApp`) read
+  and persist local audit retention (mdk#3300): `max_age_days` clamped to 1-30 and `max_bytes_per_account` to at
+  least `AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT` (16 MiB). The setter returns the stored, clamped value and requests a
+  sweep. Also new: `AUDIT_LOG_MAX_AGE_DAYS` and `AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT`.
+
+### Changed
+
+- Local audit files have a per-account size budget, 256 MiB by default (mdk#3300). Above it, retention deletes the
+  oldest sealed segments that v5 delivery accepted or will never send (no v5 cursor, v4 or another identity's
+  files, or lost to cursor overflow); undelivered data is deleted only by age or an explicit clear. Checks run at
+  startup, hourly, and after recording activity and delivery passes, at most every 30 seconds.
+- v5 audit delivery treats `409` as retryable and `400`, `413` or `422` as a rejection that bisects the batch and
+  skips only the isolated record with a `ReceiverRejected` gap (mdk#3300). Automatic passes skip a paused account and
+  count it in `blocked_accounts`.
+
+### Fixed
+
+- `decline_group_invite` no longer leaves the group after its caller stopped waiting (#3031). A decline still queued
+  on the account worker when the call returned `AppError::AccountWorkerResponseTimedOut`, or was cancelled, used to
+  run later, and an accept sent in the meantime then failed with `GroupInviteNotPending`. Such a decline is now
+  dropped unrun. A decline the worker has already started still completes.
+
+- Wiping or removing a generated identity whose setup was still publishing in the background no longer mints a new,
+  unrequested account (whitenoise-ios#1302). Each background retry now continues only its own account. It stops once
+  that account is removed, signed out or set up. `sign_out`, `sign_out_and_wipe` and `remove_account` stop the
+  attempt in flight before their first stage, so nothing publishes after the KeyPackage withdrawal. A teardown that
+  fails or is cancelled leaves the setup to resume. `sign_in_account` resumes a generated setup that its sign-out
+  stopped.
 
 ## 0.15.0 - 2026-11-09
 

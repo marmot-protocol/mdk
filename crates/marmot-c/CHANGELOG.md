@@ -7,15 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
-- Add `marmot_audit_log_retention` and `marmot_set_audit_log_retention` for the persisted local audit retention
-  policy (mdk#3300): a maximum age of 1-30 days (default 30) and a per-account size budget of at least 16 MiB
-  (default 256 MiB) that deletes only segments v5 delivery accepted or will never send. `MarmotAuditLogRetention` is a
-  new struct, freed with `marmot_audit_log_retention_free`. Additive; use the matching generated header and library.
+## [0.16.0] - 2026-11-11
+
+### Breaking changes
 
 - `MarmotAppGroupHydrationQuarantineReason` adds `MARMOT_APP_GROUP_HYDRATION_QUARANTINE_REASON_REWIND_RESTORE_FAILED`
-  (mdk#3272), reported by the quarantined-groups read: a read of past group state could not restore the live group.
-  Neither a retry nor a re-join clears it, and the next account open restores the live state. A `switch` that covers
-  every case must add it. Use the matching generated header and library.
+  (mdk#3272), reported by the quarantined-groups read and the `MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_QUARANTINED`
+  event body: a read of past group state could not restore the live group. Neither a retry nor a re-join clears it:
+  `marmot_retry_hydrate_quarantined_group` reports false, `marmot_group_recovery_status` omits the group's rejoin
+  invitations, and confirming one fails as `MARMOT_STATUS_UNKNOWN_GROUP`. The next account open restores the live state.
+  A group with two interrupted rewinds, which reported `GROUP_RECORD_LOAD_FAILED`, now reports this reason. A `switch`
+  that covers every case must add it. Use the matching generated header and library.
 
 - `MarmotGroupEventKind`'s `QueuedIntentRefused` body appends `artifact`, `has_size_class` and `size_class`
   (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's Welcome fits none of its relays'
@@ -23,13 +25,44 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `size_class` its coarse size. `artifact` is NULL and `has_size_class` false for other reasons. Rebuild against the
   matching generated header and library.
 
-- Add `marmot_deployment_set_relay_event_limits`, which replaces the largest event each listed relay accepts, for
-  relays that do not advertise it (mdk#2334): `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event,
-  Welcome or account-signed event over a relay's known limit. A send that fits none of its relays reaches none, and a
-  call that returns relay errors then fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A group create or invite whose
-  Welcome fits none of an invitee's inbox relays fails that way before anything is created or sent.
+### Added
+
+- Add `marmot_audit_log_retention` and `marmot_set_audit_log_retention` for the persisted local audit retention
+  policy (mdk#3300): a maximum age of 1-30 days (default 30) and a per-account size budget of at least 16 MiB
+  (default 256 MiB) that deletes only segments v5 delivery accepted or will never send. `MarmotAuditLogRetention` is a
+  new struct, freed with `marmot_audit_log_retention_free`. Additive; use the matching generated header and library.
+
+- Add `marmot_audit_delivery_status_v5`, a local read of each account's v5 audit delivery status (mdk#3300). It
+  returns `MarmotAuditDeliveryStatusV5List`, freed with `marmot_audit_delivery_status_v5_list_free`; each
+  `MarmotAuditDeliveryStatusV5` owns `account_ref` and the nullable `last_failure` (`MarmotAuditDeliveryFailureV5`,
+  with `MarmotAuditDeliveryFailureKindV5` and `has_http_status`/`http_status`) and `backlog`
+  (`MarmotAuditDeliveryBacklogV5`). `paused` follows a receiver block until the configuration changes or
+  `marmot_post_audit_log_tracker_update_v5` runs. Additive; use the matching generated header and library.
+
+- Add `marmot_deployment_set_relay_event_limits`, which replaces the largest event each listed relay accepts, for relays
+  that do not advertise it (mdk#2334): `relays[i]` takes `max_event_bytes[i]`. MDK sends no group event, Welcome or
+  account-signed event over a relay's known limit. For events over 64 KiB MDK also counts the WebSocket message size a
+  relay's NIP-11 document advertises, with `marmot_deployment_neutral` too. A send that fits none of its relays reaches
+  none, and a call that returns relay errors then fails as `MARMOT_STATUS_EVENT_TOO_LARGE`. A group create or invite
+  whose Welcome fits none of an invitee's inbox relays fails that way before anything is created or sent.
   `marmot_deployment_white_noise` sets 2 MiB on White Noise's two relays. Additive; use the matching generated header
   and library.
+
+- Add `marmot_start_direct_chat(client, account_ref, peer_account_id, char **out)` (mdk#464). It reuses this
+  account's direct conversation with a hex or npub peer, or creates an unnamed group with both accounts as founding
+  admins. `*out` is an owned hex MLS group id, freed with `marmot_string_free`. A success means local state is
+  canonical, not that the Welcome was delivered. A self-peer returns `MARMOT_STATUS_RUNTIME`. Additive.
+
+- Add account relay liveness (mdk#329): `marmot_account_relay_liveness` (owned `MarmotRelayLivenessList`, freed with
+  `marmot_relay_liveness_list_free`) and `marmot_reconnect_relay` (owned `MarmotRelayLiveness`, freed with
+  `marmot_relay_liveness_free`). `MarmotRelayLiveness` has `url`, `status` (`MARMOT_RELAY_STATUS_UNKNOWN`,
+  `_CONNECTING`, `_CONNECTED`, `_OFFLINE`), `has_last_attempt_unix`/`last_attempt_unix` and nullable `last_error`.
+  `marmot_subscribe_relay_liveness` returns a `MarmotRelayLivenessSubscription` that works with
+  `marmot_relay_liveness_subscription_snapshot` (once), `_next` (`timeout_ms` 0 waits forever),
+  `_set_callback`/`_clear_callback` (borrowed list; NULL with `MARMOT_STATUS_CLOSED` or the error status ends it),
+  `_cancel` and `_free` (before the client). Do not mix `_next` with a callback. Additive.
+
+### Changed
 
 - `marmot_rotate_key_package`, `marmot_republish_key_package`, account setup's KeyPackage publish,
   `marmot_block_user`, `marmot_unblock_user` and `marmot_sync_sticker_packs` return `MARMOT_STATUS_EVENT_TOO_LARGE`
@@ -38,18 +71,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   block edit retried after an uncertain attempt still returns `MARMOT_STATUS_BLOCK_PUBLICATION_UNCERTAIN`, and a
   sticker install or uninstall still succeeds, its list owed to the next sync.
 
-- Add `marmot_start_direct_chat` for shared local direct-chat reuse or creation with both accounts as
-  founding admins. It returns an owned hex MLS group id, released with `marmot_string_free`; local success does
-  not acknowledge Welcome delivery. Generic creation and existing groups' roles remain unchanged. Additive;
-  use the matching generated header and library.
+### Fixed
 
-- Add account relay liveness snapshots, single-relay reconnect, and a closeable
-  subscription with blocking reads and callbacks. `MarmotRelayLivenessList` owns
-  its records and strings; free it with `marmot_relay_liveness_list_free`.
-  Free reconnect results with `marmot_relay_liveness_free` and subscription handles
-  with `marmot_relay_liveness_subscription_free`. Callback snapshots are borrowed;
-  this callback receives an explicit status to distinguish errors from close.
-  Rebuild consumers against the matching generated header and library.
+- `marmot_decline_group_invite` that returned `MARMOT_STATUS_ACCOUNT_WORKER_RESPONSE_TIMED_OUT` no longer leaves the
+  group later (#3031).
 
 ## [0.15.0] - 2026-11-09
 
@@ -1113,7 +1138,9 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.14.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.16.0...HEAD
+[0.16.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.15.0...marmotc-v0.16.0
+[0.15.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.14.0...marmotc-v0.15.0
 [0.14.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.13.0...marmotc-v0.14.0
 [0.13.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...marmotc-v0.13.0
 [0.12.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...marmotc-v0.12.0

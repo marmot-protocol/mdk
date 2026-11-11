@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-11-11
+
 ### Fixed
 
 - Resume v5 audit delivery of a file a receiver's `409` blocked under 0.15.0
@@ -15,20 +17,74 @@
   explicit default port read as possibly exposed whatever it answered, so a
   group whose only relay was spelled that way never confirmed or rolled back a
   commit.
-- Fetch independent directory queries concurrently, so KeyPackage and deletion
-  reads overlap their relay waits while retaining separate event limits (#1813).
+- Fetch independent directory queries up to four at a time, so KeyPackage and
+  deletion reads overlap their relay waits while retaining separate event limits
+  (#1813).
 - Reuse notification settings, chat mutes, group records, and directory users
   across live subscription events (#1800). Track settings, mute, and group
   changes at the shared storage boundary, including engine-side forgets across
   connections. Honor timed mute expiry and skip non-notifying kinds before
   storage reads or blocking-task dispatch.
-- Remove a redundant connected-relay restart from the manual relay lifetime test
-  that timed out in the merge queue (#3287). Connected-relay reconnect coverage
-  remains in the socket-watch and SDK tests.
 - Keep a group commit pending when a crash interrupted its send and the relay
   then refuses the retry (#2332). The interrupted send may have reached the
   relay, so a later refusal no longer rolls back a commit that members may
   have applied.
+- An account that is offline or has no relays no longer repeats the full replay
+  synchronization on every 15 s maintenance tick (#3238). The pass ran five
+  writer transactions and woke the recovery runner each time with nothing new to
+  record. It now runs once per inactive transport generation and again on
+  activation.
+- Quarantine a group whose read of past group state could not restore its live
+  state, instead of leaving it live on that past state for the session and
+  validating it as live at the next open (#3272). The group reports the new
+  hydration-quarantine reason `RewindRestoreFailed`; a retry or re-join does not
+  clear it, its input is retained, and the next account open restores the live
+  state and replays the input. Opening an account now restores every group's
+  interrupted rewind before ingest or a Welcome join can read it.
+- Report each relay the host-safety rule refuses (a private or loopback
+  address, a plaintext `ws://` URL, or a URL that does not parse) as never
+  contacted (#3276). A commit that every other group relay refused was retried
+  against it with backoff and never rolled back; it now rolls back. A Welcome
+  whose recipient's inbox list includes such a relay goes to the list's other
+  relays instead of failing whole. Audit records the refusal as
+  `publish_attempt_failed_before_exposure`.
+- Unstick a group whose deferred-peel backlog is full (#3297). Catch-up held
+  the whole group behind a history event the engine could neither open nor
+  store, which also held the group's live messages and the account's sync
+  cursor; that event is now let go of and the rest of the group admitted. A
+  quarantined group stays held. The per-group deferred-peel caps rise from
+  2,048 rows and 16 MiB to 8,192 rows and 64 MiB, the account cap from 64 MiB
+  to 256 MiB, and the recovery runner's account breaker from 720 to 7,200
+  quanta an hour, so a first catch-up of many groups no longer pauses it.
+- Keep delivering v5 audit records however many segments a device retains
+  (#3300). The delivery cursor kept about 320 bytes per retained file under a 1
+  MiB cap and discovery held every segment open, so at about 3,250 segments
+  every pass failed before any request. Idle sealed segments are now compact
+  cursor rows matched from metadata; an over-limit cursor sheds the oldest with
+  a `CursorOverflow` gap. Version 1 cursors upgrade on load.
+- Stop retrying v5 audit delivery silently forever (#3300). A `400`, `413` or
+  `422` now halves the batch until the rejected record is isolated, records a
+  `ReceiverRejected` gap and moves on; `409` is retried instead of blocking the
+  file for good; `401`, `403`, `404` or another unexpected response pauses
+  automatic delivery until the configuration changes or the host runs a manual
+  tracker update. Each attempt's outcome is persisted and readable.
+- Record only the outcome row for a relay replay that ingest ignores as a
+  duplicate or own echo (#3300). Each such message wrote about 6 KB of audit
+  rows; one replay storm filled 2.4 GB of v5 segments in a week.
+- Record an `ExpiredUndelivered` gap when retention deletes an audit file that
+  still held undelivered data (#3300). The loss surfaced only later, as a
+  generic `MissingSource` gap.
+- Record a relay's size refusal in audit v5 as `relay_rejected_invalid` again
+  (mdk#2334). Since 0.15.0 it was written as `unclassified`. A relay MDK did not
+  send to because the event is over its known limit is recorded as
+  `publish_attempt_failed_before_exposure`.
+- Retire a queued group change whose commit every group relay refuses for size
+  (mdk#2334). The drain rolled it back and staged it again on every pass; it is
+  now dropped once and announced as `QueuedIntentRefused` with reason
+  `event_too_large`.
+- Stop resending an account event that is over a relay's advertised message
+  limit (mdk#2334). Such a relay closed the socket, which read as a possible
+  exposure, and the event was resent three times; it is no longer sent there.
 
 ## 0.15.0 - 2026-11-09
 

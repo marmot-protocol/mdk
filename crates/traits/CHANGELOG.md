@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-11-11
+
 ### Breaking changes
 
 - `GroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272): a read of past group state rewound the live
@@ -25,13 +27,20 @@
   it (mdk#2334).
 - `WelcomeSizeCheck` judges a founding create's Welcomes before the engine writes anything (mdk#2334): the size
   class of the first that fits none of the endpoints its publish would reach.
-
 - `TransportEndpointFailure::over_known_limit` is an adapter's refusal to send an event over an endpoint's known limit
-  (mdk#2334): `NotExposed` with the `TooLarge` category and the event's size class. `TooLarge` now also covers this
-  refusal, and `EventSizeClass::from_rejected_targets` counts it, alone or mixed with endpoints' own size refusals.
+  (mdk#2334): `NotExposed` with the `TooLarge` category, the event's size class and the fixed reason
+  `TransportEndpointFailure::OVER_KNOWN_LIMIT_REASON`. `TooLarge` now also covers this refusal, and
+  `EventSizeClass::from_rejected_targets` counts it, alone or mixed with endpoints' own size refusals.
 - `TransportAdapter::size_class_over_known_limits` returns a message's size class when `publish` would refuse it,
   unsent, on every endpoint it would send to, because it is over each one's known limit; it sends nothing (mdk#2334).
   It defaults to `None`, so existing adapters build unchanged.
+
+### Changed
+
+- `OutboundFanout::possible_exposure` also answers `true` for a target that is `Attempting`, and
+  `OutboundFanout::mark_attempt_started` on a target already `Attempting` (an attempt a crash or an unwound pass left
+  without a recorded result) records its possible exposure (mdk#2332). A definite refusal of the retry no longer ends
+  the target `Failed`, so a pending commit that may have reached the relay is not rolled back.
 
 ## 0.15.0 - 2026-11-09
 
