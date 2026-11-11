@@ -6303,8 +6303,13 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true, None)
-            .await
+        self.create_generated_account_local_ready(
+            request,
+            true,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
     }
 
     /// Create a generated identity whose first public kind-0 is `profile`.
@@ -6321,8 +6326,13 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true, Some(profile))
-            .await
+        self.create_generated_account_local_ready(
+            request,
+            true,
+            Some(profile),
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
     }
 
     pub async fn login(
@@ -7078,7 +7088,11 @@ impl AccountManager {
         // Fenced before the global lock: the purge may open account storage.
         // Removing the directory deletes the rows even if this purge fails.
         let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
-        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
+        let account = self.app.account_home().account(account_ref)?;
+        let _generated_setup_fence = self
+            .setup
+            .fence_generated_removal(self, &account.account_id_hex)
+            .await;
         let lock_wait = self
             .shared
             .observer

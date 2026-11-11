@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-10-17
+updated: 2026-11-11
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -65,6 +65,14 @@ Host apps should render the locally persisted chat list when `start()` returns,
 show relay progress separately, and apply projection updates as network data
 arrives. No durable account, device, or startup identifier is introduced by
 this contract.
+
+Generated setup resumed at startup stays bound to the captured account.
+Foreground publication also continues the account returned at local readiness.
+Neither handoff creates a replacement if that account has been removed.
+Account removal holds local preparation admission and the account's foreground
+transaction alongside its background setup fence until deletion finishes.
+An admitted foreground publication therefore completes before removal, while a
+handoff that arrives after removal finds no account to continue.
 
 `SharedServices` should hold runtime state shared by every account:
 

@@ -34,7 +34,12 @@ impl MarmotAppRuntime {
             }
         };
         if let Err(error) = self
-            .create_generated_account_local_ready(context.request(), true, None)
+            .create_generated_account_local_ready(
+                context.request(),
+                true,
+                None,
+                GeneratedIdentity::Continue(&account.account_id_hex),
+            )
             .await
         {
             self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
@@ -67,6 +72,7 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
         schedule_background: bool,
         initial_profile: Option<UserProfileMetadata>,
+        generated: GeneratedIdentity<'_>,
     ) -> Result<AccountSetupResult, AppError> {
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
@@ -77,13 +83,21 @@ impl MarmotAppRuntime {
             self.shared.lifecycle().ensure_running()?;
             let _generated_setup_transaction =
                 self.setup.generated_setup_local_transaction.lock().await;
+            self.shared.lifecycle().ensure_running()?;
             validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
 
-            let resumable = self
-                .accounts
-                .app
-                .account_home()
-                .resumable_generated_account_setup()?;
+            let resumable = match generated {
+                GeneratedIdentity::ResumeOrCreate => self
+                    .accounts
+                    .app
+                    .account_home()
+                    .resumable_generated_account_setup()?,
+                GeneratedIdentity::Continue(id) => Some(
+                    self.accounts
+                        .pending_generated_account(id)?
+                        .ok_or_else(|| AccountHomeError::UnknownAccount(id.to_owned()))?,
+                ),
+            };
             // Persisted relays win on resume so every retry retains the exact
             // locally prepared initial KeyPackage and its publication targets.
             let context = match resumable.as_ref() {
@@ -112,10 +126,9 @@ impl MarmotAppRuntime {
                 .validate_account_relay_list_declarations(&bootstrap, None)?;
 
             let identity_started = Instant::now();
-            let identity_result = self.accounts.create_nostr_account_from_setup(
-                &effective_request,
-                GeneratedIdentity::ResumeOrCreate,
-            );
+            let identity_result = self
+                .accounts
+                .create_nostr_account_from_setup(&effective_request, generated);
             self.shared.observer.performance().record(
                 AppPerformanceOperation::AccountSetupIdentityLocal,
                 identity_started.elapsed(),
@@ -280,7 +293,12 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let local = self
-            .create_generated_account_local_ready(request, false, None)
+            .create_generated_account_local_ready(
+                request,
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
             .await?;
         let context = self
             .accounts
@@ -292,9 +310,21 @@ impl MarmotAppRuntime {
                 serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)
                     .map_err(AppError::from)
             })?;
+        self.finish_generated_setup(local, context).await
+    }
+
+    pub(in crate::runtime) async fn finish_generated_setup(
+        &self,
+        local: AccountSetupResult,
+        context: GeneratedAccountSetupContext,
+    ) -> Result<AccountSetupResult, AppError> {
         let started_at = Instant::now();
+        let setup = self.account_setup();
+        let transaction = setup.onboarding_transaction(&local.account.account_id_hex);
+        let _transaction = transaction.lock().await;
         let result = self
-            .create_or_import_account_network_ready(context.request())
+            .accounts
+            .continue_generated_account_setup(&local.account.account_id_hex, context.request())
             .await;
         self.shared.observer.performance().record(
             AppPerformanceOperation::AccountSetupNetworkReady,

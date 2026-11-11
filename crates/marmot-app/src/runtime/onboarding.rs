@@ -35,6 +35,12 @@ pub(super) struct SetupState {
 
 pub(super) use generated_setup_tasks::GeneratedSetupFence;
 
+pub(super) struct GeneratedRemovalFence {
+    _preparation: tokio::sync::OwnedMutexGuard<()>,
+    _background: GeneratedSetupFence,
+    _foreground: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// Account setup: interactive onboarding, its recovery and its sign-in
 /// notices, reached through `MarmotAppRuntime::account_setup`.
 ///
@@ -93,6 +99,28 @@ impl SetupState {
     /// account is still pending (`generated_setup_tasks`).
     pub(super) async fn fence_generated_setup(&self, account_id: &str) -> GeneratedSetupFence {
         self.generated_setup_tasks.fence(account_id).await
+    }
+
+    /// Exclude local handoff and foreground completion as well as background
+    /// attempts until account removal returns. Take these before the worker lock.
+    pub(super) async fn fence_generated_removal(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+    ) -> GeneratedRemovalFence {
+        let preparation = self
+            .generated_setup_local_transaction
+            .clone()
+            .lock_owned()
+            .await;
+        let background = self.generated_setup_tasks.fence(account_id).await;
+        let transaction = AccountSetup::new(self, manager).onboarding_transaction(account_id);
+        let foreground = transaction.lock_owned().await;
+        GeneratedRemovalFence {
+            _preparation: preparation,
+            _background: background,
+            _foreground: foreground,
+        }
     }
 
     /// Removal hook, called under the worker transaction after the removal
