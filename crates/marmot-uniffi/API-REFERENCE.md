@@ -5791,6 +5791,8 @@ Create or reopen the external account using the verified shared signer and persi
 
 Once Native adoption is admitted, caller cancellation only stops waiting; runtime-owned work continues. Pairing is a separate bounded, caller-cancellable `connect` call and makes no account changes while unbound. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning.
 
+Adoption retains its admission generation through binding and network waits. A later explicit reconnect cannot resume adoption retired by disconnect.
+
 Before commit, a failed Native handoff restores the previous local callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup and restore prior activation on failure. Already-published KeyPackages are not retracted. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account. Account sign-out cleanup remains explicit; legacy host login behavior is unchanged.
 
 [Source](src/nip46.rs#L264) · [Session lifecycle](README.md#nip-46-accounts)

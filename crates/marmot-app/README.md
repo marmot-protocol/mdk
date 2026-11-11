@@ -131,6 +131,7 @@ Native login/register adoption is runtime-owned once admitted: dropping its futu
 stops waiting, not adoption. First await successful session `connect`; `nip46_login`
 accepts only an already-verified `Ready` session and never silently connects.
 Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
+Reconnect never resumes an adoption retired by an earlier disconnect.
 Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
 interrupts and settles owned adoption before returning. Failed completed-account
 rebind restores prior local signer state and activation, but does not retract

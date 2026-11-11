@@ -545,6 +545,7 @@ call and makes no account changes while unbound. Cancel and discard abandoned pa
 UI; call adoption explicitly only after verification succeeds. Account sign-out does
 not cancel unrelated unbound sessions.
 Use session `cancel`, `disconnect`, or `logout` to interrupt adoption explicitly.
+An explicit reconnect cannot resume adoption retired by an earlier disconnect.
 Shutdown interrupts and settles owned adoption before returning.
 
 Failed completed-account Native rebinds restore the prior local callback, grant

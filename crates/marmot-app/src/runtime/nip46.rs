@@ -35,9 +35,11 @@ impl MarmotAppRuntime {
             return Err(Nip46Error::Mismatch.into());
         }
         let public_key = session.public_key()?;
-        if session.status().state != crate::Nip46State::Ready {
+        let status = session.status();
+        if status.state != crate::Nip46State::Ready {
             return Err(Nip46Error::Unavailable.into());
         }
+        let generation = status.generation;
         let public_key = public_key.to_hex();
         let request = AccountSetupRequest {
             default_relays,
@@ -49,10 +51,17 @@ impl MarmotAppRuntime {
             ..Default::default()
         };
         let runtime = self.clone();
-        self.own_nip46_adoption(session.clone(), async move {
+        self.own_nip46_adoption(session.clone(), generation, async move {
             let result = runtime
                 .accounts
-                .login_with_external(public_key, ExternalSetupSigner::Nip46(session), request)
+                .login_with_external(
+                    public_key,
+                    ExternalSetupSigner::Nip46 {
+                        session,
+                        generation,
+                    },
+                    request,
+                )
                 .await?;
             Ok(result.account)
         })
@@ -73,9 +82,12 @@ impl MarmotAppRuntime {
         if !account.external_signing {
             return Err(Nip46Error::Mismatch.into());
         }
+        let generation = session.status().generation;
         let runtime = self.clone();
-        self.own_nip46_adoption(session.clone(), async move {
-            runtime.attach_nip46_session(account, session).await
+        self.own_nip46_adoption(session.clone(), generation, async move {
+            runtime
+                .attach_nip46_session(account, session, generation)
+                .await
         })
         .await
     }
@@ -83,6 +95,7 @@ impl MarmotAppRuntime {
     async fn own_nip46_adoption<T: Send + 'static>(
         &self,
         session: Nip46Session,
+        generation: u64,
         work: impl Future<Output = Result<T, AppError>> + Send + 'static,
     ) -> Result<T, AppError> {
         let task = {
@@ -98,6 +111,9 @@ impl MarmotAppRuntime {
                 return Err(Nip46Error::Cancelled.into());
             }
             let user = session.public_key()?;
+            if session.status().generation != generation {
+                return Err(Nip46Error::Disconnected.into());
+            }
             adoptions.active.retain(|adoption| !adoption.finished());
             let (completion, completed) = watch::channel(false);
             let registry = Arc::downgrade(&self.accounts.app.nip46_adoptions);
@@ -129,19 +145,21 @@ impl MarmotAppRuntime {
         &self,
         account: AccountSummary,
         session: Nip46Session,
+        generation: u64,
     ) -> Result<(), AppError> {
         let gate = self
             .accounts
             .onboarding_transaction(&account.account_id_hex);
+        let observer = (session.clone(), generation);
         let _transaction =
-            Nip46Session::during_adoption(Some(&session), async { Ok(gate.lock().await) }).await?;
+            Nip46Session::during_adoption(Some(&observer), async { Ok(gate.lock().await) }).await?;
         self.shared.lifecycle().ensure_running()?;
         self.accounts.app.ensure_storage_open("NIP-46 adoption")?;
         let accounts = self.accounts.clone();
         let label = account.label.clone();
-        let observer = session.clone();
         let binding =
-            blocking_app_task(move || accounts.track_nip46_session(&label, session)).await?;
+            blocking_app_task(move || accounts.track_nip46_session(&label, session, generation))
+                .await?;
         let result = Nip46Session::during_adoption(
             Some(&observer),
             self.accounts
@@ -363,6 +381,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         session: Nip46Session,
+        generation: u64,
     ) -> Result<Option<Nip46Binding>, AppError> {
         let mut sessions = self
             .app
@@ -386,7 +405,7 @@ impl AccountManager {
         if public_key.to_hex() != account.account_id_hex {
             return Err(Nip46Error::Mismatch.into());
         }
-        let previous = session.bind_account(&account.label)?;
+        let previous = session.bind_account(&account.label, generation)?;
         let signer = session.registered_signer();
         let previous_signer =
             self.app

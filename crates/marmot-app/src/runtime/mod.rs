@@ -1366,7 +1366,10 @@ pub struct AccountSetupResult {
 
 enum ExternalSetupSigner {
     Host(Arc<dyn crate::ExternalAccountSigner>),
-    Nip46(crate::Nip46Session),
+    Nip46 {
+        session: crate::Nip46Session,
+        generation: u64,
+    },
 }
 
 enum ExternalSetupOrigin {
@@ -8729,23 +8732,26 @@ impl AccountManager {
                         .get_public_key()
                         .await
                         .map_err(crate::external_signer_public_key_error)?,
-                    ExternalSetupSigner::Nip46(session) => session.public_key()?,
+                    ExternalSetupSigner::Nip46 { session, .. } => session.public_key()?,
                 };
                 let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
                 if signer_public_key.to_hex() != account_id_hex {
                     return Err(AppError::ExternalSignerMismatch);
                 }
-                let native_session = match &signer {
-                    ExternalSetupSigner::Nip46(session) => Some(session.clone()),
+                let native_adoption = match &signer {
+                    ExternalSetupSigner::Nip46 {
+                        session,
+                        generation,
+                    } => Some((session.clone(), *generation)),
                     ExternalSetupSigner::Host(_) => None,
                 };
                 let gate = self.onboarding_transaction(&account_id_hex);
                 let _transaction =
-                    crate::Nip46Session::during_adoption(native_session.as_ref(), async {
+                    crate::Nip46Session::during_adoption(native_adoption.as_ref(), async {
                         Ok(gate.lock().await)
                     })
                     .await?;
-                if native_session.is_some() {
+                if native_adoption.is_some() {
                     self.shared.lifecycle().ensure_running()?;
                     self.app.ensure_storage_open("NIP-46 adoption")?;
                 }
@@ -8834,7 +8840,7 @@ impl AccountManager {
                                     // publication; keep it for an exact-byte retry instead.
                                     // A previously signed-out account is different: restore
                                     // that durable state while retaining its setup journal.
-                                    if reactivating_existing && native_session.is_none() {
+                                    if reactivating_existing && native_adoption.is_none() {
                                         self.restore_signed_out_after_key_package_failure(
                                             &account.label,
                                         )
@@ -8876,7 +8882,7 @@ impl AccountManager {
 
                         Ok((relay_lists, key_package_bytes))
                     };
-                    crate::Nip46Session::during_adoption(native_session.as_ref(), network).await
+                    crate::Nip46Session::during_adoption(native_adoption.as_ref(), network).await
                 }
                 .await;
                 match setup {
@@ -8888,7 +8894,7 @@ impl AccountManager {
                         readiness,
                     }),
                     Err(error) => {
-                        let restored = if native_session.is_some()
+                        let restored = if native_adoption.is_some()
                             && reactivating_existing
                             && !account.signed_out
                             && readiness != AccountSetupReadiness::NetworkReady
@@ -8970,10 +8976,14 @@ impl AccountManager {
         signer: ExternalSetupSigner,
     ) -> Result<Option<Nip46Binding>, AppError> {
         match signer {
-            ExternalSetupSigner::Nip46(session) => {
+            ExternalSetupSigner::Nip46 {
+                session,
+                generation,
+            } => {
                 let accounts = self.clone();
                 let label = account.label.clone();
-                blocking_app_task(move || accounts.track_nip46_session(&label, session)).await
+                blocking_app_task(move || accounts.track_nip46_session(&label, session, generation))
+                    .await
             }
             ExternalSetupSigner::Host(signer) => {
                 self.app
@@ -9012,8 +9022,11 @@ impl AccountManager {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let reactivating = account.signed_out;
-        let native_session = match &signer {
-            ExternalSetupSigner::Nip46(session) => Some(session.clone()),
+        let native_adoption = match &signer {
+            ExternalSetupSigner::Nip46 {
+                session,
+                generation,
+            } => Some((session.clone(), *generation)),
             ExternalSetupSigner::Host(_) => None,
         };
         let binding = self
@@ -9053,7 +9066,7 @@ impl AccountManager {
             Ok((relay_lists, key_package_bytes))
         };
         let adoption =
-            crate::Nip46Session::during_adoption(native_session.as_ref(), adoption).await;
+            crate::Nip46Session::during_adoption(native_adoption.as_ref(), adoption).await;
         match adoption {
             Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
                 account,
@@ -9082,7 +9095,7 @@ impl AccountManager {
                 } else {
                     Ok(())
                 };
-                let reconciliation = if native_session.is_some() {
+                let reconciliation = if native_adoption.is_some() {
                     self.reconcile_nip46_cleanup(&account.account_id_hex).await
                 } else {
                     self.reconcile_for_account(&account.account_id_hex).await

@@ -102,7 +102,10 @@ cancel and discard abandoned pairing UI and make a new explicit adoption call on
 after verification succeeds. Account sign-out does not cancel unrelated unbound
 sessions. Explicit session `cancel`, `disconnect`, or `logout`
 interrupts adoption's network waits; local binding and persistence settle before
-the owned work ends. Shutdown interrupts and settles owned adoption before it
+the owned work ends. Adoption keeps the session generation captured at admission
+through gate waits, binding, and network work. A disconnect between phases still
+retires it; a later explicit reconnect cannot resume that older adoption.
+Shutdown interrupts and settles owned adoption before it
 closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
 adoption for that account. Explicit reactivation waits for adoption to settle,
 so an older rollback cannot undo the later sign-in. Caller drop does not replace

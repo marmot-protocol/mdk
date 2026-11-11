@@ -42,6 +42,8 @@
   and rejects other states without connecting or creating an account. Unbound pairing
   never mutates an account. Explicit session cancel/disconnect/logout interrupts
   adoption, and shutdown interrupts and settles owned work before returning.
+  Adoption keeps its admission generation through binding and network waits;
+  reconnect cannot revive retired work.
   Completed accounts rebind without reopening setup; failed Native adoption restores
   prior local callbacks, records, and activation without retracting published
   KeyPackages. Legacy host login behavior and explicit sign-out cleanup are unchanged.

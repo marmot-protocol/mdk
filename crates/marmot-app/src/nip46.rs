@@ -507,15 +507,15 @@ impl Nip46Session {
         Arc::ptr_eq(&self.core, &other.core)
     }
     pub(crate) async fn during_adoption<T>(
-        session: Option<&Self>,
+        adoption: Option<&(Self, u64)>,
         work: impl Future<Output = Result<T, crate::AppError>>,
     ) -> Result<T, crate::AppError> {
-        let Some(session) = session else {
+        let Some((session, generation)) = adoption else {
             return work.await;
         };
         let mut control = session.core.control.subscribe();
-        let generation = *control.borrow();
-        Shared::check(&lock(&session.core.shared.data), generation)?;
+        // Every phase belongs to the admitted generation, even after a later reconnect.
+        Shared::check(&lock(&session.core.shared.data), *generation)?;
         tokio::select! {
             biased;
             _ = control.changed() => {
@@ -588,9 +588,13 @@ impl Nip46Session {
         }
         protocol::uri(&data, &data.relays)
     }
-    pub(crate) fn bind_account(&self, account_ref: &str) -> Result<Nip46SessionWrite> {
+    pub(crate) fn bind_account(
+        &self,
+        account_ref: &str,
+        generation: u64,
+    ) -> Result<Nip46SessionWrite> {
         let mut data = lock(&self.core.shared.data);
-        Shared::check(&data, data.status.generation)?;
+        Shared::check(&data, generation)?;
         let account = self
             .core
             .shared

@@ -1390,3 +1390,179 @@ async fn nip46_erase_retry() {
     ));
     runtime.shutdown_and_close().await.unwrap();
 }
+
+struct BindingHoldStore {
+    inner: LocalFileSecretStore,
+    hold_once: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl AccountSecretStore for BindingHoldStore {
+    fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+        self.inner.has_secret_for_label(label)
+    }
+    fn write_secret(
+        &self,
+        account: &marmot_account::AccountSummary,
+        keys: &Keys,
+    ) -> AccountHomeResult<()> {
+        self.inner.write_secret(account, keys)?;
+        if account.label.starts_with(".nip46-client/")
+            && self
+                .hold_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            let (released, _) = self
+                .changed
+                .wait_timeout_while(
+                    self.released.lock().unwrap(),
+                    Duration::from_secs(10),
+                    |released| !*released,
+                )
+                .unwrap();
+            assert!(*released, "release the held protected-store write");
+        }
+        Ok(())
+    }
+    fn load_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<Keys> {
+        self.inner.load_secret(account)
+    }
+    fn remove_secret(&self, account: &marmot_account::AccountSummary) -> AccountHomeResult<()> {
+        self.inner.remove_secret(account)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_disconnect_during_bind() {
+    #[derive(Clone, Copy, Debug)]
+    enum AfterDisconnect {
+        StayDisconnected,
+        Reconnect,
+    }
+
+    let peer = LoginPeer::new().await;
+    let id = peer.user.public_key().to_hex();
+    let mut observations = [
+        (AfterDisconnect::StayDisconnected, false, false, false),
+        (AfterDisconnect::Reconnect, false, false, false),
+    ];
+    for (mode, retired, absent, transport) in &mut observations {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BindingHoldStore {
+            inner: LocalFileSecretStore::new(dir.path()),
+            hold_once: std::sync::atomic::AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+        let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+        let (fetch_entered, fetch_release) = fetcher.hold_fetches_for_kind(KIND_NIP65_RELAY_LIST);
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(relay.clone());
+        app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            Some(Duration::from_secs(120)),
+            relay,
+            fetcher,
+            false,
+        );
+        let runtime = app.runtime();
+        let session = peer.session(&app);
+        session.connect_async().await.unwrap();
+        let mut login = {
+            let runtime = runtime.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+                runtime
+                    .nip46_login(session, endpoints(), endpoints(), Vec::new())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
+            .await
+            .unwrap();
+        let disconnected = {
+            let store = store.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let parked = {
+                    let release = release.clone();
+                    tokio::spawn(async move {
+                        entered_tx.send(()).unwrap();
+                        let (released, _) = release
+                            .1
+                            .wait_timeout_while(
+                                release.0.lock().unwrap(),
+                                Duration::from_secs(10),
+                                |released| !*released,
+                            )
+                            .unwrap();
+                        assert!(*released, "release the parked Tokio worker");
+                    })
+                };
+                entered_rx.await.unwrap();
+                let write_release = std::thread::spawn(move || {
+                    *store.released.lock().unwrap() = true;
+                    store.changed.notify_one();
+                });
+                // Occupy both workers so disconnect wins before adoption resumes from binding.
+                session.disconnect();
+                write_release.join().unwrap();
+                let state = session.status().state;
+                *release.0.lock().unwrap() = true;
+                release.1.notify_one();
+                parked.await.unwrap();
+                state
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(disconnected, Nip46State::Disconnected);
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut login => Some(result.unwrap()),
+                _ = fetch_entered.notified() => None,
+            }
+        })
+        .await
+        .unwrap();
+        if matches!(*mode, AfterDisconnect::Reconnect) {
+            session.connect_async().await.unwrap();
+        }
+        fetch_release.notify_one();
+        let result = match completed {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(15), login)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        *retired = matches!(result, Err(AppError::Nip46(Nip46Error::Disconnected)));
+        *absent = matches!(home.account(&id), Err(AccountHomeError::UnknownAccount(_)));
+        *transport = session.status().state
+            == match mode {
+                AfterDisconnect::StayDisconnected => Nip46State::Disconnected,
+                AfterDisconnect::Reconnect => Nip46State::Ready,
+            };
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    peer.close().await;
+    assert!(
+        observations
+            .iter()
+            .all(|(_, retired, absent, transport)| *retired && *absent && *transport),
+        "disconnect retires the old adoption without blocking a new explicit connection: {observations:?}"
+    );
+}
