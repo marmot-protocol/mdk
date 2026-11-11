@@ -62,20 +62,20 @@ impl DeliveryCursorView {
             Some(identity) => identity,
             None => source_identity(path)?,
         };
-        let modified = modified_ns(&metadata);
+        let change_time = change_time_ns(&metadata);
         let matched = find_journal(state, identity);
         if let Some(journal) = matched.map(|index| &state.journals[index]) {
-            // Without opening the file, only its name and modification time
+            // Without opening the file, only its name and change time
             // show the row still describes it rather than a reused inode.
             let name = path.file_name().and_then(|n| n.to_str());
             if name != Some(journal.segment.as_str())
-                || journal.modified == 0
-                || journal.modified != modified
+                || journal.change_time == 0
+                || journal.change_time != change_time
             {
                 return Ok(SourceDelivery::Undelivered);
             }
         }
-        Ok(classify(state, matched, index, metadata.len(), modified))
+        Ok(classify(state, matched, index, metadata.len(), change_time))
     }
 }
 
@@ -130,7 +130,7 @@ pub(super) fn expire_with(
     let mut source = open_source(path)?;
     let identity = file_identity(&source)?;
     let metadata = source.metadata()?;
-    let (len, modified) = (metadata.len(), modified_ns(&metadata));
+    let (len, change_time) = (metadata.len(), change_time_ns(&metadata));
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -178,7 +178,7 @@ pub(super) fn expire_with(
             matched = None;
         }
     }
-    let status = classify(&state, matched, segment_index, len, modified);
+    let status = classify(&state, matched, segment_index, len, change_time);
     if let Some(original) = before_retirement
         && (status == SourceDelivery::Untracked
             || (status == SourceDelivery::Delivered && len == 0))
@@ -295,7 +295,7 @@ pub(super) fn expire_with(
             .ok_or_else(|| invalid("invalid sealed source"))?
             .to_owned();
         journal.observed_len = len;
-        journal.modified = modified;
+        journal.change_time = change_time;
         journal.fingerprint_len = len.min(FINGERPRINT_BYTES as u64) as u8;
         journal.fingerprint = fingerprint(&mut source, journal.fingerprint_len as usize)?;
         if !delivered {
@@ -377,7 +377,7 @@ fn classify(
     matched: Option<usize>,
     segment_index: Option<u32>,
     len: u64,
-    modified: u64,
+    change_time: u64,
 ) -> SourceDelivery {
     match matched.map(|index| &state.journals[index]) {
         Some(journal) => {
@@ -396,7 +396,7 @@ fn classify(
             .overflow_floor
             .zip(segment_index)
             .is_some_and(|(floor, index)| {
-                index <= floor && modified <= state.overflow_floor_modified
+                index <= floor && change_time <= state.overflow_floor_change_time
             }) =>
         {
             SourceDelivery::Untracked

@@ -3524,7 +3524,7 @@ mod tests {
         worker.state.journals.retain(|j| j.segment == source);
         let shed = seal_segments(&recorder, &active, 2, 2);
         worker.state.overflow_floor = Some(2);
-        worker.state.overflow_floor_modified = modified_ns(&fs::metadata(&shed[0]).unwrap());
+        worker.state.overflow_floor_change_time = change_time_ns(&fs::metadata(&shed[0]).unwrap());
         worker.publish().unwrap();
         let view = DeliveryCursorView::load(&state_dir).unwrap();
         assert_eq!(
