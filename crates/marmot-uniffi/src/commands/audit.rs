@@ -2,9 +2,9 @@
 
 use crate::Marmot;
 use crate::conversions::{
-    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
-    AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi,
-    AuditOtlpConfigV5Ffi,
+    AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi,
+    AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi,
+    AuditLogUploadResultFfi, AuditOtlpConfigV5Ffi,
 };
 use crate::errors::MarmotKitError;
 use marmot_app::audit_otlp_sender::AuditOtlpSender;
@@ -82,6 +82,22 @@ impl Marmot {
         };
         self.runtime.set_audit_otlp_sender(sender)?;
         Ok(config.redacted())
+    }
+
+    /// Per-account v5 OTLP audit delivery status: last success, last typed
+    /// failure (with the receiver's HTTP status when it answered), whether
+    /// automatic delivery is paused, and the last measured backlog. Reads
+    /// local status only; it never dials. Resume a paused account by changing
+    /// the configuration or calling `post_audit_log_tracker_update_v5`.
+    pub fn audit_delivery_status_v5(
+        &self,
+    ) -> Result<Vec<AuditDeliveryStatusV5Ffi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .audit_delivery_status()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     /// Local JSONL audit logs available for explicit forensic upload.

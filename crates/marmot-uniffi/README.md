@@ -1812,6 +1812,23 @@ accounts, and idle accounts separately from legacy v4 uploads. No host should in
 acceptance from an empty v4 `uploaded` list. The v4 whole-file Goggles endpoint never receives
 v5 records.
 
+`audit_delivery_status_v5()` returns one `AuditDeliveryStatusV5Ffi` per account so a host can
+show "audit delivery stalled since X: reason" and offer a retry. It reads local status only and
+never dials. `last_failure.kind` separates local failures (`StateOverLimit`, `TooManyOpenFiles`,
+`LocalIo`, `LocalBlocked`) from receiver verdicts, and `http_status` carries the receiver's
+status when it answered (every receiver kind carries it). `ReceiverBlocked` (`401`, `403`, `404`, any other unexpected status,
+or an invalid success response) pauses automatic delivery for that account (`paused`); the
+pause survives restarts with the same configuration. Changing the destination, endpoint or
+token in `set_audit_otlp_config_v5`, or calling `post_audit_log_tracker_update_v5()`, retries
+it. `ReceiverRejected` (`400`, `413`, `422`) means the receiver refused those rows: delivery
+continues past them and `rejected_batches` counts them. `409`, `429` and `5xx` are
+`ReceiverRetryable` and resend the same range. Only an attempt that delivers lifts a pause; a
+journal still held by an earlier rejection keeps reporting `ReceiverRejected` with its status. `last_success_at_ms` is the last attempt that
+delivered or found nothing left; `consecutive_failures` counts failed attempts since then.
+`backlog` reports undelivered bytes and segments, recorded gaps, and the oldest undelivered
+record's time as measured at `observed_at_ms`; it is not refreshed while the local cursor cannot
+open or delivery is paused.
+
 ## Legacy audit v4 upload
 
 The v4 whole-file route only drains v4 files written before 0.11.0; keep its configuration until

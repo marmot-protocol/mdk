@@ -8,11 +8,13 @@ use tokio::time::{Instant, sleep_until};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::{AuditOtlpAttemptOutcome, send_audit_otlp_once_for_app};
+use super::audit_delivery_status::{audit_delivery_paused, classify_attempt_error};
+use super::{AttemptStatus, AuditOtlpAttemptOutcome, attempt_audit_otlp_once};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
 use crate::audit_log::{AuditOtlpTrackerResult, AuditUploadAttempt};
 use crate::{
-    AppError, AuditLogFile, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp,
+    AppError, AuditDeliveryFailureKind, AuditLogFile, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, MarmotApp,
 };
 use marmot_forensics::local_delivery::DeliveryStep;
 use marmot_observability::AuditOtlpSendResult;
@@ -329,8 +331,15 @@ async fn post_audit_log_tracker_update_with_v5(
     let Some(sender) = sender else {
         return legacy;
     };
-    let v5 = match post_v5_audit_tracker_update(app, sender, configured_sender, lifecycle, schedule)
-        .await
+    let v5 = match post_v5_audit_tracker_update(
+        app,
+        sender,
+        configured_sender,
+        lifecycle,
+        automatic,
+        schedule,
+    )
+    .await
     {
         Ok(result) => result,
         Err(_) => {
@@ -357,11 +366,15 @@ async fn post_audit_log_tracker_update_with_v5(
     Ok(result)
 }
 
+/// Automatic passes skip an account whose delivery is paused after a receiver
+/// block; a manual pass (`automatic == false`) is the host's retry and always
+/// attempts it. Each attempt records its outcome as the account's delivery status.
 async fn post_v5_audit_tracker_update(
     app: &MarmotApp,
     sender: &AuditOtlpSender,
     configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
     lifecycle: &RuntimeLifecycle,
+    automatic: bool,
     schedule: &mut AuditPassSchedule,
 ) -> Result<AuditOtlpTrackerResult, AppError> {
     let mut summary = AuditOtlpTrackerResult::default();
@@ -373,37 +386,61 @@ async fn post_v5_audit_tracker_update(
     // segments is not stranded waiting for another activity trigger.
     const MAX_BATCHES_PER_ACCOUNT_PASS: usize = 256;
     for account in app.account_home().accounts()? {
+        if automatic && audit_delivery_paused(app, &account.label, sender) {
+            summary.blocked_accounts += 1;
+            continue;
+        }
         let mut reached_limit = true;
         for _ in 0..MAX_BATCHES_PER_ACCOUNT_PASS {
-            let outcome = match send_audit_otlp_once_for_app(
+            let report = match attempt_audit_otlp_once(
                 app,
                 lifecycle,
                 &account.label,
                 sender,
                 configured_sender,
+                if automatic {
+                    AttemptStatus::Automatic
+                } else {
+                    AttemptStatus::Manual
+                },
             )
             .await
             {
-                Ok(outcome) => outcome,
-                Err(_) => {
+                Ok(report) => report,
+                Err(error) => {
+                    log_v5_delivery_failure(automatic, classify_attempt_error(&error), None);
                     summary.blocked_accounts += 1;
                     schedule.failed(Duration::ZERO);
                     reached_limit = false;
                     break;
                 }
             };
-            match outcome {
+            if report.paused {
+                summary.blocked_accounts += 1;
+                reached_limit = false;
+                break;
+            }
+            if let Some((kind, http_status)) = report.failure {
+                log_v5_delivery_failure(automatic, kind, http_status);
+            }
+            match report.outcome {
                 AuditOtlpAttemptOutcome::Sent {
                     receiver: AuditOtlpSendResult::Complete,
                     local: Some(DeliveryStep::Accepted),
                 } => summary.accepted_batches += 1,
+                // The receiver's verdict on this batch's content. Once the
+                // journal moves past it with a recorded gap, the drain continues.
+                AuditOtlpAttemptOutcome::Sent {
+                    receiver: AuditOtlpSendResult::Rejected { .. },
+                    local: Some(DeliveryStep::Gap),
+                } => {}
                 AuditOtlpAttemptOutcome::Local(DeliveryStep::Idle) => {
                     summary.idle_accounts += 1;
                     reached_limit = false;
                     break;
                 }
                 AuditOtlpAttemptOutcome::Sent {
-                    receiver: AuditOtlpSendResult::Blocked,
+                    receiver: AuditOtlpSendResult::Blocked { .. },
                     ..
                 }
                 | AuditOtlpAttemptOutcome::Sent {
@@ -434,6 +471,21 @@ async fn post_v5_audit_tracker_update(
         }
     }
     Ok(summary)
+}
+
+fn log_v5_delivery_failure(
+    automatic: bool,
+    kind: AuditDeliveryFailureKind,
+    http_status: Option<u16>,
+) {
+    tracing::warn!(
+        target: "marmot_app::audit_log",
+        method = "post_v5_audit_tracker_update",
+        automatic,
+        failure_kind = kind.as_str(),
+        http_status,
+        "v5 audit delivery attempt failed"
+    );
 }
 
 async fn post_audit_log_tracker_update(

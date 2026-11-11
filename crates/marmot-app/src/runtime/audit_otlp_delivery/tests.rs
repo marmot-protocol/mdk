@@ -137,7 +137,7 @@ async fn request_or_completed<T: std::fmt::Debug>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_recorder_exact_bodies_success_and_partial_block() {
+async fn real_recorder_exact_bodies_success_and_conflict_retry() {
     let f = Fixture::new();
     assert!(
         f.active
@@ -201,16 +201,16 @@ async fn real_recorder_exact_bodies_success_and_partial_block() {
     assert_eq!(
         task.await.unwrap(),
         AuditOtlpAttemptOutcome::Sent {
-            receiver: AuditOtlpSendResult::Partial,
-            local: Some(DeliveryStep::Blocked),
+            receiver: AuditOtlpSendResult::Retryable { http_status: 409 },
+            local: Some(DeliveryStep::Retryable),
         }
     );
     server.await.unwrap();
+    // A 409 may have stored part of the batch: the range stays prepared for
+    // a deduplicated resend instead of blocking the journal.
     assert_eq!(f.cursor()["journals"][0]["acknowledged"], before);
-    assert_eq!(
-        f.cursor()["journals"][0]["blocked"],
-        "partial receiver acceptance"
-    );
+    assert!(f.cursor()["journals"][0]["blocked"].is_null());
+    assert!(f.cursor()["journals"][0]["prepared"].is_object());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -442,7 +442,7 @@ async fn retryable_response_retains_the_prepared_range() {
     assert_eq!(
         task.await.unwrap(),
         AuditOtlpAttemptOutcome::Sent {
-            receiver: AuditOtlpSendResult::Retryable,
+            receiver: AuditOtlpSendResult::Retryable { http_status: 503 },
             local: Some(DeliveryStep::Retryable),
         }
     );

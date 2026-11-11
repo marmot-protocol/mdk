@@ -231,6 +231,7 @@ pub use agent_streams::{
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
 pub use audit_log::{
+    AuditDeliveryBacklog, AuditDeliveryFailure, AuditDeliveryFailureKind, AuditDeliveryStatus,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
     AuditLogUploadResult, AuditOtlpTrackerResult,
 };
