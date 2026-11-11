@@ -2410,6 +2410,15 @@ async fn a_host_advance_never_converges_a_removed_copy_again() {
         "a removed copy drains nothing"
     );
     assert!(!carol.advance_convergence_inputs(&group_id).await.unwrap());
+    // Nor is one scheduled: no advance freezes the pass, so its past cutoff
+    // would keep the host waking the copy for nothing.
+    assert_eq!(
+        carol
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "a removed copy schedules no convergence"
+    );
 
     let group = carol_storage.get_group(&group_id).unwrap();
     assert!(group.removed, "the removal stays realized");

@@ -335,6 +335,16 @@ impl<S: StorageProvider> Engine<S> {
         if self.ensure_group_live(group_id).is_err() {
             return Ok(None);
         }
+        // A host advance never converges a removed or disbanded copy, so a
+        // pass opened here could never freeze and would read as due on every
+        // read: a rival left unresolved when the removal was realized must
+        // not keep the copy scheduled.
+        if self
+            .live_group_record(group_id)
+            .is_ok_and(|group| group.is_terminal())
+        {
+            return Ok(None);
+        }
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let now = self.convergence_now();

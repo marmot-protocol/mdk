@@ -149,7 +149,9 @@ impl Fork {
     }
 
     /// Advance until no convergence input is pending, then a few more rounds
-    /// for the deferred-peel sweeps that read the rival's later traffic.
+    /// for the deferred-peel sweeps that read the rival's later traffic. A
+    /// removed copy never converges again, so a rival it had not resolved
+    /// when its removal applied stays pending; it does not hold this up.
     async fn settle(&mut self, indices: &[usize]) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -157,10 +159,11 @@ impl Fork {
                     self.advance(index).await;
                 }
                 if indices.iter().all(|&index| {
-                    !self.clients[index]
-                        .runtime
-                        .has_pending_convergence_inputs(&self.group)
-                        .unwrap()
+                    self.removed(index)
+                        || !self.clients[index]
+                            .runtime
+                            .has_pending_convergence_inputs(&self.group)
+                            .unwrap()
                 }) {
                     break;
                 }
@@ -318,6 +321,15 @@ async fn admin_leaves_across_a_lost_step_down(
     fork.settle(&[0, 1, 2]).await;
     fork.until_removed(1, &[0, 1, 2]).await;
     assert!(fork.removed(1), "the admin's leave completes");
+    // alice and carol may both commit his SelfRemove; a rival his removal
+    // left unresolved stays pending but schedules no wake.
+    assert_eq!(
+        fork.clients[1]
+            .convergence_schedule_state(&fork.group)
+            .unwrap(),
+        crate::client::ConvergenceScheduleState::Idle,
+        "the removed copy is not kept scheduled"
+    );
     assert!(!fork.admin(0, 1), "the leaver is off the admin list");
     assert!(fork.admin(0, 0));
 }
