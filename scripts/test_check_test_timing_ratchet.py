@@ -115,6 +115,25 @@ class CountWaitsTests(unittest.TestCase):
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         """), {"sleep": 1})
+        # The innermost `use` decides what a bare `sleep` is.
+        self.assertEqual(waits("crates/a/tests/scoped.rs", """            use std::thread::sleep;
+
+            mod paused_tests {
+                use tokio::time::sleep;
+
+                #[tokio::test(start_paused = true)]
+                async fn paused() {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            }
+
+            mod blocking_tests {
+                #[tokio::test(start_paused = true)]
+                async fn blocks() {
+                    sleep(Duration::from_millis(5));
+                }
+            }
+        """), {"sleep": 1})
 
     def test_only_test_code_counts(self):
         production = """\
