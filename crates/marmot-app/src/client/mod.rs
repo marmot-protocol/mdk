@@ -1810,7 +1810,7 @@ impl AppClient {
     }
 
     /// Advance the runner's post-join history collection
-    /// (`recovery_runner/post_join.rs`). While cursors are frozen or
+    /// (`history_recovery/recovery_runner/post_join.rs`). While cursors are frozen or
     /// maintenance is paused it holds nothing and fetches nothing.
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,

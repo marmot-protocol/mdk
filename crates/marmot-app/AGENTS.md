@@ -747,7 +747,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
   live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
   newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
-  `recovery_coverage/live_boundary_tests.rs`. The runner's debt turns age the ledger out of the retention window
+  `history_recovery/recovery_coverage/live_boundary_tests.rs`. The runner's debt turns age the ledger out of the retention window
   (`prune_runner_retention`), passing the current routes and their required relays, so what they still owe below the
   floor is parked as each route's remainder and goals rise to the floor. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
@@ -986,7 +986,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   which imports new loss into the ledger and wakes the runner; a directly owned client then runs one runner pass
   in place. A discarded spill row records loss evidence and the client imports it, as overflow observation does. Nothing re-subscribes to recover history, and only startup, a frozen
   wake or an unactivated client installs live subscriptions. Explicit full-history repair is one request the
-  account's runner serves (`recovery_runner/repair.rs`). It never reports complete: history below the retained
+  account's runner serves (`history_recovery/recovery_runner/repair.rs`). It never reports complete: history below the retained
   window is unsearched (`BelowRetentionWindow` when the window is covered), so never certify explicit history from a
   window. Repair tests live in `src/client/history_recovery/recovery_runner/repair/tests.rs`. See the README for the
   automatic-recovery and send-fairness limits.
@@ -1166,8 +1166,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `src/client/`: `recovery.rs` (native replay ingress and the recovery seams), `history_recovery.rs` (history
   recovery's ledger side under one parent, mdk#2782: `history_recovery/recovery_coverage.rs` (the
   coverage-ledger recorder, mdk#2660), `history_recovery/recovery_runner.rs` (the per-account recovery
-  runner, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
-  a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
+  runner, mdk#2660; `history_recovery/recovery_runner/host.rs` seats it on the worker or
+  a direct client; `history_recovery/recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
   using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion),
   `history_recovery/epoch_stall.rs` (epoch-gap backfill detection) and `history_recovery/history_notices.rs`),
   `invite_recovery.rs` (durable invitation recovery), `delivery_spill.rs` (worker side of the durable delivery spill),
