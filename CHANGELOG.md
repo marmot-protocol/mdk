@@ -38,9 +38,9 @@
   state, instead of leaving it live on that past state for the session and
   validating it as live at the next open (#3272). The group reports the new
   hydration-quarantine reason `RewindRestoreFailed`; a retry or re-join does not
-  clear it, its input is retained, and the next account open restores the live
-  state and replays the input. Opening an account now restores every group's
-  interrupted rewind before ingest or a Welcome join can read it.
+  clear it, its input is retained, and the next account open tries to restore
+  the live state and replays the input. Opening an account now restores every
+  group's interrupted rewind before ingest or a Welcome join can read it.
 - Report each relay the host-safety rule refuses (a private or loopback
   address, a plaintext `ws://` URL, or a URL that does not parse) as never
   contacted (#3276). A commit that every other group relay refused was retried
@@ -63,11 +63,12 @@
   cursor rows matched from metadata; an over-limit cursor sheds the oldest with
   a `CursorOverflow` gap. Version 1 cursors upgrade on load.
 - Stop retrying v5 audit delivery silently forever (#3300). A `400`, `413` or
-  `422` now halves the batch until the rejected record is isolated, records a
-  `ReceiverRejected` gap and moves on; `409` is retried instead of blocking the
-  file for good; `401`, `403`, `404` or another unexpected response pauses
-  automatic delivery until the configuration changes or the host runs a manual
-  tracker update. Each attempt's outcome is persisted and readable.
+  `422` now halves the batch and retries the halves, and only a record the
+  receiver still rejects alone is skipped, with a `ReceiverRejected` gap; `409`
+  is retried instead of blocking the file for good; `401`, `403`, `404` or
+  another unexpected response pauses automatic delivery until the configuration
+  changes or the host runs a manual tracker update. Each attempt's outcome is
+  persisted and readable.
 - Record only the outcome row for a relay replay that ingest ignores as a
   duplicate or own echo (#3300). Each such message wrote about 6 KB of audit
   rows; one replay storm filled 2.4 GB of v5 segments in a week.

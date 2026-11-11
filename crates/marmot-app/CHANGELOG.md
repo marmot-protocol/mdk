@@ -6,12 +6,12 @@
 
 ### Breaking changes
 
-- `AppGroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272), reported by the quarantined-groups read
-  and the `GroupHydrationQuarantined` group event: a read of past group state could not restore the live group.
-  Neither a retry nor a re-join clears it: `retry_hydrate_quarantined_group` returns `false`, `group_recovery_status`
-  omits the group's `rejoin_invitations`, and `confirm_group_rejoin` fails as `UnknownGroup` for them. The next account
-  open restores the live state. A group with two interrupted rewinds, which reported `GroupRecordLoadFailed`, now
-  reports this reason. Exhaustive matches must add it.
+- `AppGroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272), reported by the quarantined-groups read and
+  the `GroupHydrationQuarantined` group event: a read of past group state could not restore the live group. Neither a
+  retry nor a re-join clears it: `retry_hydrate_quarantined_group` returns `false`, `group_recovery_status` omits the
+  group's `rejoin_invitations`, and `confirm_group_rejoin` fails as `UnknownGroup` for them. The next account open tries
+  to restore the live state. A group with two interrupted rewinds, which reported `GroupRecordLoadFailed`, now reports
+  this reason. Exhaustive matches must add it.
 
 - `marmot_app::AppClient` and `MarmotApp::client` are public only under the
   `test-support` feature (mdk#2782). Hosts reach accounts through
@@ -85,16 +85,16 @@
   `GroupCreateIncludesCreator`. The returned id is not a Welcome delivery acknowledgement. `create_group*` and the
   admin roles of existing conversations are unchanged.
 
-- `MarmotAppRuntime::account_relay_liveness(account_ref) -> Vec<RelayLiveness>`,
-  `subscribe_relay_liveness(account_ref) -> RuntimeRelayLivenessSubscription` and
-  `reconnect_relay(account_ref, url) -> RelayLiveness` show each relay configured for an account (default, bootstrap,
-  NIP-65 and inbox relays, canonicalized) with its own pool's state (mdk#329). `RelayLiveness` has `url`, `status`
-  (`RelayLivenessStatus::{Unknown, Connecting, Connected, Offline}`), `last_attempt_unix: Option<u64>` and
-  `last_error: Option<String>`, the SDK's connection-error category. Reads never dial. A relay not yet observed is
+- `MarmotAppRuntime::account_relay_liveness(account_ref) -> Result<Vec<RelayLiveness>, AppError>`,
+  `subscribe_relay_liveness(account_ref) -> Result<RuntimeRelayLivenessSubscription, AppError>` and
+  `reconnect_relay(account_ref, url) -> Result<RelayLiveness, AppError>` show each relay configured for an account
+  (default, bootstrap, NIP-65 and inbox relays, canonicalized) with its own pool's state (mdk#329). `RelayLiveness` has
+  `url`, `status` (`RelayLivenessStatus::{Unknown, Connecting, Connected, Offline}`), `last_attempt_unix: Option<u64>`
+  and `last_error: Option<String>`, the SDK's connection-error category. Reads never dial. A relay not yet observed is
   `Unknown`. The subscription's `snapshot` comes first; `recv()` yields later complete lists, may skip intermediate
   ones, and returns `Ok(None)` after `close()` or runtime shutdown. `close()` does not disconnect relays.
-  `reconnect_relay` dials only a configured relay through the account pool's dial checks, keeping that relay's roles
-  and owners, and fails for any other URL. Aggregate relay health and diagnostics are unchanged.
+  `reconnect_relay` dials only a configured relay through the account pool's dial checks, keeping that relay's roles and
+  owners, and fails for any other URL. Aggregate relay health and diagnostics are unchanged.
 
 - `MarmotAppRuntime::audit_delivery_status()` returns one `AuditDeliveryStatus` per account (mdk#3300): last success,
   `last_failure: Option<AuditDeliveryFailure>` (`AuditDeliveryFailureKind` and the receiver's `http_status`),

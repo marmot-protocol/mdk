@@ -10,9 +10,9 @@
   quarantined-groups read and `GroupEventKindFfi::GroupHydrationQuarantined` (mdk#3272): a read of past group state
   could not restore the live group. Neither a retry nor a re-join clears it: `retry_hydrate_quarantined_group` returns
   `false`, `group_recovery_status` omits the group's `rejoin_invitations`, and `confirm_group_rejoin` fails as
-  `MarmotKitError::UnknownGroup` for them. The next account open restores the live state. A group with two interrupted
-  rewinds, which reported `GROUP_RECORD_LOAD_FAILED`, now reports this reason. Kotlin `when` and Swift `switch`
-  statements that cover every case must add it. Use the matching native library with regenerated bindings.
+  `MarmotKitError::UnknownGroup` for them. The next account open tries to restore the live state. A group with two
+  interrupted rewinds, which reported `GROUP_RECORD_LOAD_FAILED`, now reports this reason. Kotlin `when` and Swift
+  `switch` statements that cover every case must add it. Use the matching native library with regenerated bindings.
 
 - `GroupEventKindFfi::QueuedIntentRefused` adds `artifact: OversizedArtifactFfi?` and `size_class: EventSizeClassFfi?`
   (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's Welcome fits none of its relays'
@@ -79,7 +79,8 @@
 
 - A `decline_group_invite` that timed out with `MarmotKitError::AccountWorkerResponseTimedOut`, or whose task was
   cancelled, no longer leaves the group later if it was still queued (#3031). An accept sent afterwards keeps the
-  group.
+  group. A decline the worker had already started still completes, so after a timeout read the group's state before
+  accepting.
 
 - Wiping or removing a generated identity whose setup was still publishing no longer creates a new, unrequested
   account (whitenoise-ios#1302). `sign_in_account` resumes a generated setup that its sign-out stopped.

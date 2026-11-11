@@ -15,9 +15,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   (mdk#3272), reported by the quarantined-groups read and the `MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_QUARANTINED`
   event body: a read of past group state could not restore the live group. Neither a retry nor a re-join clears it:
   `marmot_retry_hydrate_quarantined_group` reports false, `marmot_group_recovery_status` omits the group's rejoin
-  invitations, and confirming one fails as `MARMOT_STATUS_UNKNOWN_GROUP`. The next account open restores the live state.
-  A group with two interrupted rewinds, which reported `GROUP_RECORD_LOAD_FAILED`, now reports this reason. A `switch`
-  that covers every case must add it. Use the matching generated header and library.
+  invitations, and confirming one fails as `MARMOT_STATUS_UNKNOWN_GROUP`. The next account open tries to restore the
+  live state. A group with two interrupted rewinds, which reported `GROUP_RECORD_LOAD_FAILED`, now reports this reason.
+  A `switch` that covers every case must add it. Use the matching generated header and library.
 
 - `MarmotGroupEventKind`'s `QueuedIntentRefused` body appends `artifact`, `has_size_class` and `size_class`
   (mdk#2334). With `reason` `event_too_large`, a queued send's commit or an invitee's Welcome fits none of its relays'
@@ -75,8 +75,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Fixed
 
-- `marmot_decline_group_invite` that returned `MARMOT_STATUS_ACCOUNT_WORKER_RESPONSE_TIMED_OUT` no longer leaves the
-  group later (#3031).
+- `marmot_decline_group_invite` that returned `MARMOT_STATUS_ACCOUNT_WORKER_RESPONSE_TIMED_OUT` while the decline was
+  still queued no longer leaves the group later (#3031). A decline the worker had already started still completes, so
+  after a timeout read the group's state before accepting.
 
 ## [0.15.0] - 2026-11-09
 

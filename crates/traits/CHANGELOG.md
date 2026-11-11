@@ -8,7 +8,7 @@
 
 - `GroupHydrationQuarantineReason` adds `RewindRestoreFailed` (mdk#3272): a read of past group state rewound the live
   group onto a retained anchor and could not restore it, in this session or when the account opened. Neither a retry
-  nor a re-join clears it, and the next open restores the live state. Exhaustive matches must add it.
+  nor a re-join clears it, and the next open tries to restore the live state. Exhaustive matches must add it.
 - `EngineError::EventTooLarge { artifact, size_class }` refuses a change whose event fits none of the relays its
   publish would reach (mdk#2334): a group create whose founding Welcome fails the `WelcomeSizeCheck`, or a queued
   intent the drain retires. Exhaustive matches add it.

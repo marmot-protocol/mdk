@@ -33,8 +33,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   Welcome fits none of their inbox relays, before anything is created or sent; a create used to succeed and leave the
   Welcome owed. Profile, follow and relay-list commands report `event_too_large` with `artifact` `other` when the event
   fits none of the account's relays.
-- `groups quarantined` can report reason `RewindRestoreFailed` (mdk#3272): a read of past group state could not
-  restore the live group. `groups retry-hydrate` reports `recovered=false` for it, and the next account open restores
+- `groups quarantined` can report reason `RewindRestoreFailed` (mdk#3272): a read of past group state could not restore
+  the live group. `groups retry-hydrate` reports `recovered=false` for it, and the next account open tries to restore
   the live state.
 - `keys publish`, `keys rotate`, `create-identity` and `login` report JSON `event_too_large`, with `artifact` and
   `size_class`, when every relay refused the KeyPackage for size, by its own answer or over a known limit (#2334).
