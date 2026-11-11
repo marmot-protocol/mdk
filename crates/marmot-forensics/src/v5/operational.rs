@@ -449,6 +449,10 @@ fn safe_failure_category(input: &str) -> String {
         "event exceeds the endpoint's known limit" => {
             "publish_attempt_failed_before_exposure".to_owned()
         }
+        // A relay the host-safety rule refused is never contacted (mdk#3276).
+        "relay endpoint refused by the host-safety rule" => {
+            "publish_attempt_failed_before_exposure".to_owned()
+        }
         // Fixed Nostr adapter failure phrases. The SDK's free-form relay
         // suffix is never preserved; only typed protocol-prefix outcomes and
         // these locally authored phrases have an audit category.
@@ -960,6 +964,10 @@ mod tests {
             (
                 "relay rejected event (auth-required)",
                 "relay_rejected_auth_required",
+            ),
+            (
+                "relay endpoint refused by the host-safety rule",
+                "publish_attempt_failed_before_exposure",
             ),
         ] {
             let mut event = json!({
