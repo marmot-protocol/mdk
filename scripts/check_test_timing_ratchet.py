@@ -54,7 +54,7 @@ TIMEOUT = re.compile(
     r"(from_secs|from_millis|from_micros|from_nanos|from_secs_f32|from_secs_f64)\s*\(\s*"
     # The literal may carry a type suffix and a trailing comma, and must be
     # the whole first argument (`Duration::from_secs(1) * 30` is not short).
-    r"([0-9][0-9_]*(?:\.[0-9_]*)?)(?:_?(?:[ui](?:8|16|32|64|128|size)|f32|f64))?\s*,?\s*\)\s*,")
+    r"([0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?)(?:_?(?:[ui](?:8|16|32|64|128|size)|f32|f64))?\s*,?\s*\)\s*,")
 NANOS = {"from_secs": 10**9, "from_secs_f32": 10**9, "from_secs_f64": 10**9,
          "from_millis": 10**6, "from_micros": 10**3, "from_nanos": 1}
 TEST_PATH = re.compile(r"(?:^|/)(?:tests|test_support)/|(?:^|/)(?:tests|test_support|[\w]+_tests)\.rs$")
@@ -67,6 +67,9 @@ MAYBE_TEST_ATTR = re.compile(r"#\s*\[\s*(?:test\b|tokio\s*::\s*test|cfg\s*\([^\]
 # What follows a test attribute: more attributes, then a `mod` (inline or
 # declared) or anything else.
 ITEM_AFTER_ATTR = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])")
+# Or an `impl` or `trait` block, whose methods are all test code.
+BLOCK_AFTER_ATTR = re.compile(
+    r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|trait)\b[^;{}]*\{")
 MOD_PREFIX = r"(?P<attrs>(?:#\s*\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>\w+)\s*"
 MOD_DECL = re.compile(r"(?<![\w])" + MOD_PREFIX + ";")
 INLINE_MOD = re.compile(r"\bmod\s+(\w+)\s*\{")
@@ -83,9 +86,12 @@ LITERAL_OR_COMMENT = re.compile(
     r"|b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|[^\n])|[^\\'\n])'")
 NOT_NEWLINE = re.compile(r"[^\n]")
 BRACE = re.compile(r"[{}]")
-PAUSE_CALL = re.compile(r"\btime\s*::\s*pause\s*\(\s*\)")
-RESUME_CALL = re.compile(r"\btime\s*::\s*resume\s*\(\s*\)")
+# `time::pause()`, or a bare `pause()` imported from `tokio::time`.
+PAUSE_CALL = re.compile(r"(?:\btime\s*::\s*|(?<![\w.:]))pause\s*\(\s*\)")
+RESUME_CALL = re.compile(r"(?:\btime\s*::\s*|(?<![\w.:]))resume\s*\(\s*\)")
 THREAD_PATH = re.compile(r"\bthread\s*::\s*$")
+PATH_BEFORE = re.compile(r"::\s*$")
+THREAD_SLEEP_IMPORT = re.compile(r"\buse\s+std\s*::\s*thread\s*::\s*(?:sleep\b|\{[^}]*\bsleep\b)")
 
 
 @functools.lru_cache(maxsize=None)
@@ -201,6 +207,10 @@ def test_items(code: str, pairs: dict[int, int]) -> tuple[list[tuple[int, int]],
     """Ranges of test functions and inline test modules, and offsets of test-only `mod x;`."""
     ranges, declarations = [], []
     for start, end in test_attributes(code):
+        block = BLOCK_AFTER_ATTR.match(code, end)
+        if block:
+            ranges.append((start, pairs[block.end() - 1]))
+            continue
         module = ITEM_AFTER_ATTR.match(code, end)
         if module:
             if module.group(2) == "{":
@@ -247,11 +257,17 @@ def count_waits(path: str, source: str, test_only: bool = False) -> dict[str, in
     def within(offset: int, ranges: list[tuple[int, int]]) -> bool:
         return any(start <= offset < end for start, end in ranges)
 
-    # Paused Tokio time stops Tokio's waits only; `thread::sleep` still blocks.
+    imports_thread_sleep = THREAD_SLEEP_IMPORT.search(code) is not None
+
+    def blocks(offset: int) -> bool:
+        """Paused Tokio time stops Tokio's waits only; `thread::sleep` still blocks."""
+        before = code[max(0, offset - 32):offset]
+        return THREAD_PATH.search(before) is not None or (
+            imports_thread_sleep and PATH_BEFORE.search(before) is None)
+
     counts = {"sleep": sum(1 for match in SLEEP.finditer(code)
                            if within(match.start(), inside) and not is_definition(code, match.start())
-                           and (not within(match.start(), paused)
-                                or THREAD_PATH.search(code, max(0, match.start() - 32), match.start()))),
+                           and (not within(match.start(), paused) or blocks(match.start()))),
               "short_timeout": sum(1 for match in TIMEOUT.finditer(code)
                                    if within(match.start(), inside) and not within(match.start(), paused)
                                    and is_short(match.group(1), match.group(2)))}
