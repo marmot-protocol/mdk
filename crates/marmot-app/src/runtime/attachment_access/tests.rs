@@ -672,7 +672,13 @@ async fn a_finished_but_uncollected_handoff_is_discarded() {
     let control = std::sync::Arc::new(crate::MediaFileTransferControl::default());
     let mut opening =
         Box::pin(runtime.open_attachment_handoff("alice", &group, target(), control.clone()));
-    assert!(futures::poll!(&mut opening).is_pending());
+    {
+        // The first poll starts the copy; holding the registry keeps the copy
+        // from finishing before that poll returns, however late it returns.
+        let _registry = crate::media::handoff::hold_lease_registry();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(std::future::Future::poll(opening.as_mut(), &mut cx).is_pending());
+    }
     let handoffs = crate::media::handoff::handoff_directory(&app, "alice");
     // The copy completes on the blocking pool while nobody polls the call.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
