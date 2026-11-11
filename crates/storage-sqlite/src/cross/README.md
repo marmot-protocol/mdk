@@ -11,7 +11,7 @@ the list only shrinks.
 | --- | --- | --- |
 | `routes.rs` | Deleting a route's recovery inventory and NIP-77 reconciliation state when the engine deletes the route or the group | `protocol/storage/transport_routes.rs`, `protocol/storage/groups.rs` |
 | `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
-| `handles.rs` | Constructing the app handle and installing connection-local notification invalidation triggers on app tables, shared with protocol mutations | `protocol/handle.rs` (`from_opened`), callers of `app_storage()` |
+| `handles.rs` | Constructing the app handle, sharing file-keyed notification revisions, and installing TEMP triggers on app tables for app and protocol mutations | `protocol/handle.rs` (`from_opened`), callers of `app_storage()` |
 | `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, un-covering their seconds in the coverage ledger, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
 | `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer; the observer's type, its slot on the account handle and its setter, which `marmot-session` calls on the engine's storage | `protocol/storage/outbound.rs` |
 | `device_group_moves.rs` | Exact authenticated Welcome consumption records Joined; selected Made cuts trust with capture, old-debt retirement and bootstrap | protocol Welcome admission; finite session move owner |

@@ -85,11 +85,12 @@ surviving clones return `StorageError::Closed`.
 
 `SqliteAppStorage::notification_policy_snapshot(label, account_id_hex)` returns committed notification settings with
 their matching `notification_revision()`. It initializes missing defaults and rejects caller-owned transactions.
-The revision is a SQL-free, process-local counter shared by the opened account's protocol and app handles. TEMP
-triggers advance it for projected-group, notification-policy, and chat-mute writes, including protocol forget;
-rolled-back writes may also advance it. Unchanged policy upserts and mute timestamps do not invalidate it.
-Pair it with `connection_serial()` when caching across opens. It is not persisted and does not track writes from
-other connections or processes.
+The revision is SQL-free and process-local. File-backed account handles opened by this crate share it by canonical
+database path, including separate app and engine connections; in-memory handles have private revisions. TEMP
+triggers advance it for projected-group, notification-policy, and chat-mute writes, including protocol forget.
+Rollbacks may also advance it; repeating an unchanged policy or mute value does not. The snapshot captures its
+revision while holding SQLite's write lock, before commit. Pair it with `connection_serial()` when caching across
+opens. It is not persisted; writes through unwrapped connections or other processes are not observed.
 
 The shared store is unencrypted and owner-only, with WAL, `synchronous=NORMAL`, a 5-second busy timeout, foreign keys
 ON, `trusted_schema=OFF`, `temp_store=MEMORY`, and terminal close. See the

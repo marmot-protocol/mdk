@@ -6,9 +6,9 @@
 
 - Reuse notification settings, chat mutes, group records, and directory users
   across live subscription events (#1800). Track settings, mute, and group
-  changes at the shared storage boundary, including local forgets. Honor timed
-  mute expiry and skip non-notifying kinds before storage reads or blocking-task
-  dispatch.
+  changes at the shared storage boundary, including engine-side forgets across
+  connections. Honor timed mute expiry and skip non-notifying kinds before
+  storage reads or blocking-task dispatch.
 
 ## 0.15.0 - 2026-11-09
 

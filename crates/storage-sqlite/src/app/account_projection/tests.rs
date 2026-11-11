@@ -2301,6 +2301,51 @@ fn app_messages_kinds_filter_restricts_to_listed_kinds() {
 }
 
 #[test]
+fn notice_shared_file_revision() {
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::raw([0x18; 32]);
+    let other = SqliteAccountStorage::open_encrypted(root.path().join("other.sqlite"), &key)
+        .unwrap()
+        .app_storage();
+    other.notification_policy_snapshot("other", "bb").unwrap();
+    let other_revision = other.notification_revision();
+    for name in [
+        OsString::from("account.sqlite"),
+        #[cfg(unix)]
+        OsString::from_vec(b"account-\xff.sqlite".to_vec()),
+    ] {
+        let cached = SqliteAccountStorage::open_encrypted(root.path().join(&name), &key).unwrap();
+        let app = cached.app_storage();
+        app.notification_policy_snapshot("alice", "aa").unwrap();
+        let revision = app.notification_revision();
+        let engine =
+            SqliteAccountStorage::open_encrypted(root.path().join(".").join(&name), &key).unwrap();
+        engine
+            .app_storage()
+            .set_local_notifications_enabled("alice", "aa", false)
+            .unwrap();
+        let (settings, changed) = app.notification_policy_snapshot("alice", "aa").unwrap();
+        assert!(!settings.local_notifications_enabled);
+        assert!(changed > revision);
+        assert_eq!(other.notification_revision(), other_revision);
+    }
+    let memory = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    memory.notification_policy_snapshot("memory", "cc").unwrap();
+    let memory_revision = memory.notification_revision();
+    SqliteAccountStorage::in_memory()
+        .unwrap()
+        .app_storage()
+        .set_local_notifications_enabled("separate", "dd", false)
+        .unwrap();
+    assert_eq!(memory.notification_revision(), memory_revision);
+    assert_eq!(other.notification_revision(), other_revision);
+}
+
+#[test]
 fn notice_snapshot_initializes() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();

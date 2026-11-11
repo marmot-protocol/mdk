@@ -1,15 +1,64 @@
 //! The one place that turns the account handle into the app handle.
 
 use crate::{SqliteAccountStorage, SqliteAppStorage, SqliteResultExt};
-use cgka_traits::storage::StorageResult;
+use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, functions::FunctionFlags};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
 };
 
-pub(crate) fn notification_counter(conn: &Connection) -> StorageResult<Arc<AtomicU64>> {
+static NOTIFICATION_REVISIONS: LazyLock<Mutex<HashMap<PathBuf, Weak<AtomicU64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn database_revision(conn: &Connection) -> StorageResult<Arc<AtomicU64>> {
+    let path = match conn.path() {
+        Some(path) => Cow::Borrowed(Path::new(path)),
+        None => {
+            // path() rejects non-UTF-8 Unix filenames; SQLite retains their bytes.
+            let filename: Vec<u8> = conn
+                .query_row(
+                    "SELECT CAST(file AS BLOB) FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(filename))
+            };
+            #[cfg(not(unix))]
+            let path = PathBuf::from(
+                String::from_utf8(filename)
+                    .map_err(|_| StorageError::Backend("invalid database filename".into()))?,
+            );
+            Cow::Owned(path)
+        }
+    };
+    if path.as_os_str().is_empty() {
+        return Ok(Arc::new(AtomicU64::new(0)));
+    }
+    let path = path.canonicalize().map_err(|error| {
+        StorageError::Backend(format!("notification database identity: {error}"))
+    })?;
+    let mut revisions = NOTIFICATION_REVISIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    revisions.retain(|_, revision| revision.strong_count() > 0);
+    if let Some(revision) = revisions.get(&path).and_then(Weak::upgrade) {
+        return Ok(revision);
+    }
     let revision = Arc::new(AtomicU64::new(0));
+    revisions.insert(path, Arc::downgrade(&revision));
+    Ok(revision)
+}
+
+pub(crate) fn notification_counter(conn: &Connection) -> StorageResult<Arc<AtomicU64>> {
+    let revision = database_revision(conn)?;
     let counter = revision.clone();
     conn.create_scalar_function(
         "marmot_notification_changed",

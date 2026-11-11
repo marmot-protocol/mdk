@@ -2086,7 +2086,7 @@ impl SqliteAppStorage {
         read_notice_settings(&conn, account_label)
     }
 
-    /// Read committed settings and their matching connection-local revision.
+    /// Read committed settings and their matching database revision.
     /// Initializes defaults when missing. Caller-owned transactions are rejected
     /// so uncommitted settings cannot enter a notification cache.
     pub fn notification_policy_snapshot(
@@ -2105,8 +2105,10 @@ impl SqliteAppStorage {
             .storage()?;
         ensure_notice_settings(&tx, account_label, account_id_hex)?;
         let settings = read_notice_settings(&tx, account_label)?;
+        // COMMIT lets other connections write, so capture the revision first.
+        let revision = self.notification_revision();
         tx.commit().storage()?;
-        Ok((settings, self.notification_revision()))
+        Ok((settings, revision))
     }
 
     pub fn set_local_notifications_enabled(

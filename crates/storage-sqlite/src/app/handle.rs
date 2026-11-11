@@ -19,7 +19,8 @@ pub struct SqliteAppStorage {
 
 impl SqliteAppStorage {
     /// SQL-free, process-local invalidation token for notification policy and
-    /// projected groups on this connection. Rollbacks may also advance it.
+    /// projected groups. File-backed handles share it by canonical database
+    /// path; in-memory handles are independent. Rollbacks may also advance it.
     /// Pair it with [`Self::connection_serial`] when caching across opens.
     pub fn notification_revision(&self) -> u64 {
         self.notification_revision.load(Ordering::Acquire)

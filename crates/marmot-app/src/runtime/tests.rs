@@ -403,43 +403,66 @@ mod live_notifications {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_deleted_group_is_silent() {
-        for forget in [false, true] {
-            let (_root, app, account, group) = fixture();
-            let barrier = app.account_home().create_account("barrier").unwrap();
-            let mut state = app.load_state("barrier").unwrap();
-            state.groups = app.groups("alice").unwrap();
-            app.save_state(&state).unwrap();
-            let runtime = app.runtime();
-            let mut subscription = runtime.subscribe_notifications().unwrap();
-            runtime.events.send(message(&account, &group, 1)).unwrap();
-            assert_eq!(
-                next(&mut subscription).await.group_name.as_deref(),
-                Some("Before")
-            );
+        let (_root, app, account, group) = fixture();
+        let barrier = app.account_home().create_account("barrier").unwrap();
+        let mut state = app.load_state("barrier").unwrap();
+        state.groups = app.groups("alice").unwrap();
+        app.save_state(&state).unwrap();
+        let runtime = app.runtime();
+        let mut subscription = runtime.subscribe_notifications().unwrap();
+        runtime.events.send(message(&account, &group, 1)).unwrap();
+        assert_eq!(
+            next(&mut subscription).await.group_name.as_deref(),
+            Some("Before")
+        );
 
-            let changed = if forget {
-                cgka_traits::storage::GroupStorage::forget_group_local(
-                    &app.account_storage("alice").unwrap(),
-                    &group,
-                    cgka_traits::Timestamp(100),
-                )
+        assert!(
+            app.delete_group_local_data("alice", &hex::encode(group.as_slice()))
                 .unwrap()
-            } else {
-                app.delete_group_local_data("alice", &hex::encode(group.as_slice()))
-                    .unwrap()
-            };
-            assert!(changed, "forget={forget}");
-            // No GroupStateUpdated has reached this subscription.
-            runtime.events.send(message(&account, &group, 2)).unwrap();
-            runtime.events.send(message(&barrier, &group, 3)).unwrap();
-            let update = next(&mut subscription).await;
-            assert_eq!(
-                update.account_id_hex, barrier.account_id_hex,
-                "forget={forget}"
-            );
-            assert_eq!(update.message_id_hex, Some(format!("{:064x}", 3)));
-            runtime.shutdown().await;
-        }
+        );
+        // No GroupStateUpdated has reached this subscription.
+        runtime.events.send(message(&account, &group, 2)).unwrap();
+        runtime.events.send(message(&barrier, &group, 3)).unwrap();
+        let update = next(&mut subscription).await;
+        assert_eq!(update.account_id_hex, barrier.account_id_hex);
+        assert_eq!(update.message_id_hex, Some(format!("{:064x}", 3)));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_tracks_engine_forget() {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let account = app.account_home().create_account("alice").unwrap();
+        let runtime = app.runtime();
+        runtime.reconcile_accounts().await.unwrap();
+        let group = runtime
+            .create_group("alice", "Before", &[], None)
+            .await
+            .unwrap();
+        let mut resolver = crate::notifications::NotificationResolver::default();
+        let warm = crate::notifications::notification_update_from_event_cached(
+            &app,
+            &mut resolver,
+            &message(&account, &group, 1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(warm.group_name.as_deref(), Some("Before"));
+
+        assert!(runtime.forget_group_local("alice", &group).await.unwrap());
+        // The queued-message resolver has not consumed GroupStateUpdated.
+        assert_eq!(
+            crate::notifications::notification_update_from_event_cached(
+                &app,
+                &mut resolver,
+                &message(&account, &group, 2),
+            )
+            .unwrap(),
+            None
+        );
+        runtime.shutdown().await;
     }
 }
 
