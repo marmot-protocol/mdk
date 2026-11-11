@@ -39,6 +39,16 @@ pub enum AccountError {
 }
 
 impl AccountError {
+    /// The privacy-safe kind a KeyPackage maintenance failure is logged as:
+    /// `event_too_large` when every relay refused the KeyPackage for size
+    /// (mdk#2334), and `otherwise` for anything else.
+    pub(crate) fn key_package_failure_kind(&self, otherwise: &'static str) -> &'static str {
+        match self {
+            Self::KeyPackage(error) if error.event_size_class.is_some() => "event_too_large",
+            _ => otherwise,
+        }
+    }
+
     /// The engine error inside this one, whether the runtime met it directly
     /// or through the session.
     #[must_use]
@@ -48,5 +58,28 @@ impl AccountError {
             Self::Session(error) => Some(error.as_engine_error()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KeyPackage maintenance logs a KeyPackage every relay refused for size
+    /// as `event_too_large`, and any other failure under its own kind
+    /// (mdk#2334).
+    #[test]
+    fn key_package_maintenance_logs_a_size_refusal_as_too_large() {
+        let refused = KeyPackagePublishError::exposed("refused")
+            .with_event_size_class(Some(cgka_traits::EventSizeClass::Under64Kib));
+        let failed = KeyPackagePublishError::exposed("failed");
+        assert_eq!(
+            AccountError::from(refused).key_package_failure_kind("key_package_retry"),
+            "event_too_large"
+        );
+        assert_eq!(
+            AccountError::from(failed).key_package_failure_kind("key_package_retry"),
+            "key_package_retry"
+        );
     }
 }

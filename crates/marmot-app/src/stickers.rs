@@ -516,7 +516,7 @@ impl MarmotApp {
             .storage
             .enqueue_sticker_install_operation(coordinate, true, unix_now_seconds())?;
         if let Some(event) = event {
-            tolerate_offline(publish_outboxed_event(self, &context, &event).await)?;
+            tolerate_unpublished(publish_outboxed_event(self, &context, &event).await)?;
         }
         app_pack_for_context(&context, coordinate)
     }
@@ -544,7 +544,7 @@ impl MarmotApp {
             unix_now_seconds(),
         )?;
         if let Some(event) = event {
-            tolerate_offline(publish_outboxed_event(self, &context, &event).await)?;
+            tolerate_unpublished(publish_outboxed_event(self, &context, &event).await)?;
         }
         Ok(())
     }
@@ -719,7 +719,7 @@ async fn rebase_and_flush_sticker_outbox_best_effort(
 ) -> Result<bool, AppError> {
     match refresh_installed_base(app, context).await {
         Ok(()) => {
-            tolerate_offline(flush_sticker_outbox(app, context).await)?;
+            tolerate_unpublished(flush_sticker_outbox(app, context).await)?;
             Ok(true)
         }
         Err(AppError::StickerRelay(_)) => Ok(false),
@@ -973,7 +973,11 @@ async fn publish_account_event(
         .relay_client_for_account_id(&context.account_id_hex, signer.as_nostr_signer())
         .publish_event_for_account(&account_id, &context.endpoints, &transport_event, 1)
         .await
-        .map_err(|_| AppError::StickerRelay("sticker publication failed".into()))?;
+        .map_err(|error| {
+            AppError::account_publish_failure(&error, || {
+                AppError::StickerRelay("sticker publication failed".into())
+            })
+        })?;
     if outcome.accepted.is_empty() {
         return Err(AppError::StickerRelay(
             "no account relay acknowledged the sticker publication".into(),
@@ -1077,6 +1081,16 @@ fn tolerate_offline(result: Result<(), AppError>) -> Result<(), AppError> {
     match result {
         Ok(()) | Err(AppError::StickerRelay(_)) => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// A publication the account's relays did not take, offline or too large for
+/// every relay (mdk#2334), stays owed: its operation and outbox entry remain,
+/// and the next sync publishes it again and reports a size refusal.
+fn tolerate_unpublished(result: Result<(), AppError>) -> Result<(), AppError> {
+    match result {
+        Err(AppError::EventTooLarge { .. }) => Ok(()),
+        result => tolerate_offline(result),
     }
 }
 

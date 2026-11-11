@@ -366,14 +366,32 @@ async fn only_the_writer_writes_and_at_most_daily() {
 /// A backup counts only once a relay accepts its pointer. Until then its
 /// run stays in the ledger, nothing is condemned, and the pass counts as
 /// failed; the next pass publishes the same backup again, uploading
-/// nothing.
+/// nothing. A pointer every relay refuses for size is retried the same way,
+/// and the pass logs it as a size refusal (mdk#2334).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_backup_whose_pointer_no_relay_accepts_goes_out_again() {
+    for too_large in [false, true] {
+        a_refused_pointer_goes_out_again(too_large).await;
+    }
+}
+
+async fn a_refused_pointer_goes_out_again(too_large: bool) {
     let blossom = local_blossom();
     let (devices, _chat, words) = lone_writer(&blossom).await;
     let mut phone = devices.phone;
-    devices.relay.fail_publishes_of_kind(KIND_BACKUP_POINTER);
-    phone.drive_backup_pass().await;
+    if too_large {
+        devices
+            .relay
+            .reject_publishes_of_kind_as_too_large(KIND_BACKUP_POINTER);
+    } else {
+        devices.relay.fail_publishes_of_kind(KIND_BACKUP_POINTER);
+    }
+    let logged = if too_large {
+        "event_too_large"
+    } else {
+        "device_group_refused"
+    };
+    assert_eq!(phone.drive_backup_pass().await, Some(logged));
     let ledger = storage(&devices.phone_app);
     let runs = ledger.backup_runs().unwrap();
     assert_eq!(runs.len(), 1);
@@ -386,7 +404,7 @@ async fn a_backup_whose_pointer_no_relay_accepts_goes_out_again() {
 
     devices.relay.allow_all_publish_kinds();
     due_now(&phone);
-    phone.drive_backup_pass().await;
+    assert_eq!(phone.drive_backup_pass().await, None);
     assert_eq!(
         ids(&pointer(&devices.relay, &words.public)),
         vec![hex::encode(runs[0].backup_id)]

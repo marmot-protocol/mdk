@@ -40,11 +40,16 @@
   anything is created or sent. A send queued behind an unsettled group whose commit or Welcome fits none of its
   relays when the group settles is dropped unsent, not retried, and announced as `QueuedIntentRefused` with reason
   `event_too_large`, the artifact and its size class. Every other event an account publishes (profile, follow and relay lists, KeyPackages, the block list,
-  stickers, the backup pointer) goes only to the relays it fits, and nowhere when it fits none; the profile,
-  follow-list and relay-list publishes then fail as `EventTooLarge { artifact: Other }`. A relay with no known limit
-  is sent to as before.
+  stickers, the backup pointer) goes only to the relays it fits, and nowhere when it fits none. The profile,
+  follow-list, relay-list, KeyPackage, block-list and sticker-sync calls then fail as `EventTooLarge { artifact: Other }`,
+  and so they do when every relay refuses the event for size itself: a KeyPackage publish no longer fails as an
+  `Account` error, `block_user` and `unblock_user` as `BlockListUnavailable`, or `sync_sticker_packs` as
+  `StickerRelay`. A block edit retried after an uncertain attempt stays `BlockPublicationUncertain`, and a sticker
+  install or uninstall still succeeds, its list owed to the next sync. The background backup pass and KeyPackage
+  maintenance log such a refusal as `event_too_large`. A relay with no known limit is sent to as before.
   `MarmotDeployment::white_noise()` sets 2 MiB on White Noise's two relays; `neutral()` sets none. Struct literals add
-  the field.
+  the field, and those of `marmot_session::KeyPackagePublishError`, which is not `#[non_exhaustive]`, add
+  `event_size_class`; exhaustive patterns add it too.
 
 ### Added
 
