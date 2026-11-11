@@ -90,6 +90,13 @@ class ParseReportTests(unittest.TestCase):
         _, outcomes = parse_report(report(cancelled, aborted))
         self.assertEqual(list(outcomes), ["wn-cli::cli\tcrash"])
 
+    def test_a_failure_whose_retry_was_cancelled_counts_as_failed(self):
+        retry = attempt("rerunFailure", "slow", "src/lib.rs:3:5", "boom")
+        case = f'slow|<failure message="process aborted with signal 15 (SIGTERM)" type="test abort"/>{retry}'
+        _, outcomes = parse_report(report(case))
+        outcome = outcomes["wn-cli::cli\tslow"]
+        self.assertEqual((outcome.flaky, outcome.failed), (0, 1))
+
     def test_malformed_reports_are_rejected(self):
         for data in [b"<testsuites><testcase name='x'>", b"<html/>",
                      b'<!DOCTYPE x [<!ENTITY a "a">]><testsuites/>',
@@ -221,7 +228,8 @@ class LeaderboardTests(unittest.TestCase):
         broken, flaky = data["tests"]
         self.assertEqual((broken["test"], broken["failed_attempts"], broken["runs_seen"]), ("broken", 2, 1))
         self.assertEqual((flaky["test"], flaky["flaky_attempts"], flaky["runs_seen"]), ("flaky", 2, 2))
-        self.assertEqual(flaky["stress"], "just flake-stress wn-cli 'binary_id(wn-cli::cli) & test(=flaky)'")
+        self.assertEqual(flaky["stress"], "just flake-stress wn-cli 'binary_id(wn-cli::cli) & test(=flaky)' "
+                                          "40 --features test-policy-overrides")
         self.assertEqual(data["runs"]["malformed_reports"], 1)
         self.assertEqual(data["runs"]["in_progress"], 1)
         self.assertIn("| 2 | `flaky` | `wn-cli::cli` | 2 | 0 | 2 |", markdown)

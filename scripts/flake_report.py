@@ -54,6 +54,14 @@ RETRY_DELAYS = (2.0, 10.0)
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_MESSAGE_CHARS = 240
 MAX_SAMPLES = 5
+# The features ci.yml builds these packages' tests with; without them some
+# tests do not exist or behave differently.
+STRESS_FEATURES = {
+    "cgka-engine": "test-policy-overrides,test-crash-hooks",
+    "marmot-app": "test-policy-overrides",
+    "marmot-session": "test-policy-overrides",
+    "wn-cli": "test-policy-overrides",
+}
 
 
 class MalformedReport(ValueError):
@@ -121,13 +129,13 @@ def parse_report(data: bytes) -> tuple[list[str], dict[str, Outcome]]:
         # integration test with the same joined path apart.
         test = f"{classname}\t{name}"
         seen.append(test)
-        attempts = [child for child in case
-                    if child.tag in HARD_FAILURES | RETRY_FAILURES | FLAKY_FAILURES
-                    and not CANCELLED.search(child.get("message") or "")]
+        failures = [child for child in case if child.tag in HARD_FAILURES | RETRY_FAILURES | FLAKY_FAILURES]
+        attempts = [child for child in failures if not CANCELLED.search(child.get("message") or "")]
         if not attempts:
             continue
         outcome = outcomes.setdefault(test, Outcome(classname or "", name))
-        hard = any(child.tag in HARD_FAILURES for child in attempts)
+        # A retry cut off by cancellation never passed either.
+        hard = any(child.tag in HARD_FAILURES for child in failures)
         for child in attempts:
             if hard:
                 outcome.failed += 1
@@ -436,8 +444,10 @@ def leaderboard(summaries: list[dict]) -> list[dict]:
         row["failing_runs"] = sorted(set(row["failing_runs"]))
         # nextest names a unit-test binary after its package and an
         # integration binary `<package>::<target>`, as the JUnit classname does.
+        features = STRESS_FEATURES.get(row["package"])
         row["stress"] = (f"just flake-stress {row['package']} "
-                         f"'binary_id({row['binary_id']}) & test(={row['test']})'")
+                         f"'binary_id({row['binary_id']}) & test(={row['test']})'"
+                         + (f" 40 --features {features}" if features else ""))
     return sorted(rows.values(), key=lambda row: (
         -(row["flaky_attempts"] + row["failed_attempts"]), -row["failed_attempts"],
         row["binary_id"], row["test"]))

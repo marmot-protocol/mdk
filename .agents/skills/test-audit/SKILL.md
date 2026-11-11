@@ -193,8 +193,9 @@ attempts per test across the last week of merge-queue runs, including the
 ones CI's retry hid. Find the root cause; a fix awaits the state the test
 needs and never raises a timeout, adds a retry or loosens an assertion.
 
-Prove the fix with `just flake-stress <package> '<filter>'`, which runs the
-filter 40 times with no retries: it must show 0 failed iterations. When the
+Prove the fix with the `just flake-stress` line the leaderboard prints for
+the test. It runs the filter 40 times with no retries, with the features CI
+builds that package's tests with, and must show 0 failed iterations. When the
 flake reproduces locally, give the failed and total iterations before and
 after the fix in the PR; when it does not, say so. Iterations run one at a
 time, so to add contention widen the filter to the test's binary and raise
