@@ -160,7 +160,12 @@ pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// the durable store without bound. At the cap, new undecryptable input is
 /// dropped unpersisted (transport redelivery is the recovery path once the
 /// backlog drains).
-pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 2048;
+///
+/// Sized for a full-history recovery of a long-lived group: everything from
+/// epochs this device no longer holds keys for lands here, and a group whose
+/// epoch does not move frees no row until residence ends (E2, E8), so a cap
+/// below that history refuses all of the group's later undecryptable input.
+pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 8192;
 
 /// Maximum encoded `PeelDeferred` payload bytes retained for one group.
 ///
@@ -169,7 +174,7 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 2048;
 /// exact encoded [`StoredMessagePayload`] bytes written to `MessageRecord`, so
 /// transport framing overhead is included and every storage backend applies
 /// the same policy.
-pub const MAX_PEEL_DEFERRED_BYTES_PER_GROUP: usize = 16 * 1024 * 1024;
+pub const MAX_PEEL_DEFERRED_BYTES_PER_GROUP: usize = 64 * 1024 * 1024;
 
 /// Maximum encoded `PeelDeferred` payload bytes retained across one
 /// account-device database.
@@ -177,8 +182,9 @@ pub const MAX_PEEL_DEFERRED_BYTES_PER_GROUP: usize = 16 * 1024 * 1024;
 /// The per-group byte budget prevents one routing id from consuming the
 /// account, while this wider budget prevents the same flood from being spread
 /// across many known groups. One engine owns one account-device database, so
-/// this is the natural aggregate resource boundary.
-pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 64 * 1024 * 1024;
+/// this is the natural aggregate resource boundary. Kept at four groups' worth,
+/// so one group at its own cap never refuses every other group's input.
+pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 256 * 1024 * 1024;
 
 /// Per-group cap on retained outbound intents (mdk#1246). Unlike the
 /// deferred-peel cap above, these rows are not peer-mintable — every one
