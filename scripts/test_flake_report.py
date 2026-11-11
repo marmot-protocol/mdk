@@ -305,6 +305,13 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual(sorted(second.downloads), [1, 2])
         self.assertEqual(data["tests"][0]["test"], "flaky")
 
+    def test_a_rerun_attempt_that_fails_to_fetch_is_left_out(self):
+        self.main(FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY)))]}))
+        second = FakeGitHub([run(1, 1, attempt=2)], {1: [(2, "ci-runner-cli-e2e-0-2", GhError("HTTP 500"))]})
+        _, markdown, data = self.main(second)
+        self.assertEqual((data["tests"], data["runs"]["cached"]), ([], 0))
+        self.assertIn("could not be fetched and are left out", markdown)
+
     def test_another_job_selection_does_not_reuse_cached_summaries(self):
         artifacts = {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY))),
                          (2, "ci-runner-relay-runtime-0-1", artifact_zip(report(PASS)))]}

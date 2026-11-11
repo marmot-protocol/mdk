@@ -359,6 +359,8 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
     if args.prune:
         cache.prune(since)
     collection = Collection([])
+    # A run whose newer attempt was not fetched is left out, not reported from its older attempt.
+    missing: set[int] = set()
     if github is not None:
         try:
             if github.core_remaining() < args.reserve:
@@ -398,10 +400,12 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
                     summary = future.result()
                 except RateLimited:
                     collection.unfetched += 1
+                    missing.add(futures[future]["id"])
                     continue
                 except GhError as error:
                     print(f"flake_report: {error}", file=sys.stderr)
                     failed += 1
+                    missing.add(futures[future]["id"])
                     continue
                 cache.store(summary)
                 collection.fetched += 1
@@ -414,7 +418,7 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
             collection.notes.append(f"{failed} runs could not be fetched and are left out; "
                                     "a rerun tries them again.")
     collection.summaries = [summary for summary in cache.all()
-                            if parse_time(summary["created_at"]) >= since]
+                            if parse_time(summary["created_at"]) >= since and summary["run_id"] not in missing]
     return collection
 
 
