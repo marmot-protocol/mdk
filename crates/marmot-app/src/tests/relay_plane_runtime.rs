@@ -754,19 +754,6 @@ async fn liveness_manual_lifetime() {
     .await
     .expect("the managed account activates its receive socket");
 
-    runtime
-        .reconnect_relay(&account.label, &receive_url)
-        .await
-        .unwrap();
-    assert!(
-        runtime
-            .account_relay_liveness(&account.label)
-            .await
-            .unwrap()
-            .iter()
-            .all(|row| row.url != "relay.example.com")
-    );
-
     // An existing pool socket outside the configured union is not a retry target.
     sdk.client().add_relay(&unconfigured_url).await.unwrap();
     sdk.reconnect_relay(&TransportEndpoint(unconfigured_url.clone()))
@@ -779,12 +766,13 @@ async fn liveness_manual_lifetime() {
         .unwrap()
         .unwrap();
     let attempts = outside.stats().attempts();
-    assert!(
+    assert!(matches!(
         runtime
             .reconnect_relay(&account.label, &unconfigured_url)
-            .await
-            .is_err()
-    );
+            .await,
+        Err(crate::AppError::Transport(TransportAdapterError::Subscription(message)))
+            if message == "relay is not configured for this account"
+    ));
     assert_eq!(outside.stats().attempts(), attempts);
 
     lists.nip65.created_at += 1;
@@ -797,6 +785,14 @@ async fn liveness_manual_lifetime() {
         .reconnect_relay(&account.label, &manual_url)
         .await
         .unwrap();
+    assert!(
+        runtime
+            .account_relay_liveness(&account.label)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.url != "relay.example.com")
+    );
     let socket = sdk.client().relay(&manual_url).await.unwrap().unwrap();
     assert!(!socket.capabilities().can_read());
     assert!(!socket.capabilities().can_write());

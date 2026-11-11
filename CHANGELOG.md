@@ -11,6 +11,9 @@
   changes at the shared storage boundary, including engine-side forgets across
   connections. Honor timed mute expiry and skip non-notifying kinds before
   storage reads or blocking-task dispatch.
+- Remove a redundant connected-relay restart from the manual relay lifetime test
+  that timed out in the merge queue (#3287). Connected-relay reconnect coverage
+  remains in the socket-watch and SDK tests.
 
 ## 0.15.0 - 2026-11-09
 
