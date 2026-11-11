@@ -5793,6 +5793,8 @@ Once Native adoption is admitted, caller cancellation only stops waiting; runtim
 
 Adoption retains its admission generation through binding and network waits. A later explicit reconnect cannot resume adoption retired by disconnect.
 
+Rollback does not reset newer-generation transport state or cancel its pending requests.
+
 Before commit, a failed Native handoff restores the previous local callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup and restore prior activation on failure. Already-published KeyPackages are not retracted. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account. Account sign-out cleanup remains explicit; legacy host login behavior is unchanged.
 
 [Source](src/nip46.rs#L264) · [Session lifecycle](README.md#nip-46-accounts)

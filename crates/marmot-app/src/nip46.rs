@@ -251,6 +251,7 @@ enum BindingCleanup<'a> {
     Rollback {
         previous: &'a Nip46SessionWrite,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+        generation: u64,
     },
 }
 
@@ -700,8 +701,13 @@ impl Nip46Session {
         &self,
         previous: &Nip46SessionWrite,
         signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+        generation: u64,
     ) -> Result<()> {
-        self.clear_binding(BindingCleanup::Rollback { previous, signer })
+        self.clear_binding(BindingCleanup::Rollback {
+            previous,
+            signer,
+            generation,
+        })
     }
     fn clear_binding(&self, cleanup: BindingCleanup<'_>) -> Result<()> {
         let account_id = {
@@ -756,32 +762,39 @@ impl Nip46Session {
             data.keys = None;
             data.secret = None;
         }
-        data.verified = false;
         let registration = data.registration.as_ref().and_then(Weak::upgrade);
         if removal.is_ok() {
             data.account = None;
             data.registration = None;
         }
-        data.status.generation = data.status.generation.wrapping_add(1);
-        data.status.state = match &cleanup {
-            BindingCleanup::Revoke => Nip46State::LoggedOut,
-            BindingCleanup::Rollback { .. }
-                if matches!(
-                    data.status.state,
-                    Nip46State::Cancelled | Nip46State::LoggedOut
-                ) =>
-            {
-                data.status.state
-            }
-            BindingCleanup::Rollback { .. } => Nip46State::Disconnected,
+        // Retired bindings still undo storage, but no longer own a newer transport.
+        let owns_control = match &cleanup {
+            BindingCleanup::Revoke => true,
+            BindingCleanup::Rollback { generation, .. } => data.status.generation == *generation,
         };
-        data.status.auth_url = None;
-        data.status.request_id = None;
-        data.status.last_error = removal.as_ref().err().cloned();
-        for sender in data.pending.values() {
-            sender.send_replace(true);
+        if owns_control {
+            data.verified = false;
+            data.status.generation = data.status.generation.wrapping_add(1);
+            data.status.state = match &cleanup {
+                BindingCleanup::Revoke => Nip46State::LoggedOut,
+                BindingCleanup::Rollback { .. }
+                    if matches!(
+                        data.status.state,
+                        Nip46State::Cancelled | Nip46State::LoggedOut
+                    ) =>
+                {
+                    data.status.state
+                }
+                BindingCleanup::Rollback { .. } => Nip46State::Disconnected,
+            };
+            data.status.auth_url = None;
+            data.status.request_id = None;
+            data.status.last_error = removal.as_ref().err().cloned();
+            for sender in data.pending.values() {
+                sender.send_replace(true);
+            }
+            self.core.control.send_replace(data.status.generation);
         }
-        self.core.control.send_replace(data.status.generation);
         drop(data);
         if let (Some(id), Some(sessions)) = (account_id.as_ref(), sessions.as_mut())
             && current

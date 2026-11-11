@@ -566,6 +566,7 @@ and discard abandoned pairing UI; call adoption explicitly only after verificati
 succeeds. Account signout does not cancel unrelated unbound sessions. Use explicit session cancellation, disconnect, or logout
 to interrupt; client shutdown interrupts and settles owned adoption before returning.
 An explicit reconnect cannot resume adoption retired by an earlier disconnect.
+Rollback does not reset newer-generation transport state or cancel its pending requests.
 This does not permit freeing a handle during an active C call.
 
 `marmot_nip46_ping` checks the remote signer; `marmot_nip46_disconnect` interrupts

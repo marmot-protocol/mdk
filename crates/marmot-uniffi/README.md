@@ -546,6 +546,7 @@ UI; call adoption explicitly only after verification succeeds. Account sign-out 
 not cancel unrelated unbound sessions.
 Use session `cancel`, `disconnect`, or `logout` to interrupt adoption explicitly.
 An explicit reconnect cannot resume adoption retired by an earlier disconnect.
+Rollback does not reset newer-generation transport state or cancel its pending requests.
 Shutdown interrupts and settles owned adoption before returning.
 
 Failed completed-account Native rebinds restore the prior local callback, grant

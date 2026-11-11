@@ -173,7 +173,11 @@ impl MarmotAppRuntime {
             let cleanup = blocking_app_task(move || {
                 binding
                     .session
-                    .unbind_account(&binding.previous, binding.previous_signer)
+                    .unbind_account(
+                        &binding.previous,
+                        binding.previous_signer,
+                        binding.generation,
+                    )
                     .map_err(AppError::from)
             })
             .await;
@@ -419,6 +423,7 @@ impl AccountManager {
         }
         Ok(Some(Nip46Binding {
             session,
+            generation,
             previous,
             previous_signer,
         }))

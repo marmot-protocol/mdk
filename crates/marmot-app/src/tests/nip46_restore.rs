@@ -213,6 +213,8 @@ struct LoginPeer {
     hold_kp: Arc<std::sync::atomic::AtomicBool>,
     kp_seen: Arc<tokio::sync::Notify>,
     kp_release: Arc<tokio::sync::Notify>,
+    hold_public_key: Arc<std::sync::atomic::AtomicBool>,
+    public_key_release: Arc<tokio::sync::Notify>,
     signed_profiles: Arc<std::sync::Mutex<Vec<::nostr::prelude::EventId>>>,
 }
 
@@ -240,6 +242,8 @@ impl LoginPeer {
         let hold_kp = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kp_seen = Arc::new(tokio::sync::Notify::new());
         let kp_release = Arc::new(tokio::sync::Notify::new());
+        let hold_public_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let public_key_release = Arc::new(tokio::sync::Notify::new());
         let signed_profiles = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task = {
             let client = client.clone();
@@ -250,6 +254,8 @@ impl LoginPeer {
             let hold_kp = hold_kp.clone();
             let kp_seen = kp_seen.clone();
             let kp_release = kp_release.clone();
+            let hold_public_key = hold_public_key.clone();
+            let public_key_release = public_key_release.clone();
             let signed_profiles = signed_profiles.clone();
             tokio::spawn(async move {
                 let mut seen = std::collections::HashSet::new();
@@ -267,7 +273,12 @@ impl LoginPeer {
                     let result = match request["method"].as_str().unwrap() {
                         "connect" | "logout" => serde_json::json!("ack"),
                         "ping" => serde_json::json!("pong"),
-                        "get_public_key" => serde_json::json!(user.public_key().to_hex()),
+                        "get_public_key" => {
+                            if hold_public_key.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                public_key_release.notified().await;
+                            }
+                            serde_json::json!(user.public_key().to_hex())
+                        }
                         "switch_relays" => serde_json::json!(serde_json::json!([url]).to_string()),
                         "sign_event" => {
                             let unsigned: serde_json::Value =
@@ -357,6 +368,8 @@ impl LoginPeer {
             hold_kp,
             kp_seen,
             kp_release,
+            hold_public_key,
+            public_key_release,
             signed_profiles,
         }
     }
@@ -377,6 +390,7 @@ impl LoginPeer {
 
     async fn close(mut self) {
         self.kp_release.notify_one();
+        self.public_key_release.notify_one();
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
@@ -389,6 +403,7 @@ impl LoginPeer {
 impl Drop for LoginPeer {
     fn drop(&mut self) {
         self.kp_release.notify_one();
+        self.public_key_release.notify_one();
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -1441,6 +1456,7 @@ async fn nip46_disconnect_during_bind() {
     enum AfterDisconnect {
         StayDisconnected,
         Reconnect,
+        ReconnectBeforeRollback,
     }
 
     let peer = LoginPeer::new().await;
@@ -1448,6 +1464,12 @@ async fn nip46_disconnect_during_bind() {
     let mut observations = [
         (AfterDisconnect::StayDisconnected, false, false, false),
         (AfterDisconnect::Reconnect, false, false, false),
+        (
+            AfterDisconnect::ReconnectBeforeRollback,
+            false,
+            false,
+            false,
+        ),
     ];
     for (mode, retired, absent, transport) in &mut observations {
         let dir = tempfile::tempdir().unwrap();
@@ -1491,7 +1513,12 @@ async fn nip46_disconnect_during_bind() {
         tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
             .await
             .unwrap();
-        let disconnected = {
+        let after_disconnect = *mode;
+        if matches!(after_disconnect, AfterDisconnect::ReconnectBeforeRollback) {
+            peer.hold_public_key
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let (disconnected, early_reconnect) = {
             let store = store.clone();
             let session = session.clone();
             tokio::spawn(async move {
@@ -1521,10 +1548,22 @@ async fn nip46_disconnect_during_bind() {
                 session.disconnect();
                 write_release.join().unwrap();
                 let state = session.status().state;
+                let reconnect =
+                    if matches!(after_disconnect, AfterDisconnect::ReconnectBeforeRollback) {
+                        let next = session.clone();
+                        let mut reconnect = Box::pin(async move { next.connect_async().await });
+                        assert!(
+                            futures::poll!(reconnect.as_mut()).is_pending(),
+                            "admit reconnect before the interrupted adoption can resume"
+                        );
+                        Some(reconnect)
+                    } else {
+                        None
+                    };
                 *release.0.lock().unwrap() = true;
                 release.1.notify_one();
                 parked.await.unwrap();
-                state
+                (state, reconnect)
             })
             .await
             .unwrap()
@@ -1549,13 +1588,28 @@ async fn nip46_disconnect_during_bind() {
                 .unwrap()
                 .unwrap(),
         };
+        let reconnected = match early_reconnect {
+            Some(reconnect) => {
+                peer.public_key_release.notify_one();
+                Some(
+                    tokio::time::timeout(Duration::from_secs(10), reconnect)
+                        .await
+                        .unwrap(),
+                )
+            }
+            None => None,
+        };
         *retired = matches!(result, Err(AppError::Nip46(Nip46Error::Disconnected)));
         *absent = matches!(home.account(&id), Err(AccountHomeError::UnknownAccount(_)));
-        *transport = session.status().state
-            == match mode {
-                AfterDisconnect::StayDisconnected => Nip46State::Disconnected,
-                AfterDisconnect::Reconnect => Nip46State::Ready,
-            };
+        let state = session.status().state;
+        *transport = match mode {
+            AfterDisconnect::StayDisconnected => state == Nip46State::Disconnected,
+            AfterDisconnect::Reconnect => state == Nip46State::Ready,
+            AfterDisconnect::ReconnectBeforeRollback => {
+                state == Nip46State::Ready
+                    && matches!(reconnected, Some(Ok(ref user)) if user == &id)
+            }
+        };
         runtime.shutdown_and_close().await.unwrap();
     }
     peer.close().await;

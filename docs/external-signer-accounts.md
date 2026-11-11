@@ -105,6 +105,9 @@ interrupts adoption's network waits; local binding and persistence settle before
 the owned work ends. Adoption keeps the session generation captured at admission
 through gate waits, binding, and network work. A disconnect between phases still
 retires it; a later explicit reconnect cannot resume that older adoption.
+Rollback still removes or restores its credential record and restores the prior
+callback. It does not reset transport state or cancel requests belonging to a
+newer generation.
 Shutdown interrupts and settles owned adoption before it
 closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
 adoption for that account. Explicit reactivation waits for adoption to settle,

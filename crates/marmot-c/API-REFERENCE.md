@@ -3384,6 +3384,8 @@ Admitted Native adoption is runtime-owned: loss of the waiter does not cancel it
 
 Adoption retains its admission generation through binding and network waits. A later explicit reconnect cannot resume adoption retired by disconnect.
 
+Rollback does not reset newer-generation transport state or cancel its pending requests.
+
 Completed accounts rebind without opening initial setup. Failed Native adoption restores prior local callbacks, records, and activation while preserving setup readiness. Already-published KeyPackages are not retracted. Account sign-out cleanup remains explicit; legacy host login is unchanged.
 
 [Header contract](include/marmot.h#L13079)
