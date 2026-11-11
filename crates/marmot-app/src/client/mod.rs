@@ -86,12 +86,11 @@ pub(crate) mod device_inactivity;
 pub(crate) mod device_pairing;
 mod device_removal;
 mod device_renames;
-pub(crate) mod epoch_stall;
 mod history_delivery;
 pub(crate) mod history_imports;
 pub(crate) use backup_writer::BackupPassOutcome;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
-pub(crate) mod history_notices;
+pub(crate) mod history_recovery;
 mod invitation_decisions;
 use invitation_decisions::AccountLeaveReason;
 mod invite_recovery;
@@ -101,8 +100,6 @@ mod projection;
 mod push;
 mod receipts;
 pub(crate) mod recovery;
-mod recovery_coverage;
-pub(crate) mod recovery_runner;
 mod retention;
 pub(crate) mod sibling_chat_gaps;
 pub(crate) mod sign_ins;
@@ -112,12 +109,12 @@ mod sync;
 #[cfg(test)]
 pub(crate) mod upload_cleanup_tests;
 
-use epoch_stall::EpochStallDetector;
+use history_recovery::epoch_stall::EpochStallDetector;
+pub(crate) use history_recovery::recovery_coverage::LiveCoverage;
 pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
-pub(crate) use recovery_coverage::LiveCoverage;
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
@@ -757,7 +754,7 @@ pub struct AppClient {
     /// A directly owned client's in-place recovery runner (mdk#2660 phase 4).
     /// A worker account's runner is the worker's own task, so its client's
     /// seat stays empty.
-    pub(crate) recovery_runner: recovery_runner::host::RunnerSeat,
+    pub(crate) recovery_runner: history_recovery::recovery_runner::host::RunnerSeat,
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<PerformanceRecorder>,
     pub(crate) send_telemetry: Option<PerformanceRecorder>,
@@ -810,7 +807,8 @@ pub struct AppClient {
     /// The parked recovery set as last announced to hosts ("history may be
     /// incomplete"): one small entry per parked occurrence, compared at each
     /// publication seam so a change raises `HistoryNoticesChanged`.
-    pub(crate) history_notice_baseline: Option<history_notices::HistoryNoticeBaseline>,
+    pub(crate) history_notice_baseline:
+        Option<history_recovery::history_notices::HistoryNoticeBaseline>,
     /// The recovery runner's survey changed what is catching up since hosts
     /// last heard; the worker's account-level seam drains it into one
     /// `RecoveryStatusChanged` (mdk#2660 phase 4). Only a runner sets it.
@@ -936,7 +934,7 @@ pub struct AppClient {
     pub(super) pending_native_sync_summary: crate::SyncSummary,
     pub(super) native_sync_deliveries: u64,
     /// The coverage ledger's live-boundary recorder state (mdk#2660).
-    pub(crate) live_coverage: tokio::sync::Mutex<recovery_coverage::LiveCoverage>,
+    pub(crate) live_coverage: tokio::sync::Mutex<history_recovery::recovery_coverage::LiveCoverage>,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
@@ -1108,7 +1106,8 @@ pub struct AppClient {
     /// retry re-armed the pass and before any attempt could park it again.
     #[cfg(test)]
     pub(crate) fail_next_convergence_retry_advance: bool,
-    pub(crate) runner_post_join: HashMap<GroupId, recovery_runner::post_join::Collection>,
+    pub(crate) runner_post_join:
+        HashMap<GroupId, history_recovery::recovery_runner::post_join::Collection>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always

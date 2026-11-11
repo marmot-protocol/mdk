@@ -18211,7 +18211,7 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     client.apply_backfill_decision(
         &group_id,
         7,
-        crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 3 },
+        crate::client::history_recovery::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 3 },
         marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
     );
     // ...and a later fallible step in that same pass errors, so the summary the
@@ -19570,7 +19570,7 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
             cgka_traits::EpochId(10),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
         client.epoch_stall.observe_resource_refusal(
@@ -19578,7 +19578,7 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
             cgka_traits::EpochId(11),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
     // Convergence then resolves a fork this device was on the wrong side of.
@@ -19597,7 +19597,7 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
             cgka_traits::EpochId(12),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm,
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "a group whose fork convergence just adjudicated is alive; the arms it took to get there are not evidence that a replay is failing to recover it"
     );
 }
@@ -19632,7 +19632,7 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
             cgka_traits::EpochId(10),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
     // Maintenance then confirms a recovered evolution, 10 -> 11.
@@ -19657,7 +19657,7 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
             cgka_traits::EpochId(12),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
         client.epoch_stall.observe_resource_refusal(
@@ -19665,7 +19665,7 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
             cgka_traits::EpochId(13),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm,
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "the maintenance passage must have ended the run, so this is only its second arm"
     );
 }
@@ -19703,7 +19703,7 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
             cgka_traits::EpochId(10),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
     // The device then commits and the publish confirms, 10 -> 11.
@@ -19726,7 +19726,7 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
             cgka_traits::EpochId(12),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
         client.epoch_stall.observe_resource_refusal(
@@ -19734,7 +19734,7 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
             cgka_traits::EpochId(13),
             epoch_stall_test_now_ms()
         ),
-        crate::client::epoch_stall::BackfillDecision::Arm,
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "the confirm must have been observed, so this is only the new run's second arm"
     );
 }
@@ -19762,7 +19762,7 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
     client.apply_backfill_decision(
         &group_id,
         9,
-        crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 4 },
+        crate::client::history_recovery::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 4 },
         marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
     );
 
@@ -24867,7 +24867,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     storage.put_group(&record).unwrap();
 
     let before_the_welcome = welcome_at - 4 * 60 * 60;
-    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+    for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
             .ingest_received_delivery(
                 route.probe(before_the_welcome + probe as u64, &format!("gap-{probe}")),
@@ -24882,7 +24882,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
 
     // The same device, the same group, the same undecryptable outcome — only
     // the envelope time differs — still arms.
-    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+    for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
             .ingest_received_delivery(
                 route.probe(welcome_at + probe as u64, &format!("live-{probe}")),

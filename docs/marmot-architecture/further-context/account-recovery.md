@@ -871,7 +871,7 @@ leave staging in one transaction.
 
 ### 9. The recovery runner
 
-`client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
+`client/history_recovery/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
 fetches over the ledger and the retry state above, for every account. The old owner's grant,
 native capture, comparison job and the `runner_owns_debt` gate that chose between them are
 deleted (5c2a846b4 is the last commit with the old owner). Before any

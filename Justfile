@@ -463,7 +463,7 @@ focused-convergence-regressions:
     cargo nextest run -p cgka-engine --test record_write_atomicity --locked -E 'test(=leave_persistence_failure_rolls_back_every_transactional_write)'
     # #1365's armed epoch gap: arming durable epoch-gap debt wakes the recovery runner with no later traffic. The
     # old owner's tick test went with the old owner (#2660 phase 4).
-    cargo nextest run -p marmot-app --lib --locked -E 'test(=client::recovery_runner::host::tests::new_epoch_gap_reopens_covered_history_once_and_atomically)'
+    cargo nextest run -p marmot-app --lib --locked -E 'test(=client::history_recovery::recovery_runner::host::tests::new_epoch_gap_reopens_covered_history_once_and_atomically)'
     cargo nextest run -p cgka-engine --test fork_detection --locked -E 'test(=stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork)'
 
 # Capability-level entry points used by the scheduled workflows. PR checks

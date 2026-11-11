@@ -192,14 +192,14 @@ pub(crate) struct DebtTurn<'a> {
 impl DebtTurn<'_> {
     /// The last second `relay` owes `route` this turn: the second before its
     /// live tail, and never past a retained route's goal.
-    pub(super) fn owed_until(&self, route: &RunnerRoute, relay: &str) -> u64 {
+    pub(in crate::client) fn owed_until(&self, route: &RunnerRoute, relay: &str) -> u64 {
         self.checked_until(route)
             .min(self.tails.owed_until(&route.route, relay, self.now))
     }
 
     /// The last second a re-check of `route` passes over: now, or a retained
     /// route's goal end.
-    pub(super) fn checked_until(&self, route: &RunnerRoute) -> u64 {
+    pub(in crate::client) fn checked_until(&self, route: &RunnerRoute) -> u64 {
         route
             .goal_until
             .map_or(self.now, |until| until.min(self.now))

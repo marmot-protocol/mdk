@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_traits::GroupId;
 use storage_sqlite::{RecoveryDemandTicket, SqliteAppStorage, TransportReconciliationRoute};
 
-use super::AppClient;
+use crate::client::AppClient;
 use crate::history_notices::{
     decode_notice_id, encode_notice_id, history_notice, ledger_route_tag, rejoin_group_tag,
 };
@@ -309,7 +309,7 @@ impl AppClient {
         if !app.retire_parked_recovery_obligation(
             ticket.id,
             ticket.revision,
-            super::recovery::wall_now_ms()?,
+            crate::client::recovery::wall_now_ms()?,
         )? {
             tracing::debug!(
                 target: "marmot_app::recovery",
@@ -321,7 +321,7 @@ impl AppClient {
         self.wake_recovery_runner();
         self.record_need_changed(
             group.map(GroupId::new).as_ref(),
-            super::audit_recovery::obligation_cause(cause),
+            crate::client::audit_recovery::obligation_cause(cause),
             marmot_forensics::RecoveryNeedChange::NoticeDismissed,
             ticket,
             None,
@@ -438,7 +438,7 @@ impl AppClient {
             Ok((parked, ledger, rejoins)) => parked
                 .into_iter()
                 .map(|parked| {
-                    let cause = super::audit_recovery::obligation_cause(parked.cause);
+                    let cause = crate::client::audit_recovery::obligation_cause(parked.cause);
                     (parked.ticket, parked.group_id, cause)
                 })
                 .chain(ledger.into_iter().map(|notice| {

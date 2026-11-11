@@ -22,9 +22,9 @@ use transport_nostr_adapter::{
     ReplaySourceGeneration,
 };
 
-use super::AppClient;
 use super::recovery_runner::{LiveCount, LiveFence};
 use crate::AppError;
+use crate::client::AppClient;
 use crate::notifications::unix_now_seconds;
 
 const TARGET: &str = "marmot_app::recovery_coverage";
@@ -706,7 +706,7 @@ impl AppClient {
             let confirmed = match group {
                 Some(group) => {
                     let group = cgka_traits::GroupId::new(group.clone());
-                    super::group_is_terminal(&self.runtime, &group)
+                    crate::client::group_is_terminal(&self.runtime, &group)
                         || routing
                             .group_routes
                             .iter()

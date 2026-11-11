@@ -1431,7 +1431,9 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_own_tai
 /// connection the tails lapse and their seconds are owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_never_charges_an_idle_connected_account_for_its_real_tail() {
-    use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture, relay, routes};
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::{
+        Fixture, fixture, relay, routes,
+    };
     let before = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1487,7 +1489,9 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_real_ta
 /// an event restored by the relay need not be delivered again on the open REQ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_explicit_repair_revisits_a_healthy_live_tail() {
-    use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture, relay, routes};
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::{
+        Fixture, fixture, relay, routes,
+    };
     let Fixture {
         _dir,
         client,

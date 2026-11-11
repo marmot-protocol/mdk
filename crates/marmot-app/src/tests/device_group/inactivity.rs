@@ -448,7 +448,7 @@ async fn a_device_stuck_behind_a_missed_commit_is_offered_the_reset() {
         .expect("the missed Commit opened an epoch gap")
         .ticket
         .id;
-    crate::client::history_notices::park_recovery_for_test(&storage, gap);
+    crate::client::history_recovery::history_notices::park_recovery_for_test(&storage, gap);
 
     let snapshot = devices
         .laptop

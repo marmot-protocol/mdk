@@ -2145,7 +2145,7 @@ impl MarmotApp {
         {
             ms
         } else {
-            crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
+            crate::client::history_recovery::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
         let recovery_owner = client::recovery::AccountRecoveryOwner::open();
@@ -2295,7 +2295,7 @@ impl MarmotApp {
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
-            epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
+            epoch_stall: crate::client::history_recovery::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             pending_recovery_arm_writes: HashMap::new(),
             released_backfill_reload_pending: true,
@@ -8391,7 +8391,7 @@ struct SharedAppRouting {
     /// What the account's recovery runner last found catching up; `None`
     /// until one has surveyed.
     recovery_runner_catching_up: tokio::sync::watch::Sender<
-        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
     >,
 }
 
@@ -8524,7 +8524,7 @@ impl AppTransportRouting {
     fn recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Sender<
-        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
     > {
         self.inner.recovery_runner_catching_up.clone()
     }
@@ -8533,7 +8533,8 @@ impl AppTransportRouting {
     /// until one has surveyed.
     fn recovery_runner_catching_up_now(
         &self,
-    ) -> Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>> {
+    ) -> Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>
+    {
         self.inner.recovery_runner_catching_up.borrow().clone()
     }
 
@@ -8542,7 +8543,7 @@ impl AppTransportRouting {
     fn subscribe_recovery_runner_catching_up(
         &self,
     ) -> tokio::sync::watch::Receiver<
-        Option<std::collections::BTreeSet<client::recovery_runner::UnitKey>>,
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
     > {
         self.inner.recovery_runner_catching_up.subscribe()
     }

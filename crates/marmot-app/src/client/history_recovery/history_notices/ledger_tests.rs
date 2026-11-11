@@ -15,7 +15,7 @@ use storage_sqlite::{
     TransportReconciliationRoute,
 };
 
-use crate::client::recovery_runner::{RecoveryRunnerPolicy, UnitKey};
+use crate::client::history_recovery::recovery_runner::{RecoveryRunnerPolicy, UnitKey};
 use crate::history_notices::{decode_notice_id, encode_notice_id, ledger_route_tag};
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
 use crate::{AccountRecoveryStatus, AppClient, HistoryNoticeCause, MarmotApp};
@@ -626,7 +626,7 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
         .deactivate_account_context(client.adapter.account_id())
         .await
         .unwrap();
-    crate::client::recovery_coverage::scenario_tests::fault_connection(&client)
+    crate::client::history_recovery::recovery_coverage::scenario_tests::fault_connection(&client)
         .execute(
             "UPDATE account_recovery_conversion SET step = 0 WHERE singleton = 1",
             [],

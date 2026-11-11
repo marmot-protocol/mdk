@@ -60,7 +60,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
-  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `backup_writer.rs` (the backup pass: the pointer fetch, the archive upload, retention, condemned-blob deletes and takeover), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_notices.rs` ("history may be incomplete"
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `backup_writer.rs` (the backup pass: the pointer fetch, the archive upload, retention, condemned-blob deletes and takeover), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_recovery/history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -707,7 +707,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs`.
-- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660). It records at owner seams only:
+- Keep the coverage-ledger recorder in `src/client/history_recovery/recovery_coverage.rs` (mdk#2660). It records at owner seams only:
   account open (`record_open_coverage_goals`), the runner's routing-change settlement, loss imports
   (`synchronize_recovery_loss`; storage un-covers the ledger inside the import transaction, and inside each receipt
   release) and native synchronization (`synchronize_native_replay`). Conversion and new loss imports are
@@ -756,7 +756,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
   un-cover or drop debt by itself. The one exception is a rejoin (a replacement install, mdk#2660 row 11): it decides
   the retirement, and the copy's standing floor only bounds it (`settle_recovery_rejoins`). It logs aggregate counts only.
-- Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
+- Keep the recovery runner in `src/client/history_recovery/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It owns every history
   fetch for every account; there is no other owner and no switch back. `prepare_runner_ownership` converts and
   imports loss and enables live fences before any subscription activates. A
@@ -988,7 +988,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   wake or an unactivated client installs live subscriptions. Explicit full-history repair is one request the
   account's runner serves (`recovery_runner/repair.rs`). It never reports complete: history below the retained
   window is unsearched (`BelowRetentionWindow` when the window is covered), so never certify explicit history from a
-  window. Repair tests live in `src/client/recovery_runner/repair/tests.rs`. See the README for the
+  window. Repair tests live in `src/client/history_recovery/recovery_runner/repair/tests.rs`. See the README for the
   automatic-recovery and send-fairness limits.
 - A dismissed "history may be incomplete" notice is the one user-authorized ending for parked recovery debt
   besides qualified completion, and never counts as coverage or a recovery success. A ledger notice retires its
@@ -1049,7 +1049,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
   first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
 - Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626). The runner's
-  post-join collection (`src/client/recovery_runner/post_join.rs`, advanced by
+  post-join collection (`src/client/history_recovery/recovery_runner/post_join.rs`, advanced by
   `advance_post_join_maintenance_subscriptions`) keeps a copy's collection while its fetch is owed, whatever phase
   commits moved the obligation to. It ends the fetch as `Fetched` only once the coverage ledger covers the copy's
   whole requested range on its required relays, nothing of the route is staged and every source is placed; the
@@ -1163,12 +1163,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
-- `src/client/`: `recovery.rs` (native replay ingress and the recovery seams), `recovery_coverage.rs` (the
-  coverage-ledger recorder, mdk#2660), `recovery_runner.rs` (the per-account recovery
+- `src/client/`: `recovery.rs` (native replay ingress and the recovery seams), `history_recovery.rs` (history
+  recovery's ledger side under one parent, mdk#2782: `history_recovery/recovery_coverage.rs` (the
+  coverage-ledger recorder, mdk#2660), `history_recovery/recovery_runner.rs` (the per-account recovery
   runner, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
   a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
-  using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion), `invite_recovery.rs` (durable invitation recovery),
-  `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
+  using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion),
+  `history_recovery/epoch_stall.rs` (epoch-gap backfill detection) and `history_recovery/history_notices.rs`),
+  `invite_recovery.rs` (durable invitation recovery), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
   admission).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as
