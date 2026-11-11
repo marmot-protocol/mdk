@@ -516,7 +516,16 @@ async fn demoted_disband_request_fails_durably_and_is_acknowledged_once() {
     assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
     alice.ingest(demotion).await.unwrap();
     clock.advance_ms(1_000);
-    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    // Drive the quantum at the clock's explicit time: the host entry point's
+    // wall-clock slice can expire on a loaded runner before convergence
+    // settles, returning before disband preparation records the failure.
+    assert!(
+        alice
+            .converge_and_drain_queued_outbound_intents(&gid, 2_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let failed = alice.disband_request(&gid).unwrap().unwrap();
     assert_eq!(
         failed.status,
