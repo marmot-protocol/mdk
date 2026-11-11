@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fetch independent directory queries concurrently, so KeyPackage and deletion
+  reads overlap their relay waits while retaining separate event limits (#1813).
 - Reuse notification settings, chat mutes, group records, and directory users
   across live subscription events (#1800). Track settings, mute, and group
   changes at the shared storage boundary, including engine-side forgets across

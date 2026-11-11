@@ -21,6 +21,7 @@ use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
+const DIRECTORY_QUERY_CONCURRENCY: usize = 4;
 
 /// The most filters one strict directory REQ carries. strfry allows 3 per
 /// REQ and refuses more with `CLOSED invalid:`, so a request with more
@@ -867,22 +868,31 @@ impl NostrSdkDirectoryRelayFetcher {
             .connect_relays(parsed_directory_relay_urls(&request.endpoints)?)
             .await?;
 
+        let mut queries = futures::stream::iter(request.queries)
+            .map(|query| {
+                let relay_urls = &relay_urls;
+                async move {
+                    let filter = directory_query_filter(&query, false)?;
+                    let events = self
+                        .client
+                        .fetch_events(ReqTarget::manual(
+                            relay_urls
+                                .iter()
+                                .cloned()
+                                .map(|url| (url, vec![filter.clone()])),
+                        ))
+                        .timeout(DIRECTORY_RELAY_FETCH_WAIT)
+                        .max_events(query.limit)
+                        .with_outcomes()
+                        .await
+                        .map_err(|_| "fetch directory events failed".to_owned())?;
+                    Ok::<_, String>((query, events))
+                }
+            })
+            .buffered(DIRECTORY_QUERY_CONCURRENCY);
         let mut records = Vec::new();
-        for query in request.queries {
-            let filter = directory_query_filter(&query, false)?;
-            let events = self
-                .client
-                .fetch_events(ReqTarget::manual(
-                    relay_urls
-                        .iter()
-                        .cloned()
-                        .map(|url| (url, vec![filter.clone()])),
-                ))
-                .timeout(DIRECTORY_RELAY_FETCH_WAIT)
-                .max_events(query.limit)
-                .with_outcomes()
-                .await
-                .map_err(|_| "fetch directory events failed".to_owned())?;
+        while let Some(result) = queries.next().await {
+            let (query, events) = result?;
             for event in events.events {
                 let Some(event) = validated_directory_event(&event, &query) else {
                     continue;
@@ -1326,6 +1336,115 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 mod tests {
     use super::*;
     use nostr_sdk::prelude::FinalizeEvent;
+
+    enum QueryRelayEnd {
+        Eose,
+        Stalled,
+    }
+
+    async fn spawn_query_relay(
+        stored: Vec<Event>,
+        completion: QueryRelayEnd,
+    ) -> (TransportEndpoint, tokio::task::JoinHandle<()>) {
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let request: serde_json::Value = match message {
+                    Message::Text(text) => serde_json::from_str(&text).unwrap(),
+                    Message::Binary(bytes) => serde_json::from_slice(&bytes).unwrap(),
+                    Message::Ping(payload) => {
+                        socket.send(Message::Pong(payload)).await.unwrap();
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if request[0] != "REQ" {
+                    continue;
+                }
+                if matches!(completion, QueryRelayEnd::Stalled) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let kind = request[2]["kinds"][0].as_u64().unwrap();
+                let mut replies = stored
+                    .iter()
+                    .filter(|event| u64::from(event.kind.as_u16()) == kind)
+                    .map(|event| serde_json::json!(["EVENT", request[1], event]))
+                    .collect::<Vec<_>>();
+                if matches!(completion, QueryRelayEnd::Eose) {
+                    replies.push(serde_json::json!(["EOSE", request[1]]));
+                }
+                for reply in replies {
+                    if socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        (endpoint, server)
+    }
+
+    // mdk#1813: two independent three-second reads share the relay wait,
+    // retaining delayed events instead of returning the first relay's answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_waits_overlap() {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+
+        let keys = Keys::generate();
+        let events = ["healthy", "stalled"]
+            .into_iter()
+            .flat_map(|content| {
+                [1_u16, 7]
+                    .into_iter()
+                    .map(move |kind| EventBuilder::new(Kind::from(kind), content))
+            })
+            .map(|builder| builder.finalize(&keys).unwrap())
+            .collect::<Vec<_>>();
+        let mut expected = events
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<Vec<_>>();
+        expected.sort();
+        let (healthy, healthy_server) =
+            spawn_query_relay(events[..2].to_vec(), QueryRelayEnd::Eose).await;
+        let (stalled, stalled_server) =
+            spawn_query_relay(events[2..].to_vec(), QueryRelayEnd::Stalled).await;
+        let request = DirectoryFetchRequest::new(
+            vec![healthy, stalled],
+            [1_u64, 7]
+                .into_iter()
+                .map(|kind| DirectoryEventQuery::new(kind, vec![keys.public_key().to_hex()], 4))
+                .collect(),
+        )
+        .unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            NostrSdkDirectoryRelayFetcher::standalone().fetch_directory_events(request),
+        )
+        .await;
+        healthy_server.abort();
+        stalled_server.abort();
+        let _ = healthy_server.await;
+        let _ = stalled_server.await;
+        let mut actual = result
+            .expect("independent query waits must overlap")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event.id)
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn anonymous_directory_fetch_accepts_profiles_after_optional_auth_challenge() {
