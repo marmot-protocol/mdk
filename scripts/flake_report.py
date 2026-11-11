@@ -8,8 +8,10 @@ merge-group runs, downloads only the test jobs' artifacts, and keeps a compact
 per-run summary in a local cache, so a rerun fetches only runs it has not seen.
 Cached summaries outlive the artifacts, so a longer window works from the cache.
 
-It stops fetching before the GitHub API budget runs out and reports the
-leaderboard from what it has, with a note saying the data is partial.
+Before each run it re-reads the GitHub API rate limit and stops fetching once
+fewer than `--reserve` calls remain, then reports the leaderboard from what it
+has, with a note saying the data is partial. A run is cached only once all of
+its reports are in, so a run cut off midway is fetched again next time.
 
 Only test names, panic locations and the panic message line leave a report.
 """
@@ -59,7 +61,7 @@ class MalformedReport(ValueError):
 
 
 class RateLimited(RuntimeError):
-    """The API budget for this invocation is spent."""
+    """Fewer API calls than the reserve remain, or GitHub refused a call for its rate limit."""
 
 
 class GhError(RuntimeError):
@@ -135,60 +137,18 @@ def parse_report(data: bytes) -> tuple[list[str], dict[str, Outcome]]:
     return seen, outcomes
 
 
-class Budget:
-    """The API calls this invocation may still make, shared across workers."""
-
-    def __init__(self, calls: int) -> None:
-        self._calls = max(calls, 0)
-        self._lock = threading.Lock()
-        self._stopped = False
-
-    def take(self, calls: int = 1) -> None:
-        """Spend `calls`, or raise RateLimited and spend nothing if fewer remain.
-
-        A run too large for what is left leaves the rest to smaller runs and
-        to retries of downloads already paid for.
-        """
-        with self._lock:
-            if self._stopped or self._calls < calls:
-                raise RateLimited
-            self._calls -= calls
-
-    def refund(self, calls: int) -> None:
-        with self._lock:
-            if not self._stopped:
-                self._calls += calls
-
-    def spend_all(self) -> None:
-        """GitHub refused a request for its rate limit: make no more, refunds included."""
-        with self._lock:
-            self._calls = 0
-            self._stopped = True
-
-
 class GitHub:
     """The few GitHub API calls this report needs, made through `gh`."""
 
     def __init__(self, repo: str, gh: str = "gh") -> None:
         self.repo = repo
         self.gh = gh
-        self.budget = Budget(0)
 
-    def _call(self, path: str, params: dict[str, str] | None = None, *,
-              free: bool = False, prepaid: bool = False) -> bytes:
-        """Run `gh api`, charging each request to the budget.
-
-        `free` requests cost nothing; a `prepaid` request's first attempt was
-        already taken from the budget, but its retries are not.
-        """
-        if not (free or prepaid):
-            self.budget.take()
+    def _call(self, path: str, params: dict[str, str] | None = None) -> bytes:
         command = [self.gh, "api", "-X", "GET", path]
         for key, value in (params or {}).items():
             command += ["-f", f"{key}={value}"]
-        for attempt, delay in enumerate((*RETRY_DELAYS, None)):
-            if attempt and not free:
-                self.budget.take()
+        for delay in (*RETRY_DELAYS, None):
             try:
                 result = subprocess.run(command, capture_output=True, timeout=600, check=False)
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -198,7 +158,6 @@ class GitHub:
             message = result.stderr.decode("utf-8", "replace").strip().splitlines()
             message = message[-1] if message else f"exit {result.returncode}"
             if RATE_LIMITED.search(message):
-                self.budget.spend_all()
                 raise RateLimited
             # GitHub answers some artifact downloads with a transient 5xx.
             if delay is None or not SERVER_ERROR.search(message):
@@ -206,20 +165,20 @@ class GitHub:
             time.sleep(delay)
         raise AssertionError("unreachable")
 
-    def _json(self, path: str, params: dict[str, str] | None = None, *, free: bool = False):
+    def _json(self, path: str, params: dict[str, str] | None = None):
         try:
-            return json.loads(self._call(path, params, free=free))
+            return json.loads(self._call(path, params))
         except json.JSONDecodeError as error:
             raise GhError(f"gh api {path}: invalid JSON") from error
 
     def core_remaining(self) -> int:
         # GET /rate_limit does not count against the limit.
-        return int(self._json("rate_limit", free=True)["resources"]["core"]["remaining"])
+        return int(self._json("rate_limit")["resources"]["core"]["remaining"])
 
     def runs(self, workflow: str, event: str, since: dt.datetime) -> tuple[list[dict], str | None]:
         """Return the runs created since `since`, newest first, and why the list is short, if it is.
 
-        GitHub serves at most 1,000 runs for one query. A budget spent after
+        GitHub serves at most 1,000 runs for one query. A rate limit hit after
         the first page keeps the pages already listed.
         """
         runs: list[dict] = []
@@ -231,7 +190,7 @@ class GitHub:
             except RateLimited:
                 if not runs:
                     raise
-                return runs, "the API budget ran out"
+                return runs, "the API rate limit was reached"
             batch = body.get("workflow_runs", [])
             runs += batch
             if len(batch) < 100:
@@ -249,8 +208,8 @@ class GitHub:
                 break
         return artifacts
 
-    def artifact_zip(self, artifact_id: int, *, prepaid: bool = False) -> bytes:
-        return self._call(f"repos/{self.repo}/actions/artifacts/{artifact_id}/zip", prepaid=prepaid)
+    def artifact_zip(self, artifact_id: int) -> bytes:
+        return self._call(f"repos/{self.repo}/actions/artifacts/{artifact_id}/zip")
 
 
 def empty_summary(run: dict) -> dict:
@@ -343,22 +302,26 @@ def parse_time(value: str) -> dt.datetime:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def fetch_run(github: GitHub, run: dict, artifact_name: re.Pattern[str]) -> dict:
-    matching = [artifact for artifact in github.artifacts(run["id"])
-                if artifact_name.fullmatch(artifact.get("name", ""))]
-    selected = [artifact for artifact in matching if not artifact.get("expired")]
-    # Claim the whole run's downloads up front, so a spent budget never leaves
-    # a run half-fetched after paying for some of it.
-    github.budget.take(len(selected))
-    summary = empty_summary(run)
-    # An expired artifact never comes back; the summary remembers the gap.
-    summary["expired"] = len(matching) - len(selected)
-    for index, artifact in enumerate(selected):
-        try:
-            add_artifact(summary, github.artifact_zip(artifact["id"], prepaid=True))
-        except BaseException:
-            github.budget.refund(len(selected) - index - 1)
-            raise
+def fetch_run(github: GitHub, run: dict, artifact_name: re.Pattern[str], reserve: int,
+              stop: threading.Event) -> dict:
+    """Fetch one run's reports, or raise RateLimited once the rate limit is under the reserve.
+
+    Runs other workers already started finish, so the reserve must cover them.
+    """
+    try:
+        if stop.is_set() or github.core_remaining() < reserve:
+            raise RateLimited
+        matching = [artifact for artifact in github.artifacts(run["id"])
+                    if artifact_name.fullmatch(artifact.get("name", ""))]
+        selected = [artifact for artifact in matching if not artifact.get("expired")]
+        summary = empty_summary(run)
+        # An expired artifact never comes back; the summary remembers the gap.
+        summary["expired"] = len(matching) - len(selected)
+        for artifact in selected:
+            add_artifact(summary, github.artifact_zip(artifact["id"]))
+    except RateLimited:
+        stop.set()
+        raise
     return summary
 
 
@@ -390,14 +353,14 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
     collection = Collection([])
     if github is not None:
         try:
-            remaining = github.core_remaining()
-            github.budget = Budget(remaining - args.reserve)
+            if github.core_remaining() < args.reserve:
+                raise RateLimited
             runs, cut = github.runs(args.workflow, args.event, since)
             if cut:
                 collection.notes.append(f"Partial data: only the newest {len(runs)} runs of the window "
                                         f"were listed ({cut}).")
         except RateLimited:
-            collection.notes.append("The GitHub API budget was spent before runs could be listed; "
+            collection.notes.append("The GitHub API rate limit was under the reserve before runs could be listed; "
                                     "this report uses cached runs only.")
             runs = []
         except GhError as error:
@@ -418,8 +381,10 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
                 pending.append(run)
         pending.sort(key=lambda run: run["created_at"], reverse=True)
         failed = 0
+        stop = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
-            futures = {pool.submit(fetch_run, github, run, artifact_name): run for run in pending}
+            futures = {pool.submit(fetch_run, github, run, artifact_name, args.reserve, stop): run
+                       for run in pending}
             for future in concurrent.futures.as_completed(futures):
                 try:
                     summary = future.result()
@@ -434,9 +399,9 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
                 collection.fetched += 1
         if collection.unfetched:
             collection.notes.append(
-                f"Partial data: the GitHub API budget ran out before {collection.unfetched} of "
+                f"Partial data: the GitHub API rate limit reached the reserve before {collection.unfetched} of "
                 f"{len(pending)} new runs were fetched. Run again after the limit resets; "
-                "the cache keeps what was fetched.")
+                "the cache keeps the runs fetched in full.")
         if failed:
             collection.notes.append(f"{failed} runs could not be fetched and are left out; "
                                     "a rerun tries them again.")
@@ -581,8 +546,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--offline", action="store_true", help="report from the cache without calling GitHub")
     parser.add_argument("--prune", action="store_true", help="drop cached runs older than the window")
     parser.add_argument("--parallel", type=int, default=8, help="runs fetched at once (default: 8)")
-    parser.add_argument("--reserve", type=int, default=100,
-                        help="API calls to leave unspent from the hourly limit (default: 100)")
+    # A run takes about 20 calls, and runs already started finish past the reserve.
+    parser.add_argument("--reserve", type=int, default=300,
+                        help="start no run once fewer API calls than this remain in the hourly limit (default: 300)")
     parser.add_argument("--top", type=int, default=50, help="table rows (default: 50)")
     parser.add_argument("--samples", type=int, default=20, help="tests with failure samples (default: 20)")
     parser.add_argument("--max-chars", type=int, default=0,

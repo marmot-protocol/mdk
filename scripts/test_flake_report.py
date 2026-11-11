@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 
 import flake_report
-from flake_report import Budget, GhError, MalformedReport, RateLimited, parse_report
+from flake_report import GhError, MalformedReport, RateLimited, parse_report
 
 
 PANIC = (
@@ -108,32 +108,35 @@ def artifact_zip(*reports: bytes) -> bytes:
 
 
 class FakeGitHub:
-    """Serves runs and artifacts, charging the budget the way `gh api` calls do."""
+    """Serves runs and artifacts, spending the rate limit the way `gh api` calls do."""
 
     def __init__(self, runs, artifacts, remaining=1000):
         self.runs_listed = runs
         self.artifacts_by_run = artifacts
         self.remaining = remaining
-        self.budget = Budget(0)
         self.downloads = []
+
+    def spend(self):
+        if self.remaining <= 0:
+            raise RateLimited
+        self.remaining -= 1
 
     def core_remaining(self):
         return self.remaining
 
     def runs(self, workflow, event, since):
-        self.budget.take()
+        self.spend()
         if isinstance(self.runs_listed, Exception):
             raise self.runs_listed
         return self.runs_listed, None
 
     def artifacts(self, run_id):
-        self.budget.take()
+        self.spend()
         return [{"id": artifact_id, "name": name, "expired": data is None}
                 for artifact_id, name, data in self.artifacts_by_run[run_id]]
 
-    def artifact_zip(self, artifact_id, *, prepaid=False):
-        if not prepaid:
-            self.budget.take()
+    def artifact_zip(self, artifact_id):
+        self.spend()
         self.downloads.append(artifact_id)
         for artifacts in self.artifacts_by_run.values():
             for known, _, data in artifacts:
@@ -170,33 +173,19 @@ class GhCallTests(unittest.TestCase):
         """))
         script.chmod(0o755)
         github = flake_report.GitHub("o/r", gh=str(script))
-        github.budget = Budget(10)
         self.calls = lambda: int(count.read_text())
         return github
 
-    def test_a_transient_server_error_is_retried_and_charged(self):
+    def test_a_transient_server_error_is_retried(self):
         github = self.gh("gh: Server Error (HTTP 502)")
         with unittest.mock.patch.object(flake_report, "RETRY_DELAYS", (0, 0)):
-            self.assertEqual(github.artifact_zip(1, prepaid=True), b"ok")
+            self.assertEqual(github.artifact_zip(1), b"ok")
         self.assertEqual(self.calls(), 2)
-        # The prepaid first attempt cost nothing more; the retry cost one call.
-        github.budget.take(9)
-        with self.assertRaises(RateLimited):
-            github.budget.take()
 
-    def test_retries_stop_when_the_budget_is_spent(self):
-        github = self.gh("gh: Server Error (HTTP 502)", "gh: Server Error (HTTP 503)")
-        github.budget = Budget(1)
-        with unittest.mock.patch.object(flake_report, "RETRY_DELAYS", (0, 0)), self.assertRaises(RateLimited):
-            github.artifact_zip(1)
-        self.assertEqual(self.calls(), 1)
-
-    def test_a_rate_limit_spends_the_budget(self):
+    def test_a_rate_limit_is_not_retried(self):
         github = self.gh("gh: API rate limit exceeded for user ID 1. (HTTP 403)")
         with self.assertRaises(RateLimited):
             github.artifact_zip(1)
-        with self.assertRaises(RateLimited):
-            github.artifacts(2)
         self.assertEqual(self.calls(), 1)
 
     def test_other_errors_are_not_retried(self):
@@ -243,55 +232,42 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual(github.downloads, [])
         self.assertEqual(again["tests"], data["tests"])
 
-    def test_a_spent_budget_reports_partial_data_without_half_fetched_runs(self):
-        artifacts = [(n, f"ci-runner-rust-test-{n}-1", artifact_zip(report(FLAKY))) for n in range(3)]
-        # Listing runs and one run's artifacts fits; that run's three downloads do not.
-        github = FakeGitHub([run(1, 1)], {1: artifacts}, remaining=104)
-        code, markdown, data = self.main(github)
-        self.assertEqual(code, 0)
+    def test_fetching_stops_when_the_rate_limit_reaches_the_reserve(self):
+        runs = [run(n, n) for n in range(1, 4)]
+        artifacts = {n: [(n, f"ci-runner-rust-test-{n}-1", artifact_zip(report(FLAKY)))] for n in range(1, 4)}
+        # Listing and the newest run (one artifact list, one download) leave 101; the next leaves 99.
+        github = FakeGitHub(runs, artifacts, remaining=104)
+        _, markdown, data = self.main(github, "--parallel", "1", "--reserve", "100")
+        self.assertEqual(github.downloads, [1, 2])
         self.assertTrue(data["partial"])
-        self.assertEqual(github.downloads, [])
-        self.assertIn("Partial data", markdown)
+        self.assertIn("before 1 of 3 new runs were fetched", markdown)
+
+    def test_a_run_cut_off_by_the_rate_limit_is_fetched_again_next_time(self):
+        artifacts = {1: [(n, f"ci-runner-rust-test-{n}-1", artifact_zip(report(FLAKY))) for n in range(3)]}
+        # GitHub refuses the run's second download.
+        _, _, data = self.main(FakeGitHub([run(1, 1)], artifacts, remaining=3), "--reserve", "0")
+        self.assertTrue(data["partial"])
         self.assertEqual(list(self.cache.rglob("run-*")), [])
-
-    def test_a_run_too_large_for_the_budget_leaves_room_for_smaller_ones(self):
-        big = [(n, f"ci-runner-rust-test-{n}-1", artifact_zip(report(FLAKY))) for n in range(10, 15)]
-        small = [(20, "ci-runner-cli-e2e-0-1", artifact_zip(report(FAILED)))]
-        # 1 list + 2 artifact lists + 1 small download fit; the big run's 5 do not.
-        github = FakeGitHub([run(1, 1), run(2, 2)], {1: big, 2: small}, remaining=104)
-        _, _, data = self.main(github, "--parallel", "1")
-        self.assertEqual(github.downloads, [20])
-        self.assertTrue(data["partial"])
-
-    def test_a_budget_spent_after_the_first_page_keeps_the_listed_runs(self):
-        github = flake_report.GitHub("o/r")
-        github.budget = Budget(1)
-        page = {"workflow_runs": [{"id": n} for n in range(100)], "total_count": 150}
-        with unittest.mock.patch.object(github, "_call", side_effect=lambda *a, **k: (
-                github.budget.take(), json.dumps(page).encode())[1]):
-            runs, cut = github.runs("ci.yml", "merge_group", dt.datetime.now(dt.timezone.utc))
-        self.assertEqual((len(runs), cut), (100, "the API budget ran out"))
-
-    def test_rate_limit_errors_from_gh_stop_fetching(self):
-        github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", RateLimited())]})
+        github = FakeGitHub([run(1, 1)], artifacts)
         _, _, data = self.main(github)
-        self.assertTrue(data["partial"])
+        self.assertEqual(github.downloads, [0, 1, 2])
+        self.assertEqual(data["tests"][0]["flaky_attempts"], 3)
 
-    def test_a_rate_limit_response_is_not_undone_by_refunds(self):
-        budget = Budget(10)
-        budget.take(3)
-        budget.spend_all()
-        budget.refund(2)
-        with self.assertRaises(RateLimited):
-            budget.take()
+    def test_a_rate_limit_after_the_first_page_keeps_the_listed_runs(self):
+        github = flake_report.GitHub("o/r")
+        page = {"workflow_runs": [{"id": n} for n in range(100)], "total_count": 150}
+        responses = [json.dumps(page).encode(), RateLimited()]
+        with unittest.mock.patch.object(github, "_call", side_effect=responses):
+            runs, cut = github.runs("ci.yml", "merge_group", dt.datetime.now(dt.timezone.utc))
+        self.assertEqual((len(runs), cut), (100, "the API rate limit was reached"))
 
     def test_a_failed_listing_publishes_nothing_even_with_a_cache(self):
         self.main(FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY)))]}))
         code, markdown, _ = self.main(FakeGitHub(GhError("HTTP 401"), {}))
         self.assertEqual((code, markdown), (1, ""))
 
-    def test_a_budget_spent_before_listing_is_partial(self):
-        _, markdown, data = self.main(FakeGitHub([run(1, 1)], {}, remaining=100))
+    def test_a_rate_limit_under_the_reserve_before_listing_is_partial(self):
+        _, markdown, data = self.main(FakeGitHub([run(1, 1)], {}, remaining=99), "--reserve", "100")
         self.assertTrue(data["partial"])
         self.assertIn("before runs could be listed", markdown)
 
