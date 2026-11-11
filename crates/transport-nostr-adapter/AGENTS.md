@@ -175,10 +175,8 @@ for reconnect/backoff and relay status mechanics.
   still retire with their unadmitted count. A plan older than the
   last applied is ignored, and a fence nothing holds ends at once. A fresh activation (`record_account_replay_start`)
   moves the buffered live frames native ingress does not own into the new coverage: those fences hold stay held from
-  the same point under the old plan ticket, and those still waiting for admission wait there. A buffered history copy
-  that a fresh REQ asks for again (same route and relay, `since` no later than the copy) is dropped without loss
-  (`forget_replayed_history`). Only frames for groups its REQs no longer route, or past the buffer bounds, become
-  replay loss. A fence holds only what is still in the replay
+  the same point under the old plan ticket, and those still waiting for admission wait there. Only frames for groups
+  its REQs no longer route, or past the buffer bounds, become replay loss. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin
   until its next hand-off; while a fence holds it there, that pin is exempt (`held_pins`), but a pin on a copy still out

@@ -5571,41 +5571,6 @@ impl AdapterState {
         replaced
     }
 
-    /// Each group route and relay the REQs replay history on, with the REQ's
-    /// `since`, as their staged streams will have them.
-    fn fresh_replay_starts(
-        &mut self,
-        subscriptions: &[NostrSubscription],
-    ) -> Vec<([u8; 32], RelayIndex, u64)> {
-        let mut starts = Vec::new();
-        for subscription in subscriptions {
-            let since =
-                ReplayWindow::for_subscription(subscription).map_or(0, |window| window.since);
-            let routes = match subscription {
-                NostrSubscription::Group {
-                    transport_group_id, ..
-                }
-                | NostrSubscription::GroupMaintenance {
-                    transport_group_id, ..
-                } => vec![transport_group_id.as_slice()],
-                NostrSubscription::GroupBatch { routes, .. } => routes
-                    .iter()
-                    .map(|route| route.transport_group_id.as_slice())
-                    .collect(),
-                NostrSubscription::AccountInbox { .. } => Vec::new(),
-            };
-            for endpoint in subscription.endpoints() {
-                let relay = self.relay_index.index_for(endpoint);
-                for route in &routes {
-                    if let Ok(route) = <[u8; 32]>::try_from(*route) {
-                        starts.push((route, relay, since));
-                    }
-                }
-            }
-        }
-        starts
-    }
-
     /// Add a repack's batches to the account's replay coverage before their
     /// REQs go out, as activation does, so a relay's stored events, EOSE or
     /// refusal for them count however soon they arrive. Until the sync
@@ -5845,17 +5810,11 @@ impl AdapterState {
     ) {
         // Buffered live frames have no other copy: they move to the new
         // coverage, those a fence holds still held, rather than being lost
-        // with the old one. History copies the fresh REQs ask for again are
-        // not lost either.
-        let fresh = self.fresh_replay_starts(subscriptions);
+        // with the old one.
         let carried = self
             .account_replay_coverage
             .get_mut(account_id)
-            .map(|replaced| {
-                let carried = replaced.take_carried_live();
-                replaced.forget_replayed_history(&fresh);
-                carried
-            })
+            .map(AccountReplayCoverage::take_carried_live)
             .unwrap_or_default();
         let mut coverage = AccountReplayCoverage::new(
             account_id.clone(),
