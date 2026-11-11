@@ -6,6 +6,10 @@
 
 ### Fixed
 
+- Run the malformed kind-445 drain test against a relay that publishes its
+  filter limit, so a cold boot's catch-up proves the offline gap at once. Its
+  information-less relay held the message behind the unknown-cap sweep, which
+  on a loaded runner outlasted the test's wait.
 - Resume v5 audit delivery of a file a receiver's `409` blocked under 0.15.0
   (#3300). 0.15.0 blocked such a file for good as partial acceptance; loading
   the cursor now clears that block as it does a 0.15.0 rejection, including a
