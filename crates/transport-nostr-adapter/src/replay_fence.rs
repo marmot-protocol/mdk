@@ -1003,15 +1003,15 @@ mod tests {
     /// replaced the coverage comes again on a fresh REQ that routes its group
     /// on the same relay from no later: replacing loses nothing, and the copy
     /// goes out once the fresh REQ replays it. A copy from a relay the fresh
-    /// REQs leave out is lost, from the replaced coverage's floor, as before.
+    /// REQs leave out, or older than their `since`, is lost, from the replaced
+    /// coverage's floor, as before.
     #[tokio::test]
     async fn a_fresh_activation_loses_no_history_its_reqs_replay() {
-        for (relay, lost) in [
-            (RelayIndex(1), None),
-            (
-                RelayIndex(2),
-                Some(NostrNotificationLossFloor::Since(SINCE)),
-            ),
+        let lost = Some(NostrNotificationLossFloor::Since(SINCE));
+        for (relay, fresh_since, lost) in [
+            (RelayIndex(1), SINCE, None),
+            (RelayIndex(2), SINCE, lost),
+            (RelayIndex(1), 200, lost),
         ] {
             let (mut coverage, id, losses) = fenced_coverage(true);
             let (tx, mut rx) = mpsc::channel(8);
@@ -1038,9 +1038,13 @@ mod tests {
                 .index_for(&TransportEndpoint("wss://b.example".to_owned()));
             let a = TransportEndpoint("wss://a.example".to_owned());
             assert_eq!(state.relay_index.index_for(&a), RelayIndex(1));
+            let mut fresh_route = route(0);
+            if let NostrSubscription::Group { since, .. } = &mut fresh_route {
+                *since = Some(Timestamp(fresh_since));
+            }
             let batch = pack_group_batches(
                 &account(),
-                &[route(0)],
+                &[fresh_route],
                 SubscriptionAttempt::INITIAL.next(),
                 0,
             )
