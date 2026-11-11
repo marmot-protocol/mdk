@@ -1820,8 +1820,9 @@ status when it answered (every receiver kind carries it). `ReceiverBlocked` (`40
 or an invalid success response) pauses automatic delivery for that account (`paused`); the
 pause survives restarts with the same configuration. Changing the destination, endpoint or
 token in `set_audit_otlp_config_v5`, or calling `post_audit_log_tracker_update_v5()`, retries
-it. `ReceiverRejected` (`400`, `413`, `422`) means the receiver refused those rows: delivery
-continues past them and `rejected_batches` counts them. `409`, `429` and `5xx` are
+it. `ReceiverRejected` (`400`, `413`, `422`) means the receiver refused the batch: delivery
+halves it and retries the halves; a record is skipped, with a gap, only if the receiver still
+rejects it alone, and `rejected_batches` counts each record skipped this way. `409`, `429` and `5xx` are
 `ReceiverRetryable` and resend the same range. Only an attempt that delivers lifts a pause; a
 journal still held by an earlier rejection keeps reporting `ReceiverRejected` with its status. `last_success_at_ms` is the last attempt that
 delivered or found nothing left; `consecutive_failures` counts failed attempts since then.

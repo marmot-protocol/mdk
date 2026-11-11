@@ -2,10 +2,29 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-11-11
+
+### Breaking changes
+
+- Shared-database migration 0004 (`0004_audit_log_retention`) adds `audit_log_retention_settings` and advances the
+  shared database from schema 3 to 4 on first open (mdk#3300). Older binaries refuse it with
+  `StorageError::UnsupportedSchemaVersion { found: 4, latest_supported: 3 }`; downgrade is unsupported.
+- `SqliteAppStorage::remove_seen_staged_recovery_events(&[&[u8]])` becomes `settle_staged_recovery_events(&[(&[u8],
+  StagedRecoverySettlement)])` (mdk#3297). A `StagedRecoverySettlement::Refused` row, which the engine refused for its
+  group's resources after it could not open it, leaves whether or not its event is seen, and its second stays covered.
+  An `Admitted` row leaves once its event is seen, as before.
+
 ### Added
 
 - `SqliteAccountStorage` answers `StorageProvider::list_snapshots_with_prefixes` with one scan of the snapshot keys,
   which the primary-key index covers, so it reads no snapshot body (mdk#3272).
+- `SqliteAppStorage::notification_policy_snapshot(account_label, account_id_hex)` returns committed notification
+  settings, initializing defaults, with the matching `SqliteAppStorage::notification_revision()` (mdk#1800). The
+  revision is a process-local counter shared by file-backed handles on the same canonical database path. TEMP triggers
+  advance it on projected-group, notification-setting and chat-mute writes, including protocol forget. It is not
+  persisted, and the snapshot fails inside a caller-owned transaction. No schema change.
+- `SqliteSharedStorage::audit_log_retention` and `set_audit_log_retention` store the host's audit retention policy as
+  `StoredAuditLogRetention { max_age_days, max_bytes_per_account }`; `None` until a host sets one (mdk#3300).
 
 ## 0.15.0 - 2026-11-09
 

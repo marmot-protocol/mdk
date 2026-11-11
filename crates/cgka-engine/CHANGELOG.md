@@ -2,32 +2,47 @@
 
 ## Unreleased
 
-### Changed
+## 0.16.0 - 2026-11-11
+
+### Breaking changes
 
 - `Engine::create_group_with_optional_app_components_and_audit_context` and
   `Engine::create_group_with_siblings_and_audit_context` take `welcome_check: Option<&dyn WelcomeSizeCheck>`
   (mdk#2334). After wrapping the founders' Welcomes, and before the creation's canonical write, a Welcome the check
   finds too large refuses the create with `EngineError::EventTooLarge { artifact: Welcome }`; the new group's OpenMLS
   state is removed. Sibling Welcomes and chosen-id creates are not checked. Pass `None` to keep the old behaviour.
+
+### Changed
+
 - A queued intent whose event fits none of its relays is retired, not re-drained forever (mdk#2334). Before, a drained
   commit that every group relay refused for size was rolled back and the drain staged it again on the next pass. The
-  new `Engine::publish_refused_as_too_large` rolls the pending commit back like `publish_failed_with_fanout`, deletes
-  the queued intent in the same transaction, and announces `GroupEvent::QueuedIntentRefused` with reason
-  `event_too_large`, the artifact and its size class. `Engine::pending_is_queued_invite` tells a drained invite from a direct one.
+  new `Engine::publish_refused_as_too_large` rolls the pending commit back like `publish_failed_fanout`, deletes the
+  queued intent in the same transaction, and announces `GroupEvent::QueuedIntentRefused` with reason
+  `event_too_large`, the artifact and its size class. `Engine::pending_is_queued_invite` tells a drained invite from a
+  direct one.
 - Engine paths read a group's stored record only through accessors that refuse a quarantined group, and the crate's
   `clippy.toml` bans the raw reads (mdk#3272). For any quarantined group, the settle API and `cancel_leave` return
   `UnknownGroup`, `has_pending_convergence_inputs` answers `false` unless a pass or replay is outstanding,
   `buffer_openmls_convergence_message` refuses it, `reissue_superseded_own_commits_from_state` and authority recovery
   skip it, and a removed copy's input is retained as quarantined rather than in the removed ring.
+- `message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP` rises from 2,048 to 8,192,
+  `MAX_PEEL_DEFERRED_BYTES_PER_GROUP` from 16 MiB to 64 MiB and `MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT` from 64 MiB to
+  256 MiB (mdk#3297). A full-history recovery of a long-lived group passed the row cap, and with its epoch fixed no row
+  aged out, so every later undecryptable input for the group was refused. The conformance snapshot's E3 values change
+  with them.
+- `Engine::ingest` runs its read-only dedup and own-echo lookups before the audit rows (mdk#3300). A message that ends
+  `Ignored { Duplicate | OwnEcho }` records only `ingest_outcome`, with the delivery's transport context; if it ends
+  any other way, `transport_received` and `ingest_entry` are written before its outcome or `ingest_error`.
 
 ### Fixed
 
 - A convergence pass, deferred-peel sweep or past-epoch peel whose restore fails after it rewound a group onto a
   retained anchor no longer leaves the group live on anchor state (mdk#3272). The group is quarantined as
   `RewindRestoreFailed` with a `GroupHydrationQuarantined` event, and its input is retained. Neither
-  `retry_hydrate_quarantined_group`, which answers `false`, nor a re-join Welcome clears it; the next open restores
-  the kept live state and replays the input. Meanwhile `pending_group_rejoins_for` omits the group's stored rejoin
-  offers and `confirm_group_rejoin` returns `UnknownGroup` for them, since their consent token would be the anchor's.
+  `retry_hydrate_quarantined_group`, which answers `false`, nor a re-join Welcome clears it; the next open tries to
+  restore the kept live state and replays the input only if that succeeds; otherwise the group is quarantined again.
+  Meanwhile `pending_group_rejoins_for` omits the group's stored rejoin offers and `confirm_group_rejoin` returns
+  `UnknownGroup` for them, since their consent token would be the anchor's.
 - `EngineBuilder::build` restores every group's interrupted rewind before anything reads group state (mdk#3272). With
   deferred hydration, ingest and a Welcome join could read a seeded group's record before its hydration restored a
   rewind interrupted by a crash or a failed restore. A message could then be kept in a removed copy's ring, or a
