@@ -24,7 +24,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use marmot_forensics::{
     AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditRecord,
     AuditTransportContext, AuditTransportWire, ForensicRecorder, JsonlRecorder, SharedRecorder,
@@ -588,6 +588,193 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
         }
         _ => unreachable!(),
     }
+}
+
+/// The wire context the session supplies for a Nostr group delivery.
+fn group_delivery_context(msg: &TransportMessage, group_id: &GroupId) -> AuditTransportContext {
+    let event_id = hex::encode(msg.id.as_slice());
+    AuditTransportContext {
+        transport_source: "nostr".into(),
+        delivery_plane: Some("group".into()),
+        relay_url: Some("wss://relay.example".into()),
+        subscription_id: Some("group-sub".into()),
+        wire: Some(AuditTransportWire {
+            transport: Some("nostr".into()),
+            delivery_plane: Some("group".into()),
+            relay_url: Some("wss://relay.example".into()),
+            subscription_id: Some("group-sub".into()),
+            wire_id: Some(event_id.clone()),
+            wire_kind: Some("445".into()),
+            wire_pubkey_hex: Some("dd".repeat(32)),
+            transport_group_id: Some(hex::encode(group_id.as_slice())),
+            nostr_event_id: Some(event_id),
+            nostr_kind: Some(445),
+            nostr_pubkey_hex: Some("dd".repeat(32)),
+            ..Default::default()
+        }),
+    }
+}
+
+/// A relay replay of a message the engine already processed or sent records
+/// only its outcome row, which keeps the delivery's transport context. A
+/// message ingest works on keeps its full evidence, entry first (mdk#3300).
+#[tokio::test]
+async fn ignored_replays_record_only_their_outcome() {
+    use cgka_traits::SendIntent;
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+    use cgka_traits::ingest::InputRejectionCategory;
+    use marmot_forensics::v5::{BuildProfile, EngineMessageRef, Platform, Producer, Record};
+    use support::epoch_sealed_peeler::EpochSealedPeeler;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let build = |seed: &[u8], recorder: Option<JsonlRecorder>| {
+        let builder = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+            .legacy_compatibility_profile()
+            .identity(valid_identity(seed))
+            .account_identity_proof_signer(proof_signer(seed))
+            .peeler(Box::new(EpochSealedPeeler));
+        match recorder {
+            Some(recorder) => builder.recorder(Box::new(recorder)),
+            None => builder,
+        }
+        .build()
+        .unwrap()
+    };
+    let recorder = JsonlRecorder::open_v5_with_account_ref(
+        &audit_path,
+        "11".repeat(16),
+        Some("22".repeat(16)),
+        Producer {
+            mdk_revision: None,
+            build_profile: BuildProfile::Debug,
+            platform: Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    let mut alice = build(b"replay-alice", None);
+    let mut bob = build(b"replay-bob", Some(recorder));
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(group_request(vec![bob_key_package]))
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("expected group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let send = async |engine: &mut Engine<SqliteAccountStorage>, body: &str| {
+        let payload = MarmotAppEvent::new(
+            hex::encode(engine.self_id().as_slice()),
+            1_700_000_000,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            body.to_owned(),
+        )
+        .encode()
+        .unwrap();
+        let SendResult::ApplicationMessage { msg, .. } = engine
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected application message");
+        };
+        TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        }
+    };
+    let peer = send(&mut alice, "from alice").await;
+    let own = send(&mut bob, "from bob").await;
+    for (msg, expected) in [
+        (&peer, None),
+        (&peer, Some(InputRejectionCategory::Duplicate)),
+        (&own, Some(InputRejectionCategory::OwnEcho)),
+    ] {
+        let outcome = bob
+            .ingest_with_audit_context(msg, Some(group_delivery_context(msg, &group_id)))
+            .await
+            .unwrap();
+        match expected {
+            None => assert!(matches!(outcome, IngestOutcome::Processed), "{outcome:?}"),
+            Some(category) => assert_eq!(outcome, IngestOutcome::Ignored { category }),
+        }
+    }
+    drop(bob);
+
+    let lines = std::fs::read_to_string(&audit_path).unwrap();
+    let rows = lines
+        .lines()
+        .map(|line| {
+            Record::from_json(line.as_bytes()).expect("strict v5 record");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let ingest_rows = |msg: &TransportMessage| {
+        let reference = EngineMessageRef::from_message_id(msg.id.as_slice()).unwrap();
+        rows.iter()
+            .filter(|row| row["event"]["message_ref"] == reference.as_str())
+            .filter(|row| {
+                ["transport_received", "ingest_entry", "ingest_outcome"]
+                    .contains(&row["event"]["type"].as_str().unwrap())
+            })
+            .map(|row| {
+                let event = &row["event"];
+                let label = format!(
+                    "{}{}",
+                    event["type"].as_str().unwrap(),
+                    event["stale_reason"]
+                        .as_str()
+                        .map(|reason| format!("/{reason}"))
+                        .unwrap_or_default()
+                );
+                (label, event.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    fn labels(rows: &[(String, serde_json::Value)]) -> Vec<&str> {
+        rows.iter().map(|(label, ..)| label.as_str()).collect()
+    }
+    let peer_rows = ingest_rows(&peer);
+    assert_eq!(
+        labels(&peer_rows),
+        [
+            "transport_received",
+            "ingest_entry",
+            "ingest_outcome",
+            "ingest_outcome/duplicate"
+        ],
+        "the first delivery keeps its full evidence; its replay records only the outcome"
+    );
+    assert_eq!(
+        labels(&ingest_rows(&own)),
+        ["ingest_outcome/own_echo"],
+        "an own echo records only its outcome"
+    );
+    // The reader finds a replay's group through the transport context the
+    // kept outcome still carries.
+    let replay_transport = &peer_rows[3].1["record_context"]["transport"];
+    for field in ["endpoint_ref", "subscription_ref"] {
+        assert!(replay_transport[field].is_string(), "{replay_transport}");
+    }
+    assert_eq!(
+        replay_transport["wire"], peer_rows[0].1["transport"],
+        "the outcome keeps the wire evidence transport_received carried"
+    );
+    assert!(replay_transport["wire"]["transport_group_ref"].is_string());
 }
 
 /// Queued logical sends retain their audit identity when a fresh engine prepares

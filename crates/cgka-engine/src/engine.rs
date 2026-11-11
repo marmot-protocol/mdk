@@ -1259,26 +1259,25 @@ impl<S: StorageProvider> Engine<S> {
             source: None,
             v5_welcome_refs: Vec::new(),
         };
-        // Record the transport wire evidence before ingest when the transport
-        // layer supplied it, so an analyzer sees what arrived on the wire ahead
-        // of the engine's ingest_entry/outcome for the same message.
-        if let Some(wire) = context
-            .transport
-            .as_ref()
-            .and_then(|transport| transport.wire.clone())
-        {
-            self.audit_with_context(
-                None,
-                Some(context.clone()),
-                crate::audit_helpers::transport_received_event(msg, wire),
-            );
+        // A relay replay of a message this engine already holds or sent ends
+        // `Ignored { Duplicate | OwnEcho }` before any work, and replay storms
+        // repeat that per message. Learn it from the same reads ingest starts
+        // with, so such a message records only its outcome row (mdk#3300).
+        let recorded = self.recorded_ingest(msg);
+        let replay = matches!(&recorded, Ok(Some(recorded)) if recorded.is_ignored_replay());
+        if !replay {
+            self.record_ingest_entry(msg, &context);
         }
-        self.audit_with_context(
-            None,
-            Some(context.clone()),
-            crate::audit_helpers::ingest_entry_event(msg),
-        );
-        let result = self.do_ingest(msg).await;
+        let result = self.do_ingest(msg, recorded).await;
+        // Only a failed echo write can turn a replay into something else.
+        // Everything else keeps its full evidence, entry first.
+        if replay
+            && !result
+                .as_ref()
+                .is_ok_and(crate::message_processor::is_ignored_replay)
+        {
+            self.record_ingest_entry(msg, &context);
+        }
         match &result {
             Ok(outcome) => {
                 let group_ref = crate::audit_helpers::ingest_outcome_group_ref(outcome);
@@ -1302,6 +1301,29 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         result
+    }
+
+    /// The rows that open an inbound message's evidence. The transport wire
+    /// row, when the transport layer supplied it, comes first, so an analyzer
+    /// sees what arrived on the wire ahead of the engine's ingest_entry and
+    /// outcome for the same message.
+    fn record_ingest_entry(&self, msg: &TransportMessage, context: &AuditEventContext) {
+        if let Some(wire) = context
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.wire.clone())
+        {
+            self.audit_with_context(
+                None,
+                Some(context.clone()),
+                crate::audit_helpers::transport_received_event(msg, wire),
+            );
+        }
+        self.audit_with_context(
+            None,
+            Some(context.clone()),
+            crate::audit_helpers::ingest_entry_event(msg),
+        );
     }
 
     pub async fn send_with_audit_context(
