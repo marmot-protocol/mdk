@@ -909,7 +909,7 @@ pub fn audit_log_files(&self) -> Result<Vec<AuditLogFileFfi>, MarmotKitError>
 
 Local JSONL audit logs available for explicit forensic upload.
 
-[Source](src/commands/audit.rs#L104)
+[Source](src/commands/audit.rs#L124)
 
 ### `Marmot::post_audit_log_file`
 
@@ -921,7 +921,7 @@ pub async fn post_audit_log_file( &self, path: String, endpoint: String, ) -> Re
 
 POST one selected JSONL audit log to a forensic analyzer endpoint.
 
-[Source](src/commands/audit.rs#L114)
+[Source](src/commands/audit.rs#L134)
 
 ### `Marmot::delete_audit_log_file`
 
@@ -933,7 +933,7 @@ pub async fn delete_audit_log_file( &self, path: String, ) -> Result<AuditLogDel
 
 Delete one local JSONL audit log file (e.g. behind a "clear audit log" button).
 
-[Source](src/commands/audit.rs#L134)
+[Source](src/commands/audit.rs#L154)
 
 ### `Marmot::post_audit_log_tracker_update`
 
@@ -945,7 +945,7 @@ pub async fn post_audit_log_tracker_update( &self, ) -> Result<AuditLogTrackerUp
 
 POST all local audit logs to the configured tracker when audit logging is enabled. This is safe for host apps to call unconditionally; disabled or unconfigured states return a structured skip result.
 
-[Source](src/commands/audit.rs#L144)
+[Source](src/commands/audit.rs#L164)
 
 </details>
 
@@ -5286,7 +5286,7 @@ pub fn audit_delivery_status_v5( &self, ) -> Result<Vec<AuditDeliveryStatusV5Ffi
 
 Read each account's persisted v5 OTLP delivery status without dialing or touching the delivery cursor. Use it to show "audit delivery stalled since X: reason": `last_success_at_ms` against `last_failure`, whose `kind` separates local failures (`StateOverLimit`, `TooManyOpenFiles`, `LocalIo`, `LocalBlocked`) from receiver verdicts and whose `http_status` is set when the receiver answered. `paused` is true after `ReceiverBlocked` (for example `401`) for the configured destination; changing the destination, endpoint or token, or calling `post_audit_log_tracker_update_v5`, retries it. `ReceiverRejected` counts rows the receiver refused in `rejected_batches` while delivery continues. `backlog` is the last measured undelivered bytes, segments, gaps and oldest undelivered record time, as of `observed_at_ms`. Accounts that never ran a v5 pass report no failure and no backlog.
 
-[Source](src/commands/audit.rs#L92)
+[Source](src/commands/audit.rs#L112)
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 
@@ -5296,7 +5296,7 @@ pub async fn post_audit_log_tracker_update_v5( &self, ) -> Result<AuditLogTracke
 
 Run an immediate audit tracker pass and receive separate v4 whole-file and v5 OTLP outcomes. The `v5` field is absent when no dedicated sender is configured; when present, accepted batches, pending accounts, blocked accounts, and idle accounts report the delivery state without treating an empty v4 upload list as success. Recording must be enabled separately. Existing automatic activity triggers use the same v5 sender and retry policy.
 
-[Source](src/commands/audit.rs#L151)
+[Source](src/commands/audit.rs#L171)
 
 ### `Marmot::set_audit_otlp_config_v5`
 

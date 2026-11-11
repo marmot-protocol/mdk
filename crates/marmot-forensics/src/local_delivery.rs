@@ -3219,6 +3219,9 @@ mod tests {
             assert_eq!(worker.gaps()[0].reason, GapReason::ExpiredUndelivered);
             assert_eq!(worker.gaps()[0].start, acknowledged);
             assert_eq!(worker.gaps()[0].end, Some(final_len));
+            // The delivery status reports the loss, not a backlog it still owes.
+            let backlog = worker.backlog();
+            assert_eq!((backlog.gaps, backlog.undelivered_bytes), (1, 0));
             let recorder = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
             record(&recorder, "after-expiry");
             let before = sink.batches.len();
