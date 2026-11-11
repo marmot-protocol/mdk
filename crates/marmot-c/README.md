@@ -557,6 +557,12 @@ the challenge but does not complete the RPC. `marmot_nip46_cancel_request` cance
 only the named pending request. Stale IDs return `MARMOT_STATUS_INVALID_ARGUMENT`.
 RPC requests have a 90-second budget; MDK account setup can time out sooner.
 
+Login/register adoption follows the shared runtime-owned contract: once admitted,
+loss of the waiter does not cancel adoption. The preceding handshake remains
+bounded and cancellable. Use explicit session cancellation, disconnect, or logout
+to interrupt; client shutdown interrupts and settles owned adoption before returning.
+This does not permit freeing a handle during an active C call.
+
 `marmot_nip46_ping` checks the remote signer; `marmot_nip46_disconnect` interrupts
 transport work but permits explicit reconnection. `marmot_nip46_cancel` permanently
 interrupts the shared session, including its account signer and other handles,

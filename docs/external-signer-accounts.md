@@ -87,9 +87,23 @@ session to an existing account. Only one communication key can own an account,
 and a bound communication key cannot be imported into another session.
 A completed external account rebinds without opening a setup journal, including
 when reactivating after sign-out. Failed adoption preserves its setup readiness
-and restores the prior callback and grant record, or the previously empty slot.
+and restores the prior local callback, grant record, and activation state, or the
+previously empty slot. Already-published KeyPackages are not retracted.
 Only credentials created by that attempt are removed; already-attached sessions
 remain bound. Completed setup does not imply that a signer or worker is available.
+
+Native login and registration adoption runs in runtime-owned work across Rust,
+UniFFI, and C. Once admitted, dropping the caller's future stops waiting but does
+not cancel adoption or trigger rollback. The handshake before admission remains
+bounded and cancellable. Explicit session `cancel`, `disconnect`, or `logout`
+interrupts adoption's network waits; local binding and persistence settle before
+the owned work ends. Shutdown interrupts and settles owned adoption before it
+closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
+adoption for that account. Explicit reactivation waits for adoption to settle,
+so an older rollback cannot undo the later sign-in. Caller drop does not replace
+explicit account sign-out cleanup.
+These guarantees do not change legacy host-callback/NIP-55 login behavior or
+make failed host login transactional.
 
 New, promoted, and incomplete accounts follow initial provisioning. Possibly
 exposed publication retains its pairing for restart retry when no prior callback
@@ -138,8 +152,10 @@ the RPC. Only a correlated final response from the pinned signer can do that.
 Never log status snapshots containing authentication URLs, pairing URIs, exports,
 or request payloads.
 
-Request-scoped cancellation, including dropping an async signer call, retires
-that request without cancelling another account. `disconnect` interrupts the
+Request-scoped cancellation, including dropping an async signer RPC wait, retires
+that request without cancelling another account. This differs from dropping an
+admitted Native login or registration wait, which leaves adoption running.
+`disconnect` interrupts the
 current generation and permits explicit reconnect. `cancel` is terminal for that
 actor. `connect` does not preempt another RPC; use `disconnect` before reconnecting
 when an old offline request is still pending. Delayed responses cannot revive a

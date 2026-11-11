@@ -205,11 +205,15 @@ async fn nip46_restore_and_signout() {
 struct LoginPeer {
     relay: nostr_relay_builder::LocalRelay,
     client: Client,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     url: String,
     user: Keys,
     remote: Keys,
     completion_fault: Arc<std::sync::Mutex<Option<AccountHome>>>,
+    hold_kp: Arc<std::sync::atomic::AtomicBool>,
+    kp_seen: Arc<tokio::sync::Notify>,
+    kp_release: Arc<tokio::sync::Notify>,
+    signed_profiles: Arc<std::sync::Mutex<Vec<::nostr::prelude::EventId>>>,
 }
 
 impl LoginPeer {
@@ -233,12 +237,20 @@ impl LoginPeer {
             .await
             .unwrap();
         let completion_fault = Arc::new(std::sync::Mutex::new(None::<AccountHome>));
+        let hold_kp = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kp_seen = Arc::new(tokio::sync::Notify::new());
+        let kp_release = Arc::new(tokio::sync::Notify::new());
+        let signed_profiles = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task = {
             let client = client.clone();
             let remote = remote.clone();
             let user = user.clone();
             let url = url.clone();
             let completion_fault = completion_fault.clone();
+            let hold_kp = hold_kp.clone();
+            let kp_seen = kp_seen.clone();
+            let kp_release = kp_release.clone();
+            let signed_profiles = signed_profiles.clone();
             tokio::spawn(async move {
                 let mut seen = std::collections::HashSet::new();
                 while let Some(notification) = notifications.next().await {
@@ -288,6 +300,15 @@ impl LoginPeer {
                             )
                             .finalize(&user)
                             .unwrap();
+                            if signed.kind == Kind::Metadata {
+                                signed_profiles.lock().unwrap().push(signed.id);
+                            }
+                            if unsigned["kind"].as_u64() == Some(KEY_PACKAGE_KIND)
+                                && hold_kp.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                kp_seen.notify_one();
+                                kp_release.notified().await;
+                            }
                             serde_json::json!(signed.as_json())
                         }
                         "nip44_encrypt" => serde_json::json!(
@@ -328,11 +349,15 @@ impl LoginPeer {
         Self {
             relay,
             client,
-            task,
+            task: Some(task),
             url,
             user,
             remote,
             completion_fault,
+            hold_kp,
+            kp_seen,
+            kp_release,
+            signed_profiles,
         }
     }
 
@@ -350,8 +375,12 @@ impl LoginPeer {
         session
     }
 
-    async fn close(&self) {
-        self.task.abort();
+    async fn close(mut self) {
+        self.kp_release.notify_one();
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         self.client.disconnect().await;
         self.relay.shutdown();
     }
@@ -359,8 +388,335 @@ impl LoginPeer {
 
 impl Drop for LoginPeer {
     fn drop(&mut self) {
-        self.task.abort();
+        self.kp_release.notify_one();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         self.relay.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_drop_restores_host() {
+    run_nip46_drop(DropSettlement::Rejection).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_drop_shutdown_settles() {
+    run_nip46_drop(DropSettlement::Shutdown).await;
+}
+
+enum DropSettlement {
+    Rejection,
+    Shutdown,
+    NewSignIn,
+    LocalRemove,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_drop_remove_settles() {
+    run_nip46_drop(DropSettlement::LocalRemove).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_drop_then_sign_in() {
+    run_nip46_drop(DropSettlement::NewSignIn).await;
+}
+
+async fn run_nip46_drop(settlement: DropSettlement) {
+    let shutdown_held = matches!(settlement, DropSettlement::Shutdown);
+    let sign_in_requested = matches!(settlement, DropSettlement::NewSignIn);
+    let expected_signed_out = !sign_in_requested;
+    let peer = LoginPeer::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RemovalFailureStore {
+        inner: LocalFileSecretStore::new(dir.path()),
+        refuse: std::sync::atomic::AtomicBool::new(false),
+        native_removed: tokio::sync::Notify::new(),
+    });
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let open_app = || {
+        MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            AccountHome::open_with_secret_store(dir.path(), store.clone()),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(relay.clone())
+    };
+    let app = open_app();
+    let runtime = app.runtime();
+    let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+    let completed = runtime
+        .login_external_signer(
+            peer.user.public_key().to_hex(),
+            TestExternalAccountSigner {
+                keys: peer.user.clone(),
+            },
+            AccountSetupRequest {
+                default_relays: endpoints(),
+                bootstrap_relays: endpoints(),
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let id = completed.account.account_id_hex;
+    let signed_out = runtime
+        .sign_out(
+            &id,
+            crate::runtime::SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    app.register_external_signer(
+        &id,
+        TestExternalAccountSigner {
+            keys: peer.user.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let account = home.account(&id).unwrap();
+    let originally_signed_out = account.signed_out;
+    let cached = app
+        .account_signer_for_summary(&account)
+        .unwrap()
+        .as_nostr_signer();
+    let session = peer.session(&app);
+    relay.fail_publishes_of_kind(KEY_PACKAGE_KIND);
+    peer.hold_kp
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let login = {
+        let runtime = runtime.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            runtime
+                .nip46_login(session, endpoints(), endpoints(), Vec::new())
+                .await
+        })
+    };
+    let held = tokio::time::timeout(Duration::from_secs(10), peer.kp_seen.notified())
+        .await
+        .is_ok();
+    let adopting = home.account(&id).is_ok_and(|account| !account.signed_out)
+        && home
+            .load_nip46_session(&id)
+            .is_ok_and(|pairing| pairing.is_some());
+    let pending = !login.is_finished();
+    login.abort();
+    let aborted = matches!(login.await, Err(error) if error.is_cancelled());
+
+    let removed_before_reply = if matches!(settlement, DropSettlement::LocalRemove) {
+        let removed = matches!(
+            tokio::time::timeout(Duration::from_secs(5), runtime.nip46_remove(&id)).await,
+            Ok(Ok(()))
+        );
+        if !removed {
+            session.cancel();
+        }
+        removed
+    } else {
+        false
+    };
+    let mut sign_in = Box::pin(runtime.sign_in_account(&id));
+    let mut early_sign_in = None;
+    let sign_in_waited = if sign_in_requested {
+        match tokio::time::timeout(Duration::from_millis(100), &mut sign_in).await {
+            Ok(result) => {
+                early_sign_in = Some(result);
+                false
+            }
+            Err(_) => true,
+        }
+    } else {
+        false
+    };
+    let mut newer_sign_in = false;
+    let mut closed = false;
+    let mut shutdown_before_release = false;
+    let cleanup_observed = if shutdown_held {
+        let mut closing = Box::pin(runtime.shutdown_and_close());
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut closing).await;
+        shutdown_before_release = matches!(&result, Ok(Ok(())));
+        closed = match result {
+            Ok(result) => result.is_ok(),
+            Err(_) => {
+                session.cancel();
+                peer.kp_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), &mut closing)
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+            }
+        };
+        closed
+    } else {
+        peer.kp_release.notify_one();
+        let removed =
+            tokio::time::timeout(Duration::from_secs(10), store.native_removed.notified())
+                .await
+                .is_ok();
+        if sign_in_requested {
+            newer_sign_in = match early_sign_in.take() {
+                Some(result) => result.is_ok_and(|account| !account.signed_out && account.running),
+                None => matches!(
+                    tokio::time::timeout(Duration::from_secs(10), &mut sign_in).await,
+                    Ok(Ok(account)) if !account.signed_out && account.running
+                ),
+            };
+        }
+        let settled = matches!(
+            tokio::time::timeout(Duration::from_secs(10), runtime.nip46_resume(&id)).await,
+            Ok(Err(AppError::Nip46(Nip46Error::Unavailable)))
+        );
+        removed && settled
+    };
+    drop(sign_in);
+
+    let restored_signed_out = home.account(&id).is_ok_and(|account| account.signed_out);
+    let pairing_removed = home
+        .load_nip46_session(&id)
+        .is_ok_and(|pairing| pairing.is_none());
+    let secret_removed = store
+        .has_secret_for_label(&format!(".nip46-client/{}", account.label))
+        .is_ok_and(|exists| !exists);
+    let journal_removed = home
+        .account_setup_state(&id)
+        .is_ok_and(|state| state.is_none());
+    let content = serde_json::json!({
+        "name": format!("native-drop-{}", Keys::generate().public_key()),
+    })
+    .to_string();
+    let mut unsigned =
+        EventBuilder::new(Kind::Metadata, content).finalize_unsigned(peer.user.public_key());
+    unsigned.ensure_id();
+    let expected = unsigned.id.unwrap();
+    let signature = tokio::time::timeout(Duration::from_secs(5), cached.sign_event(unsigned)).await;
+    let host_signed = matches!(
+        &signature,
+        Ok(Ok(signed)) if signed.id == expected
+            && signed.pubkey == peer.user.public_key()
+            && signed.verify().is_ok()
+            && !peer.signed_profiles.lock().unwrap().contains(&expected)
+    );
+    let rejected: Vec<_> = relay
+        .attempted_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KEY_PACKAGE_KIND)
+        .cloned()
+        .collect();
+    let real_rejection = !rejected.is_empty()
+        && rejected.iter().all(|event| {
+            let signed: Event =
+                serde_json::from_str(&serde_json::to_string(event).unwrap()).unwrap();
+            signed.verify().is_ok() && signed.pubkey == peer.user.public_key()
+        });
+    if !shutdown_held {
+        closed = runtime.shutdown_and_close().await.is_ok();
+    }
+    drop(cached);
+    drop(session);
+    drop(runtime);
+    drop(app);
+
+    let app = open_app();
+    let runtime = app.runtime();
+    let reopened_signed_out = app
+        .account_home()
+        .account(&id)
+        .is_ok_and(|account| account.signed_out);
+    let reopened_pairing_removed = app
+        .account_home()
+        .load_nip46_session(&id)
+        .is_ok_and(|pairing| pairing.is_none());
+    let reopened_journal_removed = app
+        .account_home()
+        .account_setup_state(&id)
+        .is_ok_and(|state| state.is_none());
+    let reopened_ready = matches!(
+        runtime.account_setup_readiness(&id),
+        Ok(AccountSetupReadiness::NetworkReady)
+    );
+    let started = tokio::time::timeout(Duration::from_secs(10), runtime.start())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    let restart_inactive = runtime.accounts().managed_accounts().is_ok_and(|accounts| {
+        accounts.iter().any(|account| {
+            account.account_id_hex == id
+                && account.signed_out == expected_signed_out
+                && !account.running
+        })
+    });
+    let reclosed = runtime.shutdown_and_close().await.is_ok();
+    drop(runtime);
+    drop(app);
+    peer.close().await;
+
+    assert!(signed_out.local_cleanup.completed && originally_signed_out);
+    assert!(
+        held && adopting && pending && aborted,
+        "waiter must drop during Native adoption"
+    );
+    assert_eq!(
+        restored_signed_out, expected_signed_out,
+        "a later sign-in must follow rollback"
+    );
+    assert!(
+        pairing_removed && secret_removed,
+        "rollback must erase the attempt-created pairing"
+    );
+    assert!(
+        cleanup_observed,
+        "owned adoption must finish rollback after waiter drop"
+    );
+    assert!(
+        journal_removed,
+        "failed rebind must not create a setup journal"
+    );
+    assert!(
+        host_signed,
+        "the cached slot must use the original host for a real profile signature"
+    );
+    if shutdown_held {
+        assert!(
+            shutdown_before_release,
+            "shutdown must settle rollback before signer release"
+        );
+    } else if !matches!(settlement, DropSettlement::LocalRemove) {
+        assert!(
+            real_rejection,
+            "dropped adoption must reach real rejected KeyPackage publication"
+        );
+    }
+    assert!(closed && started && reclosed);
+    assert_eq!(reopened_signed_out, expected_signed_out);
+    assert!(restart_inactive);
+    assert!(
+        reopened_pairing_removed && reopened_journal_removed && reopened_ready,
+        "restart must retain no Native pairing or journal and preserve NetworkReady"
+    );
+    if sign_in_requested {
+        assert!(
+            newer_sign_in && sign_in_waited,
+            "newer explicit sign-in must wait for the older adoption and then succeed"
+        );
+        assert!(
+            !restored_signed_out,
+            "older adoption rollback must not undo a newer completed sign-in"
+        );
+    }
+    if matches!(settlement, DropSettlement::LocalRemove) {
+        assert!(
+            removed_before_reply,
+            "local removal must interrupt owned adoption without signer response"
+        );
     }
 }
 
@@ -806,6 +1162,7 @@ async fn nip46_post_commit_failure() {
 struct RemovalFailureStore {
     inner: LocalFileSecretStore,
     refuse: std::sync::atomic::AtomicBool,
+    native_removed: tokio::sync::Notify,
 }
 
 impl AccountSecretStore for RemovalFailureStore {
@@ -830,7 +1187,13 @@ impl AccountSecretStore for RemovalFailureStore {
                 "locked fixture vault".into(),
             ));
         }
-        self.inner.remove_secret(account)
+        let native_existed = account.label.starts_with(".nip46-client/")
+            && self.inner.has_secret_for_label(&account.label)?;
+        self.inner.remove_secret(account)?;
+        if native_existed {
+            self.native_removed.notify_one();
+        }
+        Ok(())
     }
 }
 
@@ -840,6 +1203,7 @@ async fn nip46_erase_retry() {
     let store = Arc::new(RemovalFailureStore {
         inner: LocalFileSecretStore::new(dir.path()),
         refuse: std::sync::atomic::AtomicBool::new(false),
+        native_removed: tokio::sync::Notify::new(),
     });
     let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
     let user = Keys::generate();

@@ -3380,7 +3380,9 @@ MarmotStatus marmot_nip46_login(const struct MarmotClient *client, const struct 
 Create or reopen an external account using the verified session signer. Run off UI; free the returned summary with `marmot_account_summary_free`.
 Set `inbox_relays` independently, or pass `NULL, 0` to reuse the default relays.
 
-Completed accounts rebind without opening initial setup. Failed adoption preserves setup readiness and prior signed-out state; signer availability remains separate.
+Admitted Native adoption is runtime-owned: loss of the waiter does not cancel it. The preceding handshake remains bounded and cancellable. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning. Never free handles during active calls.
+
+Completed accounts rebind without opening initial setup. Failed Native adoption restores prior local callbacks, records, and activation while preserving setup readiness. Already-published KeyPackages are not retracted. Account sign-out cleanup remains explicit; legacy host login is unchanged.
 
 [Header contract](include/marmot.h#L13079)
 
@@ -3414,7 +3416,9 @@ MarmotStatus marmot_nip46_register(const struct MarmotClient *client, const char
 
 Attach an explicitly approved imported descriptor to an existing account, persist its verified credentials, and activate its worker. Ordinary cold startup restores owned sessions automatically; use `marmot_nip46_resume` for their handles. A different attached session must be removed before replacement.
 
-[Header contract](include/marmot.h#L13263)
+Admitted adoption follows the runtime-owned cancellation and shutdown contract of `marmot_nip46_login`; handles must remain live throughout active C calls. If no prior callback exists, a verified pairing remains attached for recovery when worker startup fails.
+
+[Header contract](include/marmot.h#L13094)
 
 ### `marmot_nip46_state`
 

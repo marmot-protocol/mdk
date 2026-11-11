@@ -24,6 +24,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_nip46_free` releases only its C handle, preserving the runtime-owned
   account signer and other handles. Explicit `marmot_nip46_cancel` remains
   terminal for the shared session. Join handle borrowers before freeing.
+  Admitted Native login/register adoption survives waiter drop; the preceding
+  handshake remains bounded and cancellable. Explicit cancel/disconnect/logout
+  interrupts adoption; shutdown interrupts and settles owned work before returning.
+  Failed completed-account Native rebind restores prior local callbacks, records,
+  and activation without retracting published KeyPackages. Sign-out cleanup stays
+  explicit; legacy host login behavior is unchanged.
   Setup rollback restores prior signer ownership and grants; publication retries
   retain paired credentials across restart. Vault deletion failures leave a
   stopped signer with retryable cleanup ownership.

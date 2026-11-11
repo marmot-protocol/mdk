@@ -506,6 +506,25 @@ impl Nip46Session {
     pub(crate) fn same_session(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.core, &other.core)
     }
+    pub(crate) async fn during_adoption<T>(
+        session: Option<&Self>,
+        work: impl Future<Output = Result<T, crate::AppError>>,
+    ) -> Result<T, crate::AppError> {
+        let Some(session) = session else {
+            return work.await;
+        };
+        let mut control = session.core.control.subscribe();
+        let generation = *control.borrow();
+        Shared::check(&lock(&session.core.shared.data), generation)?;
+        tokio::select! {
+            biased;
+            _ = control.changed() => {
+                let data = lock(&session.core.shared.data);
+                Err(data.status.last_error.clone().unwrap_or(Nip46Error::Disconnected).into())
+            }
+            result = work => result,
+        }
+    }
     pub(crate) fn registered_signer(&self) -> Arc<dyn crate::ExternalAccountSigner> {
         let mut data = lock(&self.core.shared.data);
         if let Some(signer) = data.registration.as_ref().and_then(Weak::upgrade) {

@@ -1,5 +1,17 @@
 use super::*;
 use crate::{Nip46Error, Nip46Session};
+use nostr::prelude::PublicKey;
+
+pub(super) enum Nip46AdoptionScope {
+    Runtime,
+    App,
+    Account(PublicKey),
+}
+
+struct Nip46Erasure {
+    account: AccountSummary,
+    session: Option<Nip46Session>,
+}
 
 impl MarmotAppRuntime {
     /// Prepare an offline remote signer. Permission approval precedes connection.
@@ -8,7 +20,8 @@ impl MarmotAppRuntime {
         Ok(Nip46Session::new(&self.accounts.app, config_json)?)
     }
 
-    /// Bind the remotely verified user and persist its communication key before setup signs.
+    /// Persist the verified signer before setup signs. Once adoption starts,
+    /// dropping this waiter does not cancel it; use the session's explicit controls.
     pub async fn nip46_login(
         &self,
         session: Nip46Session,
@@ -30,14 +43,18 @@ impl MarmotAppRuntime {
             publish_initial_key_package: true,
             ..Default::default()
         };
-        let result = self
-            .accounts
-            .login_with_external(public_key, ExternalSetupSigner::Nip46(session), request)
-            .await?;
-        Ok(result.account)
+        let runtime = self.clone();
+        self.own_nip46_adoption(session.clone(), async move {
+            let result = runtime
+                .accounts
+                .login_with_external(public_key, ExternalSetupSigner::Nip46(session), request)
+                .await?;
+            Ok(result.account)
+        })
+        .await
     }
 
-    /// Attach a connected remote session to an existing external account.
+    /// Attach a connected remote session. Adoption survives dropping this waiter.
     pub async fn nip46_register(
         &self,
         account_ref: &str,
@@ -51,18 +68,81 @@ impl MarmotAppRuntime {
         if !account.external_signing {
             return Err(Nip46Error::Mismatch.into());
         }
+        let runtime = self.clone();
+        self.own_nip46_adoption(session.clone(), async move {
+            runtime.attach_nip46_session(account, session).await
+        })
+        .await
+    }
+
+    async fn own_nip46_adoption<T: Send + 'static>(
+        &self,
+        session: Nip46Session,
+        work: impl Future<Output = Result<T, AppError>> + Send + 'static,
+    ) -> Result<T, AppError> {
+        let task = {
+            let mut adoptions = self
+                .accounts
+                .app
+                .nip46_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.shared.lifecycle().ensure_running()?;
+            self.accounts.app.ensure_storage_open("NIP-46 adoption")?;
+            if adoptions.closed {
+                return Err(Nip46Error::Cancelled.into());
+            }
+            let user = session.public_key()?;
+            adoptions.active.retain(|adoption| !adoption.finished());
+            let (completion, completed) = watch::channel(false);
+            let registry = Arc::downgrade(&self.accounts.app.nip46_adoptions);
+            let task = tokio::spawn(async move {
+                let result = work.await;
+                completion.send_replace(true);
+                if let Some(registry) = registry.upgrade() {
+                    registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .active
+                        .retain(|adoption| !adoption.finished());
+                }
+                result
+            });
+            adoptions.active.push(crate::Nip46Adoption {
+                owner: Arc::downgrade(&self.accounts.nip46_adoption_owner),
+                user,
+                session,
+                completed,
+            });
+            task
+        };
+        task.await
+            .map_err(|_| AppError::BlockingTask("NIP-46 adoption task failed".into()))?
+    }
+
+    async fn attach_nip46_session(
+        &self,
+        account: AccountSummary,
+        session: Nip46Session,
+    ) -> Result<(), AppError> {
         let gate = self
             .accounts
             .onboarding_transaction(&account.account_id_hex);
-        let _transaction = gate.lock().await;
+        let _transaction =
+            Nip46Session::during_adoption(Some(&session), async { Ok(gate.lock().await) }).await?;
+        self.shared.lifecycle().ensure_running()?;
+        self.accounts.app.ensure_storage_open("NIP-46 adoption")?;
         let accounts = self.accounts.clone();
         let label = account.label.clone();
+        let observer = session.clone();
         let binding =
             blocking_app_task(move || accounts.track_nip46_session(&label, session)).await?;
-        let result = self
-            .accounts
-            .retry_and_reconcile_for_account(&account.account_id_hex)
-            .await;
+        let result = Nip46Session::during_adoption(
+            Some(&observer),
+            self.accounts
+                .retry_and_reconcile_for_account(&account.account_id_hex),
+        )
+        .await;
         if result.is_err()
             && let Some(binding) = binding
             && binding.previous_signer.is_some()
@@ -76,7 +156,7 @@ impl MarmotAppRuntime {
             .await;
             let reconciliation = self
                 .accounts
-                .reconcile_for_account(&account.account_id_hex)
+                .reconcile_nip46_cleanup(&account.account_id_hex)
                 .await;
             cleanup?;
             reconciliation?;
@@ -104,14 +184,16 @@ impl MarmotAppRuntime {
         let gate = self
             .accounts
             .onboarding_transaction(&account.account_id_hex);
-        let _transaction = gate.lock().await;
+        let _transaction = self.accounts.lock_nip46_removal(gate, &account).await;
+        self.shared.lifecycle().ensure_running()?;
+        let account_id = account.account_id_hex.clone();
+        let target = self.accounts.nip46_erase_target(account);
         let accounts = self.accounts.clone();
-        let label = account.label;
         blocking_app_task(move || {
-            accounts.erase_nip46_session(&label, Nip46Removal::IncludingOrphaned)
+            accounts.erase_nip46_target(target, Nip46Removal::IncludingOrphaned)
         })
         .await?;
-        self.accounts.reconcile().await
+        self.accounts.reconcile_nip46_cleanup(&account_id).await
     }
 
     async fn load_nip46_session(
@@ -186,6 +268,91 @@ impl MarmotAppRuntime {
 }
 
 impl AccountManager {
+    async fn lock_nip46_removal(
+        &self,
+        gate: Arc<Mutex<()>>,
+        account: &AccountSummary,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let user = PublicKey::from_hex(&account.account_id_hex).ok();
+        let acquisition = gate.lock_owned();
+        tokio::pin!(acquisition);
+        let ready = {
+            let adoptions = self
+                .app
+                .nip46_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Queue before releasing admission: later adoptions must wait behind removal.
+            let ready = futures::FutureExt::now_or_never(acquisition.as_mut());
+            for adoption in &adoptions.active {
+                if Some(adoption.user) == user {
+                    adoption.session.cancel();
+                }
+            }
+            ready
+        };
+        match ready {
+            Some(guard) => guard,
+            None => acquisition.await,
+        }
+    }
+
+    pub(super) async fn finish_nip46_adoptions(&self, scope: Nip46AdoptionScope) {
+        let owner = Arc::downgrade(&self.nip46_adoption_owner);
+        let mut active = {
+            let mut adoptions = self
+                .app
+                .nip46_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(scope, Nip46AdoptionScope::App) {
+                adoptions.closed = true;
+            }
+            adoptions.active.retain(|adoption| !adoption.finished());
+            adoptions
+                .active
+                .iter()
+                .filter(|adoption| match scope {
+                    Nip46AdoptionScope::Runtime => adoption.owner.ptr_eq(&owner),
+                    Nip46AdoptionScope::App => true,
+                    Nip46AdoptionScope::Account(user) => adoption.user == user,
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for adoption in &active {
+            adoption.session.cancel();
+        }
+        for adoption in &mut active {
+            while !*adoption.completed.borrow_and_update() {
+                if adoption.completed.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub(super) async fn finish_nip46_account(&self, account: &AccountSummary) {
+        // A malformed stored id cannot own a verified adoption; erasure still works.
+        if let Ok(user) = PublicKey::from_hex(&account.account_id_hex) {
+            self.finish_nip46_adoptions(Nip46AdoptionScope::Account(user))
+                .await;
+        }
+    }
+
+    pub(super) async fn reconcile_nip46_cleanup(&self, account: &str) -> Result<(), AppError> {
+        let closing = self
+            .app
+            .nip46_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed;
+        if closing || self.shared.lifecycle().is_stopping() {
+            return Ok(());
+        }
+        self.reconcile_for_account(account).await
+    }
+
     pub(super) fn track_nip46_session(
         &self,
         account_ref: &str,
@@ -238,9 +405,10 @@ impl AccountManager {
         removal: Nip46Removal,
     ) -> Result<(), AppError> {
         let account = self.resolve(account_ref)?;
-        if !account.external_signing {
-            return Ok(());
-        }
+        self.erase_nip46_target(self.nip46_erase_target(account), removal)
+    }
+
+    fn nip46_erase_target(&self, account: AccountSummary) -> Nip46Erasure {
         let session = self
             .app
             .nip46_sessions
@@ -248,12 +416,31 @@ impl AccountManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&account.account_id_hex)
             .cloned();
-        if let Some(session) = session {
+        Nip46Erasure { account, session }
+    }
+
+    fn erase_nip46_target(
+        &self,
+        target: Nip46Erasure,
+        removal: Nip46Removal,
+    ) -> Result<(), AppError> {
+        if !target.account.external_signing {
+            return Ok(());
+        }
+        if let Some(session) = target.session {
             session.erase_local()?;
         } else {
+            let sessions = self
+                .app
+                .nip46_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if sessions.contains_key(&target.account.account_id_hex) {
+                return Ok(());
+            }
             self.app
                 .account_home()
-                .remove_nip46_session(&account.label, removal)
+                .remove_nip46_session(&target.account.label, removal)
                 .map_err(|_| Nip46Error::Storage)?;
         }
         Ok(())

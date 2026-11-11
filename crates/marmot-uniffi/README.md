@@ -536,7 +536,16 @@ pairing can be registered after local erasure succeeds. A vault deletion error
 leaves signing stopped; retry `logout` or `nip46Remove` after the vault recovers.
 It does not replace MDK account sign-out.
 
-Completed-account rebinds preserve setup readiness even when adoption fails.
+Once Native `nip46Login` or `nip46Register` adoption is admitted, cancelling the
+foreign call only stops waiting. Runtime-owned adoption continues without rollback
+on caller cancellation. The preceding handshake remains bounded and cancellable.
+Use session `cancel`, `disconnect`, or `logout` to interrupt adoption explicitly.
+Shutdown interrupts and settles owned adoption before returning.
+
+Failed completed-account Native rebinds restore the prior local callback, grant
+record, and activation state while preserving setup readiness. Already-published
+KeyPackages are not retracted. Account sign-out cleanup remains explicit. This
+does not make legacy host-callback/NIP-55 failed login transactional.
 An unavailable signer can still stop the account's worker.
 
 Local-key and arbitrary host callback APIs are unchanged. For C ownership and

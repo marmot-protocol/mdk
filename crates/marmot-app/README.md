@@ -127,6 +127,12 @@ The runtime owns NIP-46 sessions for `bunker://` and client-initiated
 communication key. Permission approval precedes connection, and stored sessions
 restore before account workers without host signer callbacks. Sign-out and wipe
 erase the communication key; terminal storage close preserves it for restart.
+Native login/register adoption is runtime-owned once admitted: dropping its future
+stops waiting, not adoption. The preceding handshake remains bounded and cancellable.
+Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
+interrupts and settles owned adoption before returning. Failed completed-account
+rebind restores prior local signer state and activation, but does not retract
+already-published KeyPackages. Host callback/NIP-55 login behavior is unchanged.
 See [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions)
 for pairing, permission versions, recovery, cancellation, and credential storage.
 

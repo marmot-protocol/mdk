@@ -269,6 +269,7 @@ pub struct AccountManager {
     #[cfg(test)]
     reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
+    nip46_adoption_owner: Arc<()>,
 }
 
 #[derive(Default)]
@@ -6589,6 +6590,9 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.accounts
+            .finish_nip46_adoptions(nip46::Nip46AdoptionScope::Runtime)
+            .await;
         self.shared
             .local_submission_queue
             .lock()
@@ -6656,8 +6660,8 @@ impl MarmotAppRuntime {
         );
     }
 
-    /// Stop admitting runtime work, close every SQLite database and release the
-    /// root runtime lease, then make a bounded attempt to drain graceful
+    /// Stop admitting runtime work, settle NIP-46 adoption, close every SQLite
+    /// database and release the root runtime lease, then drain graceful
     /// shutdown work. When this returns, nothing this process owns holds a file
     /// lock inside the Marmot root.
     ///
@@ -6673,7 +6677,8 @@ impl MarmotAppRuntime {
     /// App Group container).
     ///
     /// Ordering is the point of this method: the lifecycle stop latch closes
-    /// admission first, then storage closure takes priority over graceful
+    /// admission first. NIP-46 network waits are interrupted and local credential
+    /// mutations settle before storage closes. Closure takes priority over graceful
     /// draining. This is deliberately different from [`Self::shutdown`]. A
     /// host suspension deadline cannot safely sit behind directory, worker,
     /// relay, or audit cleanup that may be awaiting network or task progress.
@@ -6707,6 +6712,10 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        // Finish Native local rollback before storage and its root lease close.
+        self.accounts
+            .finish_nip46_adoptions(nip46::Nip46AdoptionScope::App)
+            .await;
         self.shared
             .local_submission_queue
             .lock()
@@ -6942,6 +6951,7 @@ impl AccountManager {
                 accepting: true,
                 handles: Vec::new(),
             })),
+            nip46_adoption_owner: Arc::new(()),
         }
     }
 
@@ -7157,6 +7167,7 @@ impl AccountManager {
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
         let account = self.app.account_home().account(account_ref)?;
+        self.finish_nip46_account(&account).await;
         let fence = self
             .setup
             .fence_generated_teardown(self, &account.account_id_hex)
@@ -7174,7 +7185,6 @@ impl AccountManager {
         // A label may have been reused while foreground setup finished.
         // Check before purging reports and after taking the worker transaction.
         self.resolve_original(expected)?;
-
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
@@ -7430,6 +7440,8 @@ impl AccountManager {
         account_ref: &str,
         unlinked: bool,
     ) -> Result<(), AppError> {
+        let account = self.resolve(account_ref)?;
+        self.finish_nip46_account(&account).await;
         // Queued moderation reports never outlive a sign-out: stop and delete
         // them, and admit none until the sign-out below has committed. Fenced
         // before the global lock: the purge may open account storage. A failed
@@ -7524,6 +7536,9 @@ impl AccountManager {
 
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
+        let account = self.resolve(account_ref)?;
+        let gate = self.onboarding_transaction(&account.account_id_hex);
+        let _transaction = gate.lock().await;
         let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "login",
@@ -8720,8 +8735,20 @@ impl AccountManager {
                 if signer_public_key.to_hex() != account_id_hex {
                     return Err(AppError::ExternalSignerMismatch);
                 }
+                let native_session = match &signer {
+                    ExternalSetupSigner::Nip46(session) => Some(session.clone()),
+                    ExternalSetupSigner::Host(_) => None,
+                };
                 let gate = self.onboarding_transaction(&account_id_hex);
-                let _transaction = gate.lock().await;
+                let _transaction =
+                    crate::Nip46Session::during_adoption(native_session.as_ref(), async {
+                        Ok(gate.lock().await)
+                    })
+                    .await?;
+                if native_session.is_some() {
+                    self.shared.lifecycle().ensure_running()?;
+                    self.app.ensure_storage_open("NIP-46 adoption")?;
+                }
                 let (existing_account, previous_setup) =
                     match self.app.account_home().account(&account_id_hex).ok() {
                         Some(account) => {
@@ -8774,10 +8801,63 @@ impl AccountManager {
                             AccountSetupPhase::LocalStateCreated,
                         )?;
                     }
-                    let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-                    let relay_lists = self.resolve_external_relays(&account, &request).await?;
+                    let network = async {
+                        let directory_bootstrap_relays =
+                            directory_bootstrap_relays_for_setup(&request);
+                        let relay_lists = self.resolve_external_relays(&account, &request).await?;
 
-                    let key_package_bytes = if request.publish_initial_key_package {
+                        let key_package_bytes = if request.publish_initial_key_package {
+                            if account.signed_out {
+                                account = self
+                                    .app
+                                    .account_home()
+                                    .set_account_signed_out(&account.label, false)?;
+                                self.app.presentation_signals.catalog_changed();
+                            }
+                            self.app.account_home().set_account_setup_phase(
+                                &account.label,
+                                AccountSetupPhase::KeyPackagePublicationStarted,
+                            )?;
+                            match self.publish_initial_key_package_for_account(&account).await {
+                                Ok(bytes) => {
+                                    self.app.account_home().set_account_setup_phase(
+                                        &account.label,
+                                        AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                    )?;
+                                    Some(bytes)
+                                }
+                                Err(err) => {
+                                    // Session lifecycle state owns exact signed bytes and
+                                    // private material before network exposure. Once
+                                    // KeyPackage setup has started, deleting a freshly-added
+                                    // external account could orphan an ambiguously accepted
+                                    // publication; keep it for an exact-byte retry instead.
+                                    // A previously signed-out account is different: restore
+                                    // that durable state while retaining its setup journal.
+                                    if reactivating_existing && native_session.is_none() {
+                                        self.restore_signed_out_after_key_package_failure(
+                                            &account.label,
+                                        )
+                                        .await;
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Single-hop advisory refresh keeps the shorter profile-refresh bound.
+                        let _ = bounded_advisory_step(
+                            self.shared.observer.performance(),
+                            ACCOUNT_SETUP_ADVISORY_WAIT,
+                            "login_directory_refresh",
+                            self.app.directory().refresh_user_directory_for_account_id(
+                                &account.account_id_hex,
+                                directory_bootstrap_relays,
+                            ),
+                        )
+                        .await;
                         if account.signed_out {
                             account = self
                                 .app
@@ -8785,67 +8865,18 @@ impl AccountManager {
                                 .set_account_signed_out(&account.label, false)?;
                             self.app.presentation_signals.catalog_changed();
                         }
-                        self.app.account_home().set_account_setup_phase(
-                            &account.label,
-                            AccountSetupPhase::KeyPackagePublicationStarted,
-                        )?;
-                        match self.publish_initial_key_package_for_account(&account).await {
-                            Ok(bytes) => {
-                                self.app.account_home().set_account_setup_phase(
-                                    &account.label,
-                                    AccountSetupPhase::KeyPackagePublicationConfirmed,
-                                )?;
-                                Some(bytes)
-                            }
-                            Err(err) => {
-                                // Session lifecycle state owns exact signed bytes and
-                                // private material before network exposure. Once
-                                // KeyPackage setup has started, deleting a freshly-added
-                                // external account could orphan an ambiguously accepted
-                                // publication; keep it for an exact-byte retry instead.
-                                // A previously signed-out account is different: restore
-                                // that durable state while retaining its setup journal.
-                                if reactivating_existing {
-                                    self.restore_signed_out_after_key_package_failure(
-                                        &account.label,
-                                    )
-                                    .await;
-                                }
-                                return Err(err);
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Single-hop advisory refresh keeps the shorter profile-refresh bound.
-                    let _ = bounded_advisory_step(
-                        self.shared.observer.performance(),
-                        ACCOUNT_SETUP_ADVISORY_WAIT,
-                        "login_directory_refresh",
-                        self.app.directory().refresh_user_directory_for_account_id(
-                            &account.account_id_hex,
-                            directory_bootstrap_relays,
-                        ),
-                    )
-                    .await;
-                    if account.signed_out {
-                        account = self
-                            .app
+                        self.retry_and_reconcile_for_account(&account.account_id_hex)
+                            .await?;
+                        // Journal cleanup may remove its first file before failing.
+                        // A network-ready account and signer are already committed.
+                        readiness = AccountSetupReadiness::NetworkReady;
+                        self.app
                             .account_home()
-                            .set_account_signed_out(&account.label, false)?;
-                        self.app.presentation_signals.catalog_changed();
-                    }
-                    self.retry_and_reconcile_for_account(&account.account_id_hex)
-                        .await?;
-                    // Journal cleanup may remove its first file before failing.
-                    // A network-ready account and signer are already committed.
-                    readiness = AccountSetupReadiness::NetworkReady;
-                    self.app
-                        .account_home()
-                        .complete_account_setup(&account.label)?;
+                            .complete_account_setup(&account.label)?;
 
-                    Ok((relay_lists, key_package_bytes))
+                        Ok((relay_lists, key_package_bytes))
+                    };
+                    crate::Nip46Session::during_adoption(native_session.as_ref(), network).await
                 }
                 .await;
                 match setup {
@@ -8857,6 +8888,18 @@ impl AccountManager {
                         readiness,
                     }),
                     Err(error) => {
+                        let restored = if native_session.is_some()
+                            && reactivating_existing
+                            && !account.signed_out
+                            && readiness != AccountSetupReadiness::NetworkReady
+                        {
+                            self.app
+                                .account_home()
+                                .set_account_signed_out(&account.label, true)
+                                .map(drop)
+                        } else {
+                            Ok(())
+                        };
                         let durable_account = self.app.account_home().account(&account.label);
                         let setup_state =
                             self.app.account_home().account_setup_state(&account.label);
@@ -8892,11 +8935,12 @@ impl AccountManager {
                                 })
                                 .await;
                                 let reconciliation =
-                                    self.reconcile_for_account(&account.account_id_hex).await;
+                                    self.reconcile_nip46_cleanup(&account.account_id_hex).await;
                                 cleanup?;
                                 reconciliation?;
                             }
                         }
+                        restored?;
                         durable_account?;
                         setup_state?;
                         if rollback_account {
@@ -8968,6 +9012,10 @@ impl AccountManager {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let reactivating = account.signed_out;
+        let native_session = match &signer {
+            ExternalSetupSigner::Nip46(session) => Some(session.clone()),
+            ExternalSetupSigner::Host(_) => None,
+        };
         let binding = self
             .bind_external_signer(&account, public_key, signer)
             .await?;
@@ -9003,8 +9051,9 @@ impl AccountManager {
             self.retry_and_reconcile_for_account(&account.account_id_hex)
                 .await?;
             Ok((relay_lists, key_package_bytes))
-        }
-        .await;
+        };
+        let adoption =
+            crate::Nip46Session::during_adoption(native_session.as_ref(), adoption).await;
         match adoption {
             Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
                 account,
@@ -9033,7 +9082,11 @@ impl AccountManager {
                 } else {
                     Ok(())
                 };
-                let reconciliation = self.reconcile_for_account(&account.account_id_hex).await;
+                let reconciliation = if native_session.is_some() {
+                    self.reconcile_nip46_cleanup(&account.account_id_hex).await
+                } else {
+                    self.reconcile_for_account(&account.account_id_hex).await
+                };
                 restored?;
                 cleanup?;
                 reconciliation?;
@@ -9711,6 +9764,8 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.finish_nip46_adoptions(nip46::Nip46AdoptionScope::Runtime)
+            .await;
         self.app.stop_emoji_set_installs();
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;

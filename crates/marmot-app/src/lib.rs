@@ -560,6 +560,26 @@ fn media_close_key(label: &str) -> String {
 }
 
 #[derive(Clone)]
+struct Nip46Adoption {
+    owner: std::sync::Weak<()>,
+    user: nostr::prelude::PublicKey,
+    session: Nip46Session,
+    completed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Nip46Adoption {
+    fn finished(&self) -> bool {
+        *self.completed.borrow() || self.completed.has_changed().is_err()
+    }
+}
+
+#[derive(Default)]
+struct Nip46Adoptions {
+    closed: bool,
+    active: Vec<Nip46Adoption>,
+}
+
+#[derive(Clone)]
 pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
@@ -679,6 +699,7 @@ pub struct MarmotApp {
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     nip46_owner: Arc<()>,
     nip46_sessions: Arc<Mutex<HashMap<String, Nip46Session>>>,
+    nip46_adoptions: Arc<Mutex<Nip46Adoptions>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
@@ -1812,6 +1833,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             nip46_owner: Arc::new(()),
             nip46_sessions: Arc::default(),
+            nip46_adoptions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1938,6 +1960,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             nip46_owner: Arc::new(()),
             nip46_sessions: Arc::default(),
+            nip46_adoptions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
             sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -6888,8 +6911,8 @@ impl MarmotApp {
     /// a running account engine (see [`SqliteAccountStorage::close`] for what
     /// that does to in-flight transactions).
     /// [`MarmotAppRuntime::shutdown_and_close`] is the sequenced entry point
-    /// host apps should use; it stops admitting runtime work before calling
-    /// this and drains the workers afterwards.
+    /// host apps should use; it stops admission and settles NIP-46 adoption
+    /// before calling this, then drains workers afterwards.
     ///
     /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
     /// accessor then fails with
@@ -6930,6 +6953,10 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.nip46_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
         let _ = self.abort_all_public_indexer_copies();
         self.stop_emoji_set_installs();
         self.presentation_signals.catalog_changed();

@@ -13,6 +13,12 @@
   auth-challenge completion, export, terminal cancellation, and bounded logout.
   `MarmotKitError::Nip46` retains the typed session reason; exhaustive switches
   need the new case. Local-key and arbitrary host callback APIs are unchanged.
+  Native login/register adoption remains runtime-owned after caller cancellation;
+  only the wait ends. The preceding handshake remains bounded and cancellable.
+  Explicit session cancel/disconnect/logout interrupts adoption; shutdown interrupts
+  and settles owned work before returning. Failed completed-account Native rebind
+  restores prior local callbacks, records, and activation, not published KeyPackages.
+  Ordinary sign-out cleanup remains explicit; legacy host login is unchanged.
 
 ## 0.16.0 - 2026-11-11
 

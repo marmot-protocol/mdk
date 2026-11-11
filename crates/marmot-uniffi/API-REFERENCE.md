@@ -5789,7 +5789,9 @@ pub async fn nip46_login( &self, session: Arc<Nip46SessionFfi>, default_relays: 
 
 Create or reopen the external account using the verified shared signer and persist its communication credentials through MDK's configured secret store. Messaging relay-list discovery and default publication follow external-signer login. Empty inbox relays reuse defaults. A session from another Marmot object returns `ExternalSignerMismatch` before network work.
 
-Before commit, a failed handoff restores the previous callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup, preserving prior readiness and signed-out state on failure. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account.
+Once Native adoption is admitted, caller cancellation only stops waiting; runtime-owned work continues. The preceding handshake remains bounded and cancellable. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning.
+
+Before commit, a failed Native handoff restores the previous local callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup and restore prior activation on failure. Already-published KeyPackages are not retracted. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account. Account sign-out cleanup remains explicit; legacy host login behavior is unchanged.
 
 [Source](src/nip46.rs#L260) · [Session lifecycle](README.md#nip-46-accounts)
 
@@ -5800,6 +5802,8 @@ pub async fn nip46_register( &self, account_ref: String, session: Arc<Nip46Sessi
 ```
 
 Attach a verified imported session to an existing account, persist credentials, and activate the worker. A different attached session must be removed before replacement. A foreign-owner handle returns `ExternalSignerMismatch`. Ordinary cold startup restores MDK-owned sessions without this import path.
+
+Admitted adoption outlives caller cancellation and is interrupted and settled by shutdown, as with `nip46_login`. If no prior callback exists, a verified pairing remains attached for recovery when worker startup fails.
 
 [Source](src/nip46.rs#L289) · [Session lifecycle](README.md#nip-46-accounts)
 
