@@ -40,9 +40,9 @@
   retained anchor no longer leaves the group live on anchor state (mdk#3272). The group is quarantined as
   `RewindRestoreFailed` with a `GroupHydrationQuarantined` event, and its input is retained. Neither
   `retry_hydrate_quarantined_group`, which answers `false`, nor a re-join Welcome clears it; the next open tries to
-  restore the kept live state and replays the input. Meanwhile `pending_group_rejoins_for` omits the group's stored
-  rejoin offers and `confirm_group_rejoin` returns `UnknownGroup` for them, since their consent token would be the
-  anchor's.
+  restore the kept live state and replays the input only if that succeeds; otherwise the group is quarantined again.
+  Meanwhile `pending_group_rejoins_for` omits the group's stored rejoin offers and `confirm_group_rejoin` returns
+  `UnknownGroup` for them, since their consent token would be the anchor's.
 - `EngineBuilder::build` restores every group's interrupted rewind before anything reads group state (mdk#3272). With
   deferred hydration, ingest and a Welcome join could read a seeded group's record before its hydration restored a
   rewind interrupted by a crash or a failed restore. A message could then be kept in a removed copy's ring, or a

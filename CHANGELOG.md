@@ -38,9 +38,11 @@
   state, instead of leaving it live on that past state for the session and
   validating it as live at the next open (#3272). The group reports the new
   hydration-quarantine reason `RewindRestoreFailed`; a retry or re-join does not
-  clear it, its input is retained, and the next account open tries to restore
-  the live state and replays the input. Opening an account now restores every
-  group's interrupted rewind before ingest or a Welcome join can read it.
+  clear it, and its input is retained. The next account open tries to restore
+  the live state and replays the input only if that succeeds; otherwise the
+  group is quarantined again for the same reason. Opening an account now
+  handles every group's interrupted rewind before ingest or a Welcome join can
+  read it.
 - Report each relay the host-safety rule refuses (a private or loopback
   address, a plaintext `ws://` URL, or a URL that does not parse) as never
   contacted (#3276). A commit that every other group relay refused was retried
