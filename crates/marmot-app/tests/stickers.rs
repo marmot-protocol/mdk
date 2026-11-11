@@ -148,6 +148,7 @@ async fn remote_installed_list(relay_url: &str, author: PublicKey) -> (u64, Vec<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_installed_list_refresh_blocks_stale_publication_until_rebase() {
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let policy = StallInstalledListReadsWhileArmed::default();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(policy.clone()));
@@ -310,6 +311,7 @@ fn pack_naddr(author: &Keys, identifier: &str, hint: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let account_relay = LocalRelay::new(RelayBuilder::default());
     account_relay.run().await.unwrap();
@@ -402,6 +404,7 @@ async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sync_refreshes_installed_packs() {
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let policy = StallInstalledListReadsWhileArmed::default();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(policy.clone()));

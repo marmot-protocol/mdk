@@ -192,6 +192,7 @@ fn replay_app(root: &Path, url: &str, policy: marmot_app::CursorPersistence) -> 
 }
 
 async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Duration) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = OfflineReplayRelay::start().await;
     let roots: Vec<_> = (0..=senders)
         .map(|_| tempfile::tempdir().unwrap())

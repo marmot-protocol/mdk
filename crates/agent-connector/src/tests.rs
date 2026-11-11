@@ -389,6 +389,11 @@ pub(crate) fn test_config(
     dev_allow_any_invites: bool,
     debug_controls: bool,
 ) -> AgentConnectorConfig {
+    // Every connector this suite opens skips SQLCipher's memory security and
+    // full fsync, as storage-sqlite's test support allows. No test here
+    // observes either setting, and creating each account's database with
+    // memory security on dominated these tests' run time.
+    storage_sqlite::relax_storage_for_test_process();
     let mut config = AgentConnectorConfig::new(home);
     config.socket = socket.into();
     config.relays = relays;
@@ -427,6 +432,7 @@ fn received_message(
 
 #[tokio::test]
 async fn control_event_requires_a_durable_row_for_received_messages() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("agent")
@@ -921,6 +927,7 @@ async fn inbound_catch_up_driver_preserves_delayed_cadence_after_a_slow_pass() {
 
 #[tokio::test]
 async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_retry() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("retry enumeration failure").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -999,6 +1006,7 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
 
 #[tokio::test]
 async fn invite_policy_retry_delay_starts_after_the_failed_attempt_returns() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("retry delay after completion").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -1070,6 +1078,7 @@ async fn stream_store_evicts_idle() {
     use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
     use std::time::Instant;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1137,6 +1146,7 @@ async fn stream_store_sweep_spares_sealed_session() {
     use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
     use std::time::Instant;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1859,6 +1869,7 @@ async fn connector_socket_requires_configured_auth_token() {
 
 #[tokio::test]
 async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -1976,6 +1987,7 @@ fn invalid_edit_target_is_a_final_connector_error() {
 
 #[tokio::test]
 async fn connector_socket_subscribes_to_inbound_messages() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -2850,6 +2862,7 @@ async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
 
 #[tokio::test]
 async fn connector_policy_accepts_allowed_welcomer() {
+    storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2917,6 +2930,7 @@ async fn connector_policy_accepts_allowed_welcomer() {
 
 #[tokio::test]
 async fn connector_policy_declines_unlisted_welcomer() {
+    storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2975,6 +2989,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
 
 #[tokio::test]
 async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welcomer() {
+    storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -3120,11 +3135,13 @@ async fn assert_multiparty_invite_policy(policy: AgentControlInvitePolicy, expec
 
 #[tokio::test]
 async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() {
+    storage_sqlite::relax_storage_for_test_process();
     assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticatedDirect, true).await;
 }
 
 #[tokio::test]
 async fn connector_policy_any_authenticated_accepts_multiparty_invite() {
+    storage_sqlite::relax_storage_for_test_process();
     assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticated, false).await;
 }
 
@@ -3187,6 +3204,7 @@ fn dev_allow_any_invites_requires_debug_controls() {
 
 #[tokio::test]
 async fn connector_start_reconciles_existing_allowed_pending_invite() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("existing pending invite").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -3215,6 +3233,7 @@ async fn connector_start_reconciles_existing_allowed_pending_invite() {
 
 #[tokio::test]
 async fn connector_start_reconciles_existing_unlisted_pending_invite_by_declining() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("existing unlisted pending invite").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -3563,6 +3582,7 @@ async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
 #[tokio::test]
 async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_read_relays_hold_none()
 {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     // The account published through one relay; a later connector reads and
     // publishes through another. Re-bootstrapping with new `--relay` values is
@@ -3658,6 +3678,7 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
 
 #[tokio::test]
 async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_lagging_relay() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     // A read relay can be *stale* rather than empty: it keeps serving the
     // pre-edit kind:0 while the newer edit is already in the local directory
@@ -3906,6 +3927,7 @@ async fn connector_start_publishes_key_package_for_existing_local_account() {
 
 #[tokio::test]
 async fn connector_socket_sends_final_message() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4074,6 +4096,7 @@ fn group_info_framing_preserves_named_subject_and_omits_absent_subject() {
 
 #[tokio::test]
 async fn group_info_reads_current_chat_list_group_name_without_using_title() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4252,6 +4275,7 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
 
 #[tokio::test]
 async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4615,6 +4639,7 @@ async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() 
 /// completes the stream.
 #[tokio::test]
 async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4779,6 +4804,7 @@ async fn connector_finish_reuses_receipt() {
     use crate::error::ConnectorError;
     use crate::validation::normalize_hex;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4976,6 +5002,7 @@ async fn connector_finish_reuses_receipt() {
 
 #[tokio::test]
 async fn connector_socket_cancels_stream_session() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -5804,6 +5831,7 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
 
 #[tokio::test]
 async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
+    storage_sqlite::relax_storage_for_test_process();
     // End-to-end regression for mdk#210: when the inbound broadcast lags, the
     // connector re-queries storage and re-delivers the genuinely-missed inbound messages on
     // the existing InboundMessage path the consumer already handles. A real send populates
@@ -6131,6 +6159,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
 #[tokio::test]
 async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
+    storage_sqlite::relax_storage_for_test_process();
     // GAP-06: a retry that reuses the same idempotency key must return the
     // ORIGINAL durable message ids without re-sending, so a post-write-timeout
     // retry can never double-post an unrecallable encrypted message. Observable
@@ -8191,6 +8220,7 @@ async fn relay_list_test_relay(
 
 #[tokio::test]
 async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_added_relay, added_url) = mock_relay_url().await;
     // Seed on the primary relay. For the NIP-65 add, both old outbox relays
@@ -8396,6 +8426,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
 
 #[tokio::test]
 async fn connector_relay_lists_reports_the_cached_lists() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, relay_url) = mock_relay_url().await;
     let (_read_relay, read_url) = mock_relay_url().await;
@@ -8550,6 +8581,7 @@ async fn connector_relay_list_edit_rejects_invalid_inputs_before_reading() {
 
 #[tokio::test]
 async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_lagging_relay, lagging_url) = mock_relay_url().await;
     let (_current_relay, current_url) = mock_relay_url().await;
@@ -8683,6 +8715,7 @@ const IMPORTED_IDENTITY_SECRET_HEX: &str =
 
 #[tokio::test]
 async fn connector_start_adopts_relay_lists_an_imported_identity_already_published() {
+    storage_sqlite::relax_storage_for_test_process();
     // The identity published its lists from another device. The import runs
     // offline, so the agent home has no cached copy of either list.
     let (_relay, relay_url) = mock_relay_url().await;
@@ -8927,6 +8960,7 @@ async fn serve_socket_rejects_an_unusable_relay_url_before_binding() {
 
 #[tokio::test]
 async fn connector_restarts_keep_an_imported_read_only_relay_list() {
+    storage_sqlite::relax_storage_for_test_process();
     // A kind 10002 with only a read relay has no write route, so MDK counts it
     // as missing. The first start caches it and stops; a restart must not then
     // treat the cached read entry as a list and let the KeyPackage publish

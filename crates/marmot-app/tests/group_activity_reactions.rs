@@ -28,6 +28,7 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
 /// and that a reaction a live timeline showed survives a close made right after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn members_share_real_activity_targets_and_reactions_after_reopen() {
+    storage_sqlite::relax_storage_for_test_process();
     // A relay that publishes its cap, as White Noise's do, so a reopened
     // member's catch-up is proven rather than held for an unreadable document.
     let (_relay, url) = limited_relay::mock_relay().await;
