@@ -35,8 +35,10 @@
 //!   coverage. The live frames its fences hold have no other copy, so they
 //!   move to the new coverage, held from the same point until the owner's
 //!   next plan answers; a plan older than the last one applied still answers
-//!   nothing. Only a frame whose group the new REQs no longer route, or that
-//!   the buffer has no room for, is lost.
+//!   nothing. A history copy a fresh REQ asks for again, on the same route
+//!   and relay from no later, is dropped: it comes again. Only a frame whose
+//!   group the new REQs no longer route, or that the buffer has no room for,
+//!   is lost.
 //! - **One group.** A fence holds its own group's frames only. They count
 //!   neither in the account's pending admission nor against other groups'
 //!   placement, so other groups' live boundaries, tails and ingest go on. A
@@ -482,6 +484,44 @@ impl AccountReplayCoverage {
             }
         }
         carried
+    }
+
+    /// Drop the history copies the fresh REQs replay, which replacing this
+    /// coverage then does not lose: a copy only streams claim, one of them
+    /// on a route and relay that a fresh REQ (`fresh`: route, relay, `since`)
+    /// asks again from no later than the copy was sent. Call it after
+    /// [`Self::take_carried_live`]; what neither moves nor comes again stays
+    /// for the drop to charge as loss.
+    pub(super) fn forget_replayed_history(&mut self, fresh: &[([u8; 32], RelayIndex, u64)]) {
+        for group in self.groups.values_mut() {
+            let replayed = group
+                .events
+                .iter()
+                .filter(|(id, event)| {
+                    !event.retained
+                        && !self.native_ids.contains_key(*id)
+                        && !group.live.contains(*id)
+                        && !group.ready_history.contains(*id)
+                        && group.streams.iter().any(|(owner, stream)| {
+                            stream.claims.contains(*id)
+                                && fresh.iter().any(|(route, relay, since)| {
+                                    *route == owner.route
+                                        && *relay == owner.relay
+                                        && *since <= event.delivery.message.timestamp.0
+                                })
+                        })
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for id in replayed {
+                let event = group.events.remove(&id).expect("replayed copy is buffered");
+                for stream in group.streams.values_mut() {
+                    stream.claims.remove(&id);
+                }
+                self.buffered_items -= 1;
+                self.buffered_bytes -= event.delivery.message.payload.len();
+            }
+        }
     }
 
     /// Buffer the live frames a replaced coverage carried
@@ -957,6 +997,75 @@ mod tests {
             pending_loss(&state.replay_losses),
             Some(NostrNotificationLossFloor::Since(SINCE))
         );
+    }
+
+    /// A history copy its REQ was still replaying when a fresh activation
+    /// replaced the coverage comes again on a fresh REQ that routes its group
+    /// on the same relay from no later: replacing loses nothing, and the copy
+    /// goes out once the fresh REQ replays it. A copy from a relay the fresh
+    /// REQs leave out is lost, from the replaced coverage's floor, as before.
+    #[tokio::test]
+    async fn a_fresh_activation_loses_no_history_its_reqs_replay() {
+        for (relay, lost) in [
+            (RelayIndex(1), None),
+            (
+                RelayIndex(2),
+                Some(NostrNotificationLossFloor::Since(SINCE)),
+            ),
+        ] {
+            let (mut coverage, id, losses) = fenced_coverage(true);
+            let (tx, mut rx) = mpsc::channel(8);
+            coverage.record_stored_event(&id, relay, 150);
+            coverage
+                .stage_delivery(
+                    delivery(0, 150, 1, &id, 1),
+                    Some(relay),
+                    ReplayInput::History,
+                    &tx,
+                )
+                .unwrap();
+            assert!(sent(&mut rx).is_empty(), "its REQ has no EOSE yet");
+            let mut state = AdapterState {
+                replay_losses: losses,
+                source_clock: coverage.changes.clock.clone(),
+                ..AdapterState::default()
+            };
+            state.replay_fencing.insert(account());
+            state.account_replay_coverage.insert(account(), coverage);
+            // The replaced REQ went out with the fresh REQs' relay as relay 1.
+            state
+                .relay_index
+                .index_for(&TransportEndpoint("wss://b.example".to_owned()));
+            let a = TransportEndpoint("wss://a.example".to_owned());
+            assert_eq!(state.relay_index.index_for(&a), RelayIndex(1));
+            let batch = pack_group_batches(
+                &account(),
+                &[route(0)],
+                SubscriptionAttempt::INITIAL.next(),
+                0,
+            )
+            .remove(0);
+            state.record_account_replay_start(&account(), std::slice::from_ref(&batch));
+            assert_eq!(pending_loss(&state.replay_losses), lost);
+            if lost.is_none() {
+                let fresh = batch.subscription_id();
+                let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+                coverage.record_stored_event(&fresh, RelayIndex(1), 150);
+                coverage
+                    .stage_delivery(
+                        delivery(0, 150, 1, &fresh, 1),
+                        Some(RelayIndex(1)),
+                        ReplayInput::History,
+                        &tx,
+                    )
+                    .unwrap();
+                coverage.record_eose(&fresh, RelayIndex(1));
+                coverage.apply_fence_plan(&plan(coverage, &[]));
+                let mut out = released(coverage);
+                out.extend(sent(&mut rx));
+                assert_eq!(out, vec![(0, 150)], "the fresh REQ replays it");
+            }
+        }
     }
 
     /// A plan computed before a count became a fact does not answer it: the
