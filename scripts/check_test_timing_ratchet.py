@@ -91,7 +91,9 @@ PAUSE_CALL = re.compile(r"(?:\btime\s*::\s*|(?<![\w.:]))pause\s*\(\s*\)")
 RESUME_CALL = re.compile(r"(?:\btime\s*::\s*|(?<![\w.:]))resume\s*\(\s*\)")
 THREAD_PATH = re.compile(r"\bthread\s*::\s*$")
 PATH_BEFORE = re.compile(r"::\s*$")
-THREAD_SLEEP_IMPORT = re.compile(r"\buse\s+std\s*::\s*thread\s*::\s*(?:sleep\b|\{[^}]*\bsleep\b)")
+USE_DECL = re.compile(r"\buse\s+[^;]*;")
+BINDS_SLEEP = re.compile(r"\bsleep\b(?!\s*as\b)")
+THREAD_SLEEP_IMPORT = re.compile(r"\bthread\s*::\s*(?:sleep\b|\{[^}]*\bsleep\b)")
 
 
 @functools.lru_cache(maxsize=None)
@@ -149,6 +151,20 @@ def paused_ranges(code: str, pairs: dict[int, int]) -> list[tuple[int, int]]:
             resume = RESUME_CALL.search(code, call.end(), ends[-1])
             ranges.append((call.start(), resume.start() if resume else ends[-1]))
     return ranges
+
+
+def sleep_imports(code: str, pairs: dict[int, int]) -> list[tuple[int, int, bool]]:
+    """(scope start, scope end, imports `thread::sleep`) for each `use` binding a bare `sleep`.
+
+    The scope is the innermost block holding the `use`, or the whole file.
+    """
+    found = []
+    for use in USE_DECL.finditer(code):
+        if BINDS_SLEEP.search(use.group()):
+            scope = max(((start, end) for start, end in pairs.items() if start < use.start() < end),
+                        default=(0, len(code)))
+            found.append((*scope, THREAD_SLEEP_IMPORT.search(use.group()) is not None))
+    return found
 
 
 def cfg_requires_test(predicate: str) -> bool:
@@ -257,13 +273,16 @@ def count_waits(path: str, source: str, test_only: bool = False) -> dict[str, in
     def within(offset: int, ranges: list[tuple[int, int]]) -> bool:
         return any(start <= offset < end for start, end in ranges)
 
-    imports_thread_sleep = THREAD_SLEEP_IMPORT.search(code) is not None
+    imports = sleep_imports(code, pairs)
 
     def blocks(offset: int) -> bool:
         """Paused Tokio time stops Tokio's waits only; `thread::sleep` still blocks."""
         before = code[max(0, offset - 32):offset]
-        return THREAD_PATH.search(before) is not None or (
-            imports_thread_sleep and PATH_BEFORE.search(before) is None)
+        if THREAD_PATH.search(before) or PATH_BEFORE.search(before):
+            return THREAD_PATH.search(before) is not None
+        # A bare `sleep` is whatever the innermost `use` in scope binds.
+        in_scope = [binding for binding in imports if binding[0] <= offset < binding[1]]
+        return max(in_scope)[2] if in_scope else False
 
     counts = {"sleep": sum(1 for match in SLEEP.finditer(code)
                            if within(match.start(), inside) and not is_definition(code, match.start())
