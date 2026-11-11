@@ -202,6 +202,10 @@ time, so to add contention widen the filter to the test's binary and raise
 `FLAKE_STRESS_THREADS`; the test groups in `.config/nextest.toml` still cap
 some binaries.
 
+`just test-timing-ratchet` fails when a test file gains a `sleep` or a
+`timeout` of a second or less. After a fix removes some, run it with
+`--update` and commit the lower baseline.
+
 ## Audit evidence
 
 Discovery is read-only, and its candidates are reported before any edit.

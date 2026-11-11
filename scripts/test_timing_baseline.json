@@ -1,0 +1,536 @@
+{
+  "version": 1,
+  "comment": "Real-time waits in Rust test code, per file. Only decreases are expected; see scripts/check_test_timing_ratchet.py.",
+  "files": {
+    "crates/agent-connector/src/doctor.rs": {
+      "short_timeout": 1
+    },
+    "crates/agent-connector/src/invite_policy.rs": {
+      "sleep": 1
+    },
+    "crates/agent-connector/src/tests.rs": {
+      "sleep": 29,
+      "short_timeout": 4
+    },
+    "crates/agent-connector/src/usage_diagnostics.rs": {
+      "short_timeout": 2
+    },
+    "crates/agent-connector/tests/identity_security.rs": {
+      "sleep": 3
+    },
+    "crates/agent-stream-compose/src/tests.rs": {
+      "sleep": 6,
+      "short_timeout": 30
+    },
+    "crates/cgka-conformance-simulator/src/app_runtime/process_io.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/src/app_runtime/strfry_process_scale.rs": {
+      "sleep": 2
+    },
+    "crates/cgka-conformance-simulator/src/bin/cgka-conformance-campaign.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/src/family.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/src/relay_control.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/src/relay_fault_proxy.rs": {
+      "short_timeout": 8
+    },
+    "crates/cgka-conformance-simulator/src/scenario.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/src/scenario_input_ledger.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/tests/app_history_repair_diagnostic.rs": {
+      "sleep": 2
+    },
+    "crates/cgka-conformance-simulator/tests/app_large_group.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/tests/app_runtime_adapter.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/tests/app_runtime_interaction_journeys.rs": {
+      "sleep": 8
+    },
+    "crates/cgka-conformance-simulator/tests/app_runtime_journeys.rs": {
+      "sleep": 2
+    },
+    "crates/cgka-conformance-simulator/tests/issue_494_admin_promote_delivery.rs": {
+      "sleep": 3
+    },
+    "crates/cgka-conformance-simulator/tests/node_protocol.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/tests/sqlite_storage_modes.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-conformance-simulator/tests/support/recovery_runner_proofs.rs": {
+      "sleep": 18
+    },
+    "crates/cgka-conformance-simulator/tests/support/recovery_scorecard.rs": {
+      "sleep": 8
+    },
+    "crates/cgka-engine/src/deadline.rs": {
+      "short_timeout": 2
+    },
+    "crates/cgka-engine/tests/apply_history_cost.rs": {
+      "sleep": 2
+    },
+    "crates/cgka-engine/tests/deferred_peel_lifecycle.rs": {
+      "sleep": 1,
+      "short_timeout": 1
+    },
+    "crates/cgka-engine/tests/publish_lifecycle.rs": {
+      "sleep": 1
+    },
+    "crates/cgka-engine/tests/record_write_atomicity.rs": {
+      "sleep": 2
+    },
+    "crates/cli/src/daemon/tests.rs": {
+      "sleep": 4,
+      "short_timeout": 4
+    },
+    "crates/cli/src/tui/tests.rs": {
+      "sleep": 12
+    },
+    "crates/cli/tests/cli.rs": {
+      "sleep": 26
+    },
+    "crates/convergence-campaign-runner/src/bin/cgka-conformance-relay.rs": {
+      "short_timeout": 1
+    },
+    "crates/fs-private/tests/publication.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/audit_log/retention.rs": {
+      "sleep": 4
+    },
+    "crates/marmot-app/src/client/audit_v5_probe/tests.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/client/mod.rs": {
+      "sleep": 1,
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/client/push/tests.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/client/recovery_coverage/live_boundary_tests.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/client/recovery_runner/host/tests.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/client/recovery_runner/host/tests/rejoin.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/client/recovery_runner/repair/tests.rs": {
+      "sleep": 1,
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/client/recovery_runner/tests.rs": {
+      "sleep": 5
+    },
+    "crates/marmot-app/src/client/sync/native_comparison_tests/live_rejoin_tests.rs": {
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/client/sync/native_comparison_tests/native_failure_tests.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/client/sync/projection_retry_tests.rs": {
+      "sleep": 3,
+      "short_timeout": 3
+    },
+    "crates/marmot-app/src/client/upload_cleanup_tests.rs": {
+      "sleep": 8
+    },
+    "crates/marmot-app/src/directory_tests/search.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/directory_tests/sync.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/emoji_sets/tests.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/media/handoff/tests.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/media/tests.rs": {
+      "sleep": 6
+    },
+    "crates/marmot-app/src/moderation_reports/tests.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/observability_tests/collector_host_safety.rs": {
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/relay_caps/tests.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/runtime/account_attention/tests.rs": {
+      "sleep": 1,
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/runtime/account_worker.rs": {
+      "sleep": 1,
+      "short_timeout": 7
+    },
+    "crates/marmot-app/src/runtime/account_worker/attachments/tests.rs": {
+      "sleep": 1,
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/runtime/account_worker/attachments/tests/resume.rs": {
+      "sleep": 1,
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/runtime/account_worker/attachments/tests/storage_block.rs": {
+      "sleep": 4
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/automatic_group_recovery_tests.rs": {
+      "sleep": 7
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/local_submission_queue_tests.rs": {
+      "sleep": 4,
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/publication_progress_tests.rs": {
+      "short_timeout": 5
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/read_queue_tests.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/recovery_runner_host_tests.rs": {
+      "sleep": 18
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/refused_subscription_send_tests.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/secondary_retry_scheduler_tests.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/selective_history_tests.rs": {
+      "sleep": 6
+    },
+    "crates/marmot-app/src/runtime/account_worker/tests/worker_recovery_resume_tests.rs": {
+      "sleep": 2,
+      "short_timeout": 3
+    },
+    "crates/marmot-app/src/runtime/attachment_access/tests.rs": {
+      "sleep": 9
+    },
+    "crates/marmot-app/src/runtime/audit_tracker_tests.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/runtime/chat_list_window/tests.rs": {
+      "sleep": 1,
+      "short_timeout": 3
+    },
+    "crates/marmot-app/src/runtime/commands.rs": {
+      "short_timeout": 2
+    },
+    "crates/marmot-app/src/runtime/conversation_window/tests.rs": {
+      "sleep": 5,
+      "short_timeout": 17
+    },
+    "crates/marmot-app/src/runtime/presented_chat_list.rs": {
+      "short_timeout": 3
+    },
+    "crates/marmot-app/src/runtime/tests.rs": {
+      "sleep": 3,
+      "short_timeout": 10
+    },
+    "crates/marmot-app/src/sqlcipher/concurrency_tests.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/startup_diagnostics.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests.rs": {
+      "sleep": 47,
+      "short_timeout": 6
+    },
+    "crates/marmot-app/src/tests/canonical_membership.rs": {
+      "sleep": 6
+    },
+    "crates/marmot-app/src/tests/canonical_membership/admin_sign_out.rs": {
+      "sleep": 6
+    },
+    "crates/marmot-app/src/tests/canonical_membership/rival_branch_leave.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/conversation_cold_open.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/conversation_cold_open/local_submissions.rs": {
+      "sleep": 6
+    },
+    "crates/marmot-app/src/tests/device_group/backups.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/tests/device_group/devices.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/tests/device_group/history_delivery.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/device_group/inactivity.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/device_group/private_key_packages.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/tests/device_group/removal.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/tests/device_group/sign_out.rs": {
+      "sleep": 4
+    },
+    "crates/marmot-app/src/tests/device_pairing.rs": {
+      "sleep": 3,
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/tests/device_pairing/linked_device_chats.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/draft_lifecycle.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/follow_list_edits.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/tests/invite_recovery.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/key_package_relay_lists.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/message_journeys.rs": {
+      "sleep": 1,
+      "short_timeout": 1
+    },
+    "crates/marmot-app/src/tests/multi_device_members.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/tests/offline_queued_sends.rs": {
+      "sleep": 6
+    },
+    "crates/marmot-app/src/tests/push_announce.rs": {
+      "sleep": 9
+    },
+    "crates/marmot-app/src/tests/push_snapshot.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/src/tests/relay_event_limits.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/src/tests/relay_plane_runtime.rs": {
+      "sleep": 4
+    },
+    "crates/marmot-app/src/tests/replaceable_delivery.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-app/src/user_blocks.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-app/tests/audit_logs.rs": {
+      "sleep": 5,
+      "short_timeout": 5
+    },
+    "crates/marmot-app/tests/catch_up_snapshot_failure.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/tests/create_dm_scaling.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/tests/cursor_persistence.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/tests/epoch_stall_backfill_audit.rs": {
+      "sleep": 7
+    },
+    "crates/marmot-app/tests/next_event_backfill.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/tests/relay_runtime.rs": {
+      "sleep": 78,
+      "short_timeout": 9
+    },
+    "crates/marmot-app/tests/relay_runtime/attachment_retention.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-app/tests/relay_runtime/offline_replay.rs": {
+      "sleep": 4
+    },
+    "crates/marmot-app/tests/relay_telemetry_otlp.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-app/tests/startup_hydration.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-app/tests/stickers.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-c/tests/secret_store_client.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-forensics/src/local_delivery.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-observability/src/audit_otlp_sender/tests.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-observability/src/collector_host_safety/tests.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-observability/src/product_analytics/tests.rs": {
+      "short_timeout": 2
+    },
+    "crates/marmot-observability/src/relay_telemetry_export.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-session/tests/runtime.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-session/tests/runtime/account_devices_advertising.rs": {
+      "sleep": 2
+    },
+    "crates/marmot-session/tests/runtime/frozen_fanout.rs": {
+      "sleep": 4,
+      "short_timeout": 3
+    },
+    "crates/marmot-session/tests/runtime/interrupted_attempt.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-session/tests/runtime/key_package_slot.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-session/tests/runtime/key_package_slot_withdrawal.rs": {
+      "short_timeout": 1
+    },
+    "crates/marmot-session/tests/session_lifecycle.rs": {
+      "sleep": 3
+    },
+    "crates/marmot-uniffi/src/commands/chat_list.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-uniffi/src/commands/directory.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-uniffi/src/tokio_runtime.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-uniffi/tests/runtime_threads.rs": {
+      "sleep": 1
+    },
+    "crates/marmot-uniffi/tests/smoke.rs": {
+      "sleep": 1
+    },
+    "crates/media-store/src/store_tests.rs": {
+      "sleep": 1
+    },
+    "crates/storage-sqlite/src/app/attachment_acquisition/tests/outgoing_files.rs": {
+      "sleep": 2
+    },
+    "crates/storage-sqlite/src/app/storage_compaction_tests.rs": {
+      "sleep": 1
+    },
+    "crates/storage-sqlite/src/app/transport/user_blocks.rs": {
+      "sleep": 1
+    },
+    "crates/storage-sqlite/src/base/connection.rs": {
+      "sleep": 1
+    },
+    "crates/storage-sqlite/src/base/migrations.rs": {
+      "sleep": 2
+    },
+    "crates/storage-sqlite/src/cross/migrated_template.rs": {
+      "sleep": 1
+    },
+    "crates/storage-sqlite/src/protocol/storage/mod.rs": {
+      "sleep": 1
+    },
+    "crates/storage-sqlite/src/shared/assurance_tests.rs": {
+      "sleep": 1
+    },
+    "crates/transport-nostr-adapter/src/sdk_client.rs": {
+      "sleep": 10,
+      "short_timeout": 12
+    },
+    "crates/transport-nostr-adapter/src/sweep/tests.rs": {
+      "sleep": 3
+    },
+    "crates/transport-nostr-adapter/tests/inbound_routing.rs": {
+      "sleep": 8,
+      "short_timeout": 18
+    },
+    "crates/transport-nostr-adapter/tests/relay_limit_subscriptions.rs": {
+      "sleep": 4,
+      "short_timeout": 1
+    },
+    "crates/transport-nostr-adapter/tests/support/limit_relay.rs": {
+      "sleep": 4
+    },
+    "crates/transport-nostr-adapter/tests/time_sliced_sweep.rs": {
+      "sleep": 1
+    },
+    "crates/transport-nostr/src/directory.rs": {
+      "sleep": 1,
+      "short_timeout": 1
+    },
+    "crates/transport-nostr/src/publish_accounting_tests.rs": {
+      "short_timeout": 3
+    },
+    "crates/transport-nostr/src/test_support.rs": {
+      "sleep": 1
+    },
+    "crates/transport-nostr/src/tests.rs": {
+      "sleep": 24,
+      "short_timeout": 32
+    },
+    "crates/transport-quic-broker/src/tests.rs": {
+      "sleep": 31,
+      "short_timeout": 2
+    },
+    "crates/transport-quic-broker/tests/public_endpoint.rs": {
+      "sleep": 1
+    },
+    "crates/transport-quic-stream/src/tests.rs": {
+      "sleep": 4
+    },
+    "experiments/relay-backend-probe/src/acquisition.rs": {
+      "short_timeout": 2
+    },
+    "experiments/relay-backend-probe/src/boundary.rs": {
+      "sleep": 2
+    },
+    "integrations/claude/marmot/src/claude.rs": {
+      "sleep": 1
+    },
+    "integrations/opencode/marmot/src/opencode.rs": {
+      "sleep": 2
+    },
+    "integrations/pi/marmot/src/pi.rs": {
+      "sleep": 3
+    },
+    "integrations/terminal-harness/src/bridge.rs": {
+      "sleep": 3,
+      "short_timeout": 8
+    },
+    "integrations/terminal-harness/src/control.rs": {
+      "sleep": 3
+    },
+    "integrations/terminal-harness/src/test_support.rs": {
+      "sleep": 1
+    },
+    "integrations/terminal-harness/tests/jsonl_process.rs": {
+      "sleep": 2
+    }
+  }
+}

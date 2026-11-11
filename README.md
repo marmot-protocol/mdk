@@ -282,6 +282,7 @@ cargo test -p cgka-conformance-simulator --features conformance-slow  # wider pr
 just tamarin                                                        # formal models
 just flake-report                                                   # rank tests that failed an attempt in recent merge-queue runs
 just flake-stress <package> '<filter>' [count]                      # rerun a filter with no retries to prove a flake fix
+just test-timing-ratchet                                            # fail when test files gain sleeps or sub-second timeouts
 ```
 
 The CLI's real-relay end-to-end tests need the local relay stack:

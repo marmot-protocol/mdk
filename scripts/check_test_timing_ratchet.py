@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Keep real-time waits in Rust test code from growing.
+
+A test that sleeps, or bounds a wait with a timeout of a second or less, races
+the machine it runs on: under load the sleep is too short or the timeout
+fires first. This gate counts both per test file and fails when any file's
+count rises above the committed baseline, so new tests await produced state
+instead.
+
+Counted, in test-only code (comments and string literals ignored):
+
+- `sleep` calls: `sleep(...)`, `thread::sleep(...)`, `tokio::time::sleep(...)`
+  and other path-qualified free calls. Method calls such as `clock.sleep(...)`
+  are not real-time waits and do not count.
+- `timeout` calls whose first argument is a `Duration::from_*` literal of one
+  second or less, such as `timeout(Duration::from_millis(500), fut)`.
+
+Test-only code is any file under a `tests/` directory, named `tests.rs` or
+`*_tests.rs`, or in a `test_support` module, plus every `#[cfg(test)]` inline
+module, `#[test]` or `#[tokio::test]` function, and `#[cfg(test)]` function
+elsewhere. Waits inside a `#[tokio::test(start_paused = true)]`
+function, or a function that calls `time::pause()`, run on paused time and do
+not count.
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASELINE = ROOT / "scripts" / "test_timing_baseline.json"
+KINDS = ("sleep", "short_timeout")
+UPDATE_HINT = "python3 scripts/check_test_timing_ratchet.py --update"
+
+# A path-qualified call such as `tokio::time::sleep(` matches at `sleep`.
+SLEEP = re.compile(r"(?<![\w.])sleep\s*\(")
+TIMEOUT = re.compile(
+    r"(?<![\w.])timeout\s*\(\s*"
+    r"(?:(?:std|core)\s*::\s*time\s*::\s*)?Duration\s*::\s*"
+    r"(from_secs|from_millis|from_micros|from_nanos|from_secs_f32|from_secs_f64)\s*\(\s*"
+    # The literal may carry a type suffix and a trailing comma, and must be
+    # the whole first argument (`Duration::from_secs(1) * 30` is not short).
+    r"([0-9][0-9_]*(?:\.[0-9_]*)?)(?:_?(?:[ui](?:8|16|32|64|128|size)|f32|f64))?\s*,?\s*\)\s*,")
+NANOS = {"from_secs": 10**9, "from_secs_f32": 10**9, "from_secs_f64": 10**9,
+         "from_millis": 10**6, "from_micros": 10**3, "from_nanos": 1}
+TEST_PATH = re.compile(r"(?:^|/)(?:tests|test_support)/|(?:^|/)(?:tests|test_support|[\w]+_tests)\.rs$")
+# Attributes that make the next item test code: a test function, or a `cfg`
+# whose predicate requires `test` (see `cfg_requires_test`).
+TEST_FN_ATTR = re.compile(r"#\s*\[\s*(?:test|tokio\s*::\s*test(?:\s*\([^\]]*\))?)\s*\]")
+CFG_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(")
+# A loose screen on raw source for any of those attributes.
+MAYBE_TEST_ATTR = re.compile(r"#\s*\[\s*(?:test\b|tokio\s*::\s*test|cfg\s*\([^\]]*\btest\b)")
+# What follows a test attribute: more attributes, then a `mod` (inline or
+# declared) or anything else.
+ITEM_AFTER_ATTR = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])")
+MOD_PREFIX = r"(?P<attrs>(?:#\s*\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>\w+)\s*"
+MOD_DECL = re.compile(r"(?<![\w])" + MOD_PREFIX + ";")
+INLINE_MOD = re.compile(r"\bmod\s+(\w+)\s*\{")
+PATH_ATTR = re.compile(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]')
+PAUSED_ATTR = re.compile(r"#\s*\[\s*tokio\s*::\s*test\s*\([^\]]*start_paused\s*=\s*true[^\]]*\)\s*\]")
+FN_OPEN = re.compile(r"\bfn\s+\w+[^;{]*\{")
+# The leftmost of: a line comment, a block comment's opening, a raw string, a
+# string, or a char literal (a lifetime such as `'a` has no closing quote).
+LITERAL_OR_COMMENT = re.compile(
+    r"(?P<line>//[^\n]*)"
+    r"|(?P<block>/\*)"
+    r"|(?<![\w])[bc]?r(?P<hashes>#*)\"[\s\S]*?\"(?P=hashes)"
+    r"|[bc]?\"(?:\\[\s\S]|[^\"\\])*\""
+    r"|b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|[^\n])|[^\\'\n])'")
+NOT_NEWLINE = re.compile(r"[^\n]")
+BRACE = re.compile(r"[{}]")
+PAUSE_CALL = re.compile(r"\btime\s*::\s*pause\s*\(\s*\)")
+RESUME_CALL = re.compile(r"\btime\s*::\s*resume\s*\(\s*\)")
+THREAD_PATH = re.compile(r"\bthread\s*::\s*$")
+
+
+@functools.lru_cache(maxsize=None)
+def strip_comments_and_strings(source: str) -> str:
+    """Blank out comments and string/char literals, keeping offsets and newlines."""
+    pieces, position = [], 0
+    while (token := LITERAL_OR_COMMENT.search(source, position)) is not None:
+        end = token.end()
+        if token.group("block"):
+            depth, end = 1, token.end()
+            while depth and end < len(source):
+                if source.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif source.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+        pieces += [source[position:token.start()], NOT_NEWLINE.sub(" ", source[token.start():end])]
+        position = end
+    pieces.append(source[position:])
+    return "".join(pieces)
+
+
+def brace_pairs(code: str) -> dict[int, int]:
+    """Map each `{` offset to the offset just past its closing `}`."""
+    pairs, stack = {}, []
+    for brace in BRACE.finditer(code):
+        if brace.group() == "{":
+            stack.append(brace.start())
+        elif stack:
+            pairs[stack.pop()] = brace.end()
+    for k in stack:
+        pairs[k] = len(code)
+    return pairs
+
+
+def paused_ranges(code: str, pairs: dict[int, int]) -> list[tuple[int, int]]:
+    """Spans where the Tokio clock is paused.
+
+    A `start_paused` test is paused throughout; after `time::pause()` the
+    clock stays paused until `time::resume()` or the end of that function.
+    """
+    ranges = []
+    for attr in PAUSED_ATTR.finditer(code):
+        function = FN_OPEN.search(code, attr.end())
+        if function:
+            end = pairs[function.end() - 1]
+            resume = RESUME_CALL.search(code, function.end(), end)
+            ranges.append((function.start(), resume.start() if resume else end))
+    for call in PAUSE_CALL.finditer(code):
+        # The innermost function whose body holds the call.
+        ends = [pairs[function.end() - 1] for function in FN_OPEN.finditer(code, 0, call.start())
+                if pairs[function.end() - 1] > call.start()]
+        if ends:
+            resume = RESUME_CALL.search(code, call.end(), ends[-1])
+            ranges.append((call.start(), resume.start() if resume else ends[-1]))
+    return ranges
+
+
+def cfg_requires_test(predicate: str) -> bool:
+    """Whether a `cfg(...)` predicate can only hold when compiling tests.
+
+    `test` does; `all(...)` does if any member does; `any(...)` does if
+    every member does; `not(...)` and every other atom do not.
+    """
+    tokens = re.findall(r"\w+|[(),=]", predicate)
+    position = 0
+
+    def parse() -> bool:
+        nonlocal position
+        name = tokens[position] if position < len(tokens) else ""
+        position += 1
+        if position < len(tokens) and tokens[position] == "(":
+            position += 1
+            members = []
+            while position < len(tokens) and tokens[position] != ")":
+                if tokens[position] == ",":
+                    position += 1
+                    continue
+                members.append(parse())
+            position += 1
+            if name == "all":
+                return any(members)
+            if name == "any":
+                return bool(members) and all(members)
+            return False
+        if position < len(tokens) and tokens[position] == "=":
+            # A string value is blanked out of `code`, so it leaves no token.
+            position += 1
+            if position < len(tokens) and tokens[position] not in {",", ")"}:
+                position += 1
+            return False
+        return name == "test"
+
+    return parse()
+
+
+def test_attributes(code: str) -> list[tuple[int, int]]:
+    """(start, end) of each attribute that makes the next item test code."""
+    found = [(attr.start(), attr.end()) for attr in TEST_FN_ATTR.finditer(code)]
+    for attr in CFG_ATTR.finditer(code):
+        depth, k = 1, attr.end()
+        while k < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[k], 0)
+            k += 1
+        close = re.match(r"\s*\]", code[k:])
+        if close and cfg_requires_test(code[attr.end():k - 1]):
+            found.append((attr.start(), k + close.end()))
+    return sorted(found)
+
+
+def test_items(code: str, pairs: dict[int, int]) -> tuple[list[tuple[int, int]], list[int]]:
+    """Ranges of test functions and inline test modules, and offsets of test-only `mod x;`."""
+    ranges, declarations = [], []
+    for start, end in test_attributes(code):
+        module = ITEM_AFTER_ATTR.match(code, end)
+        if module:
+            if module.group(2) == "{":
+                ranges.append((start, pairs[module.end() - 1]))
+            else:
+                declarations.append(module.start(1))
+            continue
+        function = FN_OPEN.search(code, end)
+        # The attribute belongs to the function only if nothing but other
+        # attributes and qualifiers lies between them.
+        if function and not re.search(r"[;{}]", code[end:function.start()]):
+            ranges.append((start, pairs[function.end() - 1]))
+    return ranges, declarations
+
+
+def test_ranges(path: str, code: str, pairs: dict[int, int], test_only: bool = False) -> list[tuple[int, int]]:
+    if test_only or TEST_PATH.search(path):
+        return [(0, len(code))]
+    return test_items(code, pairs)[0]
+
+
+def is_short(method: str, amount: str) -> bool:
+    try:
+        value = float(amount.replace("_", ""))
+    except ValueError:
+        return False
+    return value * NANOS[method] <= 10**9
+
+
+def count_waits(path: str, source: str, test_only: bool = False) -> dict[str, int]:
+    """Count the waits in `path`'s test code; `test_only` marks the whole file as test code."""
+    # Cheap textual screens first: most files cannot contain a counted wait.
+    if "sleep" not in source and "timeout" not in source:
+        return {}
+    if not (test_only or TEST_PATH.search(path) or MAYBE_TEST_ATTR.search(source)):
+        return {}
+    code = strip_comments_and_strings(source)
+    if not (SLEEP.search(code) or TIMEOUT.search(code)):
+        return {}
+    pairs = brace_pairs(code)
+    inside = test_ranges(path, code, pairs, test_only)
+    paused = paused_ranges(code, pairs)
+
+    def within(offset: int, ranges: list[tuple[int, int]]) -> bool:
+        return any(start <= offset < end for start, end in ranges)
+
+    # Paused Tokio time stops Tokio's waits only; `thread::sleep` still blocks.
+    counts = {"sleep": sum(1 for match in SLEEP.finditer(code)
+                           if within(match.start(), inside) and not is_definition(code, match.start())
+                           and (not within(match.start(), paused)
+                                or THREAD_PATH.search(code, max(0, match.start() - 32), match.start()))),
+              "short_timeout": sum(1 for match in TIMEOUT.finditer(code)
+                                   if within(match.start(), inside) and not within(match.start(), paused)
+                                   and is_short(match.group(1), match.group(2)))}
+    return {kind: count for kind, count in counts.items() if count}
+
+
+def child_modules(path: str, source: str, test_only: bool) -> set[str]:
+    """Candidate files of the out-of-line modules `path` declares as test-only.
+
+    A `mod name;` is test-only when its attributes require `cfg(test)`, or it
+    sits in a test-only file or inline test module. Its file is
+    `<dir>/<name>.rs` or `<dir>/<name>/mod.rs`, or its `#[path]`.
+    """
+    if not ((test_only or TEST_PATH.search(path) or MAYBE_TEST_ATTR.search(source)) and MOD_DECL.search(source)):
+        return set()
+    code = strip_comments_and_strings(source)
+    pairs = brace_pairs(code)
+    inside, gated = test_items(code, pairs)
+    if test_only or TEST_PATH.search(path):
+        inside = [(0, len(code))]
+    parent = Path(path)
+    base = parent.parent if parent.name in {"lib.rs", "main.rs", "mod.rs"} else parent.parent / parent.stem
+    children = set()
+    for declaration in MOD_DECL.finditer(code):
+        if not (declaration.start("name") in gated
+                or any(start <= declaration.start() < end for start, end in inside)):
+            continue
+        nested = [module.group(1) for module in INLINE_MOD.finditer(code, 0, declaration.start())
+                  if pairs[module.end() - 1] > declaration.start()]
+        # String contents are blanked in `code`; read the path from the source.
+        # A `#[path]` is relative to the file's directory, or inside inline
+        # modules to the directory their names would give.
+        explicit = PATH_ATTR.search(source, declaration.start(), declaration.start("name"))
+        if explicit:
+            directory = base.joinpath(*nested) if nested else parent.parent
+            children.add(os.path.normpath(directory / explicit.group(1)))
+            continue
+        directory = base.joinpath(*nested)
+        name = declaration.group("name")
+        children.update({str(directory / f"{name}.rs"), str(directory / name / "mod.rs")})
+    return children
+
+
+def is_definition(code: str, offset: int) -> bool:
+    return re.search(r"\bfn\s*$", code[max(0, offset - 16):offset]) is not None
+
+
+def rust_files(root: Path) -> list[str]:
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.rs"],
+        check=True, capture_output=True).stdout.decode()
+    return sorted(path for path in set(listed.split("\0")) if path and (root / path).is_file())
+
+
+def scan(root: Path) -> dict[str, dict[str, int]]:
+    files = rust_files(root)
+    sources = {path: (root / path).read_text(encoding="utf-8", errors="replace") for path in files}
+    # Test-only modules declared out of line, followed down to their own children.
+    test_only: set[str] = set()
+    pending = [(path, False) for path in files]
+    while pending:
+        path, whole = pending.pop()
+        for child in child_modules(path, sources[path], whole):
+            if child in sources and child not in test_only:
+                test_only.add(child)
+                pending.append((child, True))
+    counts = {}
+    for path in files:
+        found = count_waits(path, sources[path], path in test_only)
+        if found:
+            counts[path] = found
+    return counts
+
+
+def compare(baseline: dict[str, dict[str, int]], current: dict[str, dict[str, int]]):
+    """Return (increases, decreases) as lists of (path, kind, before, after)."""
+    increases, decreases = [], []
+    for path in sorted(baseline.keys() | current.keys()):
+        for kind in KINDS:
+            before = baseline.get(path, {}).get(kind, 0)
+            after = current.get(path, {}).get(kind, 0)
+            if after > before:
+                increases.append((path, kind, before, after))
+            elif after < before:
+                decreases.append((path, kind, before, after))
+    return increases, decreases
+
+
+def load_baseline(path: Path) -> dict[str, dict[str, int]]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("version") != 1 or not isinstance(document.get("files"), dict):
+        raise ValueError(f"{path}: unexpected baseline format")
+    return document["files"]
+
+
+def write_baseline(path: Path, counts: dict[str, dict[str, int]]) -> None:
+    files = {file: {kind: counts[file][kind] for kind in KINDS if counts[file].get(kind)}
+             for file in sorted(counts)}
+    document = {
+        "version": 1,
+        "comment": "Real-time waits in Rust test code, per file. Only decreases are expected; "
+                   "see scripts/check_test_timing_ratchet.py.",
+        "files": files,
+    }
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def describe(change: tuple[str, str, int, int]) -> str:
+    path, kind, before, after = change
+    label = "sleep calls" if kind == "sleep" else "timeouts of 1s or less"
+    return f"  {path}: {label} {before} -> {after}"
+
+
+def main(argv: list[str] | None = None, root: Path = ROOT, baseline_path: Path | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    parser.add_argument("--update", action="store_true",
+                        help="rewrite the baseline with current counts; only decreases unless --allow-increase")
+    parser.add_argument("--allow-increase", action="store_true",
+                        help="with --update, also record increases (an explicitly reviewed exception)")
+    args = parser.parse_args(argv)
+    if args.allow_increase and not args.update:
+        parser.error("--allow-increase only applies with --update")
+    baseline_path = baseline_path or BASELINE
+    baseline = load_baseline(baseline_path)
+    current = scan(root)
+    increases, decreases = compare(baseline, current)
+
+    if args.update:
+        if increases and not args.allow_increase:
+            print("test timing ratchet: refusing to record more real-time waits:", file=sys.stderr)
+            print("\n".join(map(describe, increases)), file=sys.stderr)
+            print("Remove them, or pass --allow-increase for a reviewed exception.", file=sys.stderr)
+            return 1
+        write_baseline(baseline_path, current)
+        print(f"test timing ratchet: baseline updated ({len(decreases)} decreases, {len(increases)} increases)")
+        return 0
+
+    if increases:
+        print("test timing ratchet: real-time waits in test code rose above the baseline:", file=sys.stderr)
+        print("\n".join(map(describe, increases)), file=sys.stderr)
+        print("Await the state the test needs instead: a signal, a completed response, or paused Tokio time\n"
+              "(`#[tokio::test(start_paused = true)]`). A moved or renamed file counts as new; for that or\n"
+              f"another reviewed exception, run `{UPDATE_HINT} --allow-increase` and commit the baseline.",
+              file=sys.stderr)
+        return 1
+    if decreases:
+        print(f"test timing ratchet: {len(decreases)} counts dropped below the baseline; "
+              f"run `{UPDATE_HINT}` and commit it to lock them in.")
+    else:
+        print("test timing ratchet: no new real-time waits in test code")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
