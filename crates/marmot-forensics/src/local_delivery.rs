@@ -3503,8 +3503,9 @@ mod tests {
         );
         assert_eq!(state.gaps.len(), MAX_GAPS);
         assert_eq!(state.dropped_gaps, 16);
+        // About 110 KiB on Unix; Windows file ids make every row longer.
         assert!(
-            state_len(&state_dir) < 128 * 1024,
+            state_len(&state_dir) < MAX_STATE_BYTES / 4,
             "{}",
             state_len(&state_dir)
         );
