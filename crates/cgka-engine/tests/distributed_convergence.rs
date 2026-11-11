@@ -13,7 +13,9 @@ use cgka_engine::convergence::{ConvergencePolicy, ConvergencePolicyError};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsProjectionError, project_mls_message};
 use cgka_engine::provider::EngineOpenMlsProvider;
-use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock};
+use cgka_engine::{
+    ConvergenceClock, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock,
+};
 use cgka_traits::app_components::{AppComponentId, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -915,8 +917,10 @@ async fn advance_scheduled_group(
             .unwrap()
             .expect("retained input exposes a scheduler cutoff wake");
         clock.advance_ms(delay);
+        // Explicit clock time, through the same convergence path: the host
+        // entry point's wall-clock slice can expire on a loaded runner first.
         if engine
-            .advance_convergence_inputs(group_id)
+            .advance_convergence_inputs_until_settled(group_id, clock.now().monotonic_ms)
             .await
             .expect("scheduled background advance applies the selected branch")
         {
@@ -8422,9 +8426,11 @@ async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_inp
     assert_eq!(pass.absolute_deadline_monotonic_ms, 6_000);
     assert_eq!(pass.members.len(), 6);
     clock.advance_ms(499);
+    // Explicit clock time, through the same convergence path: the host
+    // entry point's wall-clock slice can expire on a loaded runner first.
     assert_eq!(
         carol
-            .converge_stored_openmls_messages(&group_id)
+            .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
             .unwrap()
             .convergence_status,
         ConvergenceStatus::Syncing
@@ -8432,7 +8438,7 @@ async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_inp
     clock.advance_ms(1);
     assert_eq!(
         carol
-            .converge_stored_openmls_messages(&group_id)
+            .converge_stored_openmls_messages_at(&group_id, clock.now().monotonic_ms)
             .unwrap()
             .convergence_status,
         ConvergenceStatus::Settled
@@ -11225,8 +11231,16 @@ async fn assert_by_reference_rival_adjudicates(first_label: &[u8], second_label:
     first.ingest(leave.clone()).await.unwrap();
     second.ingest(leave.clone()).await.unwrap();
     clock.advance_ms(1_000);
-    first.advance_convergence(&group_id).await.unwrap();
-    second.advance_convergence(&group_id).await.unwrap();
+    // Explicit clock time, through the same drain: the host entry point's
+    // wall-clock slice can expire on a loaded runner before this work lands.
+    first
+        .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    second
+        .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+        .await
+        .unwrap();
     let first_auto = first
         .drain_auto_publish()
         .into_iter()
