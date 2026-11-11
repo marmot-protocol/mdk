@@ -77,6 +77,13 @@ flake-report-contract:
 flake-stress package filter count="40" *args:
     cargo nextest run -p {{quote(package)}} -E {{quote(filter)}} --stress-count {{quote(count)}} --retries 0 --no-fail-fast --test-threads "${FLAKE_STRESS_THREADS:-num-cpus}" {{args}}
 
+# Fail when a test file gains real-time waits (sleeps, or timeouts of a second
+# or less) over scripts/test_timing_baseline.json. After removing waits, run
+# it with `--update` to lock the lower counts in.
+test-timing-ratchet *args:
+    python3 scripts/check_test_timing_ratchet.py {{args}}
+    python3 scripts/test_check_test_timing_ratchet.py
+
 # Startup scaling benchmarks (mdk#1161, mdk#1413): builds stores with
 # 0/10/100/1000 groups, 8/64-member rosters, and a message-heavy case;
 # reports the SQLCipher database footprint, cold-reopens each, and prints
@@ -718,6 +725,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
