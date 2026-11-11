@@ -1401,31 +1401,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Tamarin dependencies
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if sudo timeout --kill-after=15s 180s apt-get \
-              -o Acquire::Retries=3 \
-              -o Acquire::http::Timeout=30 \
-              -o Acquire::https::Timeout=30 \
-              update; then
-              break
-            fi
-            if [[ "$attempt" == 3 ]]; then
-              echo "apt-get update failed after $attempt attempts" >&2
-              exit 1
-            fi
-            echo "apt-get update attempt $attempt failed; retrying" >&2
-          done
-          sudo apt-get \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 \
-            -o DPkg::Lock::Timeout=60 \
-            install -y --no-install-recommends graphviz unzip
-
       - name: Install Maude
         run: |
           set -euo pipefail
@@ -1439,7 +1414,9 @@ jobs:
           echo "72ed1ca87e3b3d0dfc6ee1436baf154bf04c45ff97d521bec040c5e8dfc8f92c  $archive" | sha256sum --check --strict
           directory="$RUNNER_TEMP/maude-3.5.1"
           mkdir -p "$directory"
-          unzip -q "$archive" -d "$directory"
+          # Batch proving needs no Graphviz, and Python's zipfile replaces
+          # unzip, so this job installs nothing from the Ubuntu archives.
+          python3 -m zipfile -e "$archive" "$directory"
           chmod 755 "$directory/maude"
           echo "$directory" >> "$GITHUB_PATH"
           echo "MAUDE_LIB=$directory" >> "$GITHUB_ENV"

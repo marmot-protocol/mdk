@@ -863,6 +863,30 @@ Persist local forensic audit-log recording settings and return the stored value.
 
 [Source](src/commands/audit.rs#L27)
 
+### `Marmot::audit_log_retention`
+
+**Current.**
+
+```rust
+pub fn audit_log_retention(&self) -> Result<AuditLogRetentionFfi, MarmotKitError>
+```
+
+Read the persisted local audit retention policy: maximum file age in days and per-account size budget in bytes. Defaults to 30 days and 256 MiB.
+
+[Source](src/commands/audit.rs#L40)
+
+### `Marmot::set_audit_log_retention`
+
+**Current.**
+
+```rust
+pub fn set_audit_log_retention( &self, retention: AuditLogRetentionFfi, ) -> Result<AuditLogRetentionFfi, MarmotKitError>
+```
+
+Persist the local audit retention policy and return the stored value, with `max_age_days` clamped to 1-30 and `max_bytes_per_account` to at least 16 MiB. Files past the age are deleted whether or not v5 delivery accepted them; deleting undelivered data records an `ExpiredUndelivered` gap. Above the budget, only the oldest sealed segments that v5 delivery accepted, or that no v5 delivery will send, are deleted. A running app sweeps under the new policy shortly after; explicit delete and clear calls are unaffected.
+
+[Source](src/commands/audit.rs#L48)
+
 ### `Marmot::set_audit_log_tracker_config`
 
 **Current.**
@@ -873,7 +897,7 @@ pub fn set_audit_log_tracker_config( &self, config: AuditLogTrackerConfigV4Ffi, 
 
 Supply non-persisted audit tracker upload metadata: optional Goggles upload URL override, bearer token from the host app, and optional system hardware model, platform, and app version.
 
-[Source](src/commands/audit.rs#L44)
+[Source](src/commands/audit.rs#L64)
 
 ### `Marmot::audit_log_files`
 
@@ -885,7 +909,7 @@ pub fn audit_log_files(&self) -> Result<Vec<AuditLogFileFfi>, MarmotKitError>
 
 Local JSONL audit logs available for explicit forensic upload.
 
-[Source](src/commands/audit.rs#L104)
+[Source](src/commands/audit.rs#L124)
 
 ### `Marmot::post_audit_log_file`
 
@@ -897,7 +921,7 @@ pub async fn post_audit_log_file( &self, path: String, endpoint: String, ) -> Re
 
 POST one selected JSONL audit log to a forensic analyzer endpoint.
 
-[Source](src/commands/audit.rs#L114)
+[Source](src/commands/audit.rs#L134)
 
 ### `Marmot::delete_audit_log_file`
 
@@ -909,7 +933,7 @@ pub async fn delete_audit_log_file( &self, path: String, ) -> Result<AuditLogDel
 
 Delete one local JSONL audit log file (e.g. behind a "clear audit log" button).
 
-[Source](src/commands/audit.rs#L134)
+[Source](src/commands/audit.rs#L154)
 
 ### `Marmot::post_audit_log_tracker_update`
 
@@ -921,7 +945,7 @@ pub async fn post_audit_log_tracker_update( &self, ) -> Result<AuditLogTrackerUp
 
 POST all local audit logs to the configured tracker when audit logging is enabled. This is safe for host apps to call unconditionally; disabled or unconfigured states return a structured skip result.
 
-[Source](src/commands/audit.rs#L144)
+[Source](src/commands/audit.rs#L164)
 
 </details>
 
@@ -5262,7 +5286,7 @@ pub fn audit_delivery_status_v5( &self, ) -> Result<Vec<AuditDeliveryStatusV5Ffi
 
 Read each account's persisted v5 OTLP delivery status without dialing or touching the delivery cursor. Use it to show "audit delivery stalled since X: reason": `last_success_at_ms` against `last_failure`, whose `kind` separates local failures (`StateOverLimit`, `TooManyOpenFiles`, `LocalIo`, `LocalBlocked`) from receiver verdicts and whose `http_status` is set when the receiver answered. `paused` is true after `ReceiverBlocked` (for example `401`) for the configured destination; changing the destination, endpoint or token, or calling `post_audit_log_tracker_update_v5`, retries it. `ReceiverRejected` counts rows the receiver refused in `rejected_batches` while delivery continues. `backlog` is the last measured undelivered bytes, segments, gaps and oldest undelivered record time, as of `observed_at_ms`. Accounts that never ran a v5 pass report no failure and no backlog.
 
-[Source](src/commands/audit.rs#L92)
+[Source](src/commands/audit.rs#L112)
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 
@@ -5272,7 +5296,7 @@ pub async fn post_audit_log_tracker_update_v5( &self, ) -> Result<AuditLogTracke
 
 Run an immediate audit tracker pass and receive separate v4 whole-file and v5 OTLP outcomes. The `v5` field is absent when no dedicated sender is configured; when present, accepted batches, pending accounts, blocked accounts, and idle accounts report the delivery state without treating an empty v4 upload list as success. Recording must be enabled separately. Existing automatic activity triggers use the same v5 sender and retry policy.
 
-[Source](src/commands/audit.rs#L151)
+[Source](src/commands/audit.rs#L171)
 
 ### `Marmot::set_audit_otlp_config_v5`
 
@@ -5282,7 +5306,7 @@ pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> R
 
 Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
-[Source](src/commands/audit.rs#L55)
+[Source](src/commands/audit.rs#L75)
 
 </details>
 

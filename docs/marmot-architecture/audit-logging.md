@@ -1507,18 +1507,33 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
 
 ### Local retention
 
-MDK expires closed forensic files 30 days after their last filesystem write, without a user setting. Recorders seal
+MDK expires closed forensic files a host-configured number of days after their last filesystem write: 30 by
+default, clamped to 1-30 because the v5 receiver accepts records up to 30 days old. Recorders seal
 at 1 MiB or before the first row after a day, whichever comes first, preserving original bytes, inode identity,
-session, sequence and the repeated source header. Daily files therefore keep roughly 30 days of history, with up to
-one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age boundary across
-short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next actual row.
-A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
-Legacy files are not split or rewritten; they age out 30 days after their last write.
+session, sequence and the repeated source header. Daily files therefore keep roughly the configured age of history,
+with up to one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age
+boundary across short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next
+actual row. A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
+Legacy files are not split or rewritten; they age out the configured age after their last write.
 
-Exclusive-root startup sweeps account directories and failed-wipe remnants. Scanning uses filenames and metadata;
-expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when a cursor exists.
+Each account's audit files also have a size budget: 256 MiB by default, at least 16 MiB (mdk#3300). Above it,
+retention deletes that account's oldest sealed segments first, but only those no delivery will ever send again: the
+account's v5 cursor shows them fully accepted, or they are untracked (the account has no v5 cursor, they are v4 or an
+older device identity's files, or a cursor overflow already recorded their loss). A segment with undelivered data is
+never deleted by the budget; only the maximum age or an explicit user clear deletes it. The budget reads metadata and
+one cursor per account (`DeliveryCursorView`), never payloads, and rechecks each file against the cursor under the
+same exclusion as expiry (`evict_delivered_source`). The live active file is never a budget candidate. Hosts set both
+limits with `set_audit_log_retention`, persisted in shared storage.
+
+Exclusive-root startup sweeps account directories and failed-wipe remnants, then each account's budget. Scanning uses
+filenames and metadata; expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when
+a cursor exists. Startup reads the stored policy only once some file is older than a day or an account exceeds the
+smallest budget; if the policy cannot be read, expiry uses 30 days and the budget waits for a later pass.
 An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
-independently of recording consent, upload configuration and upload success. Its metadata scanner has a size-one
+independently of recording consent, upload configuration and upload success. The same worker checks budgets, at
+most every 30 seconds, when recording activity schedules an audit tracker pass and after each automatic delivery pass
+(when delivered segments become evictable): a replay storm can seal several segments a minute. A policy change
+requests a full sweep. Its metadata scanner has a size-one
 path queue and owns no recorder or storage guard. Each unlink is admitted separately; shutdown cancels the walk
 without waiting for payload copying or holding account commands behind a full sweep.
 
@@ -1539,8 +1554,12 @@ No account-file lookup or installation-wide cancellation is needed for orphan di
 Before deleting a tracked source still known as active, retirement seals its filename and durably publishes its closed
 alias and exact final byte length. It preserves ACKs and prepared ranges. A crash leaves a discoverable sealed inode
 or a durably retired alias; publication/unlink errors compensate both cursor and filename, retaining source bytes if
-compensation cannot complete. Acknowledged sources disappear without false gaps; unobserved or prepared unsent tails
-retain genuine missing-source evidence. Generic missing-active detection stays conservative. Delivery drops retired,
+compensation cannot complete. Acknowledged sources disappear without false gaps. When age expiry deletes a source
+with undelivered bytes (an unobserved or prepared unsent tail, or a segment the cursor never adopted), the same
+publication records an `ExpiredUndelivered` gap over the unaccepted extent and advances past it, before the unlink, so
+delivery continues with later data and discovery records no second gap. After the unlink, retention retires that
+journal as discovery would, so a cursor that delivery no longer reads stays bounded. Generic missing-active detection
+stays conservative. Delivery drops retired,
 gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
 reached a receiver.
 

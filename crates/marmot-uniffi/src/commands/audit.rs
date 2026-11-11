@@ -2,9 +2,9 @@
 
 use crate::Marmot;
 use crate::conversions::{
-    AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi,
-    AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi,
-    AuditLogUploadResultFfi, AuditOtlpConfigV5Ffi,
+    AuditDeliveryStatusV5Ffi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogRetentionFfi,
+    AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi, AuditLogTrackerUpdateResultFfi,
+    AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi, AuditOtlpConfigV5Ffi,
 };
 use crate::errors::MarmotKitError;
 use marmot_app::audit_otlp_sender::AuditOtlpSender;
@@ -32,6 +32,26 @@ impl Marmot {
             .runtime
             .set_audit_log_settings(settings.into())
             .await?
+            .into())
+    }
+
+    /// Local audit-log retention policy: maximum age and per-account size
+    /// budget. Defaults to 30 days and 256 MiB.
+    pub fn audit_log_retention(&self) -> Result<AuditLogRetentionFfi, MarmotKitError> {
+        Ok(self.runtime.audit_log_retention()?.into())
+    }
+
+    /// Persist the local audit-log retention policy and return the stored
+    /// value. `max_age_days` is clamped to 1-30 (the receiver accepts records
+    /// up to 30 days old) and `max_bytes_per_account` to at least 16 MiB. The
+    /// running app sweeps under the new policy shortly after.
+    pub fn set_audit_log_retention(
+        &self,
+        retention: AuditLogRetentionFfi,
+    ) -> Result<AuditLogRetentionFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_audit_log_retention(retention.into())?
             .into())
     }
 

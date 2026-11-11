@@ -198,8 +198,8 @@ pub use protocol::storage::messages::MessageFormatPromotionProgress;
 pub use protocol::storage::messages::StorageFormatBenchSizes;
 pub use shared::{
     DirectoryPresentation, DirectoryPresentationChanges, PublicDirectoryProfileRecord,
-    PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
-    StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
+    PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogRetention,
+    StoredAuditLogSettings, StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
 };
 
 pub use app::transport::agent_stream_sequences::{

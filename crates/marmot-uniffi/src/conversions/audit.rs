@@ -2,8 +2,8 @@
 
 use marmot_app::{
     AuditDeliveryBacklog, AuditDeliveryFailure, AuditDeliveryFailureKind, AuditDeliveryStatus,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource,
     AuditOtlpTrackerResult,
 };
 
@@ -285,6 +285,34 @@ impl From<AuditLogSettingsFfi> for AuditLogSettings {
     fn from(value: AuditLogSettingsFfi) -> Self {
         Self {
             enabled: value.enabled,
+        }
+    }
+}
+
+/// Local audit-log retention. Files older than `max_age_days` (1 to 30) are
+/// deleted, delivered or not. Above `max_bytes_per_account` (at least 16 MiB),
+/// the oldest sealed segments are deleted only once v5 delivery accepted them,
+/// or when the account has no v5 delivery to wait for.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogRetentionFfi {
+    pub max_age_days: u32,
+    pub max_bytes_per_account: u64,
+}
+
+impl From<AuditLogRetention> for AuditLogRetentionFfi {
+    fn from(value: AuditLogRetention) -> Self {
+        Self {
+            max_age_days: value.max_age_days,
+            max_bytes_per_account: value.max_bytes_per_account,
+        }
+    }
+}
+
+impl From<AuditLogRetentionFfi> for AuditLogRetention {
+    fn from(value: AuditLogRetentionFfi) -> Self {
+        Self {
+            max_age_days: value.max_age_days,
+            max_bytes_per_account: value.max_bytes_per_account,
         }
     }
 }

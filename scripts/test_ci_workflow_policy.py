@@ -1196,9 +1196,12 @@ class RunnerInfrastructurePolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         formal = workflow.split("\n  formal:\n", 1)[1].split("\n  hermes-installer-auth:\n", 1)[0]
         self.assertNotIn("--no-install-recommends graphviz maude", formal)
+        # The proofs need nothing from the Ubuntu archives, so an archive
+        # outage cannot stop the formal job (Canonical DDoS, 2026-11-11).
+        self.assertNotIn("apt-get", formal)
         script = workflow_step("ci.yml", "Install Maude")
         self.assertIn("Maude3.5.1/Maude-3.5.1-linux-x86_64.zip", script)
-        self.assertLess(script.index("sha256sum"), script.index("unzip"))
+        self.assertLess(script.index("sha256sum"), script.index("python3 -m zipfile -e"))
         self.assertIn("maude --version", script)
 
     def test_corrupt_maude_download_cannot_reach_installation(self):

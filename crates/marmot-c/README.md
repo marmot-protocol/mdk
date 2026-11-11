@@ -743,6 +743,12 @@ nullable `last_failure` and `backlog`. `has_http_status` tells whether the recei
 fields and the pause/retry semantics match the
 [shared description](../marmot-uniffi/README.md#audit-v5-recording-and-delivery).
 
+Local audit retention (maximum age and per-account size budget, shared with the Swift and Kotlin
+bindings in [`marmot-uniffi/README.md`](../marmot-uniffi/README.md#audit-v5-recording-and-delivery))
+is read with `marmot_audit_log_retention` and replaced with `marmot_set_audit_log_retention`,
+which takes a borrowed `MarmotAuditLogRetention` and returns the clamped stored value. Free both
+results with `marmot_audit_log_retention_free`.
+
 ## Legacy audit v4 upload
 
 Use `MarmotAuditLogTrackerConfigV4` and `marmot_set_audit_log_tracker_config_v4` to supply optional

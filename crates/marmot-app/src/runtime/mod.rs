@@ -43,13 +43,13 @@ use crate::{
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
     AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    BackupSettings, ChatListRow, ChatNotificationSettings, ChatPinState,
-    ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS,
-    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
-    MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    BackgroundNotificationCollection, BackupSettings, ChatListRow, ChatNotificationSettings,
+    ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
     NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
     PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
     ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
@@ -575,11 +575,13 @@ impl RuntimeSharedServices {
         let lifecycle = RuntimeLifecycle::new();
         let audit_log_tracker_config = app.audit_log_tracker_config.clone();
         let audit_otlp_sender = Arc::new(StdMutex::new(None));
+        let audit_retention = crate::audit_log::AuditRetentionWorker::new(app.clone());
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
             audit_log_tracker_config.clone(),
             audit_otlp_sender.clone(),
             lifecycle.clone(),
+            audit_retention.clone(),
         );
         Self {
             recovery_credits: Arc::new(StdMutex::new(
@@ -612,7 +614,7 @@ impl RuntimeSharedServices {
             audit_otlp_sender,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
-            audit_retention: Some(crate::audit_log::AuditRetentionWorker::new(app.clone())),
+            audit_retention: Some(audit_retention),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
@@ -816,6 +818,10 @@ impl RuntimeSharedServices {
                 "skipped forensic audit log tracker update"
             );
             return;
+        }
+        // Recording activity seals segments whether or not anything uploads.
+        if let Some(retention) = &self.audit_retention {
+            retention.request_budget_check();
         }
         let config = self.audit_log_tracker_config();
         if self.audit_otlp_sender().is_some() {
@@ -3847,6 +3853,23 @@ impl MarmotAppRuntime {
         Ok(stored)
     }
 
+    pub fn audit_log_retention(&self) -> Result<AuditLogRetention, AppError> {
+        self.accounts.app.audit_log_retention()
+    }
+
+    /// Persist the local audit retention policy, clamped to 1-30 days and a
+    /// minimum per-account budget, and sweep under it soon.
+    pub fn set_audit_log_retention(
+        &self,
+        retention: AuditLogRetention,
+    ) -> Result<AuditLogRetention, AppError> {
+        let stored = self.accounts.app.set_audit_log_retention(retention)?;
+        if let Some(worker) = &self.shared.audit_retention {
+            worker.request_sweep();
+        }
+        Ok(stored)
+    }
+
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
         self.accounts.app.audit_log_files()
     }
@@ -3889,14 +3912,19 @@ impl MarmotAppRuntime {
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
         let config = self.shared.audit_log_tracker_config();
         let sender = self.shared.audit_otlp_sender();
-        post_audit_log_tracker_update_for_runtime(
+        let result = post_audit_log_tracker_update_for_runtime(
             &self.accounts.app,
             config,
             sender.as_deref(),
             &self.shared.audit_otlp_sender,
             &self.shared.lifecycle(),
         )
-        .await
+        .await;
+        // Delivered segments are now evictable under the size budget.
+        if let Some(retention) = &self.shared.audit_retention {
+            retention.request_budget_check();
+        }
+        result
     }
 
     /// Per-account v5 audit OTLP delivery status: the last success, the last

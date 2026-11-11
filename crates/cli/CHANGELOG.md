@@ -9,8 +9,33 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-11
+
+### Added
+
+- `wn-agent` adds `group_admin` (#3032). It takes `account_id_hex`, `group_id_hex`, `member_id_hex` and optional
+  `promote`, `add` and `remove` flags. With no flag set it only reads the member's status. `promote` makes a current
+  member an admin. `add` invites a missing member, as an initial admin together with `promote`. `remove` takes
+  precedence and removes the member, admin rights included, in one commit. Every change goes through the runtime's
+  admin checks (`not_group_admin`). A member id that is not 32 bytes of hex fails as `invalid_hex`. The reply
+  `group_admin_status` carries a fresh `is_member`/`is_admin` readback and `message_ids_hex`. When the request sent
+  a change it also carries `accept_disposition` (`published`, `accepted_pending` or `completion_unknown`). Do not
+  resend an `accepted_pending` or `completion_unknown` change. After an error, read status before retrying. Rust
+  `agent-control` matches must handle `AgentControlRequest::GroupAdmin`, `AgentControlResponse::GroupAdminStatus`
+  and the new `AgentControlSendAcceptDisposition`.
+
 ### Changed
 
+- `wn`, `wnd` and `wn-agent` send no group event, Welcome or account-signed event over a relay's known limit
+  (mdk#2334): 2 MiB on White Noise's two relays, and for events over 64 KiB the WebSocket message size a relay's NIP-11
+  document advertises. An event that fits none of its relays is sent nowhere. `group create`, `groups create`,
+  `group invite` and `groups add-members` report JSON `event_too_large` with `artifact` `welcome` when an invitee's
+  Welcome fits none of their inbox relays, before anything is created or sent; a create used to succeed and leave the
+  Welcome owed. Profile, follow and relay-list commands report `event_too_large` with `artifact` `other` when the event
+  fits none of the account's relays.
+- `groups quarantined` can report reason `RewindRestoreFailed` (mdk#3272): a read of past group state could not restore
+  the live group. `groups retry-hydrate` reports `recovered=false` for it, and the next account open tries to restore
+  the live state.
 - `keys publish`, `keys rotate`, `create-identity` and `login` report JSON `event_too_large`, with `artifact` and
   `size_class`, when every relay refused the KeyPackage for size, by its own answer or over a known limit (#2334).
   They reported `command_failed`.
@@ -3324,7 +3349,9 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/marmot-protocol/mdk/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/marmot-protocol/mdk/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/marmot-protocol/mdk/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/marmot-protocol/mdk/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/marmot-protocol/mdk/compare/v0.11.0...v0.12.0

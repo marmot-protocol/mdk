@@ -106,7 +106,7 @@ enum Prepared {
 /// verdicts. Any other reason is a local fault.
 const RECEIVER_VERDICT_BLOCKS: [&str; 2] = [
     "permanent receiver rejection",
-    "partial receiver acceptance",
+    marmot_forensics::local_delivery::PARTIAL_RECEIVER_BLOCK,
 ];
 
 enum Reservation {

@@ -52,6 +52,14 @@ for each abandoned undelivered extent, and does not re-adopt those files
 unless they are newer than the newest one it gave up, so a full cursor never
 stops newer delivery.
 
+Retention and delivery agree through the cursor. Age expiry
+(`expire_closed_source`) publishes an `ExpiredUndelivered` gap for any
+unaccepted extent, adopting an unseen segment first, and advances the journal
+past it before unlinking; a failed publication or unlink restores the previous
+cursor. Size-budget eviction (`evict_delivered_source`) deletes only a source
+the cursor shows fully accepted or will never deliver, and `DeliveryCursorView`
+answers that question for retained segments from their metadata.
+
 `LocalAuditDelivery` reads the recorder's actual active and numbered segment
 files. It stores destination identity, monotonically assigned journal
 generation, current segment name, device/inode, a 192-byte head fingerprint,
