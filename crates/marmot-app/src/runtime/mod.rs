@@ -5090,7 +5090,7 @@ impl MarmotAppRuntime {
         // single all-or-nothing step.
         match self
             .accounts
-            .remove_account_fenced(&account.account_id_hex, &generated_setup_fence)
+            .remove_account_fenced(&account.label, &generated_setup_fence)
             .await
         {
             Ok(()) => {
@@ -7091,8 +7091,7 @@ impl AccountManager {
             .setup
             .fence_generated_teardown(self, &account.account_id_hex)
             .await;
-        self.remove_account_fenced(&account.account_id_hex, &fence)
-            .await
+        self.remove_account_fenced(&account.label, &fence).await
     }
 
     // Wipe already owns the account's foreground fence before its network
