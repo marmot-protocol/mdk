@@ -6791,6 +6791,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 self.config_cls(
                     extra={
                         "account_id_hex": "11" * 32,
+                        "home": str(root),
                         "media_local_roots": [str(root)],
                     }
                 ),
@@ -6821,7 +6822,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                             await adapter.send_multiple_images(
                                 "22" * 32, [(image.as_uri(), "caption")], metadata={key: target},
                             )
-            self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
+            self.assertFalse(adapter._outbound_media_dir.exists())
             self.assertEqual(image.read_bytes(), b"reply")
 
     async def test_standalone_media_files_use_one_batch_send(self):
