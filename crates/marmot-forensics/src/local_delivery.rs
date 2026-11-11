@@ -28,6 +28,8 @@ const STATE_VERSION: u8 = 2;
 // Hex characters of the head fingerprint a compact entry keeps: enough to
 // catch a replaced file, small enough for thousands of retained segments.
 const COMPACT_FINGERPRINT_HEX: usize = 16;
+// The block reason version 1 recorded for a permanent receiver rejection.
+const LEGACY_REJECTION_BLOCK: &str = "permanent receiver rejection";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryBatch {
@@ -1275,7 +1277,12 @@ fn source_paths(active: &Path) -> io::Result<Vec<PathBuf>> {
             segments.push(entry.path());
         }
     }
-    segments.sort();
+    // Numeric order: the recorder keeps counting past seg999999.
+    segments.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| sealed_index(stem, name))
+    });
     if active.exists() {
         segments.push(active.to_owned());
     }
@@ -1355,6 +1362,13 @@ fn decode_state(bytes: &[u8], fallback_source: &str) -> io::Result<State> {
         _ => return Err(invalid("incompatible delivery cursor")),
     }
     state.version = STATE_VERSION;
+    // Version 1 blocked a journal for good on a receiver rejection. Resume
+    // it from its prepared range; a new rejection now splits the batch.
+    for journal in &mut state.journals {
+        if journal.blocked.as_deref() == Some(LEGACY_REJECTION_BLOCK) {
+            journal.blocked = None;
+        }
+    }
     let stem = state
         .source
         .strip_suffix(".jsonl")
@@ -2260,8 +2274,9 @@ mod tests {
         let mut sink = FakeReceiver::default();
         drain(&mut worker, &mut sink);
         let segments: Vec<_> = sink.batches.iter().map(|b| b.segment.clone()).collect();
-        assert!(segments.iter().any(|s| s.ends_with("-seg999999.jsonl")));
-        assert!(segments.iter().any(|s| s.ends_with("-seg1000000.jsonl")));
+        // Delivered in recorder order: generations follow the numeric index.
+        let position = |suffix: &str| segments.iter().position(|s| s.ends_with(suffix)).unwrap();
+        assert!(position("-seg999999.jsonl") < position("-seg1000000.jsonl"));
     }
 
     #[test]
@@ -2599,6 +2614,34 @@ mod tests {
             .find(|j| j.segment.ends_with("-seg000001.jsonl"))
             .unwrap();
         assert_eq!(journal.observed_len, observed);
+    }
+
+    #[test]
+    fn version_one_rejection_block_resumes_its_prepared_range() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "one");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver {
+            next: Some(ReceiverResult::Retryable),
+            ..Default::default()
+        };
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
+        // What version 1 left after a 4xx: the journal blocked, its range kept.
+        worker.state.journals[0].blocked = Some(LEGACY_REJECTION_BLOCK.into());
+        let mut legacy = serde_json::to_value(&worker.state).unwrap();
+        legacy["version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("source");
+        drop(worker);
+        fs::write(
+            state_dir.join("local-delivery.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert!(worker.blocked().is_empty());
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        assert_eq!(sink.batches[1].token.start(), 0);
+        assert_eq!(sink.batches[1].bodies, sink.batches[0].bodies);
     }
 
     #[test]
