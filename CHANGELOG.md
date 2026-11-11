@@ -14,6 +14,10 @@
 - Remove a redundant connected-relay restart from the manual relay lifetime test
   that timed out in the merge queue (#3287). Connected-relay reconnect coverage
   remains in the socket-watch and SDK tests.
+- Keep a group commit pending when a crash interrupted its send and the relay
+  then refuses the retry (#2332). The interrupted send may have reached the
+  relay, so a later refusal no longer rolls back a commit that members may
+  have applied.
 
 ## 0.15.0 - 2026-11-09
 

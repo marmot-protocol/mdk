@@ -183,7 +183,10 @@ impl TransportPublishRequest {
 ///
 /// `Attempting` is written before the external send. A process that restarts
 /// with an `Attempting` target treats it as outstanding and safely repeats the
-/// same already-signed event bytes. Ambiguous and transient outcomes remain
+/// same already-signed event bytes. The interrupted attempt may have reached
+/// the endpoint, so the target counts as possibly exposed from then on: a
+/// definite answer to the retry speaks only for the retry, and must not let a
+/// pending commit roll back. Ambiguous and transient outcomes remain
 /// outstanding so that exact event can be retried. Terminal callbacks are
 /// idempotent: once a target is `Accepted` or `Failed`, later duplicate or
 /// contradictory results do not change it.
@@ -564,11 +567,17 @@ impl OutboundFanout {
         woken
     }
 
+    /// Whether any endpoint may hold the event without having acknowledged it.
+    /// An `Attempting` target counts: its bytes may already have left, and
+    /// only a recorded result says otherwise.
     pub fn possible_exposure(&self) -> bool {
         self.target_possible_exposure.iter().any(|exposed| *exposed)
-            || self
-                .target_statuses
-                .contains(&FanoutTargetStatus::PossiblyExposed)
+            || self.target_statuses.iter().any(|status| {
+                matches!(
+                    status,
+                    FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::Attempting
+                )
+            })
     }
 
     pub fn pending_post_confirmation_welcomes(&self) -> &[TransportMessage] {
@@ -613,6 +622,12 @@ impl OutboundFanout {
     /// Returns `true` when an outstanding target begins or resumes an attempt.
     /// Re-marking an `Attempting` target after restart is safe and increments
     /// the durable attempt counter; terminal targets remain unchanged.
+    ///
+    /// Only an attempt that ended without a recorded result leaves a target
+    /// `Attempting` for the next pass: a crash, or an error that unwound the
+    /// pass. Its bytes may have reached the endpoint, so re-marking it records
+    /// possible exposure, as an in-process cancellation does. A later definite
+    /// answer then cannot end the target `Failed`.
     pub fn mark_attempt_started(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
         self.mark_attempt_started_at(index, self.created_at_ms)
     }
@@ -626,10 +641,13 @@ impl OutboundFanout {
         match self.target_status(index).ok_or_else(|| {
             TransportAdapterError::Other("fanout target index is out of bounds".into())
         })? {
-            FanoutTargetStatus::NotAttempted
+            status @ (FanoutTargetStatus::NotAttempted
             | FanoutTargetStatus::Attempting
             | FanoutTargetStatus::PossiblyExposed
-            | FanoutTargetStatus::RetryableUnavailable => {
+            | FanoutTargetStatus::RetryableUnavailable) => {
+                if status == FanoutTargetStatus::Attempting {
+                    self.target_possible_exposure[index] = true;
+                }
                 self.target_statuses[index] = FanoutTargetStatus::Attempting;
                 self.target_attempt_counts[index] =
                     self.target_attempt_counts[index].saturating_add(1);
