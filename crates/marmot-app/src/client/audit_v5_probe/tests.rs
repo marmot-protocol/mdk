@@ -765,6 +765,14 @@ mod rejoin_policy {
 }
 
 fn actual_v5_rows(app: &MarmotApp, account: &str) -> Vec<Record> {
+    actual_v5_lines(app, account)
+        .iter()
+        .map(|line| Record::from_json(line.as_bytes()).unwrap())
+        .collect()
+}
+
+/// The account's v5 log lines, checked as [`actual_v5_rows`] checks them.
+fn actual_v5_lines(app: &MarmotApp, account: &str) -> Vec<String> {
     let dir = app.account_dir(account);
     let paths = std::fs::read_dir(dir)
         .unwrap()
@@ -784,7 +792,7 @@ fn actual_v5_rows(app: &MarmotApp, account: &str) -> Vec<Record> {
     body.lines()
         .map(|line| {
             assert!(line.len() < 65_535);
-            Record::from_json(line.as_bytes()).unwrap()
+            line.to_owned()
         })
         .collect()
 }
@@ -2451,6 +2459,89 @@ async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
     })
     .await
     .expect("bounded no-op replay scenario");
+}
+
+/// A relay replay of a message the account already processed, or of its own
+/// send, adds one v5 row through the live delivery path: the engine's
+/// `ingest_outcome`. It records no entry rows and no projection checkpoint
+/// that changed nothing (mdk#3300).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ignored_relay_replays_add_only_their_outcome_row() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let url = scenario._relay.url().await.to_string();
+        let group = scenario.create().await;
+        scenario.bob.sync().await.unwrap();
+        scenario.bob.accept_group_invite(&group).unwrap();
+        async fn sent(client: &mut AppClient, group: &cgka_traits::GroupId) -> TransportMessage {
+            let session = client.runtime.session_mut();
+            let payload = cgka_traits::app_event::MarmotAppEvent::new(
+                hex::encode(session.self_id().as_slice()),
+                1_700_000_000,
+                cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+                vec![],
+                "replayed".to_owned(),
+            )
+            .encode()
+            .unwrap();
+            let mut effects = session
+                .send(cgka_traits::engine::SendIntent::AppMessage {
+                    group_id: group.clone(),
+                    payload,
+                    expected_epoch: None,
+                })
+                .await
+                .unwrap();
+            let marmot_session::PublishWork::ApplicationMessage { msg, .. } =
+                effects.publish.remove(0)
+            else {
+                panic!("expected an application message");
+            };
+            msg
+        }
+        let peer = sent(&mut scenario.alice, &group).await;
+        let own = sent(&mut scenario.bob, &group).await;
+        let mut deliver = async |message: &TransportMessage| {
+            let mut deliveries = scenario
+                .bob
+                .adapter
+                .recovered_deliveries(transport_nostr_adapter::NostrRelayEvent {
+                    endpoint: url.clone().into(),
+                    subscription_id: Some("group".into()),
+                    event: NostrTransportEvent::from_transport_message(message).unwrap(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            scenario
+                .bob
+                .ingest_received_delivery(deliveries.remove(0))
+                .await
+                .unwrap();
+            actual_v5_lines(&scenario.bob_app, "bob")
+        };
+        let first = deliver(&peer).await;
+        let duplicate = deliver(&peer).await;
+        let echo = deliver(&own).await;
+        let added = |before: &[String], after: &[String]| {
+            after[before.len()..]
+                .iter()
+                .map(|line| {
+                    let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                    format!(
+                        "{}/{}",
+                        row["event"]["type"].as_str().unwrap(),
+                        row["event"]["stale_reason"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(added(&first, &duplicate), ["ingest_outcome/duplicate"]);
+        assert_eq!(added(&duplicate, &echo), ["ingest_outcome/own_echo"]);
+        scenario.assert_clean();
+    })
+    .await
+    .expect("bounded ignored replay scenario");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

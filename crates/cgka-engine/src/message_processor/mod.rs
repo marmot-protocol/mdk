@@ -872,6 +872,36 @@ impl FairnessReservation {
     }
 }
 
+/// What [`Engine::recorded_ingest`] already knows about an inbound message.
+pub(crate) enum RecordedIngest {
+    /// Storage or the hot dedup cache already answers it.
+    Outcome(IngestOutcome),
+    /// The hot sent cache names it as this engine's own send. Ingest records
+    /// the echo and answers `OwnEcho`.
+    SentEcho,
+}
+
+impl RecordedIngest {
+    /// Whether ingest will answer it as a replay this engine already holds.
+    pub(crate) fn is_ignored_replay(&self) -> bool {
+        match self {
+            Self::Outcome(outcome) => is_ignored_replay(outcome),
+            Self::SentEcho => true,
+        }
+    }
+}
+
+/// `Ignored { Duplicate | OwnEcho }`: a replay of a message this engine
+/// already holds or sent.
+pub(crate) fn is_ignored_replay(outcome: &IngestOutcome) -> bool {
+    matches!(
+        outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate | InputRejectionCategory::OwnEcho,
+        }
+    )
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn strict_cutover_rejects_legacy_group_addition(
         &self,
@@ -894,41 +924,58 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// The dedup / own-echo prefix of [`Self::do_ingest`]: reads only, so the
+    /// audit seam can learn before writing a row that the message is a replay.
+    pub(crate) fn recorded_ingest(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<Option<RecordedIngest>, EngineError> {
+        // Storage is consulted before the hot cache so a restarted engine can
+        // classify replayed transport messages the same way as a running
+        // process.
+        if let Some(outcome) = self.recorded_message_outcome(&msg.id)? {
+            return Ok(Some(RecordedIngest::Outcome(outcome)));
+        }
+        // In-memory fallback for messages produced before the durable record
+        // is visible to this path.
+        if self.seen_message_ids.contains(&msg.id) {
+            return Ok(Some(RecordedIngest::Outcome(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
+            })));
+        }
+        if self.sent_message_ids.contains(&msg.id) {
+            return Ok(Some(RecordedIngest::SentEcho));
+        }
+        Ok(None)
+    }
+
     /// Inbound pipeline. Never panics; every classifiable stale case returns
     /// a typed `StaleReason` inside `Ok(IngestOutcome::Stale { .. })`.
+    /// `recorded` is [`Self::recorded_ingest`] for `msg`, read just before.
     pub(crate) async fn do_ingest(
         &mut self,
         msg: &TransportMessage,
+        recorded: Result<Option<RecordedIngest>, EngineError>,
     ) -> Result<IngestOutcome, EngineError> {
         // Clear a marker left by cancellation/panic in an earlier ingest; only
         // the current call may suppress its own seen-cache insertion.
         self.retryable_unpersisted_ingest_id = None;
         self.last_ingest_left_object_unpersisted = false;
-        // Durable dedup / own-echo check. Storage is consulted before the hot
-        // cache so a restarted engine can classify replayed transport messages
-        // the same way as a running process.
-        if let Some(outcome) = self.recorded_message_outcome(&msg.id)? {
-            return Ok(outcome);
-        }
-
-        // In-memory fallback for messages produced before the durable record
-        // is visible to this path.
-        if self.seen_message_ids.contains(&msg.id) {
-            return Ok(IngestOutcome::Ignored {
-                category: InputRejectionCategory::Duplicate,
-            });
-        }
-        if self.sent_message_ids.contains(&msg.id) {
-            let group_id = record_group_id(msg);
-            self.persist_transport_message_for_existing_group(
-                msg,
-                &group_id,
-                EpochId(0),
-                MessageState::Sent,
-            )?;
-            return Ok(IngestOutcome::Ignored {
-                category: InputRejectionCategory::OwnEcho,
-            });
+        match recorded? {
+            Some(RecordedIngest::Outcome(outcome)) => return Ok(outcome),
+            Some(RecordedIngest::SentEcho) => {
+                let group_id = record_group_id(msg);
+                self.persist_transport_message_for_existing_group(
+                    msg,
+                    &group_id,
+                    EpochId(0),
+                    MessageState::Sent,
+                )?;
+                return Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::OwnEcho,
+                });
+            }
+            None => {}
         }
 
         let outcome = match &msg.envelope {

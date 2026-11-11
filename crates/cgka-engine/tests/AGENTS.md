@@ -426,6 +426,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `audit_log.rs`
   - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and
     the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows.
+    `ignored_replays_record_only_their_outcome` owns the inbound row set: a duplicate or own-echo replay writes only
+    its `ingest_outcome`, with the delivery's transport context, while a processed message keeps
+    `transport_received` → `ingest_entry` → `ingest_outcome` (mdk#3300). The app path's single row per replay is
+    marmot-app's `ignored_relay_replays_add_only_their_outcome_row`.
     Default construction with successful wrong-recipient ingest belongs in `ingest.rs`
 
 `record_write_atomicity/application_receive_retry.rs` also owns committed stored-message audit evidence: real

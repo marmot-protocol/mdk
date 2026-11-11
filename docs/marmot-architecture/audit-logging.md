@@ -376,7 +376,11 @@ Group-state coverage:
 
 ### `ingest_entry`
 
-Emitted at `Engine::ingest()` entry before `do_ingest()`.
+Emitted at `Engine::ingest()` entry before `do_ingest()`, after `transport_received` when the transport supplied wire
+evidence. A relay replay that ingest answers from its dedup reads alone (`ignored` with `duplicate` or `own_echo`)
+writes neither row: its `ingest_outcome` is its only row and carries the same transport context. If such a message
+ends any other way, both rows are written before its outcome or `ingest_error`, so every message that ingest works on
+keeps its evidence in order (mdk#3300).
 
 | Field | Meaning |
 | --- | --- |
