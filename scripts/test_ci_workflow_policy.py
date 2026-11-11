@@ -580,6 +580,32 @@ class OdinArchiveCacheTests(unittest.TestCase):
         self.assertIn("does not match its pinned sha256", result.stderr)
         self.assertEqual((downloads, kept_good, installed), (1, None, False))
 
+    def test_windows_download_tolerates_only_an_offline_revocation_check(self):
+        # SChannel fails a handshake whose revocation server is offline; the
+        # Windows download skips only that check, and the pin still decides.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            stubs = tmp / "bin"
+            stubs.mkdir()
+            for name, body in {
+                "uname": 'case "$1" in -s) echo MINGW64_NT-10.0 ;; -m) echo x86_64 ;; esac',
+                "sha256sum": "exit 1",
+                "curl": 'printf "%s\\n" "$@" > "$ARGS"; while [ "$1" != --output ]; do shift; done; '
+                        'printf corrupt > "$2"',
+            }.items():
+                (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+                (stubs / name).chmod(0o755)
+            result = subprocess.run(
+                ["/bin/bash", str(ROOT / "scripts/install-odin.sh"), str(tmp / "odin-install")],
+                env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}", "ARGS": str(tmp / "args")},
+                capture_output=True, text=True)
+            arguments = (tmp / "args").read_text().splitlines()
+            self.assertIn("--ssl-revoke-best-effort", arguments)
+            self.assertFalse({"-k", "--insecure", "--ssl-no-revoke"} & set(arguments))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not match its pinned sha256", result.stderr)
+            self.assertFalse((tmp / "odin-install").exists())
+
 
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
