@@ -72,7 +72,8 @@ flake-report-contract:
 
 # Run a filter `count` times with no retries; the summary gives failed and
 # passed iterations. Iterations run one after another, so load the machine
-# by widening the filter and raising FLAKE_STRESS_THREADS (default num-cpus).
+# by widening the filter and raising FLAKE_STRESS_THREADS (default num-cpus);
+# the test groups in .config/nextest.toml still cap their binaries.
 flake-stress package filter count="40" *args:
     cargo nextest run -p {{quote(package)}} -E {{quote(filter)}} --stress-count {{quote(count)}} --retries 0 --no-fail-fast --test-threads "${FLAKE_STRESS_THREADS:-num-cpus}" {{args}}
 

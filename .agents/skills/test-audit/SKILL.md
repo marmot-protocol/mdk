@@ -198,7 +198,8 @@ filter 40 times with no retries: it must show 0 failed iterations. When the
 flake reproduces locally, give the failed and total iterations before and
 after the fix in the PR; when it does not, say so. Iterations run one at a
 time, so to add contention widen the filter to the test's binary and raise
-`FLAKE_STRESS_THREADS`.
+`FLAKE_STRESS_THREADS`; the test groups in `.config/nextest.toml` still cap
+some binaries.
 
 ## Audit evidence
 

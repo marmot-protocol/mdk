@@ -35,7 +35,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 DEFAULT_REPO = "marmot-protocol/mdk"
 DEFAULT_JOBS = ("rust-test", "cli-e2e", "relay-runtime", "relay-e2e", "conformance", "conformance-extras")
 # A testcase with one of these failed every attempt; nextest adds a
@@ -113,7 +113,9 @@ def parse_report(data: bytes) -> tuple[list[str], dict[str, Outcome]]:
         if not name:
             raise MalformedReport("testcase without a name")
         classname = case.get("classname")
-        test = f"{classname}::{name}" if classname else name
+        # Both halves can hold `::`, so a tab keeps a unit test and an
+        # integration test with the same joined path apart.
+        test = f"{classname}\t{name}"
         seen.append(test)
         attempts = [child for child in case
                     if child.tag in HARD_FAILURES | RETRY_FAILURES | FLAKY_FAILURES]
@@ -136,12 +138,15 @@ class Budget:
     def __init__(self, calls: int) -> None:
         self._calls = max(calls, 0)
         self._lock = threading.Lock()
-        self.exhausted = False
 
     def take(self, calls: int = 1) -> None:
+        """Spend `calls`, or raise RateLimited and spend nothing if fewer remain.
+
+        A run too large for what is left leaves the rest to smaller runs and
+        to retries of downloads already paid for.
+        """
         with self._lock:
-            if self.exhausted or self._calls < calls:
-                self.exhausted = True
+            if self._calls < calls:
                 raise RateLimited
             self._calls -= calls
 
@@ -152,7 +157,6 @@ class Budget:
     def spend_all(self) -> None:
         with self._lock:
             self._calls = 0
-            self.exhausted = True
 
 
 class GitHub:
@@ -205,21 +209,27 @@ class GitHub:
         # GET /rate_limit does not count against the limit.
         return int(self._json("rate_limit", free=True)["resources"]["core"]["remaining"])
 
-    def runs(self, workflow: str, event: str, since: dt.datetime) -> tuple[list[dict], bool]:
-        """Return the runs created since `since`, and whether the list was cut short.
+    def runs(self, workflow: str, event: str, since: dt.datetime) -> tuple[list[dict], str | None]:
+        """Return the runs created since `since`, newest first, and why the list is short, if it is.
 
-        GitHub serves at most 1,000 runs for one query.
+        GitHub serves at most 1,000 runs for one query. A budget spent after
+        the first page keeps the pages already listed.
         """
         runs: list[dict] = []
         for page in range(1, 11):
-            body = self._json(f"repos/{self.repo}/actions/workflows/{workflow}/runs", {
-                "event": event, "created": f">={since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                "per_page": "100", "page": str(page)})
+            try:
+                body = self._json(f"repos/{self.repo}/actions/workflows/{workflow}/runs", {
+                    "event": event, "created": f">={since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                    "per_page": "100", "page": str(page)})
+            except RateLimited:
+                if not runs:
+                    raise
+                return runs, "the API budget ran out"
             batch = body.get("workflow_runs", [])
             runs += batch
             if len(batch) < 100:
-                return runs, False
-        return runs, int(body.get("total_count", len(runs))) > len(runs)
+                return runs, None
+        return runs, "GitHub lists at most 1,000" if int(body.get("total_count", len(runs))) > len(runs) else None
 
     def artifacts(self, run_id: int) -> list[dict]:
         artifacts: list[dict] = []
@@ -239,7 +249,7 @@ class GitHub:
 def empty_summary(run: dict) -> dict:
     return {"version": CACHE_VERSION, "run_id": run["id"], "run_attempt": run.get("run_attempt", 1),
             "created_at": run["created_at"], "conclusion": run.get("conclusion"),
-            "reports": 0, "malformed": 0, "tests": [], "outcomes": {}}
+            "reports": 0, "malformed": 0, "expired": 0, "tests": [], "outcomes": {}}
 
 
 def add_report(summary: dict, data: bytes) -> None:
@@ -327,12 +337,15 @@ def parse_time(value: str) -> dt.datetime:
 
 
 def fetch_run(github: GitHub, run: dict, artifact_name: re.Pattern[str]) -> dict:
-    selected = [artifact for artifact in github.artifacts(run["id"])
-                if artifact_name.fullmatch(artifact.get("name", "")) and not artifact.get("expired")]
+    matching = [artifact for artifact in github.artifacts(run["id"])
+                if artifact_name.fullmatch(artifact.get("name", ""))]
+    selected = [artifact for artifact in matching if not artifact.get("expired")]
     # Claim the whole run's downloads up front, so a spent budget never leaves
     # a run half-fetched after paying for some of it.
     github.budget.take(len(selected))
     summary = empty_summary(run)
+    # An expired artifact never comes back; the summary remembers the gap.
+    summary["expired"] = len(matching) - len(selected)
     for index, artifact in enumerate(selected):
         try:
             add_artifact(summary, github.artifact_zip(artifact["id"], prepaid=True))
@@ -372,10 +385,10 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
         try:
             remaining = github.core_remaining()
             github.budget = Budget(remaining - args.reserve)
-            runs, truncated = github.runs(args.workflow, args.event, since)
-            if truncated:
-                collection.notes.append(f"Partial data: GitHub listed only the newest {len(runs)} runs "
-                                        "of the window; shorten --days to cover the rest.")
+            runs, cut = github.runs(args.workflow, args.event, since)
+            if cut:
+                collection.notes.append(f"Partial data: only the newest {len(runs)} runs of the window "
+                                        f"were listed ({cut}).")
         except RateLimited:
             collection.notes.append("The GitHub API budget was spent before runs could be listed; "
                                     "this report uses cached runs only.")
@@ -522,6 +535,11 @@ def fit_markdown(report: dict, top: int, samples: int, max_chars: int) -> str:
 
 def build_report(args: argparse.Namespace, since: dt.datetime, collection: Collection) -> dict:
     summaries = collection.summaries
+    expired = [s for s in summaries if s["expired"]]
+    if expired:
+        collection.notes.append(
+            f"Partial data: {sum(s['expired'] for s in expired)} test reports in {len(expired)} runs had "
+            "expired before they were fetched, so those runs count without them.")
     return {
         "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "repo": args.repo, "workflow": args.workflow, "event": args.event,
@@ -529,7 +547,8 @@ def build_report(args: argparse.Namespace, since: dt.datetime, collection: Colle
         "runs": {"cached": len(summaries), "with_reports": sum(1 for s in summaries if s["reports"]),
                  "listed": collection.listed, "fetched": collection.fetched,
                  "unfetched": collection.unfetched, "in_progress": collection.in_progress,
-                 "malformed_reports": sum(s["malformed"] for s in summaries)},
+                 "malformed_reports": sum(s["malformed"] for s in summaries),
+                 "expired_reports": sum(s["expired"] for s in summaries)},
         # Every note says what this report is missing.
         "partial": bool(collection.notes),
         "notes": collection.notes,

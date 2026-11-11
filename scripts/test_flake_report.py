@@ -51,18 +51,18 @@ TIMEOUT = 'hangs|<failure type="test timeout">secret output that must not be rep
 class ParseReportTests(unittest.TestCase):
     def test_a_passing_test_is_seen_without_an_outcome(self):
         seen, outcomes = parse_report(report(PASS))
-        self.assertEqual(seen, ["wn-cli::cli::passes"])
+        self.assertEqual(seen, ["wn-cli::cli\tpasses"])
         self.assertEqual(outcomes, {})
 
     def test_a_retry_that_passes_counts_as_flaky(self):
         _, outcomes = parse_report(report(FLAKY))
-        outcome = outcomes["wn-cli::cli::flaky"]
+        outcome = outcomes["wn-cli::cli\tflaky"]
         self.assertEqual((outcome.flaky, outcome.failed), (1, 0))
         self.assertEqual(outcome.samples, [["crates/cli/tests/cli.rs:12:5", "assertion `left == right` failed"]])
 
     def test_every_attempt_of_a_test_that_never_passes_counts_as_failed(self):
         _, outcomes = parse_report(report(FAILED))
-        outcome = outcomes["wn-cli::cli::broken"]
+        outcome = outcomes["wn-cli::cli\tbroken"]
         self.assertEqual((outcome.flaky, outcome.failed), (0, 2))
         # The two attempts share one panic, so one sample remains.
         self.assertEqual(outcome.samples, [["crates/cli/tests/cli.rs:40:9", "receiver must see it: Elapsed(())"]])
@@ -73,11 +73,16 @@ class ParseReportTests(unittest.TestCase):
             'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n' \
             'PRIVATE LOG LINE</failure>'
         _, outcomes = parse_report(report(case))
-        self.assertEqual(outcomes["wn-cli::cli::quiet"].samples, [["src/lib.rs:3:5", ""]])
+        self.assertEqual(outcomes["wn-cli::cli\tquiet"].samples, [["src/lib.rs:3:5", ""]])
 
     def test_a_failure_without_a_panic_reports_only_its_type(self):
         _, outcomes = parse_report(report(TIMEOUT))
-        self.assertEqual(outcomes["wn-cli::cli::hangs"].samples, [["", "test timeout"]])
+        self.assertEqual(outcomes["wn-cli::cli\thangs"].samples, [["", "test timeout"]])
+
+    def test_a_unit_test_and_an_integration_test_with_one_joined_path_stay_apart(self):
+        seen, _ = parse_report(report("relay_runtime::isolates", classname="marmot-app"))
+        other, _ = parse_report(report("isolates", classname="marmot-app::relay_runtime"))
+        self.assertNotEqual(seen, other)
 
     def test_malformed_reports_are_rejected(self):
         for data in [b"<testsuites><testcase name='x'>", b"<html/>",
@@ -113,12 +118,12 @@ class FakeGitHub:
         self.budget.take()
         if isinstance(self.runs_listed, Exception):
             raise self.runs_listed
-        return self.runs_listed, False
+        return self.runs_listed, None
 
     def artifacts(self, run_id):
         self.budget.take()
-        return [{"id": artifact_id, "name": name, "expired": False}
-                for artifact_id, name, _ in self.artifacts_by_run[run_id]]
+        return [{"id": artifact_id, "name": name, "expired": data is None}
+                for artifact_id, name, data in self.artifacts_by_run[run_id]]
 
     def artifact_zip(self, artifact_id, *, prepaid=False):
         if not prepaid:
@@ -243,6 +248,24 @@ class LeaderboardTests(unittest.TestCase):
         self.assertIn("Partial data", markdown)
         self.assertEqual(list(self.cache.rglob("run-*")), [])
 
+    def test_a_run_too_large_for_the_budget_leaves_room_for_smaller_ones(self):
+        big = [(n, f"ci-runner-rust-test-{n}-1", artifact_zip(report(FLAKY))) for n in range(10, 15)]
+        small = [(20, "ci-runner-cli-e2e-0-1", artifact_zip(report(FAILED)))]
+        # 1 list + 2 artifact lists + 1 small download fit; the big run's 5 do not.
+        github = FakeGitHub([run(1, 1), run(2, 2)], {1: big, 2: small}, remaining=104)
+        _, _, data = self.main(github, "--parallel", "1")
+        self.assertEqual(github.downloads, [20])
+        self.assertTrue(data["partial"])
+
+    def test_a_budget_spent_after_the_first_page_keeps_the_listed_runs(self):
+        github = flake_report.GitHub("o/r")
+        github.budget = Budget(1)
+        page = {"workflow_runs": [{"id": n} for n in range(100)], "total_count": 150}
+        with unittest.mock.patch.object(github, "_call", side_effect=lambda *a, **k: (
+                github.budget.take(), json.dumps(page).encode())[1]):
+            runs, cut = github.runs("ci.yml", "merge_group", dt.datetime.now(dt.timezone.utc))
+        self.assertEqual((len(runs), cut), (100, "the API budget ran out"))
+
     def test_rate_limit_errors_from_gh_stop_fetching(self):
         github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", RateLimited())]})
         _, _, data = self.main(github)
@@ -264,6 +287,15 @@ class LeaderboardTests(unittest.TestCase):
         self.assertIn("could not be fetched", markdown)
         self.assertTrue(data["partial"])
         self.assertEqual(list(self.cache.rglob("run-*")), [])
+
+    def test_expired_reports_mark_the_report_partial_on_every_rerun(self):
+        github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", None),
+                                              (2, "ci-runner-cli-e2e-1-1", artifact_zip(report(PASS)))]})
+        for _ in range(2):
+            _, markdown, data = self.main(github)
+            self.assertTrue(data["partial"])
+            self.assertIn("1 test reports in 1 runs had expired", markdown)
+        self.assertEqual(github.downloads, [2])
 
     def test_a_rerun_attempt_is_fetched_again(self):
         first = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(PASS)))]})
