@@ -24,6 +24,12 @@
 
 ### Added
 
+- Ship Swift `nextCancellable()` adapters for presented chat lists, chat-list
+  windows, account attention, conversation windows, and block lists inside
+  `MarmotKit.swift` (mdk#2760). MDK owns their native-pending cancellation
+  integration checks. Remove the host's handwritten adapter when adopting
+  the combined Swift asset to avoid duplicate method definitions.
+
 - `MarmotDeploymentFfi` adds `relay_event_limits: [RelayEventLimitFfi]`, empty by default in Swift and Kotlin: the
   largest event each listed relay accepts, for relays that do not advertise it (mdk#2334). MDK sends no group event,
   Welcome or account-signed event over a relay's known limit. For events over 64 KiB MDK also counts the WebSocket
