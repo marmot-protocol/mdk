@@ -73,6 +73,11 @@ pub(crate) enum SyncMode {
 /// difference.
 pub(super) const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
 
+/// How often a catch-up drain publishes A, the account's read state: reads
+/// during a long drain see the state after a recent delivery, not each one
+/// (mdk#3273 decision 2).
+const DRAIN_READ_STATE_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+
 // ponytail: EOSE crosses a separate router task; retain a short quiet window
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
@@ -2818,6 +2823,7 @@ impl AppClient {
         // before/after so an analyzer can compare the persisted floor against
         // the ingested `created_at`s.
         let drain_started = std::time::Instant::now();
+        let mut drain_published_at = drain_started;
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut routes_dirty = false;
         let overflowed = loop {
@@ -2842,6 +2848,14 @@ impl AppClient {
                         .await);
                 }
             };
+            // A drain turn: every delivery so far is ingested and projected
+            // and the next wait has not begun. Publish A here, at most once
+            // per bound, so reads follow a long catch-up without the
+            // per-delivery path paying for it (mdk#3273).
+            if drain_published_at.elapsed() >= DRAIN_READ_STATE_PUBLISH_INTERVAL {
+                self.publish_read_state();
+                drain_published_at = std::time::Instant::now();
+            }
             let committed = self.take_pending_applied_sync_summary();
             if let Some(on_progress) = on_progress {
                 // Native admission already checkpointed these frames. Keep
@@ -6589,6 +6603,7 @@ mod runtime_group_subscription_refresh_tests {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -6907,6 +6922,7 @@ mod runtime_group_subscription_refresh_tests {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,

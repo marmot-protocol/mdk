@@ -71,6 +71,20 @@ impl SqliteOpenMlsStorageError {
     pub(super) fn is_undecodable_value(&self) -> bool {
         matches!(self, Self::Serialization(_) | Self::Decode(_))
     }
+
+    /// The storage failure behind this error, or `None` for a stored value
+    /// that did not decode ([`Self::is_undecodable_value`]); see
+    /// `StorageProvider::mls_storage_failure`.
+    pub(crate) fn storage_failure(&self) -> Option<cgka_traits::storage::StorageError> {
+        if self.is_undecodable_value() {
+            return None;
+        }
+        Some(match self {
+            Self::Storage(error) => error.clone(),
+            Self::Sqlite(error) => crate::base::codec::sqlite_storage_error(error),
+            other => cgka_traits::storage::StorageError::Backend(other.to_string()),
+        })
+    }
 }
 
 /// The serde_json form of `value`, for matching list elements written before

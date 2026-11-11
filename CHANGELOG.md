@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- Record `read_state_publish` runtime telemetry: the count and duration of
+  each new version of an account's published read state, which the account
+  worker now builds at its quiescent points for reads that later move off the
+  worker (mdk#3273).
+- Add `durably_owned_key_packages_with_validity` to the engine, session and
+  account runtime: the owned KeyPackage list with the one clock reading its
+  lifetimes are judged at, the next lifetime bound ahead (a listed bundle's
+  `not_after` or a not-yet-valid bundle's `not_before`), whether a stored
+  bundle was skipped as undecodable, and whether a lifetime check disagreed
+  with that reading, so a caller can keep the list until it can change
+  (mdk#3273).
+
 ### Fixed
 
 - Report each relay's answer to a publish under the spelling the group or
@@ -9,6 +23,12 @@
   explicit default port read as possibly exposed whatever it answered, so a
   group whose only relay was spelled that way never confirmed or rolled back a
   commit.
+- Fail `durably_owned_key_packages` with the storage error when proving a
+  stored bundle fails to read (I/O, busy, closed), instead of returning a
+  partial list that reports this device's own KeyPackages as not owned.
+  Bundles whose stored value does not decode are still skipped. Storage
+  backends classify OpenMLS storage errors through the new
+  `StorageProvider::mls_storage_failure` (mdk#3273).
 - Fetch independent directory queries concurrently, so KeyPackage and deletion
   reads overlap their relay waits while retaining separate event limits (#1813).
 - Reuse notification settings, chat mutes, group records, and directory users

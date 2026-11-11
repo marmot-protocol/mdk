@@ -2184,6 +2184,7 @@ impl MarmotApp {
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
+            read_state: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             received_private_key_package_generation: 0,

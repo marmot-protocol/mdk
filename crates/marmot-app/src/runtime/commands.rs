@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, ReadClass, account_worker_response,
+    AccountManager, AccountWorkerCommand, Emit, ReadClass, Unpublished, account_worker_response,
     group_contributes_co_members, local_account_worker_response,
     long_account_worker_catch_up_response, long_account_worker_response,
     publish_app_runtime_group_state_updated,
@@ -1040,6 +1040,7 @@ impl AccountManager {
                 .forget_group_local(group_id, cgka_traits::Timestamp(crate::unix_now_seconds()))?;
             if changed {
                 publish_app_runtime_group_state_updated(
+                    Emit::Unpublished(Unpublished::NoClient),
                     &self.events,
                     &account.account_id_hex,
                     &account.label,
@@ -1075,6 +1076,7 @@ impl AccountManager {
                 .delete_group_local_data(&account.label, &group_id_hex)?;
             if deleted {
                 publish_app_runtime_group_state_updated(
+                    Emit::Unpublished(Unpublished::NoClient),
                     &self.events,
                     &account.account_id_hex,
                     &account.label,

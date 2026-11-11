@@ -33,6 +33,7 @@ mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
 mod push_token_reshare;
 mod quarantine_receive;
+mod read_state;
 mod relay_event_limits;
 mod relay_plane_runtime;
 mod replaceable_delivery;
@@ -4601,6 +4602,7 @@ async fn failed_leave_push_compensation_body() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let db = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &db,
@@ -10678,6 +10680,7 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -18566,6 +18569,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19009,6 +19013,7 @@ async fn accepted_projection_retries() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -21406,7 +21411,12 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     loop {
         match runtime.unhydrated_group_count_for_test("sender").await {
             Err(AppError::TransportClosed) => break,
-            Ok(_) => tokio::task::yield_now().await,
+            // The worker takes a ready command before its receive, and each
+            // probe ends with publishing A (checked against live reads under
+            // test). On two threads, a probe sent back to back would be
+            // waiting at every turn, and the receive that observes the exit
+            // would never run.
+            Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
         }
         assert!(

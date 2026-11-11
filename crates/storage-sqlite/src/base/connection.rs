@@ -6,7 +6,7 @@ use std::path::Path;
 #[cfg(any(target_os = "android", test))]
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -144,6 +144,19 @@ fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
 /// lifetime.
 pub struct ConnectionGuard<'a> {
     guard: MutexGuard<'a, Option<rusqlite::Connection>>,
+    on_release: &'a OnceLock<ReleaseHook>,
+}
+
+/// Runs with the connection still held each time a guard releases it; see
+/// [`CloseableConnection::set_release_hook`].
+pub(crate) type ReleaseHook = Box<dyn Fn(&rusqlite::Connection) + Send + Sync>;
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(hook), Some(connection)) = (self.on_release.get(), self.guard.as_ref()) {
+            hook(connection);
+        }
+    }
 }
 
 impl Deref for ConnectionGuard<'_> {
@@ -181,7 +194,6 @@ impl DerefMut for ConnectionGuard<'_> {
 /// the [`SqliteAccountStorage`] aggregate (the app's shared cache and directory
 /// caches), so the checkpoint-then-close ordering and the closed-state contract
 /// live in one place.
-#[derive(Debug)]
 pub struct CloseableConnection {
     slot: Mutex<Option<rusqlite::Connection>>,
     /// Published before [`Self::close`] waits for the connection mutex. New
@@ -196,6 +208,16 @@ pub struct CloseableConnection {
     /// Detail carried by the [`StorageError::Closed`] this connection raises,
     /// naming which database is closed.
     closed_detail: &'static str,
+    on_release: OnceLock<ReleaseHook>,
+}
+
+impl fmt::Debug for CloseableConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloseableConnection")
+            .field("closed", &self.closed)
+            .field("closed_detail", &self.closed_detail)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -244,7 +266,40 @@ impl CloseableConnection {
             closed: AtomicBool::new(false),
             released: Arc::default(),
             closed_detail,
+            on_release: OnceLock::new(),
         }
+    }
+
+    /// Run `hook` with the connection still held each time a guard on it is
+    /// released, on the releasing thread. Set once; a second hook is refused.
+    /// The hook must not lock this connection.
+    pub(crate) fn set_release_hook(&self, hook: ReleaseHook) -> StorageResult<()> {
+        self.on_release
+            .set(hook)
+            .map_err(|_| StorageError::Backend("connection release hook already set".into()))
+    }
+
+    /// Borrow the connection if no thread holds it right now, without
+    /// waiting: `Ok(None)` when one does. Unlike [`Self::lock`] it also
+    /// borrows a connection whose close has begun but not taken it yet: a
+    /// guard taken before the close began may still be committing through
+    /// it, so a caller that must see every commit's release waits for that
+    /// guard instead of skipping the connection. Fails with
+    /// [`StorageError::Closed`] once the close has taken the connection,
+    /// which it does only after every guard on it was released.
+    pub(crate) fn try_lock_until_taken(&self) -> StorageResult<Option<ConnectionGuard<'_>>> {
+        let guard = match self.slot.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        if guard.is_none() {
+            return Err(StorageError::Closed(self.closed_detail.to_string()));
+        }
+        Ok(Some(ConnectionGuard {
+            guard,
+            on_release: &self.on_release,
+        }))
     }
 
     /// Borrow the connection, or fail with [`StorageError::Closed`] if it has
@@ -263,7 +318,10 @@ impl CloseableConnection {
         if self.is_closed() || guard.is_none() {
             return Err(StorageError::Closed(self.closed_detail.to_string()));
         }
-        Ok(ConnectionGuard { guard })
+        Ok(ConnectionGuard {
+            guard,
+            on_release: &self.on_release,
+        })
     }
 
     /// Whether [`Self::close`] has started. Nonblocking.
@@ -385,6 +443,38 @@ impl SharedConnection {
     /// See [`SharedConnectionInner::serial`].
     pub(crate) fn serial(&self) -> u64 {
         self.inner.serial
+    }
+
+    /// See [`CloseableConnection::set_release_hook`].
+    pub(crate) fn set_release_hook(&self, hook: ReleaseHook) -> StorageResult<()> {
+        self.inner.connection.set_release_hook(hook)
+    }
+
+    /// [`CloseableConnection::try_lock_until_taken`]: the connection if no
+    /// thread holds it right now, even while it is closing. Unlike
+    /// [`Self::lock`] it ignores the transaction slot, so a transaction
+    /// another thread owns may be open on what it returns.
+    pub(crate) fn try_lock_idle(&self) -> StorageResult<Option<ConnectionGuard<'_>>> {
+        self.inner.connection.try_lock_until_taken()
+    }
+
+    /// A reference that does not keep the connection open.
+    pub(crate) fn downgrade(&self) -> WeakSharedConnection {
+        WeakSharedConnection(Arc::downgrade(&self.inner))
+    }
+}
+
+/// A [`SharedConnection`] that does not keep it open.
+#[derive(Clone)]
+pub(crate) struct WeakSharedConnection(std::sync::Weak<SharedConnectionInner>);
+
+impl WeakSharedConnection {
+    pub(crate) fn upgrade(&self) -> Option<SharedConnection> {
+        self.0.upgrade().map(|inner| SharedConnection { inner })
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 

@@ -153,9 +153,9 @@ pub use subscriptions::{
 
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
-    AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
-    ReadClass, ReadReply, WorkerLane, WorkerUnitGauge, publish_app_runtime_group_state_updated,
-    spawn_app_runtime_account_worker,
+    AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, Emit, ManagedAccountWorker,
+    ReadClass, ReadReply, Unpublished, WorkerLane, WorkerUnitGauge,
+    publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
 };
 pub(crate) use audit_tracker::{
     AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
@@ -6187,6 +6187,7 @@ impl MarmotAppRuntime {
             ChatListUpdateTrigger::ArchiveChanged,
         );
         publish_app_runtime_group_state_updated(
+            Emit::Unpublished(Unpublished::AfterReply),
             &self.events,
             &account.account_id_hex,
             &account.label,

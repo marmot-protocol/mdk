@@ -22,6 +22,8 @@ pub struct SqliteAccountStorage {
     migration_duration: Duration,
     pub(crate) connection: SharedConnection,
     pub(crate) notification_revision: Arc<AtomicU64>,
+    /// See [`cgka_traits::storage::StorageProvider::group_write_generation`].
+    pub(crate) group_writes: crate::cross::group_writes::GroupWriteCounter,
     pub(crate) openmls: SqliteOpenMlsStorage,
 }
 
@@ -32,19 +34,29 @@ pub type SqliteStorage = SqliteAccountStorage;
 
 impl SqliteAccountStorage {
     pub(crate) fn from_opened(opened: OpenedAccount) -> StorageResult<Self> {
-        let notification_revision = {
-            let conn = opened.connection.lock()?;
-            crate::cross::handles::notification_counter(&conn)?
-        };
+        let notification_revision =
+            crate::cross::handles::notification_counter(&*opened.connection.lock()?)?;
+        let group_writes = crate::cross::group_writes::install(&opened.connection)?;
         let openmls = SqliteOpenMlsStorage::new(opened.connection.clone());
         Ok(Self {
             connection: opened.connection,
             notification_revision,
+            group_writes,
             openmls,
             draft_commit_observer: Default::default(),
             migrations_applied: opened.migrations_applied,
             migration_duration: opened.migration_duration,
         })
+    }
+
+    /// Rows inserted, updated or deleted in this database through any
+    /// connection this process has open on it, trigger writes included,
+    /// counted once committed: a value that moves with every write a reader
+    /// could observe (mdk#3273). Compare it only with values read while one of
+    /// those connections stayed open. Writes by other processes are not
+    /// counted.
+    pub fn write_count(&self) -> u64 {
+        self.group_writes.writes(&self.connection)
     }
 
     /// Neutral open-time result. Existing ledger entries are not new migrations.

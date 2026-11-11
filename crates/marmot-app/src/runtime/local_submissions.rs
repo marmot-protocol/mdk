@@ -374,6 +374,7 @@ impl MarmotAppRuntime {
             drop(admission);
             if let Some(update) = update {
                 account_worker::publish_app_runtime_projection_update(
+                    account_worker::Emit::Unpublished(account_worker::Unpublished::OffWorker),
                     &events,
                     &account.account_id_hex,
                     &account.label,

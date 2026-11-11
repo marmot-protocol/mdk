@@ -8,6 +8,7 @@
 use crate::capabilities::leaf_capabilities;
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::Timestamp;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
@@ -21,6 +22,7 @@ use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use tls_codec::{Deserialize as _, Serialize as _};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 // The backend is private even to this parent module: callers can only validate
 // or hash, and cannot obtain the process-wide RNG-bearing provider.
@@ -86,28 +88,143 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
     storage: &S,
     protocol_profile: ProtocolProfile,
 ) -> Result<Vec<KeyPackage>, EngineError> {
+    durably_owned_key_packages_with_validity(storage, protocol_profile)
+        .map(|owned| owned.key_packages)
+}
+
+/// [`durably_owned_key_packages`], with how long the list holds while
+/// nothing writes (mdk#3273): a caller that keeps the list reuses it only
+/// inside that window.
+#[derive(Clone, Debug)]
+pub struct OwnedKeyPackages {
+    pub key_packages: Vec<KeyPackage>,
+    /// The one system-clock reading every bundle's lifetime is judged at,
+    /// on the clock OpenMLS checks lifetimes against. The list holds from it
+    /// and says nothing about earlier times.
+    pub checked_at: Timestamp,
+    /// The first time after `checked_at` the list can change with no write:
+    /// the soonest `not_after` of a listed KeyPackage, or the soonest
+    /// `not_before` of a bundle left out because it is not valid yet. `None`
+    /// when neither lies ahead.
+    pub changes_at: Option<Timestamp>,
+    /// Whether a stored bundle was skipped because it did not decode.
+    pub skipped_undecodable: bool,
+    /// Whether a bundle's lifetime check disagreed with its lifetime at
+    /// `checked_at`: OpenMLS reads the clock itself, and the clock crossed a
+    /// lifetime bound between the two readings. The window then says nothing
+    /// about the list.
+    pub clock_moved: bool,
+}
+
+/// A bundle's lifetime judged at `at` by OpenMLS's rule (valid while
+/// `not_before <= at < not_after`): whether it is valid, and when that next
+/// changes as the clock moves forward.
+fn lifetime_at(lifetime: &Lifetime, at: u64) -> (bool, Option<u64>) {
+    if at < lifetime.not_before() {
+        (false, Some(lifetime.not_before()))
+    } else if at < lifetime.not_after() {
+        (true, Some(lifetime.not_after()))
+    } else {
+        (false, None)
+    }
+}
+
+/// The clock crossed a lifetime bound between the list's reading and a
+/// bundle's own check.
+#[derive(Debug, PartialEq, Eq)]
+struct ClockMoved;
+
+/// When a bundle's place in the owned list next changes after `at`, given
+/// its check. Only the lifetime failure OpenMLS reports (no bounds attached)
+/// depends on the time; the accepted-range failure and every other one
+/// leave the bundle out at any time. A check that listed the bundle, or left
+/// it out for its lifetime, must agree with its lifetime at `at`;
+/// otherwise the clock moved between the two readings.
+fn lifetime_change<T>(
+    checked: &Result<T, EngineError>,
+    lifetime: &Lifetime,
+    at: u64,
+) -> Result<Option<u64>, ClockMoved> {
+    let listed = match checked {
+        Ok(_) => true,
+        Err(EngineError::InvalidKeyPackageLifetime {
+            not_before: None,
+            not_after: None,
+        }) => false,
+        Err(_) => return Ok(None),
+    };
+    let (valid, change) = lifetime_at(lifetime, at);
+    if listed == valid {
+        Ok(change)
+    } else {
+        Err(ClockMoved)
+    }
+}
+
+/// Seconds since the Unix epoch on the clock OpenMLS checks lifetimes against.
+fn lifetime_clock_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// [`durably_owned_key_packages`] with its [`OwnedKeyPackages`] validity.
+pub fn durably_owned_key_packages_with_validity<S: StorageProvider>(
+    storage: &S,
+    protocol_profile: ProtocolProfile,
+) -> Result<OwnedKeyPackages, EngineError> {
+    owned_key_packages_judged_at(storage, protocol_profile, lifetime_clock_now())
+}
+
+/// The owned list with every bundle's lifetime judged at the system-clock
+/// reading `checked_at`, which OpenMLS's own checks may not share.
+fn owned_key_packages_judged_at<S: StorageProvider>(
+    storage: &S,
+    protocol_profile: ProtocolProfile,
+    checked_at: u64,
+) -> Result<OwnedKeyPackages, EngineError> {
     let private = crate::private_key_packages::issued_references(storage)?;
     let mut owned = Vec::new();
+    let mut changes_at: Option<u64> = None;
+    let mut skipped_undecodable = false;
+    let mut clock_moved = false;
     let mut seen_references = std::collections::BTreeSet::new();
     let mut skipped = 0_usize;
     for stored in storage.stored_key_package_bundles()? {
         let Ok(bundle) = serde_json::from_slice::<KeyPackageBundle>(&stored.value) else {
             skipped += 1;
+            skipped_undecodable = true;
             continue;
         };
         let Ok(reference) = validation_crypto::hash_ref(bundle.key_package()) else {
             skipped += 1;
+            skipped_undecodable = true;
             continue;
         };
         if private.contains(reference.as_slice()) {
             continue;
         }
-        let Ok(Some(persisted_bundle)) = OpenMlsStorageProvider::key_package::<_, KeyPackageBundle>(
+        let persisted_bundle = match OpenMlsStorageProvider::key_package::<_, KeyPackageBundle>(
             storage.mls_storage(),
             &reference,
-        ) else {
-            skipped += 1;
-            continue;
+        ) {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => {
+                skipped += 1;
+                continue;
+            }
+            // A failed read is no fact about this bundle: answering without it
+            // would report a KeyPackage this device owns as not owned. Only a
+            // stored value that does not decode is skipped, as a corrupt row.
+            Err(error) => match storage.mls_storage_failure(&error) {
+                Some(failure) => return Err(EngineError::Storage(failure)),
+                None => {
+                    skipped += 1;
+                    skipped_undecodable = true;
+                    continue;
+                }
+            },
         };
         if persisted_bundle.key_package() != bundle.key_package() {
             skipped += 1;
@@ -120,10 +237,16 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
         let mls_message: MlsMessageOut = bundle.key_package().clone().into();
         let Ok(bytes) = mls_message.tls_serialize_detached() else {
             skipped += 1;
+            skipped_undecodable = true;
             continue;
         };
         let key_package = KeyPackage::new(bytes).with_protocol_profile(protocol_profile);
-        if key_package_metadata(&key_package).is_err() {
+        let checked = key_package_metadata(&key_package);
+        match lifetime_change(&checked, bundle.key_package().life_time(), checked_at) {
+            Ok(change) => changes_at = changes_at.into_iter().chain(change).min(),
+            Err(ClockMoved) => clock_moved = true,
+        }
+        if checked.is_err() {
             skipped += 1;
             continue;
         }
@@ -137,7 +260,13 @@ pub fn durably_owned_key_packages<S: StorageProvider>(
             "stored key package bundles were not usable"
         );
     }
-    Ok(owned)
+    Ok(OwnedKeyPackages {
+        key_packages: owned,
+        checked_at: Timestamp(checked_at),
+        changes_at: changes_at.map(Timestamp),
+        skipped_undecodable,
+        clock_moved,
+    })
 }
 
 /// Decode a transported KeyPackage and verify its signature and structure.
@@ -469,9 +598,19 @@ impl<S: StorageProvider> Engine<S> {
     /// A decodable bundle stored under any other key is therefore not usable
     /// and must not be reported as device-owned. Corrupt or otherwise invalid
     /// rows are skipped rather than turning a read-only ownership query into a
-    /// destructive repair operation.
+    /// destructive repair operation. A storage failure (I/O, busy, closed)
+    /// fails the read instead: skipping it would report an owned KeyPackage
+    /// as not owned.
     pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, EngineError> {
         durably_owned_key_packages(&self.storage, self.new_protocol_profile)
+    }
+
+    /// [`Self::durably_owned_key_packages`] with how long the list holds while
+    /// nothing writes (mdk#3273).
+    pub fn durably_owned_key_packages_with_validity(
+        &self,
+    ) -> Result<OwnedKeyPackages, EngineError> {
+        durably_owned_key_packages_with_validity(&self.storage, self.new_protocol_profile)
     }
 
     /// Whether `key_package` advertises what a KeyPackage built now would:
@@ -767,4 +906,92 @@ fn validate_key_package_lifetime_policy(key_package: &MlsKeyPackage) -> Result<(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifetime_failure() -> Result<(), EngineError> {
+        Err(EngineError::InvalidKeyPackageLifetime {
+            not_before: None,
+            not_after: None,
+        })
+    }
+
+    /// The clock stepped across a bound during a build: the list's reading
+    /// lies past a stored bundle's `not_after` (the clock then stepped back
+    /// before OpenMLS checked it) or before its `not_before` (the clock then
+    /// stepped forward). Either way the check disagrees with the reading, and
+    /// the list is not reusable (mdk#3273).
+    #[test]
+    fn a_clock_stepped_across_a_bound_during_a_build_makes_the_list_unreusable() {
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
+        let engine =
+            crate::distributed_convergence::tests::test_engine_with_storage(storage.clone());
+        let generated = engine.build_fresh_key_package(&storage).unwrap();
+        let lifetime = key_package_metadata(&generated).unwrap();
+        let profile = engine.new_protocol_profile;
+        let read_at = |at| owned_key_packages_judged_at(&storage, profile, at).unwrap();
+
+        let steady = read_at(lifetime_clock_now());
+        assert_eq!(steady.key_packages, vec![generated.clone()]);
+        assert!(!steady.clock_moved);
+        assert_eq!(steady.changes_at, Some(Timestamp(lifetime.not_after)));
+
+        let stepped_back = read_at(lifetime.not_after);
+        assert_eq!(stepped_back.key_packages, vec![generated.clone()]);
+        assert!(stepped_back.clock_moved);
+
+        let stepped_forward = read_at(lifetime.not_before - 1);
+        assert_eq!(stepped_forward.key_packages, vec![generated]);
+        assert!(stepped_forward.clock_moved);
+    }
+
+    /// A lifetime is judged by OpenMLS's rule: valid from `not_before` up to,
+    /// not including, `not_after`, and next changing at the bound ahead.
+    #[test]
+    fn a_lifetime_is_valid_from_not_before_until_not_after() {
+        let lifetime = Lifetime::init(100, 200);
+        assert_eq!(lifetime_at(&lifetime, 99), (false, Some(100)));
+        assert_eq!(lifetime_at(&lifetime, 100), (true, Some(200)));
+        assert_eq!(lifetime_at(&lifetime, 199), (true, Some(200)));
+        assert_eq!(lifetime_at(&lifetime, 200), (false, None));
+    }
+
+    /// The owned list judges every lifetime at one clock reading
+    /// (mdk#3273). A check that agrees with it gives the bound ahead; one
+    /// made at a reading on the other side of a bound, after the clock
+    /// stepped either way, is caught; a failure that does not depend on the
+    /// time gives no bound.
+    #[test]
+    fn a_bundles_check_must_agree_with_its_lifetime_at_the_lists_reading() {
+        let lifetime = Lifetime::init(100, 200);
+        assert_eq!(lifetime_change(&Ok(()), &lifetime, 150), Ok(Some(200)));
+        assert_eq!(
+            lifetime_change(&lifetime_failure(), &lifetime, 50),
+            Ok(Some(100))
+        );
+        assert_eq!(
+            lifetime_change(&lifetime_failure(), &lifetime, 250),
+            Ok(None)
+        );
+        // Listed by a check whose clock read inside the lifetime, judged at a
+        // reading before or after it.
+        assert_eq!(lifetime_change(&Ok(()), &lifetime, 50), Err(ClockMoved));
+        assert_eq!(lifetime_change(&Ok(()), &lifetime, 250), Err(ClockMoved));
+        // Left out by a check whose clock read outside the lifetime, judged
+        // at a reading inside it.
+        assert_eq!(
+            lifetime_change(&lifetime_failure(), &lifetime, 150),
+            Err(ClockMoved)
+        );
+        let out_of_range = Err::<(), _>(EngineError::InvalidKeyPackageLifetime {
+            not_before: Some(100),
+            not_after: Some(200),
+        });
+        assert_eq!(lifetime_change(&out_of_range, &lifetime, 150), Ok(None));
+        let signature = Err::<(), _>(EngineError::Backend("signature".to_owned()));
+        assert_eq!(lifetime_change(&signature, &lifetime, 150), Ok(None));
+    }
 }

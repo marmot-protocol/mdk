@@ -370,7 +370,8 @@ fn replay_query_work() {
                 .all(|package| package.value.as_slice() == [0])
         );
 
-        measured(&store, "proposal queue cleanup", 90, || {
+        // Each deleted row also runs its group-write trigger (mdk#3273).
+        measured(&store, "proposal queue cleanup", 130, || {
             store.openmls.clear_proposal_queue::<openmls::group::GroupId,
                 openmls::ciphersuite::hash_ref::ProposalRef>(&openmls::group::GroupId::from_slice(&[0xaa])).unwrap();
         });

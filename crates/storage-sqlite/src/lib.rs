@@ -182,6 +182,8 @@ pub use base::connection::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use base::connection::{SnapshotFault, relax_storage_for_test_process};
+#[cfg(any(test, feature = "test-support"))]
+pub use cross::group_writes::expect_uncounted_writes_for_test;
 pub use cross::outbound::MessageDraftCommitObserver;
 pub use protocol::handle::SqliteAccountStorage;
 #[allow(deprecated)]

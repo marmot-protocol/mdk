@@ -133,6 +133,7 @@ pub(in crate::client) fn fault_connection(client: &AppClient) -> rusqlite::Conne
     let key = app
         .sqlcipher_key(label, &keys, &path, crate::SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,

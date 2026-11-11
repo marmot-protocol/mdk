@@ -644,7 +644,7 @@ impl AppClient {
     /// Whether this device started fresh and still trusts no device group,
     /// so the host can say that only chats it is invited to from now on are
     /// here. False while device groups are off.
-    pub(crate) fn started_fresh(&mut self) -> Result<bool, AppError> {
+    pub(crate) fn started_fresh(&self) -> Result<bool, AppError> {
         if !self.app.device_groups_enabled() || self.trusted_device_group()?.is_some() {
             return Ok(false);
         }
