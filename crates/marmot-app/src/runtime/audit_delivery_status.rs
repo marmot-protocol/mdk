@@ -148,6 +148,15 @@ pub(crate) fn audit_delivery_paused(
     is_paused(&stored, Some(sender))
 }
 
+/// Whether automatic delivery is paused for this target. Attempts check it
+/// inside their admission, so a pause recorded by a concurrent attempt holds.
+pub(crate) fn paused_for_target(target: &AuditDeliveryStatusTarget, state_dir: &Path) -> bool {
+    load(state_dir, Some(&target.destination))
+        .paused_for
+        .as_deref()
+        == Some(target.fingerprint.as_str())
+}
+
 /// Fold one attempt's observation into the persisted status. The caller
 /// holds the attempt's audit export admission. Status is advisory: a failed
 /// write is logged and never fails the attempt it describes.

@@ -75,7 +75,7 @@ mod account_attention;
 mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
-pub(crate) use audit_otlp_delivery::attempt_audit_otlp_once;
+pub(crate) use audit_otlp_delivery::{AttemptStatus, attempt_audit_otlp_once};
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,

@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::audit_delivery_status::{audit_delivery_paused, classify_attempt_error};
-use super::{AuditOtlpAttemptOutcome, attempt_audit_otlp_once};
+use super::{AttemptStatus, AuditOtlpAttemptOutcome, attempt_audit_otlp_once};
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
 use crate::audit_log::{AuditOtlpTrackerResult, AuditUploadAttempt};
 use crate::{
@@ -398,7 +398,11 @@ async fn post_v5_audit_tracker_update(
                 &account.label,
                 sender,
                 configured_sender,
-                true,
+                if automatic {
+                    AttemptStatus::Automatic
+                } else {
+                    AttemptStatus::Manual
+                },
             )
             .await
             {
@@ -411,6 +415,11 @@ async fn post_v5_audit_tracker_update(
                     break;
                 }
             };
+            if report.paused {
+                summary.blocked_accounts += 1;
+                reached_limit = false;
+                break;
+            }
             if let Some((kind, http_status)) = report.failure {
                 log_v5_delivery_failure(automatic, kind, http_status);
             }

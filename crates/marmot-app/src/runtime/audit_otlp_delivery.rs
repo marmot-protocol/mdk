@@ -2,7 +2,9 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use marmot_forensics::local_delivery::{DeliveryStep, LocalAuditDelivery, Preparation};
+use marmot_forensics::local_delivery::{
+    DeliveryBacklog, DeliveryStep, LocalAuditDelivery, Preparation,
+};
 
 use crate::audit_export_lifecycle::AuditExportAttempt;
 use crate::{AppError, AuditDeliveryFailureKind, MarmotApp};
@@ -10,7 +12,7 @@ use marmot_observability::{AuditOtlpSendResult, AuditOtlpSender};
 
 use super::audit_delivery_status::{
     AuditDeliveryObservation, AuditDeliveryStatusTarget, audit_delivery_state_dir,
-    classify_attempt_error, record_observation,
+    classify_attempt_error, paused_for_target, record_observation,
 };
 use super::{MarmotAppRuntime, RuntimeLifecycle, blocking_app_task};
 
@@ -58,16 +60,29 @@ pub(crate) async fn send_audit_otlp_once_for_app(
         account_ref,
         sender,
         configured_sender,
-        false,
+        AttemptStatus::Untracked,
     )
     .await
     .map(|report| report.outcome)
+}
+
+/// Whether an attempt records delivery status, and whether it honors a pause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttemptStatus {
+    /// A host's direct one-shot attempt: no status.
+    Untracked,
+    /// A manual tracker update: records status and retries a paused account.
+    Manual,
+    /// The activity scheduler: records status and skips a paused account.
+    Automatic,
 }
 
 /// An attempt's outcome and the failure it recorded, for the tracker's log.
 pub(crate) struct AttemptReport {
     pub(crate) outcome: AuditOtlpAttemptOutcome,
     pub(crate) failure: Option<(AuditDeliveryFailureKind, Option<u16>)>,
+    /// An automatic attempt found the account paused and sent nothing.
+    pub(crate) paused: bool,
 }
 
 impl AttemptReport {
@@ -75,8 +90,16 @@ impl AttemptReport {
         Self {
             outcome,
             failure: None,
+            paused: false,
         }
     }
+}
+
+type LoggedFailure = Option<(AuditDeliveryFailureKind, Option<u16>)>;
+
+enum Prepared {
+    Paused,
+    Ready(Preparation, DeliveryBacklog, LoggedFailure),
 }
 
 /// Journal block reasons `LocalAuditDelivery::finish` records for receiver
@@ -149,20 +172,21 @@ async fn reserve(
     })
 }
 
-/// One attempt. With `record_status`, the attempt records what it observed as
-/// the account's delivery status inside its own admission, before releasing
-/// its reservation, so status writes follow the order of attempts.
+/// One attempt. A tracked attempt records what it observed as the account's
+/// delivery status inside its own admission, before releasing its
+/// reservation, so status writes follow the order of attempts. An automatic
+/// attempt rechecks the pause under that admission.
 pub(crate) async fn attempt_audit_otlp_once(
     app: &MarmotApp,
     lifecycle: &RuntimeLifecycle,
     account_ref: &str,
     sender: &AuditOtlpSender,
     configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
-    record_status: bool,
+    mode: AttemptStatus,
 ) -> Result<AttemptReport, AppError> {
     let app = app.clone();
     let lifecycle = lifecycle.clone();
-    let status = record_status.then(|| AuditDeliveryStatusTarget::new(sender));
+    let status = (mode != AttemptStatus::Untracked).then(|| AuditDeliveryStatusTarget::new(sender));
     let (attempt, account_id, account_label) =
         match reserve(&app, &lifecycle, account_ref, sender, configured_sender).await? {
             Reservation::Reserved {
@@ -185,6 +209,13 @@ pub(crate) async fn attempt_audit_otlp_once(
                         return Ok(None);
                     }
                     let state_dir = audit_delivery_state_dir(&app, &account_label);
+                    if mode == AttemptStatus::Automatic
+                        && status
+                            .as_ref()
+                            .is_some_and(|target| paused_for_target(target, &state_dir))
+                    {
+                        return Ok(Some(Prepared::Paused));
+                    }
                     let prepared = (|| {
                         let active = app.audit_delivery_active_path(&account_label)?;
                         let mut local =
@@ -234,23 +265,34 @@ pub(crate) async fn attempt_audit_otlp_once(
                         observation.observed(backlog);
                         record_observation(status.as_ref(), &state_dir, &observation);
                     }
-                    Ok(Some((preparation, backlog, observation.logged_failure())))
+                    Ok(Some(Prepared::Ready(
+                        preparation,
+                        backlog,
+                        observation.logged_failure(),
+                    )))
                 })?
                 .flatten();
             Ok((attempt, preparation))
         }
     })
     .await?;
-    let Some((preparation, backlog, failure)) = prepared else {
-        return Ok(AttemptReport::new(AuditOtlpAttemptOutcome::Cancelled));
+    let (preparation, backlog, failure) = match prepared {
+        None => return Ok(AttemptReport::new(AuditOtlpAttemptOutcome::Cancelled)),
+        Some(Prepared::Paused) => {
+            return Ok(AttemptReport {
+                paused: true,
+                ..AttemptReport::new(AuditOtlpAttemptOutcome::Cancelled)
+            });
+        }
+        Some(Prepared::Ready(preparation, backlog, failure)) => (preparation, backlog, failure),
     };
     let Preparation::Batch(batch) = preparation else {
         let Preparation::Step(step) = preparation else {
             unreachable!()
         };
         return Ok(AttemptReport {
-            outcome: AuditOtlpAttemptOutcome::Local(step),
             failure,
+            ..AttemptReport::new(AuditOtlpAttemptOutcome::Local(step))
         });
     };
     let token = batch.token.clone();
@@ -316,11 +358,11 @@ pub(crate) async fn attempt_audit_otlp_once(
             let _ = recorded;
         }
         return Ok(AttemptReport {
-            outcome: AuditOtlpAttemptOutcome::Sent {
+            failure,
+            ..AttemptReport::new(AuditOtlpAttemptOutcome::Sent {
                 receiver,
                 local: None,
-            },
-            failure,
+            })
         });
     };
     let finish_lifecycle = lifecycle.clone();
@@ -373,8 +415,8 @@ pub(crate) async fn attempt_audit_otlp_once(
         Err(error) => return Err(error),
     };
     Ok(AttemptReport {
-        outcome: AuditOtlpAttemptOutcome::Sent { receiver, local },
         failure,
+        ..AttemptReport::new(AuditOtlpAttemptOutcome::Sent { receiver, local })
     })
 }
 

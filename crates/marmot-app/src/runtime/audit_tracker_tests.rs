@@ -617,6 +617,21 @@ async fn receiver_block_pauses_automatic_delivery_until_manual_retry_or_config_c
         requests.try_recv().is_err(),
         "a paused account is not resent"
     );
+    // An automatic attempt that read "unpaused" before a concurrent attempt
+    // recorded the pause rechecks it under its own admission.
+    let sender = runtime.shared.audit_otlp_sender().unwrap();
+    let report = super::attempt_audit_otlp_once(
+        &app,
+        &runtime.shared.lifecycle(),
+        "alice",
+        &sender,
+        Some(&runtime.shared.audit_otlp_sender),
+        AttemptStatus::Automatic,
+    )
+    .await
+    .unwrap();
+    assert!(report.paused);
+    assert!(requests.try_recv().is_err());
 
     // The pause is durable: a restart with the same configuration keeps it.
     runtime.shutdown_and_close().await.unwrap();
