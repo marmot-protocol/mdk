@@ -205,7 +205,11 @@ class GitHub:
         # GET /rate_limit does not count against the limit.
         return int(self._json("rate_limit", free=True)["resources"]["core"]["remaining"])
 
-    def runs(self, workflow: str, event: str, since: dt.datetime) -> list[dict]:
+    def runs(self, workflow: str, event: str, since: dt.datetime) -> tuple[list[dict], bool]:
+        """Return the runs created since `since`, and whether the list was cut short.
+
+        GitHub serves at most 1,000 runs for one query.
+        """
         runs: list[dict] = []
         for page in range(1, 11):
             body = self._json(f"repos/{self.repo}/actions/workflows/{workflow}/runs", {
@@ -214,8 +218,8 @@ class GitHub:
             batch = body.get("workflow_runs", [])
             runs += batch
             if len(batch) < 100:
-                break
-        return runs
+                return runs, False
+        return runs, int(body.get("total_count", len(runs))) > len(runs)
 
     def artifacts(self, run_id: int) -> list[dict]:
         artifacts: list[dict] = []
@@ -368,7 +372,10 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
         try:
             remaining = github.core_remaining()
             github.budget = Budget(remaining - args.reserve)
-            runs = github.runs(args.workflow, args.event, since)
+            runs, truncated = github.runs(args.workflow, args.event, since)
+            if truncated:
+                collection.notes.append(f"Partial data: GitHub listed only the newest {len(runs)} runs "
+                                        "of the window; shorten --days to cover the rest.")
         except RateLimited:
             collection.notes.append("The GitHub API budget was spent before runs could be listed; "
                                     "this report uses cached runs only.")
@@ -523,7 +530,8 @@ def build_report(args: argparse.Namespace, since: dt.datetime, collection: Colle
                  "listed": collection.listed, "fetched": collection.fetched,
                  "unfetched": collection.unfetched, "in_progress": collection.in_progress,
                  "malformed_reports": sum(s["malformed"] for s in summaries)},
-        "partial": bool(collection.unfetched),
+        # Every note says what this report is missing.
+        "partial": bool(collection.notes),
         "notes": collection.notes,
         "tests": leaderboard(summaries),
     }
@@ -568,8 +576,9 @@ def main(argv: list[str] | None = None, github: GitHub | None = None) -> int:
         github = GitHub(args.repo)
     collection = collect(args, since, None if args.offline else github)
     report = build_report(args, since, collection)
-    if collection.listing_failed and not collection.summaries:
-        print("flake_report: listing runs failed and the cache has none; is gh authenticated?", file=sys.stderr)
+    if collection.listing_failed:
+        # A board built only from the cache would look current; publish none.
+        print("flake_report: listing runs failed; is gh authenticated?", file=sys.stderr)
         return 1
     markdown = (fit_markdown(report, args.top, args.samples, args.max_chars) if args.max_chars
                 else render_markdown(report, args.top, args.samples))

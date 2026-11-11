@@ -111,7 +111,9 @@ class FakeGitHub:
 
     def runs(self, workflow, event, since):
         self.budget.take()
-        return self.runs_listed
+        if isinstance(self.runs_listed, Exception):
+            raise self.runs_listed
+        return self.runs_listed, False
 
     def artifacts(self, run_id):
         self.budget.take()
@@ -246,10 +248,21 @@ class LeaderboardTests(unittest.TestCase):
         _, _, data = self.main(github)
         self.assertTrue(data["partial"])
 
+    def test_a_failed_listing_publishes_nothing_even_with_a_cache(self):
+        self.main(FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY)))]}))
+        code, markdown, _ = self.main(FakeGitHub(GhError("HTTP 401"), {}))
+        self.assertEqual((code, markdown), (1, ""))
+
+    def test_a_budget_spent_before_listing_is_partial(self):
+        _, markdown, data = self.main(FakeGitHub([run(1, 1)], {}, remaining=100))
+        self.assertTrue(data["partial"])
+        self.assertIn("before runs could be listed", markdown)
+
     def test_a_failed_download_leaves_the_run_for_the_next_invocation(self):
         github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", GhError("HTTP 500"))]})
-        _, markdown, _ = self.main(github)
+        _, markdown, data = self.main(github)
         self.assertIn("could not be fetched", markdown)
+        self.assertTrue(data["partial"])
         self.assertEqual(list(self.cache.rglob("run-*")), [])
 
     def test_a_rerun_attempt_is_fetched_again(self):
