@@ -17,6 +17,7 @@ use openmls::prelude::{
     KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, Lifetime,
     MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
+use openmls::treesync::LeafNodeSource;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::crypto::OpenMlsCrypto;
@@ -242,9 +243,16 @@ fn owned_key_packages_judged_at<S: StorageProvider>(
         };
         let key_package = KeyPackage::new(bytes).with_protocol_profile(protocol_profile);
         let checked = key_package_metadata(&key_package);
-        match lifetime_change(&checked, bundle.key_package().life_time(), checked_at) {
-            Ok(change) => changes_at = changes_at.into_iter().chain(change).min(),
-            Err(ClockMoved) => clock_moved = true,
+        // A leaf added by an Update or a Commit has no lifetime, and the
+        // check refuses its source whatever the time. `life_time()` would
+        // unwrap it, so read the lifetime from the source.
+        if let LeafNodeSource::KeyPackage(lifetime) =
+            bundle.key_package().leaf_node().leaf_node_source()
+        {
+            match lifetime_change(&checked, lifetime, checked_at) {
+                Ok(change) => changes_at = changes_at.into_iter().chain(change).min(),
+                Err(ClockMoved) => clock_moved = true,
+            }
         }
         if checked.is_err() {
             skipped += 1;
@@ -946,6 +954,59 @@ mod tests {
         let stepped_forward = read_at(lifetime.not_before - 1);
         assert_eq!(stepped_forward.key_packages, vec![generated]);
         assert!(stepped_forward.clock_moved);
+    }
+
+    /// A stored bundle whose leaf an Update or a Commit added has no
+    /// lifetime, and OpenMLS's check refuses its source. Stored under its own
+    /// reference it passes every lookup guard, so the list's lifetime step
+    /// sees it: it is left out with no bound, not unwrapped (mdk#3273).
+    #[test]
+    fn a_stored_bundle_without_a_key_package_leaf_is_left_out_without_a_bound() {
+        use cgka_traits::storage::KeyPackageBundleStorage as _;
+        fn set_leaf_source(value: &mut serde_json::Value, source: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::Object(map) => map
+                    .iter_mut()
+                    .map(|(key, child)| {
+                        if key == "leaf_node_source" {
+                            *child = source.clone();
+                            1
+                        } else {
+                            set_leaf_source(child, source)
+                        }
+                    })
+                    .sum(),
+                serde_json::Value::Array(items) => items
+                    .iter_mut()
+                    .map(|child| set_leaf_source(child, source))
+                    .sum(),
+                _ => 0,
+            }
+        }
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
+        let engine =
+            crate::distributed_convergence::tests::test_engine_with_storage(storage.clone());
+        let generated = engine.build_fresh_key_package(&storage).unwrap();
+        let lifetime = key_package_metadata(&generated).unwrap();
+        let stored = storage.stored_key_package_bundles().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&stored[0].value).unwrap();
+        assert_eq!(set_leaf_source(&mut value, &serde_json::json!("Update")), 1);
+        let rejected: KeyPackageBundle = serde_json::from_value(value).unwrap();
+        let reference = validation_crypto::hash_ref(rejected.key_package()).unwrap();
+        OpenMlsStorageProvider::write_key_package(storage.mls_storage(), &reference, &rejected)
+            .unwrap();
+        assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 2);
+
+        let owned = owned_key_packages_judged_at(
+            &storage,
+            engine.new_protocol_profile,
+            lifetime_clock_now(),
+        )
+        .unwrap();
+        assert_eq!(owned.key_packages, vec![generated]);
+        assert_eq!(owned.changes_at, Some(Timestamp(lifetime.not_after)));
+        assert!(!owned.clock_moved);
+        assert!(!owned.skipped_undecodable);
     }
 
     /// A lifetime is judged by OpenMLS's rule: valid from `not_before` up to,

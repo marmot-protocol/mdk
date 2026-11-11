@@ -31,7 +31,9 @@ use marmot_session::{
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
-use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
+use storage_sqlite::{
+    PreparedGroupImageUploadRecord, PreparedGroupImageUploadState, PreparedGroupImageUploadStatus,
+};
 use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
 
@@ -678,19 +680,19 @@ where
 }
 
 fn prepared_group_image_status(
-    record: &PreparedGroupImageUploadRecord,
+    status: &PreparedGroupImageUploadStatus,
 ) -> AppPreparedGroupImageUpload {
     AppPreparedGroupImageUpload {
-        upload_id: record.upload_id.clone(),
-        state: match record.state {
+        upload_id: status.upload_id.clone(),
+        state: match status.state {
             PreparedGroupImageUploadState::Staged => AppPreparedGroupImageUploadState::Staged,
             PreparedGroupImageUploadState::Uploaded => AppPreparedGroupImageUploadState::Uploaded,
             PreparedGroupImageUploadState::Failed => AppPreparedGroupImageUploadState::Failed,
             PreparedGroupImageUploadState::Consumed => AppPreparedGroupImageUploadState::Consumed,
         },
-        attempt_count: record.attempt_count,
-        last_error_kind: record.last_error_kind.clone(),
-        group_id_hex: record.group_id_hex.clone(),
+        attempt_count: status.attempt_count,
+        last_error_kind: status.last_error_kind.clone(),
+        group_id_hex: status.group_id_hex.clone(),
     }
 }
 
@@ -1907,7 +1909,7 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .app_storage()
             .stage_prepared_group_image_upload(&record)?;
-        Ok(prepared_group_image_status(&record))
+        Ok(prepared_group_image_status(&record.status()))
     }
 
     pub(crate) fn prepared_initial_group_image_status(
@@ -1922,7 +1924,7 @@ impl AppClient {
             .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
             })?;
-        Ok(prepared_group_image_status(&record))
+        Ok(prepared_group_image_status(&record.status()))
     }
 
     pub(crate) fn prepared_initial_group_images(
@@ -1932,7 +1934,7 @@ impl AppClient {
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .list_prepared_group_image_uploads()?
+            .list_prepared_group_image_upload_statuses()?
             .iter()
             .map(prepared_group_image_status)
             .collect())
@@ -1957,7 +1959,7 @@ impl AppClient {
             PreparedGroupImageUploadState::Uploaded | PreparedGroupImageUploadState::Consumed
         ) {
             return Ok(PreparedGroupImageUploadStart::Complete(
-                prepared_group_image_status(&record),
+                prepared_group_image_status(&record.status()),
             ));
         }
         let input =
@@ -2005,7 +2007,7 @@ impl AppClient {
             .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("prepared group image upload was not found".into())
             })?;
-        Ok(prepared_group_image_status(&record))
+        Ok(prepared_group_image_status(&record.status()))
     }
 
     pub(crate) fn reusable_direct_group(

@@ -13,7 +13,9 @@
   lifetimes are judged at, the next lifetime bound ahead (a listed bundle's
   `not_after` or a not-yet-valid bundle's `not_before`), whether a stored
   bundle was skipped as undecodable, and whether a lifetime check disagreed
-  with that reading, so a caller can keep the list until it can change
+  with that reading. A caller may keep the list only while no write reaches
+  the account database, the clock stays between that reading and the next
+  bound, and the read skipped no undecodable bundle and saw no disagreement
   (mdk#3273).
 
 ### Fixed
@@ -23,6 +25,10 @@
   explicit default port read as possibly exposed whatever it answered, so a
   group whose only relay was spelled that way never confirmed or rolled back a
   commit.
+- Forget and delete an external-signer account's group through its running
+  account worker, as for a local-signing account, instead of writing storage
+  directly while the worker still held the group and kept answering for it
+  (mdk#3273).
 - Fail `durably_owned_key_packages` with the storage error when proving a
   stored bundle fails to read (I/O, busy, closed), instead of returning a
   partial list that reports this device's own KeyPackages as not owned.

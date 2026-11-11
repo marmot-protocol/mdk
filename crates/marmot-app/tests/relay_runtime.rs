@@ -12126,6 +12126,58 @@ async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
     runtime.shutdown().await;
 }
 
+/// An external-signer account signs on a worker as a local-signing one does,
+/// so forgetting or deleting one of its groups goes through that worker (mdk#3273).
+/// The worker drops the group from its own state and publishes the account's
+/// read state before the host hears of it. A direct storage write would
+/// leave the running worker still answering for the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_signer_forget_and_delete_go_through_the_accounts_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
+    let created = runtime
+        .login_external_signer(
+            account_id.clone(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(&url)],
+                bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
+                discovery_relays: vec![endpoint(&url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(created.account.external_signing && !created.account.local_signing);
+
+    for forget in [true, false] {
+        let group = runtime
+            .create_group(&account_id, "local only", &[], None)
+            .await
+            .unwrap();
+        runtime.group_mls_state(&account_id, &group).await.unwrap();
+        let removed = if forget {
+            runtime.forget_group_local(&account_id, &group).await
+        } else {
+            runtime.delete_group_local(&account_id, &group).await
+        };
+        assert!(removed.unwrap());
+        let after = runtime.group_mls_state(&account_id, &group).await;
+        assert!(
+            after.is_err(),
+            "the worker still answers for a group removed with forget={forget}: {after:?}"
+        );
+    }
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_and_wipe_rejects_tracked_only_account() {
     // A tracked-only (npub) follow has no signing key of any kind, so it never

@@ -1032,7 +1032,7 @@ impl AccountManager {
     ) -> Result<bool, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        if !account.is_active_local_signing() {
+        if !self.signs_on_worker(&account) {
             use cgka_traits::storage::GroupStorage;
             let changed = self
                 .app
@@ -1069,7 +1069,7 @@ impl AccountManager {
     ) -> Result<bool, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        if !account.is_active_local_signing() {
+        if !self.signs_on_worker(&account) {
             let group_id_hex = hex::encode(group_id.as_slice());
             let deleted = self
                 .app
