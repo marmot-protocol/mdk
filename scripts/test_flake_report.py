@@ -84,6 +84,12 @@ class ParseReportTests(unittest.TestCase):
         other, _ = parse_report(report("isolates", classname="marmot-app::relay_runtime"))
         self.assertNotEqual(seen, other)
 
+    def test_a_test_interrupted_by_job_cancellation_is_not_a_failure(self):
+        cancelled = 'slow|<failure message="process aborted with signal 15 (SIGTERM)" type="test abort"/>'
+        aborted = 'crash|<failure message="process aborted with signal 6 (SIGABRT)" type="test abort"/>'
+        _, outcomes = parse_report(report(cancelled, aborted))
+        self.assertEqual(list(outcomes), ["wn-cli::cli\tcrash"])
+
     def test_malformed_reports_are_rejected(self):
         for data in [b"<testsuites><testcase name='x'>", b"<html/>",
                      b'<!DOCTYPE x [<!ENTITY a "a">]><testsuites/>',
@@ -270,6 +276,14 @@ class LeaderboardTests(unittest.TestCase):
         github = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", RateLimited())]})
         _, _, data = self.main(github)
         self.assertTrue(data["partial"])
+
+    def test_a_rate_limit_response_is_not_undone_by_refunds(self):
+        budget = Budget(10)
+        budget.take(3)
+        budget.spend_all()
+        budget.refund(2)
+        with self.assertRaises(RateLimited):
+            budget.take()
 
     def test_a_failed_listing_publishes_nothing_even_with_a_cache(self):
         self.main(FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(FLAKY)))]}))

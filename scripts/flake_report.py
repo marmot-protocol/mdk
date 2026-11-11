@@ -43,6 +43,8 @@ DEFAULT_JOBS = ("rust-test", "cli-e2e", "relay-runtime", "relay-e2e", "conforman
 HARD_FAILURES = {"failure", "error"}
 RETRY_FAILURES = {"rerunFailure", "rerunError"}
 FLAKY_FAILURES = {"flakyFailure", "flakyError"}
+# CI cancelling a job interrupts the test it was running; that is not a test failure.
+CANCELLED = re.compile(r"\((SIGTERM|SIGINT|SIGHUP)\)")
 PANIC = re.compile(r"panicked at (\S+?:\d+:\d+):?\s*$")
 RATE_LIMITED = re.compile(r"rate limit|HTTP 429|abuse detection", re.IGNORECASE)
 SERVER_ERROR = re.compile(r"HTTP 5\d\d")
@@ -118,7 +120,8 @@ def parse_report(data: bytes) -> tuple[list[str], dict[str, Outcome]]:
         test = f"{classname}\t{name}"
         seen.append(test)
         attempts = [child for child in case
-                    if child.tag in HARD_FAILURES | RETRY_FAILURES | FLAKY_FAILURES]
+                    if child.tag in HARD_FAILURES | RETRY_FAILURES | FLAKY_FAILURES
+                    and not CANCELLED.search(child.get("message") or "")]
         if not attempts:
             continue
         outcome = outcomes.setdefault(test, Outcome(classname or "", name))
@@ -138,6 +141,7 @@ class Budget:
     def __init__(self, calls: int) -> None:
         self._calls = max(calls, 0)
         self._lock = threading.Lock()
+        self._stopped = False
 
     def take(self, calls: int = 1) -> None:
         """Spend `calls`, or raise RateLimited and spend nothing if fewer remain.
@@ -146,17 +150,20 @@ class Budget:
         to retries of downloads already paid for.
         """
         with self._lock:
-            if self._calls < calls:
+            if self._stopped or self._calls < calls:
                 raise RateLimited
             self._calls -= calls
 
     def refund(self, calls: int) -> None:
         with self._lock:
-            self._calls += calls
+            if not self._stopped:
+                self._calls += calls
 
     def spend_all(self) -> None:
+        """GitHub refused a request for its rate limit: make no more, refunds included."""
         with self._lock:
             self._calls = 0
+            self._stopped = True
 
 
 class GitHub:
