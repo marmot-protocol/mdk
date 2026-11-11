@@ -35,6 +35,10 @@ struct StoredStatus {
     /// Fingerprint of the sender configuration the pause applies to.
     paused_for: Option<String>,
     backlog: Option<AuditDeliveryBacklog>,
+    /// When the newest recorded pass finished. An older pass that records
+    /// late (a concurrent manual and automatic pass) is dropped.
+    #[serde(default)]
+    updated_at_ms: u64,
 }
 
 /// What one tracker pass observed for one account.
@@ -44,7 +48,9 @@ pub(crate) struct AuditDeliveryPass {
     rejected: Option<u16>,
     rejected_batches: u64,
     failure: Option<(AuditDeliveryFailureKind, Option<u16>)>,
+    stalled_on_rejection: bool,
     backlog: Option<DeliveryBacklog>,
+    finished_at_ms: u64,
 }
 
 impl AuditDeliveryPass {
@@ -62,6 +68,17 @@ impl AuditDeliveryPass {
         self.failure = Some((kind, http_status));
     }
 
+    /// Delivery found only journals a receiver verdict blocked. It reports
+    /// the receiver's rejection, not a local fault.
+    pub(crate) fn stalled_on_rejection(&mut self) {
+        self.stalled_on_rejection = true;
+    }
+
+    /// Stamp the pass when its last attempt finished, before recording it.
+    pub(crate) fn finish(&mut self) {
+        self.finished_at_ms = now_ms();
+    }
+
     pub(crate) fn observed(&mut self, backlog: Option<DeliveryBacklog>) {
         if backlog.is_some() {
             self.backlog = backlog;
@@ -70,15 +87,19 @@ impl AuditDeliveryPass {
 
     /// The failure to log, including a rejection the pass continued past.
     pub(crate) fn logged_failure(&self) -> Option<(AuditDeliveryFailureKind, Option<u16>)> {
-        self.failure.or(self
-            .rejected
-            .map(|status| (AuditDeliveryFailureKind::ReceiverRejected, Some(status))))
+        self.failure
+            .or(if self.rejected.is_some() || self.stalled_on_rejection {
+                Some((AuditDeliveryFailureKind::ReceiverRejected, self.rejected))
+            } else {
+                None
+            })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         !self.progressed
             && self.rejected.is_none()
             && self.failure.is_none()
+            && !self.stalled_on_rejection
             && self.backlog.is_none()
     }
 }
@@ -125,10 +146,12 @@ pub(crate) fn record_pass(
     }
     let destination = marmot_observability::wiring::audit_destination(sender);
     let mut stored = load(state_dir, Some(destination));
+    if pass.finished_at_ms < stored.updated_at_ms {
+        return Ok(());
+    }
     apply(
         &mut stored,
         pass,
-        now_ms(),
         marmot_observability::wiring::audit_sender_fingerprint(sender),
     );
     store(state_dir, &stored)
@@ -166,7 +189,11 @@ fn is_paused(stored: &StoredStatus, sender: Option<&AuditOtlpSender>) -> bool {
     })
 }
 
-fn apply(stored: &mut StoredStatus, pass: &AuditDeliveryPass, now_ms: u64, fingerprint: String) {
+/// Only a pass that delivered (or found nothing left) lifts a pause; a
+/// receiver block sets it. Other failures leave it as it was.
+fn apply(stored: &mut StoredStatus, pass: &AuditDeliveryPass, fingerprint: String) {
+    let now_ms = pass.finished_at_ms;
+    stored.updated_at_ms = now_ms;
     if let Some(backlog) = pass.backlog {
         stored.backlog = Some(AuditDeliveryBacklog {
             undelivered_bytes: backlog.undelivered_bytes,
@@ -186,6 +213,20 @@ fn apply(stored: &mut StoredStatus, pass: &AuditDeliveryPass, now_ms: u64, finge
             at_ms: now_ms,
         });
     }
+    // A journal still blocked by an earlier rejection keeps reporting that
+    // rejection, with its HTTP status, rather than a local fault.
+    if pass.stalled_on_rejection
+        && stored
+            .last_failure
+            .as_ref()
+            .is_none_or(|failure| failure.kind != AuditDeliveryFailureKind::ReceiverRejected)
+    {
+        stored.last_failure = Some(AuditDeliveryFailure {
+            kind: AuditDeliveryFailureKind::ReceiverRejected,
+            http_status: None,
+            at_ms: now_ms,
+        });
+    }
     if pass.progressed {
         stored.last_success_at_ms = Some(now_ms);
     }
@@ -196,11 +237,14 @@ fn apply(stored: &mut StoredStatus, pass: &AuditDeliveryPass, now_ms: u64, finge
             at_ms: now_ms,
         });
         stored.consecutive_failures = stored.consecutive_failures.saturating_add(1);
-        stored.paused_for =
-            (kind == AuditDeliveryFailureKind::ReceiverBlocked).then_some(fingerprint);
+        if kind == AuditDeliveryFailureKind::ReceiverBlocked {
+            stored.paused_for = Some(fingerprint);
+        }
     } else if pass.progressed {
         stored.consecutive_failures = 0;
         stored.paused_for = None;
+    } else if pass.rejected.is_some() || pass.stalled_on_rejection {
+        stored.consecutive_failures = stored.consecutive_failures.saturating_add(1);
     }
 }
 
@@ -253,4 +297,99 @@ fn store(state_dir: &Path, stored: &StoredStatus) -> Result<(), AppError> {
 
 fn now_ms() -> u64 {
     system_time_ms(SystemTime::now()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pass_at(
+        finished_at_ms: u64,
+        edit: impl FnOnce(&mut AuditDeliveryPass),
+    ) -> AuditDeliveryPass {
+        let mut pass = AuditDeliveryPass {
+            finished_at_ms,
+            ..AuditDeliveryPass::default()
+        };
+        edit(&mut pass);
+        pass
+    }
+
+    #[test]
+    fn a_late_older_pass_cannot_overwrite_a_newer_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender =
+            AuditOtlpSender::new("audit", "https://collector.example/v1/logs", "token").unwrap();
+        let blocked = pass_at(100, |pass| {
+            pass.failed(AuditDeliveryFailureKind::ReceiverBlocked, Some(401))
+        });
+        let succeeded = pass_at(200, AuditDeliveryPass::progressed);
+        // A manual retry succeeds and records first; the automatic pass that
+        // saw the 401 earlier records after it.
+        record_pass(dir.path(), &sender, &succeeded).unwrap();
+        record_pass(dir.path(), &sender, &blocked).unwrap();
+        let stored = load(dir.path(), Some("audit"));
+        assert_eq!(stored.paused_for, None);
+        assert_eq!(stored.consecutive_failures, 0);
+        assert_eq!(stored.last_success_at_ms, Some(200));
+        assert_eq!(stored.last_failure, None);
+    }
+
+    #[test]
+    fn only_success_lifts_a_pause_and_a_rejection_stall_keeps_its_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender =
+            AuditOtlpSender::new("audit", "https://collector.example/v1/logs", "token").unwrap();
+        let status = |dir: &Path| {
+            let stored = load(dir, Some("audit"));
+            (
+                stored.paused_for.is_some(),
+                stored.last_failure,
+                stored.consecutive_failures,
+            )
+        };
+        record_pass(dir.path(), &sender, &pass_at(1, |pass| pass.rejected(400))).unwrap();
+        record_pass(
+            dir.path(),
+            &sender,
+            &pass_at(2, AuditDeliveryPass::stalled_on_rejection),
+        )
+        .unwrap();
+        let (paused, failure, consecutive) = status(dir.path());
+        assert!(!paused);
+        let failure = failure.unwrap();
+        assert_eq!(failure.kind, AuditDeliveryFailureKind::ReceiverRejected);
+        assert_eq!(failure.http_status, Some(400));
+        assert_eq!(consecutive, 2);
+
+        record_pass(
+            dir.path(),
+            &sender,
+            &pass_at(3, |pass| {
+                pass.failed(AuditDeliveryFailureKind::ReceiverBlocked, Some(401))
+            }),
+        )
+        .unwrap();
+        for (at, pass) in [
+            (4, pass_at(4, AuditDeliveryPass::stalled_on_rejection)),
+            (
+                5,
+                pass_at(5, |pass| {
+                    pass.failed(AuditDeliveryFailureKind::LocalIo, None)
+                }),
+            ),
+        ] {
+            record_pass(dir.path(), &sender, &pass).unwrap();
+            assert!(status(dir.path()).0, "pass at {at} must not lift the pause");
+        }
+        record_pass(
+            dir.path(),
+            &sender,
+            &pass_at(6, AuditDeliveryPass::progressed),
+        )
+        .unwrap();
+        let (paused, _, consecutive) = status(dir.path());
+        assert!(!paused);
+        assert_eq!(consecutive, 0);
+    }
 }

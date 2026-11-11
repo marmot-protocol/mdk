@@ -201,7 +201,7 @@ async fn real_recorder_exact_bodies_success_and_conflict_retry() {
     assert_eq!(
         task.await.unwrap(),
         AuditOtlpAttemptOutcome::Sent {
-            receiver: AuditOtlpSendResult::Retryable,
+            receiver: AuditOtlpSendResult::Retryable { http_status: 409 },
             local: Some(DeliveryStep::Retryable),
         }
     );
@@ -442,7 +442,7 @@ async fn retryable_response_retains_the_prepared_range() {
     assert_eq!(
         task.await.unwrap(),
         AuditOtlpAttemptOutcome::Sent {
-            receiver: AuditOtlpSendResult::Retryable,
+            receiver: AuditOtlpSendResult::Retryable { http_status: 503 },
             local: Some(DeliveryStep::Retryable),
         }
     );

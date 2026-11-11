@@ -404,9 +404,15 @@ async fn post_v5_audit_tracker_update(
             )
             .await
             {
-                Ok((outcome, backlog)) => {
-                    pass.observed(backlog);
-                    outcome
+                Ok(report) => {
+                    pass.observed(report.backlog);
+                    if report.blocked_by_receiver {
+                        pass.stalled_on_rejection();
+                        summary.blocked_accounts += 1;
+                        reached_limit = false;
+                        break;
+                    }
+                    report.outcome
                 }
                 Err(error) => {
                     pass.failed(classify_attempt_error(&error), None);
@@ -483,9 +489,12 @@ async fn post_v5_audit_tracker_update(
                 other => {
                     match other {
                         AuditOtlpAttemptOutcome::Sent {
-                            receiver: AuditOtlpSendResult::Retryable,
+                            receiver: AuditOtlpSendResult::Retryable { http_status },
                             ..
-                        } => pass.failed(AuditDeliveryFailureKind::ReceiverRetryable, None),
+                        } => pass.failed(
+                            AuditDeliveryFailureKind::ReceiverRetryable,
+                            Some(http_status),
+                        ),
                         AuditOtlpAttemptOutcome::Sent {
                             receiver: AuditOtlpSendResult::Unknown,
                             ..
@@ -503,6 +512,7 @@ async fn post_v5_audit_tracker_update(
             summary.pending_accounts += 1;
             schedule.failed(Duration::ZERO);
         }
+        pass.finish();
         if let Some((kind, http_status)) = pass.logged_failure() {
             tracing::warn!(
                 target: "marmot_app::audit_log",

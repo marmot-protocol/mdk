@@ -53,8 +53,35 @@ pub(crate) async fn send_audit_otlp_once_for_app(
 ) -> Result<AuditOtlpAttemptOutcome, AppError> {
     attempt_audit_otlp_once(app, lifecycle, account_ref, sender, configured_sender)
         .await
-        .map(|(outcome, _)| outcome)
+        .map(|report| report.outcome)
 }
+
+/// An attempt's outcome plus what the tracker records as delivery status.
+pub(crate) struct AttemptReport {
+    pub(crate) outcome: AuditOtlpAttemptOutcome,
+    /// The cursor's backlog as last observed under admission.
+    pub(crate) backlog: Option<DeliveryBacklog>,
+    /// A local `Blocked` step whose journals were all blocked by a receiver
+    /// verdict on their content, not by a local fault.
+    pub(crate) blocked_by_receiver: bool,
+}
+
+impl AttemptReport {
+    fn new(outcome: AuditOtlpAttemptOutcome, backlog: Option<DeliveryBacklog>) -> Self {
+        Self {
+            outcome,
+            backlog,
+            blocked_by_receiver: false,
+        }
+    }
+}
+
+/// Journal block reasons `LocalAuditDelivery::finish` records for receiver
+/// verdicts. Any other reason is a local fault.
+const RECEIVER_VERDICT_BLOCKS: [&str; 2] = [
+    "permanent receiver rejection",
+    "partial receiver acceptance",
+];
 
 enum Reservation {
     Reserved {
@@ -160,14 +187,14 @@ pub(crate) async fn record_audit_delivery_pass(
     .await
 }
 
-/// One attempt, plus the cursor's backlog as last observed under admission.
+/// One attempt, reported with the status facts the tracker records.
 pub(crate) async fn attempt_audit_otlp_once(
     app: &MarmotApp,
     lifecycle: &RuntimeLifecycle,
     account_ref: &str,
     sender: &AuditOtlpSender,
     configured_sender: Option<&Arc<StdMutex<Option<Arc<AuditOtlpSender>>>>>,
-) -> Result<(AuditOtlpAttemptOutcome, Option<DeliveryBacklog>), AppError> {
+) -> Result<AttemptReport, AppError> {
     let app = app.clone();
     let lifecycle = lifecycle.clone();
     let (attempt, account_id, account_label) =
@@ -177,7 +204,7 @@ pub(crate) async fn attempt_audit_otlp_once(
                 account_id,
                 account_label,
             } => (attempt, account_id, account_label),
-            Reservation::Unavailable(outcome) => return Ok((outcome, None)),
+            Reservation::Unavailable(outcome) => return Ok(AttemptReport::new(outcome, None)),
         };
     let (attempt, prepared) = blocking_app_task({
         let app = app.clone();
@@ -196,6 +223,11 @@ pub(crate) async fn attempt_audit_otlp_once(
                         LocalAuditDelivery::open(active, state_dir, attempt.destination())?;
                     let preparation = local.prepare_once()?;
                     let backlog = local.backlog();
+                    let blocked = local.blocked();
+                    let blocked_by_receiver = !blocked.is_empty()
+                        && blocked
+                            .iter()
+                            .all(|(_, reason)| RECEIVER_VERDICT_BLOCKS.contains(reason));
                     if let Preparation::Batch(batch) = &preparation {
                         let source =
                             local
@@ -205,21 +237,24 @@ pub(crate) async fn attempt_audit_otlp_once(
                                 })?;
                         app.audit_export_lifecycle.prepared_source(&attempt, source);
                     }
-                    Ok(Some((preparation, backlog)))
+                    Ok(Some((preparation, backlog, blocked_by_receiver)))
                 })?
                 .flatten();
             Ok((attempt, preparation))
         }
     })
     .await?;
-    let Some((preparation, backlog)) = prepared else {
-        return Ok((AuditOtlpAttemptOutcome::Cancelled, None));
+    let Some((preparation, backlog, blocked_by_receiver)) = prepared else {
+        return Ok(AttemptReport::new(AuditOtlpAttemptOutcome::Cancelled, None));
     };
     let Preparation::Batch(batch) = preparation else {
         let Preparation::Step(step) = preparation else {
             unreachable!()
         };
-        return Ok((AuditOtlpAttemptOutcome::Local(step), Some(backlog)));
+        return Ok(AttemptReport {
+            blocked_by_receiver: blocked_by_receiver && step == DeliveryStep::Blocked,
+            ..AttemptReport::new(AuditOtlpAttemptOutcome::Local(step), Some(backlog))
+        });
     };
     let token = batch.token.clone();
 
@@ -241,11 +276,14 @@ pub(crate) async fn attempt_audit_otlp_once(
     })
     .await?;
     if !still_live {
-        return Ok((AuditOtlpAttemptOutcome::Cancelled, Some(backlog)));
+        return Ok(AttemptReport::new(
+            AuditOtlpAttemptOutcome::Cancelled,
+            Some(backlog),
+        ));
     }
     let receiver = sender.send(batch).await;
     let Some(action) = receiver.for_finish() else {
-        return Ok((
+        return Ok(AttemptReport::new(
             AuditOtlpAttemptOutcome::Sent {
                 receiver,
                 local: None,
@@ -286,7 +324,7 @@ pub(crate) async fn attempt_audit_otlp_once(
         Some((step, finished)) => (Some(step), finished),
         None => (None, backlog),
     };
-    Ok((
+    Ok(AttemptReport::new(
         AuditOtlpAttemptOutcome::Sent { receiver, local },
         Some(backlog),
     ))

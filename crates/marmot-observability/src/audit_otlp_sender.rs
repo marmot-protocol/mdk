@@ -27,7 +27,9 @@ pub enum AuditOtlpSendResult {
     Complete,
     /// Throttled (`429`), unavailable (`5xx`), or possibly partly stored
     /// (`409`): the receiver deduplicates, so the same range is resent.
-    Retryable,
+    Retryable {
+        http_status: u16,
+    },
     /// The receiver refused the batch's content (`400`, `413`, `422`).
     /// Resending identical bytes cannot succeed.
     Rejected {
@@ -51,7 +53,7 @@ impl AuditOtlpSendResult {
     pub fn for_finish(self) -> Option<ReceiverResult> {
         match self {
             Self::Complete => Some(ReceiverResult::Complete),
-            Self::Retryable => Some(ReceiverResult::Retryable),
+            Self::Retryable { .. } => Some(ReceiverResult::Retryable),
             Self::Rejected { .. } => Some(ReceiverResult::Permanent),
             Self::Blocked { .. } | Self::Unknown => None,
         }
@@ -218,7 +220,9 @@ impl AuditOtlpSender {
             http_status: Some(response.status().as_u16()),
         };
         match response.status().as_u16() {
-            409 | 429 | 500..=599 => return AuditOtlpSendResult::Retryable,
+            http_status @ (409 | 429 | 500..=599) => {
+                return AuditOtlpSendResult::Retryable { http_status };
+            }
             http_status @ (400 | 413 | 422) => {
                 return AuditOtlpSendResult::Rejected { http_status };
             }

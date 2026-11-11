@@ -56,7 +56,9 @@ Each tracker pass persists the account's delivery status in
 last typed failure (state over its size limit, out of file descriptors, other local I/O, a
 blocked local journal, receiver blocked, rejected or retryable with its HTTP status, no
 response), consecutive failed passes, rejected batches, the pause with a one-way fingerprint of
-the sender configuration it applies to, and the last measured backlog. Hosts read it through
+the sender configuration it applies to, and the last measured backlog. Only a pass that delivers
+lifts a pause, and a pass older than the recorded status is dropped, so a concurrent manual and
+automatic pass cannot reorder it. Hosts read it through
 `audit_delivery_status_v5`. The tracker's `warn` log carries the same failure category and HTTP
 status, nothing else.
 

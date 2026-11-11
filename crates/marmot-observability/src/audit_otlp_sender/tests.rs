@@ -168,9 +168,9 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     let (_dir, _active, _state, batch) = prepared();
     for (status, body, expected) in [
         (200, "{}", AuditOtlpSendResult::Complete),
-        (409, "{}", AuditOtlpSendResult::Retryable),
-        (503, "{}", AuditOtlpSendResult::Retryable),
-        (429, "{}", AuditOtlpSendResult::Retryable),
+        (409, "{}", retryable(409)),
+        (503, "{}", retryable(503)),
+        (429, "{}", retryable(429)),
         (400, "{}", rejected(400)),
         (413, "{}", rejected(413)),
         (422, "{}", rejected(422)),
@@ -213,10 +213,7 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     }
     let (endpoint, task) = service(reply(503, &"x".repeat(2048))).await;
     let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-    assert_eq!(
-        sender.send(batch.clone()).await,
-        AuditOtlpSendResult::Retryable
-    );
+    assert_eq!(sender.send(batch.clone()).await, retryable(503));
     task.await.unwrap();
     assert_eq!(AuditOtlpSendResult::Unknown.for_finish(), None);
     assert_eq!(blocked(401).for_finish(), None);
@@ -229,15 +226,18 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
         Some(ReceiverResult::Complete)
     );
     assert_eq!(rejected(400).for_finish(), Some(ReceiverResult::Permanent));
-    assert_eq!(
-        AuditOtlpSendResult::Retryable.for_finish(),
-        Some(ReceiverResult::Retryable)
-    );
+    assert_eq!(retryable(503).for_finish(), Some(ReceiverResult::Retryable));
 }
 
 fn blocked(status: u16) -> AuditOtlpSendResult {
     AuditOtlpSendResult::Blocked {
         http_status: Some(status),
+    }
+}
+
+fn retryable(status: u16) -> AuditOtlpSendResult {
+    AuditOtlpSendResult::Retryable {
+        http_status: status,
     }
 }
 
@@ -257,10 +257,7 @@ async fn parsed_409_retries_even_if_its_diagnostic_body_is_incomplete_or_stalled
     let (endpoint, task) =
         service(b"HTTP/1.1 409 Conflict\r\nContent-Length: 9\r\n\r\n{}".to_vec()).await;
     let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-    assert_eq!(
-        sender.send(batch.clone()).await,
-        AuditOtlpSendResult::Retryable
-    );
+    assert_eq!(sender.send(batch.clone()).await, retryable(409));
     task.await.unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -296,7 +293,7 @@ async fn parsed_409_retries_even_if_its_diagnostic_body_is_incomplete_or_stalled
         result
             .expect("a parsed 409 must not await its withheld body")
             .unwrap(),
-        AuditOtlpSendResult::Retryable
+        retryable(409)
     );
     release.send(()).unwrap();
     task.await.unwrap();
@@ -304,7 +301,7 @@ async fn parsed_409_retries_even_if_its_diagnostic_body_is_incomplete_or_stalled
     let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
     assert_eq!(
         owner
-            .finish(&token, AuditOtlpSendResult::Retryable.for_finish().unwrap())
+            .finish(&token, retryable(409).for_finish().unwrap())
             .unwrap(),
         DeliveryStep::Retryable
     );

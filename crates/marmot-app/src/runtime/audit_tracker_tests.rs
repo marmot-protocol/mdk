@@ -685,6 +685,21 @@ async fn delivery_status_distinguishes_receiver_rejection_from_local_state_limit
         crate::AuditDeliveryFailureKind::ReceiverRejected
     );
     assert_eq!(failure.http_status, Some(400));
+    assert_eq!(status.consecutive_failures, 1);
+
+    // Until local delivery moves past a rejected batch, its journal stays
+    // blocked. The next pass sends nothing and still reports the rejection.
+    automatic_v5_pass(&app, &runtime).await;
+    assert!(requests.try_recv().is_err());
+    let status = alice_status(&runtime);
+    let failure = status.last_failure.unwrap();
+    assert_eq!(
+        failure.kind,
+        crate::AuditDeliveryFailureKind::ReceiverRejected
+    );
+    assert_eq!(failure.http_status, Some(400));
+    assert_eq!(status.rejected_batches, 1);
+    assert_eq!(status.consecutive_failures, 2);
 
     // The stalled-device shape from mdk#3300: an over-limit cursor fails
     // locally before any request, and the status says so.
