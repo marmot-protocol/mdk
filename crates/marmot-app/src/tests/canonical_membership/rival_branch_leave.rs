@@ -321,6 +321,15 @@ async fn admin_leaves_across_a_lost_step_down(
     fork.settle(&[0, 1, 2]).await;
     fork.until_removed(1, &[0, 1, 2]).await;
     assert!(fork.removed(1), "the admin's leave completes");
+    // alice and carol may both commit his SelfRemove; a rival his removal
+    // left unresolved stays pending but schedules no wake.
+    assert_eq!(
+        fork.clients[1]
+            .convergence_schedule_state(&fork.group)
+            .unwrap(),
+        crate::client::ConvergenceScheduleState::Idle,
+        "the removed copy is not kept scheduled"
+    );
     assert!(!fork.admin(0, 1), "the leaver is off the admin list");
     assert!(fork.admin(0, 0));
 }
