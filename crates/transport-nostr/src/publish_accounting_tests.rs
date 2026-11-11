@@ -227,7 +227,11 @@ async fn account_admission_and_unpolled_future_do_not_publish() {
         .publish(unsafe_request)
         .await
         .expect_err("private endpoint");
-    assert!(matches!(unsafe_endpoint, TransportAdapterError::Publish(_)));
+    // Refused before any send (mdk#3276); `safety` tests own its shape.
+    assert!(matches!(
+        unsafe_endpoint,
+        TransportAdapterError::PublishEndpoints(_)
+    ));
 
     let mut mismatched = fixture.message.clone();
     mismatched.envelope = TransportEnvelope::GroupMessage {

@@ -2,8 +2,9 @@ use std::net::IpAddr;
 
 use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
 use cgka_traits::{
-    TransportAccountActivation, TransportEndpoint, TransportGroupSync, TransportPublishRequest,
-    TransportPublishTarget,
+    MessageId, TransportAccountActivation, TransportAdapterError, TransportEndpoint,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportGroupSync,
+    TransportPublishFailure, TransportPublishRequest, TransportPublishTarget,
 };
 use nostr_sdk::prelude::RelayUrl;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,41 @@ pub struct RelayEndpointClassification {
     /// unsafe endpoints. Invalid inputs have no normalized representation.
     pub normalized_endpoint: Option<String>,
     pub policy: RelayEndpointPolicy,
+}
+
+/// The reason of a publish endpoint the host-safety rule refused. It names
+/// no endpoint, and audit records it as a failure before exposure.
+pub(crate) const REFUSED_BY_SAFETY_RULE_REASON: &str =
+    "relay endpoint refused by the host-safety rule";
+
+/// A publish endpoint the host-safety rule refused, under the spelling the
+/// request gave, so the caller finds the endpoint it asked for. Nothing was
+/// sent there, and the same event can never be sent there.
+fn refused_by_safety_rule(endpoint: TransportEndpoint) -> TransportEndpointFailure {
+    TransportEndpointFailure {
+        endpoint,
+        reason: REFUSED_BY_SAFETY_RULE_REASON.to_owned(),
+        kind: TransportEndpointFailureKind::NotExposed,
+        rejection_category: None,
+        size_class: None,
+    }
+}
+
+/// A publish that failed on the relays it was sent to, joined by the relays
+/// the host-safety rule refused. They leave its size proof alone, which covers
+/// only the relays publish can reach. A whole-call error stays whole, as it
+/// does when joined by size refusals.
+pub(crate) fn join_unsafe_refusals(
+    error: TransportAdapterError,
+    refused: Vec<TransportEndpointFailure>,
+) -> TransportAdapterError {
+    match error {
+        TransportAdapterError::PublishEndpoints(mut failure) => {
+            failure.endpoint_failures.extend(refused);
+            TransportAdapterError::PublishEndpoints(failure)
+        }
+        error => error,
+    }
 }
 
 /// Hostnames that the relay plane will never dial or adopt.
@@ -145,6 +181,41 @@ impl RelaySafetyPolicy {
         kept
     }
 
+    /// One publish request as the rule lets it go out: the request with the
+    /// endpoints it may send to, and a failure before exposure for each
+    /// endpoint the rule refused. Nothing is ever sent to a refused endpoint,
+    /// so its outcome is definite (mdk#3276). A request the rule lets send
+    /// nowhere fails with those same failures. A request refused for another
+    /// reason, such as an inbox list over the route cap, fails whole.
+    pub(crate) fn admit_publish_request(
+        &self,
+        request: TransportPublishRequest,
+        message_id: Option<MessageId>,
+    ) -> Result<(TransportPublishRequest, Vec<TransportEndpointFailure>), TransportAdapterError>
+    {
+        let requested = request.target.endpoints().len();
+        let refused = request
+            .target
+            .endpoints()
+            .iter()
+            .filter(|endpoint| self.admitted_relay_url(endpoint).is_none())
+            .cloned()
+            .map(refused_by_safety_rule)
+            .collect::<Vec<_>>();
+        match self.sanitize_publish_request(request) {
+            Ok(request) => Ok((request, refused)),
+            Err(_) if !refused.is_empty() && refused.len() == requested => {
+                let mut failure = TransportPublishFailure::with_endpoint_failures(
+                    REFUSED_BY_SAFETY_RULE_REASON,
+                    refused,
+                );
+                failure.message_id = message_id;
+                Err(TransportAdapterError::PublishEndpoints(failure))
+            }
+            Err(reason) => Err(TransportAdapterError::Publish(reason)),
+        }
+    }
+
     pub(crate) fn sanitize_publish_request(
         &self,
         mut request: TransportPublishRequest,
@@ -156,6 +227,11 @@ impl RelaySafetyPolicy {
     /// The endpoints one publish request to `target` may send to, or why it
     /// may send to none. Every publish request passes here, and so does the
     /// size preflight, through [`Self::reachable_publish_endpoints`].
+    ///
+    /// Both targets drop the endpoints the rule refuses and keep the rest.
+    /// A Welcome's inbox list is the recipient's published list, not this
+    /// device's configuration, so one bad entry in it must not stop the
+    /// Welcome reaching the others.
     fn sanitize_publish_target(
         &self,
         mut target: TransportPublishTarget,
@@ -169,7 +245,18 @@ impl RelaySafetyPolicy {
                 }
             }
             TransportPublishTarget::Inbox { endpoints, .. } => {
-                *endpoints = self.sanitize_endpoints(endpoints.clone(), "inbox publish")?;
+                let offered = endpoints.len();
+                *endpoints = self.retain_safe_endpoints(std::mem::take(endpoints), "inbox publish");
+                if endpoints.is_empty() && offered != 0 {
+                    return Err("inbox publish: no safe relay endpoints".to_owned());
+                }
+                if endpoints.len() > self.max_endpoints_per_route {
+                    return Err(format!(
+                        "inbox publish: relay endpoint count {} exceeds limit {}",
+                        endpoints.len(),
+                        self.max_endpoints_per_route
+                    ));
+                }
             }
         }
         Ok(target)
@@ -236,12 +323,9 @@ impl RelaySafetyPolicy {
         let offered = endpoints.len();
         let mut kept: Vec<TransportEndpoint> = Vec::new();
         for endpoint in endpoints {
-            let Ok(relay_url) = RelayUrl::parse(endpoint.as_str().trim()) else {
+            let Some(relay_url) = self.admitted_relay_url(&endpoint) else {
                 continue;
             };
-            if reject_unsafe_relay_host(&relay_url, self.allow_loopback).is_err() {
-                continue;
-            }
             let endpoint = TransportEndpoint(relay_url.to_string());
             if !kept.contains(&endpoint) {
                 kept.push(endpoint);
@@ -260,6 +344,15 @@ impl RelaySafetyPolicy {
             );
         }
         kept
+    }
+
+    /// The relay URL of a discovered endpoint that passes the host-safety
+    /// rule. Every publish and discovered-list decision asks this.
+    fn admitted_relay_url(&self, endpoint: &TransportEndpoint) -> Option<RelayUrl> {
+        let relay_url = RelayUrl::parse(endpoint.as_str().trim()).ok()?;
+        reject_unsafe_relay_host(&relay_url, self.allow_loopback)
+            .is_ok()
+            .then_some(relay_url)
     }
 
     pub fn sanitize_endpoints(
@@ -809,5 +902,123 @@ mod tests {
         let many: Vec<String> = (0..20).map(|i| format!("wss://relay{i}.example")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         assert!(policy.sanitize_endpoints(endpoints(&refs), "test").is_err());
+    }
+
+    /// mdk#3276: publish never contacts a relay the host-safety rule refuses,
+    /// so it reports each one as a failure before exposure, under the spelling
+    /// the request gave, and sends to the rest. A request the rule lets send
+    /// nowhere fails with those failures. A whole-call error instead reads to
+    /// the caller as a relay that may hold the event, which it retries and
+    /// which keeps a refused commit from rolling back.
+    #[tokio::test]
+    async fn publish_reports_each_refused_relay_as_unexposed_and_sends_to_the_rest() {
+        use std::sync::atomic::Ordering;
+
+        use cgka_traits::TransportAdapter;
+        use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+        use transport_nostr_peeler::NostrTransportEvent;
+
+        use crate::test_support::AccountPublishFixture;
+
+        let fixture = AccountPublishFixture::activate().await;
+        let safe = fixture.endpoint.clone();
+        let refused = endpoints(&["wss://10.0.0.1", "ws://plaintext.example", "not a url"]);
+        let group = |endpoints| TransportPublishTarget::Group {
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+            transport_group_id: fixture.transport_group_id.clone(),
+            endpoints,
+        };
+        let welcome: TransportMessage = NostrTransportEvent::from_nostr_event(
+            &EventBuilder::new(Kind::GiftWrap, "sealed welcome")
+                .tags([Tag::public_key(
+                    Keys::parse(&"33".repeat(32)).unwrap().public_key(),
+                )])
+                .finalize(&Keys::parse(&"11".repeat(32)).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+        .to_transport_message()
+        .unwrap();
+        let TransportEnvelope::Welcome { recipient } = welcome.envelope.clone() else {
+            panic!("a gift wrap is a Welcome");
+        };
+        let inbox = |endpoints| TransportPublishTarget::Inbox {
+            recipient: recipient.clone(),
+            endpoints,
+        };
+        let with_safe = [refused.clone(), vec![safe.clone()]].concat();
+
+        for (message, target, refused, sent_to) in [
+            // The session's group fanout: one relay per request.
+            (
+                &fixture.message,
+                group(refused[..1].to_vec()),
+                &refused[..1],
+                None,
+            ),
+            (&fixture.message, group(refused.clone()), &refused[..], None),
+            (
+                &fixture.message,
+                group(with_safe.clone()),
+                &refused[..],
+                Some(&safe),
+            ),
+            // A Welcome's first request: the recipient's whole inbox list.
+            (&welcome, inbox(refused.clone()), &refused[..], None),
+            (
+                &welcome,
+                inbox(with_safe.clone()),
+                &refused[..],
+                Some(&safe),
+            ),
+        ] {
+            let calls = fixture.client.calls.load(Ordering::SeqCst);
+            let result = fixture
+                .adapter
+                .publish(TransportPublishRequest {
+                    account_id: fixture.account_id.clone(),
+                    message: message.clone(),
+                    target: target.clone(),
+                    required_acks: 1,
+                })
+                .await;
+            let (accepted, failed) = match result {
+                Ok(report) => (
+                    report
+                        .accepted
+                        .into_iter()
+                        .map(|receipt| receipt.endpoint)
+                        .collect::<Vec<_>>(),
+                    report.failed,
+                ),
+                Err(TransportAdapterError::PublishEndpoints(failure)) => {
+                    assert_eq!(failure.message_id.as_ref(), Some(&message.id), "{target:?}");
+                    (Vec::new(), failure.endpoint_failures)
+                }
+                Err(error) => panic!("a whole-call error for {target:?}: {error:?}"),
+            };
+            assert_eq!(accepted, sent_to.cloned().into_iter().collect::<Vec<_>>());
+            assert_eq!(
+                failed,
+                refused
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| TransportEndpointFailure {
+                        endpoint,
+                        reason: REFUSED_BY_SAFETY_RULE_REASON.to_owned(),
+                        kind: TransportEndpointFailureKind::NotExposed,
+                        rejection_category: None,
+                        size_class: None,
+                    })
+                    .collect::<Vec<_>>(),
+                "{target:?}"
+            );
+            assert_eq!(
+                fixture.client.calls.load(Ordering::SeqCst) - calls,
+                usize::from(sent_to.is_some()),
+                "only the admitted relay is sent to: {target:?}"
+            );
+        }
     }
 }
