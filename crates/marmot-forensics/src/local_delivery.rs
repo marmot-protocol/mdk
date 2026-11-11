@@ -3388,6 +3388,60 @@ mod tests {
     }
 
     #[test]
+    fn age_expiry_of_an_emptied_known_segment_records_the_loss_before_unlinking() {
+        for fail_unlink in [true, false] {
+            let (_dir, active, state_dir, recorder) = setup();
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            drain(&mut worker, &mut FakeReceiver::default());
+            let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+            worker.discover().unwrap();
+            let cursor = fs::read(state_dir.join("local-delivery.json")).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&sealed)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            let result = retention::expire_with(
+                &sealed,
+                &state_dir,
+                retention::Expiry::Age,
+                |target| {
+                    if fail_unlink {
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    } else {
+                        fs::remove_file(target)
+                    }
+                },
+                |delivery| delivery.publish(),
+            );
+            if fail_unlink {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(
+                    fs::read(state_dir.join("local-delivery.json")).unwrap(),
+                    cursor
+                );
+                continue;
+            }
+            assert!(result.unwrap());
+            // Durable without any discovery: the reopened cursor validates
+            // and names the lost generation.
+            let state = load_state(
+                &state_dir.join("local-delivery.json"),
+                "receiver-A",
+                active.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.gaps.len(), 1);
+            assert_eq!(state.gaps[0].reason, GapReason::MissingSource);
+            assert_eq!(
+                state.gaps[0].segment,
+                sealed.file_name().unwrap().to_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn age_expiry_during_a_split_leaves_a_cursor_that_reopens_and_delivers() {
         let (_dir, active, state_dir, recorder) = setup();
         for index in 0..3 {

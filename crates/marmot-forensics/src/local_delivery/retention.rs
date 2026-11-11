@@ -147,6 +147,8 @@ pub(super) fn expire_with(
     };
     drop_retired(&mut state);
     let mut matched = find_journal(&state, identity);
+    // The cursor as published, if retiring a replaced generation changed it.
+    let mut before_retirement = None;
     if let Some(index) = matched {
         let journal = &state.journals[index];
         // Never bless bytes as ACKed without a stored head to compare
@@ -171,11 +173,38 @@ pub(super) fn expire_with(
                 return Ok(false);
             }
             let was_active = journal.segment == active_name;
+            before_retirement = Some(state.clone());
             retire_missing(&mut state, index, was_active);
             matched = None;
         }
     }
     let status = classify(&state, matched, segment_index, len, modified);
+    if let Some(original) = before_retirement
+        && (status == SourceDelivery::Untracked
+            || (status == SourceDelivery::Delivered && len == 0))
+    {
+        // Nothing of these bytes needs adopting, but the retired
+        // generation's loss evidence must be durable before the unlink.
+        let mut delivery = LocalAuditDelivery {
+            active: path.with_file_name(&active_name),
+            state_path,
+            state,
+            fenced: false,
+            state_limit: MAX_STATE_BYTES,
+        };
+        match fs::remove_file(delivery.state_path.with_extension("json.tmp")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let result = publish(&mut delivery).and_then(|()| remove_without_cursor(path, unlink));
+        if result.is_err() {
+            delivery.state = original;
+            let _ = fs::remove_file(delivery.state_path.with_extension("json.tmp"));
+            let _ = delivery.publish_inner();
+        }
+        return result;
+    }
     if status == SourceDelivery::Untracked {
         return remove_without_cursor(path, unlink);
     }
