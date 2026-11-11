@@ -525,8 +525,10 @@ clearing or correcting the environment afterward does not unblock it.
    and adopts policy-checked `switch_relays` results for this signer transport
    only. Messaging relays are unchanged. An unsupported-method error leaves the
    previous signer relays in place; other errors fail connection.
-4. Call `marmot_nip46_login` off the UI thread to create or reopen the external
-   account. It signs real MLS identity proofs and KeyPackages through the signer.
+4. After `marmot_nip46_connect` succeeds, call `marmot_nip46_login` off the UI
+   thread to create or reopen the external account. Login requires an already-verified
+   `Ready` session; otherwise it rejects without connecting, discovering relays, or
+   creating an account. It signs real MLS identity proofs and KeyPackages through the signer.
    Supply default messaging relays for lists the account has not published. Set
    `inbox_relays` separately, or pass `NULL, 0` to use the defaults for both lists. Login
    publishes those defaults only for lists that discovery confirms absent. An
@@ -558,8 +560,10 @@ only the named pending request. Stale IDs return `MARMOT_STATUS_INVALID_ARGUMENT
 RPC requests have a 90-second budget; MDK account setup can time out sooner.
 
 Login/register adoption follows the shared runtime-owned contract: once admitted,
-loss of the waiter does not cancel adoption. The preceding handshake remains
-bounded and cancellable. Use explicit session cancellation, disconnect, or logout
+loss of the waiter does not cancel adoption. Pairing is a separate bounded,
+caller-cancellable connect call and makes no account changes while unbound. Cancel
+and discard abandoned pairing UI; call adoption explicitly only after verification
+succeeds. Account signout does not cancel unrelated unbound sessions. Use explicit session cancellation, disconnect, or logout
 to interrupt; client shutdown interrupts and settles owned adoption before returning.
 This does not permit freeing a handle during an active C call.
 

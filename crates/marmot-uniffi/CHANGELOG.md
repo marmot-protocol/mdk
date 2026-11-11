@@ -14,7 +14,9 @@
   `MarmotKitError::Nip46` retains the typed session reason; exhaustive switches
   need the new case. Local-key and arbitrary host callback APIs are unchanged.
   Native login/register adoption remains runtime-owned after caller cancellation;
-  only the wait ends. The preceding handshake remains bounded and cancellable.
+  only the wait ends. Pairing is a separate bounded, caller-cancellable connect call.
+  Login requires an already-verified Ready session and rejects other states without
+  connecting or creating an account. Unbound pairing never mutates an account.
   Explicit session cancel/disconnect/logout interrupts adoption; shutdown interrupts
   and settles owned work before returning. Failed completed-account Native rebind
   restores prior local callbacks, records, and activation, not published KeyPackages.

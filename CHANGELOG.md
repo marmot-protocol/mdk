@@ -37,14 +37,17 @@
   retryable cleanup ownership. Setup rollback restores prior callbacks and
   grant records while initial-provisioning retries retain their paired credentials.
   Native login/register adoption is runtime-owned across all bindings: caller drop
-  stops waiting without cancelling admitted work. The preceding handshake remains
-  bounded and cancellable; explicit session cancel/disconnect/logout interrupts
+  stops waiting without cancelling admitted work. Pairing is a separate bounded,
+  caller-cancellable connect call; login requires an already-verified Ready session
+  and rejects other states without connecting or creating an account. Unbound pairing
+  never mutates an account. Explicit session cancel/disconnect/logout interrupts
   adoption, and shutdown interrupts and settles owned work before returning.
   Completed accounts rebind without reopening setup; failed Native adoption restores
   prior local callbacks, records, and activation without retracting published
   KeyPackages. Legacy host login behavior and explicit sign-out cleanup are unchanged.
   Post-commit journal cleanup failures do not revoke a ready account.
   Explicit pairing can repair metadata-only interrupted credential writes.
+  Local removal reports account disappearance after cancellation instead of a vault failure.
 
 ## 0.16.0 - 2026-11-11
 

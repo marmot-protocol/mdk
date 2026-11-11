@@ -13291,7 +13291,9 @@ MarmotStatus marmot_nip46_uri(const struct MarmotNip46Session *session, char **o
 MarmotStatus marmot_nip46_pairing_offer(const struct MarmotNip46Session *session, char **out);
 
 /**
- * Connect and pin the account identity. Run off the UI thread.
+ * Connect and pin the account identity before marmot_nip46_login.
+ * Pairing is bounded and caller-cancellable, with no account mutation while unbound.
+ * Run off the UI thread.
  * # Safety
  * Session must be live; out writable. Free with marmot_string_free.
  */
@@ -13305,7 +13307,10 @@ MarmotStatus marmot_nip46_connect(const struct MarmotNip46Session *session, char
 MarmotStatus marmot_nip46_export(const struct MarmotNip46Session *session, char **out);
 
 /**
- * Log in and persist the shared session in MDK's configured secret store.
+ * Log in and persist an already-verified Ready session in MDK's secret store.
+ * Await successful marmot_nip46_connect first. Other states are rejected without
+ * connecting, discovering relays, or creating an account. Admitted adoption is
+ * runtime-owned; loss of the waiter does not cancel it.
  * NULL/0 inbox relays use the default relays.
  * # Safety
  * All pointers must be valid for the call. Free out with marmot_account_summary_free.

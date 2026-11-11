@@ -1488,6 +1488,7 @@ fn main() -> Result<()> {
     );
     assert_ready(client, &account_a);
     let failed_rebind = Session::new(client, &export_a);
+    assert_eq!(failed_rebind.connect(), account_a);
     let mut refused_rebind = ptr::dangling_mut();
     assert_eq!(
         unsafe {
@@ -1627,6 +1628,7 @@ fn main() -> Result<()> {
     );
 
     let retry = Session::new(client, &export_a);
+    assert_eq!(retry.connect(), account_a);
     let mut refused = ptr::dangling_mut();
     assert_ne!(
         unsafe {
@@ -1659,6 +1661,7 @@ fn main() -> Result<()> {
     );
     assert_accounts(client, &local_id, &account_a, &account_b, true);
     assert_ready(client, &account_a);
+    assert_eq!(retry.connect(), account_a);
     assert_eq!(
         retry.login(client, &relay_url, fixture_a.user.public_key()),
         account_a
@@ -1701,6 +1704,7 @@ fn main() -> Result<()> {
         secret,
         author: fixture_a.bunker.clone(),
     }))?;
+    assert_eq!(replacement_a.connect(), account_a);
     assert_eq!(
         replacement_a.login(client, &relay_url, fixture_a.user.public_key()),
         account_a

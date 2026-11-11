@@ -503,7 +503,9 @@ Local-key accounts and separate remote signers can run in the same runtime.
    listener and enters `Listening`; the offline `uri` accessor alone does not.
    Never log either URI. Await `connect` to verify the user's account identity
    (bunker links can connect directly), then call `nip46Login`
-   with messaging and bootstrap relays. Login persists the verified communication
+   with messaging and bootstrap relays. Login requires an already-verified `Ready`
+   session; otherwise it rejects without connecting, discovering relays, or creating
+   an account. Login persists the verified communication
    key through the configured secret store and nonsecret metadata in the account
    home. `nip46Register` attaches a restored descriptor to an existing account.
 4. On restart, call the ordinary runtime `start`; MDK restores account sessions
@@ -538,7 +540,10 @@ It does not replace MDK account sign-out.
 
 Once Native `nip46Login` or `nip46Register` adoption is admitted, cancelling the
 foreign call only stops waiting. Runtime-owned adoption continues without rollback
-on caller cancellation. The preceding handshake remains bounded and cancellable.
+on caller cancellation. Pairing is a separate bounded, caller-cancellable `connect`
+call and makes no account changes while unbound. Cancel and discard abandoned pairing
+UI; call adoption explicitly only after verification succeeds. Account sign-out does
+not cancel unrelated unbound sessions.
 Use session `cancel`, `disconnect`, or `logout` to interrupt adoption explicitly.
 Shutdown interrupts and settles owned adoption before returning.
 

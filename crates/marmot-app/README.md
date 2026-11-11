@@ -128,7 +128,9 @@ communication key. Permission approval precedes connection, and stored sessions
 restore before account workers without host signer callbacks. Sign-out and wipe
 erase the communication key; terminal storage close preserves it for restart.
 Native login/register adoption is runtime-owned once admitted: dropping its future
-stops waiting, not adoption. The preceding handshake remains bounded and cancellable.
+stops waiting, not adoption. First await successful session `connect`; `nip46_login`
+accepts only an already-verified `Ready` session and never silently connects.
+Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
 Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
 interrupts and settles owned adoption before returning. Failed completed-account
 rebind restores prior local signer state and activation, but does not retract

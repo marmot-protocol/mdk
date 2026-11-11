@@ -3377,10 +3377,10 @@ Release only this C handle without cancelling the shared session, remote logout,
 MarmotStatus marmot_nip46_login(const struct MarmotClient *client, const struct MarmotNip46Session *session, const char *const *default_relays, uintptr_t default_len, const char *const *bootstrap_relays, uintptr_t bootstrap_len, const char *const *inbox_relays, uintptr_t inbox_len, struct MarmotAccountSummary **out);
 ```
 
-Create or reopen an external account using the verified session signer. Run off UI; free the returned summary with `marmot_account_summary_free`.
+Create or reopen an external account using the verified session signer. Requires successful explicit `marmot_nip46_connect` and an already-verified `Ready` session; other states are rejected without connecting, discovering relays, or creating an account. Run off UI; free the returned summary with `marmot_account_summary_free`.
 Set `inbox_relays` independently, or pass `NULL, 0` to reuse the default relays.
 
-Admitted Native adoption is runtime-owned: loss of the waiter does not cancel it. The preceding handshake remains bounded and cancellable. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning. Never free handles during active calls.
+Admitted Native adoption is runtime-owned: loss of the waiter does not cancel it. Pairing is a separate bounded, caller-cancellable connect call and makes no account changes while unbound. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning. Never free handles during active calls.
 
 Completed accounts rebind without opening initial setup. Failed Native adoption restores prior local callbacks, records, and activation while preserving setup readiness. Already-published KeyPackages are not retracted. Account sign-out cleanup remains explicit; legacy host login is unchanged.
 

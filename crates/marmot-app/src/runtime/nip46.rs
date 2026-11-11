@@ -20,7 +20,8 @@ impl MarmotAppRuntime {
         Ok(Nip46Session::new(&self.accounts.app, config_json)?)
     }
 
-    /// Persist the verified signer before setup signs. Once adoption starts,
+    /// Adopt a verified Ready signer; complete explicit pairing before this call.
+    /// Persist it before setup signs. Once adoption starts,
     /// dropping this waiter does not cancel it; use the session's explicit controls.
     pub async fn nip46_login(
         &self,
@@ -33,7 +34,11 @@ impl MarmotAppRuntime {
         if !session.belongs_to(&self.accounts.app) {
             return Err(Nip46Error::Mismatch.into());
         }
-        let public_key = session.connect_async().await?;
+        let public_key = session.public_key()?;
+        if session.status().state != crate::Nip46State::Ready {
+            return Err(Nip46Error::Unavailable.into());
+        }
+        let public_key = public_key.to_hex();
         let request = AccountSetupRequest {
             default_relays,
             bootstrap_relays,
@@ -186,6 +191,7 @@ impl MarmotAppRuntime {
             .onboarding_transaction(&account.account_id_hex);
         let _transaction = self.accounts.lock_nip46_removal(gate, &account).await;
         self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(&account.account_id_hex)?;
         let account_id = account.account_id_hex.clone();
         let target = self.accounts.nip46_erase_target(account);
         let accounts = self.accounts.clone();

@@ -178,7 +178,8 @@ impl Nip46SessionFfi {
             .map_err(Into::into)
     }
 
-    /// Pair or reconnect and verify the pinned account identity.
+    /// Pair or reconnect and verify the pinned account identity before nip46_login.
+    /// This bounded, caller-cancellable call makes no account changes while unbound.
     pub async fn connect(&self) -> Result<String, Nip46ErrorFfi> {
         self.inner.connect_async().await.map_err(Into::into)
     }
@@ -256,7 +257,10 @@ impl Marmot {
         Ok(Nip46SessionFfi::new(session))
     }
 
-    /// Log in with an MDK session and persist its credentials in the configured secret store.
+    /// Log in with an already-verified Ready session and persist its credentials.
+    /// Await successful connect first. Other states are rejected without connecting,
+    /// discovering relays, or creating an account. Admitted adoption is runtime-owned;
+    /// dropping this wait does not cancel it.
     pub async fn nip46_login(
         &self,
         session: Arc<Nip46SessionFfi>,

@@ -489,6 +489,7 @@ async fn run_nip46_drop(settlement: DropSettlement) {
         .unwrap()
         .as_nostr_signer();
     let session = peer.session(&app);
+    session.connect_async().await.unwrap();
     relay.fail_publishes_of_kind(KEY_PACKAGE_KIND);
     peer.hold_kp
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -721,6 +722,134 @@ async fn run_nip46_drop(settlement: DropSettlement) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_remove_after_rollback() {
+    let peer = LoginPeer::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSecretStore::new(dir.path()));
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
+    let (entered, release) = fetcher.hold_fetches_for_kind(KIND_NIP65_RELAY_LIST);
+    let mut app = MarmotApp::with_relays_and_account_home_and_config(
+        dir.path(),
+        vec!["wss://account-relay.example".into()],
+        home.clone(),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        relay,
+        fetcher,
+        false,
+    );
+    let runtime = app.runtime();
+    let session = peer.session(&app);
+    session.connect_async().await.unwrap();
+    let mut login = {
+        let runtime = runtime.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+            runtime
+                .nip46_login(session, endpoints(), endpoints(), Vec::new())
+                .await
+        })
+    };
+    let held = tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .is_ok();
+    let id = peer.user.public_key().to_hex();
+    let account = home.account(&id).unwrap();
+    let phase = home
+        .account_setup_state(&id)
+        .unwrap()
+        .map(|setup| setup.phase);
+    let removal = tokio::time::timeout(Duration::from_secs(5), runtime.nip46_remove(&id)).await;
+    let account_gone = matches!(home.account(&id), Err(AccountHomeError::UnknownAccount(_)));
+    let secret_gone = !store
+        .has_secret_for_label(&format!(".nip46-client/{}", account.label))
+        .unwrap();
+    release.notify_one();
+    if tokio::time::timeout(Duration::from_secs(5), &mut login)
+        .await
+        .is_err()
+    {
+        login.abort();
+        let _ = login.await;
+    }
+    runtime.shutdown_and_close().await.unwrap();
+    peer.close().await;
+    assert!(held, "relay discovery must be held before publication");
+    assert_eq!(
+        phase,
+        Some(marmot_account::AccountSetupPhase::LocalStateCreated)
+    );
+    assert!(
+        account_gone && secret_gone,
+        "cancellation must roll back the new account and its communication key"
+    );
+    assert!(
+        matches!(
+            removal,
+            Ok(Err(AppError::AccountHome(
+                AccountHomeError::UnknownAccount(_)
+            )))
+        ),
+        "a rolled-back account is not a vault failure: {removal:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_login_needs_pairing() {
+    #[derive(Clone, Copy, Debug)]
+    enum PairingCase {
+        Fresh,
+        CachedDisconnected,
+    }
+
+    let peer = LoginPeer::new().await;
+    let id = peer.user.public_key().to_hex();
+    let mut observations = [
+        (PairingCase::Fresh, false, false, false),
+        (PairingCase::CachedDisconnected, false, false, false),
+    ];
+    for (case, refused, unpaired, absent) in &mut observations {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileSecretStore::new(dir.path()));
+        let home = AccountHome::open_with_secret_store(dir.path(), store);
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = app.runtime();
+        let session = peer.session(&app);
+        if matches!(*case, PairingCase::CachedDisconnected) {
+            session.connect_async().await.unwrap();
+            session.disconnect();
+        }
+        let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+        let result = runtime
+            .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
+            .await;
+        *refused = matches!(result, Err(AppError::Nip46(Nip46Error::Unavailable)));
+        *unpaired = session.status().state != crate::Nip46State::Ready;
+        *absent = matches!(home.account(&id), Err(AccountHomeError::UnknownAccount(_)));
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    peer.close().await;
+    assert!(
+        observations
+            .iter()
+            .all(|(_, refused, unpaired, absent)| *refused && *unpaired && *absent),
+        "unverified login must neither pair nor create an account: {observations:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip46_login_retains_retry() {
     let peer = LoginPeer::new().await;
     let dir = tempfile::tempdir().unwrap();
@@ -741,6 +870,7 @@ async fn nip46_login_retains_retry() {
     let runtime = app.runtime();
     let session = peer.session(&app);
     let communication_key = session.client_public_key().unwrap();
+    session.connect_async().await.unwrap();
     let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
     runtime
         .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
@@ -780,6 +910,7 @@ async fn nip46_login_retains_retry() {
     runtime.start().await.unwrap();
     let restored = runtime.nip46_resume(&id).await.unwrap();
     assert_eq!(restored.client_public_key().unwrap(), communication_key);
+    restored.connect_async().await.unwrap();
     assert_eq!(
         runtime
             .nip46_login(restored, endpoints(), endpoints(), Vec::new())
@@ -853,8 +984,8 @@ async fn nip46_login_restores_host() {
             .unwrap()
             .as_nostr_signer();
         let session = peer.session(&app);
+        session.connect_async().await.unwrap();
         let previous = if let Some(permissions) = previous_grants {
-            session.connect_async().await.unwrap();
             let export: serde_json::Value =
                 serde_json::from_str(&session.export().unwrap()).unwrap();
             let keys = Keys::parse(export["client_secret"].as_str().unwrap()).unwrap();
@@ -992,6 +1123,7 @@ async fn nip46_cold_rebind_failure() {
         AccountSetupReadiness::NetworkReady
     );
     let session = peer.session(&app);
+    session.connect_async().await.unwrap();
     assert!(matches!(
         runtime
             .nip46_login(session.clone(), Vec::new(), Vec::new(), Vec::new())
@@ -1069,6 +1201,7 @@ async fn nip46_cold_rebind_failure() {
         .unwrap();
     assert!(signed_out.local_cleanup.completed);
     let session = peer.session(&app);
+    session.connect_async().await.unwrap();
     assert!(matches!(
         runtime
             .nip46_login(session.clone(), Vec::new(), Vec::new(), Vec::new())
@@ -1123,6 +1256,7 @@ async fn nip46_post_commit_failure() {
     let runtime = app.runtime();
     let session = peer.session(&app);
     let communication_key = session.client_public_key().unwrap();
+    session.connect_async().await.unwrap();
     *peer.completion_fault.lock().unwrap() = Some(home.clone());
     let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
     runtime

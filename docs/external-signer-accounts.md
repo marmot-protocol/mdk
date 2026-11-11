@@ -81,7 +81,9 @@ Later offers retry the configured endpoints rather than permanently dropping the
 
 For a bunker URI, call `connect` directly. Both paths verify `get_public_key`
 and pin the user key separately from the remote signer and communication keys.
-`nip46_login` binds that verified user to an account and persists its session
+Await successful `connect` before calling `nip46_login`. Login requires an already-verified
+`Ready` session and rejects other states without connecting, discovering relays, or
+creating an account. `nip46_login` binds that verified user and persists its session
 before account setup asks for signatures. `nip46_register` attaches an imported
 session to an existing account. Only one communication key can own an account,
 and a bound communication key cannot be imported into another session.
@@ -94,8 +96,11 @@ remain bound. Completed setup does not imply that a signer or worker is availabl
 
 Native login and registration adoption runs in runtime-owned work across Rust,
 UniFFI, and C. Once admitted, dropping the caller's future stops waiting but does
-not cancel adoption or trigger rollback. The handshake before admission remains
-bounded and cancellable. Explicit session `cancel`, `disconnect`, or `logout`
+not cancel adoption or trigger rollback. Pairing is a separate caller-owned, bounded,
+cancellable `connect` call. An unbound pairing never mutates an account. Hosts must
+cancel and discard abandoned pairing UI and make a new explicit adoption call only
+after verification succeeds. Account sign-out does not cancel unrelated unbound
+sessions. Explicit session `cancel`, `disconnect`, or `logout`
 interrupts adoption's network waits; local binding and persistence settle before
 the owned work ends. Shutdown interrupts and settles owned adoption before it
 closes storage. Local removal, sign-out, and wipe interrupt earlier admitted
@@ -108,6 +113,8 @@ make failed host login transactional.
 New, promoted, and incomplete accounts follow initial provisioning. Possibly
 exposed publication retains its pairing for restart retry when no prior callback
 is restored. Journal cleanup errors do not revoke a network-ready account.
+Cancelling early provisioning can roll back the new account. Local removal then
+returns `UnknownAccount`, not a credential-store failure.
 Account setup transactions share the app's signer-registry scope across runtime handles.
 
 MDK stores the communication secret through `AccountSecretStore` under

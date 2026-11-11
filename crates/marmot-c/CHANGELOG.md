@@ -24,8 +24,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_nip46_free` releases only its C handle, preserving the runtime-owned
   account signer and other handles. Explicit `marmot_nip46_cancel` remains
   terminal for the shared session. Join handle borrowers before freeing.
-  Admitted Native login/register adoption survives waiter drop; the preceding
-  handshake remains bounded and cancellable. Explicit cancel/disconnect/logout
+  Admitted Native login/register adoption survives waiter drop. Pairing is a separate
+  bounded, caller-cancellable connect call; login requires an already-verified Ready
+  session and rejects other states without connecting or creating an account.
+  Unbound pairing never mutates an account. Explicit cancel/disconnect/logout
   interrupts adoption; shutdown interrupts and settles owned work before returning.
   Failed completed-account Native rebind restores prior local callbacks, records,
   and activation without retracting published KeyPackages. Sign-out cleanup stays

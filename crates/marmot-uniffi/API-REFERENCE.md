@@ -5779,7 +5779,7 @@ pub fn nip46_new(&self, config_json: String) -> Result<Arc<Nip46SessionFfi>, Mar
 
 Create an offline MDK-owned session from a bunker URI, pairing config, or secret export. Review and approve permissions before URI access or connection. Imports do not silently approve grants. No host signer callback is retained; the handle belongs to its creating Marmot object.
 
-[Source](src/nip46.rs#L253) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L254) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_login`
 
@@ -5787,13 +5787,13 @@ Create an offline MDK-owned session from a bunker URI, pairing config, or secret
 pub async fn nip46_login( &self, session: Arc<Nip46SessionFfi>, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
 ```
 
-Create or reopen the external account using the verified shared signer and persist its communication credentials through MDK's configured secret store. Messaging relay-list discovery and default publication follow external-signer login. Empty inbox relays reuse defaults. A session from another Marmot object returns `ExternalSignerMismatch` before network work.
+Create or reopen the external account using the verified shared signer and persist its communication credentials through MDK's configured secret store. Requires a successful explicit `connect` and an already-verified `Ready` session; other states are rejected without connecting, discovering relays, or creating an account. Messaging relay-list discovery and default publication follow external-signer login. Empty inbox relays reuse defaults. A session from another Marmot object returns `ExternalSignerMismatch` before network work.
 
-Once Native adoption is admitted, caller cancellation only stops waiting; runtime-owned work continues. The preceding handshake remains bounded and cancellable. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning.
+Once Native adoption is admitted, caller cancellation only stops waiting; runtime-owned work continues. Pairing is a separate bounded, caller-cancellable `connect` call and makes no account changes while unbound. Explicit session cancel, disconnect, or logout interrupts adoption; shutdown interrupts and settles owned work before returning.
 
 Before commit, a failed Native handoff restores the previous local callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup and restore prior activation on failure. Already-published KeyPackages are not retracted. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account. Account sign-out cleanup remains explicit; legacy host login behavior is unchanged.
 
-[Source](src/nip46.rs#L260) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L264) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_register`
 
@@ -5805,7 +5805,7 @@ Attach a verified imported session to an existing account, persist credentials, 
 
 Admitted adoption outlives caller cancellation and is interrupted and settled by shutdown, as with `nip46_login`. If no prior callback exists, a verified pairing remains attached for recovery when worker startup fails.
 
-[Source](src/nip46.rs#L289) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L293) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_resume`
 
@@ -5815,7 +5815,7 @@ pub async fn nip46_resume( &self, account_ref: String, ) -> Result<Arc<Nip46Sess
 
 Obtain the account's shared session from MDK-owned credentials, without a host descriptor or signer callback. Persisted approval is retained unchanged; changed required grants need explicit review. Startup restores local credentials before workers; a missing account-identity proof can require bounded remote signing.
 
-[Source](src/nip46.rs#L302) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L306) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_remove`
 
@@ -5825,7 +5825,7 @@ pub async fn nip46_remove(&self, account_ref: String) -> Result<(), MarmotKitErr
 
 Detach the account's shared session and remove its persisted communication credentials. This does not replace account sign-out or data wiping.
 
-[Source](src/nip46.rs#L311) · [Session lifecycle](README.md#nip-46-accounts)
+[Source](src/nip46.rs#L315) · [Session lifecycle](README.md#nip-46-accounts)
 
 ### `Nip46SessionFfi::permissions`
 
@@ -5865,7 +5865,7 @@ pub async fn connect(&self) -> Result<String, Nip46ErrorFfi>
 
 Pair or reconnect, verify the pinned account public key, and adopt policy-checked signer relay changes. Returns user hex; messaging relays are unchanged. Requires permission approval. The independently driven native transport does not block the host or Tokio async workers. Cancelling a pending foreign call cancels its scoped request.
 
-[Source](src/nip46.rs#L182)
+[Source](src/nip46.rs#L183)
 
 ### `Nip46SessionFfi::pairing_offer`
 
@@ -5875,7 +5875,7 @@ pub async fn pairing_offer(&self) -> Result<String, Nip46ErrorFfi>
 
 Install the client-pairing listener and await relay subscription acknowledgements before returning the credential-bearing URI. Display that URI only after this call succeeds, then await connect while the pairing UI remains visible. Requires explicit permission approval and an unpaired client-initiated session. Cancellation retires the offer; obtain and display a fresh one before retrying.
 
-[Source](src/nip46.rs#L187)
+[Source](src/nip46.rs#L188)
 
 ### `Nip46SessionFfi::uri`
 
@@ -5885,7 +5885,7 @@ pub fn uri(&self) -> Result<String, Nip46ErrorFfi>
 
 Return the credential-bearing pairing URI locally after permission approval. This accessor does not install a listener; use `pairing_offer` before displaying a client-initiated QR code. Never log or persist either URI as ordinary settings.
 
-[Source](src/nip46.rs#L192)
+[Source](src/nip46.rs#L193)
 
 ### `Nip46SessionFfi::export`
 
@@ -5895,7 +5895,7 @@ pub fn export(&self) -> Result<String, Nip46ErrorFfi>
 
 Export secret communication credentials and pinned identities as compatibility JSON for an optional encrypted-vault backup. MDK-owned resume does not require this export. Logged-out credentials cannot be exported.
 
-[Source](src/nip46.rs#L197)
+[Source](src/nip46.rs#L198)
 
 ### `Nip46SessionFfi::status`
 
@@ -5905,7 +5905,7 @@ pub fn status(&self) -> Nip46StatusFfi
 
 Read local typed state, optional privacy-safe error, auth URL, request ID, and generation. No keys, pairing URI, or signer request payload is included. `Approval` is an intermediate challenge, not successful RPC completion.
 
-[Source](src/nip46.rs#L202)
+[Source](src/nip46.rs#L203)
 
 ### `Nip46SessionFfi::state_json`
 
@@ -5915,7 +5915,7 @@ pub fn state_json(&self) -> Result<String, Nip46ErrorFfi>
 
 Read the compatibility JSON status used by C. Existing state/detail/auth-url fields are retained with request, generation, and typed-error metadata. No network work.
 
-[Source](src/nip46.rs#L207)
+[Source](src/nip46.rs#L208)
 
 ### `Nip46SessionFfi::ping`
 
@@ -5925,7 +5925,7 @@ pub async fn ping(&self) -> Result<(), Nip46ErrorFfi>
 
 Check the remote signer through the independently driven shared transport. Failures retain the typed session reason. Cancelling a pending foreign call cancels its scoped request without terminally cancelling the session.
 
-[Source](src/nip46.rs#L212)
+[Source](src/nip46.rs#L213)
 
 ### `Nip46SessionFfi::disconnect`
 
@@ -5935,7 +5935,7 @@ pub fn disconnect(&self)
 
 Interrupt transport work and advance its generation while permitting explicit reconnection. Does not remove persisted credentials.
 
-[Source](src/nip46.rs#L217)
+[Source](src/nip46.rs#L218)
 
 ### `Nip46SessionFfi::cancel_request`
 
@@ -5945,7 +5945,7 @@ pub fn cancel_request(&self, request_id: String) -> Result<(), Nip46ErrorFfi>
 
 Cancel one matching pending request without cancelling the session. Stale IDs return `RequestNotFound`; other sessions are unaffected.
 
-[Source](src/nip46.rs#L222)
+[Source](src/nip46.rs#L223)
 
 ### `Nip46SessionFfi::complete_auth`
 
@@ -5955,7 +5955,7 @@ pub fn complete_auth(&self, request_id: String) -> Result<(), Nip46ErrorFfi>
 
 Acknowledge a matching auth challenge after reviewing its URL. The pending RPC still needs its final remote response. Stale IDs return `RequestNotFound`.
 
-[Source](src/nip46.rs#L227)
+[Source](src/nip46.rs#L228)
 
 ### `Nip46SessionFfi::cancel`
 
@@ -5965,7 +5965,7 @@ pub fn cancel(&self)
 
 Permanently cancel this session and interrupt pending work, including synchronous identity-proof callbacks. Does not remove persisted credentials or revoke an optional saved export.
 
-[Source](src/nip46.rs#L232)
+[Source](src/nip46.rs#L233)
 
 ### `Nip46SessionFfi::logout`
 
@@ -5975,6 +5975,6 @@ pub async fn logout(&self) -> Result<(), Nip46ErrorFfi>
 
 Attempt bounded remote courtesy logout and erase the session's communication credentials even when no acknowledgement arrives or the foreign caller cancels its wait. Successful local erasure detaches the revoked signer so a fresh pairing can be registered in the same process. A vault deletion error stops signing but retains cleanup ownership; retry logout or account-level removal after the vault recovers. This does not sign out the MDK account; account sign-out already leaves attached handles logged out.
 
-[Source](src/nip46.rs#L240)
+[Source](src/nip46.rs#L241)
 
 </details>
