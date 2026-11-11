@@ -26,6 +26,11 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   generic missing-active detection based on the cursor's previously observed length alone.
   Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
+- Keep the local-delivery cursor bounded by in-flight work, never by retained history (mdk#3300): idle sealed
+  segments persist as compact `SealedEntry` rows and are matched from metadata without opening them; discovery opens
+  other sources one at a time; gaps are capped; an over-limit cursor sheds the oldest sealed segments with a
+  `CursorOverflow` gap only at the end of discovery, when no caller holds a journal index. A receiver rejection
+  bisects the batch and skips only the isolated record.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
   A failed flush must not seal buffered data. Preserve the actual writer path if rename compensation fails.
 - Keep audit logging opt-in and explicit. The sole supported event model is privacy-safe: hashed/truncated identifiers,

@@ -319,13 +319,16 @@ pub(crate) async fn attempt_audit_otlp_once(
     }
     let receiver = sender.send(batch).await;
     let mut observation = AuditDeliveryObservation::default();
+    // A rejected multi-record batch is split and its rows retried, so only
+    // the final single-record rejection, recorded as a gap, is a loss.
+    let mut rejected_status = None;
     match receiver {
         AuditOtlpSendResult::Complete => {}
         AuditOtlpSendResult::Retryable { http_status } => observation.failed(
             AuditDeliveryFailureKind::ReceiverRetryable,
             Some(http_status),
         ),
-        AuditOtlpSendResult::Rejected { http_status } => observation.rejected(http_status),
+        AuditOtlpSendResult::Rejected { http_status } => rejected_status = Some(http_status),
         AuditOtlpSendResult::Blocked { http_status } => {
             observation.failed(AuditDeliveryFailureKind::ReceiverBlocked, http_status)
         }
@@ -333,7 +336,10 @@ pub(crate) async fn attempt_audit_otlp_once(
             observation.failed(AuditDeliveryFailureKind::NoResponse, None)
         }
     }
-    let failure = observation.logged_failure();
+    // Each rejected request is still logged as one.
+    let failure =
+        observation.logged_failure().or(rejected_status
+            .map(|status| (AuditDeliveryFailureKind::ReceiverRejected, Some(status))));
     let Some(action) = receiver.for_finish() else {
         // No local finish: record the verdict (the pause, for a block) under
         // this attempt's admission before its reservation is released.
@@ -384,6 +390,10 @@ pub(crate) async fn attempt_audit_otlp_once(
                 Ok((step, backlog)) => {
                     if step == DeliveryStep::Accepted {
                         observation.delivered();
+                    }
+                    if let Some(http_status) = rejected_status.filter(|_| step == DeliveryStep::Gap)
+                    {
+                        observation.rejected(http_status);
                     }
                     observation.observed(backlog);
                     record_observation(status.as_ref(), &state_dir, &observation);

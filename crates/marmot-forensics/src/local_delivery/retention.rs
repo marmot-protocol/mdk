@@ -38,8 +38,6 @@ pub(super) fn expire_with(
     let mut source = open_source(path)?;
     let identity = file_identity(&source)?;
     let len = source.metadata()?.len();
-    let state: State = serde_json::from_slice(&read_private_file(&state_path)?)
-        .map_err(|_| invalid("corrupt delivery cursor"))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -53,22 +51,18 @@ pub(super) fn expire_with(
     };
     let active_name = format!("{stem}.jsonl");
     let segment_prefix = format!("{stem}-seg");
+    let state = decode_state(&read_private_file(&state_path)?, &active_name)?;
     // One directory can retain files from a previous device identity. Its
     // current cursor has no authority over a different source family.
-    if !state
-        .journals
-        .iter()
-        .any(|j| j.segment == active_name || j.segment.starts_with(&segment_prefix))
+    if state.source != active_name
+        || !state
+            .journals
+            .iter()
+            .any(|j| j.segment == active_name || j.segment.starts_with(&segment_prefix))
     {
         return remove_without_cursor(path, unlink);
     }
-    if state.version != 1
-        || state.destination.is_empty()
-        || state.destination.len() > 256
-        || state.next_generation == 0
-    {
-        return Err(invalid("incompatible delivery cursor"));
-    }
+    check_header(&state)?;
     validate_state(&state, &active_name)?;
     let Some(index) = state
         .journals
@@ -79,10 +73,15 @@ pub(super) fn expire_with(
     };
     let journal = &state.journals[index];
     // Reused identities or externally changed sources retain the ordinary
-    // conservative missing-source behavior. Never bless those bytes as ACKed.
-    if len < journal.observed_len
+    // conservative missing-source behavior. Never bless those bytes as ACKed,
+    // and never without a stored head to compare against.
+    if journal.fingerprint.is_empty()
+        || len < journal.observed_len
         || len < journal.fingerprint_len as u64
-        || fingerprint(&mut source, journal.fingerprint_len as usize)? != journal.fingerprint
+        || !fingerprint_matches(
+            &journal.fingerprint,
+            &fingerprint(&mut source, journal.fingerprint_len as usize)?,
+        )
     {
         return remove_without_cursor(path, unlink);
     }
@@ -103,6 +102,7 @@ pub(super) fn expire_with(
         state_path,
         state,
         fenced: false,
+        state_limit: MAX_STATE_BYTES,
     };
     // Clear only an interrupted pre-commit state write, as open() does.
     match fs::remove_file(delivery.state_path.with_extension("json.tmp")) {

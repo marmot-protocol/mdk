@@ -20,6 +20,14 @@ const MAX_RECORDS: usize = 96;
 // Include the full id even when two fresh heads share the same millisecond.
 const FINGERPRINT_BYTES: usize = 192;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
+// Older gaps are counted, not kept, so loss evidence cannot grow the cursor
+// without bound.
+const MAX_GAPS: usize = 256;
+// Version 2 stores idle sealed sources as compact `SealedEntry` rows.
+const STATE_VERSION: u8 = 2;
+// Hex characters of the head fingerprint a compact entry keeps: enough to
+// catch a replaced file, small enough for thousands of retained segments.
+const COMPACT_FINGERPRINT_HEX: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryBatch {
@@ -84,6 +92,9 @@ pub enum DeliveryStep {
     Stale,
     Blocked,
     Gap,
+    /// The receiver rejected a multi-record batch. The next preparation
+    /// re-sends a smaller prefix until the rejected record is isolated.
+    Split,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +104,13 @@ pub enum GapReason {
     OversizedLine,
     ChangedPreparedRange,
     MissingSource,
+    /// The receiver rejected this exact range as invalid input.
+    ReceiverRejected,
+    /// Retention deleted the source before this range was delivered.
+    ExpiredUndelivered,
+    /// The cursor reached its size limit; this sealed segment's undelivered
+    /// extent is no longer tracked.
+    CursorOverflow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +179,9 @@ struct Prepared {
     start: u64,
     end: u64,
     digest: String,
+    /// Record count; 0 in a range prepared before counts were persisted.
+    #[serde(default)]
+    records: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,15 +197,53 @@ struct Journal {
     prepared: Option<Prepared>,
     blocked: Option<String>,
     missing: bool,
+    /// Record limit while isolating a record the receiver rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split_records: Option<u16>,
+    /// End of the last rejected range. The rejected record lies before it,
+    /// so the limit ends once acknowledgement passes this offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split_until: Option<u64>,
+    /// Source change time in nanoseconds when last opened; 0 unknown. See
+    /// `change_time_ns`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    change_time: u64,
 }
+
+/// A sealed source with no work in flight: never read (`delivered` false) or
+/// fully acknowledged. Stored as `[generation, segment index, device, inode,
+/// length, delivered, change time, fingerprint prefix]` so retained history
+/// costs well under a hundred bytes per file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SealedEntry(u64, u32, u64, u64, u64, bool, u64, String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     version: u8,
     destination: String,
+    /// Active recorder file name; compact entries derive segment names from it.
+    /// Empty only in a version 1 file, which stored every name in full.
+    #[serde(default)]
+    source: String,
     next_generation: u64,
     journals: Vec<Journal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sealed: Vec<SealedEntry>,
     gaps: Vec<DeliveryGap>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    dropped_gaps: u64,
+    /// After a cursor overflow, untracked sealed segments at or below this
+    /// index are not adopted again. Cleared once none of them remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overflow_floor: Option<u32>,
+    /// Newest change time (ns) among the shed segments. A file at or below
+    /// the floor index but changed later is a new incarnation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    overflow_floor_change_time: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A single-account, single-destination delivery cursor over one recorder path.
@@ -196,6 +255,7 @@ pub struct LocalAuditDelivery {
     state_path: PathBuf,
     state: State,
     fenced: bool,
+    state_limit: u64,
 }
 
 impl LocalAuditDelivery {
@@ -235,11 +295,16 @@ impl LocalAuditDelivery {
             load_state(&state_path, destination, name)?
         } else {
             State {
-                version: 1,
+                version: STATE_VERSION,
                 destination: destination.into(),
+                source: name.into(),
                 next_generation: 1,
                 journals: Vec::new(),
+                sealed: Vec::new(),
                 gaps: Vec::new(),
+                dropped_gaps: 0,
+                overflow_floor: None,
+                overflow_floor_change_time: 0,
             }
         };
         let mut delivery = Self {
@@ -247,6 +312,7 @@ impl LocalAuditDelivery {
             state_path,
             state,
             fenced: false,
+            state_limit: MAX_STATE_BYTES,
         };
         delivery.discover()?;
         if !delivery.state_path.exists() {
@@ -318,7 +384,7 @@ impl LocalAuditDelivery {
         struct WallTime {
             wall_time_ms: WallTimeMs,
         }
-        let (mut file, len) = self.open_journal(index).ok()?;
+        let (mut file, len) = self.open_journal(index).ok()?.ok()?;
         let start = self.state.journals[index].acknowledged;
         file.seek(SeekFrom::Start(start)).ok()?;
         let (line, _, complete, oversized) = read_line(&mut file, start, len).ok()?;
@@ -339,6 +405,22 @@ impl LocalAuditDelivery {
         &mut self,
         after_discover: impl FnOnce(),
     ) -> io::Result<Preparation> {
+        let mut after_discover = Some(after_discover);
+        self.prepare_inner(
+            &mut || {
+                if let Some(hook) = after_discover.take() {
+                    hook();
+                }
+            },
+            true,
+        )
+    }
+
+    fn prepare_inner(
+        &mut self,
+        after_discover: &mut dyn FnMut(),
+        recheck_heads: bool,
+    ) -> io::Result<Preparation> {
         if self.fenced {
             return Err(invalid("uncertain local state publication"));
         }
@@ -351,16 +433,36 @@ impl LocalAuditDelivery {
         }
         let mut source_moved = false;
         for index in 0..self.state.journals.len() {
-            if self.state.journals[index].missing || self.state.journals[index].blocked.is_some() {
+            let journal = &self.state.journals[index];
+            if journal.missing
+                || journal.blocked.is_some()
+                // Discovery keeps a sealed journal's length current; one with
+                // nothing left needs no open.
+                || (journal.prepared.is_none()
+                    && journal.acknowledged >= journal.observed_len
+                    && !self.is_active(index))
+            {
                 continue;
             }
-            let (mut file, len) = match self.open_journal(index) {
+            let (mut file, len) = match self.open_journal(index)? {
                 Ok(source) => source,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(Unopened::Moved) => {
                     source_moved = true;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(Unopened::HeadChanged) => {
+                    // Metadata matched, so discovery skipped this file, but
+                    // its bytes changed (a rewrite within one change-time
+                    // tick). Persist that discovery must read it before any
+                    // later journal can end this pass, then rediscover once.
+                    self.state.journals[index].change_time = 0;
+                    self.publish()?;
+                    if recheck_heads {
+                        return self.prepare_inner(&mut || {}, false);
+                    }
+                    source_moved = true;
+                    continue;
+                }
             };
             self.state.journals[index].observed_len =
                 self.state.journals[index].observed_len.max(len);
@@ -402,7 +504,12 @@ impl LocalAuditDelivery {
             let mut position = start;
             let mut bodies = Vec::new();
             let mut bytes = Vec::new();
-            while position < len && bodies.len() < MAX_RECORDS {
+            let max_records = self.state.journals[index]
+                .split_records
+                .map_or(MAX_RECORDS, |limit| {
+                    usize::from(limit).clamp(1, MAX_RECORDS)
+                });
+            while position < len && bodies.len() < max_records {
                 let line_start = position;
                 let (line, end, complete, oversized) = read_line(&mut file, position, len)?;
                 position = end;
@@ -450,6 +557,7 @@ impl LocalAuditDelivery {
                 start,
                 end,
                 digest: digest(&bytes),
+                records: bodies.len() as u16,
             };
             self.state.journals[index].prepared = Some(prepared.clone());
             self.publish()?;
@@ -505,16 +613,39 @@ impl LocalAuditDelivery {
         };
         match result {
             ReceiverResult::Complete => {
-                self.state.journals[index].acknowledged = token.end;
-                self.state.journals[index].prepared = None;
+                let journal = &mut self.state.journals[index];
+                journal.acknowledged = token.end;
+                journal.prepared = None;
+                if journal.split_until.is_some_and(|until| token.end >= until) {
+                    journal.split_records = None;
+                    journal.split_until = None;
+                }
                 self.publish()?;
                 Ok(DeliveryStep::Accepted)
             }
             ReceiverResult::Retryable => Ok(DeliveryStep::Retryable),
             ReceiverResult::Permanent => {
-                self.state.journals[index].blocked = Some("permanent receiver rejection".into());
+                // The receiver refuses a whole batch for one bad record.
+                // Halve the batch until that record is alone, then skip only
+                // its range and keep later records flowing.
+                let journal = &mut self.state.journals[index];
+                let records = journal.prepared.as_ref().map_or(0, |p| p.records);
+                if records == 1 {
+                    journal.split_records = None;
+                    journal.split_until = None;
+                    self.record_gap(index, token.start, token.end, GapReason::ReceiverRejected)?;
+                    return Ok(DeliveryStep::Gap);
+                }
+                let current = if records == 0 {
+                    MAX_RECORDS as u16
+                } else {
+                    records
+                };
+                journal.split_records = Some((current / 2).max(1));
+                journal.split_until = Some(token.end);
+                journal.prepared = None;
                 self.publish()?;
-                Ok(DeliveryStep::Blocked)
+                Ok(DeliveryStep::Split)
             }
             ReceiverResult::Partial => {
                 self.state.journals[index].blocked = Some("partial receiver acceptance".into());
@@ -548,17 +679,14 @@ impl LocalAuditDelivery {
         end: u64,
         reason: GapReason,
     ) -> io::Result<()> {
-        let j = &self.state.journals[index];
-        append_gap(
-            &mut self.state.gaps,
-            DeliveryGap {
-                generation: j.generation,
-                segment: j.segment.clone(),
-                start,
-                end: Some(end),
-                reason,
-            },
-        );
+        let gap = DeliveryGap {
+            generation: self.state.journals[index].generation,
+            segment: self.state.journals[index].segment.clone(),
+            start,
+            end: Some(end),
+            reason,
+        };
+        append_gap(&mut self.state, gap);
         self.state.journals[index].acknowledged = end;
         self.state.journals[index].prepared = None;
         self.publish()
@@ -583,7 +711,7 @@ impl LocalAuditDelivery {
                 .is_some_and(|j| j.generation == self.state.journals[index].generation)
     }
 
-    fn open_journal(&self, index: usize) -> io::Result<(File, u64)> {
+    fn open_journal(&self, index: usize) -> io::Result<Result<(File, u64), Unopened>> {
         let j = &self.state.journals[index];
         let path = self
             .active
@@ -592,28 +720,28 @@ impl LocalAuditDelivery {
             .join(&j.segment);
         let mut file = match open_source(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                return Ok(Err(Unopened::Moved));
             }
             result => result?,
         };
         let (device, inode) = file_identity(&file)?;
         let len = file.metadata()?.len();
-        if device != j.device || inode != j.inode {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        if len < j.fingerprint_len as u64 {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        if device != j.device || inode != j.inode || len < j.fingerprint_len as u64 {
+            return Ok(Err(Unopened::Moved));
         }
         let fingerprint = match fingerprint(&mut file, j.fingerprint_len as usize) {
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                return Ok(Err(Unopened::Moved));
             }
             result => result?,
         };
-        if len < j.acknowledged || (!j.fingerprint.is_empty() && fingerprint != j.fingerprint) {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        if !fingerprint_matches(&j.fingerprint, &fingerprint) {
+            return Ok(Err(Unopened::HeadChanged));
         }
-        Ok((file, len))
+        if len < j.acknowledged {
+            return Ok(Err(Unopened::Moved));
+        }
+        Ok(Ok((file, len)))
     }
 
     fn discover(&mut self) -> io::Result<()> {
@@ -633,97 +761,83 @@ impl LocalAuditDelivery {
             Err(error) => return Err(error),
         };
         after_active_open();
-        let paths = source_paths(&self.active)?;
-        let mut sources = Vec::new();
-        let mut source_identities = std::collections::HashSet::new();
-        for path in paths.into_iter().filter(|path| path != &self.active) {
-            let file = open_source(&path)?;
-            if source_identities.insert(file_identity(&file)?) {
-                sources.push((path, file));
+        let stem = self
+            .state
+            .source
+            .strip_suffix(".jsonl")
+            .ok_or_else(|| invalid("invalid recorder name"))?
+            .to_owned();
+        let mut scan = Scan {
+            by_identity: self
+                .state
+                .journals
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| !j.missing)
+                .map(|(index, j)| ((j.device, j.inode), index))
+                .collect(),
+            seen: vec![false; self.state.journals.len()],
+            changed: false,
+        };
+        // Sources are opened one at a time, and an idle sealed source not at
+        // all: an account can retain thousands of segments.
+        let mut identities = std::collections::HashSet::new();
+        let mut lowest_index = None::<u32>;
+        for path in source_paths(&self.active)? {
+            if path == self.active {
+                continue;
             }
-        }
-        if let Some(file) = active_file
-            && source_identities.insert(file_identity(&file)?)
-        {
-            sources.push((self.active.clone(), file));
-        }
-        let mut seen = vec![false; self.state.journals.len()];
-        let mut changed = false;
-        for (path, mut file) in sources {
-            let (device, inode) = file_identity(&file)?;
-            let len = file.metadata()?.len();
-            let fp_len = (len as usize).min(FINGERPRINT_BYTES) as u8;
-            let fp = fingerprint(&mut file, fp_len as usize)?;
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| invalid("invalid source name"))?
                 .to_owned();
-            if len == 0
-                && !self
-                    .state
-                    .journals
-                    .iter()
-                    .any(|j| j.device == device && j.inode == inode && !j.missing)
-            {
-                // Empty new files carry no stable prefix or deliverable line.
-                // Assign their generation after the first completed write.
-                continue;
+            let index = sealed_index(&stem, &name);
+            if let Some(index) = index {
+                lowest_index = Some(lowest_index.map_or(index, |lowest| lowest.min(index)));
             }
-            if let Some(index) = self
-                .state
-                .journals
-                .iter()
-                .position(|j| j.device == device && j.inode == inode && !j.missing)
-            {
-                let journal = &mut self.state.journals[index];
-                let was_blocked = journal.blocked.is_some();
-                let existing_fp = fingerprint(
-                    &mut file,
-                    (journal.fingerprint_len as u64).min(len) as usize,
-                )?;
-                let changed_head =
-                    !journal.fingerprint.is_empty() && journal.fingerprint != existing_fp;
-                let lost_unprepared_tail = journal.prepared.is_none()
-                    && journal.blocked.is_none()
-                    && len < journal.observed_len;
-                if changed_head || lost_unprepared_tail {
-                    // The recorder never rewrites or truncates a file in place.
-                    // A reused inode or a shortened observed file is a new
-                    // generation; keep the old unaccepted extent visible.
-                    let was_active = self.active.file_name().and_then(|n| n.to_str())
-                        == Some(journal.segment.as_str());
-                    retire_missing(&mut self.state, index, was_active);
-                    seen[index] = true;
-                    register_journal(&mut self.state, name, device, inode, fp, fp_len, len)?;
-                    seen.push(true);
-                    changed = true;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // Gone since the listing: absent, as if never listed.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some(identity) = metadata_identity(&metadata) {
+                if identities.contains(&identity) {
                     continue;
-                } else {
-                    let observed_len = journal
-                        .observed_len
-                        .max(len)
-                        .max(journal.acknowledged)
-                        .max(journal.prepared.as_ref().map_or(0, |p| p.end));
-                    changed |= journal.fingerprint != fp
-                        || journal.segment != name
-                        || journal.observed_len != observed_len;
-                    journal.fingerprint = fp;
-                    journal.fingerprint_len = fp_len;
-                    journal.segment = name;
-                    if len < journal.acknowledged {
-                        journal.blocked = Some("source truncated below cursor".into());
-                    }
-                    journal.observed_len = observed_len;
                 }
-                seen[index] = true;
-                changed |= !was_blocked && journal.blocked.is_some();
-            } else {
-                register_journal(&mut self.state, name, device, inode, fp, fp_len, len)?;
-                seen.push(true);
-                changed = true;
+                let change_time = change_time_ns(&metadata);
+                match scan.by_identity.get(&identity) {
+                    Some(&known) if self.idle_sealed(known, &stem, &name, &metadata) => {
+                        identities.insert(identity);
+                        scan.seen[known] = true;
+                        continue;
+                    }
+                    None if self.below_overflow_floor(index, change_time) => {
+                        identities.insert(identity);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            let file = match open_source(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if identities.insert(file_identity(&file)?) {
+                self.observe(&mut scan, name, index, file)?;
             }
         }
+        if let Some(file) = active_file
+            && identities.insert(file_identity(&file)?)
+        {
+            let name = self.state.source.clone();
+            self.observe(&mut scan, name, None, file)?;
+        }
+        let Scan {
+            seen, mut changed, ..
+        } = scan;
         for (index, present) in seen.into_iter().enumerate() {
             if !present && !self.state.journals[index].missing {
                 let was_active = self.active.file_name().and_then(|n| n.to_str())
@@ -733,21 +847,142 @@ impl LocalAuditDelivery {
             }
         }
         // Expiry of an acknowledged sealed file is not missing evidence.
-        // Forget only retired, gap-free journals; retain every actual gap and
-        // unaccepted extent. Otherwise normal daily expiry accumulates a
-        // permanent journal for every file this device has ever uploaded.
+        // Keep a retired journal only while a recorded gap still names it.
+        // Otherwise normal daily expiry accumulates a permanent journal for
+        // every file this device has ever uploaded.
         let gap_generations: std::collections::HashSet<_> =
             self.state.gaps.iter().map(|gap| gap.generation).collect();
         let before = self.state.journals.len();
-        self.state.journals.retain(|journal| {
-            !journal.missing
-                || journal.acknowledged < journal.observed_len
-                || gap_generations.contains(&journal.generation)
-        });
+        self.state
+            .journals
+            .retain(|journal| !journal.missing || gap_generations.contains(&journal.generation));
         changed |= before != self.state.journals.len();
+        if let Some(floor) = self.state.overflow_floor
+            && lowest_index.is_none_or(|lowest| lowest > floor)
+        {
+            // No segment it covered remains, so a reused index is new data.
+            self.state.overflow_floor = None;
+            self.state.overflow_floor_change_time = 0;
+            changed = true;
+        }
+        changed |= self.shed_until_fits()?;
         if changed {
             self.publish()?;
         }
+        Ok(())
+    }
+
+    /// True when a known sealed source has nothing in flight and is unchanged
+    /// by name, length and modification time, so this pass need not open it.
+    /// Any difference sends it through `observe`, which checks its head.
+    fn idle_sealed(&self, index: usize, stem: &str, name: &str, metadata: &fs::Metadata) -> bool {
+        let journal = &self.state.journals[index];
+        journal.segment == name
+            && journal.observed_len == metadata.len()
+            && journal.change_time != 0
+            && journal.change_time == change_time_ns(metadata)
+            && compact_index(stem, &self.state.source, journal).is_some()
+    }
+
+    fn below_overflow_floor(&self, index: Option<u32>, change_time: u64) -> bool {
+        self.state
+            .overflow_floor
+            .zip(index)
+            .is_some_and(|(floor, index)| {
+                index <= floor && change_time <= self.state.overflow_floor_change_time
+            })
+    }
+
+    /// Reconcile one opened source with its journal, or adopt it.
+    fn observe(
+        &mut self,
+        scan: &mut Scan,
+        name: String,
+        index: Option<u32>,
+        mut file: File,
+    ) -> io::Result<()> {
+        let (device, inode) = file_identity(&file)?;
+        let metadata = file.metadata()?;
+        let len = metadata.len();
+        let change_time = change_time_ns(&metadata);
+        let fp_len = (len as usize).min(FINGERPRINT_BYTES) as u8;
+        let fp = fingerprint(&mut file, fp_len as usize)?;
+        let Some(&known) = scan.by_identity.get(&(device, inode)) else {
+            // Empty new files carry no stable prefix or deliverable line.
+            // Assign their generation after the first completed write.
+            if len == 0 || self.below_overflow_floor(index, change_time) {
+                return Ok(());
+            }
+            return self.adopt(scan, name, device, inode, fp, fp_len, len, change_time);
+        };
+        let journal = &mut self.state.journals[known];
+        let was_blocked = journal.blocked.is_some();
+        let existing_fp = fingerprint(
+            &mut file,
+            (journal.fingerprint_len as u64).min(len) as usize,
+        )?;
+        let changed_head = !fingerprint_matches(&journal.fingerprint, &existing_fp);
+        let lost_unprepared_tail =
+            journal.prepared.is_none() && journal.blocked.is_none() && len < journal.observed_len;
+        if changed_head || lost_unprepared_tail {
+            // The recorder never rewrites or truncates a file in place.
+            // A reused inode or a shortened observed file is a new
+            // generation; keep the old unaccepted extent visible.
+            let was_active =
+                self.active.file_name().and_then(|n| n.to_str()) == Some(journal.segment.as_str());
+            retire_missing(&mut self.state, known, was_active);
+            scan.seen[known] = true;
+            scan.by_identity.remove(&(device, inode));
+            return self.adopt(scan, name, device, inode, fp, fp_len, len, change_time);
+        }
+        let observed_len = journal
+            .observed_len
+            .max(len)
+            .max(journal.acknowledged)
+            .max(journal.prepared.as_ref().map_or(0, |p| p.end));
+        scan.changed |= journal.fingerprint != fp
+            || journal.segment != name
+            || journal.observed_len != observed_len
+            || journal.change_time != change_time;
+        journal.fingerprint = fp;
+        journal.change_time = change_time;
+        journal.fingerprint_len = fp_len;
+        journal.segment = name;
+        if len < journal.acknowledged {
+            journal.blocked = Some("source truncated below cursor".into());
+        }
+        journal.observed_len = observed_len;
+        scan.seen[known] = true;
+        scan.changed |= !was_blocked && journal.blocked.is_some();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt(
+        &mut self,
+        scan: &mut Scan,
+        name: String,
+        device: u64,
+        inode: u64,
+        fingerprint: String,
+        fingerprint_len: u8,
+        len: u64,
+        change_time: u64,
+    ) -> io::Result<()> {
+        register_journal(
+            &mut self.state,
+            name,
+            device,
+            inode,
+            fingerprint,
+            fingerprint_len,
+            len,
+        )?;
+        let index = self.state.journals.len() - 1;
+        self.state.journals[index].change_time = change_time;
+        scan.by_identity.insert((device, inode), index);
+        scan.seen.push(true);
+        scan.changed = true;
         Ok(())
     }
 
@@ -762,6 +997,85 @@ impl LocalAuditDelivery {
         result
     }
 
+    /// A full cursor must not stop delivery. Give up the oldest sealed
+    /// segments, record that loss as one gap, and keep the newer data. Runs
+    /// only at the end of discovery, when no caller holds a journal index,
+    /// and leaves headroom for the pass's own gaps and prepared range.
+    fn shed_until_fits(&mut self) -> io::Result<bool> {
+        let target = self.state_limit - self.state_limit / 8;
+        let mut shed_any = false;
+        loop {
+            if encode_state(&self.state)?.len() as u64 <= target {
+                return Ok(shed_any);
+            }
+            shed_any = true;
+            let stem = self
+                .state
+                .source
+                .strip_suffix(".jsonl")
+                .ok_or_else(|| invalid("invalid recorder name"))?
+                .to_owned();
+            let writer = (!self.active.exists())
+                .then(|| {
+                    self.state
+                        .journals
+                        .iter()
+                        .filter(|j| !j.missing)
+                        .max_by_key(|j| j.generation)
+                        .map(|j| j.generation)
+                })
+                .flatten();
+            let mut candidates: Vec<u32> = self
+                .state
+                .journals
+                .iter()
+                .filter(|j| !j.missing && j.prepared.is_none() && Some(j.generation) != writer)
+                .filter_map(|j| sealed_index(&stem, &j.segment))
+                .collect();
+            if candidates.is_empty() {
+                return Err(invalid("delivery cursor exceeds size limit"));
+            }
+            candidates.sort_unstable();
+            let floor = candidates[(candidates.len() / 8).max(1) - 1];
+            let mut lost = Vec::new();
+            let mut newest = self.state.overflow_floor_change_time;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    elapsed.as_nanos().try_into().unwrap_or(u64::MAX)
+                });
+            self.state.journals.retain(|j| {
+                let shed = !j.missing
+                    && j.prepared.is_none()
+                    && Some(j.generation) != writer
+                    && sealed_index(&stem, &j.segment).is_some_and(|index| index <= floor);
+                if shed {
+                    newest = newest.max(if j.change_time == 0 {
+                        now
+                    } else {
+                        j.change_time
+                    });
+                }
+                if shed && j.acknowledged < j.observed_len {
+                    lost.push(DeliveryGap {
+                        generation: j.generation,
+                        segment: j.segment.clone(),
+                        start: j.prepared.as_ref().map_or(j.acknowledged, |p| p.start),
+                        end: None,
+                        reason: GapReason::CursorOverflow,
+                    });
+                }
+                !shed
+            });
+            // One gap per abandoned extent; the gap cap bounds their count.
+            for gap in lost {
+                append_gap(&mut self.state, gap);
+            }
+            self.state.overflow_floor = Some(self.state.overflow_floor.unwrap_or(0).max(floor));
+            self.state.overflow_floor_change_time = newest;
+        }
+    }
+
     fn refresh(&mut self) -> io::Result<()> {
         let name = self
             .active
@@ -774,7 +1088,7 @@ impl LocalAuditDelivery {
 
     fn publish_inner(&self) -> io::Result<()> {
         let temp = self.state_path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(&self.state).map_err(io::Error::other)?;
+        let bytes = encode_state(&self.state)?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err(invalid("delivery cursor exceeds size limit"));
         }
@@ -791,7 +1105,39 @@ impl LocalAuditDelivery {
     }
 }
 
-fn append_gap(gaps: &mut Vec<DeliveryGap>, gap: DeliveryGap) {
+/// Why a journal's source could not be read this pass.
+enum Unopened {
+    /// Renamed, replaced or shortened; the next discovery reconciles it.
+    Moved,
+    /// Same identity and metadata, different head bytes.
+    HeadChanged,
+}
+
+/// One discovery pass's view of the journals it has matched.
+struct Scan {
+    by_identity: std::collections::HashMap<(u64, u64), usize>,
+    seen: Vec<bool>,
+    changed: bool,
+}
+
+/// Filesystem identity from metadata, without opening the file. Windows
+/// metadata does not expose it, so every source is opened there.
+#[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    metadata
+        .file_type()
+        .is_file()
+        .then(|| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn metadata_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn append_gap(state: &mut State, gap: DeliveryGap) {
+    let gaps = &mut state.gaps;
     if let Some(previous) = gaps.last_mut()
         && previous.generation == gap.generation
         && previous.segment == gap.segment
@@ -802,25 +1148,29 @@ fn append_gap(gaps: &mut Vec<DeliveryGap>, gap: DeliveryGap) {
     } else {
         gaps.push(gap);
     }
+    let excess = gaps.len().saturating_sub(MAX_GAPS);
+    if excess > 0 {
+        gaps.drain(..excess);
+        state.dropped_gaps = state.dropped_gaps.saturating_add(excess as u64);
+    }
 }
 
 fn retire_missing(state: &mut State, index: usize, was_active: bool) {
-    let journal = &mut state.journals[index];
+    let journal = &state.journals[index];
     if journal.prepared.is_some() || journal.acknowledged < journal.observed_len || was_active {
-        append_gap(
-            &mut state.gaps,
-            DeliveryGap {
-                generation: journal.generation,
-                segment: journal.segment.clone(),
-                start: journal
-                    .prepared
-                    .as_ref()
-                    .map_or(journal.acknowledged, |p| p.start),
-                end: None,
-                reason: GapReason::MissingSource,
-            },
-        );
+        let gap = DeliveryGap {
+            generation: journal.generation,
+            segment: journal.segment.clone(),
+            start: journal
+                .prepared
+                .as_ref()
+                .map_or(journal.acknowledged, |p| p.start),
+            end: None,
+            reason: GapReason::MissingSource,
+        };
+        append_gap(state, gap);
     }
+    let journal = &mut state.journals[index];
     journal.prepared = None;
     journal.missing = true;
 }
@@ -850,6 +1200,9 @@ fn register_journal(
         prepared: None,
         blocked: None,
         missing: false,
+        split_records: None,
+        split_until: None,
+        change_time: 0,
     });
     Ok(())
 }
@@ -861,34 +1214,37 @@ fn validate_state(state: &State, active_name: &str) -> io::Result<()> {
         .strip_suffix(".jsonl")
         .ok_or_else(|| invalid("invalid recorder name"))?;
     for j in &state.journals {
-        let expected_prefix = format!("{stem}-seg");
-        let segment_index = j
-            .segment
-            .strip_prefix(&expected_prefix)
-            .and_then(|s| s.strip_suffix(".jsonl"));
-        let valid_name = j.segment == active_name
-            || segment_index.is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()));
+        let valid_name = j.segment == active_name || sealed_index(stem, &j.segment).is_some();
         if !generations.insert(j.generation)
             || (!j.missing && !identities.insert((j.device, j.inode)))
             || j.generation >= state.next_generation
             || !valid_name
             || j.fingerprint_len as usize > FINGERPRINT_BYTES
             || (j.fingerprint_len == 0) != j.fingerprint.is_empty()
-            || (!j.fingerprint.is_empty() && !valid_digest(&j.fingerprint))
+            || (!j.fingerprint.is_empty()
+                && !(valid_digest(&j.fingerprint)
+                    || (j.fingerprint.len() == COMPACT_FINGERPRINT_HEX
+                        && j.fingerprint.bytes().all(|b| b.is_ascii_hexdigit()))))
             || j.acknowledged > j.observed_len
             || j.prepared.as_ref().is_some_and(|p| {
                 p.start != j.acknowledged
                     || p.end <= p.start
                     || p.end > j.observed_len
                     || p.end - p.start > MAX_BATCH_BYTES as u64
+                    || usize::from(p.records) > MAX_RECORDS
                     || !valid_digest(&p.digest)
             })
+            || j.split_records
+                .is_some_and(|limit| limit == 0 || usize::from(limit) > MAX_RECORDS)
+            || j.split_records.is_some() != j.split_until.is_some()
         {
             return Err(invalid("corrupt delivery cursor"));
         }
     }
+    // A gap may outlive its journal: overflow shedding drops the journal and
+    // keeps only the loss record.
     for gap in &state.gaps {
-        if !generations.contains(&gap.generation) || gap.end.is_some_and(|end| end <= gap.start) {
+        if gap.generation >= state.next_generation || gap.end.is_some_and(|end| end <= gap.start) {
             return Err(invalid("corrupt delivery gaps"));
         }
     }
@@ -908,7 +1264,6 @@ fn source_paths(active: &Path) -> io::Result<Vec<PathBuf>> {
     let stem = name
         .strip_suffix(".jsonl")
         .ok_or_else(|| invalid("invalid source path"))?;
-    let prefix = format!("{stem}-seg");
     let mut segments = Vec::new();
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
@@ -916,11 +1271,8 @@ fn source_paths(active: &Path) -> io::Result<Vec<PathBuf>> {
         let Some(filename) = filename.to_str() else {
             continue;
         };
-        if filename.starts_with(&prefix) && filename.ends_with(".jsonl") {
-            let middle = &filename[prefix.len()..filename.len() - 6];
-            if middle.len() == 6 && middle.bytes().all(|b| b.is_ascii_digit()) {
-                segments.push(entry.path());
-            }
+        if sealed_index(stem, filename).is_some() {
+            segments.push(entry.path());
         }
     }
     segments.sort();
@@ -969,14 +1321,172 @@ fn read_private_file(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn load_state(path: &Path, destination: &str, active_name: &str) -> io::Result<State> {
-    let bytes = read_private_file(path)?;
-    let state: State =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("corrupt delivery cursor"))?;
-    if state.version != 1 || state.destination != destination || state.next_generation == 0 {
+    let state = decode_state(&read_private_file(path)?, active_name)?;
+    if state.destination != destination || state.source != active_name {
         return Err(invalid("incompatible delivery cursor"));
     }
+    check_header(&state)?;
     validate_state(&state, active_name)?;
     Ok(state)
+}
+
+fn check_header(state: &State) -> io::Result<()> {
+    if state.version != STATE_VERSION
+        || state.destination.is_empty()
+        || state.destination.len() > 256
+        || state.next_generation == 0
+    {
+        return Err(invalid("incompatible delivery cursor"));
+    }
+    Ok(())
+}
+
+/// Parse either cursor version into the in-memory form, where every source,
+/// including a compact sealed one, is a `Journal` ordered by generation.
+/// `fallback_source` names a version 1 cursor's source, which it did not store.
+fn decode_state(bytes: &[u8], fallback_source: &str) -> io::Result<State> {
+    let mut state: State =
+        serde_json::from_slice(bytes).map_err(|_| invalid("corrupt delivery cursor"))?;
+    match state.version {
+        1 if state.source.is_empty() && state.sealed.is_empty() => {
+            state.source = fallback_source.to_owned();
+        }
+        STATE_VERSION if !state.source.is_empty() => {}
+        _ => return Err(invalid("incompatible delivery cursor")),
+    }
+    state.version = STATE_VERSION;
+    let stem = state
+        .source
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| invalid("corrupt delivery cursor"))?
+        .to_owned();
+    for SealedEntry(generation, index, device, inode, len, delivered, change_time, prefix) in
+        std::mem::take(&mut state.sealed)
+    {
+        if len == 0 || prefix.len() != COMPACT_FINGERPRINT_HEX {
+            return Err(invalid("corrupt delivery cursor"));
+        }
+        state.journals.push(Journal {
+            generation,
+            segment: segment_name(&stem, index),
+            device,
+            inode,
+            fingerprint: prefix,
+            fingerprint_len: len.min(FINGERPRINT_BYTES as u64) as u8,
+            observed_len: len,
+            acknowledged: if delivered { len } else { 0 },
+            prepared: None,
+            blocked: None,
+            missing: false,
+            split_records: None,
+            split_until: None,
+            change_time,
+        });
+    }
+    state.journals.sort_by_key(|journal| journal.generation);
+    // A version 1 cursor kept every gap; cap it before anything is published.
+    let excess = state.gaps.len().saturating_sub(MAX_GAPS);
+    if excess > 0 {
+        state.gaps.drain(..excess);
+        state.dropped_gaps = state.dropped_gaps.saturating_add(excess as u64);
+    }
+    Ok(state)
+}
+
+/// The on-disk form: idle sealed sources leave the journal list for one
+/// compact row each, so retained history costs tens of bytes per file.
+fn encode_state(state: &State) -> io::Result<Vec<u8>> {
+    let stem = state
+        .source
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| invalid("invalid recorder name"))?;
+    let mut encoded = State {
+        journals: Vec::new(),
+        sealed: Vec::new(),
+        ..state.clone()
+    };
+    for journal in &state.journals {
+        match compact_index(stem, &state.source, journal) {
+            Some(index) => encoded.sealed.push(SealedEntry(
+                journal.generation,
+                index,
+                journal.device,
+                journal.inode,
+                journal.observed_len,
+                journal.acknowledged == journal.observed_len,
+                journal.change_time,
+                journal.fingerprint[..COMPACT_FINGERPRINT_HEX].to_owned(),
+            )),
+            None => encoded.journals.push(journal.clone()),
+        }
+    }
+    serde_json::to_vec(&encoded).map_err(io::Error::other)
+}
+
+/// A sealed source with nothing in flight: unread, or fully acknowledged.
+/// Its segment name must round-trip through the index alone.
+fn compact_index(stem: &str, active_name: &str, journal: &Journal) -> Option<u32> {
+    if journal.missing
+        || journal.prepared.is_some()
+        || journal.blocked.is_some()
+        || journal.split_records.is_some()
+        || journal.observed_len == 0
+        || journal.fingerprint.len() < COMPACT_FINGERPRINT_HEX
+        || journal.fingerprint_len as u64 != journal.observed_len.min(FINGERPRINT_BYTES as u64)
+        || journal.segment == active_name
+        || (journal.acknowledged != 0 && journal.acknowledged != journal.observed_len)
+    {
+        return None;
+    }
+    sealed_index(stem, &journal.segment)
+        .filter(|index| segment_name(stem, *index) == journal.segment)
+}
+
+/// Index of a recorder segment name. The recorder pads to six digits and
+/// keeps counting past 999999.
+fn sealed_index(stem: &str, name: &str) -> Option<u32> {
+    let digits = name
+        .strip_prefix(stem)?
+        .strip_prefix("-seg")?
+        .strip_suffix(".jsonl")?;
+    if digits.len() < 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// A compact entry keeps only a prefix of its head fingerprint. An empty
+/// stored fingerprint is a version 1 journal that never recorded one.
+fn fingerprint_matches(stored: &str, computed: &str) -> bool {
+    stored.is_empty() || computed.starts_with(stored)
+}
+
+/// Inode change time on Unix: every write or metadata change moves it, and
+/// unlike the modification time, `touch`, `cp -p` or `rsync -t` cannot set it
+/// back. Elsewhere the modification time is the best available signal.
+#[cfg(unix)]
+fn change_time_ns(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    u64::try_from(metadata.ctime())
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|ns| ns.checked_add(u64::try_from(metadata.ctime_nsec()).ok()?))
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn change_time_ns(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |elapsed| {
+            elapsed.as_nanos().try_into().unwrap_or(u64::MAX)
+        })
+}
+
+fn segment_name(stem: &str, index: u32) -> String {
+    format!("{stem}-seg{index:06}.jsonl")
 }
 
 /// Flush a source's bytes before publishing a range that depends on them.
@@ -1647,26 +2157,555 @@ mod tests {
         assert!(LocalAuditDelivery::open(&active, &state_dir, "receiver-A").is_err());
     }
 
+    /// Rejects every batch that contains a record labelled `bad`, as the
+    /// receiver rejects a whole batch for one invalid record.
+    #[derive(Default)]
+    struct RejectingReceiver {
+        accepted: Vec<Vec<u8>>,
+        sends: usize,
+    }
+
+    impl TestAuditReceiver for RejectingReceiver {
+        fn send(&mut self, batch: &DeliveryBatch) -> ReceiverResult {
+            self.sends += 1;
+            if batch
+                .bodies
+                .iter()
+                .any(|body| body.windows(5).any(|w| w == b"\"bad\""))
+            {
+                return ReceiverResult::Permanent;
+            }
+            self.accepted.extend(batch.bodies.iter().cloned());
+            ReceiverResult::Complete
+        }
+    }
+
+    /// Seal `count` one-record segments beside `active`, numbered from
+    /// `first`, as the recorder leaves them after rolls.
+    fn seal_segments(
+        recorder: &JsonlRecorder,
+        active: &Path,
+        first: u32,
+        count: u32,
+    ) -> Vec<PathBuf> {
+        record(recorder, "sealed");
+        let bytes = fs::read(active).unwrap();
+        let line = bytes
+            .split_inclusive(|b| *b == b'\n')
+            .next_back()
+            .unwrap()
+            .to_vec();
+        let stem = active
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_suffix(".jsonl")
+            .unwrap()
+            .to_owned();
+        (first..first + count)
+            .map(|index| {
+                let path = active.with_file_name(segment_name(&stem, index));
+                fs::write(&path, &line).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn acknowledge_all(worker: &mut LocalAuditDelivery) {
+        for journal in &mut worker.state.journals {
+            journal.acknowledged = journal.observed_len;
+        }
+        worker.publish().unwrap();
+    }
+
+    fn state_len(state_dir: &Path) -> u64 {
+        fs::metadata(state_dir.join("local-delivery.json"))
+            .unwrap()
+            .len()
+    }
+
     #[test]
-    fn blocked_journal_does_not_stop_a_new_recorder_generation() {
+    fn thousands_of_retained_delivered_segments_keep_the_cursor_compact() {
         let (_dir, active, state_dir, recorder) = setup();
-        record(&recorder, "first");
+        seal_segments(&recorder, &active, 1, 5000);
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        acknowledge_all(&mut worker);
+        // Version 1 kept ~320 bytes per retained file and wedged at ~3,250.
+        assert!(
+            state_len(&state_dir) < 5000 * 96,
+            "{}",
+            state_len(&state_dir)
+        );
+        record(&recorder, "after-history");
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        assert_eq!(sink.batches.len(), 1);
+        assert!(
+            sink.batches[0]
+                .bodies
+                .iter()
+                .any(|body| body.windows(13).any(|w| w == b"after-history"))
+        );
+        assert!(worker.gaps().is_empty());
+        assert!(state_len(&state_dir) < 5000 * 96);
+    }
+
+    #[test]
+    fn segment_indexes_past_six_digits_are_delivered() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        seal_segments(&recorder, &active, 999_999, 2);
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let segments: Vec<_> = sink.batches.iter().map(|b| b.segment.clone()).collect();
+        assert!(segments.iter().any(|s| s.ends_with("-seg999999.jsonl")));
+        assert!(segments.iter().any(|s| s.ends_with("-seg1000000.jsonl")));
+    }
+
+    #[test]
+    fn version_one_cursor_near_the_size_cap_upgrades_and_resumes() {
+        let (_dir, active, state_dir, recorder) = setup();
+        seal_segments(&recorder, &active, 1, 3400);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        // The stalled device: most segments delivered, a backlog behind them.
+        let backlog = worker.state.journals.len() - 10;
+        for journal in &mut worker.state.journals[..backlog] {
+            journal.acknowledged = journal.observed_len;
+        }
+        let mut legacy = serde_json::to_value(&worker.state).unwrap();
+        legacy["version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("source");
+        for journal in legacy["journals"].as_array_mut().unwrap() {
+            journal.as_object_mut().unwrap().remove("change_time");
+        }
+        let legacy = serde_json::to_vec(&legacy).unwrap();
+        assert!(legacy.len() as u64 > MAX_STATE_BYTES * 7 / 8);
+        drop(worker);
+        fs::write(state_dir.join("local-delivery.json"), legacy).unwrap();
+        record(&recorder, "after-upgrade");
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        // Nine backlog segments, then the active file with its new record.
+        assert_eq!(sink.batches.len(), 10);
+        assert!(worker.gaps().is_empty());
+        assert!(state_len(&state_dir) < MAX_STATE_BYTES / 4);
+        let reopened = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(reopened.state.version, STATE_VERSION);
+    }
+
+    #[test]
+    fn full_cursor_sheds_oldest_segments_and_keeps_delivering() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        worker.state_limit = 64 * 1024;
+        let old = seal_segments(&recorder, &active, 1, 2000);
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        assert!(state_len(&state_dir) <= 64 * 1024);
+        let floor = worker.state.overflow_floor.unwrap();
+        let overflow: Vec<_> = worker
+            .gaps()
+            .iter()
+            .filter(|gap| gap.reason == GapReason::CursorOverflow)
+            .collect();
+        assert!(!overflow.is_empty());
+        let stem = worker.state.source.strip_suffix(".jsonl").unwrap();
+        for batch in &sink.batches {
+            assert!(sealed_index(stem, &batch.segment).is_none_or(|index| index > floor));
+        }
+        // Every untracked segment above the floor was still delivered once.
+        let delivered = sink.batches.len();
+        drain(&mut worker, &mut sink);
+        assert_eq!(sink.batches.len(), delivered);
+        assert!(!worker.fenced);
+        // A restarted recorder can reuse a shed index before discovery sees
+        // the old file gone. That new incarnation is delivered.
+        let reused = old[0].clone();
+        fs::remove_file(&reused).unwrap();
+        let fresh = recorded_line(&recorder, &active, "reused-index");
+        fs::write(&reused, &fresh).unwrap();
+        File::options()
+            .write(true)
+            .open(&reused)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+        let reused_name = reused.file_name().unwrap().to_str().unwrap().to_owned();
+        let before = sink.batches.len();
+        drain(&mut worker, &mut sink);
+        let reused_batches: Vec<_> = sink.batches[before..]
+            .iter()
+            .filter(|batch| batch.segment == reused_name)
+            .collect();
+        assert_eq!(reused_batches.len(), 1);
+        assert_eq!(reused_batches[0].bodies.concat(), fresh);
+        // Once nothing at or below the floor remains, it no longer applies.
+        for path in &old[..floor as usize] {
+            fs::remove_file(path).unwrap();
+        }
+        drain(&mut worker, &mut sink);
+        assert_eq!(worker.state.overflow_floor, None);
+    }
+
+    #[test]
+    fn retained_gaps_are_bounded_and_counted() {
+        let (_dir, active, state_dir, _recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let segment = worker.state.source.clone();
+        for index in 0..(MAX_GAPS as u64 + 10) {
+            append_gap(
+                &mut worker.state,
+                DeliveryGap {
+                    generation: 0,
+                    segment: segment.clone(),
+                    start: index * 2,
+                    end: Some(index * 2 + 1),
+                    reason: GapReason::InvalidRecord,
+                },
+            );
+        }
+        assert_eq!(worker.gaps().len(), MAX_GAPS);
+        assert_eq!(worker.state.dropped_gaps, 10);
+        assert_eq!(worker.gaps()[0].start, 20);
+    }
+
+    /// Runs only in the child process that `low_open_file_limit_*` spawns,
+    /// so lowering the limit cannot affect other tests in this process.
+    #[cfg(unix)]
+    #[test]
+    fn low_open_file_limit_child() {
+        if std::env::var_os("MDK_LOCAL_DELIVERY_LOW_NOFILE").is_none() {
+            return;
+        }
+        let limit = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: both pointers reference valid rlimit values for the call.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut current), 0);
+            let limit = libc::rlimit {
+                rlim_max: current.rlim_max,
+                ..limit
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        }
+        let (_dir, active, state_dir, recorder) = setup();
+        seal_segments(&recorder, &active, 1, 300);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        assert_eq!(sink.batches.len(), 301);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_open_file_limit_still_delivers_hundreds_of_segments() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_delivery::tests::low_open_file_limit_child",
+                "--nocapture",
+            ])
+            .env("MDK_LOCAL_DELIVERY_LOW_NOFILE", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The last line `recorder` wrote for `label`.
+    fn recorded_line(recorder: &JsonlRecorder, active: &Path, label: &str) -> Vec<u8> {
+        record(recorder, label);
+        fs::read(active)
+            .unwrap()
+            .split_inclusive(|b| *b == b'\n')
+            .next_back()
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn compact_entry_whose_inode_is_reused_starts_a_new_generation() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let old = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        // Retention deletes the delivered segment and a new one reuses its
+        // inode number, longer than the old one and with a different head.
+        fs::remove_file(&old).unwrap();
+        let mut fresh = recorded_line(&recorder, &active, "fresh-head");
+        fresh.extend(recorded_line(&recorder, &active, "fresh-tail"));
+        let replacement = active.with_file_name(segment_name(
+            worker.state.source.strip_suffix(".jsonl").unwrap(),
+            2,
+        ));
+        fs::write(&replacement, &fresh).unwrap();
+        let identity = file_identity(&File::open(&replacement).unwrap()).unwrap();
+        let journal = worker
+            .state
+            .journals
+            .iter_mut()
+            .find(|j| j.segment.ends_with("-seg000001.jsonl"))
+            .unwrap();
+        (journal.device, journal.inode) = identity;
+        worker.publish().unwrap();
+        drop(worker);
+        // Reopen so the old journal is the compact on-disk form.
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let delivered: Vec<u8> = sink
+            .batches
+            .iter()
+            .filter(|b| b.segment.ends_with("-seg000002.jsonl"))
+            .flat_map(|b| b.bodies.concat())
+            .collect();
+        assert_eq!(delivered, fresh);
+    }
+
+    #[test]
+    fn rewrite_that_restores_mtime_is_reread_instead_of_retried_forever() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        drop(LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap());
+        // As `cp -p` or `rsync -t` would: same name, inode, length and mtime.
+        let original = fs::metadata(&sealed).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&sealed).unwrap();
+        bytes[1] = b'X';
+        let file = OpenOptions::new().write(true).open(&sealed).unwrap();
+        (&file).write_all(&bytes).unwrap();
+        file.set_modified(original).unwrap();
+        drop(file);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        assert_ne!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Retryable);
+        drain(&mut worker, &mut sink);
+        let gaps: Vec<_> = worker
+            .gaps()
+            .iter()
+            .filter(|gap| gap.segment.ends_with("-seg000001.jsonl"))
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert!(gaps.contains(&GapReason::MissingSource));
+        assert!(gaps.contains(&GapReason::InvalidRecord));
+    }
+
+    #[test]
+    fn delivered_segment_rewritten_with_restored_mtime_is_delivered_again() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        drop(worker);
+        // Let the change-time clock tick past the original write.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let original = fs::metadata(&sealed).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&sealed).unwrap();
+        bytes[1] = b'X';
+        let file = OpenOptions::new().write(true).open(&sealed).unwrap();
+        (&file).write_all(&bytes).unwrap();
+        file.set_modified(original).unwrap();
+        drop(file);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        // The rewrite is a new generation, read from its first byte.
+        assert!(worker.gaps().iter().any(|gap| {
+            gap.reason == GapReason::InvalidRecord
+                && gap.segment.ends_with("-seg000001.jsonl")
+                && gap.start == 0
+        }));
+    }
+
+    #[test]
+    fn head_change_hidden_from_metadata_is_retired_despite_a_torn_active_tail() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        drop(recorder);
+        // Make the sealed segment unread again, then rewrite it so that even
+        // its change time matches (a coarse-clock filesystem in one tick).
+        let mut bytes = fs::read(&sealed).unwrap();
+        bytes[1] = b'X';
+        fs::write(&sealed, &bytes).unwrap();
+        let metadata = fs::metadata(&sealed).unwrap();
+        let journal = worker
+            .state
+            .journals
+            .iter_mut()
+            .find(|j| j.segment.ends_with("-seg000001.jsonl"))
+            .unwrap();
+        journal.acknowledged = 0;
+        journal.change_time = change_time_ns(&metadata);
+        worker.publish().unwrap();
+        // The active file ends in a torn line the reader must wait on.
+        let mut tail = OpenOptions::new().append(true).open(&active).unwrap();
+        tail.write_all(b"{\"partial").unwrap();
+        drop(tail);
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Gap)
+        );
+        assert!(worker.gaps().iter().any(|gap| {
+            gap.reason == GapReason::MissingSource && gap.segment.ends_with("-seg000001.jsonl")
+        }));
+    }
+
+    #[test]
+    fn expiry_never_blesses_a_journal_without_a_stored_head() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let sealed = seal_segments(&recorder, &active, 1, 1).remove(0);
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let index = worker
+            .state
+            .journals
+            .iter()
+            .position(|j| j.segment.ends_with("-seg000001.jsonl"))
+            .unwrap();
+        let observed = worker.state.journals[index].observed_len;
+        worker.state.journals[index].fingerprint.clear();
+        worker.state.journals[index].fingerprint_len = 0;
+        worker.publish().unwrap();
+        drop(worker);
+        // Different, longer bytes under the same inode.
+        let mut replacement = OpenOptions::new().append(true).open(&sealed).unwrap();
+        replacement.write_all(b"{\"unrelated\":true}\n").unwrap();
+        drop(replacement);
+        assert!(retention::expire_closed_source(&sealed, &state_dir).unwrap());
+        let state = load_state(
+            &state_dir.join("local-delivery.json"),
+            "receiver-A",
+            active.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        // The cursor still holds the old extent; discovery reports the loss.
+        let journal = state
+            .journals
+            .iter()
+            .find(|j| j.segment.ends_with("-seg000001.jsonl"))
+            .unwrap();
+        assert_eq!(journal.observed_len, observed);
+    }
+
+    #[test]
+    fn version_one_cursor_with_many_gaps_is_capped_on_upgrade() {
+        let (_dir, active, state_dir, recorder) = setup();
+        record(&recorder, "one");
+        let worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut legacy = serde_json::to_value(&worker.state).unwrap();
+        legacy["version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("source");
+        legacy["gaps"] = (0..9000u64)
+            .map(|index| {
+                serde_json::json!({
+                    "generation": 1,
+                    "segment": worker.state.source,
+                    "start": index * 2,
+                    "end": index * 2 + 1,
+                    "reason": "InvalidRecord",
+                })
+            })
+            .collect();
+        drop(worker);
+        fs::write(
+            state_dir.join("local-delivery.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        assert_eq!(worker.gaps().len(), MAX_GAPS);
+        assert_eq!(worker.state.dropped_gaps, 9000 - MAX_GAPS as u64);
+        record(&recorder, "two");
+        drain(&mut worker, &mut FakeReceiver::default());
+        assert!(state_len(&state_dir) < 64 * 1024);
+    }
+
+    #[test]
+    fn split_limit_ends_once_the_rejected_range_is_acknowledged() {
+        let (_dir, active, state_dir, recorder) = setup();
+        for index in 0..150 {
+            record(&recorder, &format!("row-{index}"));
+        }
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        // One rejection that a smaller retry no longer reproduces.
         let mut sink = FakeReceiver {
             next: Some(ReceiverResult::Permanent),
             ..Default::default()
         };
-        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Blocked);
-        recorder.rotate().unwrap();
-        record(&recorder, "second");
-        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Gap);
+        assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Split);
+        let rejected_end = sink.batches[0].token.end();
+        while worker.state.journals[0].acknowledged < rejected_end {
+            assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
+        }
+        assert!(worker.state.journals[0].split_records.is_none());
         assert_eq!(worker.run_once(&mut sink).unwrap(), DeliveryStep::Accepted);
-        assert_eq!(sink.batches.len(), 2);
-        assert_ne!(
-            sink.batches[0].token.generation(),
-            sink.batches[1].token.generation()
+        // Back to full batches: more than the halved limit of 48.
+        assert!(sink.batches.last().unwrap().bodies.len() > MAX_RECORDS / 2);
+        assert!(worker.gaps().is_empty());
+    }
+
+    #[test]
+    fn rejected_batch_is_split_until_only_the_bad_record_is_skipped() {
+        let (_dir, active, state_dir, recorder) = setup();
+        for index in 0..40 {
+            record(&recorder, &format!("good-{index}"));
+        }
+        record(&recorder, "bad");
+        for index in 40..60 {
+            record(&recorder, &format!("good-{index}"));
+        }
+        let lines: Vec<Vec<u8>> = fs::read(&active)
+            .unwrap()
+            .split_inclusive(|b| *b == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        let bad = lines
+            .iter()
+            .position(|line| line.windows(5).any(|w| w == b"\"bad\""))
+            .unwrap();
+        let bad_start: u64 = lines[..bad].iter().map(|l| l.len() as u64).sum();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = RejectingReceiver::default();
+        let mut splits = 0;
+        loop {
+            match worker.run_once(&mut sink).unwrap() {
+                DeliveryStep::Idle => break,
+                DeliveryStep::Split => splits += 1,
+                DeliveryStep::Accepted | DeliveryStep::Gap => {}
+                other => panic!("unexpected delivery step: {other:?}"),
+            }
+            assert!(sink.sends < 64, "bisection did not converge");
+        }
+        let mut expected = lines.clone();
+        expected.remove(bad);
+        assert_eq!(sink.accepted, expected);
+        assert!(splits > 0 && splits <= 7);
+        assert_eq!(
+            worker.gaps(),
+            &[DeliveryGap {
+                generation: 1,
+                segment: worker.state.source.clone(),
+                start: bad_start,
+                end: Some(bad_start + lines[bad].len() as u64),
+                reason: GapReason::ReceiverRejected,
+            }]
         );
-        assert_eq!(worker.blocked()[0].1, "permanent receiver rejection");
+        assert!(worker.blocked().is_empty());
+        assert!(worker.state.journals[0].split_records.is_none());
     }
 
     #[test]

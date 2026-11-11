@@ -684,35 +684,33 @@ async fn delivery_status_distinguishes_receiver_rejection_from_local_state_limit
         .set_audit_otlp_sender(Some(v5_sender(&endpoint, "token")))
         .unwrap();
 
+    // A receiver that rejects every batch: local delivery halves each
+    // rejected batch until one record is isolated, records a gap for it and
+    // moves on, all within one pass and without pausing.
     automatic_v5_pass(&app, &runtime).await;
-    assert_eq!(requests.try_recv().unwrap(), 400);
+    let mut rejections = 0;
+    while let Ok(status) = requests.try_recv() {
+        assert_eq!(status, 400);
+        rejections += 1;
+    }
+    assert!(rejections > 1, "the rejected batch is split and retried");
     let status = alice_status(&runtime);
     assert!(
         !status.paused,
         "a content rejection does not pause delivery"
     );
-    assert_eq!(status.rejected_batches, 1);
+    // Only isolated records the receiver still refused count as rejected;
+    // each is skipped as a gap (adjacent ones share a gap), while the split
+    // steps that narrowed them down do not count.
+    let rejected = status.rejected_batches;
+    assert!(rejected > 0 && rejected < rejections);
+    assert!(status.backlog.as_ref().unwrap().gaps > 0);
     let failure = status.last_failure.unwrap();
     assert_eq!(
         failure.kind,
         crate::AuditDeliveryFailureKind::ReceiverRejected
     );
     assert_eq!(failure.http_status, Some(400));
-    assert_eq!(status.consecutive_failures, 1);
-
-    // Until local delivery moves past a rejected batch, its journal stays
-    // blocked. The next pass sends nothing and still reports the rejection.
-    automatic_v5_pass(&app, &runtime).await;
-    assert!(requests.try_recv().is_err());
-    let status = alice_status(&runtime);
-    let failure = status.last_failure.unwrap();
-    assert_eq!(
-        failure.kind,
-        crate::AuditDeliveryFailureKind::ReceiverRejected
-    );
-    assert_eq!(failure.http_status, Some(400));
-    assert_eq!(status.rejected_batches, 1);
-    assert_eq!(status.consecutive_failures, 2);
 
     // The stalled-device shape from mdk#3300: an over-limit cursor fails
     // locally before any request, and the status says so.
@@ -728,7 +726,7 @@ async fn delivery_status_distinguishes_receiver_rejection_from_local_state_limit
     assert_eq!(schedule.retry_after, Some(Duration::ZERO));
     let status = alice_status(&runtime);
     assert!(!status.paused, "local failures keep retrying");
-    assert_eq!(status.rejected_batches, 1);
+    assert_eq!(status.rejected_batches, rejected);
     let failure = status.last_failure.unwrap();
     assert_eq!(
         failure.kind,

@@ -428,12 +428,13 @@ async fn post_v5_audit_tracker_update(
                     receiver: AuditOtlpSendResult::Complete,
                     local: Some(DeliveryStep::Accepted),
                 } => summary.accepted_batches += 1,
-                // The receiver's verdict on this batch's content. Once the
-                // journal moves past it with a recorded gap, the drain continues.
+                // A rejected batch was halved, or a gap was recorded and
+                // passed: later records are ready now.
                 AuditOtlpAttemptOutcome::Sent {
-                    receiver: AuditOtlpSendResult::Rejected { .. },
-                    local: Some(DeliveryStep::Gap),
-                } => {}
+                    local: Some(DeliveryStep::Split | DeliveryStep::Gap),
+                    ..
+                }
+                | AuditOtlpAttemptOutcome::Local(DeliveryStep::Gap) => {}
                 AuditOtlpAttemptOutcome::Local(DeliveryStep::Idle) => {
                     summary.idle_accounts += 1;
                     reached_limit = false;
@@ -444,10 +445,10 @@ async fn post_v5_audit_tracker_update(
                     ..
                 }
                 | AuditOtlpAttemptOutcome::Sent {
-                    local: Some(DeliveryStep::Blocked | DeliveryStep::Gap),
+                    local: Some(DeliveryStep::Blocked),
                     ..
                 }
-                | AuditOtlpAttemptOutcome::Local(DeliveryStep::Blocked | DeliveryStep::Gap) => {
+                | AuditOtlpAttemptOutcome::Local(DeliveryStep::Blocked) => {
                     summary.blocked_accounts += 1;
                     reached_limit = false;
                     break;
