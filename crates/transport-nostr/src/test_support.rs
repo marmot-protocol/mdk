@@ -30,7 +30,25 @@ pub enum PublishScript {
     Empty,
     Error,
     Outcome(NostrPublishOutcome),
+    /// Every relay refuses the event, in the outcome.
+    Refuse,
+    /// Every relay refuses the event, in an error, as the SDK client reports
+    /// a publish no relay accepted.
+    RefuseInError,
     Wait,
+}
+
+fn refused(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpointFailure> {
+    endpoints
+        .iter()
+        .map(|endpoint| TransportEndpointFailure {
+            endpoint: endpoint.clone(),
+            reason: "blocked".to_owned(),
+            kind: TransportEndpointFailureKind::TerminalRejected,
+            rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+            size_class: None,
+        })
+        .collect()
 }
 
 pub struct CountingClient {
@@ -145,6 +163,13 @@ impl NostrRelayClient for CountingClient {
             PublishScript::Empty => Ok(NostrPublishOutcome::default()),
             PublishScript::Error => Err(TransportAdapterError::Publish("scripted".to_owned())),
             PublishScript::Outcome(outcome) => Ok(outcome.clone()),
+            PublishScript::Refuse => Ok(NostrPublishOutcome {
+                failed: refused(endpoints),
+                ..NostrPublishOutcome::default()
+            }),
+            PublishScript::RefuseInError => Err(TransportAdapterError::PublishEndpoints(
+                TransportPublishFailure::with_endpoint_failures("blocked", refused(endpoints)),
+            )),
             PublishScript::Wait => Ok(NostrPublishOutcome::accepted(endpoints.to_vec())),
         }
     }
