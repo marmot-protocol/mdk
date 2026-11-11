@@ -85,11 +85,15 @@ and pin the user key separately from the remote signer and communication keys.
 before account setup asks for signatures. `nip46_register` attaches an imported
 session to an existing account. Only one communication key can own an account,
 and a bound communication key cannot be imported into another session.
-Before setup commits, a failed handoff restores the prior callback and stored
-grant record; only credentials created by that attempt are removed.
-Already-attached sessions remain bound. For an active account without a prior
-callback, possibly exposed publication retains its pairing for restart retry.
-Journal cleanup errors do not revoke a network-ready account.
+A completed external account rebinds without opening a setup journal, including
+when reactivating after sign-out. Failed adoption preserves its setup readiness
+and restores the prior callback and grant record, or the previously empty slot.
+Only credentials created by that attempt are removed; already-attached sessions
+remain bound. Completed setup does not imply that a signer or worker is available.
+
+New, promoted, and incomplete accounts follow initial provisioning. Possibly
+exposed publication retains its pairing for restart retry when no prior callback
+is restored. Journal cleanup errors do not revoke a network-ready account.
 Account setup transactions share the app's signer-registry scope across runtime handles.
 
 MDK stores the communication secret through `AccountSecretStore` under

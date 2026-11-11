@@ -35,7 +35,9 @@
   Freeing a C handle preserves the runtime-owned signer. Logout detaches the
   revoked signer after credential erasure; storage failures retain stopped,
   retryable cleanup ownership. Setup rollback restores prior callbacks and
-  grant records while publication retries retain their paired credentials.
+  grant records while initial-provisioning retries retain their paired credentials.
+  Completed accounts rebind without reopening setup; failed adoption preserves
+  their setup readiness and prior signed-out state.
   Post-commit journal cleanup failures do not revoke a ready account.
   Explicit pairing can repair metadata-only interrupted credential writes.
 

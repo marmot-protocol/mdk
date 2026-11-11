@@ -577,6 +577,8 @@ strings use `marmot_string_free`.
 
 New-account publication retries retain pairing credentials across restart;
 a post-commit journal cleanup error does not revoke the ready account.
+Completed-account rebinds do not reopen setup, including when adoption fails.
+An unavailable signer can still stop the account's worker.
 
 The loopback example exercises the C ABI with real NIP-44 websocket traffic,
 distinct user/bunker/client keys, mixed accounts, approvals and logout:

@@ -8722,12 +8722,31 @@ impl AccountManager {
                 }
                 let gate = self.onboarding_transaction(&account_id_hex);
                 let _transaction = gate.lock().await;
-                let existing_account = self.app.account_home().account(&account_id_hex).ok();
-                if let Some(account) = existing_account.as_ref() {
-                    refuse_unlinked(account)?;
-                    self.setup_records()
-                        .require_onboarding_complete(&account.label)?;
-                }
+                let (existing_account, previous_setup) =
+                    match self.app.account_home().account(&account_id_hex).ok() {
+                        Some(account) => {
+                            refuse_unlinked(&account)?;
+                            self.setup_records()
+                                .require_onboarding_complete(&account.label)?;
+                            let setup = self
+                                .app
+                                .account_home()
+                                .account_setup_state(&account.label)?;
+                            if account.external_signing && !account.local_signing && setup.is_none()
+                            {
+                                return self
+                                    .rebind_external_account(
+                                        account,
+                                        signer_public_key,
+                                        signer,
+                                        request,
+                                    )
+                                    .await;
+                            }
+                            (Some(account), setup)
+                        }
+                        None => (None, None),
+                    };
                 let origin = match existing_account {
                     None => ExternalSetupOrigin::Created,
                     Some(account) if !account.external_signing && !account.local_signing => {
@@ -8742,30 +8761,11 @@ impl AccountManager {
                 self.app.presentation_signals.catalog_changed();
                 let reactivating_existing = account.signed_out;
                 let mut binding = None;
-                let mut previous_setup = None;
                 let mut readiness = AccountSetupReadiness::Initializing;
                 let setup = async {
-                    previous_setup = self
-                        .app
-                        .account_home()
-                        .account_setup_state(&account.label)?;
-                    match signer {
-                        ExternalSetupSigner::Nip46(session) => {
-                            let accounts = self.clone();
-                            let label = account.label.clone();
-                            binding = blocking_app_task(move || {
-                                accounts.track_nip46_session(&label, session)
-                            })
-                            .await?;
-                        }
-                        ExternalSetupSigner::Host(signer) => {
-                            self.app.pin_external_signer(
-                                &account.account_id_hex,
-                                signer_public_key,
-                                signer,
-                            );
-                        }
-                    }
+                    binding = self
+                        .bind_external_signer(&account, signer_public_key, signer)
+                        .await?;
                     if previous_setup.is_none() {
                         self.app.account_home().begin_account_setup_with(
                             &account,
@@ -8775,33 +8775,7 @@ impl AccountManager {
                         )?;
                     }
                     let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-                    // An external-signer account is pre-existing by definition, so resolve
-                    // its profile from public indexers (its outbox metadata does not live on
-                    // the app's messaging relays). Runs before the relay-list setup so
-                    // discovery keeps its anti-clobber ordering.
-                    // Discovery is advisory (its error path already proceeds without it),
-                    // so a stalled indexer must not hold the whole login hostage.
-                    let recent_relay_lists = bounded_advisory_step(
-                        self.shared.observer.performance(),
-                        ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
-                        "login_directory_preflight",
-                        self.preflight_existing_account_directory(
-                            &account.account_id_hex,
-                            directory_discovery_relays_for_setup(&request),
-                        ),
-                    )
-                    .await
-                    .flatten();
-
-                    let relay_lists = self
-                        .setup_relay_lists_for_account(
-                            &account,
-                            &request,
-                            true,
-                            false,
-                            recent_relay_lists,
-                        )
-                        .await?;
+                    let relay_lists = self.resolve_external_relays(&account, &request).await?;
 
                     let key_package_bytes = if request.publish_initial_key_package {
                         if account.signed_out {
@@ -8917,21 +8891,9 @@ impl AccountManager {
                                         .map_err(AppError::from)
                                 })
                                 .await;
-                                let journal = if cleanup.is_ok()
-                                    && restore_signer
-                                    && unpublished
-                                    && previous_setup.is_none()
-                                {
-                                    self.app
-                                        .account_home()
-                                        .complete_account_setup(&account.label)
-                                } else {
-                                    Ok(())
-                                };
                                 let reconciliation =
                                     self.reconcile_for_account(&account.account_id_hex).await;
                                 cleanup?;
-                                journal?;
                                 reconciliation?;
                             }
                         }
@@ -8955,6 +8917,129 @@ impl AccountManager {
         observed
             .run_async(work, marmot_observability::success_or_failure)
             .await
+    }
+
+    async fn bind_external_signer(
+        &self,
+        account: &AccountSummary,
+        public_key: nostr::prelude::PublicKey,
+        signer: ExternalSetupSigner,
+    ) -> Result<Option<Nip46Binding>, AppError> {
+        match signer {
+            ExternalSetupSigner::Nip46(session) => {
+                let accounts = self.clone();
+                let label = account.label.clone();
+                blocking_app_task(move || accounts.track_nip46_session(&label, session)).await
+            }
+            ExternalSetupSigner::Host(signer) => {
+                self.app
+                    .pin_external_signer(&account.account_id_hex, public_key, signer);
+                Ok(None)
+            }
+        }
+    }
+
+    async fn resolve_external_relays(
+        &self,
+        account: &AccountSummary,
+        request: &AccountSetupRequest,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        // Discovery precedes default publication so existing relay lists are not clobbered.
+        let recent = bounded_advisory_step(
+            self.shared.observer.performance(),
+            ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
+            "login_directory_preflight",
+            self.preflight_existing_account_directory(
+                &account.account_id_hex,
+                directory_discovery_relays_for_setup(request),
+            ),
+        )
+        .await
+        .flatten();
+        self.setup_relay_lists_for_account(account, request, true, false, recent)
+            .await
+    }
+
+    async fn rebind_external_account(
+        &self,
+        mut account: AccountSummary,
+        public_key: nostr::prelude::PublicKey,
+        signer: ExternalSetupSigner,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        let reactivating = account.signed_out;
+        let binding = self
+            .bind_external_signer(&account, public_key, signer)
+            .await?;
+        // A completed account owns no setup journal. Relay repair and signer adoption
+        // must not turn its maintenance work into first-time provisioning.
+        let adoption = async {
+            let relay_lists = self.resolve_external_relays(&account, &request).await?;
+            if account.signed_out {
+                account = self
+                    .app
+                    .account_home()
+                    .set_account_signed_out(&account.label, false)?;
+                self.app.presentation_signals.catalog_changed();
+            }
+            let key_package_bytes = if request.publish_initial_key_package {
+                Some(
+                    self.publish_initial_key_package_for_account(&account)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let _ = bounded_advisory_step(
+                self.shared.observer.performance(),
+                ACCOUNT_SETUP_ADVISORY_WAIT,
+                "login_directory_refresh",
+                self.app.directory().refresh_user_directory_for_account_id(
+                    &account.account_id_hex,
+                    directory_bootstrap_relays_for_setup(&request),
+                ),
+            )
+            .await;
+            self.retry_and_reconcile_for_account(&account.account_id_hex)
+                .await?;
+            Ok((relay_lists, key_package_bytes))
+        }
+        .await;
+        match adoption {
+            Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
+                account,
+                relay_lists,
+                key_package_bytes,
+                profile: None,
+                readiness: AccountSetupReadiness::NetworkReady,
+            }),
+            Err(error) => {
+                let restored = if reactivating && !account.signed_out {
+                    self.app
+                        .account_home()
+                        .set_account_signed_out(&account.label, true)
+                        .map(drop)
+                } else {
+                    Ok(())
+                };
+                let cleanup = if let Some(binding) = binding {
+                    blocking_app_task(move || {
+                        binding
+                            .session
+                            .unbind_account(&binding.previous, binding.previous_signer)
+                            .map_err(AppError::from)
+                    })
+                    .await
+                } else {
+                    Ok(())
+                };
+                let reconciliation = self.reconcile_for_account(&account.account_id_hex).await;
+                restored?;
+                cleanup?;
+                reconciliation?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn register_external_signer<S>(

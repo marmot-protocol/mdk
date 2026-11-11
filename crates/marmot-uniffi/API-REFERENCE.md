@@ -5789,7 +5789,7 @@ pub async fn nip46_login( &self, session: Arc<Nip46SessionFfi>, default_relays: 
 
 Create or reopen the external account using the verified shared signer and persist its communication credentials through MDK's configured secret store. Messaging relay-list discovery and default publication follow external-signer login. Empty inbox relays reuse defaults. A session from another Marmot object returns `ExternalSignerMismatch` before network work.
 
-Before commit, a failed handoff restores the previous callback and grant record without deleting pre-existing credentials. A new account's possibly exposed publication retains its pairing for restart retry. Post-commit journal cleanup errors do not revoke a network-ready account.
+Before commit, a failed handoff restores the previous callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup, preserving prior readiness and signed-out state on failure. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account.
 
 [Source](src/nip46.rs#L260) · [Session lifecycle](README.md#nip-46-accounts)
 

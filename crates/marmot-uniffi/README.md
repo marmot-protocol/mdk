@@ -536,6 +536,9 @@ pairing can be registered after local erasure succeeds. A vault deletion error
 leaves signing stopped; retry `logout` or `nip46Remove` after the vault recovers.
 It does not replace MDK account sign-out.
 
+Completed-account rebinds preserve setup readiness even when adoption fails.
+An unavailable signer can still stop the account's worker.
+
 Local-key and arbitrary host callback APIs are unchanged. For C ownership and
 blocking-call rules, see [NIP-46 accounts in the C guide](../marmot-c/README.md#nip-46-accounts).
 The [shared session contract](../../docs/external-signer-accounts.md#nip-46-sessions)

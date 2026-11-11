@@ -3380,7 +3380,9 @@ MarmotStatus marmot_nip46_login(const struct MarmotClient *client, const struct 
 Create or reopen an external account using the verified session signer. Run off UI; free the returned summary with `marmot_account_summary_free`.
 Set `inbox_relays` independently, or pass `NULL, 0` to reuse the default relays.
 
-[Header contract](include/marmot.h#L13244)
+Completed accounts rebind without opening initial setup. Failed adoption preserves setup readiness and prior signed-out state; signer availability remains separate.
+
+[Header contract](include/marmot.h#L13079)
 
 ### `marmot_nip46_logout`
 

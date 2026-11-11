@@ -775,6 +775,16 @@ fn sign_out(client: Handle, account: &str) {
     unsafe { marmot_sign_out_outcome_free(out) };
 }
 
+fn assert_ready(client: Handle, account: &str) {
+    let account = c(account);
+    let mut readiness = MarmotAccountSetupReadiness::Initializing;
+    check(
+        unsafe { marmot_account_setup_readiness(client.0, account.as_ptr(), &mut readiness) },
+        "account setup readiness",
+    );
+    assert_eq!(readiness, MarmotAccountSetupReadiness::NetworkReady);
+}
+
 struct ChatChanges(*mut MarmotChatListSubscription);
 impl ChatChanges {
     fn new(client: Handle, account: &str) -> Self {
@@ -1476,6 +1486,38 @@ fn main() -> Result<()> {
         unsafe { marmot_nip46_remove(client.0, account_a_c.as_ptr()) },
         "remove before legacy descriptor restore",
     );
+    assert_ready(client, &account_a);
+    let failed_rebind = Session::new(client, &export_a);
+    let mut refused_rebind = ptr::dangling_mut();
+    assert_eq!(
+        unsafe {
+            marmot_nip46_login(
+                client.0,
+                failed_rebind.0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut refused_rebind,
+            )
+        },
+        MarmotStatus::Runtime,
+        "missing messaging relays must refuse completed-account rebind"
+    );
+    assert!(refused_rebind.is_null());
+    assert_ready(client, &account_a);
+    check(
+        client.profile(&local_id, "local-after-failed-rebind"),
+        "local after failed completed-account rebind",
+    );
+    check(
+        client.profile(&account_b, "remote-after-failed-rebind"),
+        "other remote after failed completed-account rebind",
+    );
+    drop(failed_rebind);
+    println!("PASS failed completed-account rebind preserves readiness and independent accounts");
     println!(
         "PASS cold restart reopens encrypted account databases; offline signer does not block local/other remote accounts"
     );
@@ -1494,6 +1536,7 @@ fn main() -> Result<()> {
     assert_eq!(session_a.connect(), account_a);
     session_a.register(client, &account_a);
     client.keypackage(&account_a);
+    assert_ready(client, &account_a);
     let secrets = fixture_a
         .controls
         .evidence
@@ -1615,6 +1658,7 @@ fn main() -> Result<()> {
         "failed reactivation retained account A's communication credential"
     );
     assert_accounts(client, &local_id, &account_a, &account_b, true);
+    assert_ready(client, &account_a);
     assert_eq!(
         retry.login(client, &relay_url, fixture_a.user.public_key()),
         account_a

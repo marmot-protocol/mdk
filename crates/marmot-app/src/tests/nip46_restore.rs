@@ -453,30 +453,49 @@ async fn nip46_login_restores_host() {
     let peer = LoginPeer::new().await;
     for previous_grants in [None, Some(vec!["nip44_encrypt".to_owned()])] {
         let dir = tempfile::tempdir().unwrap();
-        let home = AccountHome::open(dir.path());
+        let store = Arc::new(LocalFileSecretStore::new(dir.path()));
+        let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
         let account = home
             .add_external_signer_account(&peer.user.public_key().to_hex())
             .unwrap();
-        let app = MarmotApp::with_relays_and_account_home_and_config(
-            dir.path(),
-            vec!["wss://account-relay.example".into()],
-            home.clone(),
-            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        )
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        app.register_external_signer(
-            &account.label,
-            TestExternalAccountSigner {
-                keys: peer.user.clone(),
-            },
-        )
-        .await
-        .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let open_app = || {
+            MarmotApp::with_relays_and_account_home_and_config(
+                dir.path(),
+                vec!["wss://account-relay.example".into()],
+                home.clone(),
+                MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+            )
+            .with_test_relay_client(relay.clone())
+        };
+        let app = open_app();
+        let runtime = app.runtime();
+        let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+        runtime
+            .login_external_signer(
+                account.account_id_hex.clone(),
+                TestExternalAccountSigner {
+                    keys: peer.user.clone(),
+                },
+                AccountSetupRequest {
+                    default_relays: endpoints(),
+                    bootstrap_relays: endpoints(),
+                    publish_missing_relay_lists: true,
+                    publish_initial_key_package: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.account_setup_readiness(&account.label).unwrap(),
+            AccountSetupReadiness::NetworkReady
+        );
+        assert!(home.account_setup_state(&account.label).unwrap().is_none());
         let cached = app
             .account_signer_for_summary(&account)
             .unwrap()
             .as_nostr_signer();
-        let runtime = app.runtime();
         let session = peer.session(&app);
         let previous = if let Some(permissions) = previous_grants {
             session.connect_async().await.unwrap();
@@ -499,12 +518,32 @@ async fn nip46_login_restores_host() {
         } else {
             None
         };
+        relay.fail_publishes_of_kind(KEY_PACKAGE_KIND);
         assert!(matches!(
             runtime
-                .nip46_login(session.clone(), Vec::new(), Vec::new(), Vec::new())
+                .nip46_login(session.clone(), endpoints(), endpoints(), Vec::new())
                 .await,
-            Err(AppError::MissingDefaultRelays)
+            Err(AppError::Account(marmot_session::AccountError::KeyPackage(
+                _
+            )))
         ));
+        let rejected = relay
+            .attempted_events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| event.kind == KEY_PACKAGE_KIND)
+            .cloned()
+            .expect("Native rebind must reach KeyPackage publication");
+        let rejected: Event =
+            serde_json::from_str(&serde_json::to_string(&rejected).unwrap()).unwrap();
+        rejected.verify().unwrap();
+        assert_eq!(rejected.pubkey, peer.user.public_key());
+        assert_eq!(
+            runtime.account_setup_readiness(&account.label).unwrap(),
+            AccountSetupReadiness::NetworkReady
+        );
+        assert!(home.account_setup_state(&account.label).unwrap().is_none());
         let mut unsigned = EventBuilder::new(Kind::Metadata, "{\"name\":\"retained callback\"}")
             .finalize_unsigned(peer.user.public_key());
         unsigned.ensure_id();
@@ -519,11 +558,197 @@ async fn nip46_login_restores_host() {
                 assert_eq!(keys.public_key(), session.client_public_key().unwrap());
                 assert_eq!(record, previous);
             }
-            None => assert!(home.load_nip46_session(&account.label).unwrap().is_none()),
+            None => {
+                assert!(home.load_nip46_session(&account.label).unwrap().is_none());
+                assert!(
+                    !store
+                        .has_secret_for_label(&format!(".nip46-client/{}", account.label))
+                        .unwrap()
+                );
+            }
         }
         assert_eq!(session.status().state, Nip46State::Disconnected);
         runtime.shutdown_and_close().await.unwrap();
+        drop(cached);
+        drop(session);
+        drop(runtime);
+        drop(app);
+        let restarted = open_app();
+        let runtime = restarted.runtime();
+        assert_eq!(
+            runtime.account_setup_readiness(&account.label).unwrap(),
+            AccountSetupReadiness::NetworkReady
+        );
+        assert!(home.account_setup_state(&account.label).unwrap().is_none());
+        runtime.shutdown_and_close().await.unwrap();
     }
+    peer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nip46_cold_rebind_failure() {
+    let peer = LoginPeer::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSecretStore::new(dir.path()));
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let open_app = || {
+        MarmotApp::with_relays_and_account_home_and_config(
+            dir.path(),
+            vec!["wss://account-relay.example".into()],
+            home.clone(),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(relay.clone())
+    };
+    let app = open_app();
+    let runtime = app.runtime();
+    let endpoints = || vec![TransportEndpoint("wss://account-relay.example".into())];
+    let completed = runtime
+        .login_external_signer(
+            peer.user.public_key().to_hex(),
+            TestExternalAccountSigner {
+                keys: peer.user.clone(),
+            },
+            AccountSetupRequest {
+                default_relays: endpoints(),
+                bootstrap_relays: endpoints(),
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let id = completed.account.account_id_hex;
+    assert_eq!(completed.readiness, AccountSetupReadiness::NetworkReady);
+    assert!(completed.key_package_bytes.is_some());
+    assert!(home.account_setup_state(&id).unwrap().is_none());
+    runtime.shutdown_and_close().await.unwrap();
+    drop(runtime);
+    drop(app);
+
+    let app = open_app();
+    let runtime = app.runtime();
+    assert!(!app.has_external_signer(&id));
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    let session = peer.session(&app);
+    assert!(matches!(
+        runtime
+            .nip46_login(session.clone(), Vec::new(), Vec::new(), Vec::new())
+            .await,
+        Err(AppError::MissingDefaultRelays)
+    ));
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    assert!(home.account_setup_state(&id).unwrap().is_none());
+    assert!(home.load_nip46_session(&id).unwrap().is_none());
+    let account = home.account(&id).unwrap();
+    assert!(
+        !store
+            .has_secret_for_label(&format!(".nip46-client/{}", account.label))
+            .unwrap()
+    );
+    assert!(!app.has_external_signer(&id));
+    runtime.shutdown_and_close().await.unwrap();
+    drop(session);
+    drop(runtime);
+    drop(app);
+
+    let app = open_app();
+    let runtime = app.runtime();
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    assert!(home.account_setup_state(&id).unwrap().is_none());
+    app.register_external_signer(
+        &id,
+        TestExternalAccountSigner {
+            keys: peer.user.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    runtime.start().await.unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .any(|account| account.account_id_hex == id && account.running)
+    );
+    let signer = app
+        .account_signer_for_summary(&account)
+        .unwrap()
+        .as_nostr_signer();
+    let mut unsigned = EventBuilder::new(Kind::Metadata, "{\"name\":\"restored host\"}")
+        .finalize_unsigned(peer.user.public_key());
+    unsigned.ensure_id();
+    let expected = unsigned.id.unwrap();
+    let signed = signer.sign_event(unsigned).await.unwrap();
+    signed.verify().unwrap();
+    assert_eq!(signed.id, expected);
+    assert_eq!(signed.pubkey, peer.user.public_key());
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    assert!(home.account_setup_state(&id).unwrap().is_none());
+    drop(signer);
+    let signed_out = runtime
+        .sign_out(
+            &id,
+            crate::runtime::SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(signed_out.local_cleanup.completed);
+    let session = peer.session(&app);
+    assert!(matches!(
+        runtime
+            .nip46_login(session.clone(), Vec::new(), Vec::new(), Vec::new())
+            .await,
+        Err(AppError::MissingDefaultRelays)
+    ));
+    assert!(home.account(&id).unwrap().signed_out);
+    assert!(home.account_setup_state(&id).unwrap().is_none());
+    assert!(home.load_nip46_session(&id).unwrap().is_none());
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .any(|account| {
+                account.account_id_hex == id && account.signed_out && !account.running
+            })
+    );
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    drop(session);
+    drop(runtime);
+    drop(app);
+    let app = open_app();
+    let runtime = app.runtime();
+    assert!(home.account(&id).unwrap().signed_out);
+    assert!(home.account_setup_state(&id).unwrap().is_none());
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    runtime.shutdown_and_close().await.unwrap();
     peer.close().await;
 }
 
