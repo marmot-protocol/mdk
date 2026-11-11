@@ -2187,6 +2187,7 @@ async fn cancelled_key_package_setup_resumes_exact_pending_attempt_after_restart
     use marmot_account::AccountSetupPhase;
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let armed = Arc::new(AtomicBool::new(true));
     let entered = Arc::new(Notify::new());
